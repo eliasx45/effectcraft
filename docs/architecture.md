@@ -72,7 +72,9 @@ All time is an integer `Tick`, 254 016 000 000 per second, the least common mult
 broadcast frame rate (×1001) and audio sample rate, so frame and sample positions are exact.
 Keyframe times are in **layer time**; `layer_time = (comp_time - start_time) / stretch`, and a
 Time Remap property overrides the source time. Commands snap layer times, keyframe times and
-comp durations to whole frames, as After Effects does. Timecode is only a display.
+comp durations to whole frames, as After Effects does, except Quick Offset (`layer.quickOffset`,
+`keys.quickOffset`), which staggers layers and keys onto subframes, as After Effects 25.4 does.
+Timecode is only a display.
 
 ## 3. Document model
 
