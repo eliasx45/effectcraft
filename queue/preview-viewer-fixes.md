@@ -1,4 +1,4 @@
-title: fix(viewer): split views off the UI thread, click-free preview audio, faster Cryptomatte and GPU box blur
+title: fix(viewer): split views off the UI thread, click-free preview audio and a faster GPU box blur
 branch: upstream/preview-viewer-fixes
 depends: none
 
@@ -13,7 +13,6 @@ depends: none
 - Auto backend: AutoPick re-probes the CPU less often while the GPU is clearly faster.
 
 **Effects / GPU**
-- Cryptomatte looks its rank channels up once per frame, not per pixel (#473).
 - GPU blur: `box_h` stages its reads through workgroup memory (coalesced; bit-identical to the old kernel, which stays as the test reference and as the Metal pipeline, where fast math reassociates the sums).
 
 **Tests**
@@ -25,12 +24,12 @@ depends: none
 
 Preview responsiveness and correctness fixes from the 12 Oct preview audit: extra views stalled the UI thread during playback, preview audio clicked at every block on 44.1 kHz devices, and the horizontal box pass read memory uncoalesced (~3.2 ms per pass at 4K).
 
-Four commits are adapted to this base: the split-view change keys frame content with `Frames::content_of` (the fork used a freeze-preview variant upstream doesn't have) and its test no longer assumes the native GPU display path; the audio resampling change is ported without the fork's streamed audio-effect state; the fps-readout change leaves out the fork's audio-hold hunks; the Cryptomatte change stays serial in `effectcraft-gpu` (no rayon dependency there upstream). Each commit is cherry-picked from eliasx45/effectcraft (`-x` trailer).
+Upstream landed its own Cryptomatte rank-plane fix (#473) meanwhile, so that change is dropped here. Three commits are adapted to this base: the split-view change keys frame content with `Frames::content_of` (the fork used a freeze-preview variant upstream doesn't have) and its test no longer assumes the native GPU display path; the audio resampling change is ported without the fork's streamed audio-effect state; the fps-readout change leaves out the fork's audio-hold hunks. Each commit is cherry-picked from eliasx45/effectcraft (`-x` trailer).
 
 ## How tested
 
 All on this branch, against `upstream/main` (Linux, lavapipe for GPU tests with `EFFECTCRAFT_REQUIRE_GPU=1`):
-- `rustfmt --edition 2024 --check` on the changed files; `cargo clippy -p effectcraft-effects -p effectcraft-gpu -p effectcraft-raster -p effectcraft-render -p effectcraft-media -p effectcraft-ui-egui --all-targets -- -D warnings`: clean.
+- `rustfmt --edition 2024 --check` on the changed files; `cargo clippy -p effectcraft-gpu -p effectcraft-render -p effectcraft-media -p effectcraft-ui-egui --all-targets -- -D warnings`: clean.
 - `cargo test -p effectcraft-raster -p effectcraft-effects`, `-p effectcraft-render`, `-p effectcraft-media --test footage`: pass.
 - `cargo test -p effectcraft-gpu`: pass (including `tests_box::staged_box_h_matches_the_serial_kernel_bit_for_bit`) except `tests_fx_pixel2::stylize` and `tests_fx_stylize::posterize_thresholds_strobe_vignette`, which fail the same way on unmodified `upstream/main` under lavapipe.
 - `cargo test -p effectcraft-ui-egui --lib` (new `panels::viewer::tests::extra_view_frames_do_not_drop_the_main_viewers_prefetch`, `extra_views_render_on_the_frame_workers`, `audio::tests::resampled_blocks_join_without_a_jump`): pass except the known upstream failure `theme::script_font_tests::arabic_words_are_joined_and_read_right_to_left`.
