@@ -39,7 +39,9 @@ pub const LANGUAGES: &[(&str, &str)] = &[
 ];
 
 /// Settings ▸ Startup & Repair ▸ Window Graphics: (label, `startup.windowGraphics` value).
-pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[("Automatic", "auto"), ("OpenGL (compatibility)", "gl")];
+/// `vulkan` asks for Vulkan alone (Windows, Linux; Automatic on macOS): where Automatic picks
+/// DirectX 12, whose compiler can't build the GPU compositor's kernels (#613).
+pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[("Automatic", "auto"), ("Vulkan", "vulkan"), ("OpenGL (compatibility)", "gl")];
 
 /// Settings ▸ Appearance ▸ Appearance Mode: (label, `appearance.appearanceMode` value). Auto
 /// follows the operating system's light or dark appearance.
@@ -122,8 +124,9 @@ page!(Startup {
     /// After a crash, offer to open the most recent auto-save.
     offer_crash_recovery: bool = true,
     /// What the desktop window draws with, from the next launch: `auto` (the platform's best
-    /// graphics API) or `gl` (OpenGL, for drivers that crash with the others). A launch that
-    /// stops as its window opens switches it to `gl` (#243).
+    /// graphics API), `vulkan` (Vulkan alone; not macOS) or `gl` (OpenGL, for drivers that crash
+    /// with the others). Two launches in a row that stop as their window opens switch it to
+    /// `gl` (#243).
     window_graphics: String = "auto".into(),
 });
 

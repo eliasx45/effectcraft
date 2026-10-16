@@ -766,13 +766,15 @@ fn memory_tick_never_waits_for_the_system() {
     }
 }
 
-/// Settings ▸ Startup & Repair ▸ Window Graphics takes `auto` or `gl` (#243).
+/// Settings ▸ Startup & Repair ▸ Window Graphics takes `auto`, `vulkan` or `gl` (#243).
 #[test]
 fn window_graphics_is_validated() {
     let mut s = Session::default();
     assert_eq!(s.prefs.startup.window_graphics, "auto");
+    s.execute("prefs.set", json!({"key": "startup.windowGraphics", "value": "vulkan"})).unwrap();
+    assert_eq!(s.prefs.startup.window_graphics, "vulkan");
     s.execute("prefs.set", json!({"key": "startup.windowGraphics", "value": "gl"})).unwrap();
-    for bad in [json!("vulkan"), json!(true)] {
+    for bad in [json!("dx12"), json!(true)] {
         assert!(s.execute("prefs.set", json!({"key": "startup.windowGraphics", "value": bad})).is_err());
     }
     assert_eq!(s.prefs.startup.window_graphics, "gl");

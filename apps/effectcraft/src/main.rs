@@ -332,6 +332,8 @@ fn main() -> eframe::Result {
         Err(e) => {
             if on_gl {
                 launch_guard::opengl_failed(effectcraft_host::config_dir().as_deref());
+            } else {
+                launch_guard::window_failed(effectcraft_host::config_dir().as_deref());
             }
             startup_failed(e, !on_gl && cfg!(not(target_os = "macos")));
         }
