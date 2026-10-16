@@ -1,4 +1,4 @@
-109
+102
 # history (date pending-commits note), newest last; line 1 is what sync-gap.sh --fail-if-growing reads
 2026-10-12 347 first record (after counting open-PR branches as shared)
 2026-10-13 383 grew +36 (day's landings; 8 pending commits sit on upstream/* branches as cherry-picks without -x, so they count twice; 7 are tonight's Fix: commits on main)
@@ -6,3 +6,4 @@
 2026-10-15 121 grew +10 (day landings; top un-queued: G2 26 commits, MCP, M6, AN15, RT10e; queue branches 88 behind upstream, one repaired)
 2026-10-15n 139 grew +18 (night run: day agents landed M7/G2 work, 35 queued; two stacked queue branches repaired; MCP stack branches still 140 behind upstream with 5-10 conflicts each)
 2026-10-16n 109 fell -30 (sync-gap counts 109 un-queued of 130 shareable; full CI green; storytold PR API unavailable so queue branches not repaired tonight)
+2026-10-16d 102 fell -7 (midday run: upstream merged, 176 commits; 119 shareable, 17 queued; storytold PR API unavailable so PR states unchecked and queue branches not repaired)
