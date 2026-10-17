@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 
 use crate::control_wire::{self, lock};
 use crate::figma_bridge::{new_code, same_code};
+use crate::frame_stream::{StreamHost, Streams};
 
 /// The token file in the config directory (mode 0600).
 pub const TOKEN_FILE: &str = "frame-server-token";
@@ -78,6 +79,8 @@ pub trait FrameRender: Send + Sync {
     fn gpu_name(&self) -> Option<String> {
         None
     }
+    /// Get ready to render `comp` around `time` (compile what its frames need), before a stream.
+    fn warm(&self, _project: &Project, _comp: ItemId, _time: Tick) {}
 }
 
 /// Frames on the CPU.
@@ -245,7 +248,7 @@ impl Shared {
 }
 
 /// A connection's outgoing messages (its writer thread).
-type Out = Sender<(Down, Vec<u8>)>;
+pub(crate) type Out = Sender<(Down, Vec<u8>)>;
 
 /// The replica revision a connection holds (`u64::MAX`: none).
 const NO_REVISION: u64 = u64::MAX;
@@ -529,6 +532,12 @@ fn connection(stream: TcpStream, sched: &Arc<Sched>, shared: &Arc<Shared>) {
     }
     shared.log(&format!("connection {conn} from {peer} ({client})"));
     let (out, out_rx) = channel::<(Down, Vec<u8>)>();
+    let mut streams = Streams::new(
+        Arc::new(StreamHost { render: shared.render.clone(), cache: shared.cache.clone(), log: shared.log.clone(), render_threads: shared.threads }),
+        out.clone(),
+        conn,
+    );
+    streams.synced(replica.revision().zip(replica.project().cloned()));
     let writer_thread = std::thread::Builder::new()
         .name("ec-frames-write".into())
         .spawn(move || {
@@ -564,9 +573,17 @@ fn connection(stream: TcpStream, sched: &Arc<Sched>, shared: &Arc<Shared>) {
                     let _ = out.send((Down::Control { id, reply: json!({"ok": false, "error": "cannot start the request"}) }, vec![]));
                 }
             }
-            Up::Msg { msg, want, urgent } => message(conn, msg, want, urgent, &mut replica, &current, &out, sched, shared),
+            Up::Msg { msg: FrameMsg::Stream(m), .. } => streams.message(m),
+            Up::Msg { msg, want, urgent } => {
+                let synced = matches!(msg, FrameMsg::Project { .. } | FrameMsg::Patch(_));
+                message(conn, msg, want, urgent, &mut replica, &current, &out, sched, shared);
+                if synced {
+                    streams.synced(replica.revision().zip(replica.project().cloned()));
+                }
+            }
         }
     };
+    drop(streams);
     sched.close(conn);
     current.store(NO_REVISION, Ordering::Release);
     drop(out);

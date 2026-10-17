@@ -72,6 +72,10 @@ impl FrameRender for AssetGuard {
     fn gpu_name(&self) -> Option<String> {
         self.inner.gpu_name()
     }
+
+    fn warm(&self, project: &effectcraft_engine::project::Project, comp: effectcraft_engine::project::ItemId, time: effectcraft_engine::time::Tick) {
+        self.inner.warm(project, comp, time);
+    }
 }
 
 #[cfg(test)]

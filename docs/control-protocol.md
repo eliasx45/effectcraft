@@ -397,6 +397,47 @@ next to the JSON lines, so each message is one length-prefixed frame
 doubling to 5 s) and reports each connection, after which the app sends its project again. A lost
 connection is an event, never an error for the document.
 
+### Playback stream
+
+For playback the app asks for a comp to be *played* instead of one request per frame
+(`effectcraft_engine::remote_stream`, `plan/cloud-render.md` CR6). The server renders ahead of the
+app's playhead in play order and sends chunks of about half a second, each one closed H.264 GOP
+(SPS/PPS + IDR first, P frames only, Annex B; FilmCraft's pure-Rust `h264enc`), so any chunk
+decodes alone (`effectcraft_media::preview_stream::decode_chunk`). Frames are opaque: the comp's
+background colour is composited on the server.
+
+App → server, as `{"type":"msg","msg":{"type":"stream","op":…}}`:
+
+| op | fields | |
+|---|---|---|
+| `start` | `stream`, `revision`, `comp`, `from`, `to?`, `loopFrom?`, `looping`, `opts`, `codec` (`h264`), `crf` (23), `chunkFrames` (15), `aheadSecs` (4), `adaptive` (true), `maxSize?` | play from `from`; a running stream with the same id restarts |
+| `seek` | `stream`, `time` | the playhead jumped; a new chunk grid from there |
+| `playhead` | `stream`, `time`, `playing`, `received?` (newest chunk `seq` the app has) | a few times a second while playing: flow control and adaptive resolution |
+| `invalidate` | `stream`, `from` | frames from `from` changed (the server also works this out from each sync) |
+| `stop` | `stream` | |
+
+Server → app, as `{"type":"reply","reply":{"type":"stream","op":…}}`:
+
+| op | fields | payload |
+|---|---|---|
+| `started` | `stream`, `width`, `height` (full size), `frameRate`, `chunkFrames`, `codec` | |
+| `chunk` | `stream`, `seq`, `revision`, `index`, `first` (comp frame), `start`, `frames`, `frameRate`, `width`, `height`, `scale` (1, 0.5, 0.25 of full size), `codec`, `renderMs`, `encodeMs` | the H.264 chunk |
+| `stale` | `stream`, `revision`, `from` | chunks of older revisions from `from` on are out of date; new ones follow |
+| `end` | `stream`, `at` | every chunk up to the end of the range is sent |
+| `failed` | `stream`, `error` | the stream ended (for example a frame that can't render while footage is missing) |
+
+- Chunks sit on a grid of `chunkFrames` frames anchored at `from` (or the latest seek); frame `i`
+  of a chunk is at `frameRate.tick_of(first + i)`. A chunk can come again for the same frames at a
+  higher `scale` or a newer revision: the newest wins.
+- The server keeps `aheadSecs` plus its current chunk latency ahead of the playhead. The first
+  chunks (warm-up) go at quarter, then half size; while playing, a lead under 1 s lowers the
+  resolution one level and a lead over 2.5 s raises it (at most once per 1.2 s); chunks sent below
+  full size go again at full size when there is time.
+- Test it: `effectcraft-cli stream-test --frames 19880 F.ecproj --comp NAME --start S --duration 30
+  [--ahead 8] [--edit-at S]` plays through the tunnel and reports warm-up, each chunk against its
+  deadline, stalls and bitrate; `stream-bench F.ecproj --gpu --start S [--render-only]` measures
+  render and encode on the server.
+
 ## Render box
 
 `effectcraft-cli serve --gpu --follow APP_PORT --control PORT` is a render box: a windowless

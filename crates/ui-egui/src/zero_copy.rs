@@ -10,7 +10,9 @@
 //!
 //! Off with Settings ▸ Previews ▸ Show GPU Frames Without Copying (live: frames are read back
 //! again; the compositor moves to a device of its own at the next launch) or
-//! `EFFECTCRAFT_ZERO_COPY=0` (the desktop app then starts exactly as before RT10e). When a
+//! `EFFECTCRAFT_ZERO_COPY=0` (the desktop app then starts exactly as before RT10e). The desktop
+//! app also starts without it on an X server without DRI3 (Xvfb, a streamed cloud desktop),
+//! where presenting the window holds up the shared queue (`EFFECTCRAFT_ZERO_COPY=1` overrides). When a
 //! shared-device compositor retires (an uncaptured GPU error), the next one gets a device of its
 //! own and frames are read back as before; a lost device closes the window after an auto-save
 //! (`EffectcraftApp::close_after_device_loss`).

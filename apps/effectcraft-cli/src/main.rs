@@ -58,6 +58,7 @@ mod frame_serve;
 mod mirror;
 #[cfg(feature = "ui")]
 mod offscreen_ui;
+mod stream_cli;
 mod template;
 
 use effectcraft_automation::tools::{self, Reply};
@@ -170,6 +171,13 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
       [--jpeg-quality Q] [--n N] [--duration SECS]
                                            measure a frame server: round trips, scrub latency, a soak of
                                            random requests
+  stream-bench [F.ecproj | --demo] [--comp C] [--start SECS] [--n FRAMES] [--gpu] [--scale S] [--render-only]
+                                           render consecutive frames of a comp and time the playback
+                                           stream's H.264 chunk encoding (sizes, threads, bitrate)
+  stream-test --frames HOST:PORT [--token T] [F.ecproj | --demo] [--comp C] [--start SECS] [--duration SECS]
+      [--edit-at SECS] [--ahead SECS] [--scale S] [--max-side PX] [--fixed]
+                                           play a comp from a frame server's playback stream: warm-up, each
+                                           chunk against its deadline, bitrate, stalls; --edit-at changes a layer
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
@@ -217,6 +225,8 @@ const VALUED: &[&str] = &[
     "--frames",
     "--token",
     "--duration",
+    "--edit-at",
+    "--ahead",
     // compare
     "--threshold",
     "--min-psnr",
@@ -273,6 +283,8 @@ const FLAGS: &[&str] = &[
     "--demo",
     "--empty",
     "--gpu",
+    "--fixed",
+    "--render-only",
     "--list",
     "--schemas",
     "--enabled",
@@ -1004,6 +1016,8 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             }
         }
         "frames-bench" => frame_serve::bench(args)?,
+        "stream-bench" => stream_cli::bench(args)?,
+        "stream-test" => stream_cli::test(args)?,
         "mirror" => mirror::run(args, json_out)?,
         "drive-pull" => drive::run(args)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),

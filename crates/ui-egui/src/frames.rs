@@ -808,7 +808,7 @@ fn gpu_working_budget(g: &Gpu) -> u64 {
 /// Frozen previews, a retired device, a failed landing's retry and the frames Auto puts on the
 /// CPU (measured faster there, or its periodic re-measurement) composite on the CPU and get the
 /// CPU's cap (A3). Auto's choice counts frames, so it is taken here and only here.
-fn gpu_pick(job: &Job, retired: bool) -> bool {
+fn gpu_pick(job: &Job, retired: bool, playhead: Option<&Playhead>) -> bool {
     use effectcraft_engine::render::{Accelerator, AutoKey, Backend};
     let Some(g) = job.src.gpu.as_ref() else { return false };
     if retired || job.retry.is_some() {
@@ -824,11 +824,25 @@ fn gpu_pick(job: &Job, retired: bool) -> bool {
             if cfg!(target_arch = "wasm32") || job.opts.roi.is_some() {
                 return true;
             }
-            g.auto_pick().is_none_or(|p| p.choose(AutoKey::new(job.comp, job.opts.scale, true)))
+            let Some(p) = g.auto_pick() else { return true };
+            let key = AutoKey::new(job.comp, job.opts.scale, true);
+            // A frame a playing preview reaches goes to the CPU only when that keeps up with it
+            // (`AutoPick::choose_within`).
+            match playhead.filter(|ph| ph.ahead(&job.key).is_some()).and_then(|_| frame_ms(job)) {
+                Some(budget) => p.choose_within(key, budget),
+                None => p.choose(key),
+            }
         }
         // The full-float path (`Renderer::comp_frame`) takes Auto's choice itself: estimated.
         _ => composites_on_gpu(job, g),
     }
+}
+
+/// A frame's duration in `job`'s comp (ms).
+fn frame_ms(job: &Job) -> Option<f64> {
+    let fr = job.src.project.comp(job.comp)?.frame_rate;
+    let ms = 1000.0 * fr.den as f64 / fr.num as f64;
+    (ms.is_finite() && ms > 0.0).then_some(ms)
 }
 
 /// `job` will composite on the GPU, as far as can be told without taking Auto's choice: the
@@ -1884,9 +1898,10 @@ impl Worker {
             let Ok(mut q) = queue.lock() else { return false };
             let Some(i) = q.best() else { return false };
             let retired = self.gpu_retired.load(Ordering::Acquire);
+            let playhead = q.playhead;
             let Some(j) = q.jobs.get_mut(i) else { return false };
             if j.on_gpu.is_none() || (retired && j.on_gpu == Some(true)) {
-                j.on_gpu = Some(gpu_pick(j, retired));
+                j.on_gpu = Some(gpu_pick(j, retired, playhead.as_ref()));
             }
             let j = &q.jobs[i];
             // Keep one viewer slot beyond the prefetch budget, but never nest another viewer
@@ -3060,7 +3075,7 @@ mod tests {
             cancel: Arc::default(),
             print: None,
         };
-        let cap = |j: &Job, retired: bool| max_running(&Job { on_gpu: Some(gpu_pick(j, retired)), ..j.clone() }, 8);
+        let cap = |j: &Job, retired: bool| max_running(&Job { on_gpu: Some(gpu_pick(j, retired, None)), ..j.clone() }, 8);
         let gpu_cap = cap(&job(Backend::Gpu), false);
         assert!(gpu_cap > 2, "GPU frames run beyond the RAM cap ({gpu_cap})");
         assert_eq!(cap(&job(Backend::Gpu), true), 2, "a retired GPU: the CPU renders, at the CPU's cap");
@@ -3073,10 +3088,13 @@ mod tests {
         Arc::make_mut(&mut auto.src.project).settings.gpu_acceleration = true;
         let picks = gpu.auto_pick().unwrap();
         let k = AutoKey::new(uhd, 1.0, true);
-        assert!(gpu_pick(&auto, false), "Auto starts on the GPU");
+        assert!(gpu_pick(&auto, false, None), "Auto starts on the GPU");
         picks.record(k, true, 10.0);
-        assert!(!gpu_pick(&auto, false), "then measures the CPU");
+        assert!(!gpu_pick(&auto, false, None), "then measures the CPU");
         assert_eq!(cap(&auto, false), 2, "and that frame gets the CPU's cap");
+        // Not a frame a playing preview needs: the CPU is unmeasured, so it can't keep up.
+        let playing = Playhead { series: auto.key, cur: 0, start: 0, end: 100, step: 1, looping: false };
+        assert!(gpu_pick(&auto, false, Some(&playing)), "a playing preview's frame stays on the GPU");
     }
 
     /// CR1: a GPU frame that runs out of video memory with eight GPU frames rendering leaves at

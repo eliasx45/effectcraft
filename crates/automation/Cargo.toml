@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 effectcraft-engine = { workspace = true }
+effectcraft-media = { workspace = true }
+rayon = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 image = { workspace = true }

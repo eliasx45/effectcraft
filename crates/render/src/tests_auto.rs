@@ -204,3 +204,48 @@ fn auto_pick_skips_cpu_warm_up_at_another_resolution_of_a_gpu_comp() {
     let other = AutoKey::new(ItemId(6), 0.5, true);
     assert_eq!(cpu_frames(&pick, other, 6, 0.5, 5.0), AutoPick::WARMUP as usize);
 }
+
+#[test]
+fn playback_keeps_frames_the_cpu_cannot_render_in_time_on_the_gpu() {
+    // A long comp: a light section the CPU renders in 5 ms, then a heavy one where a CPU frame
+    // takes 1.5 s and a GPU frame 25 ms. Scrubbing the light section taught Auto the CPU.
+    let pick = AutoPick::default();
+    let key = AutoKey::new(ItemId(8), 1.0, true);
+    let budget = 1000.0 / 29.97;
+    assert!(cpu_frames(&pick, key, 40, 12.0, 5.0) > 30);
+    // Played, the light section stays on the CPU (it fits a frame's time), but for the usual
+    // re-probe of the GPU.
+    let played = (0..20).filter(|_| !pick.choose_within(key, budget)).count();
+    assert!(played >= 19, "{played} of 20 frames on the CPU");
+    // The heavy section: its first CPU frame counts in full, the next ones go to the GPU.
+    let mut cpu = 0;
+    for _ in 0..60 {
+        let g = pick.choose_within(key, budget);
+        pick.record(key, g, if g { 25.0 } else { 1500.0 });
+        cpu += usize::from(!g);
+    }
+    assert_eq!(cpu, 1, "heavy frames on the CPU");
+    assert_eq!(pick.stats(key).unwrap().cpu_ms, Some(1500.0));
+    // No CPU warm-up or re-probe during playback, however long it plays.
+    let fresh = AutoKey::new(ItemId(9), 1.0, true);
+    let probes = (0..10 * AutoPick::MAX_REPROBE).filter(|_| {
+        let g = pick.choose_within(fresh, budget);
+        pick.record(fresh, g, 25.0);
+        !g
+    });
+    assert_eq!(probes.count(), 0);
+    // A GPU that declines the comp still leaves it to the CPU.
+    pick.declined(fresh);
+    assert!(!pick.choose_within(fresh, budget));
+}
+
+#[test]
+fn a_gpu_stall_does_not_move_frames_to_the_cpu() {
+    let pick = AutoPick::default();
+    let key = AutoKey::new(ItemId(10), 1.0, true);
+    assert_eq!(cpu_frames(&pick, key, 20, 10.0, 30.0), AutoPick::WARMUP as usize);
+    // One GPU frame waits 2 s on a busy machine: it counts at most twice the average.
+    pick.record(key, true, 2000.0);
+    assert!(pick.stats(key).unwrap().gpu_ms.is_some_and(|g| g < 15.0));
+    assert!(pick.choose(key));
+}

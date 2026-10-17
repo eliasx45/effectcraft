@@ -26,6 +26,7 @@ mod layered;
 mod open;
 pub use layered::vector_doc;
 mod pool;
+pub mod preview_stream;
 mod probe;
 mod stream;
 mod webp_anim;

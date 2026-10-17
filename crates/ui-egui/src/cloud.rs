@@ -621,7 +621,8 @@ impl Link {
                     log::info!("cloud preview: resync ({error})");
                     self.resync();
                 }
-                FrameReply::Stored { .. } | FrameReply::Info { .. } => {}
+                // Playback stream replies: the Mac half (CR6b) decodes them.
+                FrameReply::Stored { .. } | FrameReply::Info { .. } | FrameReply::Stream(_) => {}
             },
             Down::Control { id, reply } => {
                 if self.preflight == Preflight::Asking(Some(id)) {

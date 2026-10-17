@@ -17,6 +17,15 @@
 //! [`AutoPick::MAX_REPROBE`] frames apart), and a new key (the same comp at another resolution,
 //! when adaptive resolution steps) whose comp already measured the GPU clearly faster starts on
 //! the GPU without CPU warm-up frames, re-measuring the CPU at the first re-probe.
+//!
+//! A playing preview asks with a budget ([`AutoPick::choose_within`], a frame's duration): it
+//! shows frames in order, so one slow CPU frame holds up all the frames after it. Its frames go
+//! to the CPU only when the CPU measured within the budget; otherwise to the GPU, with no CPU
+//! warm-up or re-probe during playback. One comp's sections can differ a lot (a long edit with
+//! a light title section and a heavy one), so a CPU frame slower than the average counts in
+//! full: the next frames go to the GPU (the side that keeps up) instead of a run of heavy CPU
+//! frames. Slow GPU frames still count at most twice the average, so a stall of the machine
+//! does not send heavy frames to the CPU.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -130,12 +139,26 @@ impl AutoPick {
         gpu_faster
     }
 
+    /// Render a frame for `key` that a playing preview needs within `budget_ms` on the GPU?
+    /// The CPU only when it measured within the budget (then as [`Self::choose`]); else the GPU,
+    /// unless it declined `key`. Takes no CPU warm-up or re-probe frames otherwise.
+    pub fn choose_within(&self, key: AutoKey, budget_ms: f64) -> bool {
+        let fits = {
+            let Ok(m) = self.stats.lock() else { return true };
+            match m.get(&key) {
+                Some(s) => s.declined || s.cpu_ms.is_some_and(|c| c <= budget_ms),
+                None => false,
+            }
+        };
+        if fits { self.choose(key) } else { true }
+    }
+
     /// A frame for `key` took `ms` on the GPU (`gpu`) or the CPU.
     ///
     /// The warm-up keeps the fastest of its counted frames; after that the average follows
-    /// improvements quickly and slow-downs gradually, and a single frame counts at most twice
-    /// the average (a stall of the machine does not flip the choice for a whole re-probe
-    /// period).
+    /// improvements quickly and slow-downs gradually. A single GPU frame counts at most twice
+    /// the average (a stall of the machine does not move heavy frames to the CPU for a whole
+    /// re-probe period); a slow CPU frame counts in full (see the module docs).
     pub fn record(&self, key: AutoKey, gpu: bool, ms: f64) {
         let Ok(mut m) = self.stats.lock() else { return };
         let s = m.entry(key).or_default();
@@ -152,6 +175,7 @@ impl AutoPick {
             None => ms,
             Some(a) if *frames <= Self::WARMUP => a.min(ms),
             Some(a) if ms < a => a + (ms - a) * Self::ALPHA_DOWN,
+            Some(a) if !gpu && ms > 2.0 * a => ms,
             Some(a) => a + (ms.min(2.0 * a) - a) * Self::ALPHA,
         });
         // A CPU re-probe: back off while the GPU stays clearly faster, else the usual cadence.

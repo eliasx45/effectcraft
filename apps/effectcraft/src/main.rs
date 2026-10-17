@@ -66,6 +66,28 @@ fn wayland_drop_notice(wayland_display: Option<&std::ffi::OsStr>, backend: Optio
         .then_some("Native Wayland file drops are unavailable. Use File ▸ Import ▸ File… or run via XWayland (see README, Linux).")
 }
 
+/// Whether the window will be on an X server (winit prefers Wayland when both are there).
+#[cfg(target_os = "linux")]
+fn on_x11(display: Option<&std::ffi::OsStr>, wayland_display: Option<&std::ffi::OsStr>, backend: Option<&std::ffi::OsStr>) -> bool {
+    let set = |v: Option<&std::ffi::OsStr>| v.is_some_and(|v| !v.is_empty());
+    set(display) && (!set(wayland_display) || backend == Some(std::ffi::OsStr::new("x11")))
+}
+
+/// An X server without DRI3 (Xvfb, a cloud desktop streamed by Selkies or VNC): the Vulkan
+/// driver presents there by copying the window through the X server (`PutImage`), which holds
+/// up a queue the compositor shares. Uncached playback on an RTX 3090 behind Selkies ran at
+/// 14–17 fps with zero-copy display and 30 fps without, so it starts off there.
+#[cfg(target_os = "linux")]
+fn x_server_without_dri3() -> bool {
+    use x11rb::connection::RequestConnection;
+    let env = |k: &str| std::env::var_os(k);
+    if !on_x11(env("DISPLAY").as_deref(), env("WAYLAND_DISPLAY").as_deref(), env("WINIT_UNIX_BACKEND").as_deref()) {
+        return false;
+    }
+    let Ok((conn, _)) = x11rb::connect(None) else { return false };
+    matches!(conn.extension_information("DRI3"), Ok(None))
+}
+
 /// The command line.
 #[derive(Debug, Default, PartialEq)]
 struct Args {
@@ -172,7 +194,18 @@ fn main() -> eframe::Result {
     let notice = launch.notice.take();
     // RT10e: the GPU compositor shares the window's device (viewer frames without a copy), with
     // the window's events gated (`surface_gate`). `EFFECTCRAFT_ZERO_COPY=0`: as before.
-    let gate = (effectcraft_ui_egui::zero_copy::env_choice() != Some(false) && !on_gl).then(surface_gate::Gate::new);
+    // Off by default on an X server without DRI3 (see `x_server_without_dri3`).
+    #[cfg(target_os = "linux")]
+    let software_x = effectcraft_ui_egui::zero_copy::env_choice().is_none() && x_server_without_dri3();
+    #[cfg(not(target_os = "linux"))]
+    let software_x = false;
+    if software_x {
+        log::info!(
+            "zero-copy display off: the X server has no DRI3, so the window presents through it ({}=1 turns it on)",
+            effectcraft_ui_egui::zero_copy::ENV
+        );
+    }
+    let gate = (effectcraft_ui_egui::zero_copy::env_choice() != Some(false) && !software_x && !on_gl).then(surface_gate::Gate::new);
     let app_gate = gate.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -640,6 +673,19 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn the_window_is_on_x11_unless_winit_picks_wayland() {
+        use std::ffi::OsStr;
+        let s = |v: &'static str| Some(OsStr::new(v));
+        assert!(super::on_x11(s(":20"), None, None));
+        assert!(super::on_x11(s(":20"), s(""), None));
+        assert!(!super::on_x11(s(":20"), s("wayland-0"), None));
+        assert!(super::on_x11(s(":20"), s("wayland-0"), s("x11")));
+        assert!(!super::on_x11(None, None, s("x11")));
+        assert!(!super::on_x11(s(""), None, None));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn wayland_drop_notice_recommends_import_or_xwayland() {
         use std::ffi::OsStr;
         let warning = super::wayland_drop_notice(Some(OsStr::new("wayland-0")), None).unwrap();

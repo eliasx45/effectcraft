@@ -202,6 +202,8 @@ pub enum FrameMsg {
     Segs { segs: Vec<SegData> },
     /// Drop cached layer buffers (Edit ▸ Purge).
     Purge,
+    /// The playback stream (`crate::remote_stream`): handled by the transport, not here.
+    Stream(crate::remote_stream::StreamMsg),
 }
 
 /// Frame worker → page. A [`FrameReply::Frame`]'s pixels travel next to the message (a
@@ -250,6 +252,8 @@ pub enum FrameReply {
     Failed { id: u64, error: String, stale: bool },
     /// A sync could not be applied: the page must send the whole project again.
     Resync { error: String },
+    /// The playback stream (`crate::remote_stream`); a chunk's frames are the payload.
+    Stream(crate::remote_stream::StreamReply),
 }
 
 /// The page's record of a worker's replica: the snapshot it holds (its comps and layers are
@@ -442,6 +446,8 @@ impl FrameServer {
                     Err(e) => self.lost(e),
                 }
             }
+            // A transport that streams handles these itself.
+            FrameMsg::Stream(_) => vec![],
             FrameMsg::Segs { segs } => {
                 for s in &segs {
                     s.store();

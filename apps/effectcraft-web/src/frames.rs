@@ -241,6 +241,8 @@ fn on_message(index: u32, json: JsValue, bytes: JsValue, error: JsValue) {
                 }
                 None
             }
+            // Browser frame workers don't stream.
+            FrameReply::Stream(_) => None,
             FrameReply::Info { gpu, error } => {
                 match (&gpu, &error) {
                     (Some(g), _) => log::info!("frame worker {index}: GPU {g}"),

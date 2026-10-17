@@ -35,6 +35,9 @@ log = { workspace = true }
 # Settings ▸ Appearance ▸ Sync with System: the XDG desktop portal's colour scheme. Already in
 # Cargo.lock (accesskit, through eframe), so it adds no new crates.
 zbus = "5.19"
+# Whether the X server has DRI3 (zero-copy display is off without it, see `main.rs`). Already in
+# Cargo.lock (winit's X11 backend); core protocol only, no extension features.
+x11rb = { version = "0.13", default-features = false }
 
 [build-dependencies]
 # Icon + VERSIONINFO for effectcraft.exe; build.rs only uses it when targeting Windows.

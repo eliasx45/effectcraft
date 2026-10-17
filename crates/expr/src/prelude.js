@@ -834,7 +834,8 @@ Prop.prototype = {
   __docAt: function (t) {
     var d = __h(__DOC, this.__c, this.__l, this.__p, t, this.__self);
     if (d === null) __err('Property "' + this.name + '" is not a Source Text property');
-    return JSON.parse(d);
+    var o = __jparse(d);
+    return o === undefined ? JSON.parse(d) : o;
   },
   get style() { return this.getStyleAt(0); },
   getStyleAt: function (i, t) {

@@ -15,6 +15,12 @@
 //! * Size limit with least-recently-used eviction. The in-memory index is rebuilt from the
 //!   folder when the cache opens (file modification times order it), so the cache survives
 //!   restarts; reads refresh a file's time.
+//! * Never fills the disk: the cache keeps a reserve free on its volume (the larger of 5 GB and
+//!   10% of the volume, at most 20 GB, [`reserve_bytes`]). Its effective limit is the smaller of the size
+//!   setting and what the volume can spare ([`effective_cap`], recomputed on every write and
+//!   eviction); below it, the oldest entries are evicted and writes that cannot fit are dropped,
+//!   so project saves and auto-saves keep their room even with a size setting copied from a
+//!   bigger machine.
 //! * Safe concurrent access: writes go to a unique temporary file that is renamed into place
 //!   (atomic on every desktop OS), so readers in this or another process never see a partial
 //!   entry; a missing or damaged file is just a miss. Writes run on a background thread with a
@@ -76,12 +82,62 @@ pub struct Frame8 {
     pub rgba: Vec<u8>,
 }
 
+/// The smallest reserve of free space the cache leaves on its volume.
+pub const RESERVE_MIN_BYTES: u64 = 5 << 30;
+/// The largest: 10% of a multi-terabyte disk would leave a nearly full one no cache at all.
+pub const RESERVE_MAX_BYTES: u64 = 20 << 30;
+
+/// Bytes the cache keeps free on a volume of `total` bytes: 10% of the volume, between
+/// [`RESERVE_MIN_BYTES`] and [`RESERVE_MAX_BYTES`].
+pub fn reserve_bytes(total: u64) -> u64 {
+    (total / 10).clamp(RESERVE_MIN_BYTES, RESERVE_MAX_BYTES)
+}
+
+/// The cache's limit given the size setting, the bytes it holds (`used`, which eviction frees)
+/// and its volume's free and total bytes: it may grow until only the reserve is left free.
+/// Saturating: a volume already below its reserve gives 0 (evict everything), never an
+/// underflow.
+pub fn effective_cap(max_bytes: u64, used: u64, free: u64, total: u64) -> u64 {
+    max_bytes.min(used.saturating_add(free).saturating_sub(reserve_bytes(total)))
+}
+
+/// Free and total bytes of the volume holding a folder.
+pub trait VolumeSpace: Send + Sync {
+    /// `(free, total)`, or `None` when unknown (then the cache only follows its size setting).
+    fn space(&self, folder: &Path) -> Option<(u64, u64)>;
+}
+
+/// The operating system's answer (none in the browser).
+struct SystemVolume;
+
+impl VolumeSpace for SystemVolume {
+    fn space(&self, folder: &Path) -> Option<(u64, u64)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let st = fs4::statvfs(folder).ok()?;
+            // A file system that reports no size (some network and virtual ones) is unknown.
+            (st.total_space() > 0).then(|| (st.available_space(), st.total_space()))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = folder;
+            None
+        }
+    }
+}
+
 /// Counters for tests, the Info panel and `cache.diskStats`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiskStats {
     pub entries: usize,
     pub bytes: u64,
     pub max_bytes: u64,
+    /// The limit in force: `max_bytes` capped by what the volume can spare ([`effective_cap`]).
+    pub effective_max_bytes: u64,
+    /// Free bytes on the cache's volume (0 when unknown).
+    pub free_bytes: u64,
+    /// Bytes the cache keeps free on its volume (0 when unknown).
+    pub reserve_bytes: u64,
     pub hits: u64,
     pub misses: u64,
     pub writes: u64,
@@ -266,6 +322,7 @@ pub struct DiskCache {
     dir: PathBuf,
     index: Mutex<DiskIndex>,
     max_bytes: AtomicU64,
+    volume: Arc<dyn VolumeSpace>,
     hits: AtomicU64,
     misses: AtomicU64,
     writes: AtomicU64,
@@ -372,6 +429,11 @@ pub fn default_folder() -> PathBuf {
 impl DiskCache {
     /// Open (or create) the cache in `folder`, holding at most `max_bytes`.
     pub fn open(folder: impl AsRef<Path>, max_bytes: u64) -> std::io::Result<Arc<DiskCache>> {
+        Self::open_with_volume(folder, max_bytes, Arc::new(SystemVolume))
+    }
+
+    /// [`Self::open`] with another source of the volume's free space (tests).
+    pub fn open_with_volume(folder: impl AsRef<Path>, max_bytes: u64, volume: Arc<dyn VolumeSpace>) -> std::io::Result<Arc<DiskCache>> {
         let dir = folder.as_ref().join(VERSION);
         std::fs::create_dir_all(&dir)?;
         let dc = Arc::new(DiskCache {
@@ -382,6 +444,7 @@ impl DiskCache {
             before_publish: Mutex::new(None),
             index: Mutex::new(DiskIndex::default()),
             max_bytes: AtomicU64::new(max_bytes),
+            volume,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             writes: AtomicU64::new(0),
@@ -504,10 +567,14 @@ impl DiskCache {
 
     pub fn stats(&self) -> DiskStats {
         let (entries, bytes) = self.index.lock().map(|g| (g.len(), g.total())).unwrap_or_default();
+        let (free_bytes, reserve) = self.volume.space(self.folder()).map(|(f, t)| (f, reserve_bytes(t))).unwrap_or_default();
         DiskStats {
             entries,
             bytes,
             max_bytes: self.max_bytes(),
+            effective_max_bytes: self.limit(),
+            free_bytes,
+            reserve_bytes: reserve,
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             writes: self.writes.load(Ordering::Relaxed),
@@ -643,6 +710,15 @@ impl DiskCache {
             return;
         }
         let data = seal(kind, payload);
+        // Never fill the disk: make room under the volume's limit, or drop the write.
+        let need = data.len() as u64;
+        let limit = self.limit();
+        if need > limit {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.evict_to(limit);
+            return;
+        }
+        self.evict_to(limit - need);
         let n = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
         let tmp = parent.join(format!("{key:032x}.tmp.{}.{n}", std::process::id()));
         if std::fs::write(&tmp, &data).is_err() {
@@ -685,7 +761,20 @@ impl DiskCache {
 
     /// Remove least recently used entries until the cache fits its limit.
     fn evict(&self) {
+        self.evict_to(self.limit());
+    }
+
+    /// The limit in force now: the size setting, capped so the volume keeps its reserve free
+    /// (see [`effective_cap`]). Asks the volume each time (a cheap call) so other writers (a
+    /// project save, another program) are noticed.
+    fn limit(&self) -> u64 {
         let max = self.max_bytes();
+        let Some((free, total)) = self.volume.space(self.folder()) else { return max };
+        let used = self.index.lock().map(|g| g.total()).unwrap_or_default();
+        effective_cap(max, used, free, total)
+    }
+
+    fn evict_to(&self, max: u64) {
         let victims = match self.index.lock() {
             Ok(mut g) => g.evict(max),
             Err(_) => return,
@@ -1709,5 +1798,157 @@ mod tests {
         for k in 0..5u128 {
             assert_eq!(b.get_layer(k).unwrap().img, buf(k as u32, 16, 16).img);
         }
+    }
+
+    // ------------------------------------------------------------ free-space guard
+
+    #[test]
+    fn reserve_and_effective_cap_math() {
+        const GB: u64 = 1 << 30;
+        // The reserve is 10% of the volume, between 5 GB and 20 GB.
+        assert_eq!(reserve_bytes(0), 5 * GB);
+        assert_eq!(reserve_bytes(60 * GB), 6 * GB);
+        assert_eq!(reserve_bytes(40 * GB), 5 * GB);
+        assert_eq!(reserve_bytes(120 * GB), 12 * GB);
+        assert_eq!(reserve_bytes(1000 * GB), 20 * GB);
+        assert_eq!(reserve_bytes(u64::MAX), 20 * GB);
+        // Plenty of room: the size setting rules.
+        assert_eq!(effective_cap(100 * GB, 0, 500 * GB, 1000 * GB), 100 * GB);
+        // 1,200 GB setting on a 60 GB machine with 50 GB free and 4 GB cached: 48 GB (reserve 6).
+        assert_eq!(effective_cap(1200 * GB, 4 * GB, 50 * GB, 60 * GB), 48 * GB);
+        // Under the reserve already: nothing may stay, and nothing underflows.
+        assert_eq!(effective_cap(1200 * GB, 0, 2 * GB, 60 * GB), 0);
+        assert_eq!(effective_cap(1200 * GB, GB, 2 * GB, 60 * GB), 0);
+        assert_eq!(effective_cap(1200 * GB, 0, 0, 0), 0);
+        // Exactly at the reserve.
+        assert_eq!(effective_cap(1200 * GB, 3 * GB, 3 * GB, 60 * GB), 0);
+        assert_eq!(effective_cap(1200 * GB, 3 * GB, 4 * GB, 60 * GB), GB);
+        // Huge inputs saturate instead of overflowing.
+        assert_eq!(effective_cap(u64::MAX, u64::MAX, u64::MAX, u64::MAX), u64::MAX - 20 * GB);
+        assert_eq!(effective_cap(10, u64::MAX, 5, 100 * GB), 10);
+        assert_eq!(effective_cap(0, 5, 5, 0), 0);
+    }
+
+    /// A disk whose free space is its reserve plus `spare` minus what the cache folder holds.
+    struct FakeDisk {
+        dir: PathBuf,
+        total: u64,
+        spare: AtomicU64,
+    }
+
+    impl FakeDisk {
+        fn new(dir: &Path, spare: u64) -> Arc<FakeDisk> {
+            Arc::new(FakeDisk { dir: dir.to_path_buf(), total: 100 << 30, spare: AtomicU64::new(spare) })
+        }
+        fn held(d: &Path) -> u64 {
+            let mut n = 0;
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        n += Self::held(&p);
+                    } else {
+                        n += e.metadata().map(|m| m.len()).unwrap_or(0);
+                    }
+                }
+            }
+            n
+        }
+    }
+
+    impl VolumeSpace for FakeDisk {
+        fn space(&self, _: &Path) -> Option<(u64, u64)> {
+            let free = (reserve_bytes(self.total) + self.spare.load(Ordering::Relaxed)).saturating_sub(Self::held(&self.dir));
+            Some((free, self.total))
+        }
+    }
+
+    /// A disk that is nearly full stops the cache writing and makes it evict the oldest
+    /// entries; the size setting alone (here far larger than the disk) never fills it.
+    #[test]
+    fn low_free_space_stops_writes_and_evicts_oldest() {
+        let dir = tmpdir("freeguard");
+        let disk = FakeDisk::new(&dir, u64::MAX / 2);
+        let dc = DiskCache::open_with_volume(&dir, 1200 << 30, disk.clone()).unwrap();
+        dc.put_layer_now(0, &buf(0, 64, 64));
+        let per = dc.stats().bytes;
+        assert!(per > 0);
+        // Room for three and a half entries beyond the reserve.
+        let spare = per * 3 + per / 2;
+        disk.spare.store(spare, Ordering::Relaxed);
+        for k in 1..8u128 {
+            dc.put_layer_now(k, &buf(k as u32, 64, 64));
+            assert!(FakeDisk::held(&dir) <= spare, "the cache never eats into the reserve");
+        }
+        let st = dc.stats();
+        assert_eq!(st.entries, 3, "{st:?}");
+        assert_eq!((st.effective_max_bytes, st.max_bytes), (st.bytes + st.free_bytes - st.reserve_bytes, 1200 << 30));
+        assert!(st.effective_max_bytes <= spare && st.reserve_bytes == 10 << 30);
+        assert!(st.evictions >= 5);
+        // The newest survive, the oldest went.
+        assert!(dc.contains(Kind::Layer, 7) && dc.contains(Kind::Layer, 6) && dc.contains(Kind::Layer, 5));
+        assert!(!dc.contains(Kind::Layer, 0) && !dc.contains(Kind::Layer, 1));
+
+        // Something else (a project save, a download) takes the space: the next write notices,
+        // evicts until the reserve is back, and is itself dropped when nothing is left to spare.
+        disk.spare.store(0, Ordering::Relaxed);
+        let (writes, dropped) = (st.writes, st.dropped);
+        dc.put_layer_now(100, &buf(9, 64, 64));
+        let st = dc.stats();
+        assert_eq!((st.entries, st.bytes), (0, 0), "{st:?}");
+        assert_eq!(st.effective_max_bytes, 0);
+        assert_eq!((st.writes, st.dropped), (writes, dropped + 1), "the write was dropped");
+        assert!(!dc.contains(Kind::Layer, 100));
+        assert_eq!(walk(&dir), 0, "files are really gone");
+
+        // Room again: writes resume.
+        disk.spare.store(spare, Ordering::Relaxed);
+        dc.put_layer_now(101, &buf(1, 64, 64));
+        assert!(dc.contains(Kind::Layer, 101));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opening with a size setting from a bigger machine evicts down to what the disk can
+    /// spare, and the queued (background) write path obeys the same limit.
+    #[test]
+    fn open_on_a_small_disk_evicts_and_queued_writes_obey() {
+        let dir = tmpdir("freeguard-open");
+        let roomy = FakeDisk::new(&dir, u64::MAX / 2);
+        let dc = DiskCache::open_with_volume(&dir, 1200 << 30, roomy).unwrap();
+        for k in 0..6u128 {
+            dc.put_layer_now(k, &buf(k as u32, 64, 64));
+        }
+        let per = dc.stats().bytes / 6;
+        drop(dc);
+        let spare = per * 2 + per / 2;
+        let tight = FakeDisk::new(&dir, spare);
+        let dc = DiskCache::open_with_volume(&dir, 1200 << 30, tight.clone()).unwrap();
+        assert_eq!(dc.stats().entries, 2);
+        assert!(FakeDisk::held(&dir) <= spare);
+        // The newest two (by file time) stay when the times differ; at least the limit holds.
+        for k in 10..16u128 {
+            dc.put_layer(k, &buf(k as u32, 64, 64));
+            dc.flush();
+            assert!(FakeDisk::held(&dir) <= spare);
+        }
+        assert_eq!(dc.stats().entries, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A volume that cannot say how much is free leaves the size setting in charge.
+    #[test]
+    fn unknown_free_space_follows_the_size_setting() {
+        struct Unknown;
+        impl VolumeSpace for Unknown {
+            fn space(&self, _: &Path) -> Option<(u64, u64)> {
+                None
+            }
+        }
+        let dir = tmpdir("freeguard-unknown");
+        let dc = DiskCache::open_with_volume(&dir, 7 << 20, Arc::new(Unknown)).unwrap();
+        dc.put_layer_now(1, &buf(1, 16, 16));
+        let st = dc.stats();
+        assert_eq!((st.entries, st.effective_max_bytes, st.free_bytes, st.reserve_bytes), (1, 7 << 20, 0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

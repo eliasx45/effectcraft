@@ -13,6 +13,7 @@ workspace = true
 effectcraft-time = { workspace = true }
 effectcraft-geom = { workspace = true }
 effectcraft-keyframe = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 effectcraft-project = { workspace = true }
 effectcraft-path = { workspace = true }
