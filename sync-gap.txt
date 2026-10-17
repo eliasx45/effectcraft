@@ -1,4 +1,4 @@
-90
+146
 # history (date pending-commits note), newest last; line 1 is what sync-gap.sh --fail-if-growing reads
 2026-10-12 347 first record (after counting open-PR branches as shared)
 2026-10-13 383 grew +36 (day's landings; 8 pending commits sit on upstream/* branches as cherry-picks without -x, so they count twice; 7 are tonight's Fix: commits on main)
@@ -8,3 +8,4 @@
 2026-10-16n 109 fell -30 (sync-gap counts 109 un-queued of 130 shareable; full CI green; storytold PR API unavailable so queue branches not repaired tonight)
 2026-10-16d 102 fell -7 (midday run: upstream merged, 176 commits; 119 shareable, 17 queued; storytold PR API unavailable so PR states unchecked and queue branches not repaired)
 2026-10-17n 90 fell -12 (night run: full CI; 11 queued of 101 shareable; queue branches 173-938 behind upstream, merges clean for 3 tried but upstream/main itself fails clippy on script tests so not repaired; storytold PR API unavailable)
+2026-10-17d 146 grew +56 (midday run: day landings; CI fixes pushed to main: frame_shown test, Motion Library i18n, viewer/GPU dialog tests; 11 queue branches not repaired because upstream/main fails clippy on crates/script tests; storytold PR API unavailable)
