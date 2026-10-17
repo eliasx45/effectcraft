@@ -13,7 +13,8 @@
 //! walk will look up: the layer's content (source → masks → effects) on the CPU into the layer
 //! cache, admitted straight away ([`effectcraft_render::cache::set_warming_thread`]). A layer
 //! with effects only has its source read (decoded, rasterised), because its effects run on the
-//! GPU in the frame. Footage still being read by a layer on screen is left alone (its decoder is
+//! GPU in the frame. A layer without a cache key (its pixels change every frame) is skipped:
+//! nothing would be kept. Footage still being read by a layer on screen is left alone (its decoder is
 //! busy with the frames being shown). The footage and layer caches keep what it makes, within
 //! their usual budgets; nothing is uploaded to the GPU, so the VRAM gate ([`super::vram`], CR1)
 //! is untouched.
@@ -355,8 +356,11 @@ fn warm(r: &Renderer, layers: &[&Active]) -> usize {
     for a in layers {
         let Some(ctx) = r.eval_ctx(a.comp, a.t) else { continue };
         let Some(layer) = ctx.comp.layer(a.layer) else { continue };
-        // A frame got there first: it renders the layer, no use doing it twice.
-        if r.resident_content(&ctx, layer).is_some_and(|(k, _)| r.cache.is_some_and(|c| c.in_flight(k))) {
+        // A layer without a cache key renders again on every frame (the phone mock-ups of
+        // "10-10 Edit": 0.7–2.8 s of source each frame): warming it keeps nothing and takes CPU
+        // from the frames. And one a frame is rendering already needn't be rendered twice.
+        let Some((key, _)) = r.resident_content(&ctx, layer) else { continue };
+        if r.cache.is_none_or(|c| c.in_flight(key)) {
             continue;
         }
         if layer.effects().is_some_and(|fx| fx.groups().any(|e| e.enabled)) {
