@@ -640,7 +640,7 @@ impl LayerCache {
                 // (A buffer of one frame is seen again later when every frame rendering then
                 // has finished.)
                 let again = if once { seen.is_some_and(|f| g.active.keys().next().is_none_or(|oldest| *oldest > f)) } else { seen.is_some() };
-                (g.missed_at.remove(&key), again)
+                (g.missed_at.remove(&key), again || warming_thread())
             }
             Err(_) => return,
         };
@@ -1048,6 +1048,23 @@ static WAIT_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub fn wait_timeouts() -> u64 {
     WAIT_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed)
 }
+thread_local! {
+    /// Set on the threads that warm the caches ahead of a playing preview ([`set_warming_thread`]).
+    static WARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the calling thread as one that renders layers ahead of the frames that show them
+/// (playback warm-up of the layers a new section brings in): what it inserts skips probation
+/// and goes straight into the cache proper. On probation it would be flushed by the frames
+/// rendered between the warm-up and the playhead reaching the section, and render again there.
+pub fn set_warming_thread(on: bool) {
+    WARMING.with(|w| w.set(on));
+}
+
+fn warming_thread() -> bool {
+    WARMING.with(|w| w.get())
+}
+
 /// How long any other thread waits.
 const WAIT_OTHER: std::time::Duration = std::time::Duration::from_secs(30);
 
