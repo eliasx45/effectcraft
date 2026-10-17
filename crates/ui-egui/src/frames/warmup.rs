@@ -355,6 +355,10 @@ fn warm(r: &Renderer, layers: &[&Active]) -> usize {
     for a in layers {
         let Some(ctx) = r.eval_ctx(a.comp, a.t) else { continue };
         let Some(layer) = ctx.comp.layer(a.layer) else { continue };
+        // A frame got there first: it renders the layer, no use doing it twice.
+        if r.resident_content(&ctx, layer).is_some_and(|(k, _)| r.cache.is_some_and(|c| c.in_flight(k))) {
+            continue;
+        }
         if layer.effects().is_some_and(|fx| fx.groups().any(|e| e.enabled)) {
             let _ = r.layer_source(&ctx, layer);
         } else {
@@ -478,6 +482,23 @@ mod tests {
         // Seeking back starts over from the new position: what is on screen there isn't warmed.
         let mut fresh = Plan::default();
         assert_eq!(run_to_horizon(&mut fresh, &ahead(&s, a, footage.clone(), cache.clone(), 3.5)), 0);
+    }
+
+    /// A frame never waits for the warm-up: its threads render without claiming a key (their
+    /// pool is a fraction of the frame's), so the key stays free for a frame thread to claim.
+    #[test]
+    fn warm_up_threads_never_claim_a_layer() {
+        use effectcraft_render::cache::Claim;
+        let cache = Arc::new(LayerCache::default());
+        let c = cache.clone();
+        let warm = std::thread::spawn(move || {
+            effectcraft_render::cache::set_warming_thread(true);
+            let claim = c.claim(7);
+            (matches!(claim, Claim::Owner(_)), c.in_flight(7))
+        });
+        assert_eq!(warm.join().unwrap(), (false, false));
+        let claim = cache.claim(7);
+        assert!(matches!(claim, Claim::Owner(_)) && cache.in_flight(7), "a frame thread claims it");
     }
 
     /// The warm-up thread decodes on its own pool, never a frame thread, and what it renders

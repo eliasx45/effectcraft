@@ -903,6 +903,11 @@ impl LayerCache {
             .unwrap_or_default()
     }
 
+    /// Whether another thread is rendering `key` right now ([`Self::claim`]).
+    pub fn in_flight(&self, key: u64) -> bool {
+        self.inflight.lock().unwrap_or_else(PoisonError::into_inner).map.contains_key(&key)
+    }
+
     /// After a miss on `key`: render it ([`Claim::Owner`], whose drop wakes the waiters), take
     /// the buffer another thread just rendered under it ([`Claim::Ready`]), or render it anyway
     /// ([`Claim::Render`]: this thread is already rendering it further up its stack, or the
@@ -930,7 +935,9 @@ impl LayerCache {
                 Some(f) if pool && m.stalled.contains_key(&f.owner.id()) => return Claim::Render,
                 Some(f) => f.clone(),
                 None => {
-                    if m.map.len() >= 4096 || m.map.try_reserve(1).is_err() {
+                    // A warm-up thread renders without a claim: a frame never waits for its
+                    // small pool (see [`set_warming_thread`]).
+                    if warming_thread() || m.map.len() >= 4096 || m.map.try_reserve(1).is_err() {
                         return Claim::Render;
                     }
                     let f = Arc::new(Flight { owner: me, done: Mutex::new(false), cv: Condvar::new() });
@@ -1057,6 +1064,8 @@ thread_local! {
 /// (playback warm-up of the layers a new section brings in): what it inserts skips probation
 /// and goes straight into the cache proper. On probation it would be flushed by the frames
 /// rendered between the warm-up and the playhead reaching the section, and render again there.
+/// It also never claims a key ([`LayerCache::claim`]): a frame that needs the same layer renders
+/// it itself rather than wait for the warm-up's slower pool.
 pub fn set_warming_thread(on: bool) {
     WARMING.with(|w| w.set(on));
 }
