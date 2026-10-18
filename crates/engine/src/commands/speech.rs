@@ -87,7 +87,10 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     {
         return Err(bad(
             C,
-            format!("{} is time-remapped, so its media time can't be mapped to the comp: import without `layer`, with the map's times already in comp seconds (speech-map --offset)", l.name),
+            format!(
+                "{} is time-remapped, so its media time can't be mapped to the comp: import without `layer`, with the map's times already in comp seconds (speech-map --offset)",
+                l.name
+            ),
         ));
     }
     let owned;
@@ -102,7 +105,10 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let (map, dropped) = parse_map(doc, layer, C)?;
     if map.words.is_empty() {
-        return Err(bad(C, format!("no words of the map fall inside the comp{}", layer.map(|l| format!(" (through {}'s in/out)", l.name)).unwrap_or_default())));
+        return Err(bad(
+            C,
+            format!("no words of the map fall inside the comp{}", layer.map(|l| format!(" (through {}'s in/out)", l.name)).unwrap_or_default()),
+        ));
     }
     let fps = comp.frame_rate.as_f64();
     let summary = summary(cid, &map, fps);
@@ -152,7 +158,9 @@ fn span(p: &Value, comp: &Comp, cmd: &str) -> Result<(f64, f64)> {
 fn lead_p(p: &Value, cmd: &str) -> Result<f64> {
     match p.get("accentLead").filter(|v| !v.is_null()) {
         None => Ok(lint::DEFAULT_ACCENT_LEAD),
-        Some(v) => v.as_f64().filter(|x| x.is_finite() && (0.0..=100.0).contains(x)).ok_or_else(|| bad(cmd, format!("`accentLead` is frames (0 to 100), not {v}"))),
+        Some(v) => {
+            v.as_f64().filter(|x| x.is_finite() && (0.0..=100.0).contains(x)).ok_or_else(|| bad(cmd, format!("`accentLead` is frames (0 to 100), not {v}")))
+        }
     }
 }
 

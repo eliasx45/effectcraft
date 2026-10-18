@@ -42,17 +42,8 @@ use effectcraft_time::Tick;
 use crate::layout;
 
 /// Every rule id, in report order.
-pub const RULES: [&str; 9] = [
-    "text-too-small",
-    "low-contrast",
-    "outside-title-safe",
-    "outside-action-safe",
-    "cut-off",
-    "text-overlap",
-    "hidden-visible",
-    "off-beat",
-    "off-accent",
-];
+pub const RULES: [&str; 9] =
+    ["text-too-small", "low-contrast", "outside-title-safe", "outside-action-safe", "cut-off", "text-overlap", "hidden-visible", "off-beat", "off-accent"];
 
 /// Most sample times one lint looks at; longer ranges are thinned evenly (`truncated`).
 pub const MAX_SAMPLES: usize = 120;
@@ -558,7 +549,12 @@ pub struct Problem {
 pub fn merge(occurrences: Vec<(Tick, Finding)>) -> Vec<Problem> {
     let mut out: Vec<Problem> = vec![];
     for (t, f) in occurrences {
-        let same = |p: &Problem| p.finding.rule == f.rule && p.finding.layer == f.layer && p.finding.other == f.other && (!matches!(f.rule, "off-beat" | "off-accent") || p.time == t);
+        let same = |p: &Problem| {
+            p.finding.rule == f.rule
+                && p.finding.layer == f.layer
+                && p.finding.other == f.other
+                && (!matches!(f.rule, "off-beat" | "off-accent") || p.time == t)
+        };
         match out.iter_mut().find(|p| same(p)) {
             Some(p) => {
                 p.time = p.time.min(t);

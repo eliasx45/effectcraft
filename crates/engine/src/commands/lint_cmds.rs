@@ -58,7 +58,10 @@ fn comp_beats(s: &Session, cid: ItemId, a0: f64, a1: f64) -> Vec<f64> {
 fn frames_p(p: &Value, k: &str, default: f64, min: f64, cmd: &str) -> Result<f64> {
     match p.get(k).filter(|v| !v.is_null()) {
         None => Ok(default),
-        Some(v) => v.as_f64().filter(|x| x.is_finite() && *x >= min && *x <= 100.0).ok_or_else(|| bad(cmd, format!("`{k}` is a number of frames ({min} to 100), not {v}"))),
+        Some(v) => v
+            .as_f64()
+            .filter(|x| x.is_finite() && *x >= min && *x <= 100.0)
+            .ok_or_else(|| bad(cmd, format!("`{k}` is a number of frames ({min} to 100), not {v}"))),
     }
 }
 

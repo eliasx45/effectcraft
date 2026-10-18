@@ -76,12 +76,9 @@ fn accent_is_one_frame_before_the_vowel_never_before_the_onset() {
 #[test]
 fn off_accent_flags_near_misses_only() {
     // Peak at 1.5 s. Accent = vowel − 1 frame (0.04 s).
-    for (vowel, flagged, words) in [
-        (1.54, false, "hit"),
-        (1.62, true, "2 frames before"),
-        (1.48, true, "1.5 frames after"),
-        (1.76, false, "5.5 frames away: outside the window"),
-    ] {
+    for (vowel, flagged, words) in
+        [(1.54, false, "hit"), (1.62, true, "2 frames before"), (1.48, true, "1.5 frames after"), (1.76, false, "5.5 frames away: outside the window")]
+    {
         let (mut s, l) = comp();
         scale_keys(&mut s, l, 1.0, 2.0, false);
         s.execute("speech.import", json!({"map": map(vowel - 0.1, vowel)})).unwrap();
@@ -135,7 +132,11 @@ fn import_maps_media_time_through_the_layer() {
     let g = s.execute("speech.get", json!({"stressed": true})).unwrap();
     let a = &g["accents"][0];
     // Media 1.0 s → comp 2.0 s; accent = vowel 2.1 − 1 frame = 2.06 (frame 51.5 → 52).
-    assert_eq!((a["word"].as_str(), a["onset"].as_f64(), a["vowel"].as_f64(), a["accent"].as_f64()), (Some("content"), Some(2.0), Some(2.1), Some(2.06)), "{g}");
+    assert_eq!(
+        (a["word"].as_str(), a["onset"].as_f64(), a["vowel"].as_f64(), a["accent"].as_f64()),
+        (Some("content"), Some(2.0), Some(2.1), Some(2.06)),
+        "{g}"
+    );
     assert_eq!(a["onsetFrame"].as_f64(), Some(50.0));
     let w = s.execute("speech.get", json!({})).unwrap();
     assert_eq!(w["list"][0]["syllables"].as_array().unwrap().len(), 2, "{w}");
@@ -174,7 +175,11 @@ fn accents_list_every_peak_with_its_offset_and_the_map_saves() {
     assert_eq!((r["peaks"].as_u64(), r["hits"].as_u64()), (Some(1), Some(0)), "{r}");
     let p = &r["list"][0];
     // Accent 1.58, peak 1.5: 2 frames early.
-    assert_eq!((p["word"].as_str(), p["accent"].as_f64(), p["offsetFrames"].as_f64(), p["hit"].as_bool()), (Some("content"), Some(1.58), Some(-2.0), Some(false)), "{p}");
+    assert_eq!(
+        (p["word"].as_str(), p["accent"].as_f64(), p["offsetFrames"].as_f64(), p["hit"].as_bool()),
+        (Some("content"), Some(1.58), Some(-2.0), Some(false)),
+        "{p}"
+    );
     assert_eq!(s.execute("speech.accents", json!({"layer": l, "start": 3.0})).unwrap()["peaks"], 0);
     // Saved with the comp, and only when there is one.
     let comp = s.active_comp().unwrap().clone();
