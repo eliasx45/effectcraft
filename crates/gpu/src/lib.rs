@@ -620,6 +620,8 @@ mod tests_deferred;
 #[cfg(test)]
 mod tests_deferred_jobs;
 #[cfg(test)]
+mod tests_fx_codes;
+#[cfg(test)]
 mod tests_fx_color;
 #[cfg(test)]
 mod tests_fx_deepglow;
