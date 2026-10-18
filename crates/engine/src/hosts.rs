@@ -267,7 +267,8 @@ pub(crate) fn check_unchanged(path: &str) -> Result<()> {
 }
 
 /// Forget this process's entry (tests; the save guard's memory stays, other tests rely on it).
-#[cfg(test)]
+/// Unix only, as the test that uses it (dead code on Windows failed clippy there).
+#[cfg(all(test, unix))]
 pub(crate) fn reset() {
     *lock(&ME) = None;
 }

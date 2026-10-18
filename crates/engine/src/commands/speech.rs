@@ -3,7 +3,7 @@
 //! makes one outside the app (transcript, forced alignment, acoustic onset snap);
 //! `speech.import` stores it on the comp (undoable), mapping media time through the voice
 //! layer; `speech.get` lists words or accents; `speech.accents` matches every keyframed
-//! property's speed-graph peak to its nearest accent (what the `off-accent` lint flags);
+//! property's speed-graph peak, precomps included, to its nearest accent (what the `off-accent` lint flags);
 //! `speech.clear` removes the map.
 
 use std::sync::Arc;
@@ -227,15 +227,30 @@ fn accents(s: &mut Session, p: &Value) -> Result<Value> {
         None => None,
         Some(v) => Some(resolve_layer(comp, v).ok_or_else(|| bad(C, format!("no layer {v}")))?),
     };
-    let peaks: Vec<_> = lint::speed_peaks(comp, a, b).into_iter().filter(|pk| only.is_none_or(|l| pk.layer == l)).collect();
+    // `layer` picks the comp's own layer, or a precomp layer and everything in it.
+    let deep = lint::speed_peaks_deep(&s.project, cid, a, b);
+    let peaks: Vec<_> = deep.peaks.into_iter().filter(|pk| only.is_none_or(|l| pk.via.first().map_or(pk.layer, |h| h.layer) == l)).collect();
     let matched = lint::match_accents(peaks, &map, fps, lead);
     let hits = matched.iter().filter(|m| m.offset_frames.abs() <= 1.0 + 1e-6).count();
     let list: Vec<Value> = matched
         .iter()
         .take(MAX_LIST)
         .map(|m| {
-            let l = comp.layer(m.peak.layer);
+            let inner = m.peak.comp.unwrap_or(cid);
+            let l = s.project.comp(inner).and_then(|c| c.layer(m.peak.layer));
+            let via: Vec<u64> = m.peak.via.iter().map(|h| h.layer.0).collect();
+            // Ready `keys.alignPeak` params: land this peak on its accent.
+            let word = map.words.iter().position(|w| std::ptr::eq(w, m.word));
+            let syllable = m.word.syllables.iter().position(|x| *x == m.syllable);
+            let mut align =
+                json!({"comp": inner.0, "layer": m.peak.layer.0, "path": m.peak.path, "speech": {"index": word, "syllable": syllable}, "accentLead": lead});
+            if m.peak.comp.is_some() {
+                (align["targetComp"], align["via"]) = (json!(cid.0), json!(via));
+            }
             json!({
+                "comp": inner.0,
+                "compName": s.project.item(inner).map(|i| i.name.as_str()).unwrap_or(""),
+                "via": via,
                 "layer": m.peak.layer.0,
                 "layerName": l.map(|l| l.name.as_str()).unwrap_or(""),
                 "property": m.peak.property,
@@ -250,6 +265,7 @@ fn accents(s: &mut Session, p: &Value) -> Result<Value> {
                 "accentFrame": (m.target * fps).round(),
                 "offsetFrames": r2(m.offset_frames),
                 "hit": m.offset_frames.abs() <= 1.0 + 1e-6,
+                "alignPeak": align,
             })
         })
         .collect();
@@ -259,6 +275,7 @@ fn accents(s: &mut Session, p: &Value) -> Result<Value> {
         "peaks": matched.len(),
         "hits": hits,
         "truncated": matched.len() > MAX_LIST,
+        "skipped": deep.skipped,
         "list": list,
     }))
 }
@@ -295,7 +312,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "speech.accents",
             "Speed Peaks vs Accents",
-            "{comp?, layer?, start? (s), end? (s), accentLead? (frames, default 1)} → {peaks, hits, list: [{layer, layerName, property, path, time, frame, speed, word, onset, vowel, accent, accentFrame, offsetFrames (peak − accent; negative = early), hit (within 1 frame)}]}: every keyframed property's speed-graph peak with its nearest stressed syllable",
+            "{comp?, layer?, start? (s), end? (s), accentLead? (frames, default 1)} → {peaks, hits, list: [{comp (the layer's comp: a precomp for nested moves), compName, via (precomp layer ids from this comp down, outermost first), layer, layerName, property, path, time, frame (this comp's), speed, word, onset, vowel, accent, accentFrame, offsetFrames (peak − accent; negative = early), hit (within 1 frame), alignPeak (keys.alignPeak params that land it on the accent)}], skipped (precomps not searched: time-remapped)}: every keyframed property's speed-graph peak, also inside precomps (mapped through each precomp layer's start and stretch; kept only where every precomp layer shows it), with its nearest stressed syllable; `layer` may be a precomp layer (everything in it)",
             accents
         ),
         cmd!("speech.clear", "Remove Speech Map", [], None, "{comp?}", always, clear),
