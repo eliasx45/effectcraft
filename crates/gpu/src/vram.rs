@@ -19,8 +19,65 @@ pub const VRAM_CAP_ENV: &str = "EFFECTCRAFT_GPU_VRAM_CAP_MB";
 /// the driver reports fails with an out-of-memory error the frame's error scope catches (the frame
 /// then renders on the CPU and fewer GPU frames run at once), instead of overcommitting video
 /// memory until the device is lost.
+///
+/// Not on an NVIDIA card without resizable BAR (a 256 MiB BAR1, as on some rented RTX 5090s): wgpu
+/// checks each memory heap on its own, and the small heap the CPU can write into (which the desktop
+/// also uses) is over its budget almost at once, so every upload failed as out of memory and the
+/// device could not be made again, with 29 GB of video memory free (18 Oct). A cap
+/// ([`VRAM_CAP_ENV`]) still applies there.
 pub fn memory_budget_thresholds() -> wgpu::MemoryBudgetThresholds {
+    let capped = std::env::var(VRAM_CAP_ENV).is_ok_and(|v| v.trim().parse::<u64>().is_ok_and(|mb| mb > 0));
+    if !capped && small_bar() {
+        return wgpu::MemoryBudgetThresholds { for_resource_creation: None, for_device_loss: None };
+    }
     wgpu::MemoryBudgetThresholds { for_resource_creation: Some(creation_percent()), for_device_loss: None }
+}
+
+/// Below this BAR1 aperture the budget check is off (resizable BAR gives the whole card).
+const SMALL_BAR_MIB: u64 = 1024;
+
+/// Whether an NVIDIA card here has a small BAR1 aperture (asked of `nvidia-smi` once).
+fn small_bar() -> bool {
+    static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SMALL.get_or_init(|| match bar1_total_mib() {
+        Some(mib) if mib < SMALL_BAR_MIB => {
+            log::info!("gpu: BAR1 is {mib} MiB (no resizable BAR): video memory budget check off");
+            true
+        }
+        _ => false,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn bar1_total_mib() -> Option<u64> {
+    parse_bar1_total(&run_nvidia_smi(&["-q", "-d", "MEMORY"])?)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn bar1_total_mib() -> Option<u64> {
+    None
+}
+
+/// The smallest BAR1 `Total` (MiB) in `nvidia-smi -q -d MEMORY` output.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn parse_bar1_total(out: &str) -> Option<u64> {
+    let mut in_bar1 = false;
+    let mut smallest: Option<u64> = None;
+    for line in out.lines() {
+        let t = line.trim();
+        if t.starts_with("BAR1 Memory Usage") {
+            in_bar1 = true;
+        } else if in_bar1 && t.starts_with("Total") {
+            in_bar1 = false;
+            let mib = t.split(':').nth(1).and_then(|v| v.trim().trim_end_matches("MiB").trim().parse::<u64>().ok());
+            if let Some(mib) = mib {
+                smallest = Some(smallest.map_or(mib, |s| s.min(mib)));
+            }
+        } else if !line.starts_with("        ") {
+            in_bar1 = false;
+        }
+    }
+    smallest
 }
 
 /// The share of the driver's budget resources may take: 90 %, or [`VRAM_CAP_ENV`]'s share of
@@ -124,13 +181,15 @@ fn detect(_vendor: u32, _device: u32) -> Option<VideoMemory> {
 /// seconds (a wedged driver can make it hang).
 #[cfg(not(target_arch = "wasm32"))]
 fn nvidia_smi() -> Option<String> {
+    run_nvidia_smi(&["--query-gpu=pci.device_id,memory.total,memory.used", "--format=csv,noheader,nounits"])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_nvidia_smi(args: &[&str]) -> Option<String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     let mut cmd = Command::new("nvidia-smi");
-    cmd.args(["--query-gpu=pci.device_id,memory.total,memory.used", "--format=csv,noheader,nounits"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -201,6 +260,15 @@ fn amd_sysfs(device: u32) -> Option<VideoMemory> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bar1_total_from_nvidia_smi_q() {
+        let out = "==============NVSMI LOG==============\n\nAttached GPUs                             : 1\nGPU 00000000:01:00.0\n    FB Memory Usage\n        Total                             : 32607 MiB\n        Used                              : 3182 MiB\n    BAR1 Memory Usage\n        Total                             : 256 MiB\n        Used                              : 195 MiB\n        Free                              : 61 MiB\n    Conf Compute Protected Memory Usage\n        Total                             : 0 MiB\n";
+        assert_eq!(parse_bar1_total(out), Some(256));
+        let rebar = out.replace("256 MiB", "32768 MiB");
+        assert_eq!(parse_bar1_total(&rebar), Some(32768));
+        assert_eq!(parse_bar1_total(""), None);
+    }
 
     #[test]
     fn nvidia_smi_answers_by_device_id() {
