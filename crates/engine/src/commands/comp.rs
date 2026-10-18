@@ -162,6 +162,25 @@ fn close(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// Drag a Timeline comp tab along the strip: comp `comp` moves before tab `before` (to the end
+/// without one). Only the tab order changes (like opening and closing tabs, not undoable).
+fn move_tab(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = comp_id(s, p)?;
+    let before = match p.get("before") {
+        Some(v) if !v.is_null() => Some(comp_id(s, &json!({"comp": v}))?),
+        _ => None,
+    };
+    let Some(from) = s.state.open_comps.iter().position(|c| *c == id) else {
+        return Err(bad("comp.moveTab", "that comp has no open Timeline tab"));
+    };
+    if before != Some(id) {
+        s.state.open_comps.remove(from);
+        let to = before.and_then(|b| s.state.open_comps.iter().position(|c| *c == b)).unwrap_or(s.state.open_comps.len());
+        s.state.open_comps.insert(to, id);
+    }
+    Ok(json!({"openComps": s.state.open_comps.iter().map(|c| c.0).collect::<Vec<_>>()}))
+}
+
 fn work_area(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let t = s.time();
@@ -295,6 +314,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("comp.trimToWorkArea", "Trim Comp to Work Area", ["Composition"], Some("Cmd+Shift+X"), "{comp?}", has_comp, trim_to_wa),
         cmd!("comp.open", "Open Composition", [], None, "{comp: id|name}", always, open),
         cmd!("comp.close", "Close Composition", [], None, "{comp?}", has_comp, close),
+        cmd!("comp.moveTab", "Move Timeline Tab", [], None, "{comp, before?: id (end without)}", has_comp, move_tab),
         cmd!("comp.workArea", "Set Work Area", [], None, "{start?, end?, set?: begin|end (at CTI)}", has_comp, work_area),
         cmd!("comp.setSwitch", "Composition Switch", [], None, "{switch: hideShy|motionBlur|frameBlending|draft3d, value?}", has_comp, comp_switch),
         cmd!("comp.addMarker", "Add Marker", [], Some("Num*"), "{time?, comment?}", has_comp, add_marker),

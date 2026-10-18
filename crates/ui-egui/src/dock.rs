@@ -1205,7 +1205,23 @@ pub enum DockAction {
     ActivateDoc(PanelKind, u64),
     /// A document tab's close button (or middle click): close that document (comp `id`).
     CloseDoc(PanelKind, u64),
+    /// A document tab dragged along its strip: document `id` moves before tab `before` (to the
+    /// end without one).
+    MoveDoc(PanelKind, u64, Option<u64>),
 }
+
+/// A document tab (a Timeline comp tab) being dragged along its group's strip: it reorders the
+/// tabs; dragged well out of the strip it becomes a panel drag (re-dock or undock), as in After
+/// Effects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DocDrag {
+    panel: PanelKind,
+    doc: u64,
+}
+
+/// How far (points) past its strip a dragged document tab still reorders; beyond, it drags the
+/// panel.
+const DOC_DRAG_SLACK: egui::Vec2 = vec2(48.0, 24.0);
 
 /// One document a panel shows as a tab of its own (the Timeline: one tab per open comp, as in
 /// After Effects).
@@ -1498,6 +1514,55 @@ fn tab_scroll_start(widths: &[f32], gap: f32, room: f32, active: usize, start: u
     start
 }
 
+/// A document tab being dragged along `strip` (its drawn tabs `doc_tabs`): the drop mark between
+/// tabs, and on release the move. Escape cancels; dragged well out of the strip it drags the panel.
+#[allow(clippy::too_many_arguments)]
+fn doc_tab_drag(
+    ui: &egui::Ui,
+    dd: DocDrag,
+    id: egui::Id,
+    strip: Rect,
+    gap: f32,
+    doc_tabs: &[(PanelKind, u64, Rect)],
+    info: &TabInfo,
+    t: &Tokens,
+    out: &mut Chrome,
+) {
+    let (pos, down, escape) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down(), i.key_pressed(egui::Key::Escape)));
+    let all: Vec<u64> = info.docs.iter().find(|(k, _)| *k == dd.panel).map(|(_, d)| d.iter().map(|d| d.id).collect()).unwrap_or_default();
+    let (Some(pos), true) = (pos, !escape && all.contains(&dd.doc)) else {
+        ui.data_mut(|d| d.remove::<DocDrag>(id));
+        return;
+    };
+    if !strip.expand2(DOC_DRAG_SLACK).contains(pos) {
+        ui.data_mut(|d| d.remove::<DocDrag>(id));
+        out.actions.push(DockAction::BeginDrag(dd.panel));
+        return;
+    }
+    let shown: Vec<(u64, Rect)> = doc_tabs.iter().filter(|(p, d, _)| *p == dd.panel && *d != dd.doc).map(|(_, d, r)| (*d, *r)).collect();
+    // The first shown tab right of the pointer; past the last shown one, the tab after it (or
+    // the end), so tabs scrolled out of view keep their place.
+    let before = match shown.iter().find(|(_, r)| r.center().x > pos.x) {
+        Some((d, _)) => Some(*d),
+        None => shown.last().and_then(|(last, _)| all.iter().skip_while(|d| *d != last).skip(1).find(|d| **d != dd.doc).copied()),
+    };
+    let mark_x = match shown.iter().find(|(_, r)| r.center().x > pos.x) {
+        Some((_, r)) => r.min.x - gap / 2.0,
+        None => shown.last().map_or(strip.min.x, |(_, r)| r.max.x + gap / 2.0),
+    };
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, id));
+    painter.line_segment([pos2(mark_x, strip.min.y + 3.0), pos2(mark_x, strip.max.y - 3.0)], Stroke::new(2.0, t.focus));
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    ui.ctx().request_repaint();
+    if !down {
+        ui.data_mut(|d| d.remove::<DocDrag>(id));
+        let next = all.iter().skip_while(|d| **d != dd.doc).nth(1).copied();
+        if before != next {
+            out.actions.push(DockAction::MoveDoc(dd.panel, dd.doc, before));
+        }
+    }
+}
+
 pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut crate::automation::Registry, info: &TabInfo) -> Chrome {
     struct Entry {
         panel: PanelKind,
@@ -1633,6 +1698,9 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
         }
         let start = scroll.start;
         ui.data_mut(|d| d.insert_temp(sid, scroll));
+        let doc_drag_id = egui::Id::new(("tab-doc-drag", g.path.clone()));
+        // The document tabs drawn (panel, document, rect), for a reorder drag.
+        let mut doc_tabs: Vec<(PanelKind, u64, Rect)> = vec![];
         for (k, e) in entries.iter().enumerate().skip(start) {
             let p = &e.panel;
             // A collapsed stacked panel's header is plain text (no underline or panel menu).
@@ -1672,8 +1740,18 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
                 None => out.tabs.push((*p, tab)),
             }
             let resp = ui.interact(tab, egui::Id::new(("tab", g.path.clone(), k)), Sense::click_and_drag());
+            if let Some(id) = e.doc {
+                doc_tabs.push((*p, id, tab));
+            }
             if resp.drag_started() {
-                out.actions.push(DockAction::BeginDrag(*p));
+                // One of several document tabs reorders them; any other tab drags its panel.
+                let docs = entries.iter().filter(|o| o.panel == *p && o.doc.is_some()).count();
+                match e.doc {
+                    Some(doc) if docs > 1 => ui.data_mut(|d| {
+                        d.insert_temp(doc_drag_id, DocDrag { panel: *p, doc });
+                    }),
+                    _ => out.actions.push(DockAction::BeginDrag(*p)),
+                }
             }
             // A document tab also answers to the panel's id while it is the shown one.
             let auto_id = match e.doc {
@@ -1775,6 +1853,9 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
                 out.actions.push(DockAction::TabMenu(*p, e.doc, ui.input(|i| i.pointer.interact_pos()).unwrap_or(tab.left_bottom())));
             }
             x += w + gap;
+        }
+        if let Some(dd) = ui.data(|d| d.get_temp::<DocDrag>(doc_drag_id)) {
+            doc_tab_drag(ui, dd, doc_drag_id, strip, gap, &doc_tabs, info, t, &mut out);
         }
         // Right-clicking the empty part of the strip: the shown panel's menu.
         if strip_resp.secondary_clicked()

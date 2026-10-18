@@ -402,6 +402,9 @@ impl EffectcraftApp {
                 DockAction::CloseDoc(_, id) => {
                     let _ = crate::menus::invoke(self, &ctx, "comp.close", serde_json::json!({"comp": id}));
                 }
+                DockAction::MoveDoc(_, id, before) => {
+                    let _ = crate::menus::invoke(self, &ctx, "comp.moveTab", serde_json::json!({"comp": id, "before": before}));
+                }
             }
         }
         self.tab_drag(&ctx, &groups, &float_groups, &float_windows, &tab_rects);

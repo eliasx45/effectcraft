@@ -167,3 +167,21 @@ fn auto_saves_and_xml_copies_carry_the_open_comps() {
     }
     let _ = std::fs::remove_dir_all(d);
 }
+
+#[test]
+fn move_tab_reorders_the_open_comps_and_keeps_the_front_comp() {
+    let (mut s, [a, b, c]) = three_open();
+    s.execute("comp.moveTab", json!({"comp": c.0, "before": a.0})).unwrap();
+    assert_eq!(s.state.open_comps, vec![c, a, b]);
+    s.execute("comp.moveTab", json!({"comp": c.0})).unwrap();
+    assert_eq!(s.state.open_comps, vec![a, b, c]);
+    // Before itself: nothing moves.
+    s.execute("comp.moveTab", json!({"comp": b.0, "before": b.0})).unwrap();
+    assert_eq!(s.state.open_comps, vec![a, b, c]);
+    assert_eq!(s.active_comp_id(), Some(c));
+    // A comp with no tab is an error, not a new tab.
+    let d = comp(&mut s, "D");
+    s.execute("comp.close", json!({"comp": d.0})).unwrap();
+    assert!(s.execute("comp.moveTab", json!({"comp": d.0})).is_err());
+    assert_eq!(s.state.open_comps, vec![a, b, c]);
+}
