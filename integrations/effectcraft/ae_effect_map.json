@@ -13127,7 +13127,7 @@
             "Exposure": 163
           },
           "instances": 163,
-          "param_id": "PEDG-0002",
+          "param_id": "exposure",
           "status": "native_parameter"
         },
         "PEDG-0003": {

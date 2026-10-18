@@ -365,6 +365,13 @@ fn bounding_box(img: &Image, nonzero: impl Fn(&Px) -> bool + Sync) -> (Option<(u
     (bbox, rows.into_iter().map(|r| r.0).collect())
 }
 
+/// Deep Glow's Exposure control runs at half the plug-in's scale (Exposure 0.2 glows like the
+/// plug-in's 0.1) for finer control near zero; AE imports and projects saved before are doubled
+/// (`crates/aep`, [`crate::migrate::ALIAS_VALUE_SCALES`]).
+pub fn exposure_gain(exposure: f64) -> f32 {
+    (exposure * 0.5).clamp(0.0, 64.0) as f32
+}
+
 /// Editable, clean-room approximation of Plugin Everything Deep Glow v1. The public product
 /// description specifies a wide inverse-square-like falloff; three Gaussian scales approximate
 /// that profile without depending on the third-party plug-in.
@@ -527,7 +534,7 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     };
     drop(blurred);
     let halo = if work_scale < 1.0 { resample_sparse(&halo, fw, fh) } else { halo };
-    let exposure = ctx.params.f("PEDG-0002").clamp(0.0, 64.0) as f32;
+    let exposure = exposure_gain(ctx.params.f("exposure"));
     let exposure = if linear_model { exposure.powf(0.75) } else { exposure };
     let source_opacity = (ctx.params.f("PEDG-0024") / 100.0).clamp(0.0, 1.0) as f32;
     let screen = ctx.params.e("PEDG-0008") == 0;
@@ -774,7 +781,7 @@ fn deep_glow_reference(ctx: &EffectCtx, mut b: Buf) -> Buf {
         });
     }
     let halo = if work_scale < 1.0 { resample(&halo, b.img.width, b.img.height) } else { halo };
-    let exposure = ctx.params.f("PEDG-0002").clamp(0.0, 64.0) as f32;
+    let exposure = exposure_gain(ctx.params.f("exposure"));
     let exposure = if linear_model { exposure.powf(0.75) } else { exposure };
     if convert {
         to_linear(&mut b.img);
@@ -1265,7 +1272,7 @@ pub fn specs() -> Vec<EffectSpec> {
             "Stylize",
             vec![
                 p("PEDG-0001", "Radius", num(116.0), slider(0.0, 2000.0, 0.0, 500.0, 0)),
-                p("PEDG-0002", "Exposure", num(1.0), slider(0.0, 64.0, 0.0, 4.0, 2)),
+                p("exposure", "Exposure", num(0.01), slider(0.0, 128.0, 0.0, 4.0, 3)),
                 p("PEDG-0004", "Threshold", num(0.0), slider(0.0, 1600.0, 0.0, 100.0, 0)),
                 p("PEDG-0005", "Threshold Smooth", num(0.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
                 p("PEDG-0008", "Blend Mode", Value::Enum(0), popup(&["Screen", "Add"])),
@@ -1600,7 +1607,7 @@ mod tests {
             }
         }
         let set =
-            [("PEDG-0001", num(100.0)), ("PEDG-0002", num(1.0)), ("PEDG-0008", Value::Enum(1)), ("PEDG-0055", num(2.0)), ("PEDG-0031", Value::Bool(false))];
+            [("PEDG-0001", num(100.0)), ("exposure", num(2.0)), ("PEDG-0008", Value::Enum(1)), ("PEDG-0055", num(2.0)), ("PEDG-0031", Value::Bool(false))];
         let o = run_fx("ec.stylize.deepglow", &set, img, 0.0, EffectEnv::default());
         let px = |x: i64| o.img.get(x + o.offset[0] as i64, 150 + o.offset[1] as i64);
         let inside = px(300);
@@ -1621,7 +1628,7 @@ mod tests {
         let pixel = |b: &Buf, x: i64, y: i64| b.img.get(x + b.offset[0] as i64, y + b.offset[1] as i64);
         assert!(pixel(&base, 11, 8)[0] > 0.0, "radius must create a halo");
         assert!(pixel(&base, 11, 8)[0] > pixel(&base, 11, 8)[1], "halo keeps source hue");
-        let brighter = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(2.0))]);
+        let brighter = run(&[("PEDG-0001", num(8.0)), ("exposure", num(4.0))]);
         assert!(pixel(&brighter, 11, 8)[0] > pixel(&base, 11, 8)[0], "exposure must brighten halo");
         let cut = run(&[("PEDG-0001", num(8.0)), ("PEDG-0004", num(200.0))]);
         assert_eq!(pixel(&cut, 11, 8)[0], 0.0, "threshold must remove dim sources");
@@ -1643,10 +1650,10 @@ mod tests {
         let dim_run = |mode| run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0008", native(mode))], dim.clone(), 0.0, EffectEnv::default());
         let (dim_add, dim_screen) = (dim_run(2), dim_run(1));
         assert!(pixel(&dim_add, 8, 8)[0] > pixel(&dim_screen, 8, 8)[0], "AE Blend Mode 2 (Add) lifts the source more than Screen");
-        let low_auto = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37))]);
-        let low_linear = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37)), ("PEDG-0043", Value::Bool(false))]);
+        let low_auto = run(&[("PEDG-0001", num(8.0)), ("exposure", num(0.74))]);
+        let low_linear = run(&[("PEDG-0001", num(8.0)), ("exposure", num(0.74)), ("PEDG-0043", Value::Bool(false))]);
         assert_ne!(pixel(&low_auto, 11, 8), pixel(&low_linear, 11, 8), "gamma correction changes the glow model");
-        let low_manual = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37)), ("PEDG-0043", Value::Bool(false)), ("PEDG-0009", Value::Bool(true))]);
+        let low_manual = run(&[("PEDG-0001", num(8.0)), ("exposure", num(0.74)), ("PEDG-0043", Value::Bool(false)), ("PEDG-0009", Value::Bool(true))]);
         assert_eq!(pixel(&low_auto, 11, 8), pixel(&low_manual, 11, 8), "manual gamma can replace auto detection");
         let tint = [("PEDG-0001", num(8.0)), ("PEDG-0037", Value::Bool(true)), ("PEDG-0038", Value::Color([0.8, 0.2, 0.5, 1.0]))];
         let standard = run(&[tint[0].clone(), tint[1].clone(), tint[2].clone(), ("PEDG-0039", native(1))]);
@@ -1690,7 +1697,7 @@ mod tests {
         }
         let set = [
             ("PEDG-0001", num(100.0)),
-            ("PEDG-0002", num(0.4)),
+            ("exposure", num(0.8)),
             ("PEDG-0008", Value::Enum(0)),
             ("PEDG-0025", Value::Bool(true)),
             ("PEDG-0031", Value::Bool(false)),
@@ -1733,7 +1740,7 @@ mod tests {
         let spec = crate::find("ec.stylize.deepglow");
         let mut params =
             crate::Params { values: spec.map(|s| s.params.iter().map(|p| (p.id.to_string(), crate::default_value(p, size))).collect()).unwrap_or_default() };
-        for (k, v) in [("PEDG-0001", num(150.0)), ("PEDG-0002", num(0.01))].iter().chain(vals) {
+        for (k, v) in [("PEDG-0001", num(150.0)), ("exposure", num(0.02))].iter().chain(vals) {
             assert!(params.values.contains_key(*k), "unknown param {k}");
             params.values.insert(k.to_string(), v.clone());
         }
@@ -1770,11 +1777,11 @@ mod tests {
         let small = ring_frame(0.3);
         let options: [&[(&str, Value)]; 11] = [
             &[("PEDG-0025", Value::Bool(false))],
-            &[("PEDG-0031", Value::Bool(false)), ("PEDG-0008", Value::Enum(1)), ("PEDG-0002", num(1.5))],
+            &[("PEDG-0031", Value::Bool(false)), ("PEDG-0008", Value::Enum(1)), ("exposure", num(3.0))],
             &[("PEDG-0043", Value::Bool(false))],
             &[("PEDG-0019", num(30.0)), ("PEDG-0010", num(0.4))],
             &[("PEDG-0019", num(100.0)), ("PEDG-0013", Value::Bool(true))],
-            &[("PEDG-0001", num(1500.0)), ("PEDG-0002", num(1.0))],
+            &[("PEDG-0001", num(1500.0)), ("exposure", num(2.0))],
             &[("PEDG-0004", num(60.0)), ("PEDG-0005", num(20.0))],
             &[("PEDG-0037", Value::Bool(true)), ("PEDG-0039", Value::Enum(2)), ("PEDG-0024", num(40.0))],
             &[("PEDG-0055", num(0.0))],
@@ -1837,7 +1844,13 @@ mod tests {
     fn deep_glow_renders_radius_above_512() {
         let mut impulse = Image::new(9, 9);
         impulse.set(4, 4, [1.0; 4]);
-        let wide = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(1603.0)), ("PEDG-0031", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
+        let wide = run_fx(
+            "ec.stylize.deepglow",
+            &[("PEDG-0001", num(1603.0)), ("exposure", num(2.0)), ("PEDG-0031", Value::Bool(false))],
+            impulse,
+            0.0,
+            EffectEnv::default(),
+        );
         assert_eq!(wide.offset, [1603.0; 2]);
         assert_eq!(wide.img.width, 3215);
         // The widest Gaussian's three boxes reach ~3.6 sigma (~580 px here); past that the
