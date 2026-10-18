@@ -8,6 +8,7 @@ destroying stays manual in the vast.ai console.
 scripts/fork/cloud.sh connect root@<ip> -p <port>   # everything below, in one go
 scripts/fork/cloud.sh status                        # tunnel, server commit, GPU, free VRAM/disk, pending uploads
 scripts/fork/cloud.sh disconnect                    # app back to This Mac, tunnel closed, server process stopped
+scripts/fork/cloud.sh tunnel                        # reopen the tunnel + start its watchdog only (no build, no server restart)
 ```
 
 Open the project in the Mac app first (the mirror reads the project from the app on control port 9877),
@@ -44,6 +45,28 @@ or pass `--project "/path/10-10 Edit.ecproj"`.
 
 Running `connect` twice is safe: finished steps are skipped (build, mirror bytes, server, tunnel).
 
+## Tunnel watchdog (CR11)
+
+`connect` (and `tunnel`) start a watchdog: a small loop (`cloud.sh _watch`, its own session, so closing
+the terminal or the agent that ran connect doesn't stop it) that checks the ssh ControlMaster every 2 s
+and reopens it when it's gone. It never rebuilds, mirrors or restarts the server.
+
+- **Drops it fixes:** a Wi‑Fi blip or network stall (the tunnel's ssh uses 5 s keepalives, so a dead
+  link is noticed in ~15 s; reopening is retried every 2 s, each try with a 5 s connect timeout),
+  Mac sleep (after a wake, a gap over 30 s, it reopens at once instead of waiting for ssh), a killed
+  tunnel (`ssh -S … -O exit`).
+- **Machine gone:** after 20 s of "Connection refused" (or 60 s of no answer) it says the instance is
+  most likely paused (outbid, for interruptible ones) or stopped, and retries every 15 s, then every
+  60 s after 10 min, so it reconnects by itself if the instance resumes. It never rents or resumes anything.
+- **Deliberate disconnect:** `disconnect` stops the watchdog before closing the tunnel, and the
+  watchdog exits by itself when the state file is removed or names another machine.
+- **Where to see it:** `cloud.sh status` (🐕 line: drops reopened, or down for N s with the reason);
+  log `…/EffectCraft/cloud-watchdog.log` (each drop, failed attempt and recovery with ssh's error).
+- **The app:** its frame client retries at least every 2 s, and the Preview On chip says
+  `Preview: Mac (reconnecting…)` (not "cloud offline") after a connection it had is lost. Once the
+  tunnel is back, frames come from the cloud again within ~2–4 s.
+- An existing connection made before CR11 has no watchdog: run `cloud.sh tunnel` once.
+
 ## Files and secrets
 
 - Connection state (ip, ports, no secrets): `~/Library/Application Support/EffectCraft/cloud-connection.env`
@@ -56,7 +79,9 @@ Running `connect` twice is safe: finished steps are skipped (build, mirror bytes
   `~/.config/effectcraft/motion-library.json` for root (library-pull) and for `user` (the browser desktop
   app's Motion Library panel), mode 600. Not in a command line, a log or the vast template.
 - A build needs about 12 GB free on /workspace: below that `connect` refuses and says what to free.
-- The tunnel's control socket: `/tmp/ec-cloud-<uid>.sock`.
+- The tunnel's control socket: `/tmp/ec-cloud-<uid>.sock` (`EC_CLOUD_SOCK`; macOS limits it to 104 characters).
+  Watchdog: `cloud-watchdog.pid`, `.log`, `.state` next to the state file. `EC_CLOUD_SSH_OPTS` adds ssh
+  options to the tunnel (tests use a `ProxyCommand` there to fake a stalled network).
 - `EFFECTCRAFT_CONFIG_DIR` moves all of the above (tests use it); ssh key `~/.ssh/id_ed25519`
   (`EC_CLOUD_KEY`); `EC_CLI` picks the Mac's `effectcraft-cli`.
 
@@ -97,3 +122,10 @@ instance, which keeps billing) after MIN minutes with no app connected. Re-run `
 
 3090, 17 Oct 2026: connect from a cold checkout (build, mirror, serve, tunnel), second connect (nothing
 repeated), `status`, app copy on its own control port showing `connected / ready`, idle stop, `disconnect`.
+
+18 Oct 2026 (CR11, watchdog): the A40 was paused (refused ssh), so the chain ran on the Mac (lane app
+→ watchdog tunnel via `ssh localhost` through a pausable ProxyCommand → `effectcraft-cli serve --frames`).
+Tunnel killed with `-O exit`: preview back on Cloud in 3.3 s (chip showed "reconnecting…"). 51 s network
+stall: ssh noticed after ~17 s, preview back on Cloud 1.8 s after the network returned. Watchdog stopped for
+40 s (a sleep): reopened 3 s after resuming. Refused port: retried, then named the paused-instance cause.
+`disconnect`: watchdog stopped, nothing reopened.

@@ -520,13 +520,16 @@ fn preview_on(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, cy: f32) -> f
     let on_cloud = app.cloud.source == Some(Source::Cloud);
     let rtt = status.as_ref().and_then(|s| s.rtt_ms).map(|r| format!(" {r:.0} ms")).unwrap_or_default();
     let ready = status.as_ref().is_some_and(|s| s.ready);
+    // It was connected and lost it (a network blip; the client retries and `cloud.sh`'s watchdog
+    // reopens the tunnel, CR11): "reconnecting", not "offline".
+    let gone = if status.as_ref().is_some_and(|s| s.server.is_some() && !s.refused) { "reconnecting…" } else { "cloud offline" };
     let label = match mode.as_str() {
         "cloud" if on_cloud => format!("Preview: Cloud{rtt}"),
         "cloud" if status.as_ref().is_some_and(|s| s.connected) => "Preview: Cloud (loading)".to_string(),
-        "cloud" => "Preview: Mac (cloud offline)".to_string(),
+        "cloud" => format!("Preview: Mac ({gone})"),
         "auto" if on_cloud => format!("Preview: Auto · Cloud{rtt}"),
         "auto" if ready => "Preview: Auto · Mac".to_string(),
-        "auto" => "Preview: Auto · Mac (cloud offline)".to_string(),
+        "auto" => format!("Preview: Auto · Mac ({gone})"),
         _ => "Preview: This Mac".to_string(),
     };
     let tip = match &status {
@@ -538,6 +541,8 @@ fn preview_on(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, cy: f32) -> f
                     "ready"
                 } else if s.connected {
                     "loading the project"
+                } else if s.server.is_some() {
+                    "connection lost, reconnecting"
                 } else {
                     "not connected"
                 },

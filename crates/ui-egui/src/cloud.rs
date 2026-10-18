@@ -202,7 +202,9 @@ impl CloudFrames {
             stop: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
-        let client = FrameClient::connect(addr, token, "effectcraft-app", Backoff::default());
+        // Retry at least every 2 s: the address is the local end of the ssh tunnel, so an attempt
+        // is cheap, and the frames come back soon after `cloud.sh`'s watchdog reopens it (CR11).
+        let client = FrameClient::connect(addr, token, "effectcraft-app", Backoff { max: Duration::from_secs(2), ..Backoff::default() });
         let link = Link {
             me: tx.clone(),
             preflight: Preflight::Unknown,

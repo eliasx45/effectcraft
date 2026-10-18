@@ -19,7 +19,10 @@ CONFIG_DIR="${EFFECTCRAFT_CONFIG_DIR:-$HOME/Library/Application Support/EffectCr
 STATE="$CONFIG_DIR/cloud-connection.env"      # ip, port, remote ports: no secrets
 TOKEN_FILE="$CONFIG_DIR/cloud-frame-token"    # the app reads it (CR5)
 SSH_KEY="${EC_CLOUD_KEY:-$HOME/.ssh/id_ed25519}"
-SOCK="/tmp/ec-cloud-$(id -u).sock"            # ssh ControlMaster = the tunnel
+SOCK="${EC_CLOUD_SOCK:-/tmp/ec-cloud-$(id -u).sock}"   # ssh ControlMaster = the tunnel
+WD_PID="$CONFIG_DIR/cloud-watchdog.pid"         # the tunnel watchdog (CR11)
+WD_LOG="$CONFIG_DIR/cloud-watchdog.log"
+WD_STATE="$CONFIG_DIR/cloud-watchdog.state"
 REMOTE_DIR=/workspace/effectcraft
 SKILL_SCRIPTS="$HOME/.claude/skills/effectcraft-remote-gpu/scripts"
 BANNER='vast.ai|Have fun|AI agents'
@@ -39,6 +42,7 @@ cloud.sh connect root@IP -p PORT [options]   check, build, mirror, start the ser
   --no-mirror             skip the media/fonts mirror
 cloud.sh status          tunnel, server commit, GPU, free VRAM/disk, pending uploads
 cloud.sh disconnect      app back to This Mac, close the tunnel, stop the server process (the instance stays: destroy it yourself)
+cloud.sh tunnel          reopen the tunnel and (re)start its watchdog, nothing else (no build, no mirror, no server restart)
 EOF
 }
 
@@ -64,9 +68,9 @@ load_state() {
 }
 
 # ---------- ssh ----------
-ssh_opts() {
-  printf '%s\n' -o IdentitiesOnly=yes -i "$SSH_KEY" -p "$SSH_PORT" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
-    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o LogLevel=ERROR
+ssh_opts() { # ssh_opts [CONNECT_TIMEOUT] [ALIVE_INTERVAL]   (ssh keeps an option's first value: set them here)
+  printf '%s\n' -o IdentitiesOnly=yes -i "$SSH_KEY" -p "$SSH_PORT" -o ConnectTimeout="${1:-15}" -o StrictHostKeyChecking=accept-new \
+    -o ServerAliveInterval="${2:-15}" -o ServerAliveCountMax=3 -o LogLevel=ERROR
 }
 rssh() { # rssh 'remote command'   (banner filtered)
   local opts=(); while IFS= read -r l; do opts+=("$l"); done < <(ssh_opts)
@@ -129,18 +133,106 @@ ensure_library_token() {
   esac
 }
 tunnel_up() { ssh -S "$SOCK" -O check "$TARGET" >/dev/null 2>&1; }
+# The tunnel's ssh notices a dead network within 15 s (5 s keepalives, 3 missed) so the watchdog
+# can reopen it; EC_CLOUD_SSH_OPTS adds ssh options (tests put a ProxyCommand there).
+tunnel_ssh() { # tunnel_ssh: start the ControlMaster; prints ssh's error, returns its status
+  local opts=(); while IFS= read -r l; do opts+=("$l"); done < <(ssh_opts 5 5)
+  local extra=(); [ -n "${EC_CLOUD_SSH_OPTS:-}" ] && read -r -a extra <<<"$EC_CLOUD_SSH_OPTS"
+  ssh "${opts[@]}" ${extra[@]+"${extra[@]}"} -o ExitOnForwardFailure=yes -o BatchMode=yes \
+    -M -S "$SOCK" -f -N -L "127.0.0.1:$LOCAL_PORT:127.0.0.1:$FRAMES_PORT" "$TARGET" 2>&1 | quiet_banner
+  tunnel_up
+}
 tunnel_open() {
   if tunnel_up; then return 0; fi
   rm -f "$SOCK"
   if lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     die "port $LOCAL_PORT on this Mac is taken by another program (not our tunnel). Use --local-port N."
   fi
-  local opts=(); while IFS= read -r l; do opts+=("$l"); done < <(ssh_opts)
-  ssh "${opts[@]}" -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-    -M -S "$SOCK" -f -N -L "127.0.0.1:$LOCAL_PORT:127.0.0.1:$FRAMES_PORT" "$TARGET" 2>&1 | quiet_banner
-  tunnel_up || die "the SSH tunnel did not start."
+  tunnel_ssh || die "the SSH tunnel did not start."
 }
-tunnel_close() { if tunnel_up; then ssh -S "$SOCK" -O exit "$TARGET" >/dev/null 2>&1 || true; fi; rm -f "$SOCK"; }
+tunnel_close() {
+  local pid; pid="$(ssh -S "$SOCK" -O check "$TARGET" 2>&1 | sed -n 's/.*pid=\([0-9]*\).*/\1/p')"
+  if [ -n "$pid" ]; then
+    ssh -S "$SOCK" -O exit "$TARGET" >/dev/null 2>&1 || true
+    sleep 0.3; kill "$pid" 2>/dev/null || true   # a master hung on a dead network
+  fi
+  rm -f "$SOCK"
+}
+
+# ---------- tunnel watchdog (CR11) ----------
+# A loop in its own session (survives the terminal or agent that ran connect), started by
+# connect/tunnel, stopped by disconnect. Every 2 s it checks the ControlMaster; when it is gone
+# (network blip, sleep, `ssh -O exit`) it reopens it, retrying quickly, then more slowly when the
+# machine stays unreachable (an interruptible instance may be paused: outbid). It never rebuilds
+# or restarts the server. It exits when the state file goes or names another machine, so it
+# can't fight a deliberate disconnect. Log: $WD_LOG; one-line state for `status`: $WD_STATE.
+wd_running() { local p; p="$(cat "$WD_PID" 2>/dev/null)" && [ -n "$p" ] && kill -0 "$p" 2>/dev/null && ps -o command= -p "$p" | grep -q 'cloud.sh _watch'; }
+wd_stop() {
+  local p; p="$(cat "$WD_PID" 2>/dev/null)" || true
+  if wd_running; then kill "$p" 2>/dev/null || true; for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.2; done; fi
+  rm -f "$WD_PID"
+}
+wd_start() {
+  wd_stop
+  # perl's setsid: a new session, so closing the terminal (or the agent's shell) doesn't stop it.
+  EC_CLOUD_SOCK="$SOCK" EFFECTCRAFT_CONFIG_DIR="$CONFIG_DIR" perl -e 'use POSIX "setsid"; fork and exit; setsid; exec @ARGV' \
+    "$REPO/scripts/fork/cloud.sh" _watch </dev/null >>"$WD_LOG" 2>&1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do wd_running && return 0; sleep 0.2; done
+  say "   ⚠️  the tunnel watchdog did not start (log: $WD_LOG)"
+}
+wd_log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+cmd_watch() {
+  load_state
+  echo $$ >"$WD_PID"
+  trap 'wd_log "stopped"; rm -f "$WD_STATE"; exit 0' TERM INT
+  local me="$TARGET:$SSH_PORT" last now gap down_since="" tries=0 drops=0 wait=2 err="" note
+  wd_log "watching the tunnel 127.0.0.1:$LOCAL_PORT → $TARGET -p $SSH_PORT:$FRAMES_PORT (pid $$)"
+  # Keep the log small.
+  [ "$(wc -c <"$WD_LOG" 2>/dev/null || echo 0)" -gt 1000000 ] && { tail -n 2000 "$WD_LOG" >"$WD_LOG.tmp" && mv "$WD_LOG.tmp" "$WD_LOG"; } || true
+  last=$(date +%s)
+  while :; do
+    [ -f "$STATE" ] && [ "$(state_get target):$(state_get ssh_port)" = "$me" ] || { wd_log "connection state gone or changed: stopping"; rm -f "$WD_STATE" "$WD_PID"; exit 0; }
+    now=$(date +%s); gap=$((now - last)); last=$now
+    if [ "$gap" -gt 30 ] && [ -z "$down_since" ] && tunnel_up; then
+      # The Mac slept (or this loop was stopped): the connection under the tunnel is most
+      # likely dead, and ssh would only notice in 15 s. Reopen now.
+      wd_log "Mac awake after ${gap} s: reopening the tunnel"
+      tunnel_close
+    fi
+    if tunnel_up; then
+      if [ -n "$down_since" ]; then
+        wd_log "✅ tunnel back after $((now - down_since)) s ($tries attempts)"
+        down_since=""; tries=0; wait=2
+      fi
+      printf 'up since=%s drops=%s\n' "${up_since:=$now}" "$drops" >"$WD_STATE"
+    else
+      if [ -z "$down_since" ]; then
+        down_since=$now; drops=$((drops + 1)); up_since=""
+        wd_log "⚠️  tunnel down (drop $drops): reopening"
+      fi
+      rm -f "$SOCK"
+      tries=$((tries + 1))
+      if lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        err="port $LOCAL_PORT is taken by another program"
+      else
+        err="$(tunnel_ssh 2>&1 | tr '\n' ' ' | cut -c1-200)" && err=""
+      fi
+      if [ -z "$err" ] && tunnel_up; then continue; fi
+      local down=$((now - down_since))
+      if ! scutil -r "${TARGET#*@}" 2>/dev/null | grep -q '^Reachable'; then note="this Mac is offline"
+      elif [ "$down" -ge 20 ] && printf '%s' "$err" | grep -qi 'refused'; then note="the machine refuses ssh: the instance is most likely paused (outbid, if interruptible) or stopped; check the vast.ai console"
+      elif [ "$down" -ge 60 ]; then note="the machine has not answered for $((down / 60)) min: an interruptible instance may be paused (outbid) or stopped; check the vast.ai console"
+      else note="retrying"; fi
+      # Quick retries for a blip, then slower: an unreachable machine is no reason to spin.
+      if [ "$down" -lt 120 ]; then wait=2; elif [ "$down" -lt 600 ]; then wait=15; else wait=60; fi
+      if [ "$tries" -le 3 ] || [ $((tries % 10)) -eq 0 ] || [ "$wait" -gt 2 ]; then wd_log "   attempt $tries failed: ${err:-no tunnel} ($note)"; fi
+      printf 'down since=%s drops=%s tries=%s note=%s\n' "$down_since" "$drops" "$tries" "$note" >"$WD_STATE"
+      sleep "$wait" & wait $!; continue
+    fi
+    # (sleep in the background: a TERM from disconnect runs the trap at once, not after the sleep)
+    sleep 2 & wait $!
+  done
+}
 
 # ---------- remote scripts ----------
 REMOTE_PREFLIGHT='
@@ -394,7 +486,8 @@ EOF
   say "🔌 5/5 SSH tunnel 127.0.0.1:$LOCAL_PORT → machine:$FRAMES_PORT and the Mac app"
   tunnel_open
   state_write
-  say "   tunnel up"
+  wd_start
+  say "   tunnel up, watchdog pid $(cat "$WD_PID" 2>/dev/null) reopens it after a drop (log: $WD_LOG)"
   if app_up; then
     app_cmd prefs.set "$(jq -cn --arg a "127.0.0.1:$LOCAL_PORT" '{values:{"previews.cloudAddress":$a,"previews.previewOn":"cloud"}}')" >/dev/null || true
     local back; back="$(app_cmd prefs.get '{"key":"previews.previewOn"}' || true)"
@@ -407,10 +500,25 @@ EOF
 }
 
 # ---------- status ----------
+wd_status() {
+  if ! wd_running; then say "🐕 watchdog: not running (scripts/fork/cloud.sh tunnel starts it and reopens the tunnel)"; return; fi
+  local w; w="$(cat "$WD_STATE" 2>/dev/null || true)"
+  local since drops tries note; since="$(printf '%s' "$w" | sed -n 's/.*since=\([0-9]*\).*/\1/p')"
+  drops="$(printf '%s' "$w" | sed -n 's/.*drops=\([0-9]*\).*/\1/p')"; tries="$(printf '%s' "$w" | sed -n 's/.*tries=\([0-9]*\).*/\1/p')"
+  note="$(printf '%s' "$w" | sed -n 's/.*note=//p')"
+  case "$w" in
+    down*) say "🐕 watchdog pid $(cat "$WD_PID"): tunnel down for $(( $(date +%s) - since )) s, $tries attempts: $note" ;;
+    *) say "🐕 watchdog pid $(cat "$WD_PID"): ${drops:-0} drops reopened$( [ -n "$since" ] && echo ", up $(( ($(date +%s) - since) / 60 )) min")" ;;
+  esac
+  local last; last="$(grep -E 'tunnel down|tunnel back|awake' "$WD_LOG" 2>/dev/null | tail -2 | tr '\n' ';' | sed 's/;$//; s/;/ · /')"
+  [ -n "$last" ] && say "   last: $last (log: $WD_LOG)"
+  return 0
+}
 cmd_status() {
   load_state
   say "🔗 connection: $TARGET -p $SSH_PORT (saved $(state_get connected_at))"
-  if tunnel_up; then say "✅ tunnel up: 127.0.0.1:$LOCAL_PORT → machine:$FRAMES_PORT"; else say "❌ tunnel down (connect again to reopen it)"; fi
+  if tunnel_up; then say "✅ tunnel up: 127.0.0.1:$LOCAL_PORT → machine:$FRAMES_PORT"; else say "❌ tunnel down"; fi
+  wd_status
   local s; s="$(rbash "$FRAMES_PORT" <<<"$REMOTE_STATUS")" || true
   if [ -z "$(printf '%s' "$s" | parse_kv gpu)" ]; then say "❌ machine not reachable over ssh"; else
     local mac_commit; mac_commit="$(git -C "$REPO" rev-parse main)"
@@ -430,6 +538,16 @@ cmd_status() {
   else say "🍎 app: not listening on control port $APP_PORT"; fi
 }
 
+# ---------- tunnel only ----------
+cmd_tunnel() {
+  load_state
+  APP_PORT="${APP_PORT:-9877}"
+  wd_stop
+  tunnel_open
+  wd_start
+  say "✅ tunnel up: 127.0.0.1:$LOCAL_PORT → $TARGET:$FRAMES_PORT; watchdog pid $(cat "$WD_PID" 2>/dev/null) (log: $WD_LOG)"
+}
+
 # ---------- disconnect ----------
 cmd_disconnect() {
   load_state
@@ -438,7 +556,7 @@ cmd_disconnect() {
     app_cmd prefs.set '{"values":{"previews.previewOn":"local"}}' >/dev/null || true
     say "🍎 app: Preview On = This Mac"
   else say "🍎 app not reachable on $APP_PORT (set Preview On = This Mac yourself if it is open)"; fi
-  tunnel_close; say "🔌 tunnel closed"
+  wd_stop; tunnel_close; say "🔌 tunnel closed (watchdog stopped)"
   rbash "$FRAMES_PORT" <<<"$REMOTE_STOP" | sed 's/^/🚀 /' || say "⚠️  could not reach the machine to stop the server (it may be gone already)"
   rm -f "$STATE"
   say "✅ Disconnected. The rented instance is still running and billing: destroy it in the vast.ai console when you are done."
@@ -448,6 +566,8 @@ case "${1:-}" in
   connect) shift; cmd_connect "$@" ;;
   status) shift; cmd_status "$@" ;;
   disconnect) shift; cmd_disconnect "$@" ;;
+  tunnel) shift; cmd_tunnel "$@" ;;
+  _watch) shift; cmd_watch; exit 0 ;;
   -h|--help|help|"") usage ;;
   *) usage; exit 2 ;;
 esac
