@@ -429,3 +429,72 @@ fn a_tab_dropped_on_a_stacked_panel_joins_its_frame() {
     let s = serde_json::to_string(&dock(&h)).unwrap();
     assert_eq!(serde_json::from_str::<DockNode>(&s).unwrap(), dock(&h));
 }
+
+/// The app with comps A, B and C open as Timeline tabs (C in front), driven through the control
+/// channel.
+struct Driver {
+    h: Harness<'static, EffectcraftApp>,
+    tx: std::sync::mpsc::Sender<effectcraft_ui_egui::ControlRequest>,
+}
+
+impl Driver {
+    fn new() -> (Self, [u64; 3]) {
+        let mut s = Session::default();
+        let ids =
+            ["A", "B", "C"].map(|n| s.execute("comp.new", json!({"name": n, "width": 320, "height": 180, "duration": 4})).unwrap()["comp"].as_u64().unwrap());
+        s.state.open_comps = ids.iter().map(|c| ItemId(*c)).collect();
+        s.state.active_comp = Some(ItemId(ids[2]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = EffectcraftApp::new(s).with_control(rx);
+        app.ui.start_screen = false;
+        let mut d = Self { h: Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(move |_| app), tx };
+        d.frames(3);
+        (d, ids)
+    }
+
+    /// Frames as the app runs them (control requests are read in the raw input hook).
+    fn frames(&mut self, n: usize) {
+        for _ in 0..n {
+            let ctx = self.h.ctx.clone();
+            let mut raw = std::mem::take(self.h.input_mut());
+            eframe::App::raw_input_hook(self.h.state_mut(), &ctx, &mut raw);
+            *self.h.input_mut() = raw;
+            self.h.step();
+        }
+    }
+
+    fn drag(&mut self, from: &str, to: serde_json::Value) {
+        let (request, reply) = effectcraft_ui_egui::ControlRequest::new("ui.drag", json!({"from": {"id": from}, "to": to, "steps": 8}));
+        self.tx.send(request).unwrap();
+        for _ in 0..80 {
+            self.frames(1);
+            if let Ok(r) = reply.try_recv() {
+                assert_eq!(r["ok"], true, "{r}");
+                self.frames(3);
+                return;
+            }
+        }
+        panic!("no reply to ui.drag");
+    }
+}
+
+#[test]
+fn dragging_a_comp_tab_along_the_strip_reorders_the_comps_and_out_of_it_undocks() {
+    let (mut d, [a, b, c]) = Driver::new();
+    let dock = d.h.state().ui.dock.clone();
+    let tab = |c: u64| format!("panel.tab.Timeline.{c}");
+    // A dropped on the right half of C goes after it; the Timeline stays where it is.
+    d.drag(&tab(a), json!({"id": tab(c), "fx": 0.8, "fy": 0.5}));
+    assert_eq!(open_comps(&d.h), vec![b, c, a]);
+    assert_eq!(d.h.state().ui.dock, dock, "a comp tab drag along the strip must not move the panel");
+    assert!(d.h.state().ui.floating.is_empty());
+    // Back before B (the front comp stays in front).
+    d.drag(&tab(a), json!({"id": tab(b), "fx": 0.2, "fy": 0.5}));
+    assert_eq!(open_comps(&d.h), vec![a, b, c]);
+    assert_eq!(d.h.state().session.state.active_comp, Some(ItemId(c)));
+    // Dragged well out of the strip it drags the whole Timeline panel (re-dock or undock), and
+    // the tab order is kept.
+    d.drag(&tab(c), json!({"id": tab(c), "fx": 0.5, "fy": 12.0}));
+    assert_eq!(open_comps(&d.h), vec![a, b, c]);
+    assert!(d.h.state().ui.dock != dock || !d.h.state().ui.floating.is_empty(), "dragging out of the strip must still move the Timeline panel");
+}
