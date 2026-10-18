@@ -434,10 +434,15 @@ pub fn activate(app: &mut EffectcraftApp, ctx: &egui::Context, menu: &NativeMenu
         ctx.request_repaint();
         return Ok(Value::Null);
     }
-    if ctx.egui_wants_keyboard_input() {
+    // (A field in an undocked panel's own window counts: the menu bar answers for every window.)
+    let typing_window = crate::float_windows::typing_window(app, ctx);
+    if ctx.egui_wants_keyboard_input() || typing_window.is_some() {
         let clip = if command == "edit.paste" { app.hooks.clipboard_text.as_ref().and_then(|f| f()) } else { None };
         if let Some(events) = text_field_event(&command, clip) {
-            app.synthetic.extend(events);
+            match typing_window {
+                Some(w) => crate::float_windows::send_keys_to(app, ctx, w, events),
+                None => app.synthetic.extend(events),
+            }
             ctx.request_repaint();
             return Ok(Value::Null);
         }

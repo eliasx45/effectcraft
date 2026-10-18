@@ -103,7 +103,8 @@ fn rgb(c: [f32; 4]) -> [f32; 4] {
 
 /// Hue/Saturation with colour ranges (Channel Control); Master and Colorize alone run in the
 /// base `pointwise` kernel.
-pub(crate) fn hue_saturation(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+/// `b` may be 8 bpc codes (the kernel reads them).
+pub(crate) fn hue_saturation(e: &mut Enc, ctx: &EffectCtx, b: crate::effects::PBuf) -> Option<GBuf> {
     let pr = ctx.params;
     let f = |id: String, d: f64| pr.get(&id).map(|v| v.as_f64()).unwrap_or(d) as f32;
     let mut data = vec![];
@@ -126,7 +127,11 @@ pub(crate) fn hue_saturation(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GB
     p.u[0] = [14, pr.b("colorize") as u32, (data.len() / 7) as u32, 0];
     p.f[0] = [g("hue") / 360.0, g("saturation") / 100.0, g("lightness") / 100.0, 0.0];
     p.f[1] = [g("colorizeHue") / 360.0, g("colorizeSaturation") / 100.0, g("colorizeLightness") / 100.0, 0.0];
-    run(e, &p, b, Some(data))
+    let buf = e.data(&data);
+    let out = e.scratch(b.img.width(), b.img.height());
+    // As `run`.
+    crate::codes::pixels(e, "fxt_point", &p, &b.img, None, &out.clone().into(), Some(&buf));
+    Some(GBuf { img: out, offset: b.offset, scale: b.scale })
 }
 
 /// Levels with Red / Green / Blue / Alpha controls (the RGB controls alone run in the base

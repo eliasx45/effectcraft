@@ -5,6 +5,7 @@ use effectcraft_effects::{Buf, EffectCtx};
 use effectcraft_raster::Sampling;
 use effectcraft_render::FxStep;
 
+use crate::codes::{self, Pixels};
 use crate::context::{Enc, GpuImage, Params};
 use crate::ops;
 
@@ -41,6 +42,51 @@ impl GBuf {
         self.offset[0] += pad as f64;
         self.offset[1] += pad as f64;
         Some(())
+    }
+}
+
+/// An effect's input buffer whose image may still be 8 bpc codes (see `codes`): the effects
+/// with kernels reading codes ([`apply_px`]) take it as it is, any other decodes it first.
+pub(crate) struct PBuf {
+    pub img: Pixels,
+    pub offset: [f64; 2],
+    pub scale: f64,
+}
+
+impl From<GBuf> for PBuf {
+    fn from(b: GBuf) -> PBuf {
+        PBuf { img: b.img.into(), offset: b.offset, scale: b.scale }
+    }
+}
+
+impl PBuf {
+    /// [`GBuf::pad`] (codes stay codes).
+    fn pad(&mut self, e: &mut Enc, pad: u32) -> Option<()> {
+        if pad == 0 {
+            return Some(());
+        }
+        match &self.img {
+            Pixels::Float(img) => {
+                let mut b = GBuf { img: img.clone(), offset: self.offset, scale: self.scale };
+                b.pad(e, pad)?;
+                *self = b.into();
+            }
+            Pixels::Codes(c) => {
+                self.img = Pixels::Codes(codes::pad(e, c, pad)?);
+                self.offset[0] += pad as f64;
+                self.offset[1] += pad as f64;
+            }
+        }
+        Some(())
+    }
+
+    /// The buffer with its image as floats (codes decoded).
+    pub fn float(self, e: &mut Enc) -> Option<GBuf> {
+        Some(GBuf { img: self.img.float(e)?, offset: self.offset, scale: self.scale })
+    }
+
+    fn with(&self, img: GpuImage) -> GBuf {
+        GBuf { img, offset: self.offset, scale: self.scale }
     }
 }
 
@@ -93,40 +139,50 @@ fn readback_buf(r: crate::deferred::Readback) -> Option<Buf> {
 
 /// An effect stack running on a GPU-resident image (adjustment layers): GPU chains stay on
 /// the device; CPU effects read the image back, run, and upload the result.
+/// The image may be 8 bpc codes: the first effects read them where their kernels can.
 pub(crate) struct GpuFx<'e, 'g> {
     e: &'e mut Enc<'g>,
-    b: Option<GBuf>,
+    b: Option<PBuf>,
     levels: Option<f32>,
 }
 
 impl<'e, 'g> GpuFx<'e, 'g> {
-    pub fn new(e: &'e mut Enc<'g>, img: GpuImage, offset: [f64; 2], scale: f64, levels: Option<f32>) -> Self {
-        GpuFx { e, b: Some(GBuf { img, offset, scale }), levels }
+    pub fn new(e: &'e mut Enc<'g>, img: impl Into<Pixels>, offset: [f64; 2], scale: f64, levels: Option<f32>) -> Self {
+        GpuFx { e, b: Some(PBuf { img: img.into(), offset, scale }), levels }
     }
 
     /// The result: (image, offset, scale); `None` when a step failed.
     pub fn finish(self) -> Option<(GpuImage, [f64; 2], f64)> {
-        self.b.map(|b| (b.img, b.offset, b.scale))
+        let b = self.b?.float(self.e)?;
+        Some((b.img, b.offset, b.scale))
+    }
+
+    /// The image as floats (codes decoded); `None` (and no image) when that failed.
+    fn float(&mut self) -> Option<GBuf> {
+        let b = self.b.take()?.float(self.e)?;
+        self.b = Some(PBuf { img: b.img.clone().into(), offset: b.offset, scale: b.scale });
+        Some(b)
     }
 }
 
 impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
         let Some(b) = &self.b else { return false };
-        let cur = GBuf { img: b.img.clone(), offset: b.offset, scale: b.scale };
-        let Some(cur) = apply_chain(self.e, steps, cur, self.levels) else { return false };
+        let cur = PBuf { img: b.img.clone(), offset: b.offset, scale: b.scale };
+        let Some(cur) = apply_chain_px(self.e, steps, cur, self.levels) else { return false };
         self.b = Some(cur);
         true
     }
 
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
         let Some(b) = self.b.take() else { return };
-        let Some(img) = self.e.download(&b.img) else { return };
+        // Codes read back as 4 bytes a pixel, decoded with the same table.
+        let Some(img) = self.e.download_px(&b.img) else { return };
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
-        self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
+        self.b = self.e.g.upload_image(&out.img).map(|img| PBuf { img: img.into(), offset: out.offset, scale: out.scale });
     }
     fn effect_canvas(&mut self, size: [f64; 2]) {
-        let Some(b) = &self.b else { return };
+        let Some(b) = self.float() else { return };
         let Some(([width, height], pad)) = effectcraft_render::effect_canvas_extent([b.img.width, b.img.height], b.offset, b.scale, size) else {
             return;
         };
@@ -149,7 +205,7 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
             self.b = None;
             return;
         }
-        self.b = Some(GBuf { img: out, offset: [b.offset[0] + f64::from(pad[0]), b.offset[1] + f64::from(pad[1])], scale: b.scale });
+        self.b = Some(PBuf { img: out.into(), offset: [b.offset[0] + f64::from(pad[0]), b.offset[1] + f64::from(pad[1])], scale: b.scale });
     }
 
     fn shift(&mut self, d: [f64; 2]) {
@@ -192,22 +248,91 @@ pub(crate) fn apply_chain(e: &mut Enc, chain: &[FxStep], mut b: GBuf, levels: Op
     Some(b)
 }
 
+/// [`apply_chain`] on a buffer that may be 8 bpc codes: while it is, each effect whose kernels
+/// read codes ([`apply_px`]) runs on them directly (no decoded copy); the first other effect
+/// decodes it and the rest of the chain runs as [`apply_chain`].
+pub(crate) fn apply_chain_px(e: &mut Enc, chain: &[FxStep], mut b: PBuf, levels: Option<f32>) -> Option<PBuf> {
+    if !b.img.is_codes() {
+        let b = b.float(e)?;
+        return apply_chain(e, chain, b, levels).map(Into::into);
+    }
+    e.take_missing();
+    let mut remaining = chain;
+    while let Some((step, rest)) = remaining.split_first() {
+        if !b.img.is_codes() || !reads_codes(step.spec.id) {
+            break;
+        }
+        b = apply_px(e, step.spec.id, &step.ctx, b)?;
+        if e.take_missing() {
+            return None;
+        }
+        if let Some(l) = levels {
+            b.img = match b.img {
+                Pixels::Float(img) => Pixels::Float(ops::quantize(e, &img, l)),
+                // Codes are on the 8 bpc grid already (`ops::quantize` keeps them as they are).
+                codes @ Pixels::Codes(_) if l == codes::LEVELS => codes,
+                codes => {
+                    let f = codes.float(e)?;
+                    Pixels::Float(ops::quantize(e, &f, l))
+                }
+            };
+        }
+        if e.take_missing() {
+            return None;
+        }
+        remaining = rest;
+    }
+    if remaining.is_empty() {
+        return Some(b);
+    }
+    let b = b.float(e)?;
+    apply_chain(e, remaining, b, levels).map(Into::into)
+}
+
+/// Effects with kernels reading 8 bpc codes (see [`apply_px`]); none of them is fused
+/// (`fusion`), so [`apply_chain`] would run each through [`apply`] too.
+fn reads_codes(id: &str) -> bool {
+    matches!(
+        id,
+        "ec.blur.gaussian" | "ec.blur.fastbox" | "ec.perspective.dropshadow" | "ec.color.huesaturation" | "ec.generate.fill" | "ec.generate.gradientramp"
+    )
+}
+
+/// [`apply`] on a buffer that may be codes: the [`reads_codes`] effects as [`apply`] runs them,
+/// their first kernels reading the codes.
+fn apply_px(e: &mut Enc, id: &str, ctx: &EffectCtx, b: PBuf) -> Option<PBuf> {
+    if !effectcraft_effects::catalog::gpu_supported(id, ctx) {
+        return None;
+    }
+    match id {
+        "ec.blur.gaussian" => gaussian_px(e, ctx, b),
+        "ec.blur.fastbox" => box_blur_px(e, ctx, b),
+        "ec.perspective.dropshadow" => drop_shadow_px(e, ctx, b).map(Into::into),
+        "ec.color.huesaturation" if !effectcraft_effects::huesat_ranges_identity(ctx) => crate::fx_tone::hue_saturation(e, ctx, b).map(Into::into),
+        "ec.color.huesaturation" | "ec.generate.fill" | "ec.generate.gradientramp" => pointwise_px(e, id, ctx, b).map(Into::into),
+        _ => {
+            let b = b.float(e)?;
+            apply(e, id, ctx, b).map(Into::into)
+        }
+    }
+}
+
 fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     // Controls the kernels do not implement render on the CPU.
     if !effectcraft_effects::catalog::gpu_supported(id, ctx) {
         return None;
     }
     match id {
-        "ec.blur.gaussian" => gaussian(e, ctx, b),
-        "ec.blur.fastbox" => box_blur(e, ctx, b),
+        "ec.blur.gaussian" => gaussian_px(e, ctx, b.into())?.float(e),
+        "ec.blur.fastbox" => box_blur_px(e, ctx, b.into())?.float(e),
         "ec.blur.directional" => directional(e, ctx, b),
         "ec.stylize.glow" if crate::fx_stylize::glow_extra(ctx) => crate::fx_stylize::glow(e, ctx, b),
         "ec.distort.transform" if crate::fx_stylize::transform_blur(ctx) => crate::fx_stylize::transform(e, ctx, b),
         "ec.stylize.glow" => glow(e, ctx, b),
-        "ec.perspective.dropshadow" => drop_shadow(e, ctx, b),
+        "ec.perspective.dropshadow" => drop_shadow_px(e, ctx, b.into()),
         "ec.distort.transform" => transform(e, ctx, b),
         "ec.color.curves" => curves(e, ctx, b),
-        "ec.color.huesaturation" if !effectcraft_effects::huesat_ranges_identity(ctx) => crate::fx_tone::hue_saturation(e, ctx, b),
+        "ec.color.huesaturation" if !effectcraft_effects::huesat_ranges_identity(ctx) => crate::fx_tone::hue_saturation(e, ctx, b.into()),
         "ec.color.levels" if !effectcraft_effects::levels_channels_identity(ctx) => crate::fx_tone::levels(e, ctx, b),
         "ec.channel.invert" if (4..=11).contains(&ctx.params.e("channel")) => crate::fx_tone::invert(e, ctx, b),
         "ec.noise.fractal" if crate::fx_noise::fractal_extra(ctx) => crate::fx_noise::fractal(e, ctx, b, false),
@@ -233,7 +358,7 @@ fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         _ if crate::fx_pixel2::IDS.contains(&id) => crate::fx_pixel2::apply(e, id, ctx, b),
         _ if crate::fx_gen2::IDS.contains(&id) => crate::fx_gen2::apply(e, id, ctx, b),
         _ if crate::fx_deepglow::IDS.contains(&id) => crate::fx_deepglow::apply(e, id, ctx, b),
-        _ => pointwise(e, id, ctx, b),
+        _ => pointwise_px(e, id, ctx, b.into()),
     }
 }
 
@@ -276,11 +401,40 @@ pub(crate) fn box_passes_with(e: &mut Enc, h: &str, img: &GpuImage, rx: &[usize]
     cur
 }
 
+/// [`box_passes`] from an image that may be 8 bpc codes: the first pass reads the codes, the
+/// rest run as [`box_passes`] (no passes: the image as it is).
+pub(crate) fn box_passes_px(e: &mut Enc, img: &Pixels, rx: &[usize], ry: &[usize], repeat: bool) -> Pixels {
+    if let Pixels::Float(f) = img {
+        return box_passes(e, f, rx, ry, repeat).into();
+    }
+    let first = match rx.iter().position(|&r| r > 0) {
+        Some(i) => rx.get(i).zip(rx.get(i + 1..)).map(|(&r, rest)| (false, r, rest, ry)),
+        None => ry.iter().position(|&r| r > 0).and_then(|j| ry.get(j).zip(ry.get(j + 1..))).map(|(&r, rest)| (true, r, &[][..], rest)),
+    };
+    let Some((vertical, r, rx, ry)) = first else { return img.clone() };
+    // The pass as `box_passes_with` runs it.
+    let (w, h) = img.size();
+    let block = if vertical { (4 * r).clamp(32, 256) } else { 256 } as u32;
+    let (lines, n) = if vertical { (w, h) } else { (h, w) };
+    let mut p = Params::default();
+    p.u[0] = [r as u32, repeat as u32, block, 0];
+    let out = e.scratch(w, h);
+    codes::dispatch(e, if vertical { "box_v" } else { "box_h" }, &p, img, None, &out.clone().into(), None, (lines.div_ceil(64), n.div_ceil(block)));
+    box_passes(e, &out, rx, ry, repeat).into()
+}
+
 /// raster::gaussian_blur (3 box passes per axis).
 pub(crate) fn gaussian_blur(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repeat: bool) -> GpuImage {
     let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
     let ry = if sy > 0.05 { box_radii(sy, 3) } else { vec![] };
     box_passes(e, img, &rx, &ry, repeat)
+}
+
+/// [`gaussian_blur`] from an image that may be codes ([`box_passes_px`]).
+fn gaussian_blur_px(e: &mut Enc, img: &Pixels, sx: f64, sy: f64, repeat: bool) -> Pixels {
+    let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
+    let ry = if sy > 0.05 { box_radii(sy, 3) } else { vec![] };
+    box_passes_px(e, img, &rx, &ry, repeat)
 }
 
 fn dims_xy(dim: u32) -> (f64, f64) {
@@ -293,7 +447,7 @@ fn dims_xy(dim: u32) -> (f64, f64) {
 
 /// Gaussian Blur (as `effectcraft_effects`' CPU one: σ from [`effectcraft_effects::gaussian_sigma`],
 /// comp pixels on a layer whose effects run in comp space).
-fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+fn gaussian_px(e: &mut Enc, ctx: &EffectCtx, mut b: PBuf) -> Option<PBuf> {
     let s = effectcraft_effects::gaussian_sigma(ctx.params.f("blurriness")) * b.scale;
     if s <= 0.0 {
         return Some(b);
@@ -305,11 +459,11 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if !repeat && !ctx.adjustment {
         b.pad(e, (sx.max(sy) * 3.0).ceil().min(1.0e5) as u32)?;
     }
-    b.img = gaussian_blur(e, &b.img, sx, sy, repeat || ctx.adjustment);
+    b.img = gaussian_blur_px(e, &b.img, sx, sy, repeat || ctx.adjustment);
     Some(b)
 }
 
-fn box_blur(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+fn box_blur_px(e: &mut Enc, ctx: &EffectCtx, mut b: PBuf) -> Option<PBuf> {
     let r = ctx.params.f("radius").max(0.0) * b.scale;
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
     let [cx, cy] = ctx.env.comp_px();
@@ -323,7 +477,7 @@ fn box_blur(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if !repeat && !ctx.adjustment {
         b.pad(e, (rx.max(ry) * it) as u32 + 1)?;
     }
-    b.img = box_passes(e, &b.img, &vec![rx; it], &vec![ry; it], repeat || ctx.adjustment);
+    b.img = box_passes_px(e, &b.img, &vec![rx; it], &vec![ry; it], repeat || ctx.adjustment);
     Some(b)
 }
 
@@ -392,7 +546,7 @@ pub(crate) fn glow_params(ctx: &EffectCtx) -> Params {
     p
 }
 
-fn drop_shadow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+fn drop_shadow_px(e: &mut Enc, ctx: &EffectCtx, mut b: PBuf) -> Option<GBuf> {
     let color = ctx.params.color("color");
     let opacity = ctx.params.f("opacity") as f32 / 100.0;
     let dir = ctx.params.f("direction").to_radians();
@@ -407,18 +561,18 @@ fn drop_shadow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let mut p = Params::default();
     p.f[0] = color;
     p.f[1] = [opacity, dx as f32, dy as f32, 0.0];
-    let mut sh = e.image(b.img.width, b.img.height);
-    e.pixels("shadow_make", &p, &b.img, None, &sh, None);
+    let (w, h) = b.img.size();
+    let mut sh = e.image(w, h);
+    codes::pixels(e, "shadow_make", &p, &b.img, None, &sh.clone().into(), None);
     if soft > 0.0 {
         sh = gaussian_blur(e, &sh, soft / 2.0, soft / 2.0, false);
     }
     if !only {
-        let out = e.scratch(b.img.width, b.img.height);
-        e.pixels("shadow_combine", &Params::default(), &sh, Some(&b.img), &out, None);
+        let out = e.scratch(w, h);
+        codes::pixels(e, "shadow_combine", &Params::default(), &sh.into(), Some(&b.img), &out.clone().into(), None);
         sh = out;
     }
-    b.img = sh;
-    Some(b)
+    Some(b.with(sh))
 }
 
 fn transform(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
@@ -593,11 +747,11 @@ pub(crate) fn pointwise_params(id: &str, ctx: &EffectCtx, offset: [f64; 2], scal
     Some(p)
 }
 
-fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+fn pointwise_px(e: &mut Enc, id: &str, ctx: &EffectCtx, b: PBuf) -> Option<GBuf> {
     let p = pointwise_params(id, ctx, b.offset, b.scale)?;
-    let out = e.scratch(b.img.width, b.img.height);
-    e.pixels("pointwise", &p, &b.img, None, &out, None);
-    Some(GBuf { img: out, ..b })
+    let out = e.scratch(b.img.width(), b.img.height());
+    codes::pixels(e, "pointwise", &p, &b.img, None, &out.clone().into(), None);
+    Some(b.with(out))
 }
 
 #[cfg(test)]
