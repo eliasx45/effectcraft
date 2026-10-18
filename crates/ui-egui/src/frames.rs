@@ -37,6 +37,7 @@ use effectcraft_gpu::{DisplayFrame, Gpu};
 use rayon::prelude::*;
 
 mod fingerprint;
+mod frame_keys;
 #[cfg(not(target_arch = "wasm32"))]
 mod landing;
 mod property_reuse;
@@ -618,6 +619,8 @@ pub struct RemotePrecache {
     pub opts: RenderOpts,
     /// Inclusive frame ranges, in the order they render.
     pub ranges: Vec<(i64, i64)>,
+    /// The frames' fingerprints, which name them in the server's frame cache.
+    pub prints: Option<Arc<effectcraft_engine::remote::FramePrints>>,
 }
 
 /// Whether a comp (or a comp it nests) has a layer with enabled effects.
@@ -692,6 +695,10 @@ pub struct Frames {
     pub times: Arc<times::RenderTimes>,
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
+    /// Footage salts by revision, for frame disk keys named by fingerprint ([`frame_keys`]).
+    salts: frame_keys::Salts,
+    /// Every frame's fingerprint per series ([`frame_keys::PrintTable`]).
+    tables: Arc<frame_keys::Tables>,
     #[cfg(not(target_arch = "wasm32"))]
     content_key_jobs: Arc<Mutex<ContentKeyJobs>>,
     gpu_retired: Arc<AtomicBool>,
@@ -772,6 +779,8 @@ impl Default for Frames {
             times: Arc::default(),
             playback_budget: Arc::default(),
             content_keys: Arc::default(),
+            salts: Arc::default(),
+            tables: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             content_key_jobs: Arc::default(),
             gpu_retired: Arc::default(),
@@ -1327,7 +1336,8 @@ impl Frames {
             Some(dc) => dc.generation(),
             None => self.cache.lock().map(|c| c.generation).unwrap_or(0),
         } ^ remote.map_or(0, |r| r.disk_generation().rotate_left(32));
-        let k = [base.revision, frames as u64, oh, generation, u64::from(local.is_some())];
+        let table = self.print_table(src, base, opts);
+        let k = [base.revision, frames as u64, oh, generation, u64::from(local.is_some()) | u64::from(table.is_some()) << 1];
         let ram = self.cached_frames(base);
         let in_ram = |f: &i64| ram.binary_search(f).is_ok();
         if let Ok(bar) = self.bar.lock()
@@ -1348,7 +1358,13 @@ impl Frames {
         };
         #[cfg(target_arch = "wasm32")]
         let content = content_key(&self.content_keys, &src.project, base.revision, base.comp);
-        let v: Vec<i64> = (0..frames.clamp(0, 100_000)).filter(|f| contains(disk_cache::frame_key(content, *f, base.scale, base.view ^ oh))).collect();
+        // Frames with a fingerprint are named by it ([`frame_keys`]), the others by the content key.
+        let v: Vec<i64> = (0..frames.clamp(0, 100_000))
+            .filter(|f| {
+                let at = FrameKey { frame: *f, ..*base };
+                contains(table.as_ref().and_then(|t| t.disk_key(&at, oh)).unwrap_or_else(|| disk_cache::frame_key(content, *f, base.scale, base.view ^ oh)))
+            })
+            .collect();
         if let Ok(mut bar) = self.bar.lock() {
             bar.disk.retain(|(s, ..)| *s != series);
             remember(&mut bar.disk, series, k, &v);
@@ -1385,8 +1401,33 @@ impl Frames {
     /// way, or the link isn't ready), try again shortly.
     pub fn precache_remote(&self, src: &RenderSource, base: &FrameKey, comp: ItemId, opts: RenderOpts, ranges: Vec<(i64, i64)>) -> Option<bool> {
         let remote = self.remote.as_ref().filter(|r| r.eager() && r.disk())?;
-        let Some(series) = self.cache_series(&src.project, base, &opts) else { return Some(false) };
-        Some(remote.precache(RemotePrecache { project: src.project.clone(), revision: base.revision, comp, series, opts, ranges }))
+        let Some(mut series) = self.cache_series(&src.project, base, &opts) else { return Some(false) };
+        // The server names the frames by their fingerprints too: an edit re-renders only the
+        // frames it changed.
+        let Some(table) = self.print_table(src, base, &opts) else { return Some(false) };
+        series.prints = table.prints.digest();
+        let prints = Some(Arc::new(table.prints.clone()));
+        Some(remote.precache(RemotePrecache { project: src.project.clone(), revision: base.revision, comp, series, opts, ranges, prints }))
+    }
+
+    /// The fingerprints of every frame of `base`'s series with `opts` ([`frame_keys::PrintTable`]);
+    /// native: computed on the frame pool, `None` until then.
+    fn print_table(&self, src: &RenderSource, base: &FrameKey, opts: &RenderOpts) -> Option<Arc<frame_keys::PrintTable>> {
+        let key = frame_keys::table_key(base, opts_hash(opts));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let pool = self.pool.clone();
+            let spawn = move |job: Box<dyn FnOnce() + Send>| match pool {
+                Some(p) => p.spawn(job),
+                None => rayon::spawn(job),
+            };
+            self.tables.get_or_request(spawn, &self.salts, self.ctx.as_ref(), src, key, ItemId(base.comp), *opts)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = src;
+            self.tables.get(&key)
+        }
     }
 
     pub fn set_budget(&self, bytes: usize) {
@@ -1522,7 +1563,9 @@ impl Frames {
         if self.is_cached(&key) || self.failed(&key) {
             return false;
         }
-        if dc.contains(disk_cache::Kind::Frame, frame_disk_key(&self.content_keys, &src.project, &key, opts_hash(&opts))) {
+        let oh = opts_hash(&opts);
+        let named = self.print_table(src, &key, &opts).and_then(|t| t.disk_key(&key, oh));
+        if dc.contains(disk_cache::Kind::Frame, named.unwrap_or_else(|| frame_disk_key(&self.content_keys, &src.project, &key, oh))) {
             return false;
         }
         let (w, h) = src.project.comp(comp).map_or((0, 0), |c| (c.width, c.height));
@@ -1669,6 +1712,7 @@ impl Frames {
             times: self.times.clone(),
             playback_budget: self.playback_budget.clone(),
             content_keys: self.content_keys.clone(),
+            salts: self.salts.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             content_key_jobs: self.content_key_jobs.clone(),
             gpu_retired: self.gpu_retired.clone(),
@@ -1864,6 +1908,8 @@ struct Worker {
     times: Arc<times::RenderTimes>,
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
+    /// Footage salts by revision, for frame disk keys named by fingerprint ([`frame_keys`]).
+    salts: frame_keys::Salts,
     #[cfg(not(target_arch = "wasm32"))]
     content_key_jobs: Arc<Mutex<ContentKeyJobs>>,
     gpu_retired: Arc<AtomicBool>,
@@ -1982,7 +2028,7 @@ impl Worker {
     /// Render the queued job that matters most right now. `false` when the queue was empty, or
     /// the job has to wait for memory (a finishing frame starts it, see [`Worker::release`]).
     fn run_next(&self) -> bool {
-        let Worker { queue, content_keys, .. } = self;
+        let Worker { queue, content_keys, salts, .. } = self;
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut job = {
             let Ok(mut q) = queue.lock() else { return false };
@@ -2030,7 +2076,17 @@ impl Worker {
             }
         }
         let t0 = web_time::Instant::now();
-        let disk = job.src.disk.as_ref().map(|dc| (dc.clone(), frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts))));
+        if job.disk_only && job.src.disk.is_some() {
+            job.print = fingerprint::of(&job.src, job.comp, job.t, job.opts);
+        }
+        // Named by its fingerprint when it has one: on disk, an edit elsewhere keeps it.
+        let disk = job.src.disk.as_ref().map(|dc| {
+            let key = match job.print {
+                Some(p) => frame_keys::print_disk_key(salts, &job.src.project, &job.key, p, opts_hash(&job.opts)),
+                None => frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts)),
+            };
+            (dc.clone(), key)
+        });
         if job.disk_only && disk.as_ref().is_none_or(|(dc, k)| dc.contains(disk_cache::Kind::Frame, *k)) {
             // Already on disk (or no disk cache any more): nothing to do.
             self.release(job.key, false);
@@ -2133,11 +2189,12 @@ impl Worker {
         self.finish_print(job.key, job.urgent, img, t0, job.print);
     }
 
+    #[cfg(test)]
     fn finish_key(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant) {
         self.finish_print(key, urgent, img, t0, None);
     }
 
-    /// [`Self::finish_key`] with the frame's fingerprint, if it has one.
+    /// Store a finished frame, stamped with its fingerprint if it has one, and release its job.
     fn finish_print(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant, print: Option<u64>) {
         if urgent && let Ok(mut l) = self.last.lock() {
             *l = t0.elapsed().as_secs_f64() * 1000.0;
@@ -2222,82 +2279,123 @@ impl Worker {
                 *b += 1;
             }
             started += 1;
-            let (key, urgent, epoch) = (job.key, job.urgent, job.epoch);
-            let t0 = web_time::Instant::now();
-            // The cloud (eager) never hashes the comp here (this may be the UI thread): its key
-            // goes along once a worker has the content key.
+            // The cloud (eager): a pool thread takes the frame's fingerprint first, so a frame the
+            // last edit didn't change is taken over from RAM instead of downloaded again, and the
+            // server names it by what it shows (its frame cache survives edits elsewhere).
+            #[cfg(not(target_arch = "wasm32"))]
+            if remote.eager() && !job.disk_only {
+                let (fw, link) = (self.clone(), link.clone());
+                self.spawn(move || fw.print_and_send(&link, job));
+                continue;
+            }
             let disk_key = if remote.eager() {
-                self.known_disk_key(&job.src.project, &key, &job.opts)
+                self.known_disk_key(&job.src.project, &job.key, &job.opts)
             } else {
-                remote.disk().then(|| frame_disk_key(&self.content_keys, &job.src.project, &key, opts_hash(&job.opts)))
+                remote.disk().then(|| frame_disk_key(&self.content_keys, &job.src.project, &job.key, opts_hash(&job.opts)))
             };
-            let fw = self.clone();
-            let refined = {
-                let fw = self.clone();
-                Box::new(move |f: RemoteFrame| {
-                    if fw.epoch.load(Ordering::Acquire) != epoch {
-                        return;
-                    }
-                    let Some(img) = egui_image(&f) else { return };
-                    if let Ok(mut c) = fw.cache.lock()
-                        && c.map.contains_key(&key)
-                    {
-                        c.insert(key, FrameImage::Cpu(Arc::new(img)));
-                    }
-                    if let Some(ctx) = &fw.ctx {
-                        ctx.request_repaint();
-                    }
-                }) as RemoteRefine
-            };
-            let rj = RemoteJob {
-                project: job.src.project.clone(),
-                revision: key.revision,
-                comp: job.comp,
-                t: job.t,
-                opts: job.opts,
-                disk_key,
-                urgent,
-                cancel: job.cancel.clone(),
-                refined: Some(refined),
-                timed: Some({
-                    let sink = self.times.clone();
-                    Box::new(move |t: times::FrameTimes| sink.put(&key, t)) as RemoteTimes
-                }),
-            };
-            let next = link.clone();
-            remote.start(
-                rj,
-                Box::new(move |r: Result<RemoteFrame, String>| {
-                    if let Ok(mut b) = next.busy.lock() {
-                        *b = b.saturating_sub(1);
-                    }
-                    match r.and_then(|f| egui_image(&f).ok_or_else(|| "the frame's size and pixels disagree".to_string())) {
-                        // Purge Caches since it was asked for: its pixels may be from before.
-                        Ok(_) if fw.epoch.load(Ordering::Acquire) != epoch => fw.release(key, urgent),
-                        Ok(img) => {
-                            fw.finish_key(key, urgent, FrameImage::Cpu(Arc::new(img)), t0);
-                            if urgent && let Ok(mut l) = next.latest.lock() {
-                                // Never move back to an older frame finishing late.
-                                if l.is_none_or(|old| old.comp != key.comp || old.revision <= key.revision) {
-                                    *l = Some(key);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Not rendered (a stale revision, a lost connection, called off): the
-                            // viewer asks again.
-                            log::debug!("remote frame: {e}");
-                            fw.release(key, urgent);
-                        }
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if next.remote.eager() {
-                        fw.dispatch_remote(&next);
-                    }
-                }),
-            );
+            self.send_remote(link, job, disk_key);
         }
         started
+    }
+
+    /// [`Self::dispatch_remote`] for the cloud, on a pool thread: the frame's fingerprint, then
+    /// the cached frame that shows the same (released, no download), else the render request
+    /// with the frame's disk key named by its fingerprint.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn print_and_send(&self, link: &RemoteLink, mut job: Job) {
+        job.print = fingerprint::of(&job.src, job.comp, job.t, job.opts);
+        if let Some(p) = job.print
+            && !job.called_off()
+            && self.cache.lock().is_ok_and(|mut c| c.adopt(job.key, p))
+        {
+            if let Ok(mut b) = link.busy.lock() {
+                *b = b.saturating_sub(1);
+            }
+            self.release(job.key, job.urgent);
+            if let Some(ctx) = &self.ctx {
+                ctx.request_repaint();
+            }
+            self.dispatch_remote(link);
+            return;
+        }
+        let disk_key = match job.print {
+            Some(p) => Some(frame_keys::print_disk_key(&self.salts, &job.src.project, &job.key, p, opts_hash(&job.opts))),
+            None => self.known_disk_key(&job.src.project, &job.key, &job.opts),
+        };
+        self.send_remote(link, job, disk_key);
+    }
+
+    /// Send `job` to the remote renderer (its slot is counted in `link.busy`); the frame lands in
+    /// the cache with its fingerprint, if it has one.
+    fn send_remote(&self, link: &RemoteLink, job: Job, disk_key: Option<u128>) {
+        let remote = &link.remote;
+        let (key, urgent, epoch, print) = (job.key, job.urgent, job.epoch, job.print);
+        let t0 = web_time::Instant::now();
+        let fw = self.clone();
+        let refined = {
+            let fw = self.clone();
+            Box::new(move |f: RemoteFrame| {
+                if fw.epoch.load(Ordering::Acquire) != epoch {
+                    return;
+                }
+                let Some(img) = egui_image(&f) else { return };
+                if let Ok(mut c) = fw.cache.lock()
+                    && c.map.contains_key(&key)
+                {
+                    c.insert(key, FrameImage::Cpu(Arc::new(img)));
+                }
+                if let Some(ctx) = &fw.ctx {
+                    ctx.request_repaint();
+                }
+            }) as RemoteRefine
+        };
+        let rj = RemoteJob {
+            project: job.src.project.clone(),
+            revision: key.revision,
+            comp: job.comp,
+            t: job.t,
+            opts: job.opts,
+            disk_key,
+            urgent,
+            cancel: job.cancel.clone(),
+            refined: Some(refined),
+            timed: Some({
+                let sink = self.times.clone();
+                Box::new(move |t: times::FrameTimes| sink.put(&key, t)) as RemoteTimes
+            }),
+        };
+        let next = link.clone();
+        remote.start(
+            rj,
+            Box::new(move |r: Result<RemoteFrame, String>| {
+                if let Ok(mut b) = next.busy.lock() {
+                    *b = b.saturating_sub(1);
+                }
+                match r.and_then(|f| egui_image(&f).ok_or_else(|| "the frame's size and pixels disagree".to_string())) {
+                    // Purge Caches since it was asked for: its pixels may be from before.
+                    Ok(_) if fw.epoch.load(Ordering::Acquire) != epoch => fw.release(key, urgent),
+                    Ok(img) => {
+                        fw.finish_print(key, urgent, FrameImage::Cpu(Arc::new(img)), t0, print);
+                        if urgent && let Ok(mut l) = next.latest.lock() {
+                            // Never move back to an older frame finishing late.
+                            if l.is_none_or(|old| old.comp != key.comp || old.revision <= key.revision) {
+                                *l = Some(key);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Not rendered (a stale revision, a lost connection, called off): the
+                        // viewer asks again.
+                        log::debug!("remote frame: {e}");
+                        fw.release(key, urgent);
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if next.remote.eager() {
+                    fw.dispatch_remote(&next);
+                }
+            }),
+        );
     }
 
     /// The render of `key` failed: remember it (see [`Frames::failed`]) and release the job.
@@ -2879,16 +2977,6 @@ mod tests {
         s.execute("comp.new", serde_json::json!({"width":32,"height":18,"duration":1})).unwrap();
         let cid = s.active_comp_id().unwrap();
         let opts = RenderOpts::default();
-        let stored = disk_cache::frame_key(disk_cache::comp_content_key(&s.project, cid), 2, 1000, opts_hash(&opts));
-        let mut frames = Frames { pool: Some(Arc::new(workers::Workers::new(1).unwrap())), ..Default::default() };
-        frames.set_remote(Some(Arc::new(Disk(stored))));
-        let (entered, started) = mpsc::channel();
-        let (release, wait) = mpsc::channel();
-        frames.pool.as_ref().unwrap().spawn(move || {
-            entered.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
-        });
-        started.recv_timeout(Duration::from_secs(3)).unwrap();
         let src = RenderSource {
             freeze_feedback: Default::default(),
             project: s.project.clone(),
@@ -2899,8 +2987,21 @@ mod tests {
             gpu_display: false,
             disk: None,
         };
+        // Frame 2 on the server, named by its fingerprint ([`frame_keys`]).
         let mut base = key(1, 0, 0);
         base.comp = cid.0;
+        let t2 = s.project.comp(cid).unwrap().frame_rate.tick_of(2);
+        let print = fingerprint::of(&src, cid, t2, opts).expect("a fingerprint");
+        let stored = frame_keys::print_disk_key(&Default::default(), &s.project, &FrameKey { frame: 2, ..base }, print, opts_hash(&opts));
+        let mut frames = Frames { pool: Some(Arc::new(workers::Workers::new(1).unwrap())), ..Default::default() };
+        frames.set_remote(Some(Arc::new(Disk(stored))));
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        frames.pool.as_ref().unwrap().spawn(move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
         for revision in 1..50 {
             base.revision = revision;
             assert!(frames.disk_frames(&src, &base, 30, &opts).is_empty());
@@ -2908,12 +3009,12 @@ mod tests {
         assert!(frames.content_keys.lock().unwrap().is_empty(), "painting computed a content hash while the worker was blocked");
         assert_eq!(frames.content_key_jobs.lock().unwrap().pending.len(), 1);
         release.send(()).unwrap();
-        let until = Instant::now() + Duration::from_secs(3);
-        while !frames.content_keys.lock().unwrap().contains_key(&(base.revision, base.comp)) {
-            assert!(Instant::now() < until);
+        // The content key and the fingerprints are computed on the pool, then the bar shows it.
+        let until = Instant::now() + Duration::from_secs(10);
+        while frames.disk_frames(&src, &base, 30, &opts) != vec![2] {
+            assert!(Instant::now() < until, "the blue indicator must return once its keys are ready");
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(frames.disk_frames(&src, &base, 30, &opts), vec![2], "the blue indicator must return once its key is ready");
         assert_eq!(frames.content_keys.lock().unwrap().len(), 1, "superseded revisions were hashed");
     }
 
@@ -4164,7 +4265,8 @@ mod tests {
         let content = f.content_of(&s.project, s.revision, cid);
         let k = |frame: i64| FrameKey { revision: s.revision, content, comp: cid.0, ..key(0, frame, 0) };
         let opts = RenderOpts::default();
-        assert!(f.request_to_disk(&src, k(3), cid, Tick::ZERO, opts));
+        let t3 = s.project.comp(cid).unwrap().frame_rate.tick_of(3);
+        assert!(f.request_to_disk(&src, k(3), cid, t3, opts));
         for _ in 0..500 {
             if f.inflight() == 0 && f.disk_frames(&src, &k(0), 10, &opts) == vec![3] {
                 break;
@@ -4173,7 +4275,7 @@ mod tests {
         }
         assert_eq!(f.disk_frames(&src, &k(0), 10, &opts), vec![3], "written to disk");
         assert!(!f.is_cached(&k(3)), "not put in RAM");
-        assert!(!f.request_to_disk(&src, k(3), cid, Tick::ZERO, opts), "already on disk");
+        assert!(!f.request_to_disk(&src, k(3), cid, t3, opts), "already on disk");
         // A queued disk-only job asked for by the viewer comes to RAM.
         {
             let mut q = f.queue.lock().unwrap();

@@ -1633,6 +1633,9 @@ fn import_native_effect_params(
                 "opacity" | "strokeOptions/curviness" | "strokeOptions/curvinessVariation" => 100.0,
                 _ => 1.0,
             }
+        } else if effect_id == "ec.stylize.deepglow" && path == "exposure" {
+            // The native Exposure runs at half the plug-in's scale (`exposure_gain`).
+            2.0
         } else if effect_id == "ec.generate.radiowaves" {
             match path {
                 // AE's 0..1 Opacity: 1 draws the waves at half strength (measured with aerender).

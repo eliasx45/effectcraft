@@ -27,6 +27,9 @@ impl<'a> Renderer<'a> {
     /// The region of interest of a top-level 2D frame: (x, y) offset of the output in output
     /// pixels and its size. `None` renders the whole comp (no ROI, or a nested comp).
     pub(crate) fn roi_offset(&self) -> Option<(f64, f64, u32, u32)> {
+        if let Some(w) = self.window {
+            return Some((f64::from(w.x), f64::from(w.y), w.w.max(1), w.h.max(1)));
+        }
         let r = self.opts.roi.filter(|_| self.top)?;
         let s = self.opts.scale;
         if r[2] <= 0.0 || r[3] <= 0.0 {

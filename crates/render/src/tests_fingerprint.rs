@@ -69,6 +69,9 @@ fn print(p: &Project, cid: ItemId, t: Tick) -> Option<u64> {
 }
 
 /// Every 5th frame of the 4 s comp.
+/// The comp's end (4 s): no layer is on screen there, so no edit to a layer changes it.
+const END: i64 = 120;
+
 fn frames() -> impl Iterator<Item = i64> {
     (0..=120).step_by(5)
 }
@@ -132,21 +135,58 @@ fn an_effect_keyframe_edit_keeps_the_frames_outside_its_span() {
     *p.comp_mut(cid).unwrap().layers.get_mut(0).unwrap() = l;
     let q = edit(&p, cid, |l| l.props.prop_mut("effects/#1/blurriness").unwrap().keys[2].value = Value::Scalar(1.0));
     let kept = kept(&p, &q, cid);
-    assert_eq!(kept, (0..=60).step_by(5).collect::<Vec<_>>());
+    assert_eq!(kept, (0..=60).step_by(5).chain([END]).collect::<Vec<_>>());
 }
 
 #[test]
 fn a_static_value_edit_changes_every_frame() {
     let (p, cid) = scene();
     let q = edit(&p, cid, |l| l.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(50.0));
-    assert_eq!(kept(&p, &q, cid), Vec::<i64>::new());
+    assert_eq!(kept(&p, &q, cid), vec![END]);
     // A static effect value too.
     let (mut p, cid) = scene();
     let mut l = p.comp(cid).unwrap().layers.get(0).unwrap().clone();
     effect(&mut p, &mut l, "ec.blur.gaussian");
     *p.comp_mut(cid).unwrap().layers.get_mut(0).unwrap() = l;
     let q = edit(&p, cid, |l| l.props.prop_mut("effects/#1/blurriness").unwrap().value = Value::Scalar(9.0));
-    assert_eq!(kept(&p, &q, cid), Vec::<i64>::new());
+    assert_eq!(kept(&p, &q, cid), vec![END]);
+}
+
+/// A layer on screen from 2 to 3 s: a static edit to it changes exactly the frames it shows
+/// (the layers off screen at a frame count by their place alone), each kept frame equal to a
+/// fresh render.
+#[test]
+fn a_static_edit_to_a_layer_changes_only_the_frames_it_is_on_screen() {
+    let (p, cid) = scene();
+    let p = edit(&p, cid, |l| {
+        l.in_point = s(2.0);
+        l.out_point = s(3.0);
+    });
+    let q = edit(&p, cid, |l| l.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(50.0));
+    let outside: Vec<i64> = frames().filter(|f| !(60..90).contains(f)).collect();
+    assert_eq!(kept(&p, &q, cid), outside);
+    // Its keyframes too: a moved keyframe changes nothing outside the layer's span.
+    let q = edit(&p, cid, |l| l.props.prop_mut("transform/position").unwrap().keys[3].value = Value::Vec3([5.0, 5.0, 0.0]));
+    let kept = kept(&p, &q, cid);
+    assert!(outside.iter().all(|f| kept.contains(f)), "{kept:?}");
+}
+
+/// A parent moves its children outside its own span: an edit to a parent off screen changes
+/// every frame its child shows.
+#[test]
+fn an_edit_to_a_parent_off_screen_changes_its_childs_frames() {
+    let (mut p, cid) = scene();
+    {
+        let layers = &mut p.comp_mut(cid).unwrap().layers;
+        let bg = layers.get(1).unwrap().id;
+        let parent = layers.get_mut(1).unwrap();
+        parent.in_point = s(3.5);
+        parent.out_point = s(4.0);
+        layers.get_mut(0).unwrap().parent = Some(bg);
+    }
+    let mut q = p.clone();
+    q.comp_mut(cid).unwrap().layers.get_mut(1).unwrap().props.prop_mut("transform/position").unwrap().value = Value::Vec3([10.0, 10.0, 0.0]);
+    assert_eq!(kept(&p, &q, cid), vec![END]);
 }
 
 /// An outer comp showing a precomp whose solid fades with keyframes at 0, 1, 2, 3 s.
@@ -169,7 +209,7 @@ fn a_keyframe_edit_in_a_precomp_keeps_the_outer_frames_it_doesnt_change() {
     let q = edit(&p, iid, |l| l.props.prop_mut("transform/opacity").unwrap().keys[3].value = Value::Scalar(5.0));
     // Key 3 (3 s, the last): frames up to 2 s keep theirs (and 4 s, past the precomp's end).
     let kept = kept(&p, &q, oid);
-    assert_eq!(kept, (0..=60).step_by(5).chain([120]).collect::<Vec<_>>());
+    assert_eq!(kept, (0..=60).step_by(5).chain([END]).collect::<Vec<_>>());
 }
 
 #[test]
@@ -187,7 +227,7 @@ fn a_motion_blurred_precomp_keeps_its_nested_keyframes_out_unless_collapsed() {
     // Collapsed, its layers are drawn at the shutter's times: every nested keyframe counts.
     let collapse = |p: &Project| edit(p, oid, |l| l.switches.collapse = true);
     let kept = self::kept(&collapse(&p), &collapse(&q), oid);
-    assert!(kept.iter().all(|f| *f == 120), "{kept:?}");
+    assert!(kept.iter().all(|f| *f == END), "{kept:?}");
 }
 
 #[test]
@@ -211,7 +251,7 @@ fn time_remapping_keeps_its_keyframes_in_the_key() {
         l.props.get_mut("timeRemap").unwrap().keys[2].value = Value::Scalar(3.5);
     });
     // Can't prove: every frame is invalidated, even those before the edited span.
-    assert_eq!(kept(&p, &q, oid), Vec::<i64>::new());
+    assert_eq!(kept(&p, &q, oid), vec![END]);
 }
 
 /// Position keyframes every half second.
@@ -233,7 +273,7 @@ fn motion_blur_keeps_the_keyframes_its_shutter_reads_in_the_key() {
     let q = edit(&p, cid, |l| l.props.prop_mut("transform/position").unwrap().keys[8].value = Value::Vec3([0.0, 0.0, 0.0]));
     let kept = kept(&p, &q, cid);
     assert!((0..=60).step_by(5).all(|f| kept.contains(&f)), "{kept:?}");
-    assert!(kept.iter().all(|f| *f < 90), "{kept:?}");
+    assert!(kept.iter().all(|f| *f < 90 || *f == END), "{kept:?}");
     // The first key (0 s): frames from ~1.6 s on stay.
     let q = edit(&p, cid, |l| l.props.prop_mut("transform/position").unwrap().keys[0].value = Value::Vec3([0.0, 0.0, 0.0]));
     let kept = self::kept(&p, &q, cid);
@@ -278,7 +318,7 @@ fn a_motion_blurred_layers_parent_keeps_the_keyframes_its_shutter_reads_in_the_k
     q.comp_mut(cid).unwrap().layers.get_mut(1).unwrap().props.prop_mut("transform/position").unwrap().keys[8].value = Value::Vec3([0.0, 0.0, 0.0]);
     let kept = kept(&p, &q, cid);
     assert!((0..=60).step_by(5).all(|f| kept.contains(&f)), "{kept:?}");
-    assert!(kept.iter().all(|f| *f < 90), "{kept:?}");
+    assert!(kept.iter().all(|f| *f < 90 || *f == END), "{kept:?}");
 }
 
 #[test]
@@ -304,7 +344,7 @@ fn a_time_reader_meeting_an_expression_has_no_fingerprint() {
     });
     assert!(print(&p, cid, s(1.0)).is_some());
     let q = edit(&p, cid, |l| l.props.prop_mut("transform/position").unwrap().keys[3].value = Value::Vec3([0.0, 0.0, 0.0]));
-    assert_eq!(kept(&p, &q, cid), Vec::<i64>::new());
+    assert_eq!(kept(&p, &q, cid), vec![END]);
 }
 
 #[test]
@@ -497,9 +537,9 @@ fn an_expression_reading_another_layer_at_another_time_follows_the_edit() {
         Some(Expression { text: "thisComp.layer(1).transform.opacity.valueAtTime(time + 1)".into(), enabled: true });
     // The last key (3 s) changes the first layer from 2 s on, the second from 1 s on.
     let q = edit(&p, cid, |l| l.props.prop_mut("transform/opacity").unwrap().keys[3].value = Value::Scalar(0.0));
-    assert_eq!(kept_with(&p, &q, cid, Some(&ReadsAhead)), (0..=30).step_by(5).collect::<Vec<_>>());
+    assert_eq!(kept_with(&p, &q, cid, Some(&ReadsAhead)), (0..=30).step_by(5).chain([END]).collect::<Vec<_>>());
     // Without the expression the second layer holds still: the frames up to 2 s are kept.
-    assert_eq!(kept_with(&p, &q, cid, None), (0..=60).step_by(5).collect::<Vec<_>>());
+    assert_eq!(kept_with(&p, &q, cid, None), (0..=60).step_by(5).chain([END]).collect::<Vec<_>>());
 }
 
 /// Why a real project's frames have no fingerprint (`EC_PRINTS_PROJECT=…`): per layer of the
