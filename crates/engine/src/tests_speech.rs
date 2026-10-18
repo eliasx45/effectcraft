@@ -54,6 +54,9 @@ fn speed_peak_of_an_eased_segment_sits_in_its_middle() {
     assert_eq!((peaks[0].layer, peaks[0].property.as_str()), (LayerId(l), "Scale"));
     // Outside the range: none.
     assert!(lint::speed_peaks(s.active_comp().unwrap(), 2.5, 4.0).is_empty());
+    // Trimmed away (the layer starts after the peak): nothing shows, so no peak.
+    s.execute("layer.timing", json!({"layers": [l], "in": 1.6})).unwrap();
+    assert!(lint::speed_peaks(s.active_comp().unwrap(), 0.0, 4.0).is_empty());
     // Linear keys move at a constant speed: no peak.
     let (mut s, l) = comp();
     scale_keys(&mut s, l, 1.0, 2.0, true);

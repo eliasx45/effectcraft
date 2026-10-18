@@ -856,8 +856,8 @@ pub fn accent_time(s: &effectcraft_project::speech::Syllable, fps: f64, lead: f6
 
 /// Speed-graph peaks of every keyframed property of `comp`'s layers in `start..=end` (comp
 /// seconds): for each pair of neighbouring keyframes with different values and no hold between
-/// them, the time of the highest speed (keyframes only; expressions are not evaluated). Linear
-/// segments (constant speed) have no peak. Sorted by time.
+/// them, the time of the highest speed (keyframes only; expressions are not evaluated), when it
+/// falls inside the layer's in/out. Linear segments (constant speed) have no peak. Sorted by time.
 pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
     let mut out: Vec<SpeedPeak> = vec![];
     for l in &comp.layers {
@@ -901,7 +901,9 @@ pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
                 }
                 let lt = (lo + hi) / 2.0;
                 let time = l.comp_time(Tick::from_seconds_f64(lt)).seconds();
-                if time < start - 1e-9 || time > end + 1e-9 {
+                // Outside the layer's in/out nothing shows, so the peak can't be seen.
+                let shown = time >= l.in_point.seconds() - 1e-9 && time <= l.out_point.seconds() + 1e-9;
+                if !shown || time < start - 1e-9 || time > end + 1e-9 {
                     continue;
                 }
                 if out.iter().any(|q| q.layer == l.id && q.path == path && (q.time - time).abs() < 1e-6) {
