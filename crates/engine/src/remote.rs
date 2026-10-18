@@ -221,11 +221,57 @@ pub struct CacheSeries {
     pub scale: u32,
     /// The view and render options (`FrameKey::view ^ opts_hash`).
     pub salt: u64,
+    /// A digest of the frames' fingerprints when they name the frames ([`FramePrints`]), 0 when
+    /// the content key names every frame.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub prints: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// The fingerprints of a series' frames (index: frame number), which name them in a frame cache
+/// instead of the comp's content key: an edit then changes the keys of only the frames it
+/// changes ([`effectcraft_render::disk_cache::print_content`]). `None`: the content key names
+/// that frame.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FramePrints {
+    /// The footage salt ([`effectcraft_render::disk_cache::footage_salt`]) of the app's project.
+    pub salt: u64,
+    pub prints: Vec<Option<u64>>,
+}
+
+impl FramePrints {
+    /// The digest a [`CacheSeries`] carries (never 0).
+    pub fn digest(&self) -> u64 {
+        let mut h = effectcraft_render::disk_cache::Hash128::default();
+        h.write_u64(self.salt);
+        for p in &self.prints {
+            h.write_u64(p.map_or(0, |p| p ^ 0x9e37_79b9_7f4a_7c15));
+        }
+        let v = h.finish();
+        ((v as u64) ^ ((v >> 64) as u64)).max(1)
+    }
 }
 
 impl CacheSeries {
     pub fn new(content: u128, scale: u32, salt: u64) -> CacheSeries {
-        CacheSeries { content: format!("{content:032x}"), scale, salt }
+        CacheSeries { content: format!("{content:032x}"), scale, salt, prints: 0 }
+    }
+
+    /// Frame `frame`'s key with the series' fingerprints `prints` (see [`FramePrints`]) of comp
+    /// `comp`; frames without one go through [`CacheSeries::key`].
+    pub fn key_with(&self, prints: Option<&FramePrints>, comp: ItemId, frame: i64) -> Option<u128> {
+        let print = prints.and_then(|p| usize::try_from(frame).ok().and_then(|i| p.prints.get(i).copied().flatten()).map(|x| (x, p.salt)));
+        match print {
+            Some((print, salt)) => {
+                let content = effectcraft_render::disk_cache::print_content(print, salt, comp.0);
+                Some(effectcraft_render::disk_cache::frame_key(content, frame, self.scale, self.salt))
+            }
+            None => self.key(frame),
+        }
     }
 
     /// Frame `frame`'s key (`None`: the content isn't 32 hex digits).
@@ -246,6 +292,17 @@ pub struct Precache {
     /// Frame ranges (inclusive), in the order they render: the work area from the playhead, then
     /// the rest of the comp.
     pub ranges: Vec<(i64, i64)>,
+    /// The frames' fingerprints, which name them (see [`FramePrints`]); without them the content
+    /// key names every frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prints: Option<FramePrints>,
+}
+
+impl Precache {
+    /// Frame `frame`'s key in the frame cache.
+    pub fn key(&self, frame: i64) -> Option<u128> {
+        self.series.key_with(self.prints.as_ref(), self.comp, frame)
+    }
 }
 
 /// Merge frame numbers (sorted, without repeats) into inclusive ranges.

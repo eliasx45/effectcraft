@@ -216,6 +216,12 @@ fn channel_exposure_and_fast_preview_commands() {
     s.execute("view.fastPreviewMode", json!({"mode": "fastDraft"})).unwrap();
     assert_eq!(s.state.viewer.fast_previews, crate::commands::viewer_cmds::FastPreviews::FastDraft);
     assert!(s.execute("view.fastPreviewMode", json!({"mode": "nope"})).is_err());
+    assert!(s.prefs.previews.adaptive_playback);
+    assert_eq!(s.execute("view.adaptivePlayback", json!({})).unwrap(), json!({"on": false}));
+    assert!(!s.prefs.previews.adaptive_playback);
+    assert_eq!(s.execute("view.adaptivePlayback", json!({"on": true})).unwrap(), json!({"on": true}));
+    assert_eq!(s.prefs.get("previews.adaptivePlayback"), Some(json!(true)));
+    assert!(s.execute("view.adaptivePlayback", json!({"on": "yes"})).is_err());
     let was = s.state.snapping;
     s.execute("view.snapping", json!({})).unwrap();
     assert_eq!(s.state.snapping, !was);

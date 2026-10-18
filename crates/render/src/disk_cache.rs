@@ -2,8 +2,10 @@
 //! and layer cache entries kept on disk between sessions, like After Effects' disk cache.
 //!
 //! * Entries are files keyed by a 128-bit content hash (`<folder>/v1/<kind>/<2 hex>/<32 hex>.ecc`):
-//!   frames by the hash of the composition's content (the comp and everything it uses, footage
-//!   files' size and modification time included) plus frame, scale and view; layer buffers by
+//!   frames by their fingerprint ([`print_content`]: what the frame shows at its time, so an
+//!   edit changes the keys of only the frames it changes) or, for a frame without one, the hash
+//!   of the composition's content (the comp and everything it uses, footage files' size and
+//!   modification time included), plus frame, scale and view; layer buffers by
 //!   the layer cache's content key salted with the project's footage fingerprint. A changed
 //!   project therefore never reads stale pixels: its keys simply change.
 //! * Payloads are LZ4-compressed (`lz4_flex`, MIT): frames as 8-bit premultiplied RGBA, layer
@@ -1339,6 +1341,19 @@ pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraf
         }
     }
     h.write_u64(comp.0);
+    h.finish()
+}
+
+/// The per-frame content of a viewer frame named by its fingerprint
+/// (`Renderer::frame_fingerprint`) instead of its comp's [`comp_content_key`]: the fingerprint,
+/// the footage files' identities ([`footage_salt`]: the fingerprint names footage items, not
+/// file contents) and the comp. An edit changes it only for the frames it changes.
+pub fn print_content(print: u64, footage_salt: u64, comp: u64) -> u128 {
+    let mut h = Hash128::default();
+    h.write(b"ECFP");
+    h.write_u64(print);
+    h.write_u64(footage_salt);
+    h.write_u64(comp);
     h.finish()
 }
 

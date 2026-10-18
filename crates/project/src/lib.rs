@@ -16,6 +16,7 @@ pub mod props;
 pub mod render_queue;
 pub mod render_templates;
 pub mod sequence;
+pub mod speech;
 pub mod styles;
 pub mod tracking;
 
@@ -576,6 +577,10 @@ pub struct Comp {
     /// the undo history.
     #[serde(default, skip_serializing_if = "Resolution::is_auto")]
     pub resolution: Resolution,
+    /// The voice-over's words and stressed syllables (`speech.import`), for timing animation to
+    /// speech. Draws nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech: Option<std::sync::Arc<speech::SpeechMap>>,
 }
 
 /// A viewer guide line: vertical guides sit at an x position, horizontal ones at a y position.
@@ -652,6 +657,7 @@ impl Comp {
             global_light: styles::GlobalLight::default(),
             essential: None,
             resolution: Resolution::Auto,
+            speech: None,
         }
     }
     /// Whether the composition has a frame at its time `t`: nested, it shows nothing before it
@@ -1007,6 +1013,7 @@ impl Comp {
             guides,
             essential,
             resolution: _,
+            speech: _,
         } = self;
         *width == o.width
             && *height == o.height
@@ -1046,6 +1053,7 @@ impl Comp {
     pub fn pixel_form_with(&self, with_markers: bool) -> std::borrow::Cow<'_, Comp> {
         if !self.hide_shy
             && self.resolution.is_auto()
+            && self.speech.is_none()
             && self.layers.iter().all(|l| l.switches == l.switches.pixels())
             && (with_markers || (self.markers.iter().all(is_timing_marker) && self.layers.iter().all(|l| l.markers.is_empty())))
         {
@@ -1054,6 +1062,7 @@ impl Comp {
         let mut c = self.clone();
         c.hide_shy = false;
         c.resolution = Resolution::Auto;
+        c.speech = None;
         if !with_markers {
             c.markers.retain(is_timing_marker);
         }
