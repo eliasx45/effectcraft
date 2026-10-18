@@ -1838,7 +1838,10 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 }
                 // Playing: the frames after `t` with one cache kept between them (what playback
                 // pays per frame once a layer is cached): mean per layer over 8 frames.
-                let playing = LayerCache::default();
+                // The app sizes its layer cache from the machine's memory (8 GB on 64 GB):
+                // EFFECTCRAFT_BENCH_CACHE_MB measures with that budget (default 1 GB).
+                let mb = std::env::var("EFFECTCRAFT_BENCH_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024);
+                let playing = LayerCache::new(mb.saturating_mul(1 << 20));
                 let step = comp.frame_rate.frame_duration();
                 let frames = 8;
                 let mut sum = std::collections::HashMap::new();
