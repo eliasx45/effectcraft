@@ -619,6 +619,8 @@ mod tests_deferred;
 #[cfg(test)]
 mod tests_deferred_jobs;
 #[cfg(test)]
+mod tests_fx_codes;
+#[cfg(test)]
 mod tests_fx_color;
 #[cfg(test)]
 mod tests_fx_deepglow;
@@ -668,6 +670,8 @@ mod tests_inplace;
 mod tests_layer_times;
 #[cfg(test)]
 mod tests_particles;
+#[cfg(test)]
+mod tests_precomp_clip;
 #[cfg(test)]
 mod tests_precomp_resident;
 #[cfg(test)]

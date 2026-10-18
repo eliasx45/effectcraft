@@ -25,6 +25,7 @@ impl<'a> Renderer<'a> {
                 let k = self.raster_scale(ctx, layer);
                 self.authored(crate::shapes::render_window(ctx, layer, contents, k, Some([w.x, w.y, w.w, w.h])))
             }
+            (None, Some(w), LayerSource::Comp { .. }) => self.source_window(ctx, layer, Some(w))?,
             (None, ..) => self.source(ctx, layer)?,
         };
         // A solid is filled with a quantised colour: only masks can take it off the grid.
@@ -122,12 +123,18 @@ impl<'a> Renderer<'a> {
     /// its values keeps its key) and the existing key-attempt bookkeeping id. Accelerators must
     /// still apply `precomp_source` eligibility before using this key, and admit animated
     /// content ([`Self::resident_precomp_animated`]) only once its key repeats.
-    pub fn resident_precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, u64)> {
+    pub fn resident_precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, u64, ContentClip)> {
         if !matches!(layer.source, LayerSource::Comp { .. }) || self.freeze.is_some() {
             return None;
         }
-        let (key, noted, _) = self.content_cache_key_noted(ctx, layer);
-        Some((key?, noted?))
+        let (key, noted, clip) = self.content_cache_key_noted(ctx, layer);
+        Some((key?, noted?, ContentClip(clip)))
+    }
+
+    /// The window of its nested comp a precomp layer drawn uncached renders (see
+    /// [`Self::precomp_clip`]); the whole frame when it is not windowed.
+    pub fn precomp_window(&self, ctx: &EvalCtx, layer: &Layer) -> ContentClip {
+        ContentClip(self.precomp_clip(ctx, layer, None))
     }
 
     /// Whether a precomp's pixels may change from frame to frame (its key then changes with
@@ -185,15 +192,15 @@ impl<'a> Renderer<'a> {
     /// [`cache::LayerCache::precomp_note`] (an animated precomp is keyed only now and then, see
     /// [`cache::LayerCache::precomp_try`]).
     ///
-    /// A shape layer drawn clipped (see [`Self::shape_clip`]) has the window in its key, and
-    /// the window is returned too.
+    /// A shape layer drawn clipped (see [`Self::shape_clip`]) or a precomp layer drawn windowed
+    /// (see [`Self::precomp_clip`]) has the window in its key, and the window is returned too.
     fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> ContentKey {
-        let Some(c) = self.cache else { return (None, None, self.shape_clip(ctx, layer, None)) };
+        let Some(c) = self.cache else { return (None, None, self.shape_clip(ctx, layer, None).or_else(|| self.precomp_clip(ctx, layer, None))) };
         let (src, noted) = match layer.source {
             LayerSource::Comp { .. } => {
                 let id = cache::derive(cache::derive(ctx.comp_id.0, layer.id.0), self.depth as u64);
                 if !c.precomp_try(id) {
-                    return (None, None, None);
+                    return (None, None, self.precomp_clip(ctx, layer, None));
                 }
                 (self.precomp_key(ctx, layer), Some(id))
             }
@@ -203,7 +210,7 @@ impl<'a> Renderer<'a> {
         };
         let key = cache::layer_key_src(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), src);
         let key = self.content_key(ctx, layer, key);
-        let clip = self.shape_clip(ctx, layer, key);
+        let clip = self.shape_clip(ctx, layer, key).or_else(|| self.precomp_clip(ctx, layer, key));
         let key = match clip {
             Some(w) => key.map(|k| clip::clipped_key(k, w)),
             None => key,
@@ -338,7 +345,9 @@ impl<'a> Renderer<'a> {
         let t0 = web_time::Instant::now();
         let size = source_size(self.project, layer);
         let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-        let st = styles::render(ctx, layer, &content, layer_size);
+        // A text layer with effects is a comp-sized canvas: its styles run on the visible part.
+        let cropped = styles::crop_margin(ctx, layer, content.scale).and_then(|m| crop_visible(&content, m));
+        let st = styles::render(ctx, layer, cropped.as_ref().unwrap_or(&content), layer_size);
         if let Some(t) = timing {
             t.cached = false;
             t.effects.push(("layerStyles".into(), t0.elapsed().as_secs_f64() * 1e3));
@@ -495,6 +504,49 @@ impl<'a> Renderer<'a> {
     }
 }
 
+/// Test switch: run layer styles on the whole content buffer (the reference for the crop).
+pub(crate) static NO_STYLE_CROP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Tests: how many times styles ran on a cropped buffer.
+#[cfg(test)]
+pub(crate) static STYLE_CROPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `buf` cut down to the pixels that aren't fully clear (any channel non-zero) plus `margin`
+/// pixels around them, same pixel grid and place. `None` when that saves little (or nothing
+/// is visible): the buffer is used as it is.
+fn crop_visible(buf: &Buf, margin: u32) -> Option<Buf> {
+    if NO_STYLE_CROP.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let (w, h) = (buf.img.width as usize, buf.img.height as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    use rayon::prelude::*;
+    let (x0, y0, x1, y1) = buf
+        .img
+        .data
+        .par_chunks(w)
+        .enumerate()
+        .filter_map(|(y, row)| {
+            let first = row.iter().position(|p| *p != [0.0; 4])?;
+            let last = row.iter().rposition(|p| *p != [0.0; 4]).unwrap_or(first) + 1;
+            Some((first, y, last, y + 1))
+        })
+        .reduce_with(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))?;
+    let m = margin as usize;
+    let (x0, y0) = (x0.saturating_sub(m), y0.saturating_sub(m));
+    let (x1, y1) = (x1.saturating_add(m).min(w), y1.saturating_add(m).min(h));
+    let (cw, ch) = (x1.checked_sub(x0)?, y1.checked_sub(y0)?);
+    // Worth a copy only when it drops at least a quarter of the pixels.
+    if cw.checked_mul(ch)?.saturating_mul(4) > w.saturating_mul(h).saturating_mul(3) {
+        return None;
+    }
+    let img = buf.img.crop(x0 as i64, y0 as i64, cw as u32, ch as u32);
+    #[cfg(test)]
+    STYLE_CROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(Buf { img, offset: [buf.offset[0] - x0 as f64, buf.offset[1] - y0 as f64], scale: buf.scale })
+}
+
 /// Could anything in `layer`'s comp read its working-space pixels (its content buffer) other
 /// than compositing it: a track matte naming it, an effect's layer parameter (Displacement Map,
 /// Set Matte…) or an expression's `sampleImage`? Errs towards yes: a wrong yes only keeps a
@@ -502,7 +554,9 @@ impl<'a> Renderer<'a> {
 pub(crate) fn working_read(comp: &Comp, layer: &Layer) -> bool {
     comp.layers.iter().any(|l| {
         l.track_matte.as_ref().is_some_and(|m| m.layer == layer.id)
-            || l.effects().is_some_and(names_a_layer)
+            // Its own effects may read it through any layer parameter (an empty one can stand
+            // for the layer itself); another layer's only through one that can name it.
+            || l.effects().is_some_and(|fx| if l.id == layer.id { names_a_layer(fx) } else { names_layer(fx, layer.id.0) })
             || (cache::layer_info(comp, l).expressions && samples_pixels(&l.props))
     })
 }
@@ -515,6 +569,16 @@ fn names_a_layer(g: &PropGroup) -> bool {
     })
 }
 
+/// Can a layer parameter of `g` name layer `id`: set to it, or keyframed or driven by an
+/// expression (which may name any layer)? An empty layer parameter (Deep Glow's Mask Layer left
+/// at None) reads nothing.
+fn names_layer(g: &PropGroup, id: u64) -> bool {
+    g.children.iter().any(|c| match c {
+        Node::Prop(p) => matches!(p.value, Value::Layer(_)) && (p.value == Value::Layer(Some(id)) || !p.keys.is_empty() || p.has_expression()),
+        Node::Group(sub) => names_layer(sub, id),
+    })
+}
+
 /// Does an expression in `g` read rendered pixels (`sampleImage`)?
 fn samples_pixels(g: &PropGroup) -> bool {
     g.children.iter().any(|c| match c {
@@ -524,9 +588,26 @@ fn samples_pixels(g: &PropGroup) -> bool {
 }
 
 /// The window of a layer's buffer its content key stands for (see [`Renderer::resident_content`]):
-/// the whole buffer, or the part of a shape layer's that can show (see `clip.rs`).
+/// the whole buffer, or the part of a shape layer's or a nested comp's frame that can show (see
+/// `clip.rs`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ContentClip(Option<Window>);
+
+impl ContentClip {
+    /// The window `[x, y, w, h]` (buffer pixels), `None` for the whole buffer.
+    pub fn rect(&self) -> Option<[u32; 4]> {
+        self.0.map(|w| [w.x, w.y, w.w, w.h])
+    }
+
+    /// The offset of the buffer holding this window of a whole buffer at offset 0.
+    pub fn offset(&self) -> [f64; 2] {
+        crate::sources::window_offset(self.0)
+    }
+
+    pub(crate) fn window(&self) -> Option<Window> {
+        self.0
+    }
+}
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
 pub struct StyledLayer {
@@ -647,5 +728,12 @@ mod tests {
         sub.children.push(Node::Prop(Property::new(3, "layer", "Layer", Value::Layer(None))));
         fx.children.push(Node::Group(sub));
         assert!(names_a_layer(&fx));
+        // An empty layer parameter (Deep Glow's Mask Layer at None) names no other layer; one
+        // set to a layer names just it.
+        assert!(!names_layer(&fx, 7));
+        let Some(Node::Group(sub)) = fx.children.first_mut() else { panic!("sub") };
+        let Some(Node::Prop(lp)) = sub.children.first_mut() else { panic!("layer") };
+        lp.value = Value::Layer(Some(7));
+        assert!(names_layer(&fx, 7) && !names_layer(&fx, 8));
     }
 }
