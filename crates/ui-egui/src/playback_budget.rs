@@ -1,7 +1,7 @@
 //! Bounded native render-service measurements for Auto playback resolution.
 //! Cache hits and old playback/content/scale epochs never train this controller.
 //!
-//! A ladder Full → Half → Quarter: three slow renders out of the last four step down one
+//! A ladder Full → Half → Third → Quarter (as After Effects' resolutions): three slow renders out of the last four step down one
 //! rung, so a slow cut is caught a few frames in; eight renders that would fit the budget
 //! comfortably at the rung above step back up. A rung that is not measurably faster than
 //! the one above it is abandoned and becomes the floor for the rest of the epoch.
@@ -18,6 +18,8 @@ use std::sync::Arc;
 use crate::frames::FrameKey;
 
 const WINDOW: usize = 32;
+/// The lowest rung (0 Full, 1 Half, 2 Third, 3 Quarter).
+pub(crate) const QUARTER: usize = 3;
 // AutoPick warms three frames per compositor (CPU and GPU). Discard those renders when
 // playback starts, so cold uploads and compositor exploration do not decide.
 const WARMUP: usize = 6;
@@ -39,6 +41,7 @@ const BOUNCE: usize = 32;
 pub(crate) struct Config {
     pub full: FrameKey,
     pub half: FrameKey,
+    pub third: FrameKey,
     pub quarter: FrameKey,
     pub budget_ms: f64,
     pub gpu_context: usize,
@@ -51,6 +54,7 @@ impl Config {
         self.full.same_series(&other.full)
             && self.full.revision == other.full.revision
             && self.half.same_series(&other.half)
+            && self.third.same_series(&other.third)
             && self.quarter.same_series(&other.quarter)
             && self.budget_ms == other.budget_ms
             && self.gpu_context == other.gpu_context
@@ -60,13 +64,31 @@ impl Config {
         match level {
             0 => self.full,
             1 => self.half,
+            2 => self.third,
             _ => self.quarter,
         }
     }
 
-    /// The lowest usable rung: Quarter only when it is smaller than Half.
+    /// The next rung down from `level`: the first one smaller than it (the Adaptive Resolution
+    /// Limit makes the lower rungs the same size).
+    fn below(&self, level: usize) -> Option<usize> {
+        let here = self.rung(level).scale;
+        (level.saturating_add(1)..=QUARTER).find(|&l| self.rung(l).scale < here)
+    }
+
+    /// The next rung up from `level`: the nearest larger one.
+    fn above(&self, level: usize) -> Option<usize> {
+        let here = self.rung(level).scale;
+        (0..level).rev().find(|&l| self.rung(l).scale > here)
+    }
+
+    /// The lowest usable rung (0: no smaller rung at all).
     fn bottom(&self) -> usize {
-        if self.quarter.scale < self.half.scale { 2 } else { 1 }
+        let mut level = 0;
+        while let Some(next) = self.below(level) {
+            level = next;
+        }
+        level
     }
 }
 
@@ -80,7 +102,7 @@ pub(crate) struct Budget {
     /// Per render: (its share of the throughput, its service time over the pool size).
     samples: VecDeque<(f64, f64)>,
     residency: Option<bool>,
-    /// The rung in use: 0 Full, 1 Half, 2 Quarter.
+    /// The rung in use: 0 Full, 1 Half, 2 Third, 3 Quarter.
     level: usize,
     /// Lowest rung allowed this epoch (a rung that was not faster raises it).
     floor: usize,
@@ -101,10 +123,10 @@ fn median(samples: impl Iterator<Item = f64>) -> f64 {
 }
 
 impl Budget {
-    /// The rung to render at (0 Full, 1 Half, 2 Quarter). A new playback/content epoch, or
+    /// The rung to render at (0 Full, 1 Half, 2 Third, 3 Quarter). A new playback/content epoch, or
     /// no adaptive playback at all (idle, an explicit resolution), restores Full.
     pub fn configure(&mut self, config: Option<Config>) -> usize {
-        let config = config.filter(|c| c.budget_ms.is_finite() && c.budget_ms > 0.0 && c.half.scale < c.full.scale);
+        let config = config.filter(|c| c.budget_ms.is_finite() && c.budget_ms > 0.0 && c.bottom() > 0);
         let unchanged = match (&self.config, &config) {
             (Some(a), Some(b)) => a.same(b),
             (None, None) => true,
@@ -174,7 +196,7 @@ impl Budget {
             if self.trial_samples > 64 {
                 // An unstable trial never settled: return to the rung above and stay there.
                 self.trial_reference = None;
-                self.floor = self.level.saturating_sub(1);
+                self.floor = config.above(self.level).unwrap_or(0);
                 self.step(self.floor);
                 return;
             }
@@ -202,30 +224,66 @@ impl Budget {
             // Fewer pixels are not necessarily faster: Auto may choose different compositors
             // at each scale. Keep the lower rung only with a clear measured win.
             if median(self.samples.iter().map(|s| s.0)) >= reference * 0.9 {
-                self.floor = self.level.saturating_sub(1);
+                self.floor = config.above(self.level).unwrap_or(0);
                 self.step(self.floor);
                 return;
             }
         }
         let threshold = config.budget_ms * 1.1;
-        if self.level < self.floor && n >= DOWN && shares(DOWN).filter(|ms| *ms > threshold).count() >= SLOW_OF {
+        if let Some(next) = config.below(self.level).filter(|&l| l <= self.floor)
+            && n >= DOWN
+            && shares(DOWN).filter(|ms| *ms > threshold).count() >= SLOW_OF
+        {
             let reference = median(shares(DOWN));
-            self.step(self.level.saturating_add(1));
+            // Far over budget (a heavy stretch), go straight to the first rung predicted to fit
+            // (cost grows with the pixel count), or the lowest allowed: one rung per four slow
+            // frames took seconds at a frame a second.
+            let here = config.rung(self.level).scale.max(1) as f64;
+            let mut target = next;
+            while reference * (config.rung(target).scale as f64 / here).powi(2) > config.budget_ms {
+                match config.below(target).filter(|&l| l <= self.floor) {
+                    Some(l) => target = l,
+                    None => break,
+                }
+            }
+            self.step(target);
             self.trial_reference = Some(reference);
             return;
         }
-        if self.level > 0 && n >= UP {
+        if let Some(up) = config.above(self.level)
+            && n >= UP
+        {
             // Cost grows with the pixel count: predict the rung above from this one.
-            let above = config.rung(self.level.saturating_sub(1)).scale as f64;
+            let above = config.rung(up).scale as f64;
             let here = config.rung(self.level).scale.max(1) as f64;
             let recent = self.samples.iter().skip(n.saturating_sub(UP));
             let cost = if self.bounced { median(recent.map(|s| s.0)) } else { median(recent.map(|s| s.1)) };
             let predicted = cost * (above / here).powi(2);
             if predicted <= config.budget_ms * UP_HEADROOM {
-                self.step(self.level.saturating_sub(1));
+                self.step(up);
             }
         }
     }
+}
+
+/// The viewer's draft badge: the resolution of the frame on screen (`shown`, render scale × 1000)
+/// against the one the viewer asks for at full quality (`full`). `None`: full quality.
+pub(crate) fn draft_label(full: u32, shown: u32) -> Option<&'static str> {
+    if full == 0 || u64::from(shown) * 100 >= u64::from(full) * 98 {
+        return None;
+    }
+    let ratio = f64::from(shown) / f64::from(full);
+    Some(if ratio >= 0.6 {
+        "Draft"
+    } else if ratio >= 0.45 {
+        "Half"
+    } else if ratio >= 0.3 {
+        "Third"
+    } else if ratio >= 0.2 {
+        "Quarter"
+    } else {
+        "Lower"
+    })
 }
 
 #[cfg(test)]
@@ -236,6 +294,7 @@ mod tests {
         Config {
             full,
             half: FrameKey { scale: 500, opts: 2, ..full },
+            third: FrameKey { scale: 333, opts: 4, ..full },
             quarter: FrameKey { scale: 250, opts: 3, ..full },
             budget_ms: 1000.0 / 30.0,
             gpu_context: 0,
@@ -289,14 +348,22 @@ mod tests {
             sample(&mut b, c, 100.0, false);
         }
         assert_eq!(b.configure(Some(c)), 1);
-        // Half is faster, but still over budget: on to Quarter.
+        // Half is faster, but still over budget: on to Third, then Quarter.
         for _ in 0..STEP_WARMUP + DOWN {
             assert!(at(&mut b, c.half, 60.0, false));
         }
         assert_eq!(b.configure(Some(c)), 2);
-        // The cut ends: Quarter renders that would fit at Half step up, then up again.
+        for _ in 0..STEP_WARMUP + DOWN {
+            assert!(at(&mut b, c.third, 40.0, false));
+        }
+        assert_eq!(b.configure(Some(c)), QUARTER);
+        // The cut ends: Quarter renders that would fit above step up one rung at a time.
         for _ in 0..STEP_WARMUP + UP {
             assert!(at(&mut b, c.quarter, 3.0, false));
+        }
+        assert_eq!(b.configure(Some(c)), 2);
+        for _ in 0..STEP_WARMUP + UP {
+            assert!(at(&mut b, c.third, 3.0, false));
         }
         assert_eq!(b.configure(Some(c)), 1);
         for _ in 0..STEP_WARMUP + UP {
@@ -317,6 +384,7 @@ mod tests {
     #[test]
     fn quarter_is_skipped_when_it_is_not_smaller_than_half() {
         let mut c = config();
+        c.third = c.half;
         c.quarter = c.half;
         let mut b = Budget::default();
         b.configure(Some(c));
@@ -331,6 +399,71 @@ mod tests {
         assert_eq!(b.configure(Some(c)), 1);
     }
 
+    /// The Adaptive Resolution Limit at 1/4 makes Third and Quarter the same size: Half steps
+    /// straight to the one smaller rung, and back up to Half.
+    #[test]
+    fn rungs_of_the_same_size_are_one_rung() {
+        let mut c = config();
+        c.third = FrameKey { scale: 250, ..c.third };
+        let mut b = Budget::default();
+        b.configure(Some(c));
+        warm(&mut b, c);
+        for _ in 0..DOWN {
+            sample(&mut b, c, 100.0, false);
+        }
+        assert_eq!(b.configure(Some(c)), 1);
+        for _ in 0..STEP_WARMUP + DOWN {
+            assert!(at(&mut b, c.half, 60.0, false));
+        }
+        assert_eq!(b.configure(Some(c)), 2, "Third (the limit's size) is the next rung");
+        // Faster than Half (kept), still over budget, but Quarter is no smaller: no step.
+        for _ in 0..100 {
+            assert!(at(&mut b, c.third, 40.0, false));
+        }
+        assert_eq!(b.configure(Some(c)), 2, "Quarter is no smaller: no step");
+        // Light again: back up to Half (once the window's median is light, before all of `UP`).
+        for _ in 0..UP {
+            at(&mut b, c.third, 2.0, false);
+        }
+        assert_eq!(b.configure(Some(c)), 1);
+    }
+
+    /// A stretch far over budget goes straight to the rung predicted to fit, and steps back up
+    /// one rung at a time.
+    #[test]
+    fn far_over_budget_skips_straight_to_the_rung_that_fits() {
+        let c = config();
+        let mut b = Budget::default();
+        b.configure(Some(c));
+        warm(&mut b, c);
+        for _ in 0..DOWN {
+            sample(&mut b, c, 200.0, false);
+        }
+        assert_eq!(b.configure(Some(c)), 2, "200 ms × (1/3)² = 22 ms fits 33 ms: Third");
+        b.configure(None);
+        b.configure(Some(c));
+        warm(&mut b, c);
+        for _ in 0..DOWN {
+            sample(&mut b, c, 5000.0, false);
+        }
+        assert_eq!(b.configure(Some(c)), QUARTER, "nothing fits: the lowest rung");
+        for _ in 0..STEP_WARMUP + UP {
+            assert!(at(&mut b, c.quarter, 3.0, false));
+        }
+        assert_eq!(b.configure(Some(c)), 2);
+    }
+
+    #[test]
+    fn draft_labels_name_the_resolution_on_screen() {
+        assert_eq!(draft_label(1000, 1000), None);
+        assert_eq!(draft_label(1000, 995), None);
+        assert_eq!(draft_label(1000, 500), Some("Half"));
+        assert_eq!(draft_label(2000, 667), Some("Third"));
+        assert_eq!(draft_label(1000, 250), Some("Quarter"));
+        assert_eq!(draft_label(1000, 125), Some("Lower"));
+        assert_eq!(draft_label(0, 0), None);
+    }
+
     #[test]
     fn explicit_resolution_and_invalid_budgets_never_adapt() {
         let c = config();
@@ -343,7 +476,7 @@ mod tests {
             assert!(b.ticket(c.full).is_none());
         }
         // A Half no smaller than Full (the adaptive limit) is no ladder either.
-        let flat = Config { half: c.full, quarter: c.full, ..c };
+        let flat = Config { half: c.full, third: c.full, quarter: c.full, ..c };
         assert_eq!(b.configure(Some(flat)), 0);
         assert!(b.ticket(c.full).is_none());
     }
@@ -470,7 +603,7 @@ mod tests {
         b.configure(None);
         b.configure(Some(c));
         parallel(&mut b, c.full, 1, 200.0, WARMUP + DOWN);
-        assert_eq!(b.configure(Some(c)), 1, "one frame at a time is slow");
+        assert_eq!(b.configure(Some(c)), 2, "one frame at a time is slow: 200 ms × ¼ still misses, Third fits");
     }
 
     /// A5: Half delivering on demand (few renders in flight) steps back up when the pool

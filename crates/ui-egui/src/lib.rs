@@ -1479,23 +1479,28 @@ impl EffectcraftApp {
         let res = self.viewer_res();
         let full = res.scale(zoom, ppp);
         // Native Auto playback measures actual render service times, never cache hits, and
-        // ladders Full → Half → Quarter while frames miss their deadline (see playback_budget).
+        // ladders Full → Half → Third → Quarter while frames miss their deadline (see
+        // playback_budget): Settings ▸ Previews ▸ Adaptive Resolution While Playing, or Fast
+        // Previews ▸ Adaptive Resolution.
         let adaptive = self.playback.playing
             && !self.playback.caching
             && res.is_auto()
-            && self.session.state.viewer.fast_previews == effectcraft_engine::commands::viewer_cmds::FastPreviews::AdaptiveResolution
+            && (self.session.prefs.previews.adaptive_playback
+                || self.session.state.viewer.fast_previews == effectcraft_engine::commands::viewer_cmds::FastPreviews::AdaptiveResolution)
             && !self.ui.viewer.interacting
             && !self.ui.viewer.property_interacting
             && !self.frames.remote_active()
             && self.playback.fps.is_finite()
             && self.playback.fps > 0.0;
         let half = full.min((full * 0.5).max(self.session.prefs.adaptive_limit()));
+        let third = full.min((full / 3.0).max(self.session.prefs.adaptive_limit()));
         let quarter = full.min((full * 0.25).max(self.session.prefs.adaptive_limit()));
         let config = self.session.active_comp_id().filter(|_| adaptive).map(|comp| {
             let step = self.playback.plan.map_or(1, |p| p.step).max(1) as f64;
             crate::playback_budget::Config {
                 full: self.frame_series(comp, full),
                 half: self.frame_series(comp, half),
+                third: self.frame_series(comp, third),
                 quarter: self.frame_series(comp, quarter),
                 budget_ms: 1000.0 * step / self.playback.fps,
                 gpu_context: self.gpu.as_ref().map_or(0, |g| std::ptr::from_ref(g.context()) as usize),
@@ -1505,6 +1510,7 @@ impl EffectcraftApp {
         match self.frames.adapt_playback(config) {
             0 => {}
             1 => return half,
+            2 => return third,
             _ => return quarter,
         }
         if self.scrubbing() {
@@ -3316,7 +3322,10 @@ mod playback_budget_tests {
         let mut app = app();
         slow(&app);
         assert_eq!(app.viewer_scale(1.0, 1.0), 0.5);
-        // Half still misses the deadline: Quarter, shown as "(Quarter)" by the popup.
+        // Half still misses the deadline: Third, then Quarter, shown as "(Quarter)" by the popup.
+        render(&app, 50.0);
+        assert!((app.viewer_scale(1.0, 1.0) - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(crate::panels::viewer_tools::resolution_label(state::Resolution::Auto, 1.0 / 3.0), "(Third)");
         render(&app, 40.0);
         assert_eq!(app.viewer_scale(1.0, 1.0), 0.25);
         assert_eq!(crate::panels::viewer_tools::resolution_label(state::Resolution::Auto, 0.25), "(Quarter)");
@@ -3333,11 +3342,37 @@ mod playback_budget_tests {
         slow(&app);
         assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         app.playback.res = None;
+        // Settings ▸ Previews ▸ Adaptive Resolution While Playing off: only Fast Previews ▸
+        // Adaptive Resolution adapts.
+        app.session.prefs.previews.adaptive_playback = false;
         for mode in [FastPreviews::Off, FastPreviews::Draft, FastPreviews::FastDraft, FastPreviews::Wireframe] {
             app.session.state.viewer.fast_previews = mode;
             slow(&app);
             assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         }
+    }
+
+    /// Adaptive Resolution While Playing (on by default) drafts slow playback in any Fast
+    /// Previews mode, and the paused viewer asks for full quality again.
+    #[test]
+    fn adaptive_playback_pref_drafts_in_every_mode_and_pause_restores_full() {
+        assert!(Session::default().prefs.previews.adaptive_playback, "on by default");
+        for mode in [FastPreviews::Off, FastPreviews::Draft, FastPreviews::Wireframe] {
+            let mut app = app();
+            app.session.state.viewer.fast_previews = mode;
+            assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
+            slow(&app);
+            assert_eq!(app.viewer_scale(1.0, 1.0), 0.5, "{mode:?}");
+            app.playback.playing = false;
+            assert_eq!(app.viewer_scale(1.0, 1.0), 1.0, "paused: full quality");
+            app.playback.playing = true;
+            assert_eq!(app.viewer_scale(1.0, 1.0), 1.0, "a new playback starts at full");
+        }
+        let mut app = app();
+        app.session.execute("view.adaptivePlayback", json!({"on": false})).unwrap();
+        app.session.state.viewer.fast_previews = FastPreviews::Off;
+        slow(&app);
+        assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
     }
     /// A4: after a ladder rung change the old rung's queued prefetch no longer counts as the
     /// new rung's frames in flight (it held playback at every Full ↔ Half switch): it is dropped.
