@@ -388,6 +388,28 @@ and lists what is wrong, in words an agent can act on. Run it before calling a d
   envelope, tempo by autocorrelation, beats by dynamic programming); with a single `time` only the
   key moments on that frame are checked. Without audio, or without a clear beat, a `notes` entry
   says it was skipped.
+- `off-accent` (warning, only when the comp has a speech map): a keyframed property's speed-graph
+  peak (the fastest moment between two eased keyframes; linear segments have none; keyframes only,
+  no expressions) within `accentWindow` frames (default 4) of a stressed syllable's accent that
+  misses it by more than one frame. The accent is `accentLead` frames (default 1) before the
+  stressed vowel, never before the syllable's onset: Elias's hand-timed peak on "CONtent" sits at
+  the k burst + 2 frames = the vowel − 1 frame. The message names the word, the onset, the vowel
+  and the time to move the peak to.
+
+### Speech maps (timing peaks to stressed syllables)
+
+1. `scripts/fork/speech-map MEDIA --start S --dur S --fps 29.97 --out map.json`: ElevenLabs Scribe
+   text (`scribe-words`), Montreal Forced Aligner phones with stress digits, then a forward
+   acoustic snap of each word-initial and stressed onset (0.15 frames median against hand labels;
+   `~/Developer/lab/S1-speech-timing/REPORT.md`). Times are media seconds + `--offset`.
+2. `speech.import {path, layer?}` stores it on the comp (undoable, saved with the project). With
+   `layer` (the voice footage) media time is mapped through the layer's start and stretch, and
+   words outside its in/out are dropped; without it the times are taken as comp seconds.
+3. `speech.get {stressed: true, start?, end?}` lists accents (`onset`, `vowel`, `accent`,
+   `accentFrame`): where to put a speed-graph peak. `speech.accents {layer?, start?, end?}` lists
+   every speed peak with its nearest accent and `offsetFrames` (negative = early); `hit` is
+   within one frame. `render.lint {rules: ["off-accent"]}` flags the near misses.
+4. `speech.clear` removes the map.
 
 Geometry is the `get_layout` geometry (track-matte sources and adjustment layers are skipped);
 only `low-contrast` renders, at most 480 px on the long side, once per sample time that shows text.
