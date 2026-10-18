@@ -27,6 +27,7 @@ filmcraft-color = { workspace = true }
 filmcraft-time = { workspace = true }
 filmcraft-h264 = { workspace = true }
 filmcraft-h264enc = { workspace = true }
+filmcraft-prores = { workspace = true }
 exr = { workspace = true }
 gif = { workspace = true }
 image = { workspace = true, features = ["gif", "webp", "tiff", "bmp", "exr", "tga", "hdr"] }
@@ -37,7 +38,6 @@ thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
-filmcraft-prores = { workspace = true }
 filmcraft-isobmff = { workspace = true }
 effectcraft-color = { workspace = true }
 effectcraft-av1enc = { workspace = true }
