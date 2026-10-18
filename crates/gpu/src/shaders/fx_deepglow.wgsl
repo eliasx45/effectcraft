@@ -20,14 +20,16 @@ fn fdg_to_linear(px: vec4<f32>, unmult: bool) -> vec4<f32> {
 }
 
 // The glow input: misc::deep_glow_key, the Mask Layer (aux, misc::deep_glow_mask), then to linear.
-// u[0] = (mask, luma mask, invert mask, to linear); u[1].x = unmult; f[0] = (threshold, smooth).
+// u[0] = (mask, luma mask, invert mask, to linear); u[1] = (unmult, src offset); f[0] = (threshold,
+// smooth). The output is the padded frame; src is the unpadded layer at (offset, offset) in it.
 @compute @workgroup_size(16, 16)
 fn fdg_key(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
     if (!fdg_inside(p)) {
         return;
     }
-    let px = textureLoad(src, p, 0);
+    let so = i32(P.u[1].y);
+    let px = tex_get(src, p.x - so, p.y - so);
     let a = px.w;
     var l = 0.0;
     if (a > 0.0) {
@@ -74,7 +76,9 @@ fn fdg_sum(@builtin(global_invocation_id) gid: vec3<u32>) {
 // The final composite (the CPU's `finish`): the original (src, to linear) plus the exposed,
 // tinted halo (aux), back to display values, Unmult's alpha, then Dither.
 // u[0] = (to linear, unmult, screen, tint); u[1] = (tint mode, dither, monochrome, frame width);
-// u[2].x = seed; f[0] = (exposure, source opacity, tint mix, dither amount); f[1] = tint colour.
+// u[2] = (seed, src offset, halo offset); f[0] = (exposure, source opacity, tint mix, dither amount);
+// f[1] = tint colour. src (the unpadded layer) and the halo (the frame's region that can glow) sit
+// at their offsets in the padded output frame; outside them both are transparent.
 @compute @workgroup_size(16, 16)
 fn fdg_finish(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
@@ -83,8 +87,10 @@ fn fdg_finish(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let convert = P.u[0].x != 0u;
     let unmult = P.u[0].y != 0u;
-    let glow = tex_get(aux, p.x, p.y);
-    var original = textureLoad(src, p, 0);
+    let ho = i32(P.u[2].z);
+    let so = i32(P.u[2].y);
+    let glow = tex_get(aux, p.x - ho, p.y - ho);
+    var original = tex_get(src, p.x - so, p.y - so);
     if (convert) {
         original = fdg_to_linear(original, unmult);
     }
