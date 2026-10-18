@@ -16,11 +16,10 @@ use serde_json::{Value, json};
 use super::prop::prop_ref;
 use super::{CommandSpec, b_p, bad, comp_id, f_p, has_comp, match_path_of, resolve_layer, str_p, unlocked};
 use crate::lint;
+use crate::precomp_time::{self, Hop, MAX_DEPTH, chains, down, scale, up};
 use crate::{EngineError, KeyRef, Result, Session, cmd, query};
 
 const C: &str = "keys.alignPeak";
-/// Deepest precomp nesting searched between the target comp and the layer's comp.
-const MAX_DEPTH: usize = 12;
 /// Most properties one call aligns.
 const MAX_PROPS: usize = 64;
 /// Smallest influence the `ease` mode sets (0.1 %).
@@ -42,13 +41,33 @@ pub struct Graph {
 /// Devin Jatho → Graphs, in order of where their speed peak sits.
 pub const GRAPHS: [Graph; 5] = [
     // Library entry 2b85eb981d3543cd8298d1f066ab74fb, "for really fast slide ins".
-    Graph { id: "fast-in", name: "Fast In", out: Ease { speed: 23.752_732_274_402_83, influence: 0.005_926_622_109_416_769 }, inn: Ease { speed: 0.0, influence: 0.929_213_858_190_53 } },
+    Graph {
+        id: "fast-in",
+        name: "Fast In",
+        out: Ease { speed: 23.752_732_274_402_83, influence: 0.005_926_622_109_416_769 },
+        inn: Ease { speed: 0.0, influence: 0.929_213_858_190_53 },
+    },
     // starter-curve-4.
-    Graph { id: "quick-launch", name: "Quick launch · soft landing", out: Ease { speed: 0.0, influence: 0.398_782_730_102_539_06 }, inn: Ease { speed: 0.0, influence: 0.909_237_649_705_674_9 } },
+    Graph {
+        id: "quick-launch",
+        name: "Quick launch · soft landing",
+        out: Ease { speed: 0.0, influence: 0.398_782_730_102_539_06 },
+        inn: Ease { speed: 0.0, influence: 0.909_237_649_705_674_9 },
+    },
     // starter-curve-3.
-    Graph { id: "smooth-emphasis", name: "Smooth emphasis", out: Ease { speed: 0.0, influence: 0.702_064_355_214_437 }, inn: Ease { speed: 0.0, influence: 0.700_731_542_375_352_6 } },
+    Graph {
+        id: "smooth-emphasis",
+        name: "Smooth emphasis",
+        out: Ease { speed: 0.0, influence: 0.702_064_355_214_437 },
+        inn: Ease { speed: 0.0, influence: 0.700_731_542_375_352_6 },
+    },
     // starter-curve-5.
-    Graph { id: "slow-launch", name: "Slow launch · quick finish", out: Ease { speed: 0.0, influence: 0.830_011_261_834_038_5 }, inn: Ease { speed: 0.0, influence: 0.601_217_269_897_460_9 } },
+    Graph {
+        id: "slow-launch",
+        name: "Slow launch · quick finish",
+        out: Ease { speed: 0.0, influence: 0.830_011_261_834_038_5 },
+        inn: Ease { speed: 0.0, influence: 0.601_217_269_897_460_9 },
+    },
     // Library entry 131137cbe3474b509a3760133d62e8d5, "for super fast slide outs".
     Graph { id: "fast-out", name: "Fast out", out: Ease { speed: 0.0, influence: 1.0 }, inn: Ease { speed: 0.0, influence: 0.008_870_442_708_333_37 } },
 ];
@@ -108,7 +127,13 @@ fn graph_p(p: &Value) -> Result<GraphChoice> {
             return Ok(GraphChoice::Auto);
         }
         return graph_named(name).map(GraphChoice::Use).ok_or_else(|| {
-            bad(C, format!("no ease graph {name:?}: use one of {} (Devin Jatho → Graphs), \"keep\" or {{out: {{speed, influence}}, in: {{speed, influence}}}}", GRAPHS.iter().map(|g| format!("\"{}\"", g.id)).collect::<Vec<_>>().join(", ")))
+            bad(
+                C,
+                format!(
+                    "no ease graph {name:?}: use one of {} (Devin Jatho → Graphs), \"keep\" or {{out: {{speed, influence}}, in: {{speed, influence}}}}",
+                    GRAPHS.iter().map(|g| format!("\"{}\"", g.id)).collect::<Vec<_>>().join(", ")
+                ),
+            )
         });
     }
     let side = |k: &str| -> Result<Ease> {
@@ -148,69 +173,17 @@ fn mode_p(p: &Value) -> Result<Mode> {
         Some("stretchin") => Ok(Mode::StretchIn),
         Some("stretchout") => Ok(Mode::StretchOut),
         Some("ease") => Ok(Mode::Ease),
-        Some(_) => Err(bad(C, "`mode` is \"shift\" (move both keys), \"stretch-in\" (keep the second key), \"stretch-out\" (keep the first key) or \"ease\" (keys stay, influences change)")),
+        Some(_) => Err(bad(
+            C,
+            "`mode` is \"shift\" (move both keys), \"stretch-in\" (keep the second key), \"stretch-out\" (keep the first key) or \"ease\" (keys stay, influences change)",
+        )),
     }
 }
 
 // ---------------------------------------------------------------- time through precomps
 
-/// One precomp layer between the target comp and the layer's comp (outermost first): its start
-/// and stretch map the outer comp's time to the precomp's.
-#[derive(Clone, Copy, Debug)]
-struct Hop {
-    comp: ItemId,
-    layer: LayerId,
-    start: f64,
-    stretch: f64,
-}
-
-fn down(chain: &[Hop], t: f64) -> f64 {
-    chain.iter().fold(t, |t, h| (t - h.start) * 100.0 / h.stretch)
-}
-fn up(chain: &[Hop], t: f64) -> f64 {
-    chain.iter().rev().fold(t, |t, h| h.start + t * h.stretch / 100.0)
-}
-/// Seconds of the inner comp per second of the target comp.
-fn scale(chain: &[Hop]) -> f64 {
-    chain.iter().fold(1.0, |k, h| k * 100.0 / h.stretch.abs())
-}
-
 fn hop(comp: ItemId, l: &Layer) -> Result<Hop> {
-    if l.props.get("timeRemap").is_some_and(|t| !t.keys.is_empty() || t.has_expression()) {
-        return Err(bad(C, format!("{} is time-remapped, so its time can't be mapped to the comp around it", l.name)));
-    }
-    if !l.stretch.is_finite() || l.stretch.abs() < 1e-6 {
-        return Err(bad(C, format!("{} has a zero time stretch", l.name)));
-    }
-    Ok(Hop { comp, layer: l.id, start: l.start_time.seconds(), stretch: l.stretch })
-}
-
-/// Every chain of precomp layers from `outer` down to `inner` (at most 8).
-fn chains(project: &Project, outer: ItemId, inner: ItemId) -> Vec<Vec<(ItemId, LayerId)>> {
-    fn walk(project: &Project, at: ItemId, inner: ItemId, path: &mut Vec<(ItemId, LayerId)>, out: &mut Vec<Vec<(ItemId, LayerId)>>) {
-        if out.len() >= 8 || path.len() >= MAX_DEPTH {
-            return;
-        }
-        let Some(comp) = project.comp(at) else { return };
-        for l in &comp.layers {
-            let LayerSource::Comp { item } = l.source else { continue };
-            if path.iter().any(|(c, _)| *c == item) || item == at {
-                continue;
-            }
-            path.push((at, l.id));
-            if item == inner {
-                out.push(path.clone());
-            } else {
-                walk(project, item, inner, path, out);
-            }
-            path.pop();
-        }
-    }
-    let mut out = vec![];
-    if outer != inner {
-        walk(project, outer, inner, &mut vec![], &mut out);
-    }
-    out
+    precomp_time::hop(comp, l).map_err(|e| bad(C, e))
 }
 
 fn comp_ref(s: &Session, v: &Value) -> Result<ItemId> {
@@ -248,13 +221,20 @@ fn chain_p(s: &Session, p: &Value, outer: ItemId, inner: ItemId) -> Result<Vec<H
     let found = chains(project, outer, inner);
     match found.as_slice() {
         [] => Err(bad(C, format!("{} is not nested in {} (targetComp)", comp_name(project, inner), comp_name(project, outer)))),
-        [one] => one
-            .iter()
-            .map(|(c, l)| project.comp(*c).and_then(|comp| comp.layer(*l)).ok_or(EngineError::NoComp).and_then(|layer| hop(*c, layer)))
-            .collect(),
+        [one] => {
+            one.iter().map(|(c, l)| project.comp(*c).and_then(|comp| comp.layer(*l)).ok_or(EngineError::NoComp).and_then(|layer| hop(*c, layer))).collect()
+        }
         many => {
             let list: Vec<Value> = many.iter().map(|ch| json!(ch.iter().map(|(_, l)| l.0).collect::<Vec<_>>())).collect();
-            Err(bad(C, format!("{} is nested in {} more than once: pass `via` (precomp layer ids, outermost first), one of {}", comp_name(project, inner), comp_name(project, outer), Value::Array(list))))
+            Err(bad(
+                C,
+                format!(
+                    "{} is nested in {} more than once: pass `via` (precomp layer ids, outermost first), one of {}",
+                    comp_name(project, inner),
+                    comp_name(project, outer),
+                    Value::Array(list)
+                ),
+            ))
         }
     }
 }
@@ -300,10 +280,19 @@ fn target_p(p: &Value, comp: &Comp, hint: Option<f64>) -> Result<Target> {
     let (word, index, occurrence, syllable) = match sp {
         Value::String(w) => (Some(w.as_str()), None, None, None),
         Value::Number(n) => (None, n.as_u64(), None, None),
-        _ => (str_p(sp, "word"), sp.get("index").and_then(Value::as_u64), sp.get("occurrence").and_then(Value::as_u64), sp.get("syllable").and_then(Value::as_u64)),
+        _ => (
+            str_p(sp, "word"),
+            sp.get("index").and_then(Value::as_u64),
+            sp.get("occurrence").and_then(Value::as_u64),
+            sp.get("syllable").and_then(Value::as_u64),
+        ),
     };
     let candidates: Vec<(usize, &effectcraft_project::speech::SpeechWord)> = match (word, index) {
-        (_, Some(i)) => map.words.get(i as usize).map(|w| vec![(i as usize, w)]).ok_or_else(|| bad(C, format!("the speech map has {} words; no index {i}", map.words.len())))?,
+        (_, Some(i)) => map
+            .words
+            .get(i as usize)
+            .map(|w| vec![(i as usize, w)])
+            .ok_or_else(|| bad(C, format!("the speech map has {} words; no index {i}", map.words.len())))?,
         (Some(w), None) => {
             let q = clean_word(w);
             map.words.iter().enumerate().filter(|(_, x)| clean_word(&x.word) == q).collect()
@@ -319,7 +308,10 @@ fn target_p(p: &Value, comp: &Comp, hint: Option<f64>) -> Result<Target> {
     };
     let pick = match (occurrence, candidates.len()) {
         (_, 0) => return Err(bad(C, format!("no word {:?} in the speech map", word.unwrap_or("")))),
-        (Some(n), len) => candidates.get((n as usize).checked_sub(1).ok_or_else(|| bad(C, "`occurrence` is 1-based"))?).copied().ok_or_else(|| bad(C, format!("{:?} occurs {len} times", word.unwrap_or(""))))?,
+        (Some(n), len) => candidates
+            .get((n as usize).checked_sub(1).ok_or_else(|| bad(C, "`occurrence` is 1-based"))?)
+            .copied()
+            .ok_or_else(|| bad(C, format!("{:?} occurs {len} times", word.unwrap_or(""))))?,
         (None, 1) => candidates.first().copied().ok_or_else(|| bad(C, "no word"))?,
         (None, _) => match hint {
             Some(h) => candidates
@@ -331,7 +323,15 @@ fn target_p(p: &Value, comp: &Comp, hint: Option<f64>) -> Result<Target> {
                 .ok_or_else(|| bad(C, "the word has no syllables"))?,
             None => {
                 let list: Vec<String> = candidates.iter().map(|(i, w)| format!("#{i} at {:.3} s", w.start.seconds())).collect();
-                return Err(bad(C, format!("{:?} occurs {} times ({}): pass `speech: {{word, occurrence}}` or `{{index}}`", word.unwrap_or(""), candidates.len(), list.join(", "))));
+                return Err(bad(
+                    C,
+                    format!(
+                        "{:?} occurs {} times ({}): pass `speech: {{word, occurrence}}` or `{{index}}`",
+                        word.unwrap_or(""),
+                        candidates.len(),
+                        list.join(", ")
+                    ),
+                ));
             }
         },
     };
@@ -557,9 +557,7 @@ fn solve(
     let prev = i.checked_sub(1).and_then(|j| keys.get(j)).map(|k| k.time);
     let next = keys.get(i + 2).map(|k| k.time);
     let min_dur = fr.frame_duration().seconds() * 100.0 / clock.layer.stretch.abs().max(1e-6);
-    let fits = |ka: Tick, kb: Tick| -> bool {
-        prev.is_none_or(|p| ka > p) && next.is_none_or(|n| kb < n) && kb.seconds() - ka.seconds() >= min_dur * 0.999
-    };
+    let fits = |ka: Tick, kb: Tick| -> bool { prev.is_none_or(|p| ka > p) && next.is_none_or(|n| kb < n) && kb.seconds() - ka.seconds() >= min_dur * 0.999 };
     // Candidate key times (layer ticks) for the pair.
     let options = |t: f64| -> Vec<(Tick, bool)> {
         let mut out: Vec<(Tick, bool)> = if snap { frame_candidates(clock.layer, fr, t).into_iter().map(|t| (t, true)).collect() } else { vec![] };
@@ -669,10 +667,16 @@ fn solve(
             (_, Some(n)) => format!(" (the key after is at frame {:.0})", clock.frame_of(n)),
             _ => String::new(),
         };
-        return Err(bad(C, format!("{}: the keys can't move there without crossing a neighbouring key or getting shorter than a frame{around}: try another mode", prop.name)));
+        return Err(bad(
+            C,
+            format!("{}: the keys can't move there without crossing a neighbouring key or getting shorter than a frame{around}: try another mode", prop.name),
+        ));
     };
     if err.abs() > tolerance + 1e-6 {
-        return Err(bad(C, format!("{}: the closest peak is {err:+.2} frames off the target (tolerance ±{tolerance}): try another mode or `snap: false`", prop.name)));
+        return Err(bad(
+            C,
+            format!("{}: the closest peak is {err:+.2} frames off the target (tolerance ±{tolerance}): try another mode or `snap: false`", prop.name),
+        ));
     }
     let after = peak_of(&out).map(|t| clock.frame(t));
     let key_frames = |k: &[Keyframe]| json!([k.get(i).map(|k| r2(clock.frame_of(k.time))), k.get(i + 1).map(|k| r2(clock.frame_of(k.time)))]);
@@ -753,7 +757,11 @@ fn segment(prop: &effectcraft_project::Property, key: Option<usize>, clock: &Clo
         return Err(bad(C, format!("{} has fewer than two keyframes", prop.name)));
     }
     if let Some(k) = key {
-        return if k + 1 < prop.keys.len() { Ok(k) } else { Err(bad(C, format!("{} has {} keys: `key` (the pair's first, 0-based) must be below {}", prop.name, prop.keys.len(), prop.keys.len() - 1))) };
+        return if k + 1 < prop.keys.len() {
+            Ok(k)
+        } else {
+            Err(bad(C, format!("{} has {} keys: `key` (the pair's first, 0-based) must be below {}", prop.name, prop.keys.len(), prop.keys.len() - 1)))
+        };
     }
     if prop.keys.len() == 2 {
         return Ok(0);
@@ -866,6 +874,11 @@ pub fn specs() -> Vec<CommandSpec> {
             has_comp,
             align
         ),
-        query!("keys.peakGraphs", "Peak Ease Graphs", "{} → {graphs: [{id, name, peak (0 start … 1 end), out, in}]}: Devin's ease graphs keys.alignPeak uses", graphs),
+        query!(
+            "keys.peakGraphs",
+            "Peak Ease Graphs",
+            "{} → {graphs: [{id, name, peak (0 start … 1 end), out, in}]}: Devin's ease graphs keys.alignPeak uses",
+            graphs
+        ),
     ]
 }
