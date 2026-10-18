@@ -114,6 +114,7 @@ impl<'a> Renderer<'a> {
             || self.through.iter().any(Option::is_some)
             || self.canvas_origin != [0; 2]
             || self.out_comp.is_some()
+            || self.window.is_some()
             || self.layer_view.is_some()
         {
             return None;
