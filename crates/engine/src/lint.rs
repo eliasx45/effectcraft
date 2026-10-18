@@ -956,7 +956,15 @@ pub fn speed_peaks_deep(project: &Project, cid: ItemId, start: f64, end: f64) ->
 }
 
 /// Peaks inside the precomp layers of `at` whose shown part overlaps `lo..=hi` (`at`'s seconds).
-fn nested_peaks(project: &Project, at: (ItemId, &Comp), (lo, hi): (f64, f64), chain: &mut Vec<Hop>, comps: &mut Vec<ItemId>, out: &mut DeepPeaks, budget: &mut usize) {
+fn nested_peaks(
+    project: &Project,
+    at: (ItemId, &Comp),
+    (lo, hi): (f64, f64),
+    chain: &mut Vec<Hop>,
+    comps: &mut Vec<ItemId>,
+    out: &mut DeepPeaks,
+    budget: &mut usize,
+) {
     if chain.len() >= precomp_time::MAX_DEPTH {
         return;
     }
@@ -1037,7 +1045,16 @@ pub fn match_accents<'a>(peaks: Vec<SpeedPeak>, map: &'a effectcraft_project::sp
 /// `lead` frames before its vowel) that miss it by more than one frame. A nested peak's finding is
 /// on the precomp layer in `cid`; its message names the nested layer and the `keys.alignPeak`
 /// call that fixes it. Also returns why some precomps were not searched.
-pub fn off_accent(project: &Project, cid: ItemId, map: &effectcraft_project::speech::SpeechMap, start: f64, end: f64, fps: f64, lead: f64, window: f64) -> (Vec<(Tick, Finding)>, Vec<String>) {
+pub fn off_accent(
+    project: &Project,
+    cid: ItemId,
+    map: &effectcraft_project::speech::SpeechMap,
+    start: f64,
+    end: f64,
+    fps: f64,
+    lead: f64,
+    window: f64,
+) -> (Vec<(Tick, Finding)>, Vec<String>) {
     let mut out = vec![];
     let Some(comp) = project.comp(cid) else { return (out, vec![]) };
     if fps.is_nan() || fps <= 0.0 {

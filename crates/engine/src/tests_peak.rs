@@ -2,7 +2,7 @@
 //! spatial and multi-dimensional properties, speech targets ("content" at frame 1281 in 10-10
 //! MAIN), one undo step.
 
-use effectcraft_project::{LayerId, ItemId};
+use effectcraft_project::{ItemId, LayerId};
 use serde_json::{Value, json};
 
 use crate::Session;
@@ -140,7 +140,9 @@ fn stretch_in_keeps_the_second_key_and_stretch_out_the_first() {
     // A peak on the kept key can't move.
     let (mut s, _, l) = comp(25.0, 6.0);
     scale_move(&mut s, l, 1.0, 2.0);
-    assert!(s.execute_checked("keys.alignPeak", json!({"layer": l, "path": "transform/scale", "frame": 40, "mode": "stretch-in", "graph": "fast-out"})).is_err());
+    assert!(
+        s.execute_checked("keys.alignPeak", json!({"layer": l, "path": "transform/scale", "frame": 40, "mode": "stretch-in", "graph": "fast-out"})).is_err()
+    );
 }
 
 #[test]
@@ -211,10 +213,14 @@ fn shift_never_crosses_a_neighbouring_key() {
     key(&mut s, l, "transform/rotation", 1.0, json!(0.0));
     key(&mut s, l, "transform/rotation", 2.0, json!(90.0));
     key(&mut s, l, "transform/rotation", 2.5, json!(0.0));
-    let e = s.execute_checked("keys.alignPeak", json!({"layer": l, "path": "transform/rotation", "key": 0, "frame": 60, "graph": "smooth-emphasis"})).unwrap_err().to_string();
+    let e = s
+        .execute_checked("keys.alignPeak", json!({"layer": l, "path": "transform/rotation", "key": 0, "frame": 60, "graph": "smooth-emphasis"}))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("crossing"), "{e}");
     // A linear move with the graph kept has no peak.
-    let e = s.execute_checked("keys.alignPeak", json!({"layer": l, "path": "transform/rotation", "key": 0, "frame": 30, "graph": "keep"})).unwrap_err().to_string();
+    let e =
+        s.execute_checked("keys.alignPeak", json!({"layer": l, "path": "transform/rotation", "key": 0, "frame": 30, "graph": "keep"})).unwrap_err().to_string();
     assert!(e.contains("linear"), "{e}");
 }
 
@@ -295,7 +301,10 @@ fn speech_target_in_the_parent_comp_reaches_a_precomp() {
     s.execute("layer.addItem", json!({"comp": main.0, "item": inner.0, "time": 40.0})).unwrap();
     let first_key = key_times(&s, inner, l, "transform/scale")[0];
     // Without targetComp: the comp with the speech map that nests the precomp.
-    let r = align(&mut s, json!({"comp": inner.0, "layer": l, "path": "transform/scale", "speech": {"word": "content"}, "mode": "stretch-out", "graph": "slow-launch"}));
+    let r = align(
+        &mut s,
+        json!({"comp": inner.0, "layer": l, "path": "transform/scale", "speech": {"word": "content"}, "mode": "stretch-out", "graph": "slow-launch"}),
+    );
     assert_eq!(r["targetComp"], main.0);
     assert!((after(&r) - r["target"]["frame"].as_f64().unwrap()).abs() <= 0.5, "{r:#}");
     assert_eq!(key_times(&s, inner, l, "transform/scale")[0], first_key, "stretch-out keeps the first key");

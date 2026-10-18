@@ -242,7 +242,8 @@ fn accents(s: &mut Session, p: &Value) -> Result<Value> {
             // Ready `keys.alignPeak` params: land this peak on its accent.
             let word = map.words.iter().position(|w| std::ptr::eq(w, m.word));
             let syllable = m.word.syllables.iter().position(|x| *x == m.syllable);
-            let mut align = json!({"comp": inner.0, "layer": m.peak.layer.0, "path": m.peak.path, "speech": {"index": word, "syllable": syllable}, "accentLead": lead});
+            let mut align =
+                json!({"comp": inner.0, "layer": m.peak.layer.0, "path": m.peak.path, "speech": {"index": word, "syllable": syllable}, "accentLead": lead});
             if m.peak.comp.is_some() {
                 (align["targetComp"], align["via"]) = (json!(cid.0), json!(via));
             }
