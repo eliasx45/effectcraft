@@ -257,7 +257,7 @@ if [ "$(git rev-parse HEAD)" != "$want" ]; then
   git merge -q --ff-only "$want" || { echo "ERR cannot fast-forward /workspace/effectcraft to $want (local changes or another branch there)"; exit 3; }
 fi
 pgrep -f "cloud-build.state" >/dev/null && { echo "BUILDING (already running)"; exit 0; }
-nohup bash -c "echo running >/workspace/cloud-build.state; if nice -n 15 taskset -c ${EC_BUILD_CPUS:-100-111} cargo build --profile local -p effectcraft-cli -j 8 >/workspace/cloud-build.log 2>&1; then echo $want >target/local/.built-commit; echo ok >/workspace/cloud-build.state; else echo failed >/workspace/cloud-build.state; fi" >/dev/null 2>&1 &
+nohup bash -c "echo running >/workspace/cloud-build.state; if nice -n 15 \${EC_BUILD_CPUS:+taskset -c \$EC_BUILD_CPUS} cargo build --profile local -p effectcraft-cli -j \$(( \$(nproc) / 2 > 8 ? \$(nproc) / 2 : 8 )) >/workspace/cloud-build.log 2>&1; then echo $want >target/local/.built-commit; echo ok >/workspace/cloud-build.state; else echo failed >/workspace/cloud-build.state; fi" >/dev/null 2>&1 &
 echo "BUILDING"
 '
 
