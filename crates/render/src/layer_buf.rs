@@ -314,10 +314,30 @@ impl<'a> Renderer<'a> {
         Some(buf)
     }
 
-    /// A styled layer's pixels before its styles (working space, layer cache), for an
-    /// accelerator that renders the styles itself ([`crate::styles::gpu_prepare`]).
-    pub fn styled_content(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
-        self.content_buf_timed(ctx, layer, None, None).map(|(b, _)| b)
+    /// A styled layer for an accelerator that renders its styles itself: the content cropped
+    /// and padded for them, and the styles ([`crate::styles::gpu_prepare`]). `None` leaves the
+    /// layer to [`Self::styled`]: styles the accelerator can't render, a static layer (its
+    /// styles are cached and uploaded once), or a frame seen before. The first visit of a frame
+    /// leaves a mark in the layer cache; the next one styles it on the CPU and caches the
+    /// result, so scrubbing back over it costs no styling at all.
+    pub fn gpu_styles(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, crate::styles::GpuStyles)> {
+        if self.layer_is_static(ctx, layer) {
+            return None;
+        }
+        let (content, ckey) = self.content_buf_timed(ctx, layer, None, None)?;
+        if let (Some(c), Some(k)) = (self.cache, ckey.map(|k| cache::styles_key(ctx, layer, k))) {
+            let mark = cache::derive(k, 0x6e57);
+            if c.peek(k).is_some() || c.peek(mark).is_some() {
+                return None;
+            }
+            if let Some(keep) = self.cache_to_keep() {
+                keep.insert(mark, Arc::new(Buf { img: effectcraft_raster::Image::new(1, 1), offset: [0.0; 2], scale: 1.0 }));
+            }
+        }
+        let size = source_size(self.project, layer);
+        let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
+        let (buf, plan) = crate::styles::gpu_prepare(ctx, layer, &content, layer_size)?;
+        Some((Arc::new(buf), plan))
     }
 
     /// The layer with its styles: exterior passes and body (cached per pass).

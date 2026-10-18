@@ -548,11 +548,13 @@ fn cropped_styles_match_the_whole_buffer() {
     const DISSOLVE: u32 = 1;
     let sets: [&[(&str, &[(&str, Value)])]; 2] = [
         &[
-            ("dropShadow", &[("size", Value::Scalar(9.0)), ("distance", Value::Scalar(6.0)), ("noise", Value::Scalar(30.0)), ("blendMode", Value::Enum(DISSOLVE))]),
+            ("dropShadow", &[("size", Value::Scalar(9.0)), ("distance", Value::Scalar(6.0)), ("noise", Value::Scalar(30.0))]),
             ("outerGlow", &[("size", Value::Scalar(12.0)), ("noise", Value::Scalar(20.0)), ("jitter", Value::Scalar(40.0)), ("colorType", Value::Enum(1))]),
             ("innerShadow", &[("size", Value::Scalar(5.0)), ("noise", Value::Scalar(10.0))]),
             ("satin", &[]),
-            ("colorOverlay", &[("opacity", Value::Scalar(40.0))]),
+            // Dissolve on an interior style: its grain is the buffer's (an exterior pass is
+            // dissolved by the compositor, in comp pixels).
+            ("colorOverlay", &[("opacity", Value::Scalar(40.0)), ("blendMode", Value::Enum(DISSOLVE))]),
             ("gradientOverlay", &[("opacity", Value::Scalar(60.0)), ("alignWithLayer", Value::Bool(true))]),
         ],
         &[
@@ -573,10 +575,10 @@ fn cropped_styles_match_the_whole_buffer() {
         }
     }
     let content = effectcraft_effects::Buf { img, offset: [150.0, 100.0], scale: 1.0 };
-    for set in sets {
+    for styles in sets {
         let (mut p, cid, comp) = setup();
         let mut l = solid(&mut p, &comp, [1.0; 3], 40, 40);
-        for (style, params) in set {
+        for (style, params) in styles {
             add(&mut p, &comp, &mut l, style);
             for (k, v) in *params {
                 set(&mut l, &format!("{style}/{k}"), v.clone());
@@ -588,7 +590,7 @@ fn cropped_styles_match_the_whole_buffer() {
         assert!(cropped.img.width * 2 < whole.img.width && cropped.img.height * 2 < whole.img.height, "not cropped");
         let (dx, dy) = (whole.offset[0] - cropped.offset[0], whole.offset[1] - cropped.offset[1]);
         assert!(dx.fract() == 0.0 && dy.fract() == 0.0 && dx >= 0.0 && dy >= 0.0, "{dx} {dy}");
-        let mut worst = 0.0f32;
+        let mut worst = (0.0f32, 0, 0);
         for y in 0..whole.img.height {
             for x in 0..whole.img.width {
                 let a = whole.img.get(x as i64, y as i64);
@@ -596,10 +598,12 @@ fn cropped_styles_match_the_whole_buffer() {
                 let inside = cx >= 0 && cy >= 0 && (cx as u32) < cropped.img.width && (cy as u32) < cropped.img.height;
                 let b = if inside { cropped.img.get(cx, cy) } else { [0.0; 4] };
                 for c in 0..4 {
-                    worst = worst.max((a[c] - b[c]).abs());
+                    if (a[c] - b[c]).abs() > worst.0 {
+                        worst = ((a[c] - b[c]).abs(), x, y);
+                    }
                 }
             }
         }
-        assert!(worst <= 1.0 / 255.0, "{:?}: max difference {worst}", set.iter().map(|s| s.0).collect::<Vec<_>>());
+        assert!(worst.0 <= 1.0 / 255.0, "{:?}: max difference {worst:?}", styles.iter().map(|s| s.0).collect::<Vec<_>>());
     }
 }

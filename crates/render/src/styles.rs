@@ -942,7 +942,7 @@ pub fn gpu_prepare(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64
     }
     let s = content.scale.max(1e-6);
     let hard = |size: f64, spread: f64| size * s * spread;
-    let soft = |size: f64, spread: f64| ((size * s - hard(size, spread)).max(0.0) / 2.0);
+    let soft = |size: f64, spread: f64| (size * s - hard(size, spread)).max(0.0) / 2.0;
     let shadow = |d: &Shadow| {
         (hard(d.size, d.spread) <= 0.01).then(|| GpuShadow {
             mode: d.mode,

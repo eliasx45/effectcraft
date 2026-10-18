@@ -357,23 +357,18 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
 #[cfg(test)]
 pub(crate) static STYLED_ON_GPU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// A layer with Layer Styles the GPU renders (`fx_styles`): its content (from the layer cache)
-/// cropped to its visible part, uploaded once, styled by kernels and placed like the CPU path's
-/// passes and body (knockout, track matte / Preserve Transparency, channel switches). The CPU
-/// path instead styles the layer on the CPU, on a comp-sized canvas for a shape or text layer
-/// with effects, and uploads every pass. `None`: no styles, or styles the GPU doesn't render
-/// (a distance field: spread, choke, Precise glows, Stroke, Bevel and Emboss); `Some(None)`: the
-/// GPU failed.
+/// An animated layer with Layer Styles the GPU renders (`fx_styles`): its content (from the
+/// layer cache) cropped to its visible part, uploaded once, styled by kernels and placed like
+/// the CPU path's passes and body (knockout, track matte / Preserve Transparency, channel
+/// switches); the CPU path styles it on the CPU and uploads every pass. `None`: no styles,
+/// styles the GPU doesn't render (a distance field: spread, choke, Precise glows, Stroke, Bevel
+/// and Emboss), or cached styles (`Renderer::gpu_styles`); `Some(None)`: the GPU failed.
 fn draw_styled_gpu(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32) -> Option<Option<()>> {
     if !styles::active(ctx, layer) {
         return None;
     }
-    let content = r.styled_content(ctx, layer)?;
-    let size = effectcraft_render::source_size(r.project, layer);
-    let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-    let (buf, plan) = styles::gpu_prepare(ctx, layer, &content, layer_size)?;
+    let (buf, plan) = r.gpu_styles(ctx, layer)?;
     let failed = |e: &mut Enc| if e.g.check_health().is_ok() { None } else { Some(None) };
-    let buf = Arc::new(buf);
     let Some(src) = e.upload_buf(&buf) else { return failed(e) };
     let Some(st) = crate::fx_styles::render(e, &src, &plan) else { return failed(e) };
     #[cfg(test)]
