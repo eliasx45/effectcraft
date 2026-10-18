@@ -134,7 +134,12 @@ struct Held {
 pub struct StreamBuffer {
     frames: BTreeMap<i64, Held>,
     /// `stale` notices: (revision, first frame): older revisions' frames from there on are old.
+    /// The app's own ones ([`StreamBuffer::edited`]) say `i64::MAX` for an edit that changed
+    /// nothing the comp shows.
     notices: Vec<(u64, i64)>,
+    /// `notices` hold every edit since this revision (the stream's start; older ones fell off):
+    /// a frame of a revision from here on that no notice made old shows the newest revision.
+    chain_from: u64,
     /// Keys this stream put in the cache that are stale: taken out again when the preview stops.
     dirty: HashSet<FrameKey>,
     /// The newest revision a chunk or a `stale` notice came at.
@@ -157,6 +162,7 @@ impl StreamBuffer {
         StreamBuffer {
             frames: BTreeMap::new(),
             notices: vec![],
+            chain_from: 0,
             dirty: HashSet::new(),
             acked: 0,
             cur,
@@ -167,6 +173,30 @@ impl StreamBuffer {
             received: None,
             failed: None,
         }
+    }
+
+    /// The stream plays the project at `revision`: edits from there on are followed.
+    pub fn at_revision(mut self, revision: u64) -> StreamBuffer {
+        self.chain_from = revision;
+        self.acked = self.acked.max(revision);
+        self
+    }
+
+    fn notice(&mut self, revision: u64, from: i64) {
+        self.notices.push((revision, from));
+        if self.notices.len() > 64 {
+            let (gone, _) = self.notices.remove(0);
+            self.chain_from = self.chain_from.max(gone);
+        }
+    }
+
+    /// The revision a frame of `revision` that no notice made old shows: the newest the notices
+    /// know (it is identical there), else its own.
+    fn shows(&self, revision: u64) -> u64 {
+        if revision < self.chain_from {
+            return revision;
+        }
+        self.notices.iter().map(|(r, _)| *r).filter(|r| *r > revision).max().unwrap_or(revision).max(revision)
     }
 
     /// Frames playback shows before it reaches `f` (`None`: it doesn't, from where it is).
@@ -248,14 +278,15 @@ impl StreamBuffer {
                 continue;
             }
             let stale = self.notices.iter().any(|(r, from)| meta.revision < *r && f >= *from);
-            let new = Held { img, revision: meta.revision, seq: meta.seq, scale: meta.scale, stale, published: None };
+            let revision = if stale { meta.revision } else { self.shows(meta.revision) };
+            let new = Held { img, revision, seq: meta.seq, scale: meta.scale, stale, published: None };
             match self.frames.get(&f) {
                 None => {
                     first_copies += 1;
                     self.frames.insert(f, new);
                 }
                 Some(old) => {
-                    let better = if old.stale != stale { old.stale } else { (meta.revision, meta.seq) > (old.revision, old.seq) };
+                    let better = if old.stale != stale { old.stale } else { (revision, meta.seq) > (old.revision, old.seq) };
                     if better {
                         upgrade = true;
                         self.frames.insert(f, new);
@@ -278,16 +309,41 @@ impl StreamBuffer {
     pub fn mark_stale(&mut self, revision: u64, from: i64) {
         self.stats.stale = self.stats.stale.saturating_add(1);
         self.acked = self.acked.max(revision);
-        self.notices.push((revision, from));
-        if self.notices.len() > 64 {
-            self.notices.remove(0);
-        }
+        self.notice(revision, from);
         for h in self.frames.range_mut(from..).map(|(_, h)| h) {
             if h.revision < revision && !h.stale {
                 h.stale = true;
                 if let Some(k) = h.published {
                     self.dirty.insert(k);
                 }
+            }
+        }
+    }
+
+    /// This Mac made the edit to `revision`, which changes the comp's frames from `from` on
+    /// (`None`: nothing it shows; [`effectcraft_engine::remote_stream::first_change`], as the
+    /// server works it out). Frames from there on are old at once; the ones before show the new
+    /// revision as they are: they stay current (cache bar, disk cache) instead of turning into
+    /// drafts until a server notice that never comes when nothing changed.
+    pub fn edited(&mut self, revision: u64, from: Option<i64>) {
+        let from = from.unwrap_or(i64::MAX);
+        self.acked = self.acked.max(revision);
+        self.notice(revision, from);
+        let chain = self.chain_from;
+        let dirty = &mut self.dirty;
+        for (f, h) in &mut self.frames {
+            if h.stale || h.revision >= revision {
+                continue;
+            }
+            if *f >= from {
+                h.stale = true;
+                if let Some(k) = h.published {
+                    dirty.insert(k);
+                }
+            } else if h.revision >= chain {
+                h.revision = revision;
+                // Published again as current (and kept on disk).
+                h.published = None;
             }
         }
     }
@@ -483,7 +539,40 @@ struct Running {
     shared: Arc<StreamShared>,
     client: Arc<CloudFrames>,
     revision: u64,
+    /// The project at `revision` (edits are compared with it).
+    project: Arc<Project>,
+    /// What the server's stream was set up with: another one needs a new stream.
+    shape: Option<Shape>,
     run: (i64, i64),
+    /// Chunks received when playback last had them all or got a new one, and when (see
+    /// [`NO_CHUNKS_SECS`]).
+    progress: (u64, f64),
+}
+
+/// What a running stream can't follow: the comp's frame grid and size, and the viewer's frame
+/// series apart from its content (comp, resolution, view, render options).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Shape {
+    rate: FrameRate,
+    size: (u32, u32),
+    duration: Tick,
+    series: (u64, u32, u64, u64),
+}
+
+fn shape(p: &PlayNow<'_>) -> Option<Shape> {
+    let c = p.project.comp(p.comp)?;
+    Some(Shape { rate: c.frame_rate, size: (c.width, c.height), duration: c.duration, series: (p.series.comp, p.series.scale, p.series.view, p.series.opts) })
+}
+
+/// Playback waits for frames and no chunk came for this long: the stream is stuck (a server that
+/// stopped rendering; 17 Oct: chunks in flight forever at 14.5 s), so the preview plays on here
+/// rather than hang. The first chunk of a heavy comp can take a few seconds (warm-up).
+const NO_CHUNKS_SECS: f64 = 12.0;
+
+/// The first comp frame an edit from `old` to `new` can change (`None`: nothing it shows).
+pub(crate) fn first_changed_frame(old: &Project, new: &Project, comp: ItemId, rate: FrameRate) -> Option<i64> {
+    let t = effectcraft_engine::remote_stream::first_change(old, new, comp)?;
+    Some(if t.0 == i64::MIN { i64::MIN } else { rate.frame_at(t) })
 }
 
 /// A playing preview.
@@ -618,7 +707,10 @@ impl CloudPlayback {
         if self.given_up {
             return PlayTick::default();
         }
-        if self.current.as_ref().is_some_and(|r| !Arc::ptr_eq(&r.client, client)) {
+        // Another server, or a change the server's stream can't follow (frame rate, comp size or
+        // duration, the viewer's resolution, view or options, another comp): a new stream.
+        let now_shape = shape(p);
+        if self.current.as_ref().is_some_and(|r| !Arc::ptr_eq(&r.client, client) || r.shape != now_shape) {
             self.halt(frames, None, p.revision);
         }
         let range = (p.start, p.end, p.looping);
@@ -652,12 +744,24 @@ impl CloudPlayback {
         let cap = usize::try_from(p.fit.clamp(1, 100_000)).unwrap_or(1);
         // Feed the running stream and publish its frames.
         if let (Some(r), Some(pv)) = (&mut self.current, &mut self.preview) {
-            // An edit: the server renders again from the first frame it changes.
+            // An edit: the server renders again from the first frame it changes. This Mac knows
+            // which frames that is as well as the server does: they are old at once, the ones
+            // before stay current (the server says nothing when nothing changed).
             if p.revision != r.revision {
+                let from = first_changed_frame(&r.project, p.project, p.comp, p.rate);
+                r.shared.buffer().edited(p.revision, from);
                 r.revision = p.revision;
+                r.project = p.project.clone();
                 r.client.stream_sync(p.revision, p.project);
             }
             let mut b = r.shared.buffer();
+            // A stuck stream: playback has waited for NO_CHUNKS_SECS without a chunk coming.
+            if !p.waiting || b.stats.chunks != r.progress.0 {
+                r.progress = (b.stats.chunks, p.now);
+            } else if p.now - r.progress.1 >= NO_CHUNKS_SECS && b.failed.is_none() {
+                log::warn!("cloud stream: no chunk for {NO_CHUNKS_SECS} s while playback waits at frame {}: playing on this Mac", p.cur);
+                b.fail(format!("no frames from the cloud for {NO_CHUNKS_SECS:.0} s"));
+            }
             b.range = range;
             b.cap = cap;
             b.set_playhead(p.cur);
@@ -745,7 +849,7 @@ impl CloudPlayback {
         let Some(pv) = &mut self.preview else { return streamed };
         pv.streams = pv.streams.saturating_add(1);
         let ahead = AHEAD_SECS.min(((p.fit as f64 * 0.6) / p.rate.as_f64().max(1.0)) as f32).max(1.0);
-        let shared = StreamShared::new(StreamBuffer::new(p.cur, range, cap), p.rate, ctx.cloned());
+        let shared = StreamShared::new(StreamBuffer::new(p.cur, range, cap).at_revision(p.revision), p.rate, ctx.cloned());
         let start = StreamStart {
             project: p.project.clone(),
             revision: p.revision,
@@ -761,7 +865,15 @@ impl CloudPlayback {
         client.stream_start(start, shared.clone());
         client.stream_playhead(p.rate.tick_of(p.cur), true);
         pv.playhead_at = p.now;
-        self.current = Some(Running { shared, client: client.clone(), revision: p.revision, run: (a, b) });
+        self.current = Some(Running {
+            shared,
+            client: client.clone(),
+            revision: p.revision,
+            project: p.project.clone(),
+            shape: shape(p),
+            run: (a, b),
+            progress: (0, p.now),
+        });
         streamed
     }
 
@@ -796,6 +908,9 @@ impl CloudPlayback {
     pub fn stop(&mut self, frames: &Frames, shown: Option<FrameKey>, revision: u64) {
         self.halt(frames, shown, revision);
         self.end_preview();
+        // The next preview tries the stream again (the app doesn't tick a stopped one, so this is
+        // where a failed stream is forgotten; a dropped tunnel once kept every later preview here).
+        self.given_up = false;
     }
 
     /// Stop the stream (if any) and take its stale frames out of the cache (below-full-size

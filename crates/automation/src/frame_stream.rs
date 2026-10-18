@@ -34,7 +34,7 @@ use effectcraft_engine::time::{FrameRate, Tick};
 use effectcraft_media::preview_stream::{ChunkSpec, encode_chunk, even};
 
 use crate::control_wire::lock;
-use crate::frame_server::{FrameRender, LogFn, Out, RenderJob, Rendered};
+use crate::frame_server::{FrameRender, LogFn, Out, RenderJob, Rendered, render_guarded};
 
 /// Chunks rendering or encoding at once per stream (encoding a chunk takes longer than
 /// rendering it on a busy CPU, so several encode at once).
@@ -602,6 +602,9 @@ impl Shared {
                 let lead = st.lead();
                 let missing = window.iter().copied().find(|c| !st.sent.contains_key(c) && !st.flying.contains_key(c));
                 let next = match missing {
+                    // Frames the frame cache holds cost an encode only: full size from the first
+                    // chunk (no low-resolution warm-up copy sent first and its upgrade after).
+                    Some(c) if self.cached(&st, c) => Some((c, 0)),
                     Some(c) => Some((c, st.level(lead))),
                     // The window is full: send chunks below full size again at full size, if
                     // there is time for it before the app plays them (paused: always).
@@ -639,6 +642,12 @@ impl Shared {
             }
             st = self.cv.wait_timeout(st, TICK).map(|(g, _)| g).unwrap_or_else(|e| e.into_inner().0);
         }
+    }
+
+    /// Whether the frame cache holds every frame of chunk `c` at full size (CR8).
+    fn cached(&self, st: &State, c: i64) -> bool {
+        let (Some(series), Some((first, count))) = (st.p.cache.as_ref(), st.p.frames(c)) else { return false };
+        (first..first.saturating_add(i64::from(count))).all(|f| series.key(f).is_some_and(|k| self.host.frames.contains(k)))
     }
 
     /// Queue chunk `c`'s frames at `level`.
@@ -700,7 +709,10 @@ impl Shared {
             let frame = match cached {
                 Some(f) => Ok(f),
                 None => {
-                    let rendered = self.host.render.render(&RenderJob { project: &project, comp, time: job.time, opts, cache: &self.host.cache, times: None });
+                    let rendered = render_guarded(
+                        self.host.render.as_ref(),
+                        &RenderJob { project: &project, comp, time: job.time, opts, cache: &self.host.cache, times: None },
+                    );
                     let frame = match rendered {
                         Ok((Rendered::Image(img), _)) => Ok((img.width, img.height, remote_encode::rgba8_premultiplied_par(&img))),
                         Ok((Rendered::Rgba8 { width, height, bytes }, _)) => Ok((width, height, bytes)),

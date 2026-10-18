@@ -192,3 +192,99 @@ fn broken_chunks_are_an_error_not_a_crash() {
     assert!(crate::cloud_stream::decode(&[0, 0, 1, 0x65, 9, 9, 9]).is_ok_and(|f| f.is_empty()) || crate::cloud_stream::decode(&[0, 0, 1, 0x65]).is_err());
     assert!(crate::cloud_stream::decode(&[]).is_ok_and(|f| f.is_empty()));
 }
+
+/// Edit audit, 18 Oct: an edit this Mac makes while the stream plays. Frames from the first one
+/// it changes are old at once; the ones before stay current under the new revision (cache bar,
+/// disk cache) instead of turning into drafts until a server notice. The server sends none when
+/// nothing changed, and pausing then took every streamed frame out of the cache.
+#[test]
+fn an_edit_that_changes_nothing_keeps_every_streamed_frame_current() {
+    let mut b = StreamBuffer::new(0, (0, 299, false), 1000).at_revision(5);
+    let (m, i) = chunk(1, 5, 0, 15, 1.0, 1);
+    b.insert(m, i, 10.0);
+    // Same comp content (a label colour, another comp): the series keeps its key.
+    let s = series(9, 5);
+    assert!(b.publish(&s).iter().all(|p| p.current && !p.draft));
+    b.edited(6, None);
+    let out = b.publish(&series(9, 6));
+    assert_eq!(out.len(), 15, "published again under the new revision");
+    assert!(out.iter().all(|p| p.current && !p.draft), "still current: kept on disk, full green bar");
+    assert!(b.take_dirty(6).is_empty(), "pausing keeps them (no server notice comes)");
+}
+
+#[test]
+fn frames_before_an_edit_stay_current_and_the_ones_after_are_old_at_once() {
+    let mut b = StreamBuffer::new(0, (0, 299, false), 1000).at_revision(5);
+    for k in 0..3 {
+        let (m, i) = chunk(k + 1, 5, k as i64 * 15, 15, 1.0, 1);
+        b.insert(m, i, 10.0);
+    }
+    b.publish(&series(9, 5));
+    // The edit changes frames from 20 on (a layer starting at 20): this Mac knows before the
+    // server answers.
+    b.edited(6, Some(20));
+    assert!(b.fresh(19) && b.stale(20) && b.stale(44));
+    let after = series(10, 6);
+    let out = b.publish(&after);
+    assert!(out.iter().filter(|p| p.key.frame < 20).all(|p| p.current && !p.draft), "unchanged frames stay current under the new key");
+    assert!(out.iter().filter(|p| p.key.frame >= 20).all(|p| p.draft && !p.current), "changed ones are drafts until replaced");
+    // A revision-5 chunk still on its way: its frames before 20 show revision 6 as they are.
+    let (m, i) = chunk(4, 5, 45, 15, 1.0, 2);
+    b.insert(m, i, 10.0);
+    assert!(b.stale(45), "after the edit point: old on arrival");
+    // The server's own notice (same edit) changes nothing more.
+    b.mark_stale(6, 20);
+    assert!(b.fresh(0) && b.fresh(19));
+    let dirty = b.take_dirty(6);
+    assert!(dirty.iter().all(|k| k.frame >= 20), "only changed frames leave the cache: {dirty:?}");
+}
+
+#[test]
+fn two_edits_racing_a_chunk_leave_only_truly_changed_frames_old() {
+    let mut b = StreamBuffer::new(0, (0, 299, false), 1000).at_revision(5);
+    b.edited(6, Some(50));
+    b.edited(7, Some(100));
+    // A revision-5 chunk rendered before both edits arrives after them.
+    let (m, i) = chunk(1, 5, 40, 15, 1.0, 1);
+    b.insert(m, i, 10.0);
+    assert!(b.fresh(49) && b.stale(50) && b.stale(54));
+    // A revision-6 chunk: only the second edit (from 100) came after it.
+    let (m, i) = chunk(2, 6, 60, 15, 1.0, 2);
+    b.insert(m, i, 10.0);
+    assert!(b.fresh(60) && b.fresh(74));
+    let out = b.publish(&series(3, 7));
+    assert!(out.iter().filter(|p| p.key.frame < 50 || p.key.frame >= 60).all(|p| p.current));
+    assert!(out.iter().filter(|p| (50..60).contains(&p.key.frame)).all(|p| !p.current));
+}
+
+#[test]
+fn a_chunk_older_than_the_edits_the_buffer_remembers_is_not_trusted() {
+    let mut b = StreamBuffer::new(0, (0, 299, false), 1000).at_revision(5);
+    // 70 edits that change nothing the comp shows: the oldest fall off the list.
+    for r in 6..76 {
+        b.edited(r, None);
+    }
+    let (m, i) = chunk(1, 5, 0, 15, 1.0, 1);
+    b.insert(m, i, 10.0);
+    assert!(b.publish(&series(3, 75)).iter().all(|p| !p.current), "too old to know: a draft, never on disk");
+    let (m, i) = chunk(2, 74, 15, 15, 1.0, 1);
+    b.insert(m, i, 10.0);
+    assert!(b.publish(&series(3, 75)).iter().filter(|p| p.key.frame >= 15).all(|p| p.current));
+}
+
+/// The first frame an edit can change, as the server works it out.
+#[test]
+fn the_first_changed_frame_follows_the_edited_layer() {
+    let mut s = effectcraft_engine::Session::default();
+    s.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 4, "frameRate": 30})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let rate = s.project.comp(cid).unwrap().frame_rate;
+    s.execute("layer.newSolid", serde_json::json!({"name": "Box", "color": "#ff0000"})).unwrap();
+    let before = s.project.clone();
+    s.execute("comp.new", serde_json::json!({"name": "Other", "width": 32, "height": 18, "duration": 1})).unwrap();
+    assert_eq!(crate::cloud_stream::first_changed_frame(&before, &s.project, cid, rate), None, "another comp: nothing it shows");
+    let before = s.project.clone();
+    s.execute("comp.open", serde_json::json!({"comp": cid.0})).unwrap();
+    s.execute("layer.newSolid", serde_json::json!({"name": "Late", "color": "#00ff00"})).unwrap();
+    assert!(crate::cloud_stream::first_changed_frame(&before, &s.project, cid, rate).is_some(), "a new layer changes it");
+}
