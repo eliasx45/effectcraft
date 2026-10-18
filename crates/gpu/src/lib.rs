@@ -84,6 +84,7 @@ mod fx_noise;
 mod fx_particles;
 mod fx_pixel2;
 mod fx_sim;
+mod fx_styles;
 mod fx_stylize;
 mod fx_text;
 mod fx_time;
@@ -648,6 +649,8 @@ mod tests_fx_particles;
 mod tests_fx_pixel2;
 #[cfg(test)]
 mod tests_fx_sim;
+#[cfg(test)]
+mod tests_fx_styles;
 #[cfg(test)]
 mod tests_fx_stylize;
 #[cfg(test)]

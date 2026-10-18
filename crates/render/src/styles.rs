@@ -497,26 +497,38 @@ impl Lazy {
     }
 }
 
+/// Where a cropped style buffer's pixel (0, 0) sat in the uncropped one (see [`crop_to_content`]):
+/// noise and Dissolve read the uncropped buffer's coordinates, so cropping keeps their grain.
+#[derive(Clone, Copy, Default)]
+struct Org(u32, u32);
+
+impl Org {
+    #[inline]
+    fn noise(self, x: usize, y: usize, seed: u32) -> f32 {
+        hash_noise((x as u32).wrapping_add(self.0), (y as u32).wrapping_add(self.1), seed)
+    }
+}
+
 #[inline]
-fn noisy(a: f32, noise: f32, x: usize, y: usize, seed: u32) -> f32 {
-    if noise <= 0.0 { a } else { a * (1.0 - noise * hash_noise(x as u32, y as u32, seed)) }
+fn noisy(o: Org, a: f32, noise: f32, x: usize, y: usize, seed: u32) -> f32 {
+    if noise <= 0.0 { a } else { a * (1.0 - noise * o.noise(x, y, seed)) }
 }
 
 /// `dst` with the straight colour `c` at coverage `a` blended onto it at pixel (`x`, `y`).
 #[inline]
-fn blend_style(mode: BlendMode, seed: u32, x: usize, y: usize, dst: [f32; 4], c: [f32; 3], a: f32) -> [f32; 4] {
-    let n = if mode == BlendMode::Dissolve { hash_noise(x as u32, y as u32, seed) } else { 0.5 };
+fn blend_style(o: Org, mode: BlendMode, seed: u32, x: usize, y: usize, dst: [f32; 4], c: [f32; 3], a: f32) -> [f32; 4] {
+    let n = if mode == BlendMode::Dissolve { o.noise(x, y, seed) } else { 0.5 };
     blend_pixel(mode, dst, [c[0] * a, c[1] * a, c[2] * a, a], n)
 }
 
 /// Blend a straight colour with coverage `a` onto every pixel of `img` (`f(x, y)` → (colour, a)).
-fn blend_into(img: &mut Image, mode: BlendMode, seed: u32, f: impl Fn(usize, usize) -> ([f32; 3], f32) + Sync) {
+fn blend_into(o: Org, img: &mut Image, mode: BlendMode, seed: u32, f: impl Fn(usize, usize) -> ([f32; 3], f32) + Sync) {
     let w = img.width as usize;
     img.data.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
         for (x, d) in row.iter_mut().enumerate() {
             let (c, a) = f(x, y);
             if a > 0.0 {
-                *d = blend_style(mode, seed, x, y, *d, c, a);
+                *d = blend_style(o, mode, seed, x, y, *d, c, a);
             }
         }
     });
@@ -527,7 +539,7 @@ fn blend_into(img: &mut Image, mode: BlendMode, seed: u32, f: impl Fn(usize, usi
 /// alpha and an anti-aliased edge pixel mixes the style with the layer's colour in the
 /// proportion the style covers it, instead of letting the layer's own colour show through
 /// around a blended edge (#416).
-fn blend_clipped(img: &mut Image, clip: &Plane, mode: BlendMode, seed: u32, f: impl Fn(usize, usize) -> ([f32; 3], f32) + Sync) {
+fn blend_clipped(o: Org, img: &mut Image, clip: &Plane, mode: BlendMode, seed: u32, f: impl Fn(usize, usize) -> ([f32; 3], f32) + Sync) {
     let w = img.width as usize;
     img.data.par_chunks_mut(w.max(1)).zip(clip.data.par_chunks(w.max(1))).enumerate().for_each(|(y, (row, cov))| {
         for (x, (d, &k)) in row.iter_mut().zip(cov).enumerate() {
@@ -535,7 +547,7 @@ fn blend_clipped(img: &mut Image, clip: &Plane, mode: BlendMode, seed: u32, f: i
                 && let (c, a) = f(x, y)
                 && a > 0.0
             {
-                *d = blend_style(mode, seed, x, y, d.map(|v| v / k), c, a).map(|v| v * k);
+                *d = blend_style(o, mode, seed, x, y, d.map(|v| v / k), c, a).map(|v| v * k);
             }
         }
     });
@@ -555,12 +567,12 @@ fn pass_image(w: usize, h: usize, f: impl Fn(usize, usize) -> ([f32; 3], f32) + 
 }
 
 /// Glow intensity → (colour, alpha) for colour or gradient glows.
-fn glow_color(g: &Glow, v: f32, x: usize, y: usize) -> ([f32; 3], f32) {
+fn glow_color(o: Org, g: &Glow, v: f32, x: usize, y: usize) -> ([f32; 3], f32) {
     let v = v.clamp(0.0, 1.0).powf((0.5 / g.range) as f32);
     match &g.gradient {
         None => (g.color, v),
         Some(gr) => {
-            let j = if g.jitter > 0.0 { (hash_noise(x as u32, y as u32, 77) - 0.5) * g.jitter } else { 0.0 };
+            let j = if g.jitter > 0.0 { (o.noise(x, y, 77) - 0.5) * g.jitter } else { 0.0 };
             let c = gr.sample((1.0 - v + j) as f64);
             ([c[0], c[1], c[2]], c[3] * (v * 8.0).min(1.0))
         }
@@ -587,16 +599,49 @@ fn glow_intensity(alpha: &Plane, d: &Lazy, g: &Glow, s: f64, inner: bool) -> Pla
 
 /// Render the layer's styles around its processed `content` (layer size `layer_size` in layer
 /// pixels, for Gradient Overlay without Align with Layer).
+///
+/// Styles work on the content's visible part only: the content is first cropped to where its
+/// alpha is non-zero, then padded by the styles' reach (a shape or text layer with effects is
+/// drawn on a comp-sized canvas, mostly transparent; its styles cost 20–90 ms per frame there).
+/// The result is the same as styling the whole buffer: outside the crop every style is zero.
 pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2]) -> Styled {
+    render_in(ctx, layer, content, layer_size, true)
+}
+
+/// The content's visible part (alpha above 1e-6, as [`Image::alpha_bounds`]) and where its
+/// pixel (0, 0) sat in `content`; `None` when that is the whole buffer already.
+fn crop_to_content(content: &Buf) -> Option<(Buf, Org)> {
+    let (w, h) = (content.img.width, content.img.height);
+    // Nothing visible: one transparent pixel keeps the passes and the body in place.
+    let (x0, y0, x1, y1) = content.img.alpha_bounds().unwrap_or((0, 0, 1.min(w), 1.min(h)));
+    if (x0, y0, x1, y1) == (0, 0, w, h) || x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (cw, ch) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let mut img = Image::new(cw as u32, ch as u32);
+    let src = content.img.data.chunks(w.max(1) as usize).skip(y0 as usize).take(ch);
+    for (d, s) in img.data.chunks_mut(cw.max(1)).zip(src) {
+        let row = s.get(x0 as usize..x1 as usize)?;
+        d.copy_from_slice(row);
+    }
+    let offset = [content.offset[0] - x0 as f64, content.offset[1] - y0 as f64];
+    Some((Buf { img, offset, scale: content.scale }, Org(x0, y0)))
+}
+
+/// [`render`]; `crop` off styles the whole content buffer (the tests' reference).
+pub(crate) fn render_in(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2], crop: bool) -> Styled {
     let Some(g) = group(layer) else { return Styled { passes: vec![], body: content.clone() } };
     let styles = evaluate(ctx, layer, g);
     let bl = blending(ctx, layer);
     let s = content.scale.max(1e-6);
     let pad = ((reach(&styles) * s).ceil() + 2.0).min(MAX_PAD) as u32;
-    let mut buf = content.clone();
     if content.img.is_empty() {
-        return Styled { passes: vec![], body: buf };
+        return Styled { passes: vec![], body: content.clone() };
     }
+    let (mut buf, o) = match crop.then(|| crop_to_content(content)).flatten() {
+        Some(c) => c,
+        None => (content.clone(), Org::default()),
+    };
     buf.pad(pad);
     let (w, h) = (buf.img.width as usize, buf.img.height as usize);
     let alpha = Plane::alpha(&buf.img);
@@ -613,7 +658,7 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
             if ds.knocks_out {
                 a *= 1.0 - alpha.data[y * w + x];
             }
-            (ds.color, noisy(a, ds.noise, x, y, seed))
+            (ds.color, noisy(o, a, ds.noise, x, y, seed))
         });
         passes.push((Buf { img, offset: buf.offset, scale: buf.scale }, ds.mode));
     }
@@ -621,9 +666,9 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
         let v = glow_intensity(&alpha, &d, gl, s, false);
         let img = pass_image(w, h, |x, y| {
             let i = y * w + x;
-            let (c, a) = glow_color(gl, v.data[i], x, y);
+            let (c, a) = glow_color(o, gl, v.data[i], x, y);
             // The glow sits outside the content (knocked out under it).
-            (c, noisy(a * gl.opacity * (1.0 - alpha.data[i]), gl.noise, x, y, seed ^ 0x5a5a))
+            (c, noisy(o, a * gl.opacity * (1.0 - alpha.data[i]), gl.noise, x, y, seed ^ 0x5a5a))
         });
         passes.push((Buf { img, offset: buf.offset, scale: buf.scale }, gl.mode));
     }
@@ -638,7 +683,7 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
         let (ux, uy) = (go.angle.to_radians().cos(), -go.angle.to_radians().sin());
         let ext = ((hw * ux).abs() + (hh * uy).abs()).max(1e-3) * go.scale;
         let radius = hw.max(hh).max(1e-3) * go.scale;
-        blend_clipped(&mut body, &alpha, go.mode, seed, |x, y| {
+        blend_clipped(o, &mut body, &alpha, go.mode, seed, |x, y| {
             let (px, py) = (x as f64 + 0.5 - cx, y as f64 + 0.5 - cy);
             let along = px * ux + py * uy;
             let across = -px * uy + py * ux;
@@ -660,12 +705,12 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
         });
     }
     if let Some(co) = &styles.color {
-        blend_clipped(&mut body, &alpha, co.mode, seed, |_, _| (co.color, co.opacity));
+        blend_clipped(o, &mut body, &alpha, co.mode, seed, |_, _| (co.color, co.opacity));
     }
     if let Some(sa) = &styles.satin {
         let b = gauss_plane(&alpha, sa.size * s / 2.0, sa.size * s / 2.0);
         let off = [sa.offset[0] * s, sa.offset[1] * s];
-        blend_clipped(&mut body, &alpha, sa.mode, seed, |x, y| {
+        blend_clipped(o, &mut body, &alpha, sa.mode, seed, |x, y| {
             let v = (shifted(&b, x, y, off) - shifted(&b, x, y, [-off[0], -off[1]])).abs().min(1.0);
             let v = if sa.invert { 1.0 - v } else { v };
             (sa.color, v * sa.opacity)
@@ -673,19 +718,19 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
     }
     if let Some(gl) = &styles.inner_glow {
         let v = glow_intensity(&alpha, &d, gl, s, true);
-        blend_clipped(&mut body, &alpha, gl.mode, seed, |x, y| {
+        blend_clipped(o, &mut body, &alpha, gl.mode, seed, |x, y| {
             let i = y * w + x;
             let e = if gl.center { 1.0 - v.data[i] } else { v.data[i] };
-            let (c, a) = glow_color(gl, e, x, y);
-            (c, noisy(a * gl.opacity, gl.noise, x, y, seed ^ 0x3c3c))
+            let (c, a) = glow_color(o, gl, e, x, y);
+            (c, noisy(o, a * gl.opacity, gl.noise, x, y, seed ^ 0x3c3c))
         });
     }
     for is in &styles.inner_shadow {
         let shape = soft_shape(&alpha, &d, is.size * s, is.spread, true);
         let off = [is.offset[0] * s, is.offset[1] * s];
-        blend_clipped(&mut body, &alpha, is.mode, seed, |x, y| {
+        blend_clipped(o, &mut body, &alpha, is.mode, seed, |x, y| {
             let a = shifted(&shape, x, y, off).min(1.0) * is.opacity;
-            (is.color, noisy(a, is.noise, x, y, seed ^ 0x1234))
+            (is.color, noisy(o, a, is.noise, x, y, seed ^ 0x1234))
         });
     }
     if bl.interior_group && bl.fill < 1.0 {
@@ -702,7 +747,7 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
         // Inside part: blended over the body within the content, over the share of each
         // pixel's coverage the ring takes.
         if r_in > 0.0 {
-            blend_clipped(&mut body, &alpha, sk.mode, seed, |x, y| {
+            blend_clipped(o, &mut body, &alpha, sk.mode, seed, |x, y| {
                 let i = y * w + x;
                 let a = alpha.data[i];
                 let ring = ((a - grown(sd.data[i], -r_in)) / a.max(1e-6)).clamp(0.0, 1.0);
@@ -723,7 +768,7 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
         }
     }
     if let Some(bv) = &styles.bevel {
-        bevel(&mut body, &alpha, &d, bv, s, seed);
+        bevel(o, &mut body, &alpha, &d, bv, s, seed);
     }
     Styled { passes, body: Buf { img: body, offset: buf.offset, scale: buf.scale } }
 }
@@ -746,7 +791,7 @@ fn gradient_frame(go: &GradOverlay, buf: &Buf, alpha: &Plane, layer_size: [f64; 
 }
 
 /// Bevel and Emboss: a height field from the content edge, lit by a directional light.
-fn bevel(body: &mut Image, alpha: &Plane, d: &Lazy, bv: &Bevel, s: f64, seed: u32) {
+fn bevel(o: Org, body: &mut Image, alpha: &Plane, d: &Lazy, bv: &Bevel, s: f64, seed: u32) {
     let size = (bv.size * s).max(0.5) as f32;
     let sd = d.get(alpha);
     let w = alpha.w;
@@ -796,12 +841,207 @@ fn bevel(body: &mut Image, alpha: &Plane, d: &Lazy, bv: &Bevel, s: f64, seed: u3
         let shd = ((flat - dot) / flat.max(1e-4)).clamp(0.0, 1.0);
         (hl, shd)
     };
-    blend_into(body, bv.sh.0, seed, |x, y| {
+    blend_into(o, body, bv.sh.0, seed, |x, y| {
         let (_, shd) = shade(x, y);
         (bv.sh.1, shd * bv.sh.2 * region(y * w + x))
     });
-    blend_into(body, bv.hl.0, seed, |x, y| {
+    blend_into(o, body, bv.hl.0, seed, |x, y| {
         let (hl, _) = shade(x, y);
         (bv.hl.1, hl * bv.hl.2 * region(y * w + x))
     });
+}
+
+// ------------------------------------------------------------------------------------------
+// GPU plan
+
+/// A Drop Shadow or Inner Shadow for an accelerator, in buffer pixels: the content alpha (the
+/// inverse for an inner shadow) blurred by `sigma`, moved by `offset`.
+#[derive(Clone, Debug)]
+pub struct GpuShadow {
+    pub mode: BlendMode,
+    pub color: [f32; 3],
+    pub opacity: f32,
+    pub offset: [f32; 2],
+    pub sigma: f64,
+    pub noise: f32,
+    pub knocks_out: bool,
+}
+
+/// A Softer Outer or Inner Glow for an accelerator: intensity `min(2 · blur(alpha), 1)`.
+#[derive(Clone, Debug)]
+pub struct GpuGlow {
+    pub mode: BlendMode,
+    pub opacity: f32,
+    pub noise: f32,
+    pub color: [f32; 3],
+    /// Gradient stops packed by [`pack_gradient`] when the glow uses a gradient.
+    pub gradient: Option<Vec<f32>>,
+    pub sigma: f64,
+    pub range: f32,
+    pub jitter: f32,
+    /// Inner Glow from the centre.
+    pub center: bool,
+}
+
+/// Gradient Overlay for an accelerator: its frame in buffer pixels.
+#[derive(Clone, Debug)]
+pub struct GpuGradient {
+    pub mode: BlendMode,
+    pub opacity: f32,
+    pub stops: Vec<f32>,
+    pub style: u32,
+    pub reverse: bool,
+    pub center: [f32; 2],
+    /// Unit direction of the angle (x, y down).
+    pub dir: [f32; 2],
+    pub ext: f32,
+    pub radius: f32,
+    pub angle: f32,
+}
+
+/// Satin for an accelerator.
+#[derive(Clone, Debug)]
+pub struct GpuSatin {
+    pub mode: BlendMode,
+    pub color: [f32; 3],
+    pub opacity: f32,
+    pub offset: [f32; 2],
+    pub sigma: f64,
+    pub invert: bool,
+}
+
+/// A layer's styles as an accelerator renders them (see [`gpu_prepare`]): the steps of
+/// [`render`] with every distance in buffer pixels. Only styles that need no distance field
+/// (spread / choke 0, Softer glows; no Stroke or Bevel and Emboss) have a plan.
+#[derive(Clone, Debug)]
+pub struct GpuStyles {
+    /// Noise origin: where the buffer's pixel (0, 0) sat before it was cropped.
+    pub org: [u32; 2],
+    pub seed: u32,
+    pub fill: f32,
+    pub interior_group: bool,
+    pub drops: Vec<GpuShadow>,
+    pub outer_glow: Option<GpuGlow>,
+    pub gradient: Option<GpuGradient>,
+    pub color: Option<(BlendMode, [f32; 3], f32)>,
+    pub satin: Option<GpuSatin>,
+    pub inner_glow: Option<GpuGlow>,
+    pub inner_shadows: Vec<GpuShadow>,
+}
+
+impl GpuStyles {
+    /// Blend modes of the exterior passes, in order (as [`pass_modes`]).
+    pub fn pass_modes(&self) -> Vec<BlendMode> {
+        self.drops.iter().map(|d| d.mode).chain(self.outer_glow.as_ref().map(|g| g.mode)).collect()
+    }
+}
+
+/// Gradient stops for a kernel: `[colour count, opacity count]`, then per colour stop
+/// `(position, r, g, b, a, midpoint to the next)`, then per opacity stop `(position, opacity,
+/// midpoint)`; midpoints as [`Gradient::sample`] reads them.
+pub fn pack_gradient(g: &Gradient) -> Vec<f32> {
+    let mid = |m: &[f64], i: usize| m.get(i).copied().filter(|m| m.is_finite()).unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6) as f32;
+    let mut v = vec![g.colors.len() as f32, g.opacities.len() as f32];
+    for (i, (p, c)) in g.colors.iter().enumerate() {
+        v.extend_from_slice(&[*p as f32, c[0], c[1], c[2], c[3], mid(&g.color_midpoints, i)]);
+    }
+    for (i, (p, a)) in g.opacities.iter().enumerate() {
+        v.extend_from_slice(&[*p as f32, *a, mid(&g.opacity_midpoints, i)]);
+    }
+    v
+}
+
+/// The layer's styles as an accelerator renders them, and the buffer they render around: the
+/// content cropped to its visible part and padded by their reach, as [`render`] does. `None`
+/// when the layer has no styles, its content is empty, or a style needs the CPU (a distance
+/// field: spread or choke, Precise glows, Stroke, Bevel and Emboss; a stencil pass mode).
+pub fn gpu_prepare(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2]) -> Option<(Buf, GpuStyles)> {
+    let g = group(layer)?;
+    if content.img.is_empty() || pass_modes(ctx, layer).iter().any(|m| m.is_stencil()) {
+        return None;
+    }
+    let styles = evaluate(ctx, layer, g);
+    if styles.stroke.is_some() || styles.bevel.is_some() {
+        return None;
+    }
+    let s = content.scale.max(1e-6);
+    let hard = |size: f64, spread: f64| size * s * spread;
+    let soft = |size: f64, spread: f64| (size * s - hard(size, spread)).max(0.0) / 2.0;
+    let shadow = |d: &Shadow| {
+        (hard(d.size, d.spread) <= 0.01).then(|| GpuShadow {
+            mode: d.mode,
+            color: d.color,
+            opacity: d.opacity,
+            offset: [(d.offset[0] * s) as f32, (d.offset[1] * s) as f32],
+            sigma: soft(d.size, d.spread),
+            noise: d.noise,
+            knocks_out: d.knocks_out,
+        })
+    };
+    let glow = |gl: &Glow| {
+        (!gl.precise && hard(gl.size, gl.spread) <= 0.01).then(|| GpuGlow {
+            mode: gl.mode,
+            opacity: gl.opacity,
+            noise: gl.noise,
+            color: gl.color,
+            gradient: gl.gradient.as_ref().map(pack_gradient),
+            sigma: soft(gl.size, gl.spread),
+            range: gl.range as f32,
+            jitter: gl.jitter,
+            center: gl.center,
+        })
+    };
+    let drops = styles.drop.iter().map(shadow).collect::<Option<Vec<_>>>()?;
+    let inner_shadows = styles.inner_shadow.iter().map(shadow).collect::<Option<Vec<_>>>()?;
+    let outer_glow = match &styles.outer_glow {
+        Some(gl) => Some(glow(gl)?),
+        None => None,
+    };
+    let inner_glow = match &styles.inner_glow {
+        Some(gl) => Some(glow(gl)?),
+        None => None,
+    };
+    let bl = blending(ctx, layer);
+    let pad = ((reach(&styles) * s).ceil() + 2.0).min(MAX_PAD) as u32;
+    let (mut buf, o) = crop_to_content(content).unwrap_or_else(|| (content.clone(), Org::default()));
+    buf.pad(pad);
+    let gradient = styles.gradient.as_ref().map(|go| {
+        let alpha = Plane::alpha(&buf.img);
+        let (cx, cy, hw, hh) = gradient_frame(go, &buf, &alpha, layer_size);
+        let (ux, uy) = (go.angle.to_radians().cos(), -go.angle.to_radians().sin());
+        GpuGradient {
+            mode: go.mode,
+            opacity: go.opacity,
+            stops: pack_gradient(&go.gradient),
+            style: go.style,
+            reverse: go.reverse,
+            center: [cx as f32, cy as f32],
+            dir: [ux as f32, uy as f32],
+            ext: (((hw * ux).abs() + (hh * uy).abs()).max(1e-3) * go.scale) as f32,
+            radius: (hw.max(hh).max(1e-3) * go.scale) as f32,
+            angle: go.angle.to_radians() as f32,
+        }
+    });
+    let satin = styles.satin.as_ref().map(|sa| GpuSatin {
+        mode: sa.mode,
+        color: sa.color,
+        opacity: sa.opacity,
+        offset: [(sa.offset[0] * s) as f32, (sa.offset[1] * s) as f32],
+        sigma: sa.size * s / 2.0,
+        invert: sa.invert,
+    });
+    let plan = GpuStyles {
+        org: [o.0, o.1],
+        seed: layer.id.0 as u32,
+        fill: bl.fill,
+        interior_group: bl.interior_group,
+        drops,
+        outer_glow,
+        gradient,
+        color: styles.color.as_ref().map(|c| (c.mode, c.color, c.opacity)),
+        satin,
+        inner_glow,
+        inner_shadows,
+    };
+    Some((buf, plan))
 }
