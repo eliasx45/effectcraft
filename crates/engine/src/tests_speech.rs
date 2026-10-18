@@ -189,3 +189,91 @@ fn accents_list_every_peak_with_its_offset_and_the_map_saves() {
     assert_eq!(s.execute("speech.clear", json!({})).unwrap()["removed"], true);
     assert!(!serde_json::to_string(s.active_comp().unwrap()).unwrap().contains("\"speech\""));
 }
+
+/// `inner` placed in a new 25 fps comp `name` (12 s) at `start` with `stretch` %, trimmed to
+/// `in_out` (comp seconds): (the new comp, the precomp layer).
+fn nest(s: &mut Session, inner: effectcraft_project::ItemId, name: &str, start: f64, stretch: f64, in_out: (f64, f64)) -> (effectcraft_project::ItemId, u64) {
+    s.execute("comp.new", json!({"name": name, "width": 320, "height": 180, "frameRate": 25, "duration": 12.0})).unwrap();
+    let outer = s.active_comp_id().unwrap();
+    let l = s.execute("layer.addItem", json!({"comp": outer.0, "item": inner.0, "time": 0.0})).unwrap()["layer"].as_u64().unwrap();
+    let p = std::sync::Arc::make_mut(&mut s.project);
+    let nl = p.comp_mut(outer).unwrap().layer_mut(LayerId(l)).unwrap();
+    nl.start_time = Tick::from_seconds_f64(start);
+    nl.stretch = stretch;
+    (nl.in_point, nl.out_point) = (Tick::from_seconds_f64(in_out.0), Tick::from_seconds_f64(in_out.1));
+    (outer, l)
+}
+
+#[test]
+fn a_peak_inside_a_stretched_offset_precomp_is_found_at_the_parent_frame() {
+    // The move peaks at 1.5 s inside "Talk"; Main shows Talk from 3 s at 200 %: 3 + 1.5 × 2 = 6 s.
+    let (mut s, l) = comp();
+    let inner = s.active_comp_id().unwrap();
+    scale_keys(&mut s, l, 1.0, 2.0, false);
+    let (main, pre) = nest(&mut s, inner, "Main", 3.0, 200.0, (3.0, 11.0));
+    let deep = lint::speed_peaks_deep(&s.project, main, 0.0, 12.0);
+    assert_eq!(deep.peaks.len(), 1, "{deep:#?}");
+    let pk = &deep.peaks[0];
+    assert!((pk.time - 6.0).abs() < 0.004, "{pk:#?}");
+    assert_eq!((pk.layer, pk.comp, pk.via.len(), pk.via[0].layer), (LayerId(l), Some(inner), 1, LayerId(pre)));
+    // The comp's own layers only: nothing.
+    assert!(lint::speed_peaks(s.project.comp(main).unwrap(), 0.0, 12.0).is_empty());
+
+    // Accent = vowel 6.12 − 1 frame = 6.08: the peak is 2 frames early.
+    s.execute("speech.import", json!({"map": map(6.0, 6.12)})).unwrap();
+    let r = s.execute("render.lint", json!({"start": 0, "end": 12, "rules": ["off-accent"]})).unwrap();
+    let found = r["problems"].as_array().unwrap();
+    assert_eq!(found.len(), 1, "{r:#}");
+    assert_eq!(found[0]["layer"].as_u64(), Some(pre), "on the precomp layer in Main");
+    let m = found[0]["message"].as_str().unwrap();
+    assert!(m.contains("Logo") && m.contains("\"Talk\"") && m.contains("2 frames before") && m.contains(&format!("comp: {}, layer: {l}", inner.0)), "{m}");
+
+    let a = s.execute("speech.accents", json!({})).unwrap();
+    let p = &a["list"][0];
+    assert_eq!((p["comp"].as_u64(), p["layer"].as_u64(), p["via"][0].as_u64()), (Some(inner.0), Some(l), Some(pre)), "{a:#}");
+    assert_eq!((p["frame"].as_f64().map(f64::round), p["offsetFrames"].as_f64()), (Some(150.0), Some(-2.0)), "{p:#}");
+    // Filtering by the precomp layer keeps what is inside it.
+    assert_eq!(s.execute("speech.accents", json!({"layer": pre})).unwrap()["peaks"], 1);
+    // The finding's alignPeak params land the nested peak on the accent.
+    let mut params = p["alignPeak"].clone();
+    params["graph"] = json!("keep");
+    s.execute_checked("keys.alignPeak", params).unwrap();
+    let a = s.execute("speech.accents", json!({})).unwrap();
+    assert_eq!(a["hits"], 1, "{a:#}");
+}
+
+#[test]
+fn a_peak_two_precomps_deep_maps_through_each_start_and_stretch() {
+    // Talk (peak 1.5 s) in Middle from 1 s at 100 % → 2.5 s; Middle in Main from 2 s at 50 % → 3.25 s.
+    let (mut s, l) = comp();
+    let inner = s.active_comp_id().unwrap();
+    scale_keys(&mut s, l, 1.0, 2.0, false);
+    let (middle, _) = nest(&mut s, inner, "Middle", 1.0, 100.0, (1.0, 5.0));
+    let (main, top) = nest(&mut s, middle, "Main", 2.0, 50.0, (2.0, 8.0));
+    let deep = lint::speed_peaks_deep(&s.project, main, 0.0, 12.0);
+    assert_eq!(deep.peaks.len(), 1, "{deep:#?}");
+    assert!((deep.peaks[0].time - 3.25).abs() < 0.004, "{deep:#?}");
+    assert_eq!((deep.peaks[0].comp, deep.peaks[0].via.len(), deep.peaks[0].via[0].layer), (Some(inner), 2, LayerId(top)));
+    // A window that ends before it: none.
+    assert!(lint::speed_peaks_deep(&s.project, main, 0.0, 3.0).peaks.is_empty());
+}
+
+#[test]
+fn trimmed_away_nested_peaks_are_dropped() {
+    let (mut s, l) = comp();
+    let inner = s.active_comp_id().unwrap();
+    scale_keys(&mut s, l, 1.0, 2.0, false);
+    // Main shows Talk (peak at 3 + 1.5 = 4.5 s) only from 5 s: the peak is trimmed away.
+    let (main, _) = nest(&mut s, inner, "Main", 3.0, 100.0, (5.0, 7.0));
+    assert!(lint::speed_peaks_deep(&s.project, main, 0.0, 12.0).peaks.is_empty());
+    // Out before it: dropped too.
+    let (main, _) = nest(&mut s, inner, "Main 2", 3.0, 100.0, (3.0, 4.2));
+    assert!(lint::speed_peaks_deep(&s.project, main, 0.0, 12.0).peaks.is_empty());
+    // Two deep, trimmed in the middle: Middle's precomp layer ends before the peak (2.5 s there).
+    let (middle, _) = nest(&mut s, inner, "Middle", 1.0, 100.0, (1.0, 2.2));
+    let (main, _) = nest(&mut s, middle, "Main 3", 0.0, 100.0, (0.0, 10.0));
+    assert!(lint::speed_peaks_deep(&s.project, main, 0.0, 12.0).peaks.is_empty());
+    // Shown: found.
+    let (main, _) = nest(&mut s, inner, "Main 4", 3.0, 100.0, (4.0, 5.0));
+    assert_eq!(lint::speed_peaks_deep(&s.project, main, 0.0, 12.0).peaks.len(), 1);
+}

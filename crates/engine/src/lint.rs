@@ -29,7 +29,7 @@
 //!   point after the comp start) within half a beat of a beat that misses it by more than one
 //!   frame. Beats come from [`detect_beats`] on the comp's audio mix. Warning.
 //! - `off-accent`: with a speech map (`speech.import`), a keyframed property's speed-graph peak
-//!   ([`speed_peaks`]) within a few frames (default 4) of a stressed syllable's accent
+//!   ([`speed_peaks_deep`]: also inside precomps) within a few frames (default 4) of a stressed syllable's accent
 //!   ([`accent_time`]: one frame before its vowel, never before its onset) that misses it by
 //!   more than one frame. Warning.
 
@@ -40,6 +40,7 @@ use effectcraft_render::EvalCtx;
 use effectcraft_time::Tick;
 
 use crate::layout;
+use crate::precomp_time::{self, Hop};
 
 /// Every rule id, in report order.
 pub const RULES: [&str; 9] =
@@ -841,6 +842,12 @@ pub struct SpeedPeak {
     pub time: f64,
     /// Top speed (property units per second; the length of the velocity for several dimensions).
     pub speed: f64,
+    /// The comp `layer` is in when it sits in a precomp ([`speed_peaks_deep`]); `None`: the
+    /// comp searched.
+    pub comp: Option<ItemId>,
+    /// The precomp layers from the comp searched down to `comp`, outermost first (empty when
+    /// `comp` is `None`). `time` is mapped through them.
+    pub via: Vec<Hop>,
 }
 
 /// Where a peak lands on a stressed syllable: `lead` frames before its vowel, never before its
@@ -914,12 +921,83 @@ pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
                 if out.iter().any(|q| q.layer == l.id && q.path == path && (q.time - time).abs() < 1e-6) {
                     continue;
                 }
-                out.push(SpeedPeak { layer: l.id, path: path.to_string(), property: p.name.clone(), time, speed: top });
+                out.push(SpeedPeak { layer: l.id, path: path.to_string(), property: p.name.clone(), time, speed: top, comp: None, via: vec![] });
             }
         });
     }
     out.sort_by(|a, b| a.time.total_cmp(&b.time));
     out
+}
+
+/// Most precomp layers [`speed_peaks_deep`] looks into.
+const MAX_PRECOMP_VISITS: usize = 4096;
+
+/// Speed peaks of a comp and of everything nested in it ([`speed_peaks_deep`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeepPeaks {
+    pub peaks: Vec<SpeedPeak>,
+    /// Why some precomps were not searched (time-remapped precomp layers).
+    pub skipped: Vec<String>,
+}
+
+/// [`speed_peaks`] of `cid`'s own layers and of the layers in its precomps, at most
+/// [`precomp_time::MAX_DEPTH`] deep, each peak's time mapped up through every precomp layer's
+/// start and stretch to `cid`'s seconds. A nested peak is kept only when every precomp layer on
+/// the way shows it (inside its in/out, and inside its comp's duration). Time-remapped precomp
+/// layers are not searched (see `skipped`). Sorted by time.
+pub fn speed_peaks_deep(project: &Project, cid: ItemId, start: f64, end: f64) -> DeepPeaks {
+    let Some(comp) = project.comp(cid) else { return DeepPeaks::default() };
+    let mut out = DeepPeaks { peaks: speed_peaks(comp, start, end), skipped: vec![] };
+    let mut budget = MAX_PRECOMP_VISITS;
+    nested_peaks(project, (cid, comp), (start, end), &mut vec![], &mut vec![cid], &mut out, &mut budget);
+    out.peaks.sort_by(|a, b| a.time.total_cmp(&b.time));
+    out.peaks.truncate(MAX_PEAKS);
+    out
+}
+
+/// Peaks inside the precomp layers of `at` whose shown part overlaps `lo..=hi` (`at`'s seconds).
+fn nested_peaks(project: &Project, at: (ItemId, &Comp), (lo, hi): (f64, f64), chain: &mut Vec<Hop>, comps: &mut Vec<ItemId>, out: &mut DeepPeaks, budget: &mut usize) {
+    if chain.len() >= precomp_time::MAX_DEPTH {
+        return;
+    }
+    for l in &at.1.layers {
+        let LayerSource::Comp { item } = l.source else { continue };
+        if comps.contains(&item) || out.peaks.len() >= MAX_PEAKS || *budget == 0 {
+            continue;
+        }
+        let Some(inner) = project.comp(item) else { continue };
+        // The part of the window this precomp layer shows.
+        let (a, b) = (lo.max(l.in_point.seconds()), hi.min(l.out_point.seconds()));
+        if a > b + 1e-9 {
+            continue;
+        }
+        let h = match precomp_time::hop(at.0, l) {
+            Ok(h) => h,
+            Err(why) => {
+                if !out.skipped.contains(&why) {
+                    out.skipped.push(why);
+                }
+                continue;
+            }
+        };
+        *budget = budget.saturating_sub(1);
+        let one = [h];
+        let (x, y) = (precomp_time::down(&one, a), precomp_time::down(&one, b));
+        let (x, y) = (x.min(y).max(0.0), x.max(y).min(inner.duration.seconds()));
+        if x.is_nan() || y.is_nan() || x > y + 1e-9 {
+            continue;
+        }
+        chain.push(h);
+        comps.push(item);
+        for mut pk in speed_peaks(inner, x, y) {
+            pk.time = precomp_time::up(chain, pk.time);
+            (pk.comp, pk.via) = (Some(item), chain.clone());
+            out.peaks.push(pk);
+        }
+        nested_peaks(project, (item, inner), (x, y), chain, comps, out, budget);
+        chain.pop();
+        comps.pop();
+    }
 }
 
 /// A peak matched to the nearest accent (a stressed syllable's [`accent_time`]).
@@ -954,30 +1032,49 @@ pub fn match_accents<'a>(peaks: Vec<SpeedPeak>, map: &'a effectcraft_project::sp
         .collect()
 }
 
-/// `off-accent` findings with their times: speed-graph peaks within `window` frames of an accent
-/// (a stressed syllable's onset, `lead` frames before its vowel) that miss it by more than one
-/// frame.
-pub fn off_accent(comp: &Comp, map: &effectcraft_project::speech::SpeechMap, start: f64, end: f64, fps: f64, lead: f64, window: f64) -> Vec<(Tick, Finding)> {
+/// `off-accent` findings with their times: speed-graph peaks ([`speed_peaks_deep`] of `cid`, so
+/// moves inside precomps count) within `window` frames of an accent (a stressed syllable's onset,
+/// `lead` frames before its vowel) that miss it by more than one frame. A nested peak's finding is
+/// on the precomp layer in `cid`; its message names the nested layer and the `keys.alignPeak`
+/// call that fixes it. Also returns why some precomps were not searched.
+pub fn off_accent(project: &Project, cid: ItemId, map: &effectcraft_project::speech::SpeechMap, start: f64, end: f64, fps: f64, lead: f64, window: f64) -> (Vec<(Tick, Finding)>, Vec<String>) {
     let mut out = vec![];
+    let Some(comp) = project.comp(cid) else { return (out, vec![]) };
     if fps.is_nan() || fps <= 0.0 {
-        return out;
+        return (out, vec![]);
     }
-    for m in match_accents(speed_peaks(comp, start, end), map, fps, lead) {
+    let deep = speed_peaks_deep(project, cid, start, end);
+    for m in match_accents(deep.peaks, map, fps, lead) {
         let d = m.offset_frames;
         if d.abs() <= 1.0 + 1e-6 || d.abs() > window + 1e-6 {
             continue;
         }
-        let Some(l) = comp.layer(m.peak.layer) else { continue };
+        // The layer in `cid` the finding is on: the peak's own, or the outermost precomp layer.
+        let top = m.peak.via.first().map_or(m.peak.layer, |h| h.layer);
+        let Some(shown) = comp.layer(top) else { continue };
+        let inner = m.peak.comp.and_then(|c| project.comp(c));
+        let Some(l) = inner.map_or(Some(shown), |c| c.layer(m.peak.layer)) else { continue };
         let frames = if (d.abs() - d.abs().round()).abs() < 0.05 { format!("{:.0}", d.abs().round()) } else { format!("{:.1}", d.abs()) };
+        let (where_, call) = match m.peak.comp {
+            None => (String::new(), format!("layer: {}, path: \"{}\"", l.id.0, m.peak.path)),
+            Some(c) => {
+                let names: Vec<String> = m.peak.via.iter().map(|h| project.comp(h.comp).and_then(|x| x.layer(h.layer)).map(name).unwrap_or_default()).collect();
+                let via: Vec<String> = m.peak.via.iter().map(|h| h.layer.0.to_string()).collect();
+                (
+                    format!(" (in precomp {}, via {})", project.item(c).map(|i| format!("\"{}\"", i.name)).unwrap_or_default(), names.join(" → ")),
+                    format!("comp: {}, layer: {}, path: \"{}\", targetComp: {}, via: [{}]", c.0, l.id.0, m.peak.path, cid.0, via.join(", ")),
+                )
+            }
+        };
         out.push((
             Tick::from_seconds_f64(m.peak.time),
             Finding {
                 rule: "off-accent",
                 severity: Severity::Warning,
-                layer: l.id,
+                layer: shown.id,
                 other: None,
                 message: format!(
-                    "{}'s {} speed peak at {:.3} s (frame {:.1}) is {frames} frames {} the stressed syllable of \"{}\" (onset {:.3} s, vowel {:.3} s; accent at {:.3} s, frame {:.0}): move the peak by {:+.0} frames, to {:.3} s, to land on the accent (keys.alignPeak {{layer: {}, path: \"{}\", frame: {:.0}}}).",
+                    "{}'s {} speed peak{where_} at {:.3} s (frame {:.1}) is {frames} frames {} the stressed syllable of \"{}\" (onset {:.3} s, vowel {:.3} s; accent at {:.3} s, frame {:.0}): move the peak by {:+.0} frames, to {:.3} s, to land on the accent (keys.alignPeak {{{call}, frame: {:.0}}}).",
                     name(l),
                     m.peak.property,
                     m.peak.time,
@@ -990,12 +1087,10 @@ pub fn off_accent(comp: &Comp, map: &effectcraft_project::speech::SpeechMap, sta
                     (m.target * fps).round(),
                     -d.round(),
                     m.target,
-                    l.id.0,
-                    m.peak.path,
                     (m.target * fps).round()
                 ),
             },
         ));
     }
-    out
+    (out, deep.skipped)
 }

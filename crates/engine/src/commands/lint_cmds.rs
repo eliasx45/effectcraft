@@ -171,7 +171,8 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
                 let lead = frames_p(p, "accentLead", lint::DEFAULT_ACCENT_LEAD, 0.0, C)?;
                 let window = frames_p(p, "accentWindow", lint::DEFAULT_ACCENT_WINDOW, 1.0, C)?;
                 let half = if range || fps.is_nan() || fps <= 0.0 { 0.0 } else { 0.5 / fps };
-                let found = lint::off_accent(comp, map, span.0 - half, span.1 + half, fps, lead, window);
+                let (found, skipped) = lint::off_accent(&s.project, cid, map, span.0 - half, span.1 + half, fps, lead, window);
+                notes.extend(skipped.into_iter().map(|why| format!("off-accent: a precomp was not searched: {why}")));
                 notes.push(format!(
                     "off-accent: {} stressed syllables in the speech map; peaks within {window} frames of an accent ({lead} frame(s) before the stressed vowel) that miss it by more than one frame: {}",
                     map.stressed().len(),

@@ -16,11 +16,10 @@ use serde_json::{Value, json};
 use super::prop::prop_ref;
 use super::{CommandSpec, b_p, bad, comp_id, f_p, has_comp, match_path_of, resolve_layer, str_p, unlocked};
 use crate::lint;
+use crate::precomp_time::{self, Hop, MAX_DEPTH, chains, down, scale, up};
 use crate::{EngineError, KeyRef, Result, Session, cmd, query};
 
 const C: &str = "keys.alignPeak";
-/// Deepest precomp nesting searched between the target comp and the layer's comp.
-const MAX_DEPTH: usize = 12;
 /// Most properties one call aligns.
 const MAX_PROPS: usize = 64;
 /// Smallest influence the `ease` mode sets (0.1 %).
@@ -154,63 +153,8 @@ fn mode_p(p: &Value) -> Result<Mode> {
 
 // ---------------------------------------------------------------- time through precomps
 
-/// One precomp layer between the target comp and the layer's comp (outermost first): its start
-/// and stretch map the outer comp's time to the precomp's.
-#[derive(Clone, Copy, Debug)]
-struct Hop {
-    comp: ItemId,
-    layer: LayerId,
-    start: f64,
-    stretch: f64,
-}
-
-fn down(chain: &[Hop], t: f64) -> f64 {
-    chain.iter().fold(t, |t, h| (t - h.start) * 100.0 / h.stretch)
-}
-fn up(chain: &[Hop], t: f64) -> f64 {
-    chain.iter().rev().fold(t, |t, h| h.start + t * h.stretch / 100.0)
-}
-/// Seconds of the inner comp per second of the target comp.
-fn scale(chain: &[Hop]) -> f64 {
-    chain.iter().fold(1.0, |k, h| k * 100.0 / h.stretch.abs())
-}
-
 fn hop(comp: ItemId, l: &Layer) -> Result<Hop> {
-    if l.props.get("timeRemap").is_some_and(|t| !t.keys.is_empty() || t.has_expression()) {
-        return Err(bad(C, format!("{} is time-remapped, so its time can't be mapped to the comp around it", l.name)));
-    }
-    if !l.stretch.is_finite() || l.stretch.abs() < 1e-6 {
-        return Err(bad(C, format!("{} has a zero time stretch", l.name)));
-    }
-    Ok(Hop { comp, layer: l.id, start: l.start_time.seconds(), stretch: l.stretch })
-}
-
-/// Every chain of precomp layers from `outer` down to `inner` (at most 8).
-fn chains(project: &Project, outer: ItemId, inner: ItemId) -> Vec<Vec<(ItemId, LayerId)>> {
-    fn walk(project: &Project, at: ItemId, inner: ItemId, path: &mut Vec<(ItemId, LayerId)>, out: &mut Vec<Vec<(ItemId, LayerId)>>) {
-        if out.len() >= 8 || path.len() >= MAX_DEPTH {
-            return;
-        }
-        let Some(comp) = project.comp(at) else { return };
-        for l in &comp.layers {
-            let LayerSource::Comp { item } = l.source else { continue };
-            if path.iter().any(|(c, _)| *c == item) || item == at {
-                continue;
-            }
-            path.push((at, l.id));
-            if item == inner {
-                out.push(path.clone());
-            } else {
-                walk(project, item, inner, path, out);
-            }
-            path.pop();
-        }
-    }
-    let mut out = vec![];
-    if outer != inner {
-        walk(project, outer, inner, &mut vec![], &mut out);
-    }
-    out
+    precomp_time::hop(comp, l).map_err(|e| bad(C, e))
 }
 
 fn comp_ref(s: &Session, v: &Value) -> Result<ItemId> {
