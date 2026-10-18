@@ -649,7 +649,7 @@ impl Drop for Feed {
 /// render no frames; a sequence skipping existing files renders only some.
 pub(crate) fn shares_frames(a: &Job, b: &Job) -> bool {
     use effectcraft_project::render_queue::OutputFormat;
-    let renders = |j: &Job| !matches!(j.output.format, OutputFormat::Wav | OutputFormat::Aiff) && !(j.output.format.is_sequence() && j.settings.skip_existing);
+    let renders = |j: &Job| !(matches!(j.output.format, OutputFormat::Wav | OutputFormat::Aiff) || (j.output.format.is_sequence() && j.settings.skip_existing));
     renders(a)
         && renders(b)
         && WarmKey::of(a) == WarmKey::of(b)
