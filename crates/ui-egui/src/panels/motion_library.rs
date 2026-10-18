@@ -74,6 +74,9 @@ pub struct ViewState {
     /// The card whose details are shown.
     #[serde(skip)]
     pub details: Option<String>,
+    /// The details' Variants row is open (its saved variants with their situation cards).
+    #[serde(skip)]
+    pub variants_open: bool,
     /// Where the card being applied goes: comp seconds (a drop on the Timeline), else the playhead.
     #[serde(skip)]
     pub apply_time: Option<f64>,
@@ -138,6 +141,7 @@ impl Default for ViewState {
             sfx_volume: DEFAULT_SFX_VOLUME,
             popover: String::new(),
             details: None,
+            variants_open: false,
             apply_time: None,
             applying: None,
             saving: None,
@@ -203,6 +207,7 @@ impl ViewState {
             "workspace": self.workspace,
             "group": self.group,
             "details": self.details,
+            "variants": self.variants_open,
         })
     }
     /// Open every folder above `folder` so its row shows in the tree.
@@ -1604,6 +1609,13 @@ fn kind_label(c: &Card) -> &str {
     }
 }
 
+/// Whether "Save Selection as Variant" can run: layers selected in the open comp and a library
+/// folder to keep the variant in.
+fn can_variant(app: &EffectcraftApp) -> bool {
+    let s = &app.session;
+    !s.prefs.libraries.is_empty() && s.active_comp().is_some() && !s.state.selected_layers.is_empty()
+}
+
 /// A card's right-click menu: each entry is a command (with an automation id) → the one picked.
 fn card_menu(
     auto: &mut crate::automation::Registry,
@@ -1612,10 +1624,11 @@ fn card_menu(
     local: &LocalIndex,
     lib: &LocalLib,
     can_save: bool,
+    can_variant: bool,
     danger: Color32,
 ) -> Option<(&'static str, Value)> {
     let mut pick = None;
-    crate::widgets::context_menu(resp, |ui| pick = card_menu_entries(ui, auto, card, local, lib, can_save, danger, "menu"));
+    crate::widgets::context_menu(resp, |ui| pick = card_menu_entries(ui, auto, card, local, lib, can_save, can_variant, danger, "menu"));
     pick
 }
 
@@ -1629,6 +1642,7 @@ fn card_menu_entries(
     local: &LocalIndex,
     lib: &LocalLib,
     can_save: bool,
+    can_variant: bool,
     danger: Color32,
     prefix: &str,
 ) -> Option<(&'static str, Value)> {
@@ -1684,6 +1698,9 @@ fn card_menu_entries(
     );
     entry(ui, "reveal", "Reveal in Finder", has_file, "library.reveal", json!({"id": id}), None);
     entry(ui, "copyName", "Copy Name", true, "motionLibrary.copyName", json!({"id": id}), None);
+    // The refined layers (or precomp) selected in the open comp, remembered with their situation.
+    ui.separator();
+    entry(ui, "saveVariant", "Save Selection as Variant", can_variant, "library.saveVariant", json!({"parent": id}), None);
     if let Some(e) = edit {
         ui.separator();
         entry(ui, "rename", "Rename…", true, "motionLibrary.card", json!({"op": "rename", "id": id}), None);
@@ -1947,8 +1964,9 @@ fn details_sheet(
     let mut menu_pick = None;
     let local = app.session.motion_library_local();
     let saving = view.saving.is_none();
+    let can_v = can_variant(app);
     egui::Popup::menu(&mresp).style(widgets::menu_style).show(|ui| {
-        menu_pick = card_menu_entries(ui, &mut app.auto, card, &local, lib, saving, t.danger, "details");
+        menu_pick = card_menu_entries(ui, &mut app.auto, card, &local, lib, saving, can_v, t.danger, "details");
     });
     y += 20.0 * s;
     p.text(pos2(inner.min.x, y), Align2::LEFT_TOP, card.subtitle(), Tokens::ui(11.0 * s), t.text_faint);
@@ -2004,7 +2022,73 @@ fn details_sheet(
         facts.push(format!("needs footage: {}", names.join(", ")));
     }
     let buttons_h = 34.0 * s;
-    let text_rect = Rect::from_min_max(pos2(inner.min.x, y), pos2(inner.max.x, inner.max.y - buttons_h));
+    let mut text_rect = Rect::from_min_max(pos2(inner.min.x, y), pos2(inner.max.x, inner.max.y - buttons_h));
+    // Variants: refined copies saved with the situation each was made for; the row opens a list.
+    let saved = effectcraft_engine::library_variants::index(&app.session).by_parent.get(&card.id).cloned().unwrap_or_default();
+    if !saved.is_empty() {
+        let (head_h, row_h) = (22.0 * s, 36.0 * s);
+        // Room for the rows, keeping a few lines of the description.
+        let room = ((text_rect.height() - head_h - 48.0 * s) / row_h).floor().max(0.0) as usize;
+        let shown = if view.variants_open { saved.len().min(4).min(room) } else { 0 };
+        let more = view.variants_open && saved.len() > shown;
+        let area_h = head_h + shown as f32 * row_h + if more { 16.0 * s } else { 0.0 };
+        let area = Rect::from_min_max(pos2(inner.min.x, (text_rect.max.y - area_h).max(text_rect.min.y)), pos2(inner.max.x, text_rect.max.y));
+        text_rect.max.y = (area.min.y - 6.0 * s).max(text_rect.min.y);
+        let head = Rect::from_min_size(area.min, vec2(area.width(), head_h));
+        let hresp = ui.interact(head, egui::Id::new("ml-details-variants"), Sense::click());
+        p.rect_filled(head, CornerRadius::same(4), if hresp.hovered() { t.hover } else { t.field_bg });
+        let c = pos2(head.min.x + 10.0 * s, head.center().y);
+        let k = 3.5 * s;
+        let tri = if view.variants_open {
+            vec![pos2(c.x - k, c.y - k * 0.6), pos2(c.x + k, c.y - k * 0.6), pos2(c.x, c.y + k * 0.7)]
+        } else {
+            vec![pos2(c.x - k * 0.6, c.y - k), pos2(c.x + k * 0.7, c.y), pos2(c.x - k * 0.6, c.y + k)]
+        };
+        p.add(egui::Shape::convex_polygon(tri, t.text_dim, Stroke::NONE));
+        let title = format!("{} ({})", tr("Variants"), saved.len());
+        p.text(pos2(head.min.x + 20.0 * s, head.center().y), Align2::LEFT_CENTER, &title, Tokens::semibold(11.5 * s), t.text);
+        p.text(
+            pos2(head.max.x - 8.0 * s, head.center().y),
+            Align2::RIGHT_CENTER,
+            tr("refined copies, each with its situation"),
+            Tokens::ui(10.0 * s),
+            t.text_faint,
+        );
+        app.auto.add_response("motionLibrary.details.variants", &hresp, &title);
+        if hresp.clicked() {
+            view.variants_open = !view.variants_open;
+        }
+        for (i, v) in saved.iter().take(shown).enumerate() {
+            let row = Rect::from_min_size(pos2(area.min.x, head.max.y + i as f32 * row_h), vec2(area.width(), row_h));
+            if i % 2 == 1 {
+                p.rect_filled(row, CornerRadius::same(3), t.field_bg.gamma_multiply(0.5));
+            }
+            let bw = 52.0 * s;
+            let apply_v = Rect::from_min_size(pos2(row.max.x - bw - 4.0 * s, row.center().y - 10.0 * s), vec2(bw, 20.0 * s));
+            let tw = (apply_v.min.x - row.min.x - 14.0 * s).max(20.0);
+            let name_font = Tokens::medium(11.0 * s);
+            let sum_font = Tokens::ui(10.0 * s);
+            let summary = v.card.summary();
+            p.text(pos2(row.min.x + 8.0 * s, row.min.y + 10.0 * s), Align2::LEFT_CENTER, elide(&p, &v.name, &name_font, tw), name_font, t.text);
+            let line = if summary.is_empty() { tr("no situation recorded yet").to_string() } else { summary.clone() };
+            p.text(pos2(row.min.x + 8.0 * s, row.min.y + 25.0 * s), Align2::LEFT_CENTER, elide(&p, &line, &sum_font, tw), sum_font, t.text_faint);
+            app.auto.add(&format!("motionLibrary.details.variant.{}", v.id), row, &format!("{}: {line}", v.name));
+            if kit::button(app, ui, apply_v, &format!("motionLibrary.details.variant.{}.apply", v.id), "Apply", false) {
+                menu_pick = Some(("library.applyVariant", json!({"id": v.id})));
+                view.details = None;
+            }
+        }
+        if more {
+            let r = Rect::from_min_size(pos2(area.min.x, head.max.y + shown as f32 * row_h), vec2(area.width(), 16.0 * s));
+            p.text(
+                pos2(r.min.x + 8.0 * s, r.center().y),
+                Align2::LEFT_CENTER,
+                format!("+{} more (library.variants lists them all)", saved.len() - shown),
+                Tokens::ui(10.0 * s),
+                t.text_faint,
+            );
+        }
+    }
     let mut body = facts.join("  ·  ");
     // Its description (editable on the Mac with the library), else the catalog's.
     let own = edit.map(|e| folder_ops().card_descriptions.get(&card.id).cloned().unwrap_or_else(|| e.description.clone()));
@@ -2553,6 +2637,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut apply_now: Option<String> = None;
     // A card's right-click menu entry: a command and its params, run after the cards.
     let mut menu_pick: Option<(&'static str, Value)> = None;
+    let variants = effectcraft_engine::library_variants::index(&app.session);
+    let can_v = can_variant(app);
     for item in &lay.items {
         match item {
             Placed::Header { folder, count, rect: hr } => {
@@ -2646,6 +2732,30 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         gp.text(badge.center(), Align2::CENTER_CENTER, label, font, color);
                     }
                 }
+                // Saved variants (refined copies with their situation cards): the count, which
+                // opens the details' Variants row.
+                let n_variants = variants.count(&card.id);
+                if n_variants > 0 {
+                    let font = Tokens::medium(9.5 * s);
+                    let label = if thumb_r.width() > 110.0 * s {
+                        format!("{n_variants} variant{}", if n_variants == 1 { "" } else { "s" })
+                    } else {
+                        format!("◆ {n_variants}")
+                    };
+                    let vw = gp.layout_no_wrap(label.clone(), font.clone(), Color32::WHITE).size().x + 12.0 * s;
+                    let vr = Rect::from_min_size(pos2(thumb_r.max.x - vw - 5.0 * s, thumb_r.max.y - 20.0 * s), vec2(vw, 15.0 * s));
+                    if grid.contains_rect(vr) {
+                        let vresp = ui.interact(vr, egui::Id::new(("ml-card-variants", &card.id)), Sense::click());
+                        gp.rect_filled(vr, CornerRadius::same((7.0 * s) as u8), if vresp.hovered() { t.accent } else { t.accent.gamma_multiply(0.75) });
+                        gp.text(vr.center(), Align2::CENTER_CENTER, &label, font, Color32::WHITE);
+                        app.auto.add(&format!("motionLibrary.variantCount.{}", card.id), vr, &format!("{n_variants} saved variants"));
+                        if vresp.on_hover_text(tr("Saved variants, each with the situation it was made for: click to see them")).clicked() {
+                            view.details = Some(card.id.clone());
+                            view.selected = Some(card.id.clone());
+                            view.variants_open = true;
+                        }
+                    }
+                }
                 if view.applying.as_deref() == Some(card.id.as_str()) {
                     gp.rect_filled(thumb_r, tr_radius, Color32::from_black_alpha(140));
                     gp.text(thumb_r.center(), Align2::CENTER_CENTER, tr("Downloading…"), Tokens::medium(11.5 * s), Color32::WHITE);
@@ -2726,7 +2836,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if resp.clicked() || resp.secondary_clicked() {
                     view.selected = Some(card.id.clone());
                 }
-                if let Some(pick) = card_menu(&mut app.auto, &resp, card, &local, &lib, view.saving.is_none(), t.danger) {
+                if let Some(pick) = card_menu(&mut app.auto, &resp, card, &local, &lib, view.saving.is_none(), can_v, t.danger) {
                     menu_pick = Some(pick);
                 }
                 if resp.double_clicked() {
@@ -3043,6 +3153,9 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
     }
     if let Some(d) = p.get("details") {
         view.details = d.as_str().map(str::to_string);
+    }
+    if let Some(v) = p.get("variants") {
+        view.variants_open = v.as_bool().ok_or("`variants` is true or false (the details' Variants row open)")?;
     }
     if let Some(sel) = p.get("select") {
         view.selected = sel.as_str().map(str::to_string);
