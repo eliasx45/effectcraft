@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Speech map for animation timing: words + syllable onsets, stressed syllables marked.
+
+speech-map MEDIA [--start S] [--dur S] [--fps 29.97] [--offset S] [--out map.json] [--text FILE] [--local]
+
+Pipeline (the winner of ~/Developer/lab/S1-speech-timing, 0.15 frames median on stressed onsets):
+  1. ElevenLabs Scribe text (`scribe-words`; `--local` = faster-whisper; `--text` = a known script)
+  2. Montreal Forced Aligner (english_us_arpa) on that text: words + ARPAbet phones with stress digits
+  3. forward acoustic snap: each word-initial or stressed syllable onset moves to the strongest
+     4-band energy rise 40 ms before to 120 ms after it
+
+Times are MEDIA seconds + --offset (pass the layer's comp start, or import with
+`speech.import {layer}` in EffectCraft, which maps media time through the layer itself).
+Writes {version, engine, fps, media, start, dur, offset, text, words:[{word, start, end,
+syllables:[{t, vowel, stress, frame}]}]}; `t` = the syllable's onset (burst/hiss/voicing),
+`vowel` = its vowel onset, `stress` 1 primary / 2 secondary / 0 none, frame = round(t * fps).
+MFA runs from the lab's micromamba env (override with SPEECH_MAP_MFA_ENV / SPEECH_MAP_MFA_ROOT).
+"""
+import argparse, json, os, re, subprocess, sys, tempfile, time, wave
+
+import numpy as np
+
+LAB = os.path.expanduser("~/Developer/lab/S1-speech-timing")
+MFA_ENV = os.environ.get("SPEECH_MAP_MFA_ENV", os.path.join(LAB, "envs", "mfa"))
+MFA_ROOT = os.environ.get("SPEECH_MAP_MFA_ROOT", os.path.join(LAB, "envs", "mfa_root"))
+MFA_DICT = os.environ.get("SPEECH_MAP_MFA_DICT", os.path.join(LAB, "mfa", "custom.dict"))
+SCRIBE = os.path.expanduser("~/.local/bin/scribe-words")
+SR = 16000
+# Audio longer than this is aligned in chunks cut in pauses (MFA struggles with long utterances).
+CHUNK_OVER, CHUNK_TARGET = 90.0, 45.0
+
+# ---------------------------------------------------------------- syllables (from routes/syl.py)
+VOW = lambda p: p[-1:].isdigit()
+LIQ = {"R", "L", "W", "Y"}
+OBS = {"P", "B", "T", "D", "K", "G", "F", "TH", "SH", "V"}
+LEGAL = {(c,) for c in "P B T D K G F V TH DH S Z SH ZH HH CH JH M N L R W Y".split()}
+LEGAL |= {(o, l) for o in OBS for l in LIQ if (o, l) not in {("T", "L"), ("D", "L"), ("TH", "L"), ("SH", "L")}}
+LEGAL |= {("S", c) for c in "P T K M N L W F".split()}
+LEGAL |= {("S", "P", "R"), ("S", "P", "L"), ("S", "T", "R"), ("S", "K", "R"), ("S", "K", "W"), ("S", "P", "Y"), ("S", "K", "Y")}
+
+
+def onset_index(ph, v):
+    """Index of the first phone of the syllable whose nucleus is ph[v] (maximal legal onset)."""
+    j = v
+    while j > 0 and not VOW(ph[j - 1]) and tuple(ph[j - 1:v]) in LEGAL:
+        j -= 1
+    return j
+
+
+# ---------------------------------------------------------------- numbers → words for the aligner
+ONES = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split()
+TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+
+
+def say_int(n):
+    if n < 20:
+        return ONES[n]
+    if n < 100:
+        return TENS[n // 10] + ("" if n % 10 == 0 else " " + ONES[n % 10])
+    if n < 1000:
+        return ONES[n // 100] + " hundred" + ("" if n % 100 == 0 else " " + say_int(n % 100))
+    for size, name in ((10 ** 9, "billion"), (10 ** 6, "million"), (1000, "thousand")):
+        if n >= size:
+            return say_int(n // size) + " " + name + ("" if n % size == 0 else " " + say_int(n % size))
+    return str(n)
+
+
+def say_number(m):
+    whole, frac = m.group(1).replace(",", ""), m.group(2)
+    s = say_int(int(whole)) if len(whole) < 13 else " ".join(ONES[int(c)] for c in whole)
+    if frac:
+        s += " point " + " ".join(ONES[int(c)] for c in frac)
+    return " " + s + " "
+
+
+def for_aligner(text):
+    t = re.sub(r"\$(\d[\d,]*(?:\.\d+)?)\s*([kKmM])?\b", lambda m: m.group(1) + {"k": " thousand", "m": " million"}.get((m.group(2) or "").lower(), "") + " dollars", text)
+    t = re.sub(r"(\d)\s*%", r"\1 percent", t)
+    t = re.sub(r"(\d)[kK]\b", r"\1 thousand", t)
+    t = re.sub(r"(\d[\d,]*)(?:\.(\d+))?", say_number, t)
+    t = t.replace("&", " and ")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+# ---------------------------------------------------------------- forward snap (from routes/snap.py)
+HOP = 0.005
+BANDS = [(80, 500), (500, 2000), (2000, 5000), (5000, 8000)]
+
+
+def onset_envelope(x):
+    win, hop = int(0.020 * SR), int(HOP * SR)
+    if len(x) < win + 2 * hop:
+        return np.zeros(0), np.zeros(0)
+    frames = np.lib.stride_tricks.sliding_window_view(x, win)[::hop] * np.hanning(win)
+    spec = np.abs(np.fft.rfft(frames, n=512)) ** 2
+    f = np.fft.rfftfreq(512, 1 / SR)
+    log_e = np.stack([np.log10(spec[:, (f >= a) & (f < b)].sum(1) + 1e-10) for a, b in BANDS], 1)
+    rise = np.maximum(0, log_e[2:] - log_e[:-2]).sum(1)
+    onset = np.concatenate([[0, 0], rise])
+    return np.arange(len(onset)) * HOP + win / 2 / SR, onset
+
+
+def snap_fwd(T, O, p, back=0.04, fwd=0.12, sigma=0.06):
+    i0, i1 = np.searchsorted(T, p - back), np.searchsorted(T, p + fwd)
+    seg = O[i0:i1]
+    pk = [k for k in range(1, len(seg) - 1) if seg[k] >= seg[k - 1] and seg[k] > seg[k + 1] and seg[k] > 0.5]
+    if not pk:
+        return p
+    b = max(pk, key=lambda k: seg[k] * np.exp(-((T[i0 + k] - p) ** 2) / (2 * sigma ** 2)))
+    return float(T[i0 + b] - HOP)
+
+
+# ---------------------------------------------------------------- steps
+def run(cmd, **kw):
+    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if r.returncode != 0:
+        sys.exit(f"{os.path.basename(cmd[0])} failed:\n{(r.stderr or r.stdout)[-1500:]}")
+    return r
+
+
+def read_wav(path):
+    with wave.open(path) as wf:
+        return np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float64) / 32768
+
+
+def write_wav(path, x):
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SR)
+        wf.writeframes((np.clip(x, -1, 1) * 32767).astype(np.int16).tobytes())
+
+
+def chunks(words, total):
+    """[(t0, t1, text)] cut in the widest pauses; one chunk when the audio is short."""
+    if total <= CHUNK_OVER or len(words) < 2:
+        return [(0.0, total, " ".join(w["word"] for w in words))]
+    out, first = [], 0
+    while first < len(words):
+        last = first
+        best, best_gap = None, -1.0
+        while last + 1 < len(words):
+            gap = words[last + 1]["start"] - words[last]["end"]
+            span = words[last]["end"] - words[first]["start"]
+            if span >= CHUNK_TARGET * 0.5 and gap > best_gap:
+                best, best_gap = last, gap
+            if span >= CHUNK_TARGET * 1.5:
+                break
+            last += 1
+        cut = best if (best is not None and last + 1 < len(words)) else last
+        if last + 1 >= len(words):
+            cut = last
+        t0 = 0.0 if not out else out[-1][1]
+        t1 = total if cut + 1 >= len(words) else (words[cut]["end"] + words[cut + 1]["start"]) / 2
+        out.append((t0, t1, " ".join(w["word"] for w in words[first:cut + 1])))
+        first = cut + 1
+    return out
+
+
+def mfa_align(x, parts, tmp):
+    corpus, outdir = os.path.join(tmp, "corpus"), os.path.join(tmp, "aligned")
+    os.makedirs(corpus)
+    for i, (t0, t1, text) in enumerate(parts):
+        write_wav(os.path.join(corpus, f"c{i:03d}.wav"), x[int(t0 * SR):int(t1 * SR)])
+        with open(os.path.join(corpus, f"c{i:03d}.txt"), "w") as f:
+            f.write(for_aligner(text))
+    env = {**os.environ, "MFA_ROOT_DIR": MFA_ROOT, "PATH": os.path.join(MFA_ENV, "bin") + os.pathsep + os.environ.get("PATH", "")}
+    run([os.path.join(MFA_ENV, "bin", "mfa"), "align", "--clean", "--single_speaker", "--output_format", "json",
+         corpus, MFA_DICT, "english_us_arpa", outdir], env=env)
+    words = []
+    for i, (t0, _, _) in enumerate(parts):
+        path = os.path.join(outdir, f"c{i:03d}.json")
+        if not os.path.exists(path):
+            print(f"# MFA left chunk {i} unaligned", file=sys.stderr)
+            continue
+        tiers = json.load(open(path))["tiers"]
+        phones = tiers["phones"]["entries"]
+        for s, e, w in tiers["words"]["entries"]:
+            if not w:
+                continue
+            ph = [{"p": p, "start": a + t0, "end": b + t0} for a, b, p in phones if a >= s - 1e-6 and b <= e + 1e-6]
+            words.append({"word": w, "start": s + t0, "end": e + t0, "phones": ph})
+    return words
+
+
+def build_map(aligned, T, O, base, fps):
+    out = []
+    for w in aligned:
+        ph = [p["p"] for p in w["phones"]]
+        syls = []
+        for v, p in enumerate(ph):
+            if not VOW(p):
+                continue
+            o = onset_index(ph, v)
+            t = w["phones"][o]["start"]
+            if o == 0 or p.endswith("1"):
+                t = snap_fwd(T, O, t)
+            # A vowel-initial syllable's snapped onset is its vowel onset (the snap may pass MFA's boundary).
+            vowel = max(w["phones"][v]["start"], t)
+            syls.append({"t": round(t + base, 3), "vowel": round(vowel + base, 3),
+                         "stress": int(p[-1]), "frame": int(round((t + base) * fps))})
+        first = syls[0]["t"] - base if syls else None
+        start = first if first is not None and abs(first - w["start"]) < 0.13 else w["start"]
+        out.append({"word": w["word"], "start": round(min(start, w["end"]) + base, 3), "end": round(w["end"] + base, 3), "syllables": syls})
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("media")
+    p.add_argument("--start", type=float, default=0.0, help="seconds into MEDIA to start")
+    p.add_argument("--dur", type=float, help="seconds to map (default: to the end)")
+    p.add_argument("--fps", type=float, default=29.97)
+    p.add_argument("--offset", type=float, default=0.0, help="added to every time (e.g. the layer's start in the comp)")
+    p.add_argument("--out", help="map JSON (default: MEDIA.speech.json)")
+    p.add_argument("--text", help="align this transcript instead of transcribing")
+    p.add_argument("--local", action="store_true", help="transcribe offline (faster-whisper) instead of Scribe")
+    a = p.parse_args()
+    fps = 30000 / 1001 if abs(a.fps - 29.97) < 1e-6 else (24000 / 1001 if abs(a.fps - 23.976) < 1e-6 else a.fps)
+    t_all = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = os.path.join(tmp, "a.wav")
+        cut = ["-ss", str(a.start)] + (["-t", str(a.dur)] if a.dur else [])
+        run(["ffmpeg", "-v", "error", "-y", *cut, "-i", a.media, "-vn", "-ac", "1", "-ar", str(SR), wav])
+        x = read_wav(wav)
+        total = len(x) / SR
+        if a.text:
+            text = open(a.text).read()
+            engine = "script"
+            words = [{"word": text, "start": 0.0, "end": total}]
+            parts = [(0.0, total, text)]
+        else:
+            sw = os.path.join(tmp, "scribe.json")
+            run([SCRIBE, wav, "--out", sw] + (["--local"] if a.local else []))
+            d = json.load(open(sw))
+            engine, text, words = d.get("engine", "scribe"), d.get("text", ""), d.get("words", [])
+            parts = chunks(words, total) if words else [(0.0, total, text)]
+        t_mfa = time.time()
+        aligned = mfa_align(x, parts, tmp)
+        took_mfa = time.time() - t_mfa
+        T, O = onset_envelope(x)
+        base = a.start + a.offset
+        speech = build_map(aligned, T, O, base, fps)
+    out = a.out or os.path.splitext(a.media)[0] + ".speech.json"
+    doc = {"version": 1, "engine": f"{engine} + mfa english_us_arpa + forward snap", "fps": round(fps, 6),
+           "media": os.path.abspath(a.media), "start": a.start, "dur": round(total, 3), "offset": a.offset,
+           "text": text, "words": speech}
+    with open(out, "w") as f:
+        json.dump(doc, f, indent=1)
+    n_syl = sum(len(w["syllables"]) for w in speech)
+    print(f"# {doc['engine']}: {len(speech)} words, {n_syl} syllables, {len(parts)} chunk(s), MFA {took_mfa:.0f}s, total {time.time() - t_all:.0f}s -> {out}", file=sys.stderr)
+    for w in speech:
+        st = [s for s in w["syllables"] if s["stress"] == 1]
+        mark = "  ".join(f"STRESS t={s['t']:.3f} f{s['frame']} vowel={s['vowel']:.3f}" for s in st)
+        print(f"{w['start']:9.3f} {w['end']:9.3f}  {w['word']:<16} {mark}")
+
+
+if __name__ == "__main__":
+    main()
