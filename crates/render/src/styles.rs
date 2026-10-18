@@ -333,6 +333,30 @@ fn evaluate(ctx: &EvalCtx, layer: &Layer, g: &PropGroup) -> Styles {
     s
 }
 
+/// Buffer pixels around a layer's visible content that its styles can read or paint at `scale`,
+/// when their pixels don't depend on where the content sits in its buffer: `None` with noise,
+/// glow jitter or a Dissolve style (hashed by buffer pixel), or no styles. The content can then
+/// be cropped to its visible pixels plus this margin before [`render`] with the same result (a
+/// text layer with effects is a comp-sized canvas, mostly transparent).
+pub(crate) fn crop_margin(ctx: &EvalCtx, layer: &Layer, scale: f64) -> Option<u32> {
+    let g = group(layer)?;
+    let s = evaluate(ctx, layer, g);
+    let dissolve = |m: BlendMode| m == BlendMode::Dissolve;
+    let shadows = s.drop.iter().chain(&s.inner_shadow).any(|d| d.noise > 0.0 || dissolve(d.mode));
+    let glows = [&s.outer_glow, &s.inner_glow].into_iter().flatten().any(|gl| gl.noise > 0.0 || gl.jitter > 0.0 || dissolve(gl.mode));
+    let others = s.bevel.as_ref().is_some_and(|b| dissolve(b.hl.0) || dissolve(b.sh.0))
+        || s.satin.as_ref().is_some_and(|x| dissolve(x.mode))
+        || s.color.as_ref().is_some_and(|x| dissolve(x.mode))
+        || s.gradient.as_ref().is_some_and(|x| dissolve(x.mode))
+        || s.stroke.as_ref().is_some_and(|x| dissolve(x.mode));
+    if shadows || glows || others {
+        return None;
+    }
+    // Twice what `render` pads by: blurred styles fade out within their reach.
+    let m = (reach(&s) * scale.max(1e-6) * 2.0).ceil() + 4.0;
+    (m.is_finite() && m <= MAX_PAD * 2.0).then_some(m as u32)
+}
+
 /// Layer-space margin the styles reach beyond the content.
 fn reach(s: &Styles) -> f64 {
     let soft = |size: f64| size * 1.6;
