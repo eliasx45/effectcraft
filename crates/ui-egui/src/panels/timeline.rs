@@ -1345,6 +1345,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let graph_x0 = rect.min.x + left_w + 1.0;
     let graph_x1 = rect.max.x - GUTTER_W;
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("timeline-graph-area"), (graph_x0, graph_x1 - graph_x0)));
+    switch_comp_view(&mut app.ui.timeline, cid.0);
     let fit_pps = fit_pps(graph_x1 - graph_x0, &comp);
     let pps = app.ui.timeline.pps.unwrap_or(fit_pps);
     if app.ui.timeline.pps.is_none() {
@@ -3455,6 +3456,23 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.status = e;
         }
     }
+}
+
+/// The Timeline now shows `comp`: keeps the time view (zoom and scroll) of the comp it showed
+/// and puts back `comp`'s, or fits a comp it hasn't shown yet. The first comp after launch keeps
+/// the saved view.
+pub(super) fn switch_comp_view(tl: &mut crate::state::TimelineState, comp: u64) {
+    if tl.view_comp == Some(comp) {
+        return;
+    }
+    if let Some(prev) = tl.view_comp {
+        tl.comp_views.insert(prev, (tl.start, tl.pps));
+        let (start, pps) = tl.comp_views.get(&comp).copied().unwrap_or((0.0, None));
+        tl.start = start;
+        tl.pps = pps;
+        tl.before_fit = None;
+    }
+    tl.view_comp = Some(comp);
 }
 
 /// The render times of the frame in the viewer for the Timeline's comp `comp` (the viewer's comp,
