@@ -605,6 +605,8 @@ fn cropped_styles_match_the_whole_buffer() {
             }
         }
         assert!(worst.0 <= 1.0 / 255.0, "{:?}: max difference {worst:?}", styles.iter().map(|s| s.0).collect::<Vec<_>>());
+    }
+}
 
 /// A text layer with an effect is a comp-sized canvas; its styles run on the visible part
 /// (`layer_buf::crop_visible`). The frame must be exactly the one styled on the whole canvas,
