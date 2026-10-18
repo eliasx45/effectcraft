@@ -309,6 +309,23 @@ impl<'a> Renderer<'a> {
         t.buf.unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale })
     }
 
+    /// A Transform effect that leaves every pixel where it is (Anchor Point = Position, Scale
+    /// 100 %, no Rotation or Skew) and isn't motion blurred: it only fades the layer, so a text
+    /// or shape layer needs no comp-sized effect canvas for it (#659 is about effects that move
+    /// pixels past the glyphs; the Transform effect grows its own buffer when it does).
+    fn transform_moves_nothing(&self, ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, spec: &effectcraft_effects::EffectSpec) -> bool {
+        if spec.id != "ec.distort.transform" || ALWAYS_TEXT_CANVAS.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let p = self.effect_params(ctx, layer, g);
+        let sh = p.f("scaleHeight");
+        let sw = if p.b("uniform") { sh } else { p.f("scaleWidth") };
+        let still = p.v2("anchor") == p.v2("position") && sw == 100.0 && sh == 100.0 && p.f("rotation") == 0.0 && p.f("skew") == 0.0;
+        // Motion blur samples the Transform at other times, where it may move.
+        let blurred = if p.b("useCompositionShutterAngle") { layer.switches.motion_blur && ctx.comp.enable_motion_blur } else { p.f("shutterAngle") > 0.0 };
+        still && !blurred
+    }
+
     /// Run the layer's video effect stack on `target` (in effect space, measured from `origin`
     /// in layer coordinates): runs of GPU-capable effects go to [`FxTarget::gpu`] (when an
     /// accelerator is active and supports them), the rest to [`FxTarget::cpu`] one by one
@@ -380,7 +397,10 @@ impl<'a> Renderer<'a> {
         // Text and shape rasterisation is tight to the glyphs or the drawn paths. Distortions
         // and tilers need transparent output pixels beyond that rectangle, on CPU and GPU alike
         // (#659).
-        if matches!(layer.source, LayerSource::Text | LayerSource::Shape) && !adjustment && stack.iter().any(|(_, _, spec)| text_needs_canvas(spec)) {
+        if matches!(layer.source, LayerSource::Text | LayerSource::Shape)
+            && !adjustment
+            && stack.iter().any(|(_, g, spec)| text_needs_canvas(spec) && !self.transform_moves_nothing(ctx, layer, g, spec))
+        {
             target.effect_canvas(layer_size);
         }
         let accel = self.active_accel();
@@ -458,6 +478,10 @@ pub(crate) fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
     }
     Some(ctx.layer_to_comp(layer).0)
 }
+
+/// Test switch: every distortion gets the comp-sized text canvas (the reference for
+/// `Renderer::transform_moves_nothing`).
+pub(crate) static ALWAYS_TEXT_CANVAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Colour-only effects and expression controls neither move pixels nor create coverage.
 /// The colour effects listed here can modify zero alpha, so keep their larger canvas.
