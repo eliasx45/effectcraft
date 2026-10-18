@@ -44,7 +44,31 @@ pub const PARAM_ID_ALIASES: &[(&str, &str, &str)] = &[
     ("ec.key.innerouter", "additionalBackground", "additionalBackground/background1"),
     // Generate: Radio Waves' growth speed was called Velocity; Velocity now moves the wave.
     ("ec.generate.radiowaves", "velocity", "waveMotion/expansion"),
+    // Stylize: Deep Glow's Exposure moved to a half-strength scale (see `ALIAS_VALUE_SCALES`).
+    ("ec.stylize.deepglow", "PEDG-0002", "exposure"),
 ];
+
+/// Value factors applied once when a parameter is found under its old id ([`PARAM_ID_ALIASES`]),
+/// so the instance renders as before: `(effect id, new id, factor)`.
+pub const ALIAS_VALUE_SCALES: &[(&str, &str, f64)] = &[
+    // Deep Glow's Exposure 1 is now 2 (`exposure_gain` halves it).
+    ("ec.stylize.deepglow", "exposure", 2.0),
+];
+
+/// Multiply a scalar property's value, keyframes and keyframe speeds by `f`.
+fn scale_scalar(pr: &mut Property, f: f64) {
+    if let Value::Scalar(v) = &mut pr.value {
+        *v *= f;
+    }
+    for k in &mut pr.keys {
+        if let Value::Scalar(v) = &mut k.value {
+            *v *= f;
+        }
+        for e in k.in_ease.as_mut_slice().iter_mut().chain(k.out_ease.as_mut_slice().iter_mut()) {
+            e.speed *= f;
+        }
+    }
+}
 
 /// Popup option labels renamed since they were first saved:
 /// `(effect id, param id, old label, new label)`.
@@ -352,6 +376,9 @@ fn upgrade_full(spec: &EffectSpec, g: &mut PropGroup, ids: &mut Ids, layer_size:
             let pr = match moved {
                 Some(mut pr) => {
                     pr.match_id = leaf.to_string();
+                    if let Some((_, _, f)) = ALIAS_VALUE_SCALES.iter().find(|(e, id, _)| *e == spec.id && *id == ps.id) {
+                        scale_scalar(&mut pr, *f);
+                    }
                     pr
                 }
                 None => {

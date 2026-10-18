@@ -198,7 +198,7 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if work_scale < 1.0 {
         halo = resample(e, &halo, fw, fh)?;
     }
-    let exposure = pr.f("PEDG-0002").clamp(0.0, 64.0) as f32;
+    let exposure = effectcraft_effects::exposure_gain(pr.f("exposure"));
     let exposure = if linear_model { exposure.powf(0.75) } else { exposure };
     let tint = pr.color("PEDG-0038");
     let mut p = Params::default();
