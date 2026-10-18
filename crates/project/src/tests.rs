@@ -210,6 +210,7 @@ fn default_fields_are_left_out_and_read_back() {
         spatial_auto: false,
         spatial_continuous: true,
         roving: true,
+        ae_spatial: true,
         label: 3,
         ..Keyframe::new(Tick(1000), Value::Vec3([4.0, 5.0, 6.0]))
     };

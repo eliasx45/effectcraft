@@ -1746,6 +1746,34 @@ fn drop_place(path: &str, row: Rect, pointer: Option<egui::Pos2>) -> DropPlace {
     }
 }
 
+/// Where a folder dropped at `place` on `target` lands, given the row shown `above` it. The line
+/// between the last row of a group and the next, shallower row is drawn in one spot for "after the
+/// group's last folder" and "before the next row": for a folder from that group it stays a
+/// reorder among its siblings (it moved the folder out of its parent).
+fn boundary_drop(folder: &str, target: &str, place: DropPlace, above: Option<&str>) -> (String, DropPlace) {
+    let parent = |p: &str| p.rsplit_once('/').map_or(String::new(), |(a, _)| a.to_string());
+    let depth = |p: &str| p.matches('/').count();
+    if let (DropPlace::Before, Some(above)) = (place, above)
+        && parent(target) != parent(folder)
+        && depth(above) > depth(target)
+    {
+        let mut q = above;
+        loop {
+            if parent(q) == parent(folder) {
+                if q != folder {
+                    return (q.to_string(), DropPlace::After);
+                }
+                break;
+            }
+            match q.rsplit_once('/') {
+                Some((up, _)) => q = up,
+                None => break,
+            }
+        }
+    }
+    (target.to_string(), place)
+}
+
 /// The command a folder dropped on `target` (`""`: All motion) runs.
 fn folder_drop(folder: &str, target: &str, place: DropPlace) -> (&'static str, Value) {
     let parent = |p: &str| p.rsplit_once('/').map_or(String::new(), |(a, _)| a.to_string());
@@ -2224,6 +2252,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 Some(row) => (row.path.as_str(), row.name.as_str(), row.cards, row.depth),
                 None => ("", tr("All motion"), total, 0),
             };
+            let above = i.checked_sub(2).and_then(|k| rows.get(k)).map(|r| r.path.as_str());
             let auto_id = format!("motionLibrary.folder.{}", if path.is_empty() { "all" } else { path });
             let resp = ui.interact(r.intersect(list), egui::Id::new(("ml-folder", path)), Sense::click_and_drag());
             let active = view.folder == path;
@@ -2239,9 +2268,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 && fd.0 != path
                 && !under(path, &fd.0)
             {
-                let place = drop_place(path, r, pointer);
+                let (to, place) = boundary_drop(&fd.0, path, drop_place(path, r, pointer), above);
+                // Indented to the level the folder lands at.
+                let x = r.min.x + to.matches('/').count() as f32 * 12.0 * s;
                 let line = |y: f32| {
-                    sp.line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], Stroke::new(2.0, t.accent));
+                    sp.line_segment([pos2(x, y), pos2(r.max.x, y)], Stroke::new(2.0, t.accent));
                 };
                 match place {
                     DropPlace::Before => line(r.min.y),
@@ -2255,7 +2286,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 && fd.0 != path
                 && !under(path, &fd.0)
             {
-                folder_pick = Some(folder_drop(&fd.0, path, drop_place(path, r, pointer)));
+                let (to, place) = boundary_drop(&fd.0, path, drop_place(path, r, pointer), above);
+                folder_pick = Some(folder_drop(&fd.0, &to, place));
             }
             // Drop a card on a folder: move it there.
             if !path.is_empty()
@@ -3903,7 +3935,8 @@ fn folder_ask_sheet(app: &mut EffectcraftApp, ui: &mut egui::Ui, grid: Rect, ask
         p.with_clip_rect(body_r.intersect(grid)).galley(body_r.min, galley, t.text_dim);
     } else {
         let field = Rect::from_min_size(body_r.min, vec2(body_r.width(), 24.0 * s));
-        let resp = ui.put(field, egui::TextEdit::singleline(&mut ask.text).hint_text(tr("Folder name")));
+        let resp = ui
+            .put(field, egui::TextEdit::singleline(&mut ask.text).hint_text(tr("Folder name")).vertical_align(egui::Align::Center).font(Tokens::ui(12.0 * s)));
         app.auto.add_response("motionLibrary.folderAsk.name", &resp, "Folder name");
         if !resp.has_focus() && !resp.lost_focus() {
             resp.request_focus();
@@ -4741,6 +4774,23 @@ pub fn refresh_command(app: &mut EffectcraftApp, ctx: &egui::Context, _params: &
 #[cfg(test)]
 mod library_tests {
     use super::*;
+
+    #[test]
+    fn drop_between_a_group_and_the_next_row_stays_a_sibling() {
+        // Refs dragged to the line under Backgrounds (the top of Graphs): after Backgrounds, not out.
+        let (to, place) = boundary_drop("Devin Jatho/Refs", "Graphs", DropPlace::Before, Some("Devin Jatho/Backgrounds"));
+        assert_eq!((to.as_str(), place), ("Devin Jatho/Backgrounds", DropPlace::After));
+        assert_eq!(folder_drop("Devin Jatho/Refs", &to, place).1["op"], "reorder");
+        // Under an open subfolder: after its sibling ancestor.
+        let (to, _) = boundary_drop("Devin Jatho/Refs", "Graphs", DropPlace::Before, Some("Devin Jatho/Icons/Instagram"));
+        assert_eq!(to, "Devin Jatho/Icons");
+        // A top folder dropped at the top of a group's first child still moves in.
+        let (to, place) = boundary_drop("Graphs", "Devin Jatho/Elements", DropPlace::Before, Some("Devin Jatho"));
+        assert_eq!((to.as_str(), place), ("Devin Jatho/Elements", DropPlace::Before));
+        // Its own row above: unchanged.
+        let (to, _) = boundary_drop("Devin Jatho/Refs", "Graphs", DropPlace::Before, Some("Devin Jatho/Refs"));
+        assert_eq!(to, "Graphs");
+    }
 
     #[test]
     fn reorder_moves_before_and_after() {
