@@ -1755,6 +1755,44 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                         note!("    {lname:<28} {ms:8.2} ms");
                     }
                 }
+                // Playing: the frames after `t` with one cache kept between them (what playback
+                // pays per frame once a layer is cached): mean per layer over 8 frames.
+                let playing = LayerCache::default();
+                let step = comp.frame_rate.frame_duration();
+                let frames = 8;
+                let mut sum = std::collections::HashMap::new();
+                let mut total = 0.0;
+                for i in 0..=frames {
+                    let times = effectcraft_render::LayerTimes::default();
+                    let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+                    r.expr = s.expr.as_deref();
+                    r.cache = Some(&playing);
+                    r.accel = Some(&gpu);
+                    r.times = Some(&times);
+                    let at = Tick(t.0.saturating_add(step.0.saturating_mul(i)));
+                    let t0 = std::time::Instant::now();
+                    std::hint::black_box(gpu.render_display(&r, cid, at));
+                    gpu.wait();
+                    // Frame 0 fills the cache.
+                    if i > 0 {
+                        total += t0.elapsed().as_secs_f64() * 1e3;
+                        for (k, ms) in times.into_map() {
+                            *sum.entry(k).or_insert(0.0) += ms;
+                        }
+                    }
+                }
+                note!("  layers, playing ({frames} frames after t, warm cache): {:.2} ms/frame", total / frames as f64);
+                let mut rows: Vec<(f64, String)> = sum
+                    .into_iter()
+                    .map(|((c, l), ms)| {
+                        let lname = project.comp(c).and_then(|cc| cc.layers.iter().find(|x| x.id == l)).map(|x| x.name.clone()).unwrap_or_default();
+                        (ms / frames as f64, lname)
+                    })
+                    .collect();
+                rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+                for (ms, lname) in rows.iter().take(8) {
+                    note!("    {lname:<28} {ms:8.2} ms");
+                }
             }
         }
     }

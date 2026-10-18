@@ -179,6 +179,8 @@ pub(crate) struct Bank {
     variants: [OnceLock<Result<Variant, String>>; 8],
     /// The viewer's `display` pass reading codes.
     display: OnceLock<Result<Variant, String>>,
+    /// Effect kernels reading codes: [`FX_SRC`] by `src`, [`FX_AUX`] by `aux` (f32 out).
+    fx: [OnceLock<Result<Variant, String>>; 2],
     /// Codes decoded for a float-only consumer (diagnostics, tests).
     pub(crate) promotions: AtomicU64,
     /// Passes that read or wrote codes (diagnostics, tests).
@@ -209,6 +211,7 @@ impl Bank {
             lut,
             variants: Default::default(),
             display: OnceLock::new(),
+            fx: Default::default(),
             promotions: AtomicU64::new(0),
             dispatches: AtomicU64::new(0),
             sites: Default::default(),
@@ -222,7 +225,38 @@ impl Bank {
                 return Err(e.clone());
             }
         }
+        for aux in [false, true] {
+            if let Err(e) = self.fx_variant(aux) {
+                return Err(e.clone());
+            }
+        }
         self.display_variant().map(|_| ()).map_err(Clone::clone)
+    }
+
+    /// The effect kernels reading codes by `aux` (else by `src`).
+    fn fx_variant(&self, aux: bool) -> Result<&Variant, &String> {
+        let cell = self.fx.get(usize::from(aux)).ok_or(&NO_VARIANT)?;
+        cell.get_or_init(|| build_fx(&self.device, aux)).as_ref()
+    }
+
+    /// The pipeline of `entry` for `io`: a compositor variant, else (codes in, f32 out) an
+    /// effect variant.
+    fn find(&self, entry: &str, io: Io) -> Option<(&Variant, &wgpu::ComputePipeline)> {
+        fn pick<'v>(v: &'v Variant, entry: &str) -> Option<&'v wgpu::ComputePipeline> {
+            v.pipes.iter().find(|(name, _)| *name == entry).map(|(_, p)| p)
+        }
+        if let Ok(v) = self.variant(io)
+            && let Some(pipe) = pick(v, entry)
+        {
+            return Some((v, pipe));
+        }
+        let fx = match io {
+            Io { src: true, aux: false, out: false } => false,
+            Io { src: false, aux: true, out: false } => true,
+            _ => return None,
+        };
+        let v = self.fx_variant(fx).ok()?;
+        pick(v, entry).map(|pipe| (v, pipe))
     }
 
     fn variant(&self, io: Io) -> Result<&Variant, &String> {
@@ -236,7 +270,7 @@ impl Bank {
 
     /// Whether kernel `entry` exists for `io` (a producer asks before choosing codes output).
     pub(crate) fn has(&self, entry: &str, io: Io) -> bool {
-        io.index() == 0 || self.variant(io).is_ok_and(|v| v.pipes.iter().any(|(e, _)| *e == entry))
+        io.index() == 0 || self.find(entry, io).is_some()
     }
 }
 
@@ -261,8 +295,7 @@ pub(crate) fn dispatch(
     let io = Io { src: src.is_codes(), aux: aux.is_some_and(Pixels::is_codes), out: out.is_codes() };
     if io.index() != 0
         && let Some(bank) = e.g.codes.as_ref()
-        && let Ok(v) = bank.variant(io)
-        && let Some((_, pipe)) = v.pipes.iter().find(|(name, _)| *name == entry)
+        && let Some((v, pipe)) = bank.find(entry, io)
     {
         bank.dispatches.fetch_add(1, Relaxed);
         let views = [src.view(), aux.map_or(&e.g.dummy.view, Pixels::view), out.view()];
@@ -304,6 +337,21 @@ pub(crate) fn decode(e: &mut Enc, c: &CodeImage) -> Option<GpuImage> {
     let mut out = e.scratch(c.width(), c.height());
     pixels(e, "decode", &Params::default(), &Pixels::Codes(c.clone()), None, &Pixels::Float(out.clone()), None);
     out.levels = Some(LEVELS);
+    Some(out)
+}
+
+/// `c` inside a border of `pad` transparent pixels (`Buf::pad` on codes: code 0 is 0.0), as a
+/// new codes image of `e`; `None` when it can't be made (over the size limit, no kernel).
+pub(crate) fn pad(e: &mut Enc, c: &CodeImage, pad: u32) -> Option<CodeImage> {
+    let w = c.width().checked_add(pad.checked_mul(2)?)?;
+    let h = c.height().checked_add(pad.checked_mul(2)?)?;
+    if !e.g.fits(w, h) || !e.g.codes.as_ref()?.has("clear", Io { src: false, aux: false, out: true }) {
+        return None;
+    }
+    let out = Pixels::Codes(e.scratch_codes(w, h)?);
+    pixels(e, "clear", &Params::default(), &Pixels::Float(e.g.dummy.clone()), None, &out, None);
+    let Pixels::Codes(out) = out else { return None };
+    e.copy_into(&c.0, &out.0, pad, pad);
     Some(out)
 }
 
@@ -371,6 +419,19 @@ fn store_q(p: vec2<i32>, v: vec4<f32>, levels: f32, inv: f32) {
 }
 "#;
 
+/// A codes image cleared to code 0 (transparent black), for [`pad`].
+const CLEAR_ENTRY: &str = r#"
+@compute @workgroup_size(16, 16)
+fn clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    textureStore(out, p, vec4<u32>(0u));
+}
+"#;
+
 /// Replace `from` (which must occur exactly `n` times) by `to`.
 fn subst(text: &str, from: &str, to: &str, n: usize) -> Result<String, String> {
     let found = text.matches(from).count();
@@ -400,7 +461,7 @@ fn function(src: &str, name: &str) -> Result<String, String> {
 fn entries(io: Io) -> Vec<&'static str> {
     let mut e = vec!["warp_blend", "warp_blend_at", "blend_full", "blend_full_at"];
     if io == (Io { src: false, aux: false, out: true }) {
-        e.push("quantize");
+        e.extend(["quantize", "clear"]);
     }
     if io == (Io { src: true, aux: false, out: false }) {
         e.extend(["half", "warp_accum", "warp_accum_at", "decode"]);
@@ -444,7 +505,10 @@ pub(crate) fn source(io: Io) -> Result<String, String> {
     if names.contains(&"decode") {
         kernels.push_str(DECODE_ENTRY);
     }
-    for f in fns.into_iter().filter(|f| *f != "decode") {
+    if names.contains(&"clear") {
+        kernels.push_str(CLEAR_ENTRY);
+    }
+    for f in fns.into_iter().filter(|f| *f != "decode" && *f != "clear") {
         let mut t = function(KERNELS, f)?;
         if f == "quantize" && io.out {
             t = subst(
@@ -464,6 +528,64 @@ pub(crate) fn source(io: Io) -> Result<String, String> {
     if io.aux {
         kernels = kernels.replace("textureLoad(aux, ", "aux_load(");
         text.push_str("fn aux_load(p: vec2<i32>, l: i32) -> vec4<f32> { return dec(textureLoad(aux, p, l)); }\n");
+    }
+    text.push_str(&kernels);
+    Ok(text)
+}
+
+/// The text of `src`'s section `title`: from its `// ----…---- title` rule to the next rule.
+fn section(src: &str, title: &str) -> Result<String, String> {
+    const RULE: &str = "// ----------------------------------------------------------------";
+    let head = format!("{RULE} {title}\n");
+    let at = src.find(&head).ok_or_else(|| format!("8 bpc codes shader: no section {title}"))?;
+    let body = src.get(at.saturating_add(head.len())..).ok_or("8 bpc codes shader: bad offset")?;
+    let end = body.find(&format!("\n{RULE}")).unwrap_or(body.len());
+    body.get(..end).map(str::to_owned).ok_or_else(|| "8 bpc codes shader: bad range".into())
+}
+
+const FX_TONE: &str = include_str!("shaders/fx_tone.wgsl");
+
+/// Entry points of the effect variant reading codes by `src` (`aux`: by `aux`).
+fn fx_entries(aux: bool) -> &'static [&'static str] {
+    if aux { &["shadow_combine"] } else { &["box_h", "box_v", "shadow_make", "pointwise", "fxt_point", "adjust_mix"] }
+}
+
+/// The WGSL of the effect kernels reading codes (Gaussian / Fast Box Blur's passes, Drop
+/// Shadow, the per-pixel effects, Hue/Saturation's colour ranges, the adjustment layer mix):
+/// as [`source`], from the same text, with the effects' sections of `kernels.wgsl` and
+/// `fx_tone.wgsl`. `aux`: Drop Shadow's combine reading the layer (`aux`) as codes.
+pub(crate) fn fx_source(aux: bool) -> Result<String, String> {
+    let mut common = COMMON.to_owned();
+    let mut kernels = function(KERNELS, "out_dims")?;
+    kernels.push('\n');
+    if aux {
+        common = subst(&common, "var aux: texture_2d<f32>;", "var aux: texture_2d<u32>;", 1)?;
+        kernels.push_str(&function(KERNELS, "shadow_combine")?);
+        kernels = subst(&kernels, "textureLoad(aux, ", "aux_load(", 1)?;
+    } else {
+        common = subst(&common, "var src: texture_2d<f32>;", "var src: texture_2d<u32>;", 1)?;
+        common = subst(&common, "(t: texture_2d<f32>,", "(t: texture_2d<u32>,", 6)?;
+        common = subst(&common, "return textureLoad(t, vec2<i32>(x, y), 0);", "return dec(textureLoad(t, vec2<i32>(x, y), 0));", 1)?;
+        common = subst(
+            &common,
+            "return textureLoad(t, vec2<i32>(clamp(x, 0, d.x - 1), clamp(y, 0, d.y - 1)), 0);",
+            "return dec(textureLoad(t, vec2<i32>(clamp(x, 0, d.x - 1), clamp(y, 0, d.y - 1)), 0));",
+            1,
+        )?;
+        kernels.push_str(&section(KERNELS, "blurs (raster::blur)")?);
+        kernels.push('\n');
+        kernels.push_str(&function(KERNELS, "shadow_make")?);
+        kernels.push('\n');
+        kernels.push_str(&section(KERNELS, "per-pixel effects")?);
+        kernels.push('\n');
+        kernels.push_str(FX_TONE);
+        kernels = kernels.replace("textureLoad(src, ", "src_load(");
+    }
+    let mut text = format!("{common}\n{DECODE}\n@group(0) @binding(3) var out: texture_storage_2d<rgba32float, write>;\n");
+    if aux {
+        text.push_str("fn aux_load(p: vec2<i32>, l: i32) -> vec4<f32> { return dec(textureLoad(aux, p, l)); }\n");
+    } else {
+        text.push_str("fn src_load(p: vec2<i32>, l: i32) -> vec4<f32> { return dec(textureLoad(src, p, l)); }\n");
     }
     text.push_str(&kernels);
     Ok(text)
@@ -547,6 +669,18 @@ fn build(device: &wgpu::Device, io: Io) -> Result<Variant, String> {
     compile(device, "8 bpc codes kernels", text, &layout, &entries(io))
 }
 
+fn build_fx(device: &wgpu::Device, aux: bool) -> Result<Variant, String> {
+    let layout = [
+        buffer_entry(0, wgpu::BufferBindingType::Uniform),
+        texture_entry(1, !aux),
+        texture_entry(2, aux),
+        storage_texture_entry(3, crate::context::FORMAT),
+        buffer_entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
+        buffer_entry(6, wgpu::BufferBindingType::Storage { read_only: true }),
+    ];
+    compile(device, "8 bpc codes effect kernels", fx_source(aux)?, &layout, fx_entries(aux))
+}
+
 fn build_display(device: &wgpu::Device) -> Result<Variant, String> {
     let entries = [
         texture_entry(1, true),
@@ -588,5 +722,13 @@ mod tests {
             }
         }
         display_source().unwrap();
+        for aux in [false, true] {
+            let s = fx_source(aux).unwrap_or_else(|e| panic!("fx {aux}: {e}"));
+            for name in fx_entries(aux) {
+                assert!(s.contains(&format!("fn {name}(")), "fx {aux} lacks {name}");
+            }
+            let t = if aux { "aux" } else { "src" };
+            assert_eq!(s.matches(&format!("textureLoad({t}, ")).count(), 1, "fx {aux} reads {t} undecoded");
+        }
     }
 }

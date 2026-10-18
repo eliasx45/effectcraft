@@ -1742,6 +1742,8 @@ fn fill_property_mapped(
         k.auto_bezier = boolean(key, &["temporal_auto_bezier"]).unwrap_or(false);
         k.spatial_continuous = boolean(key, &["spatial_continuous"]).unwrap_or(false);
         k.spatial_auto = boolean(key, &["spatial_auto_bezier"]).unwrap_or(k.spatial_auto);
+        // AE's exact auto-Bezier tangents, without EffectCraft's still point at coincident keys.
+        k.ae_spatial = true;
         k.roving = boolean(key, &["roving"]).unwrap_or(false);
         k.label = integer(key, &["label"]).unwrap_or(0).clamp(0, 255) as u8;
         // Reversed layers play the source curve backwards in layer time.

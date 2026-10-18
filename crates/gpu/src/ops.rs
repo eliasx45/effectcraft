@@ -625,13 +625,14 @@ pub(crate) fn channel_mix_in(e: &mut Enc, canvas: &mut GpuImage, tmp: &GpuImage,
 }
 
 /// Adjustment layer finish: move `canvas` toward `adjusted` by `matte`'s alpha × `opacity`.
-pub fn adjust_mix(e: &mut Enc, canvas: &GpuImage, adjusted: &GpuImage, matte: &GpuImage, opacity: f32) -> GpuImage {
+/// `canvas` may be 8 bpc codes (the kernel reads them).
+pub(crate) fn adjust_mix(e: &mut Enc, canvas: &Pixels, adjusted: &GpuImage, matte: &GpuImage, opacity: f32) -> GpuImage {
     let (rows, stride) = e.image_rows(matte);
     let mut p = Params::default();
     p.u[0][0] = stride;
     p.f[0][0] = opacity;
-    let out = e.scratch(canvas.width, canvas.height);
-    e.pixels("adjust_mix", &p, canvas, Some(adjusted), &out, Some(&rows));
+    let out = e.scratch(canvas.width(), canvas.height());
+    codes::pixels(e, "adjust_mix", &p, canvas, Some(&adjusted.clone().into()), &out.clone().into(), Some(&rows));
     out
 }
 

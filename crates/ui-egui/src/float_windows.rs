@@ -84,6 +84,9 @@ pub struct OsWindows {
     pub(crate) drag_overlay: Option<DragOverlay>,
     /// Whether the windows float above the main window.
     pub(crate) on_top: OnTop,
+    /// The windows with a focused text field in their last pass: Edit ▸ Select All (Cmd+A) and
+    /// the other text edits from the menu bar go to the field, not the comp.
+    pub(crate) typing: BTreeSet<u64>,
 }
 
 /// How long no EffectCraft window may have the focus before the undocked windows stop floating
@@ -241,6 +244,17 @@ pub(crate) fn send_pointer(app: &mut EffectcraftApp, ctx: &egui::Context, window
     send(app, ctx, target, events);
 }
 
+/// The undocked window that has the OS focus and a focused text field, if any.
+pub(crate) fn typing_window(app: &EffectcraftApp, ctx: &egui::Context) -> Option<u64> {
+    let focused = ctx.input(|i| i.raw.viewports.iter().filter(|(_, v)| v.focused == Some(true)).map(|(id, _)| *id).collect::<Vec<_>>());
+    app.os_windows.typing.iter().copied().find(|w| app.os_windows.shown.contains_key(w) && focused.contains(&viewport_id(*w)))
+}
+
+/// Queue synthetic key input for undocked window `window`.
+pub(crate) fn send_keys_to(app: &mut EffectcraftApp, ctx: &egui::Context, window: u64, events: Vec<egui::Event>) {
+    send(app, ctx, Some(window), events);
+}
+
 /// Queue synthetic key input for the window the last synthetic pointer input went to.
 pub(crate) fn send_keys(app: &mut EffectcraftApp, ctx: &egui::Context, events: Vec<egui::Event>) {
     let target = app.os_windows.key_target.filter(|w| app.os_windows.shown.contains_key(w));
@@ -321,6 +335,11 @@ impl EffectcraftApp {
             self.auto.window = Some(f.id);
             let out = self.os_window_ui(ui, i, &f, active, info);
             self.auto.window = None;
+            if ui.ctx().egui_wants_keyboard_input() {
+                self.os_windows.typing.insert(f.id);
+            } else {
+                self.os_windows.typing.remove(&f.id);
+            }
             out
         });
         actions.extend(out.actions);
