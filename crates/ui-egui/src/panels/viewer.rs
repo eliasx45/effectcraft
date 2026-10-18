@@ -1287,6 +1287,22 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.auto.add("viewer.warpBanner", r, &text);
     }
 
+    // Adaptive Resolution While Playing (and a scrub's coarse frames): the frame on screen is
+    // below full quality. Paused, the full frame replaces it and the badge goes.
+    if (app.playback.playing && app.playback.res.is_none()) || app.scrubbing() {
+        let full = (app.viewer_res().scale(zoom, ppp) * 1000.0).round() as u32;
+        let shown = app.viewer_shown.as_ref().filter(|(_, k)| k.comp == cid.0).map(|(_, k)| k.scale);
+        if let Some(label) = shown.and_then(|s| crate::playback_budget::draft_label(full, s)) {
+            let text = format!("Draft · {label}");
+            let galley = painter.layout_no_wrap(text.clone(), Tokens::medium(11.0), Color32::WHITE);
+            let size = galley.size() + vec2(12.0, 6.0);
+            let r = Rect::from_min_size(pos2(area.max.x - size.x - 8.0, area.min.y + 8.0), size);
+            painter.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(0xb0, 0x6a, 0x10, 0xe0));
+            painter.galley(r.min + vec2(6.0, 3.0), galley, Color32::WHITE);
+            app.auto.add("viewer.draftBadge", r, &text);
+        }
+    }
+
     // Footage that can't be decoded (no decoder for its codec / profile): say why on the layer
     // instead of leaving a black picture (#886).
     let mut notices = 0;

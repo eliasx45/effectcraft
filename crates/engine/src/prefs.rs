@@ -162,6 +162,11 @@ page!(CompositionPrefs {
 page!(Previews {
     /// Largest downsampling while playing back: `1/2`, `1/4`, `1/8`.
     adaptive_resolution_limit: String = "1/8".into(),
+    /// Spacebar playback at Auto resolution that can't keep real time renders Half, then Third,
+    /// then Quarter (no lower than the limit above), whatever the Fast Previews mode, and full
+    /// quality again once it stops or you scrub. Off: only Fast Previews ▸ Adaptive Resolution
+    /// does. Exports never change.
+    adaptive_playback: bool = true,
     show_internal_wireframes: bool = false,
     cache_frames_when_idle: bool = false,
     fast_previews: bool = false,
@@ -1275,6 +1280,10 @@ pub fn pages() -> Vec<Page> {
             id: "previews",
             title: "Previews",
             items: vec![
+                s("previews.adaptivePlayback", "Adaptive Resolution While Playing", B, true),
+                Note(
+                    "Playback that can't keep real time drops to Half, Third, then Quarter resolution, and renders full quality as soon as it stops or you scrub. Off: only Fast Previews ▸ Adaptive Resolution does. Exports are never affected.",
+                ),
                 s("previews.adaptiveResolutionLimit", "Adaptive Resolution Limit", Kind::Choice(ON_OFF_RES), true),
                 s("previews.showInternalWireframes", "Show Internal Wireframes", B, true),
                 s("previews.cacheFramesWhenIdle", "Cache Frames When Idle", B, true),
