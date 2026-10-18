@@ -1040,7 +1040,7 @@ pub(crate) fn param_id(effect_id: &str, ae_param_match: &str) -> Option<&'static
         ("ec.vr.glow", "Mettle SkyBox Glow-0007") => "tintColor",
         ("ec.vr.glow", "Mettle SkyBox Glow-0008") => "frameLayout",
         ("ec.stylize.deepglow", "PEDG-0001") => "PEDG-0001",
-        ("ec.stylize.deepglow", "PEDG-0002") => "PEDG-0002",
+        ("ec.stylize.deepglow", "PEDG-0002") => "exposure",
         ("ec.stylize.deepglow", "PEDG-0004") => "PEDG-0004",
         ("ec.stylize.deepglow", "PEDG-0005") => "PEDG-0005",
         ("ec.stylize.deepglow", "PEDG-0008") => "PEDG-0008",

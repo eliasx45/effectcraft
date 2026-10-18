@@ -529,14 +529,20 @@ impl Link {
         let Some((plan, sent)) = &mut self.plan else { return };
         let mut opts = plan.opts;
         opts.backend = Backend::Auto;
-        let msg = FrameMsg::Precache(Precache { revision, comp: plan.comp, series: plan.series.clone(), opts: Box::new(opts), ranges: plan.ranges.clone() });
+        let prints = plan.prints.as_deref().cloned();
+        let msg =
+            FrameMsg::Precache(Precache { revision, comp: plan.comp, series: plan.series.clone(), opts: Box::new(opts), ranges: plan.ranges.clone(), prints });
         *sent = self.client.send(Up::Msg { msg, want: Want::default(), urgent: false }, vec![]);
     }
 
     /// The server's frame cache report: remember its frames' keys (the cache bar).
     #[allow(clippy::too_many_arguments)]
     fn cached(&mut self, series: CacheSeries, ranges: &[(i64, i64)], done: u64, total: u64, frames: u64, ram: u64, budget: u64, disk: u64) {
-        let keys: HashSet<u128> = ranges.iter().flat_map(|&(a, b)| a..=b.min(a.saturating_add(200_000))).filter_map(|f| series.key(f)).collect();
+        // Frames named by their fingerprints: the plan the report is about has them.
+        let plan = self.plan.as_ref().map(|(p, _)| p).filter(|p| p.series == series);
+        let (prints, comp) = (plan.and_then(|p| p.prints.as_deref()), plan.map_or(effectcraft_engine::project::ItemId(0), |p| p.comp));
+        let keys: HashSet<u128> =
+            ranges.iter().flat_map(|&(a, b)| a..=b.min(a.saturating_add(200_000))).filter_map(|f| series.key_with(prints, comp, f)).collect();
         {
             let mut k = self.shared.server_keys.lock().unwrap_or_else(PoisonError::into_inner);
             k.series.retain(|(s, _)| *s != series);
@@ -1828,5 +1834,82 @@ mod tests {
         assert_eq!(u128::from_str_radix(&key, 16).ok(), plans[0].series.key(4));
         let st = cloud.status();
         assert!(st.bytes_down > 2304 && st.bytes_up > 0, "{st:?}");
+    }
+
+    /// Edit audit, 18 Oct: a stream that stops sending while playback waits (17 Oct: chunks in
+    /// flight forever at 14.5 s) gives up after a while, and the preview plays on here instead of
+    /// hanging; a comp settings change (frame rate) while it plays starts a new stream instead of
+    /// filing old-grid frames under the new frame numbers.
+    #[test]
+    fn a_stuck_stream_gives_up_and_a_frame_rate_change_starts_a_new_one() {
+        use crate::cloud_stream::{CloudPlayback, PlayNow};
+        use crate::frames::{FrameKey, Frames, opts_hash};
+        use effectcraft_engine::render::RenderOpts;
+        let server = FakeServer::start("secret");
+        let cloud = CloudFrames::connect(&server.addr, "secret", None);
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 4, "frameRate": 30})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        cloud.offer(s.revision, &s.project);
+        wait_until("the cloud to hold the project", || cloud.ready());
+        let mut frames = Frames::default();
+        frames.set_remote(Some(cloud.clone()));
+        let opts = RenderOpts::default();
+        let tick = |play: &mut CloudPlayback, frames: &Frames, s: &effectcraft_engine::Session, cur: i64, now: f64| {
+            let p = PlayNow {
+                playing: true,
+                now,
+                comp: cid,
+                rate: s.project.comp(cid).unwrap().frame_rate,
+                project: &s.project,
+                revision: s.revision,
+                series: FrameKey {
+                    revision: s.revision,
+                    content: frames.content_of(&s.project, s.revision, cid),
+                    comp: cid.0,
+                    frame: 0,
+                    scale: 1000,
+                    view: 0,
+                    opts: opts_hash(&opts),
+                },
+                opts,
+                cur,
+                start: 0,
+                end: 99,
+                looping: false,
+                waiting: true,
+                fit: 1000,
+                disk: None,
+            };
+            play.tick(Some(&cloud), &p, frames, None)
+        };
+
+        // Playback waits at frame 40; the (fake) server only ever sends frames 0–29.
+        let mut play = CloudPlayback::default();
+        let mut now = 0.0;
+        wait_until("the stream's chunks", || {
+            now += 0.02;
+            assert!(tick(&mut play, &frames, &s, 40, now).note.is_none());
+            play.stats().is_some_and(|st| st.chunks == 3)
+        });
+        assert!(tick(&mut play, &frames, &s, 40, now + 5.0).note.is_none(), "5 s without a chunk: still waiting for the stream");
+        tick(&mut play, &frames, &s, 40, now + 13.0);
+        let t = tick(&mut play, &frames, &s, 40, now + 13.1);
+        assert!(!t.streamed, "the preview plays on here");
+        assert!(t.note.as_deref().is_some_and(|n| n.contains("no frames from the cloud")), "{t:?}");
+        assert!(!play.active());
+
+        // A new preview: a frame rate change while it plays restarts the stream.
+        play.stop(&frames, None, s.revision);
+        let starts = server.starts.lock().unwrap().len();
+        now += 20.0;
+        assert!(tick(&mut play, &frames, &s, 0, now).streamed);
+        wait_until("the second stream", || server.starts.lock().unwrap().len() == starts + 1);
+        s.execute("comp.settings", serde_json::json!({"frameRate": 25})).unwrap();
+        wait_until("a new stream for the new frame grid", || {
+            now += 0.02;
+            tick(&mut play, &frames, &s, 0, now);
+            server.starts.lock().unwrap().len() == starts + 2
+        });
     }
 }

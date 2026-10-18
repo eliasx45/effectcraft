@@ -31,7 +31,7 @@ pub use accel::{Accelerator, Backend, FxStep, FxTarget};
 pub use adjustment::adjustment_crop;
 pub use auto::{AutoKey, AutoPick};
 pub use cache::{CacheStats, LayerCache, LayerStore, PrefetchStore};
-pub use clip::set_shape_clip;
+pub use clip::{set_precomp_clip, set_shape_clip};
 pub use effectcraft_raster::Image;
 pub use eval::{EvalCtx, ExprHost, effect_bounds, source_size};
 pub use footage::{

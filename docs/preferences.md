@@ -49,8 +49,15 @@ Commands (CLI, MCP, control channel):
 - `autoSave.folder`: Custom Location
 - `autoSave.saveOnRenderStart`: Save When Starting Render Queue
 - `composition.showRenderingProgress`: Show Rendering Progress in Info Panel and Flowchart
+- `previews.adaptivePlayback`: Adaptive Resolution While Playing (on): spacebar playback at Auto
+  resolution that can't keep real time renders Half, then Third, then Quarter, in any Fast Previews
+  mode, and full quality again as soon as it stops or you scrub; the viewer shows a "Draft · Half"
+  badge (`viewer.draftBadge`) while the frame on screen is below full quality. Off: only Fast
+  Previews ▸ Adaptive Resolution does. Also `view.adaptivePlayback {on?}` and the viewer's Fast
+  Previews menu. An explicit Resolution (the viewer's or the Preview panel's), a cloud preview
+  (its stream has its own levels) and exports never change.
 - `previews.adaptiveResolutionLimit`: Adaptive Resolution Limit (the lowest resolution Fast Previews ▸
-  Adaptive Resolution drops to while you drag; a playing preview keeps the viewer's resolution)
+  Adaptive Resolution drops to while you drag, and adaptive playback while it plays)
 - `previews.cacheFramesWhenIdle`: Cache Frames When Idle (Composition ▸ Preview): after a second
   without input or edits, the viewer renders the work area into the RAM preview in the
   background, from the current time on, until it is cached or the budget is full

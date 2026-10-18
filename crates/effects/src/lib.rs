@@ -53,7 +53,8 @@ use effectcraft_project::{GroupKind, ParamUi, PropGroup, Property};
 pub use effectcraft_raster::{AuxChannels, Image};
 pub use generate::four_color_softening;
 pub use misc::{
-    GLOW_KNEE, GLOW_OPERATIONS, GLOW_SIGMA_PER_RADIUS, INVERT_ALPHA, INVERT_CHANNELS, glow_ab_position, glow_ab_t, glow_bright, glow_composite, glow_operation,
+    GLOW_KNEE, GLOW_OPERATIONS, GLOW_SIGMA_PER_RADIUS, INVERT_ALPHA, INVERT_CHANNELS, exposure_gain, glow_ab_position, glow_ab_t, glow_bright, glow_composite,
+    glow_operation,
 };
 pub use sim::particle_state;
 pub use sim3::{PgBlit, PgPlan, playground_plan, playground_state};

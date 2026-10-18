@@ -106,6 +106,11 @@ pub struct Renderer<'a> {
     /// The size (comp pixels) of the comp whose frame a collapsed precomp's layers are drawn
     /// into; `None` draws into this renderer's own comp (see [`Renderer::raster_scale`]).
     pub(crate) out_comp: Option<(u32, u32)>,
+    /// A nested comp drawn only where its precomp layer can show (see [`crate::clip`]): the
+    /// window of its frame (output pixels at this renderer's scale) the canvas covers, as a
+    /// region of interest does at the top level. Collapsed precomps drawn into this canvas keep
+    /// it; renders one level deeper start whole.
+    pub(crate) window: Option<crate::placement::Window>,
     /// The Layer panel's zoom (layer pixels → screen pixels): Continuously Rasterize layers
     /// (vector footage, text, shapes) are drawn at it instead of at their size in the comp, so
     /// they stay sharp when the panel magnifies them. `None` everywhere else; nested renders
@@ -215,6 +220,7 @@ impl<'a> Renderer<'a> {
             through_lost: false,
             canvas_origin: [0; 2],
             out_comp: None,
+            window: None,
             layer_view: None,
         }
     }
@@ -269,6 +275,7 @@ impl<'a> Renderer<'a> {
             through_lost: false,
             canvas_origin: [0; 2],
             out_comp: None,
+            window: None,
             layer_view: None,
             ..*self
         }
