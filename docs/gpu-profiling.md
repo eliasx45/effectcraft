@@ -86,7 +86,10 @@ existing readback pool does not imply upload pooling.
 
 ### Adaptive playback availability (RT5)
 
-Auto resolution with Fast Previews set to Adaptive Resolution can reduce to Half
+Auto resolution with Settings ▸ Previews ▸ Adaptive Resolution While Playing (on by
+default) or Fast Previews set to Adaptive Resolution steps Full → Half → Third → Quarter
+(the ladder in `playback_budget.rs`; the paragraph below describes the original Half step;
+`examples/playbench.rs` measures playback fps and stalls headless) can reduce to Half
 of the normal Auto scale when native render-service p95 exceeds the displayed
 frame budget. Each scale discards eight cold renders, then needs eight real
 render completions with at least three quarters missing the budget by 10%.

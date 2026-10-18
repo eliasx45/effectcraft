@@ -28,6 +28,10 @@
 //! - `off-beat`: with audio, a key moment (a transform or opacity keyframe, or a layer's in
 //!   point after the comp start) within half a beat of a beat that misses it by more than one
 //!   frame. Beats come from [`detect_beats`] on the comp's audio mix. Warning.
+//! - `off-accent`: with a speech map (`speech.import`), a keyframed property's speed-graph peak
+//!   ([`speed_peaks`]) within a few frames (default 4) of a stressed syllable's accent
+//!   ([`accent_time`]: one frame before its vowel, never before its onset) that misses it by
+//!   more than one frame. Warning.
 
 use effectcraft_geom::vec2;
 use effectcraft_project::{AlphaMode, Comp, ItemId, ItemKind, Layer, LayerId, LayerSource, Project};
@@ -38,8 +42,8 @@ use effectcraft_time::Tick;
 use crate::layout;
 
 /// Every rule id, in report order.
-pub const RULES: [&str; 8] =
-    ["text-too-small", "low-contrast", "outside-title-safe", "outside-action-safe", "cut-off", "text-overlap", "hidden-visible", "off-beat"];
+pub const RULES: [&str; 9] =
+    ["text-too-small", "low-contrast", "outside-title-safe", "outside-action-safe", "cut-off", "text-overlap", "hidden-visible", "off-beat", "off-accent"];
 
 /// Most sample times one lint looks at; longer ranges are thinned evenly (`truncated`).
 pub const MAX_SAMPLES: usize = 120;
@@ -322,7 +326,7 @@ fn opaque_cover(ctx: &EvalCtx, l: &Layer) -> bool {
         && ctx.opacity(l) >= 1.0 - 1e-6
 }
 
-/// Every enabled rule (except `off-beat`, which looks at the whole span) at the context time.
+/// Every enabled rule (except `off-beat` and `off-accent`, which look at the whole span) at the context time.
 /// `backdrop` (the comp without text) is needed for `low-contrast`.
 pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Vec<Finding> {
     let comp = ctx.comp;
@@ -540,12 +544,17 @@ pub struct Problem {
 }
 
 /// Merge occurrences of the same (rule, layer, other) across sample times into one problem
-/// (`off-beat` findings stay one per key moment). The worst occurrence's severity and message
+/// (`off-beat` and `off-accent` findings stay one per key moment / peak). The worst occurrence's severity and message
 /// win. Sorted errors first, then by time, rule and layer.
 pub fn merge(occurrences: Vec<(Tick, Finding)>) -> Vec<Problem> {
     let mut out: Vec<Problem> = vec![];
     for (t, f) in occurrences {
-        let same = |p: &Problem| p.finding.rule == f.rule && p.finding.layer == f.layer && p.finding.other == f.other && (f.rule != "off-beat" || p.time == t);
+        let same = |p: &Problem| {
+            p.finding.rule == f.rule
+                && p.finding.layer == f.layer
+                && p.finding.other == f.other
+                && (!matches!(f.rule, "off-beat" | "off-accent") || p.time == t)
+        };
         match out.iter_mut().find(|p| same(p)) {
             Some(p) => {
                 p.time = p.time.min(t);
@@ -804,4 +813,177 @@ pub fn detect_beats(mono: &[f32], rate: u32) -> Vec<f64> {
     beats.reverse();
     let half = period / 2.0;
     beats.into_iter().filter(|&b| b as f64 >= first as f64 - half && b as f64 <= last as f64 + half).map(|b| b as f64 * hop_s).collect()
+}
+
+// ---------------------------------------------------------------- off-accent
+
+/// Samples per keyframe segment when looking for its speed peak (then refined).
+const PEAK_SAMPLES: usize = 48;
+/// A segment whose speed varies by less than this share of its top speed is flat (linear): no peak.
+const FLAT_SHARE: f64 = 0.05;
+/// Most speed peaks one lint collects.
+pub const MAX_PEAKS: usize = 20_000;
+/// Default: frames before the stressed vowel's onset where a peak lands on the accent (Elias's
+/// hand-timed peak on "CONtent" in 10-10 MAIN: the k burst + 2 frames = the vowel − 1 frame).
+pub const DEFAULT_ACCENT_LEAD: f64 = 1.0;
+/// Default: a peak this many frames or fewer from an accent (but more than one off) is a near miss.
+pub const DEFAULT_ACCENT_WINDOW: f64 = 4.0;
+
+/// A speed-graph peak: where a keyframed property moves fastest between two keyframes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeedPeak {
+    pub layer: LayerId,
+    /// The property's uid path inside the layer (`@3/@7`).
+    pub path: String,
+    /// The property's name ("Scale", "Position").
+    pub property: String,
+    /// Comp seconds.
+    pub time: f64,
+    /// Top speed (property units per second; the length of the velocity for several dimensions).
+    pub speed: f64,
+}
+
+/// Where a peak lands on a stressed syllable: `lead` frames before its vowel, never before its
+/// onset (comp seconds).
+pub fn accent_time(s: &effectcraft_project::speech::Syllable, fps: f64, lead: f64) -> f64 {
+    let (t, v) = (s.t.seconds(), s.vowel.seconds());
+    if fps.is_finite() && fps > 0.0 { (v - lead / fps).max(t) } else { t }
+}
+
+/// Speed-graph peaks of every keyframed property of `comp`'s layers in `start..=end` (comp
+/// seconds): for each pair of neighbouring keyframes with different values and no hold between
+/// them, the time of the highest speed (keyframes only; expressions are not evaluated), when it
+/// falls inside the layer's in/out. Linear segments (constant speed) have no peak. Sorted by time.
+pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
+    let mut out: Vec<SpeedPeak> = vec![];
+    for l in &comp.layers {
+        l.props.walk("", &mut |path, p| {
+            if p.keys.len() < 2 || out.len() >= MAX_PEAKS {
+                return;
+            }
+            let speed = |lt: f64| {
+                let v = effectcraft_keyframe::speed(&p.keys, Tick::from_seconds_f64(lt), p.spatial);
+                if v.is_finite() { v } else { 0.0 }
+            };
+            for pair in p.keys.windows(2) {
+                let [a, b] = pair else { continue };
+                if a.out_interp == effectcraft_keyframe::Interp::Hold || a.value == b.value || b.time <= a.time {
+                    continue;
+                }
+                let (a_t, b_t) = (l.comp_time(a.time).seconds(), l.comp_time(b.time).seconds());
+                if a_t.max(b_t) < start - 1e-9 || a_t.min(b_t) > end + 1e-9 {
+                    continue;
+                }
+                let (t0, t1) = (a.time.seconds(), b.time.seconds());
+                let dt = (t1 - t0) / PEAK_SAMPLES as f64;
+                let at = |i: f64| t0 + (i + 0.5) * dt;
+                let samples: Vec<f64> = (0..PEAK_SAMPLES).map(|i| speed(at(i as f64))).collect();
+                let (mut best, mut top, mut low) = (0usize, f64::MIN, f64::MAX);
+                for (i, v) in samples.iter().enumerate() {
+                    if *v > top {
+                        (best, top) = (i, *v);
+                    }
+                    low = low.min(*v);
+                }
+                if top <= 1e-9 || top - low < FLAT_SHARE * top {
+                    continue;
+                }
+                // Golden-section refine around the best sample (the speed is unimodal there).
+                let (mut lo, mut hi) = (at(best as f64 - 1.0).max(t0), at(best as f64 + 1.0).min(t1));
+                for _ in 0..24 {
+                    let m1 = hi - (hi - lo) * 0.618_034;
+                    let m2 = lo + (hi - lo) * 0.618_034;
+                    if speed(m1) < speed(m2) { lo = m1 } else { hi = m2 }
+                }
+                let lt = (lo + hi) / 2.0;
+                let time = l.comp_time(Tick::from_seconds_f64(lt)).seconds();
+                // Outside the layer's in/out nothing shows, so the peak can't be seen.
+                let shown = time >= l.in_point.seconds() - 1e-9 && time <= l.out_point.seconds() + 1e-9;
+                if !shown || time < start - 1e-9 || time > end + 1e-9 {
+                    continue;
+                }
+                if out.iter().any(|q| q.layer == l.id && q.path == path && (q.time - time).abs() < 1e-6) {
+                    continue;
+                }
+                out.push(SpeedPeak { layer: l.id, path: path.to_string(), property: p.name.clone(), time, speed: speed(lt).max(top) });
+            }
+        });
+    }
+    out.sort_by(|a, b| a.time.total_cmp(&b.time));
+    out
+}
+
+/// A peak matched to the nearest accent (a stressed syllable's [`accent_time`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccentMatch<'a> {
+    pub peak: SpeedPeak,
+    pub word: &'a effectcraft_project::speech::SpeechWord,
+    pub syllable: effectcraft_project::speech::Syllable,
+    /// The accent time (comp seconds).
+    pub target: f64,
+    /// Peak − target, in frames (negative: the peak is early).
+    pub offset_frames: f64,
+}
+
+/// Each peak with its nearest accent in `map` (`None` without stressed syllables).
+pub fn match_accents<'a>(peaks: Vec<SpeedPeak>, map: &'a effectcraft_project::speech::SpeechMap, fps: f64, lead: f64) -> Vec<AccentMatch<'a>> {
+    let stressed = map.stressed();
+    let targets: Vec<f64> = stressed.iter().map(|(_, s)| accent_time(s, fps, lead)).collect();
+    let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
+    peaks
+        .into_iter()
+        .filter_map(|peak| {
+            let i = targets.partition_point(|t| *t < peak.time);
+            let near = [i.checked_sub(1), Some(i)]
+                .into_iter()
+                .flatten()
+                .filter_map(|j| Some((j, *targets.get(j)?)))
+                .min_by(|a, b| (a.1 - peak.time).abs().total_cmp(&(b.1 - peak.time).abs()))?;
+            let (word, syllable) = *stressed.get(near.0)?;
+            Some(AccentMatch { offset_frames: (peak.time - near.1) * fps, target: near.1, word, syllable: *syllable, peak })
+        })
+        .collect()
+}
+
+/// `off-accent` findings with their times: speed-graph peaks within `window` frames of an accent
+/// (a stressed syllable's onset, `lead` frames before its vowel) that miss it by more than one
+/// frame.
+pub fn off_accent(comp: &Comp, map: &effectcraft_project::speech::SpeechMap, start: f64, end: f64, fps: f64, lead: f64, window: f64) -> Vec<(Tick, Finding)> {
+    let mut out = vec![];
+    if fps.is_nan() || fps <= 0.0 {
+        return out;
+    }
+    for m in match_accents(speed_peaks(comp, start, end), map, fps, lead) {
+        let d = m.offset_frames;
+        if d.abs() <= 1.0 + 1e-6 || d.abs() > window + 1e-6 {
+            continue;
+        }
+        let Some(l) = comp.layer(m.peak.layer) else { continue };
+        let frames = if (d.abs() - d.abs().round()).abs() < 0.05 { format!("{:.0}", d.abs().round()) } else { format!("{:.1}", d.abs()) };
+        out.push((
+            Tick::from_seconds_f64(m.peak.time),
+            Finding {
+                rule: "off-accent",
+                severity: Severity::Warning,
+                layer: l.id,
+                other: None,
+                message: format!(
+                    "{}'s {} speed peak at {:.3} s (frame {:.1}) is {frames} frames {} the stressed syllable of \"{}\" (onset {:.3} s, vowel {:.3} s; accent at {:.3} s, frame {:.0}): move the peak by {:+.0} frames, to {:.3} s, to land on the accent.",
+                    name(l),
+                    m.peak.property,
+                    m.peak.time,
+                    m.peak.time * fps,
+                    if d > 0.0 { "after" } else { "before" },
+                    m.word.word,
+                    m.syllable.t.seconds(),
+                    m.syllable.vowel.seconds(),
+                    m.target,
+                    (m.target * fps).round(),
+                    -d.round(),
+                    m.target
+                ),
+            },
+        ));
+    }
+    out
 }

@@ -667,11 +667,12 @@ fn styles_on_a_cropped_text_canvas_match_the_whole_canvas() {
         l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "$165".into(), size: 40.0, ..Default::default() }));
         l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.7, 90.3, 0.0]);
         l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([103.0, 103.0, 100.0]);
-        // Any effect gives the text a comp-sized effect canvas.
+        // A Transform effect that moves the text gives it a comp-sized effect canvas.
         let spec = effectcraft_effects::find("ec.distort.transform").unwrap();
         let mut next = p.next_id;
-        let g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
         p.next_id = next;
+        g.prop_mut("position").unwrap().value = Value::Vec2([210.0, 105.0]);
         l.props.sub_mut("effects").unwrap().children.push(g.into());
         f(&mut p, &comp, &mut l);
         let bg = solid(&mut p, &comp, [0.3, 0.4, 0.5], 400, 200);
@@ -691,6 +692,61 @@ fn styles_on_a_cropped_text_canvas_match_the_whole_canvas() {
             let diff = whole.data.iter().zip(&cropped.data).filter(|(a, b)| a != b).count();
             assert_eq!(diff, 0, "{name} at {scale}: {diff} pixels differ");
             assert!(whole.data.iter().any(|px| px[0] > 0.31 || px[0] < 0.29), "{name}: the text is drawn");
+        }
+    }
+}
+
+/// A Transform effect that only fades (Anchor Point = Position, Scale 100 %, no Rotation or
+/// Skew) leaves a text layer on its tight glyph buffer instead of the comp-sized effect canvas,
+/// with the frame the canvas gives; one that moves pixels keeps the canvas.
+#[test]
+fn a_fading_transform_effect_keeps_text_on_its_glyph_buffer() {
+    use crate::fx::ALWAYS_TEXT_CANVAS;
+    use crate::{EvalCtx, NoFootage, RenderOpts, Renderer};
+    use effectcraft_keyframe::TextDoc;
+    use std::sync::atomic::Ordering;
+    for (rotation, styled) in [(0.0, false), (0.0, true), (12.0, false)] {
+        let mut p = Project::default();
+        let comp = Comp::new(400, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (400, 200), None);
+        l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "$165".into(), size: 40.0, ..Default::default() }));
+        l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.7, 90.3, 0.0]);
+        l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([103.0, 103.0, 100.0]);
+        let spec = effectcraft_effects::find("ec.distort.transform").unwrap();
+        let mut next = p.next_id;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
+        p.next_id = next;
+        g.prop_mut("opacity").unwrap().value = Value::Scalar(60.0);
+        g.prop_mut("rotation").unwrap().value = Value::Scalar(rotation);
+        l.props.sub_mut("effects").unwrap().children.push(g.into());
+        if styled {
+            add(&mut p, &comp, &mut l, "outerGlow");
+            add(&mut p, &comp, &mut l, "gradientOverlay");
+        }
+        let bg = solid(&mut p, &comp, [0.3, 0.4, 0.5], 400, 200);
+        p.comp_mut(cid).unwrap().layers = vec![l, bg].into();
+        let c = p.comp(cid).unwrap();
+        let layer = c.layers.iter().next().unwrap();
+        let width = |scale: f64| {
+            let r = Renderer::new(&p, &NoFootage, RenderOpts { scale, ..Default::default() });
+            r.content_buf(&EvalCtx::new(&p, cid, c, Tick::ZERO), layer).unwrap().img.width
+        };
+        for scale in [1.0, 0.5] {
+            ALWAYS_TEXT_CANVAS.store(true, Ordering::Relaxed);
+            let canvas = render_frame(&p, cid, Tick::ZERO, scale);
+            let wide = width(scale);
+            ALWAYS_TEXT_CANVAS.store(false, Ordering::Relaxed);
+            let tight = render_frame(&p, cid, Tick::ZERO, scale);
+            let narrow = width(scale);
+            let comp_w = (400.0 * scale) as u32;
+            if rotation == 0.0 {
+                assert!(narrow < comp_w / 2 && wide >= comp_w, "fade only, styled {styled}, at {scale}: {narrow} vs {wide} px wide");
+            } else {
+                assert_eq!(narrow, wide, "a rotating Transform keeps the canvas");
+            }
+            let worst = canvas.data.iter().zip(&tight.data).flat_map(|(a, b)| (0..4).map(move |i| (a[i] - b[i]).abs())).fold(0.0f32, f32::max);
+            assert!(worst <= 1.0 / 255.0, "rotation {rotation}, styled {styled}, at {scale}: differs by {worst}");
         }
     }
 }

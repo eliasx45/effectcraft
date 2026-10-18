@@ -237,6 +237,10 @@ impl<'a> Renderer<'a> {
         let strict = !free || info.spread;
         let mut h = hasher(0x9ae1_6a3b_2f90_404f);
         info.settings.hash(&mut h);
+        // Only the layers the frame uses count by their content (see [`needed_layers`]); the
+        // others by their place, so an edit to a layer that isn't on screen keeps the key.
+        let needed = if strict { None } else { Some(needed_layers(&ctx, &info, t)) };
+        let used = |i: usize| needed.as_ref().is_none_or(|n| n.get(i).copied().unwrap_or(true));
         // Layers read at other times than the frame's: their expressions must read nothing else.
         let mut timed = false;
         for (i, ((l, li), mode)) in nc.layers.iter().zip(&info.layers).zip(&modes).enumerate() {
@@ -249,6 +253,12 @@ impl<'a> Renderer<'a> {
             };
             if li.expressions && !contained {
                 return None;
+            }
+            if !used(i) {
+                // Unused: its id and switches (solo hides the comp's other layers at every time).
+                (0xdead_u16, l.id).hash(&mut h);
+                hash_debug(&mut h, &l.switches);
+                continue;
             }
             timed |= *mode != Mode::Free;
             hash_debug(&mut h, mode);
@@ -274,11 +284,11 @@ impl<'a> Renderer<'a> {
         for l in nc.layers.iter() {
             l.is_active_at(t).hash(&mut h);
         }
-        for &i in &info.animated {
+        for &i in info.animated.iter().filter(|i| used(**i)) {
             let l = nc.layers.get(i)?;
             hash_values(&mut h, &ctx, l, &l.props);
         }
-        for &i in &info.sources {
+        for &i in info.sources.iter().filter(|i| used(**i)) {
             let l = nc.layers.get(i)?;
             match &l.source {
                 LayerSource::Footage { item } | LayerSource::Model { item } => {
@@ -302,6 +312,62 @@ impl<'a> Renderer<'a> {
             }
         }
         Some(h.finish())
+    }
+}
+
+/// The layers of `ctx`'s comp a frame at `t` can draw or read: the layers active at `t`, the
+/// cameras and lights, and what those use, followed transitively: parents (a parent moves its
+/// children outside its own span), track mattes and the layers effects read (layer parameters).
+/// The renderer draws only layers active at the frame's time, so the others can't change it.
+fn needed_layers(ctx: &EvalCtx, info: &CompInfo, t: Tick) -> Vec<bool> {
+    let nc = ctx.comp;
+    let n = nc.layers.len();
+    let mut needed = vec![false; n];
+    let mut todo: Vec<usize> = Vec::new();
+    for (i, l) in nc.layers.iter().enumerate() {
+        if l.is_active_at(t) || matches!(l.source, LayerSource::Camera | LayerSource::Light { .. }) || l.environment {
+            todo.push(i);
+        }
+    }
+    let mut refs: Vec<LayerId> = Vec::new();
+    while let Some(i) = todo.pop() {
+        let Some(slot) = needed.get_mut(i) else { continue };
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        let Some(l) = nc.layers.get(i) else { continue };
+        refs.clear();
+        refs.extend(l.parent);
+        refs.extend(l.track_matte.as_ref().map(|m| m.layer));
+        layer_params(ctx, l, &l.props, 0, &mut refs);
+        for r in &refs {
+            match info.index.get(r) {
+                Some(j) => todo.push(*j),
+                // A reference this comp can't resolve: count every layer.
+                None => return vec![true; n],
+            }
+        }
+    }
+    needed
+}
+
+/// The layers `layer`'s layer parameters in `g` point at, at the context time.
+fn layer_params(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, depth: usize, out: &mut Vec<LayerId>) {
+    use effectcraft_project::Node;
+    if depth > 32 {
+        return;
+    }
+    for node in &g.children {
+        match node {
+            Node::Prop(p) if matches!(p.value, effectcraft_keyframe::Value::Layer(_)) => {
+                if let Some(id) = ctx.value(layer, p).as_layer() {
+                    out.push(LayerId(id));
+                }
+            }
+            Node::Group(sub) => layer_params(ctx, layer, sub, depth + 1, out),
+            Node::Prop(_) => {}
+        }
     }
 }
 
