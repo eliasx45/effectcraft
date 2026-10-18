@@ -267,7 +267,8 @@ fn default_frames_mb() -> u64 {
     let total = read("/proc/meminfo")
         .and_then(|m| m.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()))
         .map(|kb| kb.saturating_mul(1024));
-    let allot = std::env::var("EFFECTCRAFT_RAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|g| g.is_finite() && *g > 0.0).map(|g| (g * 1e9) as u64);
+    let allot =
+        std::env::var("EFFECTCRAFT_RAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|g| g.is_finite() && *g > 0.0).map(|g| (g * 1e9) as u64);
     let Some(ram) = limit.into_iter().chain(total).chain(allot).min() else { return 4096 };
     let mb = (ram / 100).saturating_mul(85) >> 20;
     mb.saturating_sub(8192).saturating_sub(cache_budget() as u64 >> 20).max(1024)

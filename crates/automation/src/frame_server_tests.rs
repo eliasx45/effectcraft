@@ -377,7 +377,7 @@ fn precache_fills_the_frame_cache_and_cached_frames_skip_the_render() {
     assert!(c.send(Up::Msg { msg, want: Want::default(), urgent: false }, vec![]));
     let opts = RenderOpts { scale: 0.1, ..Default::default() };
     let series = CacheSeries::new(0x1234_5678_9abc_def0_1234_5678_9abc_def0, 100, 42);
-    let plan = Precache { revision: s.revision, comp, series: series.clone(), opts: Box::new(opts), ranges: vec![(4, 7), (0, 1)] };
+    let plan = Precache { revision: s.revision, comp, series: series.clone(), opts: Box::new(opts), ranges: vec![(4, 7), (0, 1)], prints: None };
     assert!(c.send(Up::Msg { msg: FrameMsg::Precache(plan), want: Want::default(), urgent: false }, vec![]));
     // The first report (nothing cached yet), then the last once all six frames are in.
     let mut last = None;

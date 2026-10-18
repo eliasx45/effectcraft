@@ -212,6 +212,8 @@ const VALUED: &[&str] = &[
     "--save-as",
     "--filter",
     "--time",
+    "--times",
+    "--disk-cache",
     "--frame",
     "--comp",
     "--max-side",
@@ -1302,6 +1304,9 @@ fn bench_cmd(args: &Args) -> Result<(), Failure> {
         #[cfg(not(feature = "profile"))]
         return Err(Failure::Error("--rt-profile requires a CLI built with --features profile".into()));
     }
+    if let Some(dir) = args.opt("--disk-cache") {
+        return bench_disk(&s, args, dir);
+    }
     if args.flag("--gpu") {
         return bench_gpu(&s, args);
     }
@@ -1623,6 +1628,71 @@ fn adv3d_bench_comp(p: &mut effectcraft_engine::project::Project) -> Option<Item
 /// unchanged layers: compositing cost); "viewer" is the GPU display path without readback;
 /// "auto" is Backend::Auto (Mercury GPU Acceleration) choosing per comp from measured times,
 /// warm; "up/dn MB" are the GPU's uploads / readbacks per warm GPU frame.
+/// `bench --disk-cache DIR [--gpu] [--times 30,54,…]`: the active comp's frames at each time
+/// with a layer cache kept on disk in DIR, as the app's: the first visit (from what DIR holds:
+/// nothing the first run, the layer results of the run before after a restart), then warm
+/// (median of `--n`); a checksum of the first visit's pixels and whether they equal a render
+/// without any cache. Run it twice for cold vs after a restart.
+fn bench_disk(s: &Session, args: &Args, dir: &str) -> Result<(), Failure> {
+    use effectcraft_render::Backend;
+    use effectcraft_render::disk_cache::{self, DiskCache};
+    let gpu = if args.flag("--gpu") {
+        Some(effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?)
+    } else {
+        None
+    };
+    let cid = s.active_comp_id().ok_or_else(|| Failure::Error("no composition".into()))?;
+    let n = args.num("--n")?.unwrap_or(5.0).max(1.0) as usize;
+    let scale = args.num("--scale")?.unwrap_or(1.0);
+    let times: Vec<f64> = match args.opt("--times") {
+        Some(v) => {
+            v.split(',').map(|t| t.trim().parse::<f64>().map_err(|_| Failure::Error(format!("--times: not a number: {t}")))).collect::<Result<_, _>>()?
+        }
+        None => vec![args.num("--time")?.unwrap_or(3.0)],
+    };
+    let mut project = (*s.project).clone();
+    project.settings.gpu_acceleration = gpu.is_some();
+    let project = &project;
+    let dc = DiskCache::open(dir, 20 << 30).map_err(|e| Failure::Error(format!("--disk-cache: {e}")))?;
+    let cache = LayerCache::default();
+    cache.set_disk(Some((dc.clone(), disk_cache::footage_salt(project))));
+    let backend = if gpu.is_some() { Backend::Gpu } else { Backend::Cpu };
+    let render = |t: Tick, cache: Option<&LayerCache>| {
+        let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend, ..Default::default() });
+        r.expr = s.expr.as_deref();
+        r.cache = cache;
+        r.accel = gpu.as_ref().map(|g| g as &dyn effectcraft_render::Accelerator);
+        r.comp_frame(cid, t)
+    };
+    let checksum = |img: &effectcraft_render::Image| {
+        let mut h = disk_cache::Hash128::default();
+        for p in &img.data {
+            for c in p {
+                h.write_u64(u64::from(c.to_bits()));
+            }
+        }
+        h.finish() as u64
+    };
+    note!("bench --disk-cache {dir} ({}), scale {scale}: first visit, warm (median of {n}) ms/frame", if gpu.is_some() { "GPU" } else { "CPU" });
+    for secs in times {
+        let t = Tick::from_seconds_f64(secs);
+        let t0 = std::time::Instant::now();
+        let first = render(t, Some(&cache));
+        let first_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let warm = time_ms(n, || {
+            std::hint::black_box(render(t, Some(&cache)));
+        });
+        let exact = render(t, None);
+        let same = first.width == exact.width && first.height == exact.height && first.data == exact.data;
+        note!("  {secs:>7.2} s  first {first_ms:9.1}  warm {warm:8.1}  pixels {:016x} {}", checksum(&first), if same { "= uncached" } else { "≠ UNCACHED" });
+    }
+    if let Some(g) = &gpu {
+        g.wait();
+    }
+    dc.flush();
+    Ok(())
+}
+
 fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     use effectcraft_render::Backend;
     let gpu = effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?;

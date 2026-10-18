@@ -529,14 +529,20 @@ impl Link {
         let Some((plan, sent)) = &mut self.plan else { return };
         let mut opts = plan.opts;
         opts.backend = Backend::Auto;
-        let msg = FrameMsg::Precache(Precache { revision, comp: plan.comp, series: plan.series.clone(), opts: Box::new(opts), ranges: plan.ranges.clone() });
+        let prints = plan.prints.as_deref().cloned();
+        let msg =
+            FrameMsg::Precache(Precache { revision, comp: plan.comp, series: plan.series.clone(), opts: Box::new(opts), ranges: plan.ranges.clone(), prints });
         *sent = self.client.send(Up::Msg { msg, want: Want::default(), urgent: false }, vec![]);
     }
 
     /// The server's frame cache report: remember its frames' keys (the cache bar).
     #[allow(clippy::too_many_arguments)]
     fn cached(&mut self, series: CacheSeries, ranges: &[(i64, i64)], done: u64, total: u64, frames: u64, ram: u64, budget: u64, disk: u64) {
-        let keys: HashSet<u128> = ranges.iter().flat_map(|&(a, b)| a..=b.min(a.saturating_add(200_000))).filter_map(|f| series.key(f)).collect();
+        // Frames named by their fingerprints: the plan the report is about has them.
+        let plan = self.plan.as_ref().map(|(p, _)| p).filter(|p| p.series == series);
+        let (prints, comp) = (plan.and_then(|p| p.prints.as_deref()), plan.map_or(effectcraft_engine::project::ItemId(0), |p| p.comp));
+        let keys: HashSet<u128> =
+            ranges.iter().flat_map(|&(a, b)| a..=b.min(a.saturating_add(200_000))).filter_map(|f| series.key_with(prints, comp, f)).collect();
         {
             let mut k = self.shared.server_keys.lock().unwrap_or_else(PoisonError::into_inner);
             k.series.retain(|(s, _)| *s != series);

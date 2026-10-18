@@ -455,7 +455,7 @@ impl Sched {
             let mut looked = 0;
             while let Some(&frame) = plan.frames.get(plan.next) {
                 plan.next += 1;
-                let Some(key) = plan.precache.series.key(frame) else { continue };
+                let Some(key) = plan.precache.key(frame) else { continue };
                 if frames.contains(key) {
                     looked += 1;
                     if looked > 256 {
@@ -600,7 +600,7 @@ fn precache(p: &PrecacheJob, shared: &Shared) {
 /// Tell the app which of a plan's frames the cache holds.
 fn report(plan: &Plan, frames: &FrameCache) {
     let pc = &plan.precache;
-    let mut cached: Vec<i64> = plan.frames.iter().copied().filter(|f| pc.series.key(*f).is_some_and(|k| frames.contains(k))).collect();
+    let mut cached: Vec<i64> = plan.frames.iter().copied().filter(|f| pc.key(*f).is_some_and(|k| frames.contains(k))).collect();
     cached.sort_unstable();
     cached.dedup();
     let st = frames.stats();
