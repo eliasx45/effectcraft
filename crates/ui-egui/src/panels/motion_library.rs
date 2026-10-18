@@ -2315,7 +2315,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     // Clicking the open folder again folds it.
                     toggle = Some(path.to_string());
                 } else {
+                    // Opening a folder ends a search (as Finder): a forgotten query hid every card.
                     view.folder = path.to_string();
+                    view.query.clear();
                     view.scroll = 0.0;
                     if has_children {
                         view.expanded.insert(path.to_string());
@@ -2485,11 +2487,28 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         } else {
             "No matching motion"
         };
-        gp.text(grid.center() - vec2(0.0, 14.0 * s), Align2::CENTER_CENTER, tr(msg), Tokens::ui(12.0 * s), t.text_faint);
-        // Searching inside a folder: search every collection instead.
-        if !view.query.trim().is_empty() && !view.folder.is_empty() {
-            let b = Rect::from_center_size(grid.center() + vec2(0.0, 16.0 * s), vec2(170.0 * s, 24.0 * s));
-            if kit::button(app, ui, b, "motionLibrary.searchAll", "Search all collections", true) {
+        let query = view.query.trim().to_string();
+        let msg = if query.is_empty() || msg.is_empty() || !view.group.is_empty() && tree.is_empty() {
+            tr(msg).to_string()
+        } else {
+            format!("{} \u{201c}{}\u{201d}", tr("No motion matches"), elide(&gp, &query, &Tokens::ui(12.0 * s), (grid.width() - 140.0 * s).max(40.0)))
+        };
+        gp.text(grid.center() - vec2(0.0, 14.0 * s), Align2::CENTER_CENTER, msg, Tokens::ui(12.0 * s), t.text_faint);
+        if !query.is_empty() {
+            // Clear the search; searching inside a folder can also search every collection.
+            let in_folder = !view.folder.is_empty();
+            let w = 120.0 * s;
+            let all_w = if in_folder { 170.0 * s } else { 0.0 };
+            let gap = if in_folder { 8.0 * s } else { 0.0 };
+            let x0 = grid.center().x - (w + gap + all_w) / 2.0;
+            let y = grid.center().y + 16.0 * s;
+            let clear = Rect::from_center_size(pos2(x0 + w / 2.0, y), vec2(w, 24.0 * s));
+            if kit::button(app, ui, clear, "motionLibrary.clearSearch", "Clear search", true) {
+                view.query.clear();
+                view.scroll = 0.0;
+            }
+            let b = Rect::from_center_size(pos2(x0 + w + gap + all_w / 2.0, y), vec2(all_w, 24.0 * s));
+            if in_folder && kit::button(app, ui, b, "motionLibrary.searchAll", "Search all collections", true) {
                 view.folder.clear();
                 view.scroll = 0.0;
             }
