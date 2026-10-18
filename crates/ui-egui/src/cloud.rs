@@ -1831,7 +1831,8 @@ mod tests {
         frames.request_urgent(&src, FrameKey { frame: 4, ..base }, cid, Tick(0), opts);
         wait_until("the viewer frame", || frames.is_cached(&FrameKey { frame: 4, ..base }));
         let key = server.render_keys.lock().unwrap().first().cloned().flatten().expect("a key");
-        assert_eq!(u128::from_str_radix(&key, 16).ok(), plans[0].series.key(4));
+        // (PC3: frames are named by their fingerprints, as the plan names them.)
+        assert_eq!(u128::from_str_radix(&key, 16).ok(), plans[0].key(4));
         let st = cloud.status();
         assert!(st.bytes_down > 2304 && st.bytes_up > 0, "{st:?}");
     }
@@ -1892,6 +1893,8 @@ mod tests {
             assert!(tick(&mut play, &frames, &s, 40, now).note.is_none());
             play.stats().is_some_and(|st| st.chunks == 3)
         });
+        // (One more tick sees the last chunk: the 12 s count from here.)
+        tick(&mut play, &frames, &s, 40, now);
         assert!(tick(&mut play, &frames, &s, 40, now + 5.0).note.is_none(), "5 s without a chunk: still waiting for the stream");
         tick(&mut play, &frames, &s, 40, now + 13.0);
         let t = tick(&mut play, &frames, &s, 40, now + 13.1);
