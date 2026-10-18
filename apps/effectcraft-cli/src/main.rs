@@ -330,7 +330,11 @@ impl Args {
                     Some((k, v)) => (k.to_string(), Some(v.to_string())),
                     None => (a, None),
                 };
-                if VALUED.contains(&k.as_str()) {
+                // An option that is a flag in one command and takes a value in another (`bench
+                // --gpu --layers` vs `bench --ops --layers N`) is the flag when no value follows:
+                // `--layers --time 40` must not take `--time` as the value and drop the 40.
+                let bare_flag = FLAGS.contains(&k.as_str()) && inline.is_none() && it.peek().is_none_or(|n| n.starts_with("--"));
+                if VALUED.contains(&k.as_str()) && !bare_flag {
                     // `--bridge` / `--control` without a port: the app's default control port.
                     let port_default = matches!(k.as_str(), "--bridge" | "--control") && inline.is_none() && it.peek().is_none_or(|n| n.starts_with("--"));
                     let v = if port_default { Some(default_control_port()) } else { inline.or_else(|| it.next()) };
@@ -1682,7 +1686,10 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 std::hint::black_box(mk(Backend::Cpu, Some(&cache)));
             });
             let gcache = LayerCache::default();
-            // Traffic in steady state: after the frame that fills the layer cache.
+            // Traffic in steady state: after the frame that fills the layer cache and the one
+            // that keeps repeated content resident (`time_ms` renders once more untimed, inside
+            // the counted window, so steady state is reached before it).
+            std::hint::black_box(mk(Backend::Gpu, Some(&gcache)));
             std::hint::black_box(mk(Backend::Gpu, Some(&gcache)));
             let t0 = gpu.context().transfer_stats();
             let gpu_warm = time_ms(n, || {
@@ -1830,6 +1837,20 @@ mod tests {
         let a = parse(&["render", "t.ecproj", "--comp=Main", "--work-area", "--out", "x.mp4", "--json"]).unwrap();
         assert_eq!((a.project.as_deref(), a.opt("--comp"), a.opt("--out")), (Some("t.ecproj"), Some("Main"), Some("x.mp4")));
         assert!(a.flag("--work-area") && a.flag("--json"));
+    }
+
+    /// `--layers` is a flag for `bench --gpu` and takes a number for `bench --ops`: followed by
+    /// another option it is the flag, so `--time 40` keeps its 40 (it used to become the value
+    /// of `--layers`, and the bench silently ran at its default time).
+    #[test]
+    fn a_flag_that_can_take_a_value_does_not_swallow_the_next_option() {
+        let a = parse(&["bench", "p.ecproj", "--gpu", "--layers", "--time", "40"]).unwrap();
+        assert!(a.flag("--layers"));
+        assert_eq!(a.num("--time").unwrap(), Some(40.0));
+        let a = parse(&["bench", "--ops", "--layers", "500"]).unwrap();
+        assert_eq!(a.num("--layers").unwrap(), Some(500.0));
+        let a = parse(&["bench", "p.ecproj", "--time", "3", "--layers"]).unwrap();
+        assert!(a.flag("--layers"));
     }
 
     /// `--bridge` without a port uses the app's control port (`EFFECTCRAFT_CONTROL_PORT`, else 9877).
