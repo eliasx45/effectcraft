@@ -314,6 +314,12 @@ impl<'a> Renderer<'a> {
         Some(buf)
     }
 
+    /// A styled layer's pixels before its styles (working space, layer cache), for an
+    /// accelerator that renders the styles itself ([`crate::styles::gpu_prepare`]).
+    pub fn styled_content(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        self.content_buf_timed(ctx, layer, None, None).map(|(b, _)| b)
+    }
+
     /// The layer with its styles: exterior passes and body (cached per pass).
     pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         self.styled_keyed(ctx, layer, timing, None)

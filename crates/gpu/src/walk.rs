@@ -313,6 +313,9 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if let Some(done) = draw_resident_fx(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
+    if let Some(done) = draw_styled_gpu(e, r, ctx, layer, canvas, opacity) {
+        return done;
+    }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
         return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
@@ -343,6 +346,91 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
         reach = ops::union(reach, place_in(e, r, ctx, layer, b, &mut tmp, *m, 1.0, None)?);
     }
     reach = ops::union(reach, place_in(e, r, ctx, layer, &st.body, &mut tmp, layer.blend_mode, 1.0, None)?);
+    let tmp = tmp.float(e)?;
+    let mut out = take_float(e, canvas)?;
+    ops::channel_mix_in(e, &mut out, &tmp, bl.channels, opacity, Some(reach));
+    *canvas = out.into();
+    Some(())
+}
+
+/// Styled layers [`draw_styled_gpu`] rendered (the tests check the GPU path ran).
+#[cfg(test)]
+pub(crate) static STYLED_ON_GPU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A layer with Layer Styles the GPU renders (`fx_styles`): its content (from the layer cache)
+/// cropped to its visible part, uploaded once, styled by kernels and placed like the CPU path's
+/// passes and body (knockout, track matte / Preserve Transparency, channel switches). The CPU
+/// path instead styles the layer on the CPU, on a comp-sized canvas for a shape or text layer
+/// with effects, and uploads every pass. `None`: no styles, or styles the GPU doesn't render
+/// (a distance field: spread, choke, Precise glows, Stroke, Bevel and Emboss); `Some(None)`: the
+/// GPU failed.
+fn draw_styled_gpu(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32) -> Option<Option<()>> {
+    if !styles::active(ctx, layer) {
+        return None;
+    }
+    let content = r.styled_content(ctx, layer)?;
+    let size = effectcraft_render::source_size(r.project, layer);
+    let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
+    let (buf, plan) = styles::gpu_prepare(ctx, layer, &content, layer_size)?;
+    let failed = |e: &mut Enc| if e.g.check_health().is_ok() { None } else { Some(None) };
+    let buf = Arc::new(buf);
+    let Some(src) = e.upload_buf(&buf) else { return failed(e) };
+    let Some(st) = crate::fx_styles::render(e, &src, &plan) else { return failed(e) };
+    #[cfg(test)]
+    STYLED_ON_GPU.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (mut passes, mut body, mut content) = (st.passes, st.body, src);
+    if let Some(c) = r.pipe().to_blend() {
+        for (p, _) in passes.iter_mut() {
+            *p = ops::convert(e, p, &c);
+        }
+        body = ops::convert(e, &body, &c);
+        // Only Knockout reads the content.
+        if styles::blending(ctx, layer).knockout > 0 {
+            content = ops::convert(e, &content, &c);
+        }
+    }
+    // The placement only reads the buffer's size, offset and scale.
+    let shape = Buf { img: Image { width: buf.img.width, height: buf.img.height, data: Vec::new() }, offset: buf.offset, scale: buf.scale };
+    Some(composite_styled_gpu(e, r, ctx, layer, canvas, opacity, &shape, &passes, body, content))
+}
+
+/// [`draw_styled_gpu`]'s composite: the CPU styled branch of `draw_layer` on GPU images.
+#[allow(clippy::too_many_arguments)]
+fn composite_styled_gpu(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    canvas: &mut Pixels,
+    opacity: f32,
+    shape: &Buf,
+    passes: &[(GpuImage, BlendMode)],
+    body: GpuImage,
+    content: GpuImage,
+) -> Option<()> {
+    let bl = styles::blending(ctx, layer);
+    let (w, h) = canvas.size();
+    let mut reach = [0; 4];
+    if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
+        let mut iso: Pixels = e.zeros(w, h).into();
+        for (p, m) in passes {
+            reach = ops::union(reach, place_src_in(e, r, ctx, layer, shape, p.clone().into(), &mut iso, *m, 1.0, None)?);
+        }
+        reach = ops::union(reach, place_src_in(e, r, ctx, layer, shape, body.into(), &mut iso, BlendMode::Normal, 1.0, None)?);
+        return composite_iso(e, r, ctx, layer, iso, canvas, opacity, Some(reach));
+    }
+    let mut tmp = canvas.clone();
+    if bl.knockout > 0 {
+        let mut k: Pixels = e.zeros(w, h).into();
+        // Knockout keeps the canvas (× 1) where `k` is transparent.
+        reach = place_src_in(e, r, ctx, layer, shape, content.into(), &mut k, BlendMode::Normal, 1.0, None)?;
+        let (below, k) = (tmp.float(e)?, k.float(e)?);
+        tmp = ops::knockout(e, &below, &k).into();
+    }
+    for (p, m) in passes {
+        reach = ops::union(reach, place_src_in(e, r, ctx, layer, shape, p.clone().into(), &mut tmp, *m, 1.0, None)?);
+    }
+    reach = ops::union(reach, place_src_in(e, r, ctx, layer, shape, body.into(), &mut tmp, layer.blend_mode, 1.0, None)?);
     let tmp = tmp.float(e)?;
     let mut out = take_float(e, canvas)?;
     ops::channel_mix_in(e, &mut out, &tmp, bl.channels, opacity, Some(reach));

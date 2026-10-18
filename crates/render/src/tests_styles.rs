@@ -539,3 +539,67 @@ fn repeated_drop_shadows_render_both_sides_and_respect_enabled_state() {
     assert!(img.get(60, 50)[0] > 0.99);
     assert_eq!(img.get(140, 50)[3], 0.0);
 }
+
+/// Styles run on the content's visible part only (cropped to its alpha, then padded by their
+/// reach): the same pixels as styling the whole mostly transparent buffer a shape layer with
+/// effects is drawn on, noise, Dissolve and jitter grain included, within 1/255.
+#[test]
+fn cropped_styles_match_the_whole_buffer() {
+    const DISSOLVE: u32 = 1;
+    let sets: [&[(&str, &[(&str, Value)])]; 2] = [
+        &[
+            ("dropShadow", &[("size", Value::Scalar(9.0)), ("distance", Value::Scalar(6.0)), ("noise", Value::Scalar(30.0)), ("blendMode", Value::Enum(DISSOLVE))]),
+            ("outerGlow", &[("size", Value::Scalar(12.0)), ("noise", Value::Scalar(20.0)), ("jitter", Value::Scalar(40.0)), ("colorType", Value::Enum(1))]),
+            ("innerShadow", &[("size", Value::Scalar(5.0)), ("noise", Value::Scalar(10.0))]),
+            ("satin", &[]),
+            ("colorOverlay", &[("opacity", Value::Scalar(40.0))]),
+            ("gradientOverlay", &[("opacity", Value::Scalar(60.0)), ("alignWithLayer", Value::Bool(true))]),
+        ],
+        &[
+            ("innerGlow", &[("technique", Value::Enum(1)), ("source", Value::Enum(0)), ("noise", Value::Scalar(15.0))]),
+            ("stroke", &[("size", Value::Scalar(4.0)), ("position", Value::Enum(2))]),
+            ("bevelEmboss", &[("size", Value::Scalar(8.0)), ("soften", Value::Scalar(2.0))]),
+            ("dropShadow", &[("spread", Value::Scalar(40.0)), ("size", Value::Scalar(10.0))]),
+        ],
+    ];
+    // A soft-edged blob in a 300×200 transparent canvas (a comp-sized effect canvas).
+    let (cw, ch) = (300u32, 200u32);
+    let mut img = Image::new(cw, ch);
+    for y in 0..ch {
+        for x in 0..cw {
+            let (dx, dy) = ((x as f32 - 140.0) / 22.0, (y as f32 - 95.0) / 15.0);
+            let a = (1.6 - (dx * dx + dy * dy).sqrt() * 1.2).clamp(0.0, 1.0);
+            img.data[(y * cw + x) as usize] = [0.9 * a, 0.4 * a, 0.2 * a, a];
+        }
+    }
+    let content = effectcraft_effects::Buf { img, offset: [150.0, 100.0], scale: 1.0 };
+    for set in sets {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, [1.0; 3], 40, 40);
+        for (style, params) in set {
+            add(&mut p, &comp, &mut l, style);
+            for (k, v) in *params {
+                set(&mut l, &format!("{style}/{k}"), v.clone());
+            }
+        }
+        let ctx = crate::eval::EvalCtx::new(&p, cid, &comp, Tick::ZERO);
+        let whole = crate::styles::render_in(&ctx, &l, &content, [40.0, 40.0], false).flatten();
+        let cropped = crate::styles::render_in(&ctx, &l, &content, [40.0, 40.0], true).flatten();
+        assert!(cropped.img.width * 2 < whole.img.width && cropped.img.height * 2 < whole.img.height, "not cropped");
+        let (dx, dy) = (whole.offset[0] - cropped.offset[0], whole.offset[1] - cropped.offset[1]);
+        assert!(dx.fract() == 0.0 && dy.fract() == 0.0 && dx >= 0.0 && dy >= 0.0, "{dx} {dy}");
+        let mut worst = 0.0f32;
+        for y in 0..whole.img.height {
+            for x in 0..whole.img.width {
+                let a = whole.img.get(x as i64, y as i64);
+                let (cx, cy) = (x as i64 - dx as i64, y as i64 - dy as i64);
+                let inside = cx >= 0 && cy >= 0 && (cx as u32) < cropped.img.width && (cy as u32) < cropped.img.height;
+                let b = if inside { cropped.img.get(cx, cy) } else { [0.0; 4] };
+                for c in 0..4 {
+                    worst = worst.max((a[c] - b[c]).abs());
+                }
+            }
+        }
+        assert!(worst <= 1.0 / 255.0, "{:?}: max difference {worst}", set.iter().map(|s| s.0).collect::<Vec<_>>());
+    }
+}
