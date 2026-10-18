@@ -267,7 +267,8 @@ fn default_frames_mb() -> u64 {
     let total = read("/proc/meminfo")
         .and_then(|m| m.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()))
         .map(|kb| kb.saturating_mul(1024));
-    let allot = std::env::var("EFFECTCRAFT_RAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|g| g.is_finite() && *g > 0.0).map(|g| (g * 1e9) as u64);
+    let allot =
+        std::env::var("EFFECTCRAFT_RAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|g| g.is_finite() && *g > 0.0).map(|g| (g * 1e9) as u64);
     let Some(ram) = limit.into_iter().chain(total).chain(allot).min() else { return 4096 };
     let mb = (ram / 100).saturating_mul(85) >> 20;
     mb.saturating_sub(8192).saturating_sub(cache_budget() as u64 >> 20).max(1024)
@@ -307,6 +308,8 @@ pub fn start(args: &Args, port: u16, gpu: Option<Arc<Gpu>>, control_port: Arc<On
     }
     let render = renderer(&s, gpu, threads, &log);
     // Never colour bars or Inter from the cloud: frames fail while footage or fonts are missing (CR7).
+    // Half-size proxies of big clips, made here (PERF-PROXY); the guard checks the replica's own project.
+    let render = crate::auto_proxy::wrap(render, log.clone());
     let render = crate::asset_guard::wrap(render, log.clone());
     let (token, stored) = frame_server::frame_token(effectcraft_host::config_dir().as_deref(), args.opt("--token")).map_err(Failure::Error)?;
     let control: frame_server::ControlFn = Arc::new(move |method: &str, params: Value| match control_port.get() {

@@ -52,6 +52,7 @@
 use std::io::Write;
 
 mod asset_guard;
+mod auto_proxy;
 mod drive;
 mod figma_bridge;
 mod frame_serve;
@@ -172,7 +173,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
       [--jpeg-quality Q] [--n N] [--duration SECS]
                                            measure a frame server: round trips, scrub latency, a soak of
                                            random requests
-  stream-bench [F.ecproj | --demo] [--comp C] [--start SECS] [--n FRAMES] [--gpu] [--scale S] [--render-only]
+  stream-bench [F.ecproj | --demo] [--comp C] [--start SECS] [--n FRAMES] [--gpu] [--scale S] [--render-only] [--proxies]
                                            render consecutive frames of a comp and time the playback
                                            stream's H.264 chunk encoding (sizes, threads, bitrate)
   stream-test --frames HOST:PORT [--token T] [F.ecproj | --demo] [--comp C] [--start SECS] [--duration SECS]
@@ -288,6 +289,7 @@ const FLAGS: &[&str] = &[
     "--gpu",
     "--fixed",
     "--render-only",
+    "--proxies",
     "--list",
     "--schemas",
     "--enabled",
