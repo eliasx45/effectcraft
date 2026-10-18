@@ -25,6 +25,7 @@ impl<'a> Renderer<'a> {
                 let k = self.raster_scale(ctx, layer);
                 self.authored(crate::shapes::render_window(ctx, layer, contents, k, Some([w.x, w.y, w.w, w.h])))
             }
+            (None, Some(w), LayerSource::Comp { .. }) => self.source_window(ctx, layer, Some(w))?,
             (None, ..) => self.source(ctx, layer)?,
         };
         // A solid is filled with a quantised colour: only masks can take it off the grid.
@@ -122,12 +123,18 @@ impl<'a> Renderer<'a> {
     /// its values keeps its key) and the existing key-attempt bookkeeping id. Accelerators must
     /// still apply `precomp_source` eligibility before using this key, and admit animated
     /// content ([`Self::resident_precomp_animated`]) only once its key repeats.
-    pub fn resident_precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, u64)> {
+    pub fn resident_precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, u64, ContentClip)> {
         if !matches!(layer.source, LayerSource::Comp { .. }) || self.freeze.is_some() {
             return None;
         }
-        let (key, noted, _) = self.content_cache_key_noted(ctx, layer);
-        Some((key?, noted?))
+        let (key, noted, clip) = self.content_cache_key_noted(ctx, layer);
+        Some((key?, noted?, ContentClip(clip)))
+    }
+
+    /// The window of its nested comp a precomp layer drawn uncached renders (see
+    /// [`Self::precomp_clip`]); the whole frame when it is not windowed.
+    pub fn precomp_window(&self, ctx: &EvalCtx, layer: &Layer) -> ContentClip {
+        ContentClip(self.precomp_clip(ctx, layer, None))
     }
 
     /// Whether a precomp's pixels may change from frame to frame (its key then changes with
@@ -185,15 +192,15 @@ impl<'a> Renderer<'a> {
     /// [`cache::LayerCache::precomp_note`] (an animated precomp is keyed only now and then, see
     /// [`cache::LayerCache::precomp_try`]).
     ///
-    /// A shape layer drawn clipped (see [`Self::shape_clip`]) has the window in its key, and
-    /// the window is returned too.
+    /// A shape layer drawn clipped (see [`Self::shape_clip`]) or a precomp layer drawn windowed
+    /// (see [`Self::precomp_clip`]) has the window in its key, and the window is returned too.
     fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> ContentKey {
-        let Some(c) = self.cache else { return (None, None, self.shape_clip(ctx, layer, None)) };
+        let Some(c) = self.cache else { return (None, None, self.shape_clip(ctx, layer, None).or_else(|| self.precomp_clip(ctx, layer, None))) };
         let (src, noted) = match layer.source {
             LayerSource::Comp { .. } => {
                 let id = cache::derive(cache::derive(ctx.comp_id.0, layer.id.0), self.depth as u64);
                 if !c.precomp_try(id) {
-                    return (None, None, None);
+                    return (None, None, self.precomp_clip(ctx, layer, None));
                 }
                 (self.precomp_key(ctx, layer), Some(id))
             }
@@ -203,7 +210,7 @@ impl<'a> Renderer<'a> {
         };
         let key = cache::layer_key_src(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), src);
         let key = self.content_key(ctx, layer, key);
-        let clip = self.shape_clip(ctx, layer, key);
+        let clip = self.shape_clip(ctx, layer, key).or_else(|| self.precomp_clip(ctx, layer, key));
         let key = match clip {
             Some(w) => key.map(|k| clip::clipped_key(k, w)),
             None => key,
@@ -547,7 +554,9 @@ fn crop_visible(buf: &Buf, margin: u32) -> Option<Buf> {
 pub(crate) fn working_read(comp: &Comp, layer: &Layer) -> bool {
     comp.layers.iter().any(|l| {
         l.track_matte.as_ref().is_some_and(|m| m.layer == layer.id)
-            || l.effects().is_some_and(names_a_layer)
+            // Its own effects may read it through any layer parameter (an empty one can stand
+            // for the layer itself); another layer's only through one that can name it.
+            || l.effects().is_some_and(|fx| if l.id == layer.id { names_a_layer(fx) } else { names_layer(fx, layer.id.0) })
             || (cache::layer_info(comp, l).expressions && samples_pixels(&l.props))
     })
 }
@@ -560,6 +569,16 @@ fn names_a_layer(g: &PropGroup) -> bool {
     })
 }
 
+/// Can a layer parameter of `g` name layer `id`: set to it, or keyframed or driven by an
+/// expression (which may name any layer)? An empty layer parameter (Deep Glow's Mask Layer left
+/// at None) reads nothing.
+fn names_layer(g: &PropGroup, id: u64) -> bool {
+    g.children.iter().any(|c| match c {
+        Node::Prop(p) => matches!(p.value, Value::Layer(_)) && (p.value == Value::Layer(Some(id)) || !p.keys.is_empty() || p.has_expression()),
+        Node::Group(sub) => names_layer(sub, id),
+    })
+}
+
 /// Does an expression in `g` read rendered pixels (`sampleImage`)?
 fn samples_pixels(g: &PropGroup) -> bool {
     g.children.iter().any(|c| match c {
@@ -569,9 +588,26 @@ fn samples_pixels(g: &PropGroup) -> bool {
 }
 
 /// The window of a layer's buffer its content key stands for (see [`Renderer::resident_content`]):
-/// the whole buffer, or the part of a shape layer's that can show (see `clip.rs`).
+/// the whole buffer, or the part of a shape layer's or a nested comp's frame that can show (see
+/// `clip.rs`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ContentClip(Option<Window>);
+
+impl ContentClip {
+    /// The window `[x, y, w, h]` (buffer pixels), `None` for the whole buffer.
+    pub fn rect(&self) -> Option<[u32; 4]> {
+        self.0.map(|w| [w.x, w.y, w.w, w.h])
+    }
+
+    /// The offset of the buffer holding this window of a whole buffer at offset 0.
+    pub fn offset(&self) -> [f64; 2] {
+        crate::sources::window_offset(self.0)
+    }
+
+    pub(crate) fn window(&self) -> Option<Window> {
+        self.0
+    }
+}
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
 pub struct StyledLayer {
@@ -692,5 +728,12 @@ mod tests {
         sub.children.push(Node::Prop(Property::new(3, "layer", "Layer", Value::Layer(None))));
         fx.children.push(Node::Group(sub));
         assert!(names_a_layer(&fx));
+        // An empty layer parameter (Deep Glow's Mask Layer at None) names no other layer; one
+        // set to a layer names just it.
+        assert!(!names_layer(&fx, 7));
+        let Some(Node::Group(sub)) = fx.children.first_mut() else { panic!("sub") };
+        let Some(Node::Prop(lp)) = sub.children.first_mut() else { panic!("layer") };
+        lp.value = Value::Layer(Some(7));
+        assert!(names_layer(&fx, 7) && !names_layer(&fx, 8));
     }
 }
