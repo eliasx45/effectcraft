@@ -36,7 +36,6 @@ fn gradient() -> Value {
         color_midpoints: vec![0.3, 0.6],
         opacities: vec![(0.0, 1.0), (0.7, 0.4), (1.0, 0.9)],
         opacity_midpoints: vec![0.5, 0.2],
-        ..Gradient::default()
     }))
 }
 
@@ -73,7 +72,13 @@ fn exterior_passes_match_the_cpu() {
                 s,
                 l,
                 "outerGlow",
-                &[("size", Value::Scalar(12.0)), ("colorType", Value::Enum(1)), ("colors", gradient()), ("jitter", Value::Scalar(30.0)), ("noise", Value::Scalar(20.0))],
+                &[
+                    ("size", Value::Scalar(12.0)),
+                    ("colorType", Value::Enum(1)),
+                    ("colors", gradient()),
+                    ("jitter", Value::Scalar(30.0)),
+                    ("noise", Value::Scalar(20.0)),
+                ],
             );
         });
         case(&format!("dissolve shadow {depth:?}"), depth, opts(), |s, l| {
@@ -91,7 +96,13 @@ fn interior_styles_match_the_cpu() {
                     s,
                     l,
                     "gradientOverlay",
-                    &[("style", Value::Enum(g)), ("colors", gradient()), ("angle", Value::Scalar(30.0)), ("reverse", Value::Bool(g == 2)), ("alignWithLayer", Value::Bool(g % 2 == 0))],
+                    &[
+                        ("style", Value::Enum(g)),
+                        ("colors", gradient()),
+                        ("angle", Value::Scalar(30.0)),
+                        ("reverse", Value::Bool(g == 2)),
+                        ("alignWithLayer", Value::Bool(g % 2 == 0)),
+                    ],
                 );
             });
         }
@@ -144,12 +155,9 @@ fn blending_options_half_and_linear_match_the_cpu() {
 /// Styles the GPU doesn't render (a distance field) still match: the layer goes to the CPU.
 #[test]
 fn distance_field_styles_fall_back_to_the_cpu() {
-    for (id, vals) in [
-        ("dropShadow", vec![("spread", Value::Scalar(40.0))]),
-        ("outerGlow", vec![("technique", Value::Enum(1))]),
-        ("bevelEmboss", vec![]),
-        ("stroke", vec![]),
-    ] {
+    for (id, vals) in
+        [("dropShadow", vec![("spread", Value::Scalar(40.0))]), ("outerGlow", vec![("technique", Value::Enum(1))]), ("bevelEmboss", vec![]), ("stroke", vec![])]
+    {
         let mut s = Scene::new(BitDepth::Bpc32);
         let bg = s.footage(97, 61);
         s.push(bg);
