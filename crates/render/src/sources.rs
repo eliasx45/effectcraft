@@ -2,7 +2,8 @@
 //! and their content bounds.
 
 use crate::footage::frame_blend_mode;
-use crate::{EvalCtx, Image, RenderOpts, Renderer, blend_frames, color, frame_position, is_vector_footage, shapes, source_size, text};
+use crate::placement::Window;
+use crate::{ContentClip, EvalCtx, Image, RenderOpts, Renderer, blend_frames, color, frame_position, is_vector_footage, shapes, source_size, text};
 use effectcraft_effects::Buf;
 use effectcraft_geom::vec2;
 use effectcraft_project::{FrameBlend, ItemKind, Layer, LayerSource};
@@ -136,48 +137,7 @@ impl<'a> Renderer<'a> {
                 let px = self.pipe.quantize_px([c[0], c[1], c[2], 1.0]);
                 Some(Buf { img: Image::filled(w, h, px), offset: [0.0; 2], scale: s })
             }
-            LayerSource::Comp { item } => {
-                if self.project.comp_contains(*item, ctx.comp_id) {
-                    return None;
-                }
-                // A composition proxy (a rendered still or movie) stands in for the comp.
-                // Nothing before the nested comp starts or after it ends.
-                let lt = ctx.nested_time(layer);
-                if !self.project.comp(*item).is_some_and(|nc| nc.covers(lt)) {
-                    return None;
-                }
-                if let Some(pf) = self.proxy_for(*item)
-                    && let Some(nc) = self.project.comp(*item)
-                {
-                    let img = self.footage.frame_with(*item, pf, lt, None, self.pipe.float_encoding())?;
-                    return Some(self.footage_buf(&img, pf, nc.width, nc.height));
-                }
-                // Essential Properties overrides render the nested comp with this instance's
-                // values.
-                let ov = essential_overrides(ctx, layer);
-                let tmp = if ov.is_empty() { None } else { effectcraft_project::essential::with_overrides(self.project, *item, &ov) };
-                let (base, bs) = self.precomp_renderer(layer, *item);
-                let sub = match &tmp {
-                    // A source cache was made without this instance's property overrides.
-                    Some(p) => Renderer { project: p, freeze: None, ..base },
-                    None => base,
-                };
-                // The nested frames share their layers' transforms (parents evaluated once).
-                let frame = |t| crate::eval::with_transform_memo(sub.project, || sub.comp_frame(*item, t));
-                // Frame blending between the nested comp's frames (time-stretched/remapped).
-                let mode = frame_blend_mode(ctx, layer);
-                if mode != FrameBlend::Off
-                    && let Some(nc) = self.project.comp(*item)
-                {
-                    let (i, w) = frame_position(lt, nc.frame_rate);
-                    if w > 1e-6 {
-                        let a = frame(nc.frame_rate.tick_of(i));
-                        let b = frame(nc.frame_rate.tick_of(i + 1));
-                        return Some(Buf { img: blend_frames(mode, &a, &b, w as f32), offset: [0.0; 2], scale: bs });
-                    }
-                }
-                Some(Buf { img: frame(lt), offset: [0.0; 2], scale: bs })
-            }
+            LayerSource::Comp { .. } => self.source_window(ctx, layer, None),
             LayerSource::Footage { item } => {
                 let it = self.project.item(*item)?;
                 let ItemKind::Footage(f) = &it.kind else { return None };
@@ -205,6 +165,67 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// A precomp layer's source: its nested comp's frame, or only the window `win` of it (see
+    /// [`Self::precomp_clip`]), whose offset places it where those pixels are in the whole frame.
+    pub(crate) fn source_window(&self, ctx: &EvalCtx, layer: &Layer, win: Option<Window>) -> Option<Buf> {
+        let LayerSource::Comp { item } = &layer.source else { return None };
+        if self.project.comp_contains(*item, ctx.comp_id) {
+            return None;
+        }
+        // A composition proxy (a rendered still or movie) stands in for the comp.
+        // Nothing before the nested comp starts or after it ends.
+        let lt = ctx.nested_time(layer);
+        if !self.project.comp(*item).is_some_and(|nc| nc.covers(lt)) {
+            return None;
+        }
+        if let Some(pf) = self.proxy_for(*item)
+            && let Some(nc) = self.project.comp(*item)
+        {
+            let img = self.footage.frame_with(*item, pf, lt, None, self.pipe.float_encoding())?;
+            return Some(self.footage_buf(&img, pf, nc.width, nc.height));
+        }
+        // Essential Properties overrides render the nested comp with this instance's
+        // values.
+        let ov = essential_overrides(ctx, layer);
+        let tmp = if ov.is_empty() { None } else { effectcraft_project::essential::with_overrides(self.project, *item, &ov) };
+        let (base, bs) = self.precomp_renderer(layer, *item);
+        let base = base.windowed(win);
+        let offset = window_offset(win);
+        let sub = match &tmp {
+            // A source cache was made without this instance's property overrides.
+            Some(p) => Renderer { project: p, freeze: None, ..base },
+            None => base,
+        };
+        // The nested frames share their layers' transforms (parents evaluated once).
+        let frame = |t| crate::eval::with_transform_memo(sub.project, || sub.comp_frame(*item, t));
+        // Frame blending between the nested comp's frames (time-stretched/remapped).
+        let mode = frame_blend_mode(ctx, layer);
+        if mode != FrameBlend::Off
+            && let Some(nc) = self.project.comp(*item)
+        {
+            let (i, w) = frame_position(lt, nc.frame_rate);
+            if w > 1e-6 {
+                let a = frame(nc.frame_rate.tick_of(i));
+                let b = frame(nc.frame_rate.tick_of(i + 1));
+                return Some(Buf { img: blend_frames(mode, &a, &b, w as f32), offset, scale: bs });
+            }
+        }
+        Some(Buf { img: frame(lt), offset, scale: bs })
+    }
+
+    /// This (nested) renderer drawing only the window `clip` of its comp's frame (see
+    /// [`Self::precomp_clip`]); itself when `clip` is the whole frame.
+    pub fn with_clip(&self, clip: ContentClip) -> Renderer<'a> {
+        self.windowed(clip.window())
+    }
+
+    pub(crate) fn windowed(&self, win: Option<Window>) -> Renderer<'a> {
+        match win {
+            Some(w) => Renderer { window: Some(w), ..*self },
+            None => Renderer { ..*self },
+        }
+    }
+
     /// Authored colours into the working space (linear working spaces).
     pub(crate) fn authored(&self, mut buf: Buf) -> Buf {
         if let Some(c) = self.pipe.authored_in() {
@@ -212,6 +233,12 @@ impl<'a> Renderer<'a> {
         }
         buf
     }
+}
+
+/// The offset of a buffer that holds the window `win` of a whole buffer at offset 0 (buffer
+/// pixels; see [`Buf::offset`]).
+pub(crate) fn window_offset(win: Option<Window>) -> [f64; 2] {
+    win.map_or([0.0; 2], |w| [-f64::from(w.x), -f64::from(w.y)])
 }
 
 /// Layer-space bounds `[x0, y0, x1, y1]` of a layer's content at the context time (source size

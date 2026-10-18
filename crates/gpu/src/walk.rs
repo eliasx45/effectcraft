@@ -28,8 +28,11 @@ pub(crate) fn render<'g>(e: &mut Enc<'g>, r: &Renderer, comp_id: ItemId, t: Tick
     }
     let ctx = r.eval_ctx(comp_id, t)?;
     let s = r.opts.scale;
-    let w = ((ctx.comp.width as f64 * s).round() as u32).max(1);
-    let h = ((ctx.comp.height as f64 * s).round() as u32).max(1);
+    // A nested comp drawn only where its precomp layer shows covers that window of its frame.
+    let (w, h) = match r.nested_window() {
+        Some([_, _, w, h]) => (w.max(1), h.max(1)),
+        None => (((ctx.comp.width as f64 * s).round() as u32).max(1), ((ctx.comp.height as f64 * s).round() as u32).max(1)),
+    };
     if r.depth() > 16 || !e.g.fits(w, h) {
         return None;
     }
@@ -514,13 +517,16 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
         return Some(done);
     }
     let (sub, item, lt, bs) = source;
+    // Only the window of the nested frame that can show (`Renderer::precomp_window`).
+    let clip = r.precomp_window(ctx, layer);
+    let sub = sub.with_clip(clip);
     // A nested comp the GPU can't take (nested too deep, over the texture limit, content it
     // declines) goes back to the CPU path for this layer only; only a device failure fails the
     // frame.
     let Some(src) = crate::cull::nested(e, ctx, &sub, item, lt) else {
         return if e.g.check_health().is_ok() { None } else { Some(None) };
     };
-    finish_resident(e, r, ctx, layer, canvas, opacity, src, bs)
+    finish_resident(e, r, ctx, layer, canvas, opacity, src, bs, clip.offset())
 }
 
 /// Reuse completed layer-space precomp pixels, never the parent placement or blend.
@@ -539,7 +545,7 @@ fn draw_cached_precomp(
         return None;
     }
     let cache = r.cache?;
-    let (key, noted) = {
+    let (key, noted, clip) = {
         let _profile = effectcraft_render::profile::span("precomp_resident_key");
         r.resident_precomp_key(ctx, layer)?
     };
@@ -571,10 +577,12 @@ fn draw_cached_precomp(
     } else {
         let _profile = effectcraft_render::profile::span("precomp_resident_produce");
         let (sub, item, lt, bs) = source;
-        let Some(src) = crate::cull::nested(e, ctx, sub, *item, *lt) else {
+        // The window of the nested frame the key stands for.
+        let sub = sub.with_clip(clip);
+        let Some(src) = crate::cull::nested(e, ctx, &sub, *item, *lt) else {
             return if e.g.check_health().is_ok() { None } else { Some(None) };
         };
-        prepare_processed(e, r, ctx, layer, src, *bs, true)?
+        prepare_processed(e, r, ctx, layer, src, *bs, clip.offset(), true)?
     };
     let result = composite_processed(e, r, ctx, layer, canvas, opacity, image.clone());
     if result == Some(Some(()))
@@ -629,7 +637,7 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
         src = crate::yuv::mask(e, &src, &mask)?;
     }
     // Native entries stay f32 (`keep_native`), so no codes here.
-    let image = prepare_resident(e, r, ctx, layer, src.into(), footage.scale, false)?;
+    let image = prepare_resident(e, r, ctx, layer, src.into(), footage.scale, [0.0; 2], false)?;
     let native = match &image.img {
         Pixels::Float(img) => Some(crate::context::NativeImage { img: img.clone(), offset: image.offset, scale: image.scale }),
         Pixels::Codes(_) => None,
@@ -648,16 +656,29 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
     result
 }
 
+/// `at`: the source's offset (buffer pixels; a window of a nested frame, see
+/// `Renderer::precomp_window`).
 #[allow(clippy::too_many_arguments)]
-fn finish_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32, src: Pixels, bs: f64) -> Option<Option<()>> {
-    let image = prepare_resident(e, r, ctx, layer, src, bs, true)?;
+fn finish_resident(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    canvas: &mut Pixels,
+    opacity: f32,
+    src: Pixels,
+    bs: f64,
+    at: [f64; 2],
+) -> Option<Option<()>> {
+    let image = prepare_resident(e, r, ctx, layer, src, bs, at, true)?;
     composite_resident(e, r, ctx, layer, canvas, opacity, image)
 }
 
 /// `codes`: the result may be 8 bpc codes (see [`prepare_processed`]).
-fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, src: Pixels, bs: f64, codes: bool) -> Option<SourceImage> {
+#[allow(clippy::too_many_arguments)]
+fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, src: Pixels, bs: f64, at: [f64; 2], codes: bool) -> Option<SourceImage> {
     // Native YUV entries retain their historical blending-space representation.
-    let mut image = prepare_processed(e, r, ctx, layer, src, bs, codes)?;
+    let mut image = prepare_processed(e, r, ctx, layer, src, bs, at, codes)?;
     if let Some(c) = r.pipe().to_blend() {
         let img = image.img.float(e)?;
         image.img = ops::convert(e, &img, &c).into();
@@ -666,8 +687,10 @@ fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, src
 }
 
 /// Processed slots also serve lazy CPU consumers, so they must precede to_blend. `codes`: an
-/// image quantised to the 8 bpc grid with no effects to run may stay (or become) codes.
-fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut src: Pixels, bs: f64, codes: bool) -> Option<SourceImage> {
+/// image quantised to the 8 bpc grid with no effects to run may stay (or become) codes. `at`: the
+/// source's offset (buffer pixels).
+#[allow(clippy::too_many_arguments)]
+fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut src: Pixels, bs: f64, at: [f64; 2], codes: bool) -> Option<SourceImage> {
     let pipe = r.pipe();
     let effects = layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty());
     // `masked_source` quantises a non-solid source to the project's depth.
@@ -678,12 +701,12 @@ fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mu
         // Effects run in effect space (0.7.0): from the layer bounds' corner.
         let o = ctx.effect_bounds(layer).1;
         let src = src.float(e)?;
-        let mut fx = crate::effects::GpuFx::new(e, src, [o[0] * bs, o[1] * bs], bs, pipe.levels);
+        let mut fx = crate::effects::GpuFx::new(e, src, [at[0] + o[0] * bs, at[1] + o[1] * bs], bs, pipe.levels);
         r.run_layer_effects_on(ctx, layer, &mut fx);
         let (img, off, sc) = fx.finish()?;
         (img.into(), [off[0] - o[0] * sc, off[1] - o[1] * sc], sc)
     } else {
-        (src, [0.0; 2], bs)
+        (src, at, bs)
     };
     Some(SourceImage { img, offset, scale })
 }

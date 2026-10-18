@@ -669,6 +669,8 @@ mod tests_layer_times;
 #[cfg(test)]
 mod tests_particles;
 #[cfg(test)]
+mod tests_precomp_clip;
+#[cfg(test)]
 mod tests_precomp_resident;
 #[cfg(test)]
 mod tests_shape_clip;
