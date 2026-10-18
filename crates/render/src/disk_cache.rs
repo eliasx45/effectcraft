@@ -855,6 +855,27 @@ impl DiskCache {
         self.write_now(Kind::Layer, key, &encode_layer(buf));
     }
 
+    /// A decoded still (footage pixels, see [`still_key`]) written by [`DiskCache::put_still`].
+    pub fn get_still(&self, key: u128) -> Option<Image> {
+        self.get_layer(key).map(|b| b.img)
+    }
+
+    /// Queue a decoded still for writing (exact: the floats as they are). The encoding runs on a
+    /// thread of its own, not the caller's (a render waiting for its footage).
+    pub fn put_still(self: &Arc<Self>, key: u128, img: Arc<Image>) {
+        if self.contains(Kind::Layer, key) || self.queue_full() {
+            return;
+        }
+        let dc = self.clone();
+        let spawned = std::thread::Builder::new().name("still to disk".into()).spawn(move || {
+            let bytes = encode_parts(&img, [0.0; 2], 1.0);
+            dc.enqueue(Job::Write(Kind::Layer, key, bytes));
+        });
+        if let Err(e) = spawned {
+            log::debug!("disk cache: still not written ({e})");
+        }
+    }
+
     /// A segmentation (chain key, scale) written by [`DiskCache::put_seg`].
     pub fn get_seg(&self, key: u64, scale: f64) -> Option<effectcraft_effects::roto::FrameSeg> {
         let disk_key = seg_key(key, scale);
@@ -1042,11 +1063,15 @@ fn decode_frame(p: &[u8]) -> Option<Frame8> {
 }
 
 fn encode_layer(b: &Buf) -> Vec<u8> {
-    let (w, h) = (b.img.width, b.img.height);
-    let n = b.img.data.len();
+    encode_parts(&b.img, b.offset, b.scale)
+}
+
+fn encode_parts(img: &Image, offset: [f64; 2], scale: f64) -> Vec<u8> {
+    let (w, h) = (img.width, img.height);
+    let n = img.data.len();
     // Byte planes: all first bytes of every float, then all second bytes… (compresses well).
     let mut planes = vec![0u8; n * 16];
-    for (i, px) in b.img.data.iter().enumerate() {
+    for (i, px) in img.data.iter().enumerate() {
         for c in 0..4 {
             let bytes = px[c].to_le_bytes();
             for (k, byte) in bytes.iter().enumerate() {
@@ -1057,9 +1082,9 @@ fn encode_layer(b: &Buf) -> Vec<u8> {
     let mut out = Vec::with_capacity(planes.len() / 4 + 40);
     out.extend_from_slice(&w.to_le_bytes());
     out.extend_from_slice(&h.to_le_bytes());
-    out.extend_from_slice(&b.offset[0].to_le_bytes());
-    out.extend_from_slice(&b.offset[1].to_le_bytes());
-    out.extend_from_slice(&b.scale.to_le_bytes());
+    out.extend_from_slice(&offset[0].to_le_bytes());
+    out.extend_from_slice(&offset[1].to_le_bytes());
+    out.extend_from_slice(&scale.to_le_bytes());
     out.extend_from_slice(&lz4_flex::compress_prepend_size(&planes));
     out
 }
@@ -1095,6 +1120,28 @@ fn decode_layer(p: &[u8]) -> Option<Buf> {
 
 /// Bump when rendering changes in a way that makes old disk entries wrong.
 const RENDER_VERSION: &str = "effectcraft-render-2";
+
+/// Bump when decoding stills (PNG, JPEG, PSD, SVG, PDF, …) changes their pixels: decoded stills
+/// on disk ([`still_key`]) are named by it.
+const STILL_VERSION: &str = "effectcraft-still-1";
+
+/// Disk key of a decoded still: the decoder version, the file (path, size, modification time:
+/// an edited file gets a new key) and `how` it was decoded (layer, page, alpha and float
+/// interpretation…, as the footage pool keys it). `None` when the file can't be looked at.
+pub fn still_key(path: &str, how: &str) -> Option<u128> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let mut h = Hash128::default();
+    h.write(b"ECSTILL");
+    h.write(STILL_VERSION.as_bytes());
+    h.write_u64(path.len() as u64);
+    h.write(path.as_bytes());
+    h.write_u64(meta.len());
+    h.write_u64(modified.as_secs());
+    h.write_u64(u64::from(modified.subsec_nanos()));
+    h.write(how.as_bytes());
+    Some(h.finish())
+}
 
 /// Feeds formatted text straight into a hash (no intermediate `String`).
 struct HashWriter<'a>(&'a mut Hash128);

@@ -1662,6 +1662,8 @@ fn bench_disk(s: &Session, args: &Args, dir: &str) -> Result<(), Failure> {
     let dc = DiskCache::open(dir, 20 << 30).map_err(|e| Failure::Error(format!("--disk-cache: {e}")))?;
     let cache = LayerCache::default();
     cache.set_disk(Some((dc.clone(), disk_cache::footage_salt(project))));
+    // Stills slow to decode persist there too, as in the app.
+    s.footage.set_still_cache(Some(dc.clone()));
     let backend = if gpu.is_some() { Backend::Gpu } else { Backend::Cpu };
     let render = |t: Tick, cache: Option<&LayerCache>| {
         let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend, ..Default::default() });
