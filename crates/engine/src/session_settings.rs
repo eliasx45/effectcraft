@@ -118,6 +118,7 @@ impl Session {
         let Some(folder) = folder.filter(|_| d.disk_cache_enabled && !cfg!(target_arch = "wasm32")) else {
             self.disk_cache = None;
             self.layer_cache.set_disk(None);
+            self.footage.set_still_cache(None);
             return;
         };
         let dc = match &self.disk_cache {
@@ -131,11 +132,14 @@ impl Session {
                     log::warn!("disk cache at {}: {e}", folder.display());
                     self.disk_cache = None;
                     self.layer_cache.set_disk(None);
+                    self.footage.set_still_cache(None);
                     return;
                 }
             },
         };
         self.layer_cache.set_disk(Some((dc.clone(), footage_salt(&self.project))));
+        // Stills slow to decode (PDF / SVG artwork with big pictures) are kept there too.
+        self.footage.set_still_cache(Some(dc.clone()));
         // Roto Brush / Object Matte segmentations persist there too (held weakly: switching the
         // disk cache off drops it).
         let store: std::sync::Arc<dyn effectcraft_effects::roto::SegStore> = dc.clone();

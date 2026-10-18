@@ -229,6 +229,9 @@ pub trait FootageSource: Send + Sync {
     /// Settings ▸ Previews ▸ Hardware ProRes Decoding: let previews decode footage on a hardware
     /// decoder (visually identical, not bit-exact). Sources without one ignore it.
     fn set_hardware_decoding(&self, _on: bool) {}
+    /// Settings ▸ Media & Disk Cache ▸ Disk Cache: where decoded stills that are slow to decode
+    /// persist between sessions (`None` = off). Sources without a still decoder ignore it.
+    fn set_still_cache(&self, _disk: Option<Arc<crate::disk_cache::DiskCache>>) {}
     /// The view of this source that decodes exactly (never on a hardware decoder): what exports
     /// and other final renders read. `None`: this source is exact already. A source returns the
     /// same view every time (jobs compare footage sources by address).
@@ -333,6 +336,9 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn set_hardware_decoding(&self, on: bool) {
         self.inner.set_hardware_decoding(on)
+    }
+    fn set_still_cache(&self, disk: Option<Arc<crate::disk_cache::DiskCache>>) {
+        self.inner.set_still_cache(disk)
     }
     fn exact(&self) -> Option<&dyn FootageSource> {
         // (the exact view reads without this wrapper's cancellation: final renders finish)

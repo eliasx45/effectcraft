@@ -850,6 +850,43 @@ pub fn accent_time(s: &effectcraft_project::speech::Syllable, fps: f64, lead: f6
     if fps.is_finite() && fps > 0.0 { (v - lead / fps).max(t) } else { t }
 }
 
+/// The speed-graph peak of the keyframe segment `i` → `i + 1` of `keys`: (layer seconds, top
+/// speed), refined to well under a millisecond. `None` for a hold, equal values, keys out of
+/// order or a linear (flat-speed) segment. [`speed_peaks`] and `keys.alignPeak` both use it.
+pub fn segment_peak(keys: &[effectcraft_keyframe::Keyframe], i: usize, spatial: bool) -> Option<(f64, f64)> {
+    let (a, b) = (keys.get(i)?, keys.get(i.checked_add(1)?)?);
+    if a.out_interp == effectcraft_keyframe::Interp::Hold || a.value == b.value || b.time <= a.time {
+        return None;
+    }
+    let speed = |lt: f64| {
+        let v = effectcraft_keyframe::speed(keys, Tick::from_seconds_f64(lt), spatial);
+        if v.is_finite() { v } else { 0.0 }
+    };
+    let (t0, t1) = (a.time.seconds(), b.time.seconds());
+    let dt = (t1 - t0) / PEAK_SAMPLES as f64;
+    let at = |i: f64| t0 + (i + 0.5) * dt;
+    let (mut best, mut top, mut low) = (0usize, f64::MIN, f64::MAX);
+    for i in 0..PEAK_SAMPLES {
+        let v = speed(at(i as f64));
+        if v > top {
+            (best, top) = (i, v);
+        }
+        low = low.min(v);
+    }
+    if top <= 1e-9 || top - low < FLAT_SHARE * top {
+        return None;
+    }
+    // Golden-section refine around the best sample (the speed is unimodal there).
+    let (mut lo, mut hi) = (at(best as f64 - 1.0).max(t0), at(best as f64 + 1.0).min(t1));
+    for _ in 0..24 {
+        let m1 = hi - (hi - lo) * 0.618_034;
+        let m2 = lo + (hi - lo) * 0.618_034;
+        if speed(m1) < speed(m2) { lo = m1 } else { hi = m2 }
+    }
+    let lt = (lo + hi) / 2.0;
+    Some((lt, speed(lt).max(top)))
+}
+
 /// Speed-graph peaks of every keyframed property of `comp`'s layers in `start..=end` (comp
 /// seconds): for each pair of neighbouring keyframes with different values and no hold between
 /// them, the time of the highest speed (keyframes only; expressions are not evaluated), when it
@@ -861,41 +898,13 @@ pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
             if p.keys.len() < 2 || out.len() >= MAX_PEAKS {
                 return;
             }
-            let speed = |lt: f64| {
-                let v = effectcraft_keyframe::speed(&p.keys, Tick::from_seconds_f64(lt), p.spatial);
-                if v.is_finite() { v } else { 0.0 }
-            };
-            for pair in p.keys.windows(2) {
+            for (i, pair) in p.keys.windows(2).enumerate() {
                 let [a, b] = pair else { continue };
-                if a.out_interp == effectcraft_keyframe::Interp::Hold || a.value == b.value || b.time <= a.time {
-                    continue;
-                }
                 let (a_t, b_t) = (l.comp_time(a.time).seconds(), l.comp_time(b.time).seconds());
                 if a_t.max(b_t) < start - 1e-9 || a_t.min(b_t) > end + 1e-9 {
                     continue;
                 }
-                let (t0, t1) = (a.time.seconds(), b.time.seconds());
-                let dt = (t1 - t0) / PEAK_SAMPLES as f64;
-                let at = |i: f64| t0 + (i + 0.5) * dt;
-                let samples: Vec<f64> = (0..PEAK_SAMPLES).map(|i| speed(at(i as f64))).collect();
-                let (mut best, mut top, mut low) = (0usize, f64::MIN, f64::MAX);
-                for (i, v) in samples.iter().enumerate() {
-                    if *v > top {
-                        (best, top) = (i, *v);
-                    }
-                    low = low.min(*v);
-                }
-                if top <= 1e-9 || top - low < FLAT_SHARE * top {
-                    continue;
-                }
-                // Golden-section refine around the best sample (the speed is unimodal there).
-                let (mut lo, mut hi) = (at(best as f64 - 1.0).max(t0), at(best as f64 + 1.0).min(t1));
-                for _ in 0..24 {
-                    let m1 = hi - (hi - lo) * 0.618_034;
-                    let m2 = lo + (hi - lo) * 0.618_034;
-                    if speed(m1) < speed(m2) { lo = m1 } else { hi = m2 }
-                }
-                let lt = (lo + hi) / 2.0;
+                let Some((lt, top)) = segment_peak(&p.keys, i, p.spatial) else { continue };
                 let time = l.comp_time(Tick::from_seconds_f64(lt)).seconds();
                 // Outside the layer's in/out nothing shows, so the peak can't be seen.
                 let shown = time >= l.in_point.seconds() - 1e-9 && time <= l.out_point.seconds() + 1e-9;
@@ -905,7 +914,7 @@ pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
                 if out.iter().any(|q| q.layer == l.id && q.path == path && (q.time - time).abs() < 1e-6) {
                     continue;
                 }
-                out.push(SpeedPeak { layer: l.id, path: path.to_string(), property: p.name.clone(), time, speed: speed(lt).max(top) });
+                out.push(SpeedPeak { layer: l.id, path: path.to_string(), property: p.name.clone(), time, speed: top });
             }
         });
     }
@@ -968,7 +977,7 @@ pub fn off_accent(comp: &Comp, map: &effectcraft_project::speech::SpeechMap, sta
                 layer: l.id,
                 other: None,
                 message: format!(
-                    "{}'s {} speed peak at {:.3} s (frame {:.1}) is {frames} frames {} the stressed syllable of \"{}\" (onset {:.3} s, vowel {:.3} s; accent at {:.3} s, frame {:.0}): move the peak by {:+.0} frames, to {:.3} s, to land on the accent.",
+                    "{}'s {} speed peak at {:.3} s (frame {:.1}) is {frames} frames {} the stressed syllable of \"{}\" (onset {:.3} s, vowel {:.3} s; accent at {:.3} s, frame {:.0}): move the peak by {:+.0} frames, to {:.3} s, to land on the accent (keys.alignPeak {{layer: {}, path: \"{}\", frame: {:.0}}}).",
                     name(l),
                     m.peak.property,
                     m.peak.time,
@@ -980,7 +989,10 @@ pub fn off_accent(comp: &Comp, map: &effectcraft_project::speech::SpeechMap, sta
                     m.target,
                     (m.target * fps).round(),
                     -d.round(),
-                    m.target
+                    m.target,
+                    l.id.0,
+                    m.peak.path,
+                    (m.target * fps).round()
                 ),
             },
         ));

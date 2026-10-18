@@ -410,6 +410,16 @@ and lists what is wrong, in words an agent can act on. Run it before calling a d
    every speed peak with its nearest accent and `offsetFrames` (negative = early); `hit` is
    within one frame. `render.lint {rules: ["off-accent"]}` flags the near misses.
 4. `speech.clear` removes the map.
+5. `keys.alignPeak {layer, path | paths, speech: "content" | frame | time, mode?, graph?}` moves a
+   keyframed move so its speed-graph peak (the same finder as `off-accent`) lands on the target,
+   ±0.5 frame, in one undo step. Modes: `shift` (default, both keys, duration kept), `stretch-in` /
+   `stretch-out` (keep the second / first key), `ease` (keys stay, influences change). `graph` is one
+   of Devin's five (`fast-in`, `quick-launch`, `smooth-emphasis`, `slow-launch`, `fast-out`;
+   `keys.peakGraphs` lists them with their peak positions), `keep`, or a custom
+   `{out: {speed, influence}, in: {…}}`; without it, the graph peaking where the target falls is
+   picked. Keys in a precomp: `comp` is the layer's comp, `targetComp` the comp of the frame or
+   speech map (found automatically for speech), `via` the precomp layers when nested twice. Keys
+   land on whole frames unless that misses by more than half a target frame (`onFrames: false`).
 
 Geometry is the `get_layout` geometry (track-matte sources and adjustment layers are skipped);
 only `low-contrast` renders, at most 480 px on the long side, once per sample time that shows text.
