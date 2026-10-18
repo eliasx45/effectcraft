@@ -90,3 +90,47 @@ fn culled_work_renders_identically_and_is_skipped() {
         }
     }
 }
+
+/// One tile precomp inside two different screens (precomps of the frame's comp): its nested
+/// frame renders once and the other screen's instance shares it, and the frame equals the walk
+/// that renders every instance.
+#[test]
+fn a_precomp_in_two_different_comps_renders_once_per_frame() {
+    let g = crate::tests::gpu();
+    assert!(g.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+    let Some(g) = g else { return };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let inner = Comp::new(30, 20, FrameRate::FPS_30, Tick::from_seconds_f64(2.));
+        let tile = s.p.add_item("Tile", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+        let mut child = Scene { p: std::mem::take(&mut s.p), cid: tile, comp: inner };
+        let content = child.footage(30, 20);
+        child.push(content);
+        s.p = child.p;
+        let screen = |s: &mut Scene, name: &str, at: f64, blur: bool| {
+            let comp = Comp::new(50, 40, FrameRate::FPS_30, Tick::from_seconds_f64(2.));
+            let id = s.p.add_item(name, Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+            let mut sc = Scene { p: std::mem::take(&mut s.p), cid: id, comp };
+            let mut l = build::layer(&mut sc.p, &sc.comp, "Tile", LayerSource::Comp { item: tile }, (30, 20), None);
+            set(&mut l, "transform/position", v3(at, 18.));
+            if blur {
+                sc.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(2.))]);
+            }
+            sc.push(l);
+            s.p = sc.p;
+            let mut outer = build::layer(&mut s.p, &s.comp, name, LayerSource::Comp { item: id }, (50, 40), None);
+            set(&mut outer, "transform/position", v3(at * 2., 30.));
+            outer
+        };
+        let a = screen(&mut s, "Screen A", 20., false);
+        s.push(a);
+        let b = screen(&mut s, "Screen B", 30., true);
+        s.push(b);
+        let opts = RenderOpts { backend: Backend::Gpu, ..Default::default() };
+        let (all, _, _) = frame(g, &s, opts, true);
+        let (shared, counts, _) = frame(g, &s, opts, false);
+        let same = all.data.iter().zip(&shared.data).all(|(p, q)| p.iter().zip(q).all(|(x, y)| x == y || (x.is_nan() && y.is_nan())));
+        assert!(same, "{depth:?}: shared frame differs from the full walk");
+        assert_eq!((counts.nested_renders, counts.nested_shared), (3, 1), "{depth:?}: two screens and the tile once, shared once");
+    }
+}
