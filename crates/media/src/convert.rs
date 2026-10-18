@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 /// How to turn a (colour, alpha) sample into a premultiplied pixel.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct AlphaOp {
     mode: AlphaMode,
     matte: [f32; 3],
