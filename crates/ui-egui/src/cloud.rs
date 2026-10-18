@@ -1828,7 +1828,9 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!((plans[0].comp, plans[0].revision, plans[0].ranges.clone()), (cid, s.revision, vec![(3, 9), (0, 2)]));
         // A viewer frame names its key: the server answers it from its cache.
-        frames.request_urgent(&src, FrameKey { frame: 4, ..base }, cid, Tick(0), opts);
+        // (At frame 4's own time: PC3 names a frame by its fingerprint, which hashes the time.)
+        let at = s.project.comp(cid).unwrap().frame_rate.tick_of(4);
+        frames.request_urgent(&src, FrameKey { frame: 4, ..base }, cid, at, opts);
         wait_until("the viewer frame", || frames.is_cached(&FrameKey { frame: 4, ..base }));
         let key = server.render_keys.lock().unwrap().first().cloned().flatten().expect("a key");
         // (PC3: frames are named by their fingerprints, as the plan names them.)
