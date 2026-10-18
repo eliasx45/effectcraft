@@ -268,10 +268,10 @@ fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer
     let mut iso: Pixels = e.zeros(w, h).into();
     // collapse_into propagates the parent transform and motion-blur time chain.
     draw_comp(e, &sub, &nctx, &mut iso)?;
-    let mut iso = take_float(e, &mut iso)?;
     let pipe = r.pipe();
     if let Some(c) = pipe.from_blend() {
-        iso = ops::convert(e, &iso, &c);
+        let f = take_float(e, &mut iso)?;
+        iso = ops::convert(e, &f, &c).into();
     }
     let mut fx = crate::effects::GpuFx::new(e, iso, r.collapsed_effect_offset(), r.opts.scale, pipe.levels);
     r.run_effects_on(ctx, layer, true, &mut fx);
@@ -700,7 +700,7 @@ fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mu
     let (img, offset, scale) = if effects {
         // Effects run in effect space (0.7.0): from the layer bounds' corner.
         let o = ctx.effect_bounds(layer).1;
-        let src = src.float(e)?;
+        // 8 bpc codes go in as they are: the first effects read them (`effects::apply_px`).
         let mut fx = crate::effects::GpuFx::new(e, src, [at[0] + o[0] * bs, at[1] + o[1] * bs], bs, pipe.levels);
         r.run_layer_effects_on(ctx, layer, &mut fx);
         let (img, off, sc) = fx.finish()?;
@@ -745,10 +745,14 @@ fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
     let matte = place(e, r, ctx, layer, &foot, &e.zeros(w, h), BlendMode::Normal, 1.0, None)?;
     let matte = track_matte(e, r, ctx, layer, matte, None)?;
     let pipe = r.pipe();
-    let comp = canvas.float(e)?;
+    // 8 bpc codes stay codes: the first effects and the mix read them.
+    let comp = canvas.clone();
     // Effects run in the working space, not the linear blending space.
-    let below = match pipe.from_blend() {
-        Some(c) => ops::convert(e, &comp, &c),
+    let below: Pixels = match pipe.from_blend() {
+        Some(c) => {
+            let f = comp.float(e)?;
+            ops::convert(e, &f, &c).into()
+        }
         None => comp.clone(),
     };
     let mut fx = crate::effects::GpuFx::new(e, below, [0.0; 2], r.opts.scale, pipe.levels);

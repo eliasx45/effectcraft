@@ -345,7 +345,9 @@ impl<'a> Renderer<'a> {
         let t0 = web_time::Instant::now();
         let size = source_size(self.project, layer);
         let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-        let st = styles::render(ctx, layer, &content, layer_size);
+        // A text layer with effects is a comp-sized canvas: its styles run on the visible part.
+        let cropped = styles::crop_margin(ctx, layer, content.scale).and_then(|m| crop_visible(&content, m));
+        let st = styles::render(ctx, layer, cropped.as_ref().unwrap_or(&content), layer_size);
         if let Some(t) = timing {
             t.cached = false;
             t.effects.push(("layerStyles".into(), t0.elapsed().as_secs_f64() * 1e3));
@@ -500,6 +502,49 @@ impl<'a> Renderer<'a> {
         let passes = st.passes.into_iter().enumerate().map(|(i, (b, m))| (self.to_blend(b, st.key.map(|k| cache::derive(k, i as u64 + 1))), m)).collect();
         StyledLayer { passes, body, content, ..st }
     }
+}
+
+/// Test switch: run layer styles on the whole content buffer (the reference for the crop).
+pub(crate) static NO_STYLE_CROP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Tests: how many times styles ran on a cropped buffer.
+#[cfg(test)]
+pub(crate) static STYLE_CROPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `buf` cut down to the pixels that aren't fully clear (any channel non-zero) plus `margin`
+/// pixels around them, same pixel grid and place. `None` when that saves little (or nothing
+/// is visible): the buffer is used as it is.
+fn crop_visible(buf: &Buf, margin: u32) -> Option<Buf> {
+    if NO_STYLE_CROP.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let (w, h) = (buf.img.width as usize, buf.img.height as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    use rayon::prelude::*;
+    let (x0, y0, x1, y1) = buf
+        .img
+        .data
+        .par_chunks(w)
+        .enumerate()
+        .filter_map(|(y, row)| {
+            let first = row.iter().position(|p| *p != [0.0; 4])?;
+            let last = row.iter().rposition(|p| *p != [0.0; 4]).unwrap_or(first) + 1;
+            Some((first, y, last, y + 1))
+        })
+        .reduce_with(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))?;
+    let m = margin as usize;
+    let (x0, y0) = (x0.saturating_sub(m), y0.saturating_sub(m));
+    let (x1, y1) = (x1.saturating_add(m).min(w), y1.saturating_add(m).min(h));
+    let (cw, ch) = (x1.checked_sub(x0)?, y1.checked_sub(y0)?);
+    // Worth a copy only when it drops at least a quarter of the pixels.
+    if cw.checked_mul(ch)?.saturating_mul(4) > w.saturating_mul(h).saturating_mul(3) {
+        return None;
+    }
+    let img = buf.img.crop(x0 as i64, y0 as i64, cw as u32, ch as u32);
+    #[cfg(test)]
+    STYLE_CROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(Buf { img, offset: [buf.offset[0] - x0 as f64, buf.offset[1] - y0 as f64], scale: buf.scale })
 }
 
 /// Could anything in `layer`'s comp read its working-space pixels (its content buffer) other

@@ -539,3 +539,90 @@ fn repeated_drop_shadows_render_both_sides_and_respect_enabled_state() {
     assert!(img.get(60, 50)[0] > 0.99);
     assert_eq!(img.get(140, 50)[3], 0.0);
 }
+
+/// A text layer with an effect is a comp-sized canvas; its styles run on the visible part
+/// (`layer_buf::crop_visible`). The frame must be exactly the one styled on the whole canvas,
+/// for every style, at Full and Half, and a style hashed by buffer pixel (noise) keeps the
+/// whole canvas.
+#[test]
+fn styles_on_a_cropped_text_canvas_match_the_whole_canvas() {
+    use crate::layer_buf::{NO_STYLE_CROP, STYLE_CROPS};
+    use effectcraft_keyframe::TextDoc;
+    use std::sync::atomic::Ordering;
+    type Setup = fn(&mut Project, &Comp, &mut Layer);
+    let setups: [(&str, Setup); 10] = [
+        ("drop", |p, c, l| {
+            add(p, c, l, "dropShadow");
+            set(l, "dropShadow/size", Value::Scalar(12.0));
+            set(l, "dropShadow/spread", Value::Scalar(20.0));
+        }),
+        ("outer glow", |p, c, l| {
+            add(p, c, l, "outerGlow");
+            set(l, "outerGlow/size", Value::Scalar(8.0));
+        }),
+        ("precise glow", |p, c, l| {
+            add(p, c, l, "outerGlow");
+            set(l, "outerGlow/technique", Value::Enum(1));
+            set(l, "outerGlow/size", Value::Scalar(15.0));
+        }),
+        ("inner glow + shadow", |p, c, l| {
+            add(p, c, l, "innerGlow");
+            add(p, c, l, "innerShadow");
+        }),
+        ("bevel", |p, c, l| add(p, c, l, "bevelEmboss")),
+        ("satin", |p, c, l| add(p, c, l, "satin")),
+        ("stroke", |p, c, l| {
+            add(p, c, l, "stroke");
+            set(l, "stroke/size", Value::Scalar(6.0));
+        }),
+        ("Comp 29 counter", |p, c, l| {
+            add(p, c, l, "outerGlow");
+            set(l, "outerGlow/size", Value::Scalar(8.0));
+            add(p, c, l, "gradientOverlay");
+        }),
+        ("gradient, not aligned", |p, c, l| {
+            add(p, c, l, "gradientOverlay");
+            set(l, "gradientOverlay/alignWithLayer", Value::Bool(false));
+            add(p, c, l, "colorOverlay");
+            set(l, "colorOverlay/opacity", Value::Scalar(40.0));
+        }),
+        ("noisy glow", |p, c, l| {
+            add(p, c, l, "outerGlow");
+            set(l, "outerGlow/noise", Value::Scalar(30.0));
+        }),
+    ];
+    for (name, f) in setups {
+        let mut p = Project::default();
+        let comp = Comp::new(400, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (400, 200), None);
+        l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "$165".into(), size: 40.0, ..Default::default() }));
+        l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.7, 90.3, 0.0]);
+        l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([103.0, 103.0, 100.0]);
+        // Any effect gives the text a comp-sized effect canvas.
+        let spec = effectcraft_effects::find("ec.distort.transform").unwrap();
+        let mut next = p.next_id;
+        let g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
+        p.next_id = next;
+        l.props.sub_mut("effects").unwrap().children.push(g.into());
+        f(&mut p, &comp, &mut l);
+        let bg = solid(&mut p, &comp, [0.3, 0.4, 0.5], 400, 200);
+        p.comp_mut(cid).unwrap().layers = vec![l, bg].into();
+        for scale in [1.0, 0.5] {
+            NO_STYLE_CROP.store(true, Ordering::Relaxed);
+            let whole = render_frame(&p, cid, Tick::ZERO, scale);
+            NO_STYLE_CROP.store(false, Ordering::Relaxed);
+            let before = STYLE_CROPS.load(Ordering::Relaxed);
+            let cropped = render_frame(&p, cid, Tick::ZERO, scale);
+            let crops = STYLE_CROPS.load(Ordering::Relaxed) - before;
+            if name == "noisy glow" {
+                assert_eq!(crops, 0, "{name}: noise is hashed by buffer pixel, no crop");
+            } else {
+                assert!(crops > 0, "{name} at {scale}: styles ran on the whole canvas");
+            }
+            let diff = whole.data.iter().zip(&cropped.data).filter(|(a, b)| a != b).count();
+            assert_eq!(diff, 0, "{name} at {scale}: {diff} pixels differ");
+            assert!(whole.data.iter().any(|px| px[0] > 0.31 || px[0] < 0.29), "{name}: the text is drawn");
+        }
+    }
+}
