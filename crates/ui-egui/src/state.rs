@@ -426,6 +426,13 @@ pub struct TimelineState {
     pub inline_graph_views: BTreeMap<u64, InlineGraphView>,
     #[serde(skip)]
     pub inline_graph_active: Option<u64>,
+    /// Each comp's time view (`start`, `pps`), put back when the Timeline shows that comp again
+    /// (into a precomp and back, or a comp tab), so its zoom doesn't have to be redone.
+    #[serde(skip)]
+    pub comp_views: BTreeMap<u64, (f64, Option<f64>)>,
+    /// The comp `start` / `pps` belong to.
+    #[serde(skip)]
+    pub view_comp: Option<u64>,
     /// Parent selection hidden while a nested source owns timeline editing.
     #[serde(skip)]
     pub inline_parent_selection: Option<effectcraft_engine::CompSelection>,
@@ -539,6 +546,8 @@ impl Default for TimelineState {
             inline_dialog: None,
             inline_graph_views: BTreeMap::new(),
             inline_graph_active: None,
+            comp_views: BTreeMap::new(),
+            view_comp: None,
             inline_parent_selection: None,
             inline_parent_text_edit: None,
             open_groups: BTreeSet::new(),

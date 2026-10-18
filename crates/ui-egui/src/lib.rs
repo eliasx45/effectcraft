@@ -2570,8 +2570,8 @@ impl EffectcraftApp {
         for ev in self.session.drain_events() {
             match ev {
                 effectcraft_engine::Event::OpenComp(c) => {
+                    // (The Timeline puts back the comp's own zoom: `TimelineState::comp_views`.)
                     panels::viewers::on_open_comp(self, c);
-                    self.ui.timeline.pps = None;
                 }
                 effectcraft_engine::Event::Toast { message, .. } => self.toast = Some((message, ctx.input(|i| i.time))),
                 effectcraft_engine::Event::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),

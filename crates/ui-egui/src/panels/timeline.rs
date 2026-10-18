@@ -1345,6 +1345,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let graph_x0 = rect.min.x + left_w + 1.0;
     let graph_x1 = rect.max.x - GUTTER_W;
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("timeline-graph-area"), (graph_x0, graph_x1 - graph_x0)));
+    switch_comp_view(&mut app.ui.timeline, cid.0);
     let fit_pps = fit_pps(graph_x1 - graph_x0, &comp);
     let pps = app.ui.timeline.pps.unwrap_or(fit_pps);
     if app.ui.timeline.pps.is_none() {
@@ -3457,6 +3458,23 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
+/// The Timeline now shows `comp`: keeps the time view (zoom and scroll) of the comp it showed
+/// and puts back `comp`'s, or fits a comp it hasn't shown yet. The first comp after launch keeps
+/// the saved view.
+pub(super) fn switch_comp_view(tl: &mut crate::state::TimelineState, comp: u64) {
+    if tl.view_comp == Some(comp) {
+        return;
+    }
+    if let Some(prev) = tl.view_comp {
+        tl.comp_views.insert(prev, (tl.start, tl.pps));
+        let (start, pps) = tl.comp_views.get(&comp).copied().unwrap_or((0.0, None));
+        tl.start = start;
+        tl.pps = pps;
+        tl.before_fit = None;
+    }
+    tl.view_comp = Some(comp);
+}
+
 /// The render times of the frame in the viewer for the Timeline's comp `comp` (the viewer's comp,
 /// or a comp nested in it), and the slowest of its layers, which the Render Time pane's bars are
 /// scaled to.
@@ -3486,6 +3504,46 @@ pub(super) fn render_time_label(ms: f64) -> String {
     if ms < 10.0 { format!("{ms:.1}ms") } else { format!("{ms:.0}ms") }
 }
 
+/// Gap between a Render Time bar and its time, and the narrowest bar worth drawing beside it.
+const RENDER_TIME_GAP: f32 = 6.0;
+const RENDER_TIME_MIN_BAR: f32 = 12.0;
+
+/// Paints a Render Time cell in the part of `cr` that is on screen (the layer columns are cut off
+/// by the graph when the pane is dragged narrow). The time comes first: bar and time while both
+/// fit, else the time alone in the bar's colour, else the time without "ms", else only a swatch
+/// of that colour; a hover shows the full time whenever it is cut.
+#[allow(clippy::too_many_arguments)]
+fn render_time_cell(ui: &egui::Ui, lp: &egui::Painter, cr: Rect, cy: f32, lid: u64, label: &str, share: f32, colour: egui::Color32, text: egui::Color32) {
+    let vis = cr.intersect(lp.clip_rect());
+    if !vis.is_positive() || vis.width() < 1.0 {
+        return;
+    }
+    let cp = lp.with_clip_rect(vis);
+    let font = Tokens::mono(11.0);
+    let width = |s: &str| lp.layout_no_wrap(s.to_owned(), font.clone(), text).size().x;
+    // Every row of the column switches together: the fit is judged on a typical width ("000ms",
+    // "4.6ms") rather than this row's, so a short time doesn't keep its bar beside rows that lost it.
+    let label_w = width(label).max(width("000ms"));
+    let short = label.strip_suffix("ms").unwrap_or(label);
+    let mut cut = false;
+    if vis.width() >= label_w + RENDER_TIME_GAP + RENDER_TIME_MIN_BAR {
+        let bar_w = (vis.width() - label_w - RENDER_TIME_GAP) * share;
+        cp.rect_filled(Rect::from_min_size(vis.min, vec2(bar_w.max(1.0), vis.height())), 1.0, colour.gamma_multiply(0.85));
+        cp.text(pos2(vis.max.x, cy), Align2::RIGHT_CENTER, label, font, text);
+    } else if vis.width() >= label_w {
+        cp.text(pos2(vis.max.x, cy), Align2::RIGHT_CENTER, label, font, colour);
+    } else if vis.width() >= width(short).max(width("000")) {
+        cp.text(pos2(vis.max.x, cy), Align2::RIGHT_CENTER, short, font, colour);
+        cut = true;
+    } else {
+        cp.rect_filled(vis, 1.0, colour.gamma_multiply(0.85));
+        cut = true;
+    }
+    if cut {
+        ui.interact(vis, egui::Id::new(("tl-render-time", lid)), Sense::hover()).on_hover_text(label);
+    }
+}
+
 /// The optional per-layer cells: Comment (double-click to edit), In / Out / Duration (drag to
 /// change by frames), Stretch (click: Time Stretch dialog), Render Time (the layer's time on the
 /// viewer's frame: a bar scaled to the comp's slowest layer, green to red, and the ms).
@@ -3510,9 +3568,9 @@ fn layer_cells(
         && let Some(ms) = times.layer(layer.id)
     {
         let cr = Rect::from_min_max(pos2(cw.render_time + 4.0, r.min.y + 4.0), pos2(cw.render_time + cw.render_time_w - 4.0, r.max.y - 4.0));
+        let ms = if ms.is_finite() { ms.max(0.0) } else { 0.0 };
         let label = render_time_label(ms);
-        let share = if times.slowest > 0.0 { (ms / times.slowest).clamp(0.0, 1.0) as f32 } else { 0.0 };
-        let bar_w = (cr.width() - 46.0).max(0.0) * share;
+        let share = if times.slowest > 0.0 && times.slowest.is_finite() { (ms / times.slowest).clamp(0.0, 1.0) as f32 } else { 0.0 };
         let colour = if share < 1.0 / 3.0 {
             t.cache_green
         } else if share < 2.0 / 3.0 {
@@ -3520,9 +3578,7 @@ fn layer_cells(
         } else {
             t.danger
         };
-        let cp = lp.with_clip_rect(cr.intersect(lp.clip_rect()));
-        cp.rect_filled(Rect::from_min_size(cr.min, vec2(bar_w.max(1.0), cr.height())), 1.0, colour.gamma_multiply(0.85));
-        cp.text(pos2(cr.max.x, cy), Align2::RIGHT_CENTER, &label, Tokens::mono(11.0), t.text_dim);
+        render_time_cell(ui, lp, cr, cy, lid, &label, share, colour, t.text_dim);
         // Scripts and tests read where the time was measured.
         let auto_label = if times.frame.remote { format!("{label} (cloud)") } else { label };
         app.auto.add(&format!("timeline.layer.{lid}.renderTime"), cr, &auto_label);
