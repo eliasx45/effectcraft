@@ -137,7 +137,16 @@ pub trait FxTarget {
     /// Extend the text effect canvas without resampling existing pixels. Backends may
     /// retain their resident image; the default preserves the CPU reference behavior.
     fn effect_canvas(&mut self, size: [f64; 2]) {
-        self.cpu(&mut |buf| crate::fx::text_effect_canvas(buf, size));
+        self.effect_canvas_in([0.0; 2], size);
+    }
+    /// [`Self::effect_canvas`] of the region from `lo` to `hi` (effect-space layer units)
+    /// only: the part of the canvas the effects can make non-transparent.
+    fn effect_canvas_in(&mut self, lo: [f64; 2], hi: [f64; 2]) {
+        self.cpu(&mut |buf| crate::fx::text_effect_canvas_in(buf, lo, hi));
+    }
+    /// The buffer's size, offset and scale, when known without reading it back.
+    fn extent(&self) -> Option<([u32; 2], [f64; 2], f64)> {
+        None
     }
     /// Move the buffer's effect coordinates: subtract `d` (buffer px) from its offset.
     fn shift(&mut self, d: [f64; 2]);
