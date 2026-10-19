@@ -258,6 +258,7 @@ pub const TEXT_ANIMATOR_KINDS: &[(&str, &str)] = &[
     ("fillSaturation", "Fill Color: Saturation"),
     ("fillBrightness", "Fill Color: Brightness"),
     ("fillOpacity", "Fill Color: Opacity"),
+    ("gradientFill", "Gradient Fill"),
     ("strokeColor", "Stroke Color: RGB"),
     ("strokeHue", "Stroke Color: Hue"),
     ("strokeSaturation", "Stroke Color: Saturation"),
@@ -317,6 +318,9 @@ pub fn text_anim_props(ids: &mut Ids, kind: &str, three_d: bool) -> Vec<Property
         "fillSaturation" => vec![pct_slider(ids, "fillSaturation", "Fill Saturation", 0.0, -100.0)],
         "fillBrightness" => vec![pct_slider(ids, "fillBrightness", "Fill Brightness", 0.0, -100.0)],
         "fillOpacity" => vec![pct_slider(ids, "fillOpacity", "Fill Opacity", 100.0, 0.0)],
+        // EffectCraft extension (After Effects has no gradient text animator): see
+        // [`text_gradient_fill_props`].
+        "gradientFill" => text_gradient_fill_props(ids),
         "strokeColor" => vec![ids.prop("strokeColor", "Stroke Color", Value::Color([1.0, 0.0, 0.0, 1.0])).with_ui(ParamUi::Color)],
         "strokeHue" => vec![ids.prop("strokeHue", "Stroke Hue", Value::Scalar(0.0)).with_ui(ParamUi::Angle)],
         "strokeSaturation" => vec![pct_slider(ids, "strokeSaturation", "Stroke Saturation", 0.0, -100.0)],
@@ -334,6 +338,35 @@ pub fn text_anim_props(ids: &mut Ids, kind: &str, three_d: bool) -> Vec<Property
         }
         _ => vec![],
     }
+}
+
+/// Match ids of the Gradient Fill animator properties (an EffectCraft extension).
+pub const GRADIENT_FILL_PROPS: [&str; 4] = ["gradientType", "gradientStart", "gradientEnd", "gradientFillColors"];
+
+/// The default Gradient Fill Colors of a text animator: yellow → orange → red.
+pub fn text_gradient_fill_default() -> Gradient {
+    Gradient {
+        colors: vec![(0.0, [1.0, 0.86, 0.1, 1.0]), (0.5, [1.0, 0.5, 0.05, 1.0]), (1.0, [0.92, 0.12, 0.1, 1.0])],
+        opacities: vec![(0.0, 1.0), (1.0, 1.0)],
+        ..Gradient::default()
+    }
+}
+
+/// Gradient Fill (EffectCraft extension, not in After Effects): the selected characters are
+/// filled with a smooth gradient, per pixel, blended over the fill by the selection like Fill
+/// Color. Gradient Start and End are in percent of the box of the group of characters the
+/// animator's first selector picks (Based On Words: each word; Lines: each line; Characters:
+/// each run of consecutive selected characters; no selector: the whole text): 0,0 is the box's
+/// top left, 100,100 its bottom right, so the default 0,50 → 100,50 runs left to right across
+/// the middle. The box is the characters' outlines in the unanimated layout, and each character
+/// carries its part of the gradient when animators move, rotate or scale it.
+pub fn text_gradient_fill_props(ids: &mut Ids) -> Vec<Property> {
+    vec![
+        fixed(ids.prop("gradientType", "Gradient Type", Value::Enum(0)).with_ui(popup(&["Linear", "Radial"]))),
+        ids.prop("gradientStart", "Gradient Start", Value::Vec2([0.0, 50.0])).with_ui(ParamUi::Percent),
+        ids.prop("gradientEnd", "Gradient End", Value::Vec2([100.0, 50.0])).with_ui(ParamUi::Percent),
+        ids.prop("gradientFillColors", "Gradient Fill Colors", Value::gradient(text_gradient_fill_default())).with_ui(ParamUi::Gradient),
+    ]
 }
 
 fn char_alignment(ids: &mut Ids) -> Property {

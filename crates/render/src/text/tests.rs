@@ -7,21 +7,21 @@ use effectcraft_time::{FrameRate, Tick};
 
 use super::*;
 
-fn setup(w: u32, h: u32) -> (Project, ItemId, Comp) {
+pub(super) fn setup(w: u32, h: u32) -> (Project, ItemId, Comp) {
     let mut p = Project::default();
     let comp = Comp::new(w, h, FrameRate::FPS_30, Tick::from_seconds_f64(4.0));
     let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
     (p, cid, comp)
 }
 
-fn text_layer(p: &mut Project, comp: &Comp, doc: TextDoc) -> Layer {
+pub(super) fn text_layer(p: &mut Project, comp: &Comp, doc: TextDoc) -> Layer {
     let mut l = build::layer(p, comp, "Text", LayerSource::Text, (comp.width, comp.height), None);
     l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(doc));
     l
 }
 
 /// Add an animator with `kinds` and selectors (`range`/`wiggly`/`expression`); returns its index.
-fn animator(p: &mut Project, l: &mut Layer, kinds: &[&str], sels: &[&str]) -> usize {
+pub(super) fn animator(p: &mut Project, l: &mut Layer, kinds: &[&str], sels: &[&str]) -> usize {
     let mut next = p.next_id;
     let mut ids = Ids(&mut next);
     let props = kinds.iter().flat_map(|k| build::text_anim_props(&mut ids, k, false)).collect();
@@ -42,11 +42,11 @@ fn animator(p: &mut Project, l: &mut Layer, kinds: &[&str], sels: &[&str]) -> us
     anims.children.len()
 }
 
-fn set(l: &mut Layer, path: &str, v: Value) {
+pub(super) fn set(l: &mut Layer, path: &str, v: Value) {
     l.props.prop_mut(path).unwrap_or_else(|| panic!("no {path}")).value = v;
 }
 
-fn ctx<'a>(p: &'a Project, cid: ItemId, t: f64) -> EvalCtx<'a> {
+pub(super) fn ctx<'a>(p: &'a Project, cid: ItemId, t: f64) -> EvalCtx<'a> {
     let comp = p.comp(cid).unwrap();
     EvalCtx::new(p, cid, comp, Tick::from_seconds_f64(t))
 }
@@ -332,7 +332,7 @@ fn path_text_follows_a_mask() {
     assert!(first < 40.0 && last > 360.0, "{first} {last}");
 }
 
-fn alpha_bbox(img: &crate::Image) -> Option<[i64; 4]> {
+pub(super) fn alpha_bbox(img: &crate::Image) -> Option<[i64; 4]> {
     let mut b: Option<[i64; 4]> = None;
     for y in 0..img.height as i64 {
         for x in 0..img.width as i64 {
@@ -527,10 +527,11 @@ fn touching_glyphs_join_without_a_seam() {
             apply_fill: true,
             char_index: 0,
             rest: [0.0; 2],
+            fills: None,
         }
     };
     let draw = |glyphs: Vec<PlacedGlyph>, blend: BlendMode| {
-        let geom = TextGeom { doc: TextDoc::default(), glyphs, fill_stroke: 0, blend };
+        let geom = TextGeom { doc: TextDoc::default(), glyphs, fill_stroke: 0, blend, grad_groups: vec![] };
         let mut img = crate::Image::new(24, 20);
         draw_glyphs(&geom, &mut img, &Mat3::IDENTITY, 1.0, None);
         img

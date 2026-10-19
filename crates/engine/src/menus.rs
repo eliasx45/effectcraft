@@ -1035,6 +1035,7 @@ Animation
       Saturation | layer.addTextAnimator {"properties":["fillSaturation"]}
       Brightness | layer.addTextAnimator {"properties":["fillBrightness"]}
       Opacity | layer.addTextAnimator {"properties":["fillOpacity"]}
+    Gradient Fill | layer.addTextAnimator {"properties":["gradientFill"]}
     Stroke Color
       RGB | layer.addTextAnimator {"properties":["strokeColor"]}
       Hue | layer.addTextAnimator {"properties":["strokeHue"]}

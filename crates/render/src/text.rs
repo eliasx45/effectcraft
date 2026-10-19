@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
 use effectcraft_geom::{Mat3, Mat4, Vec3, vec2, vec3};
-use effectcraft_keyframe::{Justify, TextDoc, Value};
+use effectcraft_keyframe::{Gradient, Justify, TextDoc, Value};
 use effectcraft_path::{BezPath, FillRule, StrokeStyle};
 use effectcraft_project::{Layer, PropGroup};
 use effectcraft_raster::Image;
@@ -281,13 +281,202 @@ fn blend_over(acc: &mut Option<[f32; 4]>, acc_k: &mut f32, f: [f32; 4], k: f64) 
     }
 }
 
+/// A Gradient Fill animator's gradient at the context time (an EffectCraft extension, see
+/// `effectcraft_project::build::text_gradient_fill_props`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradSpec {
+    pub gradient: Gradient,
+    /// Start and end in percent of the group's box (0,0 top left, 100,100 bottom right).
+    pub start: [f64; 2],
+    pub end: [f64; 2],
+    pub radial: bool,
+}
+
+/// One colour animator of a glyph's fill, in animator order, while the fill has a gradient: a
+/// flat Fill Color or a Gradient Fill of character group `group` (an index into the layer's
+/// [`GradGroup`]s), each at its selection.
+#[derive(Clone, Debug)]
+enum RawFill {
+    Flat([f32; 4], f32),
+    Grad { spec: std::sync::Arc<GradSpec>, k: f32, group: usize },
+}
+
+/// One layer of a glyph's per-pixel fill (see [`PlacedGlyph::fills`]): a flat colour, or a
+/// gradient whose start and end are points `s`, `e` of the unanimated layout (layer space).
+#[derive(Clone, Debug)]
+pub enum GlyphFill {
+    Flat([f32; 4], f32),
+    Grad { spec: std::sync::Arc<GradSpec>, k: f32, s: [f64; 2], e: [f64; 2] },
+}
+
+impl GlyphFill {
+    /// The gradient's colour at point `p` of the unanimated layout.
+    fn color_at(spec: &GradSpec, s: [f64; 2], e: [f64; 2], p: [f64; 2]) -> [f32; 4] {
+        let (dx, dy) = (e[0] - s[0], e[1] - s[1]);
+        let len2 = dx * dx + dy * dy;
+        let t = if !(len2 > 1e-12) {
+            0.0
+        } else if spec.radial {
+            ((p[0] - s[0]).powi(2) + (p[1] - s[1]).powi(2)).sqrt() / len2.sqrt()
+        } else {
+            ((p[0] - s[0]) * dx + (p[1] - s[1]) * dy) / len2
+        };
+        spec.gradient.sample(if t.is_finite() { t } else { 0.0 })
+    }
+}
+
+/// A glyph's fill while a Gradient Fill selects it: the character's own fill colour and the
+/// colour animators over it, in order.
+#[derive(Clone, Debug)]
+pub struct GradientFill {
+    pub base: [f32; 4],
+    pub layers: Vec<GlyphFill>,
+}
+
+/// The fill of a glyph with Gradient Fill layers at point `p` of the unanimated layout: the
+/// base with each layer lerped over it by its selection in order, then Hue / Saturation /
+/// Brightness / Fill Opacity as for a flat fill.
+pub fn gradient_fill_at(fill: &GradientFill, xf: &CharXf, p: [f64; 2]) -> [f32; 4] {
+    let mut c = fill.base;
+    for f in &fill.layers {
+        let (col, k) = match f {
+            GlyphFill::Flat(col, k) => (*col, *k),
+            GlyphFill::Grad { spec, k, s, e } => (GlyphFill::color_at(spec, *s, *e, p), *k),
+        };
+        let k = k.clamp(0.0, 1.0);
+        c = std::array::from_fn(|d| c[d] + (col[d] - c[d]) * k);
+    }
+    adjust_color(c, None, 0.0, xf.fill_hsb, xf.fill_opacity)
+}
+
+/// A group of characters one Gradient Fill animator paints with one gradient (Based On Words:
+/// a word; Lines: a line; Characters: a run of consecutive selected characters; no selector:
+/// the whole text).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradGroup {
+    /// The animator's uid.
+    pub animator: u64,
+    /// The characters' outlines in the unanimated layout (layer space): x0, y0, x1, y1.
+    pub bbox: [f64; 4],
+    /// Gradient Start / End there (layer space of the unanimated layout).
+    pub start: [f64; 2],
+    pub end: [f64; 2],
+    /// The character (index into the text) whose animation carries the handles: the middle one.
+    pub char_index: usize,
+    /// Every character of the group (indices into the text).
+    pub chars: Vec<usize>,
+}
+
+impl GradGroup {
+    /// A point of the box in percent (0,0 top left, 100,100 bottom right) → layer space of the
+    /// unanimated layout.
+    pub fn from_percent(bbox: [f64; 4], p: [f64; 2]) -> [f64; 2] {
+        [bbox[0] + (bbox[2] - bbox[0]) * p[0] / 100.0, bbox[1] + (bbox[3] - bbox[1]) * p[1] / 100.0]
+    }
+    /// The inverse of [`GradGroup::from_percent`] (a zero-size side maps to 0).
+    pub fn to_percent(bbox: [f64; 4], p: [f64; 2]) -> [f64; 2] {
+        let f = |v: f64, a: f64, b: f64| if (b - a).abs() > 1e-9 { (v - a) / (b - a) * 100.0 } else { 0.0 };
+        [f(p[0], bbox[0], bbox[2]), f(p[1], bbox[1], bbox[3])]
+    }
+}
+
+/// Animator state per glyph, and while any animator has a Gradient Fill, every glyph's fill
+/// layers and the character groups (char indices) the gradients are drawn across.
+struct Animated {
+    xfs: Vec<CharXf>,
+    fills: Option<Vec<Vec<RawFill>>>,
+    groups: Vec<(u64, Vec<usize>)>,
+}
+
+/// The Based On of an animator's first selector (`None` without selectors).
+fn first_based_on(ctx: &EvalCtx, layer: &Layer, anim: &PropGroup) -> Option<BasedOn> {
+    let sel = anim.sub("selectors")?.groups().find(|g| g.enabled)?;
+    let i = match sel.match_id.as_str() {
+        "rangeSelector" => sel.sub("advanced").map(|a| ctx.e(layer, a, "basedOn")).unwrap_or(0),
+        _ => ctx.e(layer, sel, "basedOn"),
+    };
+    Some(BasedOn::from_index(i))
+}
+
+/// Which group (index into `groups`) each glyph belongs to for a Gradient Fill animator, by the
+/// first selector's Based On; `None` for glyphs it does not select.
+fn gradient_groups(based: Option<BasedOn>, sel: &[[f64; 3]], lay: &TextLayout, animator: u64, groups: &mut Vec<(u64, Vec<usize>)>) -> Vec<Option<usize>> {
+    let mut out = vec![None; lay.glyphs.len()];
+    let mut by_unit: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut run: Option<(usize, usize)> = None;
+    for (gi, g) in lay.glyphs.iter().enumerate() {
+        let k = sel.get(gi).map_or(0.0, |k| k[0]);
+        // Spaces draw nothing: a selected one keeps a run of characters going.
+        if g.is_space {
+            if k <= 0.0 {
+                run = None;
+            }
+            continue;
+        }
+        let unit = match based {
+            None => Some(0),
+            Some(BasedOn::Words) => Some(g.word_index),
+            Some(BasedOn::Lines) => Some(g.line_index),
+            Some(BasedOn::Characters | BasedOn::CharactersExcludingSpaces) => None,
+        };
+        let id = match unit {
+            Some(u) => {
+                if k <= 0.0 {
+                    continue;
+                }
+                *by_unit.entry(u).or_insert_with(|| {
+                    groups.push((animator, vec![]));
+                    groups.len() - 1
+                })
+            }
+            None => {
+                if k <= 0.0 {
+                    run = None;
+                    continue;
+                }
+                match run {
+                    Some((line, id)) if line == g.line_index => id,
+                    _ => {
+                        groups.push((animator, vec![]));
+                        let id = groups.len() - 1;
+                        run = Some((g.line_index, id));
+                        id
+                    }
+                }
+            }
+        };
+        if let Some(gr) = groups.get_mut(id) {
+            gr.1.push(g.char_index);
+        }
+        out[gi] = Some(id);
+    }
+    out
+}
+
 /// Evaluate animators for every glyph.
 pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &TextLayout) -> Vec<CharXf> {
+    animate(ctx, layer, text, lay).xfs
+}
+
+fn animate(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &TextLayout) -> Animated {
     let mut out = vec![CharXf::default(); lay.glyphs.len()];
-    let Some(anims) = text.sub("animators") else { return out };
+    let Some(anims) = text.sub("animators") else { return Animated { xfs: out, fills: None, groups: vec![] } };
+    let with_gradient = anims.groups().any(|a| a.enabled && a.sub("properties").is_some_and(|p| p.get("gradientFillColors").is_some()));
+    let mut fills: Option<Vec<Vec<RawFill>>> = with_gradient.then(|| vec![vec![]; lay.glyphs.len()]);
+    let mut groups: Vec<(u64, Vec<usize>)> = vec![];
     for anim in anims.groups().filter(|g| g.enabled) {
         let Some(props) = anim.sub("properties") else { continue };
         let sel = animator_selection(ctx, layer, anim, lay);
+        let grad = props.get("gradientFillColors").and_then(|p| match ctx.value(layer, p) {
+            Value::Gradient(g) => Some(*g),
+            _ => None,
+        });
+        let grad = grad.map(|gradient| {
+            let pct = |m: &str, d: [f64; 2]| props.get(m).map(|p| ctx.value(layer, p).as_vec2()).unwrap_or(d);
+            let radial = props.get("gradientType").is_some_and(|p| ctx.value(layer, p).as_enum() == 1);
+            let spec = GradSpec { gradient, start: pct("gradientStart", [0.0, 50.0]), end: pct("gradientEnd", [100.0, 50.0]), radial };
+            (std::sync::Arc::new(spec), gradient_groups(first_based_on(ctx, layer, anim), &sel, lay, anim.uid, &mut groups))
+        });
         let get = |m: &str| props.get(m).map(|p| ctx.value(layer, p).components());
         let get1 = |m: &str| props.get(m).map(|p| ctx.value(layer, p).as_f64());
         let c3 = |v: Vec<f64>, d: f64| [v.first().copied().unwrap_or(d), v.get(1).copied().unwrap_or(d), v.get(2).copied().unwrap_or(d)];
@@ -365,6 +554,15 @@ pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &Tex
             }
             if let Some(f) = fill {
                 blend_over(&mut c.fill, &mut c.fill_k, f, k);
+                if let Some(layers) = fills.as_mut().and_then(|f| f.get_mut(gi)) {
+                    layers.push(RawFill::Flat(f, k as f32));
+                }
+            }
+            if let Some((spec, by_glyph)) = &grad
+                && let Some(Some(group)) = by_glyph.get(gi)
+                && let Some(layers) = fills.as_mut().and_then(|f| f.get_mut(gi))
+            {
+                layers.push(RawFill::Grad { spec: spec.clone(), k: k as f32, group: *group });
             }
             if let Some(f) = stroke {
                 blend_over(&mut c.stroke, &mut c.stroke_k, f, k);
@@ -433,7 +631,15 @@ pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &Tex
             }
         }
     }
-    out
+    // A glyph no gradient selects keeps the flat fill (the solid path, as before).
+    if let Some(f) = fills.as_mut() {
+        for layers in f.iter_mut() {
+            if !layers.iter().any(|l| matches!(l, RawFill::Grad { k, .. } if *k > 0.0)) {
+                layers.clear();
+            }
+        }
+    }
+    Animated { xfs: out, fills, groups }
 }
 
 /// Character Offset / Character Value substitution (None = unchanged).
@@ -498,6 +704,11 @@ pub struct PlacedGlyph {
     /// Where the pivot sits in the unanimated layout (layer space): `m · (p − rest)` carries a
     /// point of the static layout to where the animation puts this character.
     pub rest: [f64; 2],
+    /// A Gradient Fill selects this character: the fill is painted per pixel from the base fill
+    /// and these layers ([`gradient_fill_at`] at the point of the unanimated layout), and
+    /// [`PlacedGlyph::fill`] holds its colour at the middle of the first gradient (for lint,
+    /// extrusions and text → shapes). `None`: the flat `fill`, as without gradients.
+    pub fills: Option<std::sync::Arc<GradientFill>>,
 }
 
 impl PlacedGlyph {
@@ -521,6 +732,8 @@ pub struct TextGeom {
     /// all fills.
     pub fill_stroke: u32,
     pub blend: BlendMode,
+    /// The Gradient Fill character groups, by animator in order, each in text order.
+    pub grad_groups: Vec<GradGroup>,
 }
 
 fn adjust_color(base: [f32; 4], rgb: Option<[f32; 4]>, k: f32, hsb: [f64; 3], opacity: f64) -> [f32; 4] {
@@ -693,7 +906,7 @@ fn text_geom_uncached(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
     let doc = source_text(ctx, layer)?;
     let text = layer.props.sub("text")?;
     let lay = layout_doc(&doc);
-    let xfs = char_transforms(ctx, layer, text, &lay);
+    let Animated { xfs, fills: raw_fills, groups } = animate(ctx, layer, text, &lay);
     let three = per_char_3d(ctx, layer);
     let more = text.sub("moreOptions");
     let grouping = more.map(|m| ctx.e(layer, m, "anchorGrouping")).unwrap_or(0);
@@ -705,7 +918,7 @@ fn text_geom_uncached(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
     // Character substitutions (Character Offset / Value). Adjust Kerning re-lays out the text.
     let mut subs: Vec<Option<char>> = lay.glyphs.iter().zip(&xfs).map(|(g, x)| substitute(g.ch, x)).collect();
     let relayout = subs.iter().zip(&xfs).any(|(s, x)| s.is_some() && x.char_align == 3);
-    let (lay, xfs) = if relayout {
+    let (lay, xfs, raw_fills) = if relayout {
         let mut chars: Vec<char> = doc.text.chars().collect();
         for (g, s) in lay.glyphs.iter().zip(&subs) {
             if let (Some(c), Some(slot)) = (s, chars.get_mut(g.char_index)) {
@@ -717,10 +930,14 @@ fn text_geom_uncached(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
         let l2 = layout_doc(&d2);
         let by_char: std::collections::HashMap<usize, CharXf> = lay.glyphs.iter().zip(&xfs).map(|(g, x)| (g.char_index, *x)).collect();
         let x2: Vec<CharXf> = l2.glyphs.iter().map(|g| by_char.get(&g.char_index).copied().unwrap_or_default()).collect();
+        let f2 = raw_fills.map(|f| {
+            let by_char: std::collections::HashMap<usize, &Vec<RawFill>> = lay.glyphs.iter().zip(&f).map(|(g, x)| (g.char_index, x)).collect();
+            l2.glyphs.iter().map(|g| by_char.get(&g.char_index).map(|v| (*v).clone()).unwrap_or_default()).collect::<Vec<_>>()
+        });
         subs = vec![None; l2.glyphs.len()];
-        (l2, x2)
+        (l2, x2, f2)
     } else {
-        (lay, xfs)
+        (lay, xfs, raw_fills)
     };
 
     // Variable Font Axes: the advance at the animated design-space position (later characters
@@ -818,6 +1035,9 @@ fn text_geom_uncached(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
 
     let base = doc.base_style();
     let mut glyphs = Vec::with_capacity(n);
+    // Gradient Fill: each group's box in the unanimated layout, and the glyphs to finish.
+    let mut boxes: Vec<[f64; 4]> = vec![[f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY]; groups.len()];
+    let mut pending: Vec<(usize, Vec<RawFill>, [f32; 4])> = vec![];
     for gi in 0..n {
         let g = &lay.glyphs[gi];
         let mut x = xfs[gi];
@@ -880,6 +1100,20 @@ fn text_geom_uncached(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
         let stroke = adjust_color(st.stroke, x.stroke, x.stroke_k, x.stroke_hsb, x.stroke_opacity);
         let base_stroke_w = if st.apply_stroke { st.stroke_width } else { 0.0 };
         let rest = [pivot[0] - (o[0] - g.origin.x), pivot[1] - (o[1] - g.origin.y)];
+        if let Some(layers) = raw_fills.as_ref().and_then(|f| f.get(gi)).filter(|l| !l.is_empty()) {
+            // The outline in the unanimated layout: character space + rest.
+            if let Some(b) = effectcraft_path::bounds(std::slice::from_ref(&local)) {
+                let (x0, y0, x1, y1) = (b.x0 + rest[0], b.y0 + rest[1], b.x1 + rest[0], b.y1 + rest[1]);
+                for l in layers {
+                    if let RawFill::Grad { group, .. } = l
+                        && let Some(bx) = boxes.get_mut(*group)
+                    {
+                        *bx = [bx[0].min(x0), bx[1].min(y0), bx[2].max(x1), bx[3].max(y1)];
+                    }
+                }
+            }
+            pending.push((glyphs.len(), layers.clone(), st.fill));
+        }
         glyphs.push(PlacedGlyph {
             local,
             m,
@@ -890,9 +1124,72 @@ fn text_geom_uncached(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
             apply_fill: st.apply_fill,
             char_index: g.char_index,
             rest,
+            fills: None,
         });
     }
-    Some(TextGeom { doc, glyphs, fill_stroke, blend })
+    let grad_groups = finish_gradients(&mut glyphs, pending, &groups, &boxes);
+    Some(TextGeom { doc, glyphs, fill_stroke, blend, grad_groups })
+}
+
+/// Gradient Fill: each group's start and end points from its box, and each selected glyph's
+/// fill layers with them (its flat `fill` becomes its colour at the middle of the gradient).
+fn finish_gradients(
+    glyphs: &mut [PlacedGlyph],
+    pending: Vec<(usize, Vec<RawFill>, [f32; 4])>,
+    groups: &[(u64, Vec<usize>)],
+    boxes: &[[f64; 4]],
+) -> Vec<GradGroup> {
+    let mut specs: Vec<Option<std::sync::Arc<GradSpec>>> = vec![None; groups.len()];
+    for (_, layers, _) in &pending {
+        for l in layers {
+            if let RawFill::Grad { spec, group, .. } = l
+                && let Some(slot) = specs.get_mut(*group)
+            {
+                *slot = Some(spec.clone());
+            }
+        }
+    }
+    let ends: Vec<Option<([f64; 2], [f64; 2])>> = specs
+        .iter()
+        .zip(boxes)
+        .map(|(spec, b)| {
+            let spec = spec.as_ref()?;
+            (b[0].is_finite() && b[2] >= b[0]).then(|| (GradGroup::from_percent(*b, spec.start), GradGroup::from_percent(*b, spec.end)))
+        })
+        .collect();
+    for (gi, layers, st_fill) in pending {
+        let Some(g) = glyphs.get_mut(gi) else { continue };
+        let fills: Vec<GlyphFill> = layers
+            .into_iter()
+            .filter_map(|l| match l {
+                RawFill::Flat(c, k) => Some(GlyphFill::Flat(c, k)),
+                RawFill::Grad { spec, k, group } => {
+                    let (s, e) = ends.get(group).copied().flatten()?;
+                    Some(GlyphFill::Grad { spec, k, s, e })
+                }
+            })
+            .collect();
+        let mid = fills.iter().find_map(|f| match f {
+            GlyphFill::Grad { s, e, .. } => Some([(s[0] + e[0]) / 2.0, (s[1] + e[1]) / 2.0]),
+            GlyphFill::Flat(..) => None,
+        });
+        if let Some(mid) = mid {
+            let gf = GradientFill { base: st_fill, layers: fills };
+            g.fill = gradient_fill_at(&gf, &g.xf, mid);
+            g.fills = Some(std::sync::Arc::new(gf));
+        }
+    }
+    groups
+        .iter()
+        .zip(boxes)
+        .zip(&ends)
+        .filter_map(|(((animator, chars), b), se)| {
+            let (start, end) = (*se)?;
+            let drawn: Vec<usize> = chars.iter().copied().filter(|c| glyphs.iter().any(|g| g.char_index == *c)).collect();
+            let char_index = drawn.get(drawn.len() / 2).or(chars.first()).copied()?;
+            Some(GradGroup { animator: *animator, bbox: *b, start, end, char_index, chars: chars.clone() })
+        })
+        .collect()
 }
 
 /// Outlines of all glyphs in layer space with their animation state (for text → shapes, bounds
@@ -948,9 +1245,54 @@ fn raster_pass(g: &PlacedGlyph, stroke: bool, paths: &[BezPath], m: &Mat3, rect:
     } else {
         effectcraft_path::fill_coverage(paths, &mm, w, h, FillRule::NonZero)
     };
-    let col = if stroke { g.stroke } else { g.fill };
     let op = (g.xf.opacity / 100.0).clamp(0.0, 1.0) as f32;
+    // Gradient Fill: the colour per pixel, at the pixel centre's point of the unanimated layout
+    // (one glyph per pass: `m` maps its character space, `rest` carries that to the layout).
+    if !stroke
+        && let Some(fills) = &g.fills
+        && let Some(inv) = mm.inverse()
+    {
+        let colors: Vec<[f32; 4]> = (0..h as usize)
+            .flat_map(|y| (0..w as usize).map(move |x| (x, y)))
+            .zip(&cov.data)
+            .map(|((x, y), c)| {
+                if *c <= 0.0 {
+                    return [0.0; 4];
+                }
+                let q = inv.apply(vec2(x as f64 + 0.5, y as f64 + 0.5));
+                gradient_fill_at(fills, &g.xf, [q.x + g.rest[0], q.y + g.rest[1]])
+            })
+            .collect();
+        return paint_coverage_colors(&cov.data, &colors, op, w, h, blur_px);
+    }
+    let col = if stroke { g.stroke } else { g.fill };
     paint_coverage(&cov.data, col, col[3] * op, w, h, blur_px)
+}
+
+/// [`paint_coverage`] with a colour per pixel (straight RGBA): premultiplied colour × coverage,
+/// each channel blurred on its own when the character has Blur.
+fn paint_coverage_colors(cov: &[f32], colors: &[[f32; 4]], op: f32, w: u32, h: u32, blur_px: [f64; 2]) -> Image {
+    let mut img = Image::new(w, h);
+    for ((px, c), col) in img.data.iter_mut().zip(cov).zip(colors) {
+        let k = c * col[3] * op;
+        if k > 0.0 {
+            *px = [col[0] * k, col[1] * k, col[2] * k, k];
+        }
+    }
+    if blur_px[0] <= 0.05 && blur_px[1] <= 0.05 {
+        return img;
+    }
+    let (pw, ph) = (w as usize, h as usize);
+    let planes: Vec<Vec<f32>> = (0..4)
+        .map(|d| {
+            let plane: Vec<f32> = img.data.iter().map(|p| p[d]).collect();
+            effectcraft_raster::gaussian_blur_plane(&plane, pw, ph, blur_px[0] / 2.0, blur_px[1] / 2.0, false)
+        })
+        .collect();
+    for (i, px) in img.data.iter_mut().enumerate() {
+        *px = std::array::from_fn(|d| planes.get(d).and_then(|p| p.get(i)).copied().unwrap_or(0.0));
+    }
+    img
 }
 
 /// A `w`×`h` patch of colour `col` (alpha `a`) × `cov`, blurred by `blur_px` (premultiplied).
@@ -1012,7 +1354,7 @@ fn blit(dst: &mut Image, src: &Image, at: [i64; 2], mode: BlendMode) {
 /// An opaque, unblurred fill pass: where such fills of one colour touch or overlap, compositing
 /// them one by one would let their anti-aliased edges show the background through.
 fn solid_fill(g: &PlacedGlyph, stroke: bool) -> bool {
-    !stroke && g.xf.blur == [0.0; 2] && g.fill[3] >= 1.0 && g.xf.opacity >= 100.0
+    !stroke && g.fills.is_none() && g.xf.blur == [0.0; 2] && g.fill[3] >= 1.0 && g.xf.opacity >= 100.0
 }
 
 /// The passes in drawing order, consecutive opaque fills of one colour gathered into a run that
@@ -1242,3 +1584,5 @@ pub fn per_char_planes(ctx: &EvalCtx, layer: &Layer, s: f64) -> Vec<(Buf, Mat4)>
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_gradient;
