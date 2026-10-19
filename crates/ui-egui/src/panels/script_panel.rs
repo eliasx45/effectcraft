@@ -9,7 +9,7 @@
 //! - A click on a word opens the word wheel (`script.word`): Pop text, Caption, Pill, Highlight,
 //!   Zoom punch, SFX, Copy for Claude, Preset…; the item's peak lands on the stressed syllable.
 //! - A drag across words opens the phrase popover (floating, it never moves the lines): the split
-//!   button "Caption · <pick>" with the Motion Library text animations (`text.presets`) and
+//!   button "Caption · <pick>" with the Motion Library text animations (`text.presetFamilies`) and
 //!   "Preset… (Motion Library)", the add-on toggles sync / +glow / near·mid·far (SX6), Views
 //!   Counter when the phrase has a number, Copy for Claude.
 //! - Emphasis glow (brighter = said harder), a gap bar where the voice runs on with no animation,
@@ -49,7 +49,7 @@ struct PanelState {
     preset_list: bool,
     /// The word the wheel was opened on.
     wheel_word: Option<usize>,
-    /// The text animation the phrase button applies (`text.presets` short name, "T3b").
+    /// The text animation the phrase button applies (`text.presetFamilies` short name, "T3b").
     pick: Option<String>,
     /// SX6 add-ons.
     sync: bool,
@@ -58,7 +58,7 @@ struct PanelState {
     /// `script.get` cache: (comp, revision, result).
     #[serde(skip)]
     cache: Option<(u64, u64, Value)>,
-    /// `text.presets` (short name, label) and Motion Library presets (id, name), read once.
+    /// `text.presetFamilies` (short name, label) and Motion Library presets (id, name), read once.
     #[serde(skip)]
     text_presets: Option<Vec<(String, String)>>,
     #[serde(skip)]
@@ -102,32 +102,6 @@ fn word_items() -> Vec<WheelItem> {
     ]
 }
 
-/// Text animations from `text.presets` (lane D): every object with a short name (`short`,
-/// `preset` or `id`) and a `name`, wherever it sits in the result.
-/// TODO(batch1-verify): text.presets' result shape (lane D); the old text_anim `text.presets` id
-/// is the same id.
-fn collect_presets(v: &Value, out: &mut Vec<(String, String)>, depth: usize) {
-    if depth > 6 || out.len() >= 64 {
-        return;
-    }
-    match v {
-        Value::Object(o) => {
-            let short = ["short", "preset", "id"].iter().find_map(|k| o.get(*k).and_then(Value::as_str));
-            let name = o.get("name").and_then(Value::as_str);
-            if let (Some(s), Some(n)) = (short, name)
-                && !o.contains_key("variants")
-            {
-                out.push((s.to_string(), n.to_string()));
-            }
-            for x in o.values() {
-                collect_presets(x, out, depth + 1);
-            }
-        }
-        Value::Array(a) => a.iter().for_each(|x| collect_presets(x, out, depth + 1)),
-        _ => {}
-    }
-}
-
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: egui::Rect) {
     let ctx = ui.ctx().clone();
     let t = app.tokens;
@@ -152,7 +126,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: egui::Rect) {
     }
     phrase_popover(app, &ctx, &mut st, &mut actions);
     for (id, p) in actions {
-        if let Err(e) = crate::menus::invoke(app, &ctx, &id, p) {
+        // text.apply runs its followUp (the glow style) too.
+        let r = if id == "text.apply" { super::text_apply::run(app, &ctx, p) } else { crate::menus::invoke(app, &ctx, &id, p) };
+        if let Err(e) = r {
             app.ui.status = e;
         }
         // Anything run may change what the script shows.
@@ -445,14 +421,11 @@ fn phrase_popover(app: &mut EffectcraftApp, ctx: &egui::Context, st: &mut PanelS
     let stressed = words.iter().find(|w| w.stressed().is_some()).map(|w| w.word.clone());
     let has_number = text.chars().any(|c| c.is_ascii_digit());
     if st.text_presets.is_none() {
-        let mut v = vec![];
-        if let Ok(r) = app.session.execute("text.presets", json!({})) {
-            collect_presets(&r, &mut v, 0);
-        }
-        st.text_presets = Some(v);
+        // Lane D's listing (`text.presets` is text_anim's built-in animator presets).
+        st.text_presets = Some(super::text_apply::preset_list(app));
     }
     if st.preset_list && st.library.is_none() {
-        // TODO(batch1-verify): library.search's result shape ({entries: [{id, name}]}).
+        // library.search → {total, entries: [{id, name, …}]} (checked in commands/library.rs).
         let r = app.session.execute("library.search", json!({"query": "text", "limit": 24})).unwrap_or(Value::Null);
         let list = r
             .get("entries")
@@ -485,11 +458,11 @@ fn phrase_popover(app: &mut EffectcraftApp, ctx: &egui::Context, st: &mut PanelS
                     app.auto.add("script.phrase.caption", main.rect, "Caption this");
                     if main.clicked() {
                         match &st.pick {
-                            // TODO(batch1-verify): text.apply's params (lane D): `words` as the phrase's text,
-                            // `from`/`to` speech-map indices not in its pinned list.
+                            // Lane D's text.apply takes the phrase as speech-map word indices
+                            // (`words: [from, to]`: this occurrence, not the first one said).
                             Some(p) => actions.push((
                                 "text.apply".into(),
-                                json!({"preset": p, "words": text, "word": stressed, "sync": st.sync, "glow": st.glow, "distance": st.distance}),
+                                json!({"preset": p, "words": [a, b], "word": stressed, "sync": st.sync, "glow": st.glow, "distance": st.distance}),
                             )),
                             None => actions.push(("word.apply".into(), json!({"from": a, "to": b, "item": "caption"}))),
                         }

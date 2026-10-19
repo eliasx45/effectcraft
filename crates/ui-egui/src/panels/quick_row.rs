@@ -106,7 +106,7 @@ pub fn default_pins() -> Vec<QuickPin> {
     vec![
         QuickPin::new("Graphs", "Fast In ↑", "Devin ▸ Graphs ▸ Fast In", FAST_IN, json!({})),
         QuickPin::new("Graphs", "G ▾", "Devin ▸ Graphs (the Graph wheel; hold G)", GRAPH_WHEEL, json!({})),
-        // TODO(batch1-verify): text.apply is lane D's command (Batch 1b); AX9 adds the add-on chips.
+        // Lane D's text.apply (AX9 adds the add-on chips; run through `text_apply::run`).
         QuickPin::new("Text", "T3b ↑", "Elias ▸ Text animations ▸ T3b Pop · mid", "text.apply", json!({"preset": "T3b"})),
         QuickPin::new(
             "Text",
@@ -196,11 +196,15 @@ pub fn run_pin(app: &mut EffectcraftApp, ctx: &egui::Context, pin: &QuickPin, at
                 return;
             }
             let mut params = if pin.params.is_object() { pin.params.clone() } else { json!({}) };
-            // AX9: the Text group's add-on chips change how text presets apply.
-            if pin.group == "Text" && id == "text.apply" {
+            // AX9: the Text group's add-on chips change how text presets apply; text.apply's
+            // followUp (the glow style) runs after it.
+            let r = if id == "text.apply" {
                 add_text_options(app, &mut params);
-            }
-            match crate::menus::invoke(app, ctx, id, params) {
+                super::text_apply::run(app, ctx, params)
+            } else {
+                crate::menus::invoke(app, ctx, id, params)
+            };
+            match r {
                 Ok(_) => toast(app, ctx, format!("{} applied", pin.label)),
                 Err(e) => app.ui.status = e,
             }
@@ -208,8 +212,13 @@ pub fn run_pin(app: &mut EffectcraftApp, ctx: &egui::Context, pin: &QuickPin, at
     }
 }
 
-/// AX9: the Text add-on chips' options on a `text.apply` call (lane D's command).
+/// AX9: the Text add-on chips' options on a `text.apply` call (lane D's command). The selected
+/// layers are passed as `layers`: with only `word`, text.apply would make a new layer instead of
+/// animating the selection.
 fn add_text_options(app: &EffectcraftApp, params: &mut Value) {
+    if params.get("layers").is_none() {
+        params["layers"] = json!(app.session.state.selected_layers.iter().map(|l| l.0).collect::<Vec<_>>());
+    }
     let q = &app.ui.timeline.quick_row;
     params["sync"] = json!(q.text_sync);
     params["glow"] = json!(q.text_glow);
@@ -221,8 +230,9 @@ fn add_text_options(app: &EffectcraftApp, params: &mut Value) {
     }
 }
 
-/// The word of the comp's speech map nearest the playhead (stressed words first).
-// TODO(batch1-verify): lane B (SX1) may move the speech map onto the voice layer; this reads `comp.speech`.
+/// The word of the comp's speech map nearest the playhead (stressed words first), among the words
+/// that can be heard: lane B (SX1) keeps the words in `comp.speech` (comp time, moved with the
+/// voice layer) and hides the ones trimmed off the voice layer (`SpeechMap::audible`).
 pub fn word_at_playhead(app: &EffectcraftApp) -> Option<String> {
     let comp = app.session.active_comp()?;
     let map = comp.speech.as_ref()?;
@@ -238,12 +248,13 @@ pub fn word_at_playhead(app: &EffectcraftApp) -> Option<String> {
         }
     };
     let stressed = |w: &&effectcraft_engine::project::speech::SpeechWord| w.syllables.iter().any(|s| s.stress == 1);
-    let best = map
-        .words
+    let heard: Vec<&effectcraft_engine::project::speech::SpeechWord> = map.audible(comp).map(|(_, w)| w).collect();
+    let best = heard
         .iter()
+        .copied()
         .filter(stressed)
         .min_by(|a, b| dist(*a).total_cmp(&dist(*b)))
-        .or_else(|| map.words.iter().min_by(|a, b| dist(*a).total_cmp(&dist(*b))))?;
+        .or_else(|| heard.iter().copied().min_by(|a, b| dist(*a).total_cmp(&dist(*b))))?;
     Some(best.word.clone())
 }
 

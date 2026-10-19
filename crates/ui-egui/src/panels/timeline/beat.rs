@@ -54,12 +54,24 @@ pub(crate) const ON_BEAT: f64 = 1.5;
 /// A dragged key snaps when its peak comes this close to an accent (frames).
 pub(crate) const SNAP_FRAMES: f64 = 2.0;
 
-/// The comp's stressed syllables: (word, accent comp seconds), in time order.
-// TODO(batch1-verify): lane B (SX1) may move the speech map onto the voice layer; this reads `comp.speech`.
+/// The comp's stressed syllables that can be heard: (word, accent comp seconds), in time order.
+/// Lane B (SX1) keeps the words in `comp.speech` in comp time and moves them with their voice
+/// layer on every edit; words outside the voice layer's in/out are trimmed away
+/// ([`SpeechMap::voice_span`](effectcraft_engine::project::speech::SpeechMap::voice_span)).
 pub(crate) fn accents(comp: &Comp) -> Vec<(String, f64)> {
     let Some(map) = comp.speech.as_ref() else { return vec![] };
     let fps = comp.frame_rate.as_f64();
-    map.stressed().into_iter().map(|(w, s)| (w.word.clone(), lint::accent_time(s, fps, lint::DEFAULT_ACCENT_LEAD))).collect()
+    let (a, b) = map.voice_span(comp);
+    map.stressed()
+        .into_iter()
+        .filter(|(w, _)| w.end > a && w.start < b)
+        .map(|(w, s)| (w.word.clone(), lint::accent_time(s, fps, lint::DEFAULT_ACCENT_LEAD)))
+        .collect()
+}
+
+/// The comp's voice layer (its words move with it, so it never snaps onto them).
+fn is_voice(comp: &Comp, layer: &Layer) -> bool {
+    comp.speech.as_ref().and_then(|m| m.layer) == Some(layer.id)
 }
 
 fn nearest(accents: &[(String, f64)], t: f64) -> Option<&(String, f64)> {
@@ -192,6 +204,9 @@ pub(crate) fn snap_line(p: &Painter, tm: TMap, rows: Rect, snap: &Snap) {
 /// its first move's speed peak (or, without keys, its in point) snaps onto the nearest stressed
 /// syllable within [`SNAP_FRAMES`]. `None` without a speech map (the Timeline's own drag then).
 pub(crate) fn layer_drag_target(comp: &Comp, layer: &Layer, desired_in: f64) -> Option<(f64, Option<Snap>)> {
+    if is_voice(comp, layer) {
+        return None;
+    }
     let acc = accents(comp);
     if acc.is_empty() {
         return None;

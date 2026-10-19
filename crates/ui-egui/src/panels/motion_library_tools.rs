@@ -335,9 +335,7 @@ fn keyed_props(s: &effectcraft_engine::Session) -> Vec<String> {
 /// (`text.unitBounce`).
 fn reveal_keys(s: &effectcraft_engine::Session) -> bool {
     let Some(c) = s.active_comp() else { return false };
-    s.state.selected_keys.iter().any(|k| {
-        c.layer(k.layer).and_then(|l| l.props.match_path_of(k.prop)).is_some_and(|m| is_range_reveal(&m))
-    })
+    s.state.selected_keys.iter().any(|k| c.layer(k.layer).and_then(|l| l.props.match_path_of(k.prop)).is_some_and(|m| is_range_reveal(&m)))
 }
 
 /// `text/animators/animator#2/selectors/rangeSelector/offset` and the like
@@ -1054,7 +1052,12 @@ fn bounce_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set:
     let reveal = reveal_keys(&app.session);
     if reveal {
         let t = app.tokens;
-        note(ui, c, &t, "Range Selector keys only reveal (Ramp Up clamps them), so Apply spring bounces each unit as the reveal reaches it: an animator with an Expression Selector moves Position; the reveal keeps the opacity.");
+        note(
+            ui,
+            c,
+            &t,
+            "Range Selector keys only reveal (Ramp Up clamps them), so Apply spring bounces each unit as the reveal reaches it: an animator with an Expression Selector moves Position; the reveal keeps the opacity.",
+        );
     }
     choice_row(app, ui, c, "motionLibrary.tools.bounce.motion", "Motion", &MOTIONS, &mut set.motion);
     set.strength = number_row(app, ui, c, "motionLibrary.tools.bounce.strength", "Strength (%)", set.strength, STRENGTH, 0);
@@ -1506,7 +1509,13 @@ pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: 
         let (Some(name), Some(count)) = (f["family"].as_str(), f["count"].as_u64()) else { continue };
         let size = f["size"].as_f64().unwrap_or(100.0);
         p.text(pos2(x0, y + 9.0 * s), Align2::LEFT_CENTER, name, Tokens::semibold(12.0 * s), t.text);
-        p.text(pos2(x0 + 150.0 * s, y + 9.0 * s), Align2::LEFT_CENTER, format!("{count} layer{}", if count == 1 { "" } else { "s" }), Tokens::ui(11.0 * s), t.text_dim);
+        p.text(
+            pos2(x0 + 150.0 * s, y + 9.0 * s),
+            Align2::LEFT_CENTER,
+            format!("{count} layer{}", if count == 1 { "" } else { "s" }),
+            Tokens::ui(11.0 * s),
+            t.text_dim,
+        );
         // Size: the slider shows the value while dragging; letting go runs the command once.
         let drag_id = egui::Id::new(("ml-family-size", name));
         let mut v: f64 = ctx.data(|d| d.get_temp(drag_id)).unwrap_or(size);
@@ -1565,7 +1574,7 @@ fn text_animations(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Cont
     y += 26.0 * s;
     let cache = egui::Id::new("ml-text-families-cache");
     let rev = app.session.revision;
-    // TODO(batch1-verify): lane D's listing is `text.presetFamilies` (the brief said `text.presets`).
+    // Lane D's listing: `text.presetFamilies` (`text.presets` is text_anim's built-in presets).
     let list: Value = match ctx.data(|d| d.get_temp::<(u64, Value)>(cache)) {
         Some((r, v)) if r == rev => v,
         _ => {
@@ -1608,7 +1617,8 @@ fn text_animations(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Cont
         y += 26.0 * s;
     }
     if let Some(short) = apply {
-        match crate::menus::invoke(app, ctx, "text.apply", json!({"preset": short})) {
+        // On the selected text layers; text.apply's followUp (the glow style) runs too.
+        match super::text_apply::run(app, ctx, json!({"preset": short})) {
             Ok(_) => app.toast = Some((format!("{short} applied"), ctx.input(|i| i.time))),
             Err(e) => app.ui.status = e,
         }

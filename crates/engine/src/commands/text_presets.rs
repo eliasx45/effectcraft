@@ -29,11 +29,9 @@ use super::{CommandSpec, b_p, bad, comp_id, has_comp, layers_p, str_p, unlocked}
 use crate::{EngineError, Result, Session, cmd, lint, query};
 
 const C: &str = "text.apply";
-// The listing is `text.presetFamilies`.
-// TODO(batch1-verify): the brief names it `text.presets`, but `text_anim.rs` already registers
-// `text.presets` (the built-in animator presets; `tests_text.rs` and the unique-id test in
-// `tests.rs` rely on it). Lane B's phrase popover reads `text.presets` for its list: point it at
-// `text.presetFamilies` (`families[].variants[].short`) in the integration pass.
+// The listing is `text.presetFamilies`: the brief named it `text.presets`, but `text_anim.rs`
+// already registers that id (the built-in animator presets; `tests_text.rs` and the unique-id test
+// in `tests.rs` rely on it). The UI lists presets through `panels/text_apply.rs` (integration pass).
 /// Elias's workshop comp: one layer per variation.
 pub const WORKSHOP: &str = "Creating Text Presets";
 /// The Motion Library text style `glow` applies.
@@ -1011,9 +1009,10 @@ fn apply_glow(s: &mut Session, cid: ItemId, targets: &[LayerId], notes: &mut Vec
     let hit = entries.iter().find(|e| e.get("name").and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(GLOW_STYLE))).or(entries.first());
     match hit.and_then(|e| e.get("id")).and_then(Value::as_str) {
         Some(id) => {
-            // TODO(batch1-verify): `motionLibrary.apply` is a UI command (the Motion Library's plug
-            // applies text styles): lane A's chips / lane B's popover run `followUp` after
-            // text.apply; agents run it with command_run. The target layers are selected.
+            // `motionLibrary.apply` is a UI command (the Motion Library's plug applies text styles):
+            // the app runs `followUp` after text.apply (`panels/text_apply.rs`: the quick row, the
+            // Script tab, Motion Library ▸ Families); agents run it with command_run. The target
+            // layers are selected.
             notes.push(format!("{GLOW_STYLE}: run followUp (motionLibrary.apply) to add it"));
             Ok(json!({"applied": false, "source": "motion", "card": id, "followUp": {"command": "motionLibrary.apply", "params": {"id": id}}}))
         }
