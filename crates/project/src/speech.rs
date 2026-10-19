@@ -100,12 +100,14 @@ impl SpeechMap {
     }
 
     /// Where the words can be heard in `comp`: its voice layer's in/out, or everywhere when the map
-    /// has no voice layer (or the layer is gone). Words outside it are trimmed away.
+    /// has no voice layer (or the layer is gone), always inside the comp's own 0..duration (a voice
+    /// layer longer than the comp is not heard past its end). Words outside it are trimmed away.
     pub fn voice_span(&self, comp: &Comp) -> (Tick, Tick) {
-        match self.layer.and_then(|l| comp.layer(l)) {
+        let (a, b) = match self.layer.and_then(|l| comp.layer(l)) {
             Some(l) => (l.in_point, l.out_point),
             None => (Tick::MIN, Tick::MAX),
-        }
+        };
+        (a.max(Tick::ZERO), b.min(comp.duration))
     }
 
     /// Indices of the words audible in `comp` (inside [`Self::voice_span`]).
@@ -416,6 +418,7 @@ pub fn emphasis(words: &[SpeechWord]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use effectcraft_time::FrameRate;
 
     fn w(word: &str, a: f64, b: f64) -> SpeechWord {
         SpeechWord { word: word.into(), start: Tick::from_seconds_f64(a), end: Tick::from_seconds_f64(b), syllables: vec![] }
@@ -432,6 +435,18 @@ mod tests {
         assert_eq!(lines[0].adlibs(), 1, "“really” is an ad-lib");
         assert_eq!((lines[0].first, lines[0].last), (Some(0), Some(6)));
         assert!(lines[1].cut());
+    }
+
+    #[test]
+    fn words_past_the_comp_end_or_before_its_start_are_not_audible() {
+        // BUILD2 AX7: a 575 s voice layer in a 12 s comp; Find word counted (and jumped to) words
+        // after the comp's end.
+        let mut comp = Comp::new(1920, 1080, FrameRate::new(30, 1), Tick::from_seconds_f64(12.0));
+        let map = SpeechMap { words: vec![w("before", -2.0, -1.5), w("in", 1.0, 1.5), w("after", 13.0, 13.5)], ..Default::default() };
+        let heard: Vec<&str> = map.audible(&comp).map(|(_, x)| x.word.as_str()).collect();
+        assert_eq!(heard, ["in"]);
+        comp.duration = Tick::from_seconds_f64(20.0);
+        assert_eq!(map.audible(&comp).count(), 2);
     }
 
     #[test]
