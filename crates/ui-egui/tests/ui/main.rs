@@ -227,3 +227,5 @@ mod ui_media_browser_copy_path;
 mod ui_timeline_effect_label;
 #[path = "../ui_viewer_trackpad.rs"]
 mod ui_viewer_trackpad;
+#[path = "../ui_parent_selection.rs"]
+mod ui_parent_selection;

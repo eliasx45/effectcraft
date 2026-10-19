@@ -200,6 +200,13 @@ fn pick_whip_id() -> egui::Id {
     egui::Id::new("tl-pickwhip")
 }
 
+/// The layers a Parent pick whip or Parent menu on layer `id` sets: every selected layer when `id`
+/// is one of them (as in After Effects), else just `id`. `layer.setParent` skips the parent and
+/// any layer that would make a cycle.
+fn parent_targets(selected: &[LayerId], id: u64) -> Vec<u64> {
+    if selected.contains(&LayerId(id)) { selected.iter().map(|l| l.0).collect() } else { vec![id] }
+}
+
 /// A pick whip at `rect`: dragging it starts a pick whip of `kind` from `layer`'s `prop` (0 for
 /// the layer's own), drawn and dropped at the end of [`show`].
 #[allow(clippy::too_many_arguments)]
@@ -2125,7 +2132,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     if let Some(i) = widgets::popup_menu(ui, pop, pr_rect.left_bottom(), &popts, None) {
                         let par = if i == 0 { serde_json::Value::Null } else { json!(cands[i - 2].id.0) };
-                        actions.push(("layer.setParent".into(), json!({"layers": [layer.id.0], "parent": par})));
+                        actions.push(("layer.setParent".into(), json!({"layers": parent_targets(&selected, layer.id.0), "parent": par})));
                     }
                 }
                 // Layer bar.
@@ -3007,7 +3014,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             };
             match (kind, target, prop_target) {
                 (WHIP_PARENT, Some((_, row)), _) if row.layer.0 != src_layer => {
-                    actions.push(("layer.setParent".into(), json!({"layers": [src_layer], "parent": row.layer.0})));
+                    actions.push(("layer.setParent".into(), json!({"layers": parent_targets(&selected, src_layer), "parent": row.layer.0})));
                 }
                 // The property pick whip replaces the expression with the reference (or adds one),
                 // as the expression pick whip does when its expression isn't being edited.
