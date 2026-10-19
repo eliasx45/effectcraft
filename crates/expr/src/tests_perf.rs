@@ -457,3 +457,18 @@ fn a_bisection_per_text_unit_runs_once_per_unit() {
         assert_eq!(*v, bisect_oracle(&f, (i as f64 + 0.5) / 6.0 * 90.0, 0.6), "unit {i}");
     }
 }
+
+/// EXPR-PERF3: cache keys and frame fingerprints evaluate a text Expression Selector's Amount
+/// outside the selector (textIndex = textTotal = 1), at the frame and (`layer_is_static`) the
+/// frame before. Those plain evaluations of the bisection cost 18 runs each; now one, and the
+/// key's value is unchanged (the same evaluation).
+#[test]
+fn plain_evaluations_for_cache_keys_run_once() {
+    let f = fx();
+    let _ = runs_of(&f, f.b, ROT, BISECT, 1.0);
+    for t in [1.0 - 1.0 / 30.0, 1.0 + 1.0 / 30.0, 1.0 + 2.0 / 30.0, 1.0 + 1.0 / 30.0] {
+        let (n, v) = runs_of(&f, f.b, ROT, BISECT, t);
+        assert!(n <= 1, "at {t}: {n} runs");
+        assert_eq!(v.as_f64(), bisect_oracle(&f, 30.0, t), "at {t}");
+    }
+}
