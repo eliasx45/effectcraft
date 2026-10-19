@@ -3,7 +3,7 @@
 //! `followUp` (with `glow` and no glow layer in the project, `text.apply` returns
 //! `followUp: [{command: "motionLibrary.apply", params: {id}}]`: the Motion Library's plug applies
 //! the "Caption glow + double shadow" style to the layers `text.apply` left selected), and both
-//! list the presets the same way (`text.presetFamilies`).
+//! list the presets the same way (`text.presetFamilies`: Elias's preset cards, CX8c).
 
 use serde_json::{Value, json};
 
@@ -35,22 +35,34 @@ pub fn run_follow_ups(app: &mut EffectcraftApp, ctx: &egui::Context, result: &Va
     Ok(())
 }
 
-/// The text presets as (short name, label), from `text.presetFamilies`
-/// (`families[].variants[].{short, name}`), in family order.
+/// The text presets as (name, label), from `text.presetFamilies` (`presets[].{name, controls}`):
+/// Elias's preset cards in Motion Library ▸ Elias ▸ Text animations (CX8c). The label names the
+/// preset's controls.
 pub fn preset_list(app: &mut EffectcraftApp) -> Vec<(String, String)> {
     let Ok(r) = app.session.execute("text.presetFamilies", json!({})) else { return vec![] };
-    parse_families(&r)
+    parse_presets(&r)
 }
 
-fn parse_families(r: &Value) -> Vec<(String, String)> {
+/// The old near / mid / far chips as travel in pixels (the engine's `text_presets::TRAVEL`): the
+/// label a distance chip shows.
+pub fn distance_label(d: &str) -> String {
+    let px = match d {
+        "near" => 40,
+        "far" => 150,
+        _ => 90,
+    };
+    format!("{d} {px}px")
+}
+
+fn parse_presets(r: &Value) -> Vec<(String, String)> {
     let mut out = vec![];
-    for f in r.get("families").and_then(Value::as_array).into_iter().flatten() {
-        for v in f.get("variants").and_then(Value::as_array).into_iter().flatten() {
-            let Some(short) = v.get("short").and_then(Value::as_str) else { continue };
-            let name = v.get("name").and_then(Value::as_str).unwrap_or(short);
-            if out.len() < 64 {
-                out.push((short.to_string(), name.to_string()));
-            }
+    for p in r.get("presets").and_then(Value::as_array).into_iter().flatten() {
+        let Some(name) = p.get("name").and_then(Value::as_str) else { continue };
+        let controls: Vec<&str> =
+            p.get("controls").and_then(Value::as_array).into_iter().flatten().filter_map(|c| c.get("name").and_then(Value::as_str)).collect();
+        let label = if controls.is_empty() { name.to_string() } else { format!("{name} · {}", controls.join(", ")) };
+        if out.len() < 64 {
+            out.push((name.to_string(), label));
         }
     }
     out
@@ -61,13 +73,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn families_flatten_to_short_names() {
-        let r = json!({"families": [
-            {"family": "T1", "name": "Fade up", "variants": [{"short": "T1b", "name": "T1b Fade up · mid"}]},
-            {"family": "T3", "name": "Pop", "variants": [{"short": "T3a", "name": "T3a Pop · near"}, {"short": "T3b"}]},
+    fn presets_list_their_names_and_controls() {
+        let r = json!({"presets": [
+            {"name": "Slide In", "controls": [{"name": "Travel Distance (px)"}, {"name": "Animate By"}]},
+            {"name": "Bounce In", "source": "motion"},
         ]});
-        let got = parse_families(&r);
-        assert_eq!(got, [("T1b".to_string(), "T1b Fade up · mid".to_string()), ("T3a".into(), "T3a Pop · near".into()), ("T3b".into(), "T3b".into())]);
-        assert!(parse_families(&Value::Null).is_empty());
+        let got = parse_presets(&r);
+        assert_eq!(got, [("Slide In".to_string(), "Slide In · Travel Distance (px), Animate By".to_string()), ("Bounce In".into(), "Bounce In".into())]);
+        assert!(parse_presets(&Value::Null).is_empty());
+        assert_eq!(distance_label("far"), "far 150px");
     }
 }

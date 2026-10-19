@@ -10,10 +10,12 @@
 //! of the project, in one undo step; `props` sets the same values on all of them.
 //! `style.family.link`, `style.family.unlink`, `style.family.list`.
 //!
-//! Text animation presets (batch 1b, CX8): `ml.saveTextPreset {layer, name}` saves one layer of the
-//! workshop comp "Creating Text Presets" as its own Motion Library preset (Elias ▸ Text
-//! animations, with a thumbnail); saving the same name again replaces it. The engine checks and
-//! selects the layer; the app saves it (`Event::Frontend`, the Motion Library plug).
+//! Text animation presets (batch 1b, CX8; CX8c): `ml.saveTextPreset {layer, name}` saves one layer
+//! of the workshop comp "Creating Text Presets" as a Motion Library preset card in Elias ▸ Text
+//! animations: the layer's effects (its Expression Controls) and its text animators, whole
+//! (`anim.savePreset`, which the plug runs on this selection); saving the same name again
+//! replaces the card. The engine checks and selects them; the app saves (`Event::Frontend`, the
+//! Motion Library plug's `save_asset`). `text.presetFamilies` / `text.apply` read those cards.
 //!
 //! Unit bounce (CX9): a spring on a Range Selector's Start / End / Offset does nothing visible
 //! (Ramp Up clamps the selection to 0..1). `text.unitBounce` adds an animator with an Expression
@@ -388,18 +390,18 @@ fn family_list(s: &mut Session, _p: &Value) -> Result<Value> {
     Ok(json!({"families": list}))
 }
 
-// ── Text animation presets (CX8) ───────────────────────────────────────────────────────────
+// ── Text animation presets (CX8, CX8c) ──────────────────────────────────────────────────────
 
-/// Elias's workshop comp for text presets (lane D's `text_presets::WORKSHOP`).
+/// Elias's workshop comp for text presets (`text_presets::WORKSHOP`).
 pub const TEXT_WORKSHOP: &str = "Creating Text Presets";
-/// Where saved text presets go in the Motion Library.
-pub const TEXT_PRESET_FOLDER: &str = "Elias/Text animations";
+/// Where saved text presets go in the Motion Library (`text_presets::TEXT_CATEGORY`).
+pub const TEXT_PRESET_FOLDER: &str = super::text_presets::TEXT_CATEGORY;
 
-/// Whether `name` reads as a text preset name (`T3b Pop · mid`: T, the family number, a variant
-/// letter, a title), by lane D's reader ([`super::text_presets::parse_name`]), so what
-/// `ml.saveTextPreset` saves is what `text.presetFamilies` lists.
+/// Whether `name` can name a text preset card: 1 to 120 characters, no `/` (a folder) or control
+/// characters.
 pub fn is_text_preset_name(name: &str) -> bool {
-    name.trim().chars().count() <= 120 && super::text_presets::parse_name(name).is_some()
+    let n = name.trim();
+    !n.is_empty() && n.chars().count() <= 120 && !n.contains('/') && !n.chars().any(char::is_control)
 }
 
 fn save_text_preset(s: &mut Session, p: &Value) -> Result<Value> {
@@ -423,18 +425,33 @@ fn save_text_preset(s: &mut Session, p: &Value) -> Result<Value> {
     if !matches!(layer.source, effectcraft_project::LayerSource::Text) {
         return Err(bad(cmd, format!("“{}” is not a text layer", layer.name)));
     }
-    let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| layer.name.clone());
+    let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| layer.name.trim().to_string());
     if !is_text_preset_name(&name) {
-        return Err(bad(cmd, format!("“{name}”: a text preset is named like “T3b Pop · mid” (T, family number, a/b/c for near/mid/far, title)")));
+        return Err(bad(cmd, format!("“{name}”: a text preset's name is 1 to 120 characters, without “/”")));
     }
-    // The plug saves the selected layers of the open comp: that layer, alone.
+    // What the preset carries: every effect (the Expression Controls) and every text animator.
+    let mut parts: Vec<(LayerId, Uid)> = vec![];
+    if let Some(fx) = layer.effects() {
+        parts.extend(fx.groups().map(|g| (lid, g.uid)));
+    }
+    let (n_fx, mut n_anim) = (parts.len(), 0);
+    if let Some(anims) = layer.props.group("text/animators") {
+        for g in anims.groups() {
+            parts.push((lid, g.uid));
+            n_anim += 1;
+        }
+    }
+    if parts.is_empty() {
+        return Err(bad(cmd, format!("“{}” has no effects or text animators to save", layer.name)));
+    }
+    // The plug saves the open comp's selection with anim.savePreset (`save_asset` kind preset).
     s.open_comp(cid);
     s.state.selected_layers = vec![lid];
-    s.state.selected_props.clear();
+    s.state.selected_props = parts;
     s.state.selected_keys.clear();
-    let params = json!({"name": name, "category": TEXT_PRESET_FOLDER, "comp": cid.0, "layer": lid.0, "replace": true});
+    let params = json!({"name": name, "category": TEXT_PRESET_FOLDER, "kind": "preset", "comp": cid.0, "layer": lid.0, "replace": true});
     s.events.push(crate::Event::Frontend { command: cmd.into(), params: params.clone() });
-    Ok(json!({"saving": name, "folder": TEXT_PRESET_FOLDER, "layer": lid.0, "comp": cid.0}))
+    Ok(json!({"saving": name, "folder": TEXT_PRESET_FOLDER, "layer": lid.0, "comp": cid.0, "effects": n_fx, "animators": n_anim}))
 }
 
 // ── Per-unit bounce on a text reveal (CX9) ─────────────────────────────────────────────────
@@ -639,7 +656,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save Text Preset",
             [],
             None,
-            "{layer: a layer of the \"Creating Text Presets\" comp, name? (default the layer's name; like \"T3b Pop · mid\"), comp?} → {saving, folder}: saved as its own Motion Library preset (Elias ▸ Text animations) with a thumbnail; the same name again replaces it",
+            "{layer: a text layer of the \"Creating Text Presets\" comp, name? (default the layer's name, e.g. \"Slide In\"), comp?} → {saving, folder, effects, animators}: its effects and text animators saved as a Motion Library preset card in Elias ▸ Text animations; the same name again replaces it",
             has_comp,
             save_text_preset
         ),

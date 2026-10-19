@@ -68,9 +68,9 @@ pub struct QuickRowState {
     pub pins: Option<Vec<QuickPin>>,
     /// Fast In's property pick (`p`, `o`, `s`, `r`); `None` follows the selected keys.
     pub fast_in_pick: Option<String>,
-    /// AX9: the Text group's add-on chips. `sync`: the preset's speed peak on the stressed
-    /// syllable; `glow`: also Caption glow; `distance`: near | mid | far; `on_word`: aim at the
-    /// word under the playhead.
+    /// AX9: the Text group's add-on chips. `sync`: the preset's reveal on the stressed
+    /// syllable; `glow`: also Caption glow; `distance`: near | mid | far (the preset's Travel
+    /// controls at 40 / 90 / 150 px); `on_word`: aim at the word under the playhead.
     pub text_sync: bool,
     pub text_glow: bool,
     pub text_distance: String,
@@ -106,8 +106,8 @@ pub fn default_pins() -> Vec<QuickPin> {
     vec![
         QuickPin::new("Graphs", "Fast In ↑", "Devin ▸ Graphs ▸ Fast In", FAST_IN, json!({})),
         QuickPin::new("Graphs", "G ▾", "Devin ▸ Graphs (the Graph wheel; hold G)", GRAPH_WHEEL, json!({})),
-        // Lane D's text.apply (AX9 adds the add-on chips; run through `text_apply::run`).
-        QuickPin::new("Text", "T3b ↑", "Elias ▸ Text animations ▸ T3b Pop · mid", "text.apply", json!({"preset": "T3b"})),
+        // The Text group also shows one button per text preset card (Elias ▸ Text animations,
+        // `text.presetFamilies`; CX8c), before the add-on chips: nothing about them is pinned here.
         QuickPin::new(
             "Text",
             "Caption glow",
@@ -258,6 +258,24 @@ pub fn word_at_playhead(app: &EffectcraftApp) -> Option<String> {
     Some(best.word.clone())
 }
 
+/// The text preset cards (name, label with their controls), read again when the project changes
+/// and every 10 s (a card saved in the Motion Library shows up).
+fn text_presets(app: &mut EffectcraftApp, ctx: &egui::Context) -> Vec<(String, String)> {
+    type Cached = (u64, f64, Vec<(String, String)>);
+    let id = egui::Id::new("tl-quick-text-presets");
+    let rev = app.session.revision;
+    let now = ctx.input(|i| i.time);
+    if let Some((r, t, list)) = ctx.data(|d| d.get_temp::<Cached>(id))
+        && r == rev
+        && now - t < 10.0
+    {
+        return list;
+    }
+    let list = super::text_apply::preset_list(app);
+    ctx.data_mut(|d| d.insert_temp::<Cached>(id, (rev, now, list.clone())));
+    list
+}
+
 /// A pin for the card selected in the Motion Library.
 fn pin_selected_card(app: &mut EffectcraftApp, ctx: &egui::Context) {
     let Some(id) = app.ui.motion_library.selected.clone() else {
@@ -360,8 +378,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
             });
             x = r.max.x + 6.0;
         }
-        // AX9: the Text group's add-on chips sit after its buttons.
+        // CX8c: a button per text preset card, then (AX9) the add-on chips.
         if *group == "Text" {
+            for (name, label) in text_presets(app, &ctx) {
+                if x > limit - 40.0 {
+                    break;
+                }
+                let pin = QuickPin::new("Text", &format!("{name} ↑"), &format!("Elias ▸ Text animations ▸ {name}"), "text.apply", json!({"preset": name}));
+                let tip = format!("Motion Library: {label} · Claude runs: text.apply {}", pin.params);
+                let (r, resp) = button(app, ui, pos2(x, y), &pin.label, &format!("textPreset.{}", pin.auto_id()), &tip, false);
+                if resp.clicked() {
+                    clicked = Some((pin, r.center_bottom()));
+                }
+                x = r.max.x + 6.0;
+            }
             x = text_chips(app, ui, pos2(x, y), limit);
         }
         x += 8.0;
@@ -404,8 +434,8 @@ fn chip(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, text: &str, auto:
 }
 
 /// AX9: the Text group's add-on chips (`sync`, `+glow`, `near/mid/far`, `on "<word>"`): toggles
-/// for how the Text buttons apply (`text.apply {sync, glow, distance, word}`). Returns the x
-/// after them.
+/// for how the Text buttons apply (`text.apply {sync, glow, distance, word}`; `distance` sets the
+/// preset's Travel controls to 40 / 90 / 150 px, CX8b). Returns the x after them.
 fn text_chips(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, limit: f32) -> f32 {
     let mut x = at.x;
     let q = app.ui.timeline.quick_row.clone();
@@ -414,7 +444,12 @@ fn text_chips(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, limit: f32)
     let chips: [(&str, String, &str, bool); 4] = [
         ("sync", "sync".into(), "Put the preset's speed peak on the stressed syllable", q.text_sync),
         ("glow", "+glow".into(), "Also apply Caption glow + double shadow", q.text_glow),
-        ("distance", q.text_distance.clone(), "How far the text travels: near (0.5×), mid (1×), far (1.6×); click to change", true),
+        (
+            "distance",
+            super::text_apply::distance_label(&q.text_distance),
+            "How far the text travels: sets the preset's Travel controls (Travel Distance (px), Bounce Travel (px)) to near 40 / mid 90 / far 150 px; click to change",
+            true,
+        ),
         ("word", word_label, "Aim at the word under the playhead (else the first stressed word)", q.text_on_word),
     ];
     for (id, text, tip, on) in chips {

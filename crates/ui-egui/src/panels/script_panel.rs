@@ -49,7 +49,7 @@ struct PanelState {
     preset_list: bool,
     /// The word the wheel was opened on.
     wheel_word: Option<usize>,
-    /// The text animation the phrase button applies (`text.presetFamilies` short name, "T3b").
+    /// The text animation the phrase button applies (a `text.presetFamilies` card name, "Slide In").
     pick: Option<String>,
     /// SX6 add-ons.
     sync: bool,
@@ -58,7 +58,7 @@ struct PanelState {
     /// `script.get` cache: (comp, revision, result).
     #[serde(skip)]
     cache: Option<(u64, u64, Value)>,
-    /// `text.presetFamilies` (short name, label) and Motion Library presets (id, name), read once.
+    /// `text.presetFamilies` (card name, label) and Motion Library presets (id, name), read once.
     #[serde(skip)]
     text_presets: Option<Vec<(String, String)>>,
     #[serde(skip)]
@@ -491,7 +491,7 @@ fn phrase_popover(app: &mut EffectcraftApp, ctx: &egui::Context, st: &mut PanelS
                                     }
                                     for (short, name) in presets {
                                         let on = st.pick.as_deref() == Some(short.as_str());
-                                        let r = ui.selectable_label(on, format!("{short}  {name}"));
+                                        let r = ui.selectable_label(on, name.as_str());
                                         app.auto.add(&format!("script.phrase.pick.{short}"), r.rect, &name);
                                         if r.clicked() {
                                             st.pick = Some(short.clone());
@@ -523,8 +523,11 @@ fn phrase_popover(app: &mut EffectcraftApp, ctx: &egui::Context, st: &mut PanelS
                         st.glow = !st.glow;
                     }
                     ui.add_space(6.0);
+                    // The preset's Travel controls at 40 / 90 / 150 px (CX8b).
                     for d in ["near", "mid", "far"] {
-                        let r = ui.selectable_label(st.distance == d, d);
+                        let r = ui
+                            .selectable_label(st.distance == d, super::text_apply::distance_label(d))
+                            .on_hover_text("Sets the preset's Travel controls (Travel Distance (px), Bounce Travel (px)) when it has them");
                         app.auto.add(&format!("script.phrase.distance.{d}"), r.rect, d);
                         if r.clicked() {
                             st.distance = d.to_string();

@@ -5144,11 +5144,12 @@ pub(crate) fn store_display(app: &mut EffectcraftApp, ctx: &egui::Context) {
     app.motion_library_saved = Some(now);
 }
 
-// ── Text animation presets (batch 1b, CX8) ────────────────────────────────────────────────────
+// ── Text animation presets (batch 1b, CX8, CX8c) ──────────────────────────────────────────────
 
-/// The frontend half of `ml.saveTextPreset`: save the selected workshop layer as its own preset
-/// (the plug's `save_layers`, with its preview as the thumbnail); cards of the same name in that
-/// folder are deleted once the new one is saved, so saving again updates the preset.
+/// The frontend half of `ml.saveTextPreset`: save the workshop layer's effects and text animators
+/// (the engine selected them) as a preset card (the plug's `save_asset` kind `preset`, which runs
+/// anim.savePreset on the selection and renders the layer as the preview; CX8c); cards of the same
+/// name in that folder are deleted once the new one is saved, so saving again updates the preset.
 pub fn save_text_preset(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
     let name = params.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()).ok_or("ml.saveTextPreset: no name")?.to_string();
     let category = params.get("category").and_then(Value::as_str).unwrap_or("Elias/Text animations").trim_matches('/').to_string();
@@ -5166,14 +5167,13 @@ pub fn save_text_preset(app: &mut EffectcraftApp, ctx: &egui::Context, params: &
         Err(_) => vec![],
     };
     let port = control_port(app)?;
-    let args =
-        json!({"name": name, "category": category, "description": "Text animation preset (from the Creating Text Presets comp)", "preview_mode": "selected"});
+    let args = json!({"kind": "preset", "name": name, "category": category, "description": "Text animation preset (from the Creating Text Presets comp)"});
     app.ui.status = format!("Saving text preset “{name}” to {category}…");
     let replaced = old.len();
     let done = if replaced > 0 { format!("Updated text preset “{name}” in {category}") } else { format!("Saved text preset “{name}” to {category}") };
     let cat2 = category.clone();
     let save = move || {
-        let r = ml_rpc("effectcraft_plug.py", &[], Some(port), "save_layers", args)?;
+        let r = ml_rpc("effectcraft_plug.py", &[], Some(port), "save_asset", args)?;
         let new_id = r.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
         wait_for_preview(&new_id);
         // TODO(batch1-verify): delete_entry's arguments as the card menu's Delete uses them.

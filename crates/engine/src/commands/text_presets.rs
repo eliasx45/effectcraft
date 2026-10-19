@@ -1,27 +1,29 @@
-//! Text presets (batch 1b, lane D: DX1): Elias's text animations, kept as one layer per variation
-//! in the workshop comp "Creating Text Presets" and saved to the Motion Library under names like
-//! `T3b Pop · mid` (family number, then a / b / c for near / mid / far).
+//! Text presets (batch 1b DX1; reworked as CX8c on 19 Oct 2026): Elias's text animations are his
+//! own Motion Library preset cards, so changing them (new controls such as "Blur In (px)") never
+//! needs code. Nothing about a preset is built in here.
 //!
-//! - `text.presetFamilies` lists the families and their variants: the workshop comp's layers
-//!   (and any other comp's layer named that way), the library folders' entries and the Motion
-//!   Library catalog's cards. (`text.presets` is already taken by the built-in text animator
-//!   presets of `text_anim.rs`; see the TODO below.)
-//! - `text.apply {preset, layers?|words?, sync?, glow?, distance?, word?}` applies one with
-//!   add-ons: to the given text layers, or to a new text layer for `words` (a phrase of the comp's
-//!   speech map, timed to it). `sync` puts the animation's speed peak (the one the `off-accent`
-//!   lint and `keys.alignPeak` find, [`lint::segment_peak`]) on the stressed syllable of `word`,
-//!   else of the first stressed word. `distance` picks the family's near / mid / far variant;
-//!   without that variant the travel is scaled (near 0.5×, mid 1×, far 1.6×). `glow` also applies
-//!   the Motion Library style "Caption glow + double shadow". One undo step.
-//!
-//! Applying copies the template layer's animation: its text animators, its keyed transform
-//! properties (relative to the target's own values, so the text settles where it is) and its
-//! effects, with the keys moved so the template's first key lands at the start time. A Motion
-//! Library card is brought in with `library.apply` (its composition is imported; the nested layer
-//! it adds is removed again), so later applies find it in the project.
+//! - **Where:** the `preset` cards (an `.ecpreset` from `anim.savePreset`, now with whole text
+//!   animators) in the Motion Library category "Elias/Text animations" (`category` overrides it),
+//!   found through the library code: this Mac's library folders (`library.json`, the
+//!   `LocalEntry` index: kind `preset`, `file` = `assets/<id>/preset.ecpreset`), then the
+//!   catalog's cards (downloaded when applied). `ml.saveTextPreset` saves one from the workshop
+//!   comp. A `.ecpreset` path works too.
+//! - `text.presetFamilies {category?}` lists them with the Expression Controls each one carries
+//!   (name, type, value, dropdown items: read from the file) and its text animators.
+//! - `text.apply {preset, layers?|words?, controls?, distance?, sync?, glow?, word?, at?}` applies
+//!   one through `anim.applyPreset` (same-named effects and animators replaced, keys from the
+//!   layer's in point), then sets the controls named in `controls` by their exact names
+//!   (`{"Travel Distance (px)": 40, "Animate By": "Words"}`; an unknown name is an error listing
+//!   the preset's controls). `distance` (the old near / mid / far chips) sets every control whose
+//!   name has "Travel" to 40 / 90 / 150 px, and does nothing when the preset has none. `words`
+//!   makes a new text layer for a phrase of the speech map. `sync` shifts the preset's keys so the
+//!   stressed syllable of `word` (else the first stressed word) lands on the reveal: when the
+//!   preset has a "Fade Up" animator with keyed Range Selector Offset, the time that Offset
+//!   half-reveals the word's unit; else the speed peak of its main move. `glow` also applies the
+//!   Motion Library style "Caption glow + double shadow". One undo step.
 
 use effectcraft_keyframe::Value as KValue;
-use effectcraft_project::{ItemId, Layer, LayerId, LayerSource, Node, PropGroup, Property};
+use effectcraft_project::{GroupKind, ItemId, Layer, LayerId, LayerSource, Node, ParamUi, PropGroup};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
@@ -29,155 +31,272 @@ use super::{CommandSpec, b_p, bad, comp_id, has_comp, layers_p, str_p, unlocked}
 use crate::{EngineError, Result, Session, cmd, lint, query};
 
 const C: &str = "text.apply";
-// The listing is `text.presetFamilies`: the brief named it `text.presets`, but `text_anim.rs`
-// already registers that id (the built-in animator presets; `tests_text.rs` and the unique-id test
-// in `tests.rs` rely on it). The UI lists presets through `panels/text_apply.rs` (integration pass).
-/// Elias's workshop comp: one layer per variation.
+/// Elias's workshop comp.
 pub const WORKSHOP: &str = "Creating Text Presets";
+/// The Motion Library category of the text animations (`styles::TEXT_PRESET_FOLDER`).
+pub const TEXT_CATEGORY: &str = "Elias/Text animations";
+/// The card the Bounce button looks for first (else a card with a "Bounce Overshoot (%)" control).
+pub const BOUNCE_CARD: &str = "Bounce In";
+/// The control that marks a bounce preset when no card is named [`BOUNCE_CARD`].
+pub const BOUNCE_OVERSHOOT: &str = "Bounce Overshoot (%)";
 /// The Motion Library text style `glow` applies.
 pub const GLOW_STYLE: &str = "Caption glow + double shadow";
+/// The old near / mid / far chips, as travel in pixels (Elias, 19 Oct).
+pub const TRAVEL: [(&str, f64); 3] = [("near", 40.0), ("mid", 90.0), ("far", 150.0)];
+/// The animator whose keyed Range Selector Offset `sync` aims (and its copies, "Fade Up · …").
+pub const REVEAL_ANIMATOR: &str = "Fade Up";
+/// Where in a unit's reveal (0 = it starts to appear, 1 = fully in) the sync puts the accent.
+// TODO(batch1-verify): half-revealed is a guess for "the peak" of a Ramp Up reveal with Ease
+// High −100; check the frame with speech.accents / the off-accent lint and tune.
+const UNIT_PEAK: f64 = 0.5;
 /// Most layers one call animates.
 const MAX_LAYERS: usize = 256;
 /// Most characters of a new layer's text.
 const MAX_TEXT: usize = 500;
+/// Most preset cards listed.
+const MAX_PRESETS: usize = 500;
+/// Largest preset file read.
+const MAX_FILE: usize = 8 << 20;
+/// Most controls one call sets.
+const MAX_CONTROLS: usize = 64;
 /// How long a new layer stays after its words and its animation (seconds).
 // TODO(batch1-verify): mock value; Elias tunes it.
 const HOLD: f64 = 0.5;
 
-// ---------------------------------------------------------------- names
+// ---------------------------------------------------------------- the cards
 
-/// Near / mid / far: the variant letters a / b / c.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Distance {
-    Near,
-    Mid,
-    Far,
-}
-
-impl Distance {
-    pub fn id(self) -> &'static str {
-        match self {
-            Distance::Near => "near",
-            Distance::Mid => "mid",
-            Distance::Far => "far",
-        }
-    }
-    /// How far the travel goes against mid.
-    // TODO(batch1-verify): mock values (0.5× / 1× / 1.6×); Elias tunes them.
-    pub fn factor(self) -> f64 {
-        match self {
-            Distance::Near => 0.5,
-            Distance::Mid => 1.0,
-            Distance::Far => 1.6,
-        }
-    }
-    pub fn letter(self) -> char {
-        match self {
-            Distance::Near => 'a',
-            Distance::Mid => 'b',
-            Distance::Far => 'c',
-        }
-    }
-    pub fn from_letter(c: char) -> Option<Distance> {
-        match c.to_ascii_lowercase() {
-            'a' => Some(Distance::Near),
-            'b' => Some(Distance::Mid),
-            'c' => Some(Distance::Far),
-            _ => None,
-        }
-    }
-    pub fn parse(s: &str) -> Option<Distance> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "near" | "a" | "close" => Some(Distance::Near),
-            "mid" | "b" | "middle" | "medium" => Some(Distance::Mid),
-            "far" | "c" => Some(Distance::Far),
-            _ => None,
-        }
-    }
-}
-
-/// A preset name read: `T3b Pop · mid` is family 3, variant `b`, title "Pop", mid.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PresetName {
-    pub family: u32,
-    pub variant: Option<char>,
-    pub title: String,
-    pub distance: Option<Distance>,
-}
-
-impl PresetName {
-    /// `T3b` (or `T3` without a variant).
-    pub fn short(&self) -> String {
-        match self.variant {
-            Some(v) => format!("T{}{v}", self.family),
-            None => format!("T{}", self.family),
-        }
-    }
-    pub fn family_id(&self) -> String {
-        format!("T{}", self.family)
-    }
-}
-
-/// Read a preset name: `T3b Pop · mid`, `T3b Pop`, `T3b`, `t3`, `T12c Slide up - far`. Anything
-/// else (`Text 1`, `T3x2`, `Title`) is `None`.
-pub fn parse_name(name: &str) -> Option<PresetName> {
-    let s = name.trim();
-    let rest = s.strip_prefix('T').or_else(|| s.strip_prefix('t'))?;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() || digits.len() > 4 {
-        return None;
-    }
-    let family: u32 = digits.parse().ok()?;
-    // Digits are ASCII: their byte length is their count.
-    let after = rest.get(digits.len()..)?;
-    let mut it = after.chars();
-    let (variant, tail) = match (it.next(), it.next()) {
-        (Some(v), next) if v.is_ascii_alphabetic() && next.is_none_or(|n| !n.is_alphanumeric()) => (Some(v.to_ascii_lowercase()), after.get(1..).unwrap_or("")),
-        (Some(v), _) if v.is_alphanumeric() => return None,
-        _ => (None, after),
-    };
-    // "Pop · mid", "Pop - mid", "Pop mid", "Pop".
-    let tail = tail.trim();
-    let (mut title, mut distance) = (tail.to_string(), None);
-    if let Some((a, b)) = tail.rsplit_once('·').or_else(|| tail.rsplit_once(" - ")).or_else(|| tail.rsplit_once('|')) {
-        if let Some(d) = Distance::parse(b) {
-            (title, distance) = (a.trim().to_string(), Some(d));
-        }
-    } else if let Some((a, b)) = tail.rsplit_once(' ')
-        && let Some(d) = Distance::parse(b).filter(|_| b.len() > 1)
-    {
-        (title, distance) = (a.trim().to_string(), Some(d));
-    }
-    let distance = distance.or_else(|| variant.and_then(Distance::from_letter));
-    Some(PresetName { family, variant, title: title.chars().take(200).collect(), distance })
-}
-
-// ---------------------------------------------------------------- where presets are
-
-#[derive(Clone, Debug, PartialEq)]
-enum Source {
-    /// A layer of the project (the workshop comp, or a card's comp imported earlier).
-    Layer { comp: ItemId, layer: LayerId },
-    /// A Motion Library card (a library folder's entry when `local`, else the catalog's).
-    Card { id: String, kind: String, local: bool },
-}
-
+/// One text preset: a Motion Library card (or a file) and its `.ecpreset` document.
 #[derive(Clone, Debug)]
-struct Preset {
-    name: String,
-    parsed: PresetName,
-    source: Source,
+pub struct TextPreset {
+    pub name: String,
+    /// The card id (`None`: a file given by path).
+    pub id: Option<String>,
+    /// The `.ecpreset` file, when it is on this machine.
+    pub path: Option<String>,
+    /// `library` (a library folder of this Mac), `motion` (the catalog) or `file`.
+    pub source: &'static str,
+    /// The `.ecpreset` document (`anim.savePreset`'s JSON).
+    pub doc: Value,
 }
 
-impl Preset {
-    fn source_json(&self, s: &Session) -> Value {
-        match &self.source {
-            Source::Layer { comp, layer } => {
-                json!({"source": "project", "comp": comp.0, "compName": s.project.items.get(comp).map(|i| i.name.clone()), "layer": layer.0})
-            }
-            Source::Card { id, kind, local } => json!({"source": if *local { "library" } else { "motion" }, "card": id, "kind": kind}),
+/// A text animation card: (id, name, file on this machine).
+#[derive(Clone, Debug)]
+struct CardRef {
+    id: String,
+    name: String,
+    file: Option<String>,
+}
+
+fn category_p(p: &Value) -> String {
+    str_p(p, "category").map(|c| c.trim().trim_matches('/')).filter(|c| !c.is_empty()).unwrap_or(TEXT_CATEGORY).to_string()
+}
+
+/// `cat` is `want` or a folder inside it.
+fn in_category(cat: &str, want: &str) -> bool {
+    let (c, w) = (cat.trim().trim_matches('/').to_lowercase(), want.to_lowercase());
+    c == w || c.starts_with(&format!("{w}/"))
+}
+
+/// The preset cards of `category`: this Mac's library folders first, then the catalog's.
+fn cards(s: &Session, category: &str) -> Vec<CardRef> {
+    let mut out: Vec<CardRef> = vec![];
+    for e in s.motion_library_local().values() {
+        if e.kind.eq_ignore_ascii_case("preset") && in_category(&e.category, category) {
+            out.push(CardRef { id: e.id.clone(), name: e.name.clone(), file: Some(e.file.clone()).filter(|f| !f.is_empty()) });
         }
     }
+    if let Ok(client) = s.motion_library()
+        && let Some(cat) = client.catalog()
+    {
+        for c in &cat.cards {
+            if c.kind.eq_ignore_ascii_case("preset") && in_category(&c.category, category) && !out.iter().any(|x| x.id == c.id) {
+                out.push(CardRef { id: c.id.clone(), name: c.name.clone(), file: None });
+            }
+        }
+    }
+    out.sort_by_key(|c| c.name.to_lowercase());
+    out.truncate(MAX_PRESETS);
+    out
+}
+
+fn parse_preset(bytes: &[u8], what: &str, cmd: &str) -> Result<Value> {
+    if bytes.len() > MAX_FILE {
+        return Err(bad(cmd, format!("{what} is larger than 8 MB: not a text preset")));
+    }
+    let doc: Value = serde_json::from_slice(bytes).map_err(|e| bad(cmd, format!("{what} is not a preset file: {e}")))?;
+    if doc.get(super::animation::PRESET_TAG).is_none() {
+        return Err(bad(cmd, format!("{what} is not an EffectCraft animation preset (.ecpreset)")));
+    }
+    Ok(doc)
+}
+
+fn read_preset(s: &Session, path: &str, cmd: &str) -> Result<Value> {
+    let bytes = s.services.read_file(path).map_err(|e| bad(cmd, format!("cannot read the text preset {path}: {e}")))?;
+    parse_preset(&bytes, path, cmd)
+}
+
+/// A card's preset document: its file on this machine, else the catalog's copy (downloaded).
+fn load_card(s: &Session, c: &CardRef, cmd: &str) -> Result<TextPreset> {
+    if let Some(f) = &c.file {
+        let doc = read_preset(s, f, cmd)?;
+        return Ok(TextPreset { name: c.name.clone(), id: Some(c.id.clone()), path: Some(f.clone()), source: "library", doc });
+    }
+    let client = s.motion_library().map_err(|e| bad(cmd, e))?;
+    // TODO(batch1-verify): a preset card's published blob (`card.project`) is its .ecpreset.
+    #[cfg(not(target_arch = "wasm32"))]
+    let prepared = client.prepare_blocking(&c.id, std::time::Duration::from_secs(60));
+    #[cfg(target_arch = "wasm32")]
+    let prepared = client.prepare(&c.id);
+    match prepared {
+        effectcraft_motionlib::Prepared::Ready { project, .. } => {
+            let doc = parse_preset(&project, &format!("“{}”", c.name), cmd)?;
+            Ok(TextPreset { name: c.name.clone(), id: Some(c.id.clone()), path: None, source: "motion", doc })
+        }
+        effectcraft_motionlib::Prepared::Loading { done, total } => {
+            Err(bad(cmd, format!("“{}” is still downloading ({done}/{total}): try again in a moment", c.name)))
+        }
+        effectcraft_motionlib::Prepared::Failed(e) => Err(bad(cmd, e)),
+    }
+}
+
+fn names_of(list: &[CardRef], category: &str) -> String {
+    if list.is_empty() {
+        format!("none yet in Motion Library ▸ {category} (save one with ml.saveTextPreset, or Motion Library ▸ Families ▸ Save selected as preset)")
+    } else {
+        list.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// The preset `query` names: a `.ecpreset` path (with a `/` or `\`), else a card of the text
+/// animations category by id or name (case-insensitive).
+pub fn find_preset(s: &Session, p: &Value, query: &str, cmd: &str) -> Result<TextPreset> {
+    let q = query.trim();
+    if q.contains('/') || q.contains('\\') {
+        let doc = read_preset(s, q, cmd)?;
+        let name = std::path::Path::new(q).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        return Ok(TextPreset { name, id: None, path: Some(q.to_string()), source: "file", doc });
+    }
+    let category = category_p(p);
+    let list = cards(s, &category);
+    let hit = list.iter().find(|c| c.id == q).or_else(|| list.iter().find(|c| c.name.trim().eq_ignore_ascii_case(q)));
+    match hit {
+        Some(c) => load_card(s, c, cmd),
+        None => Err(bad(cmd, format!("no text preset “{q}” in Motion Library ▸ {category}; there are: {}", names_of(&list, &category)))),
+    }
+}
+
+/// The Bounce button's preset: the card named [`BOUNCE_CARD`], else the first card of the
+/// category with a [`BOUNCE_OVERSHOOT`] control.
+pub fn bounce_preset(s: &Session, p: &Value, cmd: &str) -> Result<TextPreset> {
+    if let Some(q) = str_p(p, "preset").map(str::trim).filter(|q| !q.is_empty()) {
+        return find_preset(s, p, q, cmd);
+    }
+    let category = category_p(p);
+    let list = cards(s, &category);
+    if let Some(c) = list.iter().find(|c| c.name.trim().eq_ignore_ascii_case(BOUNCE_CARD)) {
+        return load_card(s, c, cmd);
+    }
+    for c in list.iter().filter(|c| c.file.is_some()) {
+        if let Ok(t) = load_card(s, c, cmd)
+            && controls(&t.doc).iter().any(|k| k.name == BOUNCE_OVERSHOOT)
+        {
+            return Ok(t);
+        }
+    }
+    Err(bad(
+        cmd,
+        format!(
+            "Save a Bounce text preset first: Motion Library ▸ {category} has no “{BOUNCE_CARD}” card and no card with a “{BOUNCE_OVERSHOOT}” control (save the workshop layer with ml.saveTextPreset {{layer, name: \"{BOUNCE_CARD}\"}})"
+        ),
+    ))
+}
+
+/// An Expression Control a preset carries (an `ec.control.*` effect): its name, kind
+/// (`slider`, `angle`, `dropdown`, `checkbox`, `color`, `point`…), value and dropdown items.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Control {
+    pub name: String,
+    pub kind: String,
+    pub value: Value,
+    pub options: Vec<String>,
+}
+
+/// The Expression Controls of a preset document, in its order.
+pub fn controls(doc: &Value) -> Vec<Control> {
+    let mut out = vec![];
+    for g in doc.get("effects").and_then(Value::as_array).into_iter().flatten() {
+        let Ok(g) = serde_json::from_value::<PropGroup>(g.clone()) else { continue };
+        let GroupKind::Effect { effect } = &g.kind else { continue };
+        let Some(kind) = effect.strip_prefix("ec.control.") else { continue };
+        let Some(pr) = g.props().next() else { continue };
+        let options = match &pr.ui {
+            ParamUi::Popup { options } => options.clone(),
+            _ => vec![],
+        };
+        let value = match &pr.value {
+            KValue::Enum(i) if !options.is_empty() => json!(options.get(*i as usize).cloned().unwrap_or_default()),
+            KValue::Bool(b) => json!(b),
+            v => {
+                let c = v.components();
+                match c.len() {
+                    0 => Value::Null,
+                    1 => json!(c.first().copied().unwrap_or(0.0)),
+                    _ => json!(c),
+                }
+            }
+        };
+        out.push(Control { name: g.name.clone(), kind: kind.to_string(), value, options });
+    }
+    out
+}
+
+/// The text animator names a preset document carries.
+pub fn animator_names(doc: &Value) -> Vec<String> {
+    doc.get("animators").and_then(Value::as_array).into_iter().flatten().filter_map(|g| g.get("name").and_then(Value::as_str).map(str::to_string)).collect()
+}
+
+fn control_json(c: &Control) -> Value {
+    let mut v = json!({"name": c.name, "type": c.kind, "value": c.value});
+    if !c.options.is_empty() {
+        v["options"] = json!(c.options);
+    }
+    v
+}
+
+// ---------------------------------------------------------------- text.presetFamilies
+
+fn families(s: &mut Session, p: &Value) -> Result<Value> {
+    let category = category_p(p);
+    let list = cards(s, &category);
+    let mut presets = vec![];
+    let mut unreadable = vec![];
+    for c in &list {
+        let mut v = json!({"name": c.name, "id": c.id, "file": c.file});
+        match c.file.as_deref().map(|f| read_preset(s, f, "text.presetFamilies")) {
+            Some(Ok(doc)) => {
+                v["controls"] = json!(controls(&doc).iter().map(control_json).collect::<Vec<_>>());
+                v["animators"] = json!(animator_names(&doc));
+                v["effects"] = json!(doc.get("effects").and_then(Value::as_array).map_or(0, Vec::len));
+                v["source"] = json!("library");
+            }
+            Some(Err(e)) => {
+                unreadable.push(json!({"id": c.id, "name": c.name, "error": e.to_string()}));
+                continue;
+            }
+            // A catalog card: its controls show once it is downloaded (text.apply does that).
+            None => v["source"] = json!("motion"),
+        }
+        presets.push(v);
+    }
+    let workshop = s.project.items.values().find(|i| i.as_comp().is_some() && is_workshop(&i.name)).map(|i| i.id.0);
+    Ok(json!({
+        "category": category,
+        "presets": presets,
+        "unreadable": unreadable,
+        "travel": TRAVEL.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<_, _>>(),
+        "workshop": workshop,
+        "glowStyle": GLOW_STYLE,
+    }))
 }
 
 fn is_workshop(name: &str) -> bool {
@@ -185,453 +304,11 @@ fn is_workshop(name: &str) -> bool {
     n == WORKSHOP.to_lowercase() || n.contains("text presets")
 }
 
-/// Layers named like presets that carry animation, the workshop comp's first.
-fn project_presets(s: &Session) -> Vec<Preset> {
-    let mut comps: Vec<(bool, u64, ItemId)> =
-        s.project.items.values().filter(|i| i.as_comp().is_some()).map(|i| (!is_workshop(&i.name), i.id.0, i.id)).collect();
-    comps.sort();
-    let mut out = vec![];
-    for (_, _, cid) in comps {
-        let Some(comp) = s.project.comp(cid) else { continue };
-        for l in comp.layers.iter() {
-            let Some(parsed) = parse_name(&l.name) else { continue };
-            if !l.props.any_animated() {
-                continue;
-            }
-            out.push(Preset { name: l.name.clone(), parsed, source: Source::Layer { comp: cid, layer: l.id } });
-        }
-    }
-    out
-}
-
-/// Library folders' entries, then the Motion Library catalog's cards, named like presets.
-fn card_presets(s: &Session) -> Vec<Preset> {
-    let mut out: Vec<Preset> = vec![];
-    for e in s.motion_library_local().values() {
-        if let Some(parsed) = parse_name(&e.name) {
-            out.push(Preset { name: e.name.clone(), parsed, source: Source::Card { id: e.id.clone(), kind: e.kind.to_lowercase(), local: true } });
-        }
-    }
-    // Lane C's `ml.saveTextPreset` (CX8) saves them to `styles::TEXT_PRESET_FOLDER`
-    // ("Elias/Text animations") with the layer's preset name; this reads any card named like one,
-    // so those are found wherever they sit.
-    if let Ok(client) = s.motion_library()
-        && let Some(cat) = client.catalog()
-    {
-        for c in &cat.cards {
-            if out.iter().any(|p| matches!(&p.source, Source::Card { id, .. } if *id == c.id)) {
-                continue;
-            }
-            if let Some(parsed) = parse_name(&c.name) {
-                out.push(Preset { name: c.name.clone(), parsed, source: Source::Card { id: c.id.clone(), kind: c.kind.to_lowercase(), local: false } });
-            }
-        }
-    }
-    out
-}
-
-/// Every preset, best source first: the project, a library folder, the catalog.
-fn all_presets(s: &Session) -> Vec<Preset> {
-    let mut out = project_presets(s);
-    out.extend(card_presets(s));
-    out
-}
-
-/// The preset `query` names (`T3b`, `T3`, `T3b Pop · mid`, or a family's title "Pop") for
-/// `distance`, and the travel scale to apply to it: the family's variant for the distance when
-/// there is one (scale 1), else the named (or mid, or first) variant scaled to the distance.
-fn pick<'a>(all: &'a [Preset], query: &str, distance: Option<Distance>) -> Option<(&'a Preset, f64)> {
-    let q = query.trim();
-    let parsed = parse_name(q);
-    let family = match &parsed {
-        Some(n) => n.family,
-        None => {
-            // A full name or a family's title.
-            let hit = all.iter().find(|p| p.name.eq_ignore_ascii_case(q)).or_else(|| all.iter().find(|p| p.parsed.title.eq_ignore_ascii_case(q)))?;
-            hit.parsed.family
-        }
-    };
-    let family_list: Vec<&Preset> = all.iter().filter(|p| p.parsed.family == family).collect();
-    let asked_variant = parsed.as_ref().and_then(|n| n.variant).or_else(|| all.iter().find(|p| p.name.eq_ignore_ascii_case(q)).and_then(|p| p.parsed.variant));
-    let want = distance.or_else(|| asked_variant.and_then(Distance::from_letter)).unwrap_or(Distance::Mid);
-    let by_letter = |c: char| family_list.iter().copied().find(|p| p.parsed.variant == Some(c));
-    if let Some(p) = by_letter(want.letter()) {
-        return Some((p, 1.0));
-    }
-    let base = asked_variant.and_then(by_letter).or_else(|| by_letter('b')).or_else(|| family_list.first().copied())?;
-    let own = base.parsed.distance.unwrap_or(Distance::Mid).factor();
-    Some((base, want.factor() / own))
-}
-
-fn shorts(all: &[Preset]) -> String {
-    let mut v: Vec<String> = all.iter().map(|p| p.parsed.short()).collect();
-    v.sort();
-    v.dedup();
-    if v.is_empty() {
-        format!("none yet: name layers of the comp “{WORKSHOP}” like “T3b Pop · mid”, or save them to the Motion Library")
-    } else {
-        v.join(", ")
-    }
-}
-
-// ---------------------------------------------------------------- text.presetFamilies
-
-fn families(s: &mut Session, _: &Value) -> Result<Value> {
-    let all = all_presets(s);
-    let mut fams: Vec<(u32, String, Vec<Value>, Vec<String>)> = vec![];
-    for p in &all {
-        let short = p.parsed.short();
-        let i = match fams.iter().position(|f| f.0 == p.parsed.family) {
-            Some(i) => i,
-            None => {
-                fams.push((p.parsed.family, p.parsed.title.clone(), vec![], vec![]));
-                fams.len() - 1
-            }
-        };
-        let Some(f) = fams.get_mut(i) else { continue };
-        // One entry per short name: the best source (listed first).
-        if f.3.contains(&short) {
-            continue;
-        }
-        if f.1.is_empty() {
-            f.1 = p.parsed.title.clone();
-        }
-        let mut v = json!({
-            "short": short,
-            "name": p.name,
-            "variant": p.parsed.variant.map(String::from),
-            "distance": p.parsed.distance.map(Distance::id),
-        });
-        if let (Some(o), Value::Object(src)) = (v.as_object_mut(), p.source_json(s)) {
-            o.extend(src);
-        }
-        f.2.push(v);
-        f.3.push(short);
-    }
-    fams.sort_by_key(|f| f.0);
-    let workshop = s.project.items.values().find(|i| i.as_comp().is_some() && is_workshop(&i.name)).map(|i| i.id.0);
-    Ok(json!({
-        "families": fams.into_iter().map(|(n, title, mut variants, _)| {
-            variants.sort_by(|a, b| a["short"].as_str().unwrap_or("").cmp(b["short"].as_str().unwrap_or("")));
-            json!({"family": format!("T{n}"), "name": title, "variants": variants})
-        }).collect::<Vec<_>>(),
-        "workshop": workshop,
-        "distances": {"near": Distance::Near.factor(), "mid": Distance::Mid.factor(), "far": Distance::Far.factor()},
-        "glowStyle": GLOW_STYLE,
-    }))
-}
-
-// ---------------------------------------------------------------- copying a template
+// ---------------------------------------------------------------- speech words
 
 /// Normalised word for matching (`"WORKS,"` → `works`).
 fn clean(w: &str) -> String {
     w.chars().filter(|c| c.is_alphanumeric() || *c == '\'').flat_map(char::to_lowercase).collect()
-}
-
-/// The earliest key of the properties a template hands on (layer time).
-fn first_key(l: &Layer) -> Option<Tick> {
-    let mut first: Option<Tick> = None;
-    let mut see = |pr: &Property| {
-        if let Some(t) = pr.keys.iter().map(|k| k.time).min() {
-            first = Some(first.map_or(t, |f| f.min(t)));
-        }
-    };
-    for path in ["transform", "text/animators", "effects"] {
-        if let Some(g) = l.props.group(path) {
-            g.walk("", &mut |_, pr| see(pr));
-        }
-    }
-    first
-}
-
-/// The last key of those properties (layer time).
-fn last_key(l: &Layer) -> Option<Tick> {
-    let mut last: Option<Tick> = None;
-    for path in ["transform", "text/animators", "effects"] {
-        if let Some(g) = l.props.group(path) {
-            g.walk("", &mut |_, pr| {
-                if let Some(t) = pr.keys.iter().map(|k| k.time).max() {
-                    last = Some(last.map_or(t, |x| x.max(t)));
-                }
-            });
-        }
-    }
-    last
-}
-
-/// How much a property's speed peak counts as "the" move (lower first).
-fn lead_rank(match_id: &str) -> u8 {
-    match match_id {
-        "position" => 0,
-        "scale" => 1,
-        "rotation" | "rotationZ" => 2,
-        "anchor" | "anchorPoint" => 3,
-        "opacity" => 4,
-        _ => 5,
-    }
-}
-
-/// The template's main move: its speed peak (layer seconds) and the property's match id. The
-/// position (else scale, rotation, anchor, opacity, anything) whose first eased move peaks.
-fn lead_peak(l: &Layer) -> Option<(f64, String)> {
-    let mut best: Option<(u8, f64, String)> = None;
-    for path in ["transform", "text/animators"] {
-        let Some(g) = l.props.group(path) else { continue };
-        g.walk("", &mut |_, pr| {
-            if pr.keys.len() < 2 {
-                return;
-            }
-            let Some((t, _)) = (0..pr.keys.len() - 1).find_map(|i| lint::segment_peak(&pr.keys, i, pr.spatial)) else { return };
-            let rank = lead_rank(&pr.match_id);
-            if best.as_ref().is_none_or(|(r, bt, _)| rank < *r || (rank == *r && t < *bt)) {
-                best = Some((rank, t, pr.match_id.clone()));
-            }
-        });
-    }
-    best.map(|(_, t, m)| (t, m))
-}
-
-/// Scale a key's eases and spatial tangents by `gain` (the value change scaled by it).
-fn scale_motion(k: &mut effectcraft_keyframe::Keyframe, gain: f64) {
-    if !gain.is_finite() || (gain - 1.0).abs() < 1e-12 {
-        return;
-    }
-    for e in k.in_ease.as_mut_slice().iter_mut().chain(k.out_ease.as_mut_slice().iter_mut()) {
-        e.speed *= gain;
-    }
-    for v in k.spatial_in.iter_mut().chain(k.spatial_out.iter_mut()) {
-        *v *= gain;
-    }
-}
-
-/// A text animator property with its travel scaled by `f` (offsets from rest: position, anchor,
-/// rotation, skew, tracking from 0; scale from 100).
-fn scale_animator_prop(pr: &mut Property, f: Option<f64>) {
-    let Some(f) = f.filter(|f| f.is_finite() && (f - 1.0).abs() > 1e-12) else { return };
-    let map = |v: &KValue| -> KValue {
-        let c = v.components();
-        if c.is_empty() {
-            return v.clone();
-        }
-        let out: Vec<f64> = match pr.match_id.as_str() {
-            "position" | "anchor" | "rotation" | "rotationX" | "rotationY" | "skew" | "tracking" | "lineSpacing" => c.iter().map(|x| x * f).collect(),
-            "scale" => c.iter().map(|x| 100.0 + f * (x - 100.0)).collect(),
-            _ => return v.clone(),
-        };
-        v.with_components(&out)
-    };
-    let scaled = matches!(pr.match_id.as_str(), "position" | "anchor" | "rotation" | "rotationX" | "rotationY" | "skew" | "tracking" | "lineSpacing" | "scale");
-    if !scaled {
-        return;
-    }
-    pr.value = map(&pr.value);
-    for k in &mut pr.keys {
-        k.value = map(&k.value);
-        scale_motion(k, f);
-    }
-}
-
-/// A transform key value moved onto the target: `rest_t` is where the template settles (its last
-/// key), `rest` the target's own value; the move keeps its shape, scaled by `f`. Opacity stays
-/// absolute; scale goes by ratio.
-fn retarget(match_id: &str, v: &KValue, rest_t: &KValue, rest: &KValue, f: f64) -> KValue {
-    let (a, rt, r) = (v.components(), rest_t.components(), rest.components());
-    if a.is_empty() || r.is_empty() {
-        return v.clone();
-    }
-    let out: Vec<f64> = (0..r.len())
-        .map(|i| {
-            let ri = r.get(i).copied().unwrap_or(0.0);
-            let rti = rt.get(i).copied().unwrap_or(ri);
-            let ai = a.get(i).copied().unwrap_or(rti);
-            match match_id {
-                "opacity" => ai,
-                "scale" if rti.abs() > 1e-9 => ri * (1.0 + f * (ai / rti - 1.0)),
-                _ => ri + f * (ai - rti),
-            }
-        })
-        .collect();
-    rest.with_components(&out)
-}
-
-/// The gain of a retargeted move's speeds (value units per second scale with it).
-fn retarget_gain(match_id: &str, rest_t: &KValue, rest: &KValue, f: f64) -> f64 {
-    match match_id {
-        "opacity" => 1.0,
-        "scale" => {
-            let (rt, r) = (rest_t.components().first().copied().unwrap_or(0.0), rest.components().first().copied().unwrap_or(0.0));
-            if rt.abs() > 1e-9 { f * (r / rt).abs() } else { f }
-        }
-        _ => f,
-    }
-}
-
-/// What one target got.
-#[derive(Default)]
-struct Copied {
-    animators: usize,
-    properties: Vec<String>,
-    effects: usize,
-    skipped: Vec<String>,
-}
-
-/// Copy `tpl`'s animation onto `dst`: keys move by `shift` (template layer time → target layer
-/// time), travel scales by `f`. Uids come from `next`.
-fn copy_animation(tpl: &Layer, dst: &mut Layer, shift: Tick, f: f64, next: &mut u64) -> Copied {
-    let mut done = Copied::default();
-    // Text animators: appended (a second apply adds them again).
-    // TODO(batch1-verify): replace animators an earlier text.apply added instead of stacking them?
-    if let Some(src) = tpl.props.group("text/animators") {
-        match dst.props.group_mut("text/animators") {
-            Some(anims) => {
-                for c in &src.children {
-                    let Node::Group(g) = c else { continue };
-                    let mut g = g.clone();
-                    g.reassign_uids(next);
-                    g.walk_mut(&mut |pr| {
-                        for k in &mut pr.keys {
-                            k.time += shift;
-                        }
-                    });
-                    if let Some(props) = g.sub_mut("properties") {
-                        props.walk_mut(&mut |pr| scale_animator_prop(pr, Some(f)));
-                    }
-                    anims.children.push(Node::Group(g));
-                    done.animators += 1;
-                }
-            }
-            None if src.children.iter().any(|c| matches!(c, Node::Group(_))) => done.skipped.push("text animators (not a text layer)".into()),
-            None => {}
-        }
-    }
-    // Keyed transform properties, relative to the target's own values.
-    if let Some(tr) = tpl.props.sub("transform") {
-        for pr_t in tr.props() {
-            if pr_t.keys.is_empty() || pr_t.has_expression() {
-                continue;
-            }
-            let Some(rest_t) = pr_t.keys.last().map(|k| k.value.clone()) else { continue };
-            let Some(pr) = dst.props.sub_mut("transform").and_then(|g| g.get_mut(&pr_t.match_id)) else {
-                done.skipped.push(format!("transform/{}", pr_t.match_id));
-                continue;
-            };
-            if pr.static_only || std::mem::discriminant(&pr.value) != std::mem::discriminant(&rest_t) {
-                done.skipped.push(format!("transform/{}", pr_t.match_id));
-                continue;
-            }
-            // Where the target settles: its own value (its last key when it has keys already).
-            let rest = pr.keys.last().map(|k| k.value.clone()).unwrap_or_else(|| pr.value.clone());
-            let gain = retarget_gain(&pr_t.match_id, &rest_t, &rest, f);
-            let mut keys = pr_t.keys.clone();
-            for k in &mut keys {
-                k.time += shift;
-                k.value = retarget(&pr_t.match_id, &k.value, &rest_t, &rest, f);
-                scale_motion(k, gain);
-            }
-            pr.keys = keys;
-            done.properties.push(format!("transform/{}", pr_t.match_id));
-        }
-    }
-    // Effects: the template's replace ones of the same kind and name.
-    if let Some(fx_t) = tpl.props.sub("effects") {
-        let list: Vec<PropGroup> = fx_t.groups().cloned().collect();
-        if let Some(fx) = dst.props.sub_mut("effects") {
-            for mut g in list {
-                fx.children.retain(|c| !matches!(c, Node::Group(x) if x.match_id == g.match_id && x.name == g.name));
-                g.reassign_uids(next);
-                g.walk_mut(&mut |pr| {
-                    for k in &mut pr.keys {
-                        k.time += shift;
-                    }
-                });
-                fx.children.push(Node::Group(g));
-                done.effects += 1;
-            }
-        } else if !list.is_empty() {
-            done.skipped.push("effects".into());
-        }
-    }
-    done
-}
-
-/// The look of `tpl` (effects and layer styles) onto `dst`, for the glow style.
-fn copy_look(tpl: &Layer, dst: &mut Layer, next: &mut u64) -> usize {
-    let mut n = 0;
-    if let Some(fx_t) = tpl.props.sub("effects") {
-        let list: Vec<PropGroup> = fx_t.groups().cloned().collect();
-        if let Some(fx) = dst.props.sub_mut("effects") {
-            for mut g in list {
-                fx.children.retain(|c| !matches!(c, Node::Group(x) if x.match_id == g.match_id && x.name == g.name));
-                g.reassign_uids(next);
-                fx.children.push(Node::Group(g));
-                n += 1;
-            }
-        }
-    }
-    // TODO(batch1-verify): a layer without a `layerStyles` group gets the template's appended at
-    // the end of its property tree; check the renderer and the Timeline find it there.
-    if dst.can_have_styles()
-        && let Some(st_t) = tpl.props.sub(effectcraft_project::styles::GROUP)
-    {
-        let mut g = st_t.clone();
-        g.reassign_uids(next);
-        match dst.props.children.iter().position(|c| matches!(c, Node::Group(x) if x.match_id == effectcraft_project::styles::GROUP)) {
-            Some(i) => {
-                if let Some(slot) = dst.props.children.get_mut(i) {
-                    *slot = Node::Group(g);
-                }
-            }
-            None => dst.props.children.push(Node::Group(g)),
-        }
-        n += 1;
-    }
-    n
-}
-
-// ---------------------------------------------------------------- text.apply
-
-/// Where a preset's template layer is in the project, bringing a card in when needed.
-fn template(s: &mut Session, p: &Preset, cid: ItemId, notes: &mut Vec<String>) -> Result<(ItemId, LayerId)> {
-    match &p.source {
-        Source::Layer { comp, layer } => Ok((*comp, *layer)),
-        Source::Card { id, kind, .. } if kind == "preset" => Err(bad(
-            C,
-            format!(
-                "“{}” is an animation preset card (.ecpreset): it holds no text animators to copy. Apply it with library.insert {{id: \"{id}\", layers}}, or save the workshop layer as a layers card",
-                p.name
-            ),
-        )),
-        Source::Card { id, .. } => {
-            // library.apply nests the card's comp in `cid` ({item, layer, comp, …}, checked in
-            // commands/motion_library.rs); the nested layer is removed right away and the imported
-            // comp stays as the template's home.
-            let r = s.execute("library.apply", json!({"id": id, "comp": cid.0}))?;
-            if r.get("pending").and_then(Value::as_bool) == Some(true) {
-                return Err(bad(C, format!("“{}” is still downloading ({}/{}): run text.apply again in a moment", p.name, r["done"], r["total"])));
-            }
-            let item = r.get("item").and_then(Value::as_u64).map(ItemId).ok_or_else(|| bad(C, format!("“{}”: the card brought no composition", p.name)))?;
-            if let Some(nested) = r.get("layer").and_then(Value::as_u64).map(LayerId) {
-                s.edit("Remove Nested Card", None, |proj, st| {
-                    if let Some(comp) = proj.comp_mut(cid) {
-                        comp.layers.retain(|l| l.id != nested);
-                    }
-                    st.selected_layers.retain(|l| *l != nested);
-                    Ok(())
-                })?;
-            }
-            let comp = s.project.comp(item).ok_or_else(|| bad(C, format!("“{}”: the card's composition is missing", p.name)))?;
-            let short = p.parsed.short();
-            let layer = comp
-                .layers
-                .iter()
-                .find(|l| parse_name(&l.name).is_some_and(|n| n.short().eq_ignore_ascii_case(&short)))
-                .or_else(|| comp.layers.iter().find(|l| matches!(l.source, LayerSource::Text) && l.props.any_animated()))
-                .or_else(|| comp.layers.iter().find(|l| l.props.any_animated()))
-                .ok_or_else(|| bad(C, format!("“{}”: the card's composition has no animated layer", p.name)))?;
-            notes.push(format!("brought “{}” in from the Motion Library", p.name));
-            Ok((item, layer.id))
-        }
-    }
 }
 
 /// Where a word or phrase is said: (accent or start comp seconds, phrase start, phrase end, the
@@ -732,11 +409,176 @@ fn accent_in(words: &[Value], word: Option<&str>) -> Option<(f64, String)> {
     }
 }
 
+// ---------------------------------------------------------------- the peak
+
+/// The earliest key under the layer's transform, text animators and effects (layer time).
+fn first_key(l: &Layer) -> Option<Tick> {
+    let mut first: Option<Tick> = None;
+    for path in ["transform", "text/animators", "effects"] {
+        if let Some(g) = l.props.group(path) {
+            g.walk("", &mut |_, pr| {
+                if let Some(t) = pr.keys.iter().map(|k| k.time).min() {
+                    first = Some(first.map_or(t, |f| f.min(t)));
+                }
+            });
+        }
+    }
+    first
+}
+
+/// The last key of those properties (layer time).
+fn last_key(l: &Layer) -> Option<Tick> {
+    let mut last: Option<Tick> = None;
+    for path in ["transform", "text/animators", "effects"] {
+        if let Some(g) = l.props.group(path) {
+            g.walk("", &mut |_, pr| {
+                if let Some(t) = pr.keys.iter().map(|k| k.time).max() {
+                    last = Some(last.map_or(t, |x| x.max(t)));
+                }
+            });
+        }
+    }
+    last
+}
+
+/// How much a property's speed peak counts as "the" move (lower first).
+fn lead_rank(match_id: &str) -> u8 {
+    match match_id {
+        "position" => 0,
+        "scale" => 1,
+        "rotation" | "rotationZ" => 2,
+        "anchor" | "anchorPoint" => 3,
+        "opacity" => 4,
+        _ => 5,
+    }
+}
+
+/// The layer's main move: its speed peak (layer seconds). The position (else scale, rotation,
+/// anchor, opacity, anything) whose first eased move peaks.
+fn lead_peak(l: &Layer) -> Option<f64> {
+    let mut best: Option<(u8, f64)> = None;
+    for path in ["transform", "text/animators"] {
+        let Some(g) = l.props.group(path) else { continue };
+        g.walk("", &mut |_, pr| {
+            if pr.keys.len() < 2 {
+                return;
+            }
+            let Some((t, _)) = (0..pr.keys.len() - 1).find_map(|i| lint::segment_peak(&pr.keys, i, pr.spatial)) else { return };
+            let rank = lead_rank(&pr.match_id);
+            if best.is_none_or(|(r, bt)| rank < r || (rank == r && t < bt)) {
+                best = Some((rank, t));
+            }
+        });
+    }
+    best.map(|(_, t)| t)
+}
+
+/// The unit (0-based) of `word` in `text` and how many units there are, by a selector's Based On
+/// (0 Characters, 1 Characters Excluding Spaces, 2 Words, 3 Lines). A word that isn't in the
+/// text is the first unit.
+fn unit_of(text: &str, word: &str, based_on: u32) -> (usize, usize) {
+    // Words: (first char, chars, line); a line break is `\r`, `\n` or `\r\n`.
+    let mut words: Vec<(usize, usize, usize)> = vec![];
+    let (mut line, mut start, mut prev_cr, mut total) = (0usize, None::<usize>, false, 0usize);
+    for (i, ch) in text.chars().enumerate() {
+        total = i + 1;
+        if ch.is_whitespace() {
+            if let Some(st) = start.take() {
+                words.push((st, i - st, line));
+            }
+            if ch == '\r' || (ch == '\n' && !prev_cr) {
+                line += 1;
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+        prev_cr = ch == '\r';
+    }
+    if let Some(st) = start {
+        words.push((st, total.saturating_sub(st), line));
+    }
+    let want = clean(word);
+    let hit = words.iter().enumerate().find(|(_, (st, len, _))| !want.is_empty() && clean(&text.chars().skip(*st).take(*len).collect::<String>()) == want);
+    let (wi, (st, len, ln)) = match hit {
+        Some((wi, w)) => (wi, *w),
+        None => (0, words.first().copied().unwrap_or((0, 0, 0))),
+    };
+    match based_on {
+        2 => (wi, words.len().max(1)),
+        3 => (ln, line.saturating_add(1)),
+        1 => {
+            let before = text.chars().take(st).filter(|c| !c.is_whitespace()).count();
+            (before + len / 2, text.chars().filter(|c| !c.is_whitespace()).count().max(1))
+        }
+        _ => (st + len / 2, total.max(1)),
+    }
+}
+
+/// When (comp s) the "Fade Up" reveal brings `word`'s unit in: its Range Selector Offset (keyed,
+/// layer time) crosses `c − 100 + 100·UNIT_PEAK` for the unit's centre `c` (a Ramp Up unit
+/// appears from Offset `c − 100` to `c`). The units are those of the "Fade Up" copy that is on
+/// (its Amount, expressions run, is not 0; else the keyed one).
+fn reveal_peak(s: &Session, cid: ItemId, l: &Layer, word: &str) -> Option<f64> {
+    let comp = s.project.comp(cid)?;
+    let anims = l.props.group("text/animators")?;
+    let fade: Vec<&PropGroup> = anims.groups().filter(|g| g.name.starts_with(REVEAL_ANIMATOR)).collect();
+    let offset_of = |g: &PropGroup| g.prop("selectors/rangeSelector/offset").filter(|o| o.keys.len() >= 2).cloned();
+    let (master, off) = fade.iter().copied().find_map(|g| offset_of(g).map(|o| (g, o)))?;
+    let (k0, k1) = (off.keys.first()?.time, off.keys.last()?.time);
+    // TODO(batch1-verify): EvalCtx::value runs the Amount expression of a text range selector
+    // (it reads `effect("Animate By")("Menu")`).
+    let ctx = effectcraft_render::EvalCtx { project: &s.project, comp_id: cid, comp, time: l.comp_time(k0), expr: s.expr.as_deref(), footage: None };
+    let active = fade
+        .iter()
+        .copied()
+        .find(|g| g.prop("selectors/rangeSelector/advanced/amount").is_some_and(|a| ctx.value(l, a).as_f64().abs() > 1e-6))
+        .unwrap_or(master);
+    let based_on = match active.prop("selectors/rangeSelector/advanced/basedOn").map(|p| &p.value) {
+        Some(KValue::Enum(i)) => *i,
+        _ => 0,
+    };
+    let text = match l.props.prop("text/sourceText").map(|p| &p.value) {
+        Some(KValue::Text(d)) => d.text.clone(),
+        _ => return None,
+    };
+    let (i, n) = unit_of(&text, word, based_on);
+    let c = (i as f64 + 0.5) / n as f64 * 100.0;
+    let target = c - 100.0 + 100.0 * UNIT_PEAK;
+    const STEPS: u32 = 64;
+    let (a0, span) = (k0.seconds(), (k1 - k0).seconds());
+    let at = |t: f64| off.value_at(Tick::from_seconds_f64(t)).as_f64();
+    let mut prev = (a0, at(a0));
+    if (prev.1 - target).abs() < 1e-9 {
+        return Some(l.comp_time(k0).seconds());
+    }
+    for j in 1..=STEPS {
+        let t = a0 + span * f64::from(j) / f64::from(STEPS);
+        let v = at(t);
+        if (prev.1 - target) * (v - target) <= 0.0 && (v - prev.1).abs() > 1e-12 {
+            let tl = prev.0 + (target - prev.1) / (v - prev.1) * (t - prev.0);
+            return Some(l.comp_time(Tick::from_seconds_f64(tl)).seconds());
+        }
+        prev = (t, v);
+    }
+    None
+}
+
+/// The time (comp s) `sync` lands on the accent, and how it was found.
+fn peak_of(s: &Session, cid: ItemId, lid: LayerId, word: &str) -> Option<(f64, &'static str)> {
+    let l = s.project.comp(cid)?.layer(lid)?;
+    if let Some(t) = reveal_peak(s, cid, l, word) {
+        return Some((t, "reveal"));
+    }
+    lead_peak(l).map(|t| (l.comp_time(Tick::from_seconds_f64(t)).seconds(), "speedPeak"))
+}
+
+// ---------------------------------------------------------------- text.apply
+
 /// One layer to animate: an existing one, or one made for words.
 struct Job {
     layer: LayerId,
     created: bool,
-    /// Comp seconds: where the template's first key lands without sync.
+    /// Comp seconds: where the preset's keys start without sync.
     start: f64,
     /// Comp seconds: the stressed syllable the peak lands on, with its word.
     accent: Option<(f64, String)>,
@@ -744,19 +586,41 @@ struct Job {
     span: Option<(f64, f64)>,
 }
 
-fn distance_p(p: &Value) -> Result<Option<Distance>> {
+/// `distance`: near | mid | far (the old chips) or pixels.
+fn distance_p(p: &Value) -> Result<Option<f64>> {
     match p.get("distance").filter(|v| !v.is_null()) {
         None => Ok(None),
         Some(Value::String(d)) if d.trim().is_empty() => Ok(None),
-        Some(Value::String(d)) => Distance::parse(d).map(Some).ok_or_else(|| bad(C, format!("`distance` is near, mid or far, not {d:?}"))),
-        Some(v) => Err(bad(C, format!("`distance` is near, mid or far, not {v}"))),
+        Some(Value::String(d)) => {
+            let d = d.trim().to_ascii_lowercase();
+            TRAVEL.iter().find(|(k, _)| *k == d).map(|(_, v)| Some(*v)).ok_or_else(|| bad(C, format!("`distance` is near, mid, far or pixels, not {d:?}")))
+        }
+        Some(Value::Number(n)) => n.as_f64().filter(|v| v.is_finite()).map(Some).ok_or_else(|| bad(C, "`distance`: a number of pixels")),
+        Some(v) => Err(bad(C, format!("`distance` is near, mid, far or pixels, not {v}"))),
+    }
+}
+
+/// `controls`: {name: value}.
+fn controls_p(p: &Value) -> Result<Vec<(String, Value)>> {
+    match p.get("controls") {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(Value::Object(o)) => {
+            if o.len() > MAX_CONTROLS {
+                return Err(bad(C, format!("`controls`: at most {MAX_CONTROLS}")));
+            }
+            Ok(o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        }
+        Some(v) => Err(bad(C, format!("`controls` is {{\"Control name\": value}}, not {v}"))),
     }
 }
 
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
-    let query =
-        str_p(p, "preset").map(str::trim).filter(|q| !q.is_empty()).ok_or_else(|| bad(C, "missing `preset` (e.g. \"T3b\"; text.presetFamilies lists them)"))?;
+    let query = str_p(p, "preset")
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .ok_or_else(|| bad(C, "missing `preset` (a text preset card's name, e.g. \"Slide In\"; text.presetFamilies lists them)"))?;
     let distance = distance_p(p)?;
+    let given = controls_p(p)?;
     let sync = b_p(p, "sync").unwrap_or(false);
     let glow = b_p(p, "glow").unwrap_or(false);
     let word = str_p(p, "word").map(str::trim).filter(|w| !w.is_empty()).map(str::to_string);
@@ -765,26 +629,44 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         None => None,
         Some(v) => Some(v.as_u64().filter(|n| *n >= 1).ok_or_else(|| bad(C, format!("`occurrence` is 1 or more, not {v}")))?),
     };
+    let at = match p.get("at").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => Some(v.as_f64().filter(|x| x.is_finite() && x.abs() <= 86_400.0).ok_or_else(|| bad(C, format!("`at` is comp seconds, not {v}")))?),
+    };
     let cid = comp_id(s, p)?;
-    let all = all_presets(s);
-    let (preset, scale) =
-        pick(&all, query, distance).map(|(p, f)| (p.clone(), f)).ok_or_else(|| bad(C, format!("no text preset {query:?}; there are: {}", shorts(&all))))?;
-    if !scale.is_finite() || scale <= 0.0 {
-        return Err(bad(C, "the distance scale is not a positive number"));
+    let preset = find_preset(s, p, query, C)?;
+    let have = controls(&preset.doc);
+    // Exact names only: a typo is an error that lists what the preset has.
+    let names = || {
+        let v: Vec<&str> = have.iter().map(|c| c.name.as_str()).collect();
+        if v.is_empty() { "none".to_string() } else { v.join(", ") }
+    };
+    for (n, _) in &given {
+        if !have.iter().any(|c| c.name == *n) {
+            return Err(bad(C, format!("“{}” has no control “{n}”; its controls: {}", preset.name, names())));
+        }
+    }
+    let mut sets = given;
+    if let Some(px) = distance {
+        for c in &have {
+            if c.name.to_lowercase().contains("travel") && !sets.iter().any(|(n, _)| *n == c.name) {
+                sets.push((c.name.clone(), json!(px)));
+            }
+        }
     }
 
     let snap = s.project.clone();
     let history = s.history.clone();
     let mut notes: Vec<String> = vec![];
-    let result = run(s, p, cid, &preset, scale, sync, glow, word.as_deref(), words.as_ref(), occurrence, &mut notes);
-    match result {
+    let opts = Opts { sync, glow, word: word.as_deref(), words: words.as_ref(), occurrence, at };
+    match run(s, p, cid, &preset, &sets, &opts, &mut notes) {
         Ok(mut r) => {
-            super::batch::fold(s, &snap, &format!("Text Preset {}", preset.parsed.short()));
+            super::batch::fold(s, &snap, &format!("Text Preset {}", preset.name));
             r["notes"] = json!(notes);
             Ok(r)
         }
         Err(e) => {
-            // Leave the project as it was (a card brought in, a layer made).
+            // Leave the project as it was (a layer made, the preset half applied).
             s.project = snap;
             s.history = history;
             s.sanitize_state();
@@ -794,30 +676,21 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(
-    s: &mut Session,
-    p: &Value,
-    cid: ItemId,
-    preset: &Preset,
-    scale: f64,
+struct Opts<'a> {
     sync: bool,
     glow: bool,
-    word: Option<&str>,
-    words: Option<&Words>,
+    word: Option<&'a str>,
+    words: Option<&'a Words>,
     occurrence: Option<u64>,
-    notes: &mut Vec<String>,
-) -> Result<Value> {
-    let (tc, tl) = template(s, preset, cid, notes)?;
-    let tpl = s.project.comp(tc).and_then(|c| c.layer(tl)).cloned().ok_or_else(|| bad(C, format!("the template layer of “{}” is gone", preset.name)))?;
-    let first = first_key(&tpl).ok_or_else(|| bad(C, format!("“{}” has no keyframes to copy", preset.name)))?;
-    let span_t = last_key(&tpl).map(|l| (l - first).seconds().max(0.0)).unwrap_or(0.0);
-    let lead = lead_peak(&tpl);
+    at: Option<f64>,
+}
 
-    // The layers: given ones, else a new one for `words` (or `word`), else the selected text layers.
+/// The layers to animate: the given ones, else a new one for `words` (or `word`), else the
+/// selected text layers.
+fn jobs(s: &mut Session, p: &Value, cid: ItemId, o: &Opts, notes: &mut Vec<String>) -> Result<Vec<Job>> {
     let explicit_layers = p.get("layers").or(p.get("layer")).is_some_and(|v| !v.is_null());
     let mut jobs: Vec<Job> = vec![];
-    if explicit_layers || (words.is_none() && word.is_none()) {
+    if explicit_layers || (o.words.is_none() && o.word.is_none()) {
         let (lcid, ids) = layers_p(s, p)?;
         if lcid != cid {
             return Err(bad(C, "the layers are in another comp than `comp`"));
@@ -833,144 +706,211 @@ fn run(
             notes.push(format!("{} layer(s) that are not text were left alone", ids.len() - text_ids.len()));
         }
         // The phrase to sync on, when given with the layers.
-        let phrase = match (words, word) {
-            (Some(w), _) if sync => Some(said_of(s, cid, w, occurrence)?),
-            (None, Some(w)) if sync => Some(find_said(s, cid, w, occurrence)?),
+        let phrase = match (o.words, o.word) {
+            (Some(w), _) if o.sync => Some(said_of(s, cid, w, o.occurrence)?),
+            (None, Some(w)) if o.sync => Some(find_said(s, cid, w, o.occurrence)?),
             _ => None,
         };
         for lid in text_ids {
             let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
             let Some(l) = comp.layer(lid) else { continue };
-            let start = l.in_point.seconds();
-            let accent = if !sync {
+            let start = o.at.unwrap_or_else(|| l.in_point.seconds());
+            let accent = if !o.sync {
                 None
             } else if let Some(ph) = &phrase {
-                accent_in(&ph.words, word).or_else(|| ph.accent.map(|t| (t, word.unwrap_or("").to_string())))
+                accent_in(&ph.words, o.word).or_else(|| ph.accent.map(|t| (t, o.word.unwrap_or("").to_string())))
             } else {
                 // The words said while the layer shows.
                 let r = s.execute("layer.words", json!({"comp": cid.0, "layer": lid.0}))?;
-                accent_in(r.get("words").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]), word)
+                accent_in(r.get("words").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]), o.word)
             };
-            if sync && accent.is_none() {
+            if o.sync && accent.is_none() {
                 notes.push(format!("layer {}: no stressed syllable to sync on, so it starts at its in point", lid.0));
             }
             jobs.push(Job { layer: lid, created: false, start, accent, span: None });
         }
-    } else {
-        let said = match (words, word) {
-            (Some(w), _) => said_of(s, cid, w, occurrence)?,
-            (None, Some(w)) => find_said(s, cid, w, occurrence)?,
-            (None, None) => return Err(bad(C, "give `layers`, `words` or `word`")),
-        };
-        let text = match words {
-            Some(Words::Text(t)) => t.clone(),
-            _ => word.unwrap_or("").to_string(),
-        };
-        let accent = if sync { accent_in(&said.words, word).or_else(|| said.accent.map(|t| (t, text.clone()))) } else { None };
-        if sync && accent.is_none() {
-            notes.push(format!("{text:?} has no stressed syllable in the speech map: the animation starts with the words"));
-        }
-        // The text as said in the map (a phrase's words joined), else as given.
-        let shown: String = {
-            let said_text: Vec<&str> = said.words.iter().filter_map(|w| w.get("word").and_then(Value::as_str)).collect();
-            if said_text.is_empty() { text.clone() } else { said_text.join(" ") }
-        };
-        let r = s.execute("layer.newText", json!({"comp": cid.0, "text": shown, "name": shown.chars().take(60).collect::<String>()}))?;
-        let lid = r.get("layer").and_then(Value::as_u64).map(LayerId).ok_or_else(|| bad(C, "layer.newText made no layer"))?;
-        jobs.push(Job { layer: lid, created: true, start: said.start, accent, span: Some((said.start, said.end)) });
+        return Ok(jobs);
     }
-
-    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
-    let fr = comp.frame_rate;
-    let fps = fr.as_f64();
-    // Template seconds from its first key to its peak.
-    let rel = lead.as_ref().map(|(t, _)| t - first.seconds());
-    if sync && lead.is_none() {
-        notes.push(format!("“{}” has no eased move with a speed peak: sync starts it on the word instead", preset.name));
+    let said = match (o.words, o.word) {
+        (Some(w), _) => said_of(s, cid, w, o.occurrence)?,
+        (None, Some(w)) => find_said(s, cid, w, o.occurrence)?,
+        (None, None) => return Err(bad(C, "give `layers`, `words` or `word`")),
+    };
+    let text = match o.words {
+        Some(Words::Text(t)) => t.clone(),
+        _ => o.word.unwrap_or("").to_string(),
+    };
+    let accent = if o.sync { accent_in(&said.words, o.word).or_else(|| said.accent.map(|t| (t, text.clone()))) } else { None };
+    if o.sync && accent.is_none() {
+        notes.push(format!("{text:?} has no stressed syllable in the speech map: the animation starts with the words"));
     }
-    let tpl_doc = tpl.props.prop("text/sourceText").map(|pr| pr.value.clone());
-    let targets: Vec<LayerId> = jobs.iter().map(|j| j.layer).collect();
+    // The text as said in the map (a phrase's words joined), else as given.
+    let shown: String = {
+        let said_text: Vec<&str> = said.words.iter().filter_map(|w| w.get("word").and_then(Value::as_str)).collect();
+        if said_text.is_empty() { text.clone() } else { said_text.join(" ") }
+    };
+    let r = s.execute("layer.newText", json!({"comp": cid.0, "text": shown, "name": shown.chars().take(60).collect::<String>()}))?;
+    let lid = r.get("layer").and_then(Value::as_u64).map(LayerId).ok_or_else(|| bad(C, "layer.newText made no layer"))?;
+    jobs.push(Job { layer: lid, created: true, start: o.at.unwrap_or(said.start), accent, span: Some((said.start, said.end)) });
+    Ok(jobs)
+}
 
-    let reports = s.edit(&format!("Apply Text Preset {}", preset.parsed.short()), None, |proj, st| {
-        let mut next = proj.next_id;
-        let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        let mut reports = vec![];
-        for job in &jobs {
-            let Some(l) = comp.layer_mut(job.layer) else { continue };
-            // Comp time of the template's first key.
-            let base_s = match (job.accent.as_ref(), rel) {
-                (Some((a, _)), Some(rel)) => a - rel,
-                (Some((a, _)), None) => *a,
-                _ => job.start,
+/// Set the controls `sets` (exact effect names) on the layer: the effect's first parameter, as
+/// prop.set reads a value (a dropdown takes its item name or 0-based index). Keyed controls are
+/// left alone (reported).
+fn set_controls(s: &mut Session, cid: ItemId, lid: LayerId, sets: &[(String, Value)]) -> Result<Vec<Value>> {
+    if sets.is_empty() {
+        return Ok(vec![]);
+    }
+    s.edit("Text Preset Controls", None, |proj, _| {
+        let l = super::layer_mut(proj, cid, lid)?;
+        let fx = l.props.sub_mut("effects").ok_or_else(|| bad(C, "this layer has no effects"))?;
+        let mut out = vec![];
+        for (name, v) in sets {
+            let Some(g) = fx.children.iter_mut().rev().find_map(|c| match c {
+                Node::Group(g) if g.name == *name => Some(g),
+                _ => None,
+            }) else {
+                out.push(json!({"control": name, "skipped": "not on the layer"}));
+                continue;
             };
-            let base = fr.snap_nearest(Tick::from_seconds_f64(base_s));
-            if job.created {
-                // The template's font, size and fill with the words' text.
-                if let (Some(KValue::Text(doc_t)), Some(pr)) = (tpl_doc.as_ref(), l.props.prop_mut("text/sourceText"))
-                    && let KValue::Text(cur) = &pr.value
-                {
-                    let mut doc = doc_t.clone();
-                    doc.set_text(&cur.text);
-                    // TODO(batch1-verify): a template with a paragraph box keeps its box here.
-                    pr.value = KValue::Text(doc);
-                }
-                if let Some((a, b)) = job.span {
-                    let inn = fr.snap_nearest(Tick::from_seconds_f64(a)).min(base);
-                    let end = (base + Tick::from_seconds_f64(span_t)).max(Tick::from_seconds_f64(b)) + Tick::from_seconds_f64(HOLD);
-                    l.in_point = inn;
-                    l.out_point = fr.snap_nearest(end).max(inn + fr.frame_duration());
-                }
+            let Some(pr) = g.children.iter_mut().find_map(|c| match c {
+                Node::Prop(pr) => Some(pr),
+                _ => None,
+            }) else {
+                out.push(json!({"control": name, "skipped": "no parameter"}));
+                continue;
+            };
+            if pr.is_animated() {
+                out.push(json!({"control": name, "skipped": "keyed in the preset"}));
+                continue;
             }
-            let shift = l.layer_time(base) - first;
-            let copied = copy_animation(&tpl, l, shift, scale, &mut next);
-            let mut rep = json!({
-                "layer": l.id.0,
-                "name": l.name,
-                "created": job.created,
-                "start": (base.seconds() * 1000.0).round() / 1000.0,
-                "startFrame": (base.seconds() * fps).round() as i64,
-                "animators": copied.animators,
-                "properties": copied.properties,
-                "effects": copied.effects,
-            });
-            if !copied.skipped.is_empty() {
-                rep["skipped"] = json!(copied.skipped);
+            let cur = pr.value.clone();
+            let (kv, warnings) = super::prop::coerce_for(pr, &cur, v, C)?;
+            pr.value = kv;
+            let mut r = json!({"control": name, "value": v});
+            if !warnings.is_empty() {
+                r["warnings"] = json!(warnings);
             }
-            if base < l.in_point {
-                rep["warning"] = json!("the animation starts before the layer's in point");
-            }
-            if let (Some((a, w)), Some(rel)) = (job.accent.as_ref(), rel) {
-                let peak = base.seconds() + rel;
-                rep["sync"] = json!({
-                    "word": w,
-                    "accentFrame": ((a * fps) * 100.0).round() / 100.0,
-                    "peakFrame": ((peak * fps) * 100.0).round() / 100.0,
-                    "offsetFrames": (((peak - a) * fps) * 100.0).round() / 100.0,
-                    "property": lead.as_ref().map(|(_, m)| m.clone()),
-                });
-            }
-            reports.push(rep);
+            out.push(r);
         }
-        st.selected_layers = targets.clone();
-        proj.next_id = next;
-        Ok(reports)
-    })?;
+        Ok(out)
+    })
+}
 
-    let glow_report = if glow { apply_glow(s, cid, &targets, notes)? } else { Value::Null };
+/// Move every key the preset put on the layer (its animators, effects and properties, by name
+/// and path) by `shift`.
+fn shift_preset_keys(s: &mut Session, cid: ItemId, lid: LayerId, doc: &Value, shift: Tick) -> Result<()> {
+    let anims = animator_names(doc);
+    let fx_names: Vec<String> =
+        doc.get("effects").and_then(Value::as_array).into_iter().flatten().filter_map(|g| g.get("name").and_then(Value::as_str).map(str::to_string)).collect();
+    let paths: Vec<String> = doc
+        .get("properties")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("path").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    s.edit("Sync Text Preset", None, |proj, _| {
+        let l = super::layer_mut(proj, cid, lid)?;
+        let mut move_keys = |pr: &mut effectcraft_project::Property| {
+            for k in &mut pr.keys {
+                k.time += shift;
+            }
+        };
+        for (group, names) in [("text/animators", &anims), ("effects", &fx_names)] {
+            if let Some(g) = l.props.group_mut(group) {
+                for c in &mut g.children {
+                    if let Node::Group(x) = c
+                        && names.contains(&x.name)
+                    {
+                        x.walk_mut(&mut move_keys);
+                    }
+                }
+            }
+        }
+        for path in &paths {
+            if let Some(pr) = l.props.prop_mut(path) {
+                move_keys(pr);
+            }
+        }
+        Ok(())
+    })
+}
+
+fn run(s: &mut Session, p: &Value, cid: ItemId, preset: &TextPreset, sets: &[(String, Value)], o: &Opts, notes: &mut Vec<String>) -> Result<Value> {
+    let jobs = jobs(s, p, cid, o, notes)?;
+    let fr = s.project.comp(cid).ok_or(EngineError::NoComp)?.frame_rate;
+    let fps = fr.as_f64();
+    let mut reports = vec![];
+    for job in &jobs {
+        // 1. The preset, from the start (same-named effects and animators replaced).
+        let start = fr.snap_nearest(Tick::from_seconds_f64(job.start));
+        let r = s.execute("anim.applyPreset", json!({"preset": preset.doc, "layers": [job.layer.0], "at": start.seconds(), "replace": true, "comp": cid.0}))?;
+        // 2. Its controls.
+        let set = set_controls(s, cid, job.layer, sets)?;
+        let mut rep = json!({
+            "layer": job.layer.0,
+            "created": job.created,
+            "applied": r.get("applied"),
+            "controls": set,
+        });
+        if let Some(sk) = r.get("skipped").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+            rep["skipped"] = json!(sk);
+        }
+        // 3. Sync: the reveal (or the main move's speed peak) on the accent, to the frame.
+        let mut base = start;
+        if let Some((accent, w)) = &job.accent {
+            match peak_of(s, cid, job.layer, w) {
+                Some((peak, how)) => {
+                    let new_base = fr.snap_nearest(Tick::from_seconds_f64(start.seconds() + accent - peak));
+                    let shift = new_base - start;
+                    shift_preset_keys(s, cid, job.layer, &preset.doc, shift)?;
+                    base = new_base;
+                    let after = peak + shift.seconds();
+                    rep["sync"] = json!({
+                        "word": w,
+                        "by": how,
+                        "accentFrame": ((accent * fps) * 100.0).round() / 100.0,
+                        "peakFrame": ((after * fps) * 100.0).round() / 100.0,
+                        "offsetFrames": (((after - accent) * fps) * 100.0).round() / 100.0,
+                    });
+                }
+                None => {
+                    notes.push(format!("“{}” has no keyed “{REVEAL_ANIMATOR}” Offset or eased move to sync on: it starts at the layer's start", preset.name))
+                }
+            }
+        }
+        rep["start"] = json!((base.seconds() * 1000.0).round() / 1000.0);
+        rep["startFrame"] = json!((base.seconds() * fps).round() as i64);
+        // 4. A made layer shows from its words (or the first key) to the end of both, plus a hold.
+        let fit = s.edit("Text Preset Layer", None, |proj, _| {
+            let l = super::layer_mut(proj, cid, job.layer)?;
+            let first = first_key(l).map(|t| l.comp_time(t));
+            let last = last_key(l).map(|t| l.comp_time(t));
+            if let (true, Some((a, b))) = (job.created, job.span) {
+                let inn = first.map_or(fr.snap_nearest(Tick::from_seconds_f64(a)), |f| f.min(fr.snap_nearest(Tick::from_seconds_f64(a))));
+                let end = last.unwrap_or(inn).max(Tick::from_seconds_f64(b)) + Tick::from_seconds_f64(HOLD);
+                l.in_point = inn;
+                l.out_point = fr.snap_nearest(end).max(inn + fr.frame_duration());
+            }
+            Ok((l.name.clone(), first.is_some_and(|f| f < l.in_point)))
+        })?;
+        rep["name"] = json!(fit.0);
+        if fit.1 {
+            rep["warning"] = json!("the animation starts before the layer's in point");
+        }
+        reports.push(rep);
+    }
+    let targets: Vec<LayerId> = jobs.iter().map(|j| j.layer).collect();
+    s.state.selected_layers = targets.clone();
+    let glow_report = if o.glow { apply_glow(s, cid, &targets, notes)? } else { Value::Null };
     let mut out = json!({
-        "preset": {
-            "short": preset.parsed.short(),
-            "name": preset.name,
-            "distance": preset.parsed.distance.map(Distance::id),
-            "travelScale": (scale * 1000.0).round() / 1000.0,
-        },
+        "preset": {"name": preset.name, "id": preset.id, "path": preset.path, "source": preset.source, "controls": controls(&preset.doc).iter().map(control_json).collect::<Vec<_>>()},
         "comp": cid.0,
-        "sync": sync,
+        "sync": o.sync,
         "layers": reports,
     });
-    if let (Some(o), Value::Object(src)) = (out["preset"].as_object_mut(), preset.source_json(s)) {
-        o.extend(src);
-    }
     if !glow_report.is_null() {
         out["glow"] = glow_report.clone();
         if let Some(f) = glow_report.get("followUp") {
@@ -978,6 +918,44 @@ fn run(
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------- the glow style
+
+/// The look of `tpl` (effects and layer styles) onto `dst`, for the glow style.
+fn copy_look(tpl: &Layer, dst: &mut Layer, next: &mut u64) -> usize {
+    let mut n = 0;
+    if let Some(fx_t) = tpl.props.sub("effects") {
+        let list: Vec<PropGroup> = fx_t.groups().cloned().collect();
+        if let Some(fx) = dst.props.sub_mut("effects") {
+            for mut g in list {
+                fx.children.retain(|c| !matches!(c, Node::Group(x) if x.match_id == g.match_id && x.name == g.name));
+                g.reassign_uids(next);
+                *next += 1;
+                fx.children.push(Node::Group(g));
+                n += 1;
+            }
+        }
+    }
+    // TODO(batch1-verify): a layer without a `layerStyles` group gets the template's appended at
+    // the end of its property tree; check the renderer and the Timeline find it there.
+    if dst.can_have_styles()
+        && let Some(st_t) = tpl.props.sub(effectcraft_project::styles::GROUP)
+    {
+        let mut g = st_t.clone();
+        g.reassign_uids(next);
+        *next += 1;
+        match dst.props.children.iter().position(|c| matches!(c, Node::Group(x) if x.match_id == effectcraft_project::styles::GROUP)) {
+            Some(i) => {
+                if let Some(slot) = dst.props.children.get_mut(i) {
+                    *slot = Node::Group(g);
+                }
+            }
+            None => dst.props.children.push(Node::Group(g)),
+        }
+        n += 1;
+    }
+    n
 }
 
 /// The glow style: a project layer named like it lends its effects and layer styles; else the
@@ -1012,9 +990,8 @@ fn apply_glow(s: &mut Session, cid: ItemId, targets: &[LayerId], notes: &mut Vec
     match hit.and_then(|e| e.get("id")).and_then(Value::as_str) {
         Some(id) => {
             // `motionLibrary.apply` is a UI command (the Motion Library's plug applies text styles):
-            // the app runs `followUp` after text.apply (`panels/text_apply.rs`: the quick row, the
-            // Script tab, Motion Library ▸ Families); agents run it with command_run. The target
-            // layers are selected.
+            // the app runs `followUp` after text.apply (`panels/text_apply.rs`); agents run it with
+            // command_run. The target layers are selected.
             notes.push(format!("{GLOW_STYLE}: run followUp (motionLibrary.apply) to add it"));
             Ok(json!({"applied": false, "source": "motion", "card": id, "followUp": {"command": "motionLibrary.apply", "params": {"id": id}}}))
         }
@@ -1029,8 +1006,8 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         query!(
             "text.presetFamilies",
-            "Text Preset Families",
-            "{} → {families: [{family (\"T3\"), name (\"Pop\"), variants: [{short (\"T3b\"), name (\"T3b Pop · mid\"), variant, distance (near|mid|far), source (project|library|motion), comp?, compName?, layer?, card?, kind?}]}], workshop (the comp “Creating Text Presets”, if open), distances: {near, mid, far} (travel scales), glowStyle}: Elias's text animations, from the workshop comp, library folders and the Motion Library",
+            "Text Presets",
+            "{category? (default \"Elias/Text animations\")} → {category, presets: [{name (\"Slide In\"), id, file, source (library|motion), controls?: [{name (\"Travel Distance (px)\"), type (slider|angle|dropdown|checkbox|color|point…), value, options? (dropdown items)}], animators? (names), effects? (count)}], unreadable: [{id, name, error}], travel: {near, mid, far} (px), workshop, glowStyle}: Elias's text animations, the Motion Library preset cards of that category, with the controls read from each card's .ecpreset (a catalog card shows them once text.apply downloaded it)",
             families
         ),
         cmd!(
@@ -1038,7 +1015,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Text Preset",
             [],
             None,
-            "{preset (\"T3b\", \"T3\" (the distance's variant, default mid) or the full name \"T3b Pop · mid\"), layers? (text layers; default the selected ones unless `words` is given), words? (a phrase of the comp's speech map as text, or [from, to] / {from, to} speech-map word indices: a new text layer shows it, timed to it), word? (the word to sync on; also the text when neither layers nor words are given), occurrence? (1-based, of words or word), sync? (bool: the animation's speed peak lands on the stressed syllable of `word`, else the first stressed word), glow? (bool: also the Motion Library style “Caption glow + double shadow”), distance?: near|mid|far (the family's variant; without it the travel scales 0.5× / 1× / 1.6×), comp?} → {preset: {short, name, distance, travelScale, source}, comp, sync, layers: [{layer, name, created, start, startFrame, animators, properties, effects, skipped?, warning?, sync?: {word, accentFrame, peakFrame, offsetFrames, property}}], glow?, followUp? ([{command, params}] the app runs next), notes}. One undo step",
+            "{preset (a text preset card of Motion Library ▸ Elias ▸ Text animations by name or id, e.g. \"Slide In\" (text.presetFamilies lists them), or a .ecpreset path), layers? (text layers; default the selected ones unless `words` is given), words? (a phrase of the comp's speech map as text, or [from, to] / {from, to} speech-map word indices: a new text layer shows it, timed to it), word? (the word to sync on; also the text when neither layers nor words are given), occurrence? (1-based, of words or word), controls? ({\"Travel Distance (px)\": 40, \"Animate By\": \"Words\"}: the preset's Expression Controls by exact name; a dropdown takes an item name or 0-based index; an unknown name is an error), distance? (near|mid|far or px: every control named with “Travel” to 40/90/150 px, when the preset has one), sync? (bool: the stressed syllable of `word`, else the first stressed word, lands on the “Fade Up” reveal of its unit (else the main move's speed peak); the preset's keys shift), glow? (bool: also the Motion Library style “Caption glow + double shadow”), at? (comp s: where the preset's keys start; default the layer's in point), category? (default \"Elias/Text animations\"), comp?} → {preset: {name, id, path, source, controls}, comp, sync, layers: [{layer, name, created, start, startFrame, applied, controls, skipped?, warning?, sync?: {word, by (reveal|speedPeak), accentFrame, peakFrame, offsetFrames}}], glow?, followUp? ([{command, params}] the app runs next), notes}. One undo step",
             has_comp,
             apply
         ),
@@ -1046,6 +1023,6 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 #[cfg(test)]
-pub(crate) fn parse_for_tests(name: &str) -> Option<PresetName> {
-    parse_name(name)
+pub(crate) fn unit_for_tests(text: &str, word: &str, based_on: u32) -> (usize, usize) {
+    unit_of(text, word, based_on)
 }

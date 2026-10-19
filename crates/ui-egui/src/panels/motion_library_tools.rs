@@ -1560,66 +1560,82 @@ pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: 
     text_animations(app, ui, &ctx, area, y + 40.0 * s, s);
 }
 
-/// Text animations (CX8): the Motion Library's text presets as families (`T3 Pop`) with their
-/// near / mid / far variants (`T3b Pop · mid`), from `text.presetFamilies` (lane D). A variant
-/// applies to the selected text layers (`text.apply`); "Save selected as preset" saves the
-/// selected workshop layer (`ml.saveTextPreset`, again = update).
+/// Text animations (CX8, CX8c): Elias's text preset cards (Motion Library ▸ Elias ▸ Text
+/// animations, from `text.presetFamilies`), each with the Expression Controls its file carries
+/// (read from the card, nothing built in). A preset applies to the selected text layers
+/// (`text.apply`); "Save selected as preset" saves the selected workshop layer's effects and
+/// text animators as a preset card (`ml.saveTextPreset`, again = update).
 fn text_animations(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, top: f32, s: f32) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(area);
     let x0 = area.min.x + 12.0 * s;
     let w = (area.width() - 24.0 * s).max(80.0);
     let mut y = top;
-    p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, tr("Text animations · families with near / mid / far"), Tokens::semibold(12.5 * s), t.text);
+    p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, tr("Text animations · Elias ▸ Text animations"), Tokens::semibold(12.5 * s), t.text);
     y += 26.0 * s;
-    let cache = egui::Id::new("ml-text-families-cache");
+    let cache = egui::Id::new("ml-text-presets-cache");
     let rev = app.session.revision;
-    // Lane D's listing: `text.presetFamilies` (`text.presets` is text_anim's built-in presets).
-    let list: Value = match ctx.data(|d| d.get_temp::<(u64, Value)>(cache)) {
-        Some((r, v)) if r == rev => v,
+    let now = ctx.input(|i| i.time);
+    // Read again when the project changes and every 10 s (a card saved meanwhile shows up).
+    let list: Value = match ctx.data(|d| d.get_temp::<(u64, f64, Value)>(cache)) {
+        Some((r, at, v)) if r == rev && now - at < 10.0 => v,
         _ => {
             let v = app.session.execute("text.presetFamilies", json!({})).unwrap_or(Value::Null);
-            ctx.data_mut(|d| d.insert_temp(cache, (rev, v.clone())));
+            ctx.data_mut(|d| d.insert_temp(cache, (rev, now, v.clone())));
             v
         }
     };
-    let fams = list["families"].as_array().cloned().unwrap_or_default();
-    if fams.is_empty() {
-        p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, tr("No text presets yet (layers named like “T3b Pop · mid”)."), Tokens::ui(11.0 * s), t.text_dim);
+    let presets = list["presets"].as_array().cloned().unwrap_or_default();
+    if presets.is_empty() {
+        p.text(
+            pos2(x0, y + 8.0 * s),
+            Align2::LEFT_CENTER,
+            tr("No text presets yet: select a workshop layer and Save selected as preset."),
+            Tokens::ui(11.0 * s),
+            t.text_dim,
+        );
         y += 24.0 * s;
     }
     let mut apply: Option<String> = None;
-    for f in &fams {
+    for (i, pr) in presets.iter().enumerate() {
         if y > area.max.y - 60.0 * s {
             break;
         }
-        let fam = f["family"].as_str().unwrap_or("T?");
-        let title = f["name"].as_str().unwrap_or("");
-        p.text(pos2(x0, y + 10.0 * s), Align2::LEFT_CENTER, format!("{fam} {title}"), Tokens::semibold(11.5 * s), t.text);
-        let mut x = x0 + 110.0 * s;
-        for v in f["variants"].as_array().cloned().unwrap_or_default() {
-            let Some(short) = v["short"].as_str() else { continue };
-            let label = match v["distance"].as_str() {
-                Some(d) => format!("{short} · {d}"),
-                None => short.to_string(),
-            };
-            let bw = (label.chars().count() as f32 * 6.6 + 16.0) * s;
-            if x + bw > x0 + w {
-                break;
-            }
-            let b = Rect::from_min_size(pos2(x, y), vec2(bw, 20.0 * s));
-            if kit::button(app, ui, b, &format!("motionLibrary.textAnimations.{short}"), &label, false) {
-                apply = Some(short.to_string());
-            }
-            ui.interact(b, egui::Id::new(("ml-text-variant-tip", short)), Sense::hover()).on_hover_text(v["name"].as_str().unwrap_or(short));
-            x += bw + 6.0 * s;
+        let Some(name) = pr["name"].as_str() else { continue };
+        let b = Rect::from_min_size(pos2(x0, y), vec2(150.0 * s, 20.0 * s));
+        if kit::button(app, ui, b, &format!("motionLibrary.textAnimations.{i}"), name, false) {
+            apply = Some(name.to_string());
         }
+        // Its controls, as the card's file has them.
+        let controls: Vec<String> = pr["controls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                let n = c["name"].as_str()?;
+                Some(match &c["value"] {
+                    Value::Null => n.to_string(),
+                    Value::String(v) => format!("{n} {v}"),
+                    v => format!("{n} {v}"),
+                })
+            })
+            .collect();
+        let summary = if controls.is_empty() {
+            if pr["source"] == "motion" { tr("(controls show once it is downloaded)").to_string() } else { tr("(no controls)").to_string() }
+        } else {
+            controls.join(" · ")
+        };
+        let tx = b.max.x + 8.0 * s;
+        let room = (x0 + w - tx).max(0.0);
+        let p2 = ui.painter().with_clip_rect(Rect::from_min_size(pos2(tx, y), vec2(room, 20.0 * s)).intersect(area));
+        p2.text(pos2(tx, y + 10.0 * s), Align2::LEFT_CENTER, &summary, Tokens::ui(10.5 * s), t.text_dim);
+        ui.interact(b, egui::Id::new(("ml-text-preset-tip", i)), Sense::hover()).on_hover_text(summary.as_str());
         y += 26.0 * s;
     }
-    if let Some(short) = apply {
+    if let Some(name) = apply {
         // On the selected text layers; text.apply's followUp (the glow style) runs too.
-        match super::text_apply::run(app, ctx, json!({"preset": short})) {
-            Ok(_) => app.toast = Some((format!("{short} applied"), ctx.input(|i| i.time))),
+        match super::text_apply::run(app, ctx, json!({"preset": name})) {
+            Ok(_) => app.toast = Some((format!("{name} applied"), ctx.input(|i| i.time))),
             Err(e) => app.ui.status = e,
         }
     }
