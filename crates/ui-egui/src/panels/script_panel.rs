@@ -399,6 +399,15 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, st: &m
     }
 }
 
+/// SX6: the phrase popover's preset list (`open`: opened by a click on ▾; `blocked`: hover stays
+/// off after a close or a pick until the pointer leaves). Returns (open, blocked, shown). It used to
+/// open on hover and stay open, covering the add-on rows, and a click couldn't close it.
+fn pick_list(open: bool, blocked: bool, clicked: bool, arrow_hovered: bool, over_list: bool) -> (bool, bool, bool) {
+    let open = if clicked { !open } else { open };
+    let blocked = (blocked || (clicked && !open)) && (arrow_hovered || over_list);
+    (open, blocked, open || (!blocked && (arrow_hovered || over_list)))
+}
+
 fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
     let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
@@ -472,19 +481,19 @@ fn phrase_popover(app: &mut EffectcraftApp, ctx: &egui::Context, st: &mut PanelS
                     let arrow = ui.button("▾");
                     app.auto.add("script.phrase.pick", arrow.rect, "Pick the text animation");
                     let open_id = egui::Id::new("script-phrase-pick-open");
-                    let mut open: bool = ctx.data(|d| d.get_temp(open_id)).unwrap_or(false);
-                    if arrow.clicked() {
-                        open = !open;
-                    }
-                    if arrow.hovered() {
-                        open = true;
-                    }
-                    ctx.data_mut(|d| d.insert_temp(open_id, open));
-                    if open {
+                    // (open by a click, hover suppressed after a close or a pick, the list's last rect)
+                    type Pick = (bool, bool, Option<egui::Rect>);
+                    let (was_open, was_blocked, list_rect): Pick = ctx.data(|d| d.get_temp(open_id)).unwrap_or_default();
+                    let over_list = list_rect.zip(ctx.pointer_latest_pos()).is_some_and(|(r, p)| r.expand(4.0).contains(p));
+                    let (open, blocked, show) = pick_list(was_open, was_blocked, arrow.clicked(), arrow.hovered(), over_list);
+                    ctx.data_mut(|d| d.insert_temp::<Pick>(open_id, (open, blocked, None)));
+                    if show {
                         let below = arrow.rect.left_bottom() + vec2(0.0, 2.0);
-                        egui::Area::new(egui::Id::new("script-phrase-pick-list")).order(egui::Order::Tooltip).fixed_pos(below).constrain(true).show(
-                            ctx,
-                            |ui| {
+                        let shown = egui::Area::new(egui::Id::new("script-phrase-pick-list"))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(below)
+                            .constrain(true)
+                            .show(ctx, |ui| {
                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                                     let presets = st.text_presets.clone().unwrap_or_default();
                                     if presets.is_empty() {
@@ -496,7 +505,7 @@ fn phrase_popover(app: &mut EffectcraftApp, ctx: &egui::Context, st: &mut PanelS
                                         app.auto.add(&format!("script.phrase.pick.{short}"), r.rect, &name);
                                         if r.clicked() {
                                             st.pick = Some(short.clone());
-                                            ctx.data_mut(|d| d.insert_temp(open_id, false));
+                                            ctx.data_mut(|d| d.insert_temp::<Pick>(open_id, (false, true, None)));
                                         }
                                     }
                                     ui.separator();
@@ -504,11 +513,12 @@ fn phrase_popover(app: &mut EffectcraftApp, ctx: &egui::Context, st: &mut PanelS
                                     app.auto.add("script.phrase.pick.library", r.rect, "Preset… (Motion Library)");
                                     if r.clicked() {
                                         st.preset_list = true;
-                                        ctx.data_mut(|d| d.insert_temp(open_id, false));
+                                        ctx.data_mut(|d| d.insert_temp::<Pick>(open_id, (false, true, None)));
                                     }
                                 });
-                            },
-                        );
+                            });
+                        let rect = shown.response.rect;
+                        ctx.data_mut(|d| d.get_temp_mut_or_default::<Pick>(open_id).2 = Some(rect));
                     }
                 });
                 // SX6 add-on toggles.
@@ -580,5 +590,23 @@ fn phrase_popover(app: &mut EffectcraftApp, ctx: &egui::Context, st: &mut PanelS
     if close || clicked_out {
         st.phrase = None;
         st.preset_list = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_list;
+
+    #[test]
+    fn the_preset_list_opens_on_hover_only_while_hovered_and_a_click_closes_it() {
+        // Hover opens it; leaving closes it (it used to stay open over the add-on rows).
+        assert_eq!(pick_list(false, false, false, true, false), (false, false, true));
+        assert_eq!(pick_list(false, false, false, false, true), (false, false, true), "moving into the list");
+        assert_eq!(pick_list(false, false, false, false, false), (false, false, false));
+        // A click opens it for good; a second click closes it although the pointer is still there.
+        assert_eq!(pick_list(false, false, true, true, false), (true, false, true));
+        assert_eq!(pick_list(true, false, true, true, false), (false, true, false));
+        assert_eq!(pick_list(false, true, false, true, false), (false, true, false), "still hovered: stays closed");
+        assert_eq!(pick_list(false, true, false, false, false), (false, false, false), "left: hover works again");
     }
 }
