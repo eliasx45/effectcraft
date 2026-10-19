@@ -318,6 +318,19 @@ fn button(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, text: &str, aut
     (r, resp)
 }
 
+const PIN_LABEL: &str = "+ pin";
+
+/// A quick-row button's width for `text` (as `button` draws it).
+fn button_w(ui: &egui::Ui, text: &str) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), Tokens::ui(11.5), Color32::WHITE).size().x + 14.0
+}
+
+/// AX5: where the pins and chips must end so "+ pin" (`pin_w` wide, after the last pin) and the
+/// Find box's note (`note_w`, left of the box at `find_left`) still fit.
+pub(crate) fn pins_limit(find_left: f32, note_w: f32, pin_w: f32) -> f32 {
+    find_left - 8.0 - note_w - pin_w - 14.0
+}
+
 fn divider(ui: &egui::Ui, x: f32, r: Rect, c: Color32) {
     ui.painter().line_segment([pos2(x, r.min.y + 6.0), pos2(x, r.max.y - 6.0)], Stroke::new(1.0, c));
 }
@@ -340,7 +353,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
     // The Find word box keeps the right end.
     let find_w = 170.0_f32.min(row.width() * 0.3);
     let find_r = Rect::from_min_size(pos2(row.max.x - find_w - 8.0, row.min.y + 4.0), vec2(find_w, ROW_H - 8.0));
-    let limit = find_r.min.x - 8.0;
+    // The Find box (and its "not said" / "f74 · 1/12" note) and "+ pin" keep their room: a full
+    // row drops its last pins, never "+ pin" or the note.
+    let note_w = find_box(app, ui, &ctx, find_r);
+    let pin_w = button_w(ui, PIN_LABEL);
+    let limit = pins_limit(find_r.min.x, note_w, pin_w);
     let mut x = row.min.x + 10.0;
     let y = row.min.y + 4.0;
     ui.painter().text(pos2(x, row.center().y), Align2::LEFT_CENTER, "Quick", Tokens::semibold(11.0), t.text_faint);
@@ -353,13 +370,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
         if in_group.is_empty() {
             continue;
         }
+        // A group whose first button no longer fits is left out with its label.
+        let label_w = ui.painter().layout_no_wrap(group.to_string(), Tokens::ui(10.0), t.text_faint).size().x + 6.0;
+        if in_group.first().is_some_and(|(_, p)| x + label_w + button_w(ui, &p.label) > limit) {
+            break;
+        }
         if gi > 0 {
             divider(ui, x - 5.0, row, t.field_border);
         }
         ui.painter().text(pos2(x, row.center().y), Align2::LEFT_CENTER, *group, Tokens::ui(10.0), t.text_faint);
         x += ui.painter().layout_no_wrap(group.to_string(), Tokens::ui(10.0), t.text_faint).size().x + 6.0;
         for (i, pin) in in_group {
-            if x > limit - 40.0 {
+            let w = if pin.command == FAST_IN { button_w(ui, &pin.label) + button_w(ui, "P") + 1.0 } else { button_w(ui, &pin.label) };
+            if x + w > limit {
                 break;
             }
             let tip = format!("Motion Library: {} · Claude runs: {} {}", pin.ml, pin.command, pin.params);
@@ -382,7 +405,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
         // CX8c: a button per text preset card, then (AX9) the add-on chips.
         if *group == "Text" {
             for (name, label) in text_presets(app, &ctx) {
-                if x > limit - 40.0 {
+                if x + button_w(ui, &format!("{name} ↑")) > limit {
                     break;
                 }
                 let pin = QuickPin::new("Text", &format!("{name} ↑"), &format!("Elias ▸ Text animations ▸ {name}"), "text.apply", json!({"preset": name}));
@@ -398,13 +421,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
         x += 8.0;
     }
     divider(ui, x - 5.0, row, t.field_border);
-    if x < limit - 40.0 {
-        let (_, resp) = button(app, ui, pos2(x, y), "+ pin", "pin", "Pin the card selected in the Motion Library here", false);
-        if resp.clicked() {
-            pin_selected_card(app, &ctx);
-        }
+    let (_, resp) = button(app, ui, pos2(x, y), PIN_LABEL, "pin", "Pin the card selected in the Motion Library here", false);
+    if resp.clicked() {
+        pin_selected_card(app, &ctx);
     }
-    find_box(app, ui, &ctx, find_r);
     ui.set_clip_rect(clip);
     if let Some(i) = unpin {
         let list = app.ui.timeline.quick_row.pins.get_or_insert_with(default_pins);
@@ -454,7 +474,7 @@ fn text_chips(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, limit: f32)
         ("word", word_label, "Aim at the word under the playhead (else the first stressed word)", q.text_on_word),
     ];
     for (id, text, tip, on) in chips {
-        if x > limit - 30.0 {
+        if x + ui.painter().layout_no_wrap(text.clone(), Tokens::ui(10.5), Color32::WHITE).size().x + 10.0 > limit {
             break;
         }
         let (r, clicked) = chip(app, ui, pos2(x, at.y), &text, id, tip, on);
@@ -531,7 +551,8 @@ fn fast_in_split(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
 }
 
 /// AX7: the Find word box. Typing jumps to the word; Enter goes to its next occurrence.
-fn find_box(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, r: Rect) {
+/// Returns the width its note takes left of the box (0 without one).
+fn find_box(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, r: Rect) -> f32 {
     let t = app.tokens;
     let mut text = app.ui.timeline.quick_row.find.clone();
     let (resp, clear) = crate::widgets::search_field_with_clear(ui, r, &mut text, "Find word", &t, false);
@@ -577,7 +598,26 @@ fn find_box(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, r:
         (None, Some(_)) => Some(("not said".to_string(), t.text_faint)),
         _ => None,
     };
-    if let Some((s, c)) = note {
-        ui.painter().text(pos2(r.min.x - 6.0, r.center().y), Align2::RIGHT_CENTER, s, Tokens::ui(10.5), c);
+    match note {
+        Some((s, c)) => ui.painter().text(pos2(r.min.x - 6.0, r.center().y), Align2::RIGHT_CENTER, s, Tokens::ui(10.5), c).width() + 6.0,
+        None => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // AX5: after "+ pin" pinned one more card, the full row dropped the Cards group's buttons and
+    // "+ pin" itself, and the Find note ("not said") was drawn over the "Cards" label.
+    #[test]
+    fn a_full_row_keeps_room_for_plus_pin_and_the_find_note() {
+        let (find_left, note_w, pin_w) = (1200.0, 60.0, 42.0);
+        let limit = pins_limit(find_left, note_w, pin_w);
+        // The last pin ends at most at `limit`; "+ pin" follows it (6 px gap) and ends before the note.
+        let pin_end = limit + 6.0 + pin_w;
+        assert!(pin_end < find_left - 8.0 - note_w, "{pin_end}");
+        // Without a note the pins get that room back.
+        assert!(pins_limit(find_left, 0.0, pin_w) > limit);
     }
 }
