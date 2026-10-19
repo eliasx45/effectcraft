@@ -155,6 +155,8 @@ mod ui_tabs;
 mod ui_tail;
 #[path = "../ui_text_edit.rs"]
 mod ui_text_edit;
+#[path = "../ui_text_gradient.rs"]
+mod ui_text_gradient;
 #[path = "../ui_theme_favorites.rs"]
 mod ui_theme_favorites;
 #[path = "../ui_time_zoom_controls.rs"]
