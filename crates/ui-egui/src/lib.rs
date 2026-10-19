@@ -2788,6 +2788,12 @@ impl EffectcraftApp {
             let t = &self.tokens;
             let galley = ui.painter().layout_no_wrap(m.clone(), Tokens::ui(12.0), t.text);
             let r = egui::Rect::from_min_size(egui::pos2(full.min.x + 16.0, full.max.y - 44.0 - lift), galley.size() + egui::vec2(24.0, 14.0));
+            let rows: Vec<egui::Rect> = panels::suggestions::TOAST_CLEAR_OF
+                .iter()
+                .filter_map(|id| self.auto.find(id).filter(|e| e.window.is_none()))
+                .map(|e| egui::Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3])))
+                .collect();
+            let r = panels::suggestions::toast_clear_of(r, &rows);
             ui.painter().rect_filled(r, 6.0, t.panel_bg);
             ui.painter().rect_stroke(r, 6.0, egui::Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
             ui.painter().galley(r.min + egui::vec2(12.0, 7.0), galley, t.text);

@@ -284,3 +284,34 @@ pub(crate) fn dashed_rect(p: &egui::Painter, r: Rect, stroke: Stroke) {
         }
     }
 }
+
+/// The strips at the bottom of the Timeline (Claude's suggestions, Why?) that a toast must not
+/// cover: the toast took the clicks meant for a pill's ✓ / ✕ (BUILD2 CX4).
+pub(crate) const TOAST_CLEAR_OF: [&str; 2] = ["timeline.suggestions.row", "timeline.why"];
+
+/// `toast` moved up until it is clear of every rect in `rows` it overlaps.
+pub(crate) fn toast_clear_of(mut toast: Rect, rows: &[Rect]) -> Rect {
+    for row in rows {
+        if row.intersects(toast) {
+            toast = toast.translate(vec2(0.0, row.min.y - 6.0 - toast.max.y));
+        }
+    }
+    toast
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_toast_moves_above_the_suggestion_row() {
+        let row = Rect::from_min_size(pos2(5.0, 963.0), vec2(1366.0, 28.0));
+        let toast = Rect::from_min_size(pos2(16.0, 976.0), vec2(600.0, 28.0));
+        let moved = toast_clear_of(toast, &[row]);
+        assert!(!moved.intersects(row));
+        assert_eq!(moved.max.y, 957.0);
+        assert_eq!(moved.width(), toast.width());
+        let far = Rect::from_min_size(pos2(16.0, 500.0), vec2(600.0, 28.0));
+        assert_eq!(toast_clear_of(far, &[row]), far, "nothing to avoid");
+    }
+}

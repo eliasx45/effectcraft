@@ -1060,6 +1060,20 @@ pub(crate) fn alt_texture(
     }
 }
 
+/// The comp's background colour, opaque: an alternative frame (a suggestion, Claude's version) has
+/// alpha where the comp is empty, and drawn straight over the viewer's own frame it let that frame
+/// show through (BUILD2 CX4: both versions on screen at once).
+fn background(project: &effectcraft_engine::project::Project, cid: effectcraft_engine::project::ItemId) -> Color32 {
+    let [r, g, b] = project.comp(cid).map_or([0.0; 3], |c| c.background);
+    let u = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color32::from_rgb(u(r), u(g), u(b))
+}
+
+/// Hides the viewer's own frame under an alternative one.
+fn cover(painter: &egui::Painter, comp_rect: Rect, project: &effectcraft_engine::project::Project, cid: effectcraft_engine::project::ItemId) {
+    painter.rect_filled(comp_rect, 0.0, background(project, cid));
+}
+
 /// The scratch copy for suggestion `id` at the document's revision (made once, then kept).
 fn suggestion_project(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str) -> Option<(std::sync::Arc<effectcraft_engine::project::Project>, u64)> {
     type Cached = (String, u64, std::sync::Arc<effectcraft_engine::project::Project>, u64);
@@ -1110,6 +1124,7 @@ pub(crate) fn agent_compare(
                 _ => app.session.time().seconds(),
             };
             if let Some(tex) = alt_texture(app, ctx, &proj, epoch, cid, Tick::from_seconds_f64(t), scale) {
+                cover(painter, comp_rect, &proj, cid);
                 painter.image(tex.id(), comp_rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
             }
             ctx.request_repaint();
@@ -1132,6 +1147,7 @@ pub(crate) fn agent_compare(
         if label.is_none() && super::suggestions::flipped(ctx) && !std::sync::Arc::ptr_eq(proj, &app.session.project) {
             let e = claude_epoch(ctx, proj);
             if let Some(tex) = alt_texture(app, ctx, proj, e, cid, app.session.time(), scale) {
+                cover(painter, comp_rect, proj, cid);
                 painter.image(tex.id(), comp_rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
             }
             let who = by.as_deref().unwrap_or("Claude");
@@ -1271,5 +1287,20 @@ mod tests {
         assert!(matches!(at(37.0, 100.0), PenTarget::AddFrame(f) if f.time == t(2)), "nearest frame");
         assert!(matches!(at(70.0, 100.0), PenTarget::PathFull), "keys on adjacent frames");
         assert!(matches!(at(40.0, 120.0), PenTarget::None), "off the path");
+    }
+
+    #[test]
+    fn an_alternative_frame_covers_the_viewer_frame_with_the_comp_background() {
+        // BUILD2 CX4/CX5: the suggestion preview and Claude's version were drawn straight over
+        // the viewer's frame, which showed through their empty (transparent) parts.
+        let mut s = effectcraft_engine::Session::default();
+        let r = s.execute("comp.new", serde_json::json!({"name": "C", "width": 64, "height": 64, "frameRate": 30, "duration": 1})).unwrap();
+        let cid = effectcraft_engine::project::ItemId(r["comp"].as_u64().unwrap());
+        let mut p = (*s.project).clone();
+        if let Some(c) = p.comp_mut(cid) {
+            c.background = [1.0, 0.5, 0.0];
+        }
+        assert_eq!(super::background(&p, cid), Color32::from_rgb(255, 128, 0));
+        assert_eq!(super::background(&p, effectcraft_engine::project::ItemId(999_999)), Color32::BLACK, "no comp: black, opaque");
     }
 }
