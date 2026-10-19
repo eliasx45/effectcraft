@@ -89,7 +89,8 @@ fn unit_bounce_applies_the_bounce_text_preset() {
             Ok(pr.uid)
         })
         .unwrap();
-    // TODO(batch1-verify): with EFFECTCRAFT_LIBRARY_REMOTE set, the catalog's own preset cards of Elias ▸ Text animations would be found here.
+    // No bounce card yet. Like the other Motion Library tests, this assumes EFFECTCRAFT_LIBRARY_REMOTE
+    // is unset: with it, the catalog's own cards of Elias ▸ Text animations would be found here.
     let e = s.execute("text.unitBounce", json!({"layer": l, "selector": off})).unwrap_err().to_string();
     assert!(e.contains("Save a Bounce text preset first"), "{e}");
     // A card that isn't called "Bounce In" but has the overshoot control.
