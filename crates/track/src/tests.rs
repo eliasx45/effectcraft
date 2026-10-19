@@ -266,3 +266,24 @@ fn featureless_regions_stay_put() {
         }
     }
 }
+
+/// Regression: near-equal match scores (flat or blurred regions) made the candidate sort's
+/// comparison non-transitive, and the standard sort panicked ("does not correctly implement a
+/// total order") while tracking a card that sharpened out of a blur.
+#[test]
+fn ranking_near_equal_candidates_is_a_total_order() {
+    // a chain of scores each within 1e-9 of the next, plus NaN, at varied distances
+    let mut cands: Vec<(f64, [f64; 2])> = (0..400)
+        .map(|i| {
+            let s = if i % 97 == 0 { f64::NAN } else { 0.5 + (i % 37) as f64 * 0.6e-9 };
+            (s, [(i * 7 % 23) as f64, (i * 11 % 19) as f64])
+        })
+        .collect();
+    rank_candidates(&mut cands, [10.0, 10.0]);
+    let finite: Vec<f64> = cands.iter().map(|c| c.0).filter(|s| s.is_finite()).collect();
+    assert!(finite.windows(2).all(|w| (w[0] * 1e9).round() >= (w[1] * 1e9).round()), "best first");
+    // equal buckets go nearest-first
+    let mut tie = vec![(0.9, [30.0, 0.0]), (0.9, [1.0, 0.0]), (0.95, [50.0, 0.0])];
+    rank_candidates(&mut tie, [0.0, 0.0]);
+    assert_eq!(tie.iter().map(|c| c.1[0]).collect::<Vec<_>>(), vec![50.0, 1.0, 30.0]);
+}
