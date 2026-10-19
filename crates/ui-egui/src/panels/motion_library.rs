@@ -3106,7 +3106,7 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
         view.scroll = 0.0;
     }
     if let Some(sc) = p.get("scale") {
-        let sc = sc.as_f64().filter(|v| v.is_finite()).ok_or("`scale` is a percentage (80–140)")?;
+        let sc = sc.as_f64().filter(|v| v.is_finite()).ok_or("`scale` is a percentage (80–200)")?;
         view.scale = ((sc / 10.0).round() * 10.0).clamp(SCALE_RANGE.0 as f64, SCALE_RANGE.1 as f64) as u32;
     }
     if let Some(c) = p.get("cardSize") {
@@ -3270,8 +3270,8 @@ mod tests {
     #[test]
     fn view_command_clamps_and_reveals() {
         let mut v = ViewState::default();
-        let r = set_view(&mut v, &json!({"scale": 175, "cardSize": 20, "folder": "Devin Jatho/Instagram/Reels"})).unwrap();
-        assert_eq!((v.scale, v.card_size), (140, 88.0));
+        let r = set_view(&mut v, &json!({"scale": 275, "cardSize": 20, "folder": "Devin Jatho/Instagram/Reels"})).unwrap();
+        assert_eq!((v.scale, v.card_size), (200, 88.0));
         assert!(v.expanded.contains("Devin Jatho") && v.expanded.contains("Devin Jatho/Instagram"));
         assert_eq!(r["folder"], "Devin Jatho/Instagram/Reels");
         set_view(&mut v, &json!({"scale": 84, "collapse": "Devin Jatho", "cardSize": 400.4})).unwrap();
