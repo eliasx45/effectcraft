@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use effectcraft_keyframe::{Interp, Keyframe, Value as KV};
 use effectcraft_project::build::{self, Ids};
-use effectcraft_project::{GroupKind, Layer, LayerId, LayerSource, Node, Project, PropGroup, Property, Uid};
+use effectcraft_project::{GroupKind, Layer, LayerId, LayerSource, Marker, Node, Project, PropGroup, Property, Uid};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
@@ -16,8 +16,67 @@ use crate::{EngineError, KeyRef, Result, Session, cmd};
 /// Preset file format version tag (`*.ecpreset`, JSON).
 pub const PRESET_TAG: &str = "effectcraftAnimationPreset";
 /// The version written: 2 adds `animators` (whole text animators, CX8d). Version 1 files still
-/// apply (they have no `animators`).
+/// apply (they have no `animators`). The optional `markers` (the source layer's markers,
+/// PRESET-MARKERS) need no new version: files without them apply as before, and a build that
+/// doesn't know them applies the rest.
 pub const PRESET_VERSION: u32 = 2;
+
+/// A preset marker anchored to the layer's out point (`time` holds out point − marker time);
+/// otherwise (`keys`) `time` is the offset from the preset's key origin, like the keys.
+const ANCHOR_OUT: &str = "out";
+const ANCHOR_KEYS: &str = "keys";
+
+/// The source layer's markers for a preset (layer time, as layer markers are stored): a marker
+/// whose start is closer to the layer's out point than to `origin` (the earliest key, or the
+/// in point when the preset has no keys) is anchored to the out point, the rest move with the keys.
+fn preset_markers(l: &Layer, origin: Tick) -> Vec<Value> {
+    let out = l.layer_time(l.out_point);
+    l.markers
+        .iter()
+        .map(|m| {
+            let to_out = (out - m.time).abs();
+            let to_keys = (m.time - origin).abs();
+            let (anchor, offset) = if to_out < to_keys { (ANCHOR_OUT, out - m.time) } else { (ANCHOR_KEYS, m.time - origin) };
+            let mut v = serde_json::to_value(Marker { time: offset, ..m.clone() }).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("anchor".into(), json!(anchor));
+            }
+            v
+        })
+        .collect()
+}
+
+/// A preset's markers: (anchored to the out point, the marker with its stored offset as `time`).
+fn markers_of(doc: &Value) -> Vec<(bool, Marker)> {
+    doc["markers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| {
+                    let mut m: Marker = serde_json::from_value(v.clone()).ok()?;
+                    // Times from a file stay in Tick's documented range (later arithmetic saturates).
+                    m.time = m.time.clamp(Tick::MIN, Tick::MAX);
+                    m.duration = m.duration.clamp(Tick::ZERO, Tick::MAX);
+                    Some((v["anchor"].as_str() == Some(ANCHOR_OUT), m))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Puts a preset's markers on `l`: key-anchored ones at `lt` (the playhead or `at`, layer time) +
+/// their offset, out-anchored ones at the layer's out point − theirs, durations as saved. A marker
+/// with the same comment is replaced (an unnamed one only at the same time), so applying again
+/// doesn't stack them. Returns how many were placed.
+fn place_markers(l: &mut Layer, markers: &[(bool, Marker)], lt: Tick) -> usize {
+    let out = l.layer_time(l.out_point);
+    let placed: Vec<Marker> = markers.iter().map(|(at_out, m)| Marker { time: if *at_out { out - m.time } else { lt + m.time }, ..m.clone() }).collect();
+    l.markers.retain(|old| !placed.iter().any(|m| m.comment == old.comment && (!m.comment.is_empty() || m.time == old.time)));
+    let n = placed.len();
+    l.markers.extend(placed);
+    l.markers.sort_by_key(|m| m.time);
+    n
+}
 
 fn has_selected_props(s: &Session) -> std::result::Result<(), String> {
     has_comp(s)?;
@@ -80,6 +139,7 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
     let mut animators: Vec<(LayerId, PropGroup)> = selected_animators(s);
     let animator_uids: Vec<Uid> = animators.iter().map(|(_, g)| g.uid).collect();
     let mut props = vec![];
+    let mut prop_layer: Option<LayerId> = None;
     for (lid, uid) in selected_leaf_props(s) {
         let Some(l) = comp.layer(lid) else { continue };
         // Properties inside a saved effect travel with the effect.
@@ -92,6 +152,7 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let (Some(pr), Some(mp)) = (l.props.find(uid), match_path_of(&l.props, uid)) else { continue };
         props.push((l.layer_time(t), mp, pr.clone()));
+        prop_layer.get_or_insert(lid);
     }
     if props.is_empty() && effects.is_empty() && animators.is_empty() {
         return Err(bad("anim.savePreset", "select properties, effects or text animators to save"));
@@ -108,7 +169,13 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
         };
         g.walk("", &mut |_, pr| first_in(pr));
     }
-    let first = props.iter().flat_map(|(_, _, pr)| pr.keys.iter().map(|k| k.time)).chain(fx_first).min().unwrap_or(Tick::ZERO);
+    let first_key = props.iter().flat_map(|(_, _, pr)| pr.keys.iter().map(|k| k.time)).chain(fx_first).min();
+    let first = first_key.unwrap_or(Tick::ZERO);
+    // The layer the selection is on carries its markers along (PRESET-MARKERS): Elias's text
+    // presets are timed by "In" / "Out" markers that their expressions read.
+    let src_layer = animators.first().map(|(l, _)| *l).or(effects.first().map(|(l, _)| *l)).or(prop_layer).or(s.state.selected_layers.first().copied());
+    let markers_json: Vec<Value> =
+        src_layer.and_then(|lid| comp.layer(lid)).map(|l| preset_markers(l, first_key.unwrap_or_else(|| l.layer_time(l.in_point)))).unwrap_or_default();
     for (_, g) in effects.iter_mut().chain(animators.iter_mut()) {
         g.walk_mut(&mut |pr| {
             for k in &mut pr.keys {
@@ -135,6 +202,9 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
     if !anim_json.is_empty() {
         doc["animators"] = json!(anim_json);
     }
+    if !markers_json.is_empty() {
+        doc["markers"] = json!(markers_json);
+    }
     let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
     // A folder that doesn't exist yet (a new card's assets/<id>/) is made.
     // FsServices::write_file (config::atomic_write) reports a missing folder as NotFound: its
@@ -144,7 +214,7 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
         other => other,
     };
     written.map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
-    Ok(json!({"path": path, "properties": props.len(), "effects": effects.len(), "animators": animators.len()}))
+    Ok(json!({"path": path, "properties": props.len(), "effects": effects.len(), "animators": animators.len(), "markers": markers_json.len()}))
 }
 
 fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
@@ -174,6 +244,8 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
     // Text animators saved whole (CX8c); text layers only.
     let animators: Vec<PropGroup> =
         doc["animators"].as_array().map(|a| a.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()).unwrap_or_default();
+    // The source layer's markers (PRESET-MARKERS); every layer gets them, text or not.
+    let markers = markers_of(&doc);
     // `replace`: same-named effects are replaced too, so applying again doesn't stack them
     // (text animators always are).
     let replace = super::b_p(p, "replace").unwrap_or(false);
@@ -200,12 +272,20 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
         None => s.time(),
     };
     let mut applied = 0;
+    let mut placed_markers = 0;
     let mut skipped = vec![];
     s.edit("Apply Animation Preset", None, |proj, _| {
         let mut next = proj.next_id;
         for lid in &ids {
             let l = layer_mut(proj, cid, *lid)?;
             let lt = l.layer_time(t);
+            if !markers.is_empty() {
+                if l.markers_locked {
+                    skipped.push("markers (the layer's markers are locked)".to_string());
+                } else {
+                    placed_markers += place_markers(l, &markers, lt);
+                }
+            }
             if !animators.is_empty() {
                 match l.props.group_mut("text/animators") {
                     Some(anims) => {
@@ -271,7 +351,7 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
         proj.next_id = next;
         Ok(())
     })?;
-    Ok(json!({"applied": applied, "skipped": skipped}))
+    Ok(json!({"applied": applied, "markers": placed_markers, "skipped": skipped}))
 }
 
 // ---------------------------------------------------------------- keyframes
@@ -575,7 +655,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save Animation Preset...",
             ["Animation"],
             None,
-            "{path (.ecpreset), name?} — saves the selected properties, effects and text animators (whole)",
+            "{path (.ecpreset), name?} — saves the selected properties, effects and text animators (whole), and their layer's markers (near the out point: kept that far from it; else: with the keys)",
             has_selected_props,
             save_preset
         ),
@@ -584,7 +664,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Animation Preset...",
             ["Animation"],
             None,
-            "{path | preset, layers?, at? (comp s: where the keys start; default the CTI), replace? (bool: same-named effects are replaced, not stacked; text animators of the same name always are)}",
+            "{path | preset, layers?, at? (comp s: where the keys start; default the CTI), replace? (bool: same-named effects are replaced, not stacked; text animators of the same name always are)} — the preset's markers go on every layer (same-comment markers replaced)",
             has_layers,
             apply_preset
         ),

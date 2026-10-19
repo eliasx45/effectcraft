@@ -52,3 +52,7 @@ trash = { version = "5.2.9", default-features = false, features = ["coinit_apart
 
 [target.'cfg(target_os = "linux")'.dependencies]
 time = { version = "0.3.55", features = ["local-offset"] }
+
+[dev-dependencies]
+# The real expression engine, for tests that check what expressions read (preset markers).
+effectcraft-expr = { workspace = true }
