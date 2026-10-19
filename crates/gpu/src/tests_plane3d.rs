@@ -15,6 +15,12 @@ use effectcraft_time::Tick;
 use crate::tests::{Scene, check, compare_at, n, opts, set};
 
 fn circle(depth: BitDepth, styled: bool) -> Scene {
+    circle_at(depth, styled, 160.0, 9.0, true)
+}
+
+/// [`circle`] scaled `scale` % with a `bevel`-pixel Bevel and Emboss, its Gradient Overlay
+/// aligned with the layer or not.
+fn circle_at(depth: BitDepth, styled: bool, scale: f64, bevel: f64, align: bool) -> Scene {
     let mut s = Scene::new(depth);
     let bg = s.footage(97, 61);
     s.push(bg);
@@ -29,7 +35,7 @@ fn circle(depth: BitDepth, styled: bool) -> Scene {
     l.switches.three_d = true;
     l.switches.collapse = true;
     l.switches.motion_blur = true;
-    set(&mut l, "transform/scale", Value::Vec3([160.0, 160.0, 100.0]));
+    set(&mut l, "transform/scale", Value::Vec3([scale, scale, 100.0]));
     set(&mut l, "transform/rotationY", Value::Scalar(18.0));
     s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(1.5)), ("repeatEdge", Value::Bool(true))]);
     s.effect(&mut l, "ec.blur.ccradialfast", &[("center", Value::Vec2([40.0, 30.0])), ("amount", n(40.0))]);
@@ -42,9 +48,9 @@ fn circle(depth: BitDepth, styled: bool) -> Scene {
             st::add_style(&mut l, &mut Ids(&mut next), id, &s.comp.global_light, true).unwrap();
         }
         s.p.next_id = next;
-        set(&mut l, &format!("{GROUP}/bevelEmboss/size"), n(9.0));
+        set(&mut l, &format!("{GROUP}/bevelEmboss/size"), n(bevel));
         set(&mut l, &format!("{GROUP}/bevelEmboss/depth"), n(40.0));
-        set(&mut l, &format!("{GROUP}/gradientOverlay/alignWithLayer"), Value::Bool(true));
+        set(&mut l, &format!("{GROUP}/gradientOverlay/alignWithLayer"), Value::Bool(align));
         set(
             &mut l,
             &format!("{GROUP}/gradientOverlay/colors"),
@@ -111,5 +117,25 @@ fn a_held_3d_styled_plane_is_made_on_the_gpu_without_uploads() {
         assert_eq!(after.uploads, before.uploads, "{depth:?}: the held plane uploads nothing");
         assert!(after.readback_bytes - before.readback_bytes < 64 << 10, "{depth:?}: the held plane reads back only its bounds");
         assert!(crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed) > made, "{depth:?}: the held plane was made on the CPU");
+    }
+}
+
+/// A 3D styled plane scaled up far past the frame (16×: most of it is never seen) styles only
+/// the part the frame shows, plus the styles' reach, and the frame is unchanged: the styles'
+/// images stay small (P01 Clock's 39-megapixel circle ran an 8 GB card out of memory).
+#[test]
+fn a_3d_styled_plane_far_past_the_frame_styles_only_what_is_seen() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        for align in [false, true] {
+            let s = circle_at(depth, true, 1600.0, 2.0, align);
+            let (made, cut) = (crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed), crate::plane3d::CUT_TO_VIEW.load(Ordering::Relaxed));
+            let d = compare_at(&s, opts(), Tick::from_seconds_f64(0.5));
+            if d.is_some() {
+                assert!(crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed) > made, "{depth:?}: the plane was made on the CPU");
+                // A gradient aligned with the layer spans all of it: kept whole.
+                assert_eq!(crate::plane3d::CUT_TO_VIEW.load(Ordering::Relaxed) > cut, !align, "{depth:?}, aligned {align}: cut to the view");
+            }
+            check(&format!("3D circle at 1600%, {depth:?}, aligned gradient {align}"), d, 0.002);
+        }
     }
 }

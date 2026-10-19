@@ -18,17 +18,21 @@ use crate::context::{Enc, GpuImage, Params};
 /// Plane-sized images the GPU styles hold at once, at most (see [`plane`]).
 const STYLE_IMAGES: u64 = 9;
 
+/// Styled planes whose styles ran on part of the plane only (its view, see [`plane`]).
+#[cfg(test)]
+pub(crate) static CUT_TO_VIEW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 pub(crate) static MADE_ON_GPU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The planes of `run` the GPU makes (see [`plane`]): their pixel-less buffers for
-/// `Renderer::prepare_3d_run_with`, and their images by the address of those buffers for
-/// `classic3d::draw_run_made`.
-pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer]) -> (PlaneBufs, HashMap<usize, GpuImage>) {
+/// The planes of `run` the GPU makes for an `out` canvas (see [`plane`]): their pixel-less
+/// buffers for `Renderer::prepare_3d_run_with`, and their images by the address of those
+/// buffers for `classic3d::draw_run_made`.
+pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer], out: (u32, u32)) -> (PlaneBufs, HashMap<usize, GpuImage>) {
     let mut bufs = PlaneBufs::new();
     let mut made = HashMap::new();
     for &l in run {
-        match plane(e, r, ctx, l) {
+        match plane(e, r, ctx, l, out) {
             Ok((shape, img)) => {
                 let shape = Arc::new(shape);
                 made.insert(Arc::as_ptr(&shape) as usize, img);
@@ -46,8 +50,10 @@ pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer]) -> 
 /// the CPU: no effects or styles to run, an unchanged layer the layer cache holds already (one
 /// it doesn't hold is made here: the CPU would style it once at its full raster size, seconds
 /// for a large Bevel and Emboss),
-/// linear blending, or a step the GPU can't do.
-fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Result<(Buf, GpuImage), &'static str> {
+/// linear blending, or a step the GPU can't do. The styles only style the part of the plane the
+/// `out` canvas can show (and what reaches it): a layer scaled up far past the frame keeps
+/// its styles' images small.
+fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Result<(Buf, GpuImage), &'static str> {
     let styled = styles::active(ctx, layer);
     let has_fx = layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty());
     if !matches!(layer.source, LayerSource::Shape) || layer.switches.adjustment || !(styled || has_fx) {
@@ -80,11 +86,19 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Result<(Buf
     let bounds = alpha_bounds(e, &img)?;
     let size = effectcraft_render::source_size(r.project, layer);
     let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-    let prep = styles::gpu_prepare_shape(ctx, layer, [img.width, img.height], offset, scale, bounds, layer_size).ok_or("a style the GPU can't run")?;
+    // The seen part of the plane in content pixels, plus 4 for the plane's sampling filter.
+    let view = r
+        .plane_view_rect(ctx, layer, out)
+        .map(|v| [v[0] * scale + offset[0] - 4.0, v[1] * scale + offset[1] - 4.0, v[2] * scale + offset[0] + 4.0, v[3] * scale + offset[1] + 4.0]);
+    let prep = styles::gpu_prepare_shape(ctx, layer, [img.width, img.height], offset, scale, bounds, layer_size, view).ok_or("a style the GPU can't run")?;
     if !prep.plan.pass_modes().is_empty() {
         return Err("styles that paint outside the layer");
     }
     let [x0, y0, x1, y1] = prep.region;
+    #[cfg(test)]
+    if bounds.is_some_and(|(a, b, c, d)| (x1 - x0) < c - a || (y1 - y0) < d - b) {
+        CUT_TO_VIEW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let (pw, ph) = (prep.shape.img.width, prep.shape.img.height);
     if !e.g.fits(pw, ph) || x1 > img.width || y1 > img.height || x0 >= x1 || y0 >= y1 {
         return Err("style canvas too large");

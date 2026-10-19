@@ -1000,7 +1000,7 @@ pub fn pack_gradient(g: &Gradient) -> Vec<f32> {
 /// [`GPU_BEVEL_REACH`]; a stencil pass mode).
 pub fn gpu_prepare(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2]) -> Option<(Buf, GpuStyles)> {
     let dims = [content.img.width, content.img.height];
-    let prep = gpu_prepare_shape(ctx, layer, dims, content.offset, content.scale, content.img.alpha_bounds(), layer_size)?;
+    let prep = gpu_prepare_shape(ctx, layer, dims, content.offset, content.scale, content.img.alpha_bounds(), layer_size, None)?;
     let (mut buf, _) = crop_to_content(content).unwrap_or_else(|| (content.clone(), Org::default()));
     buf.pad(prep.pad);
     (buf.img.width == prep.shape.img.width && buf.img.height == prep.shape.img.height).then_some((buf, prep.plan))
@@ -1019,7 +1019,20 @@ pub struct GpuStylePrep {
     pub shape: Buf,
 }
 
+/// Alpha bounds `b` (x0, y0, x1, y1) cut to `view` grown by `margin` pixels (whole pixels,
+/// outward); `None` when none of the content is that close to the view.
+fn view_crop(b: (u32, u32, u32, u32), view: [f64; 4], margin: f64) -> Option<(u32, u32, u32, u32)> {
+    let lo = |v: f64, b: u32| if v.is_finite() { (v - margin).floor().max(f64::from(b)) } else { f64::from(b) };
+    let hi = |v: f64, b: u32| if v.is_finite() { (v + margin).ceil().min(f64::from(b)) } else { f64::from(b) };
+    let (x0, y0, x1, y1) = (lo(view[0], b.0), lo(view[1], b.1), hi(view[2], b.2), hi(view[3], b.3));
+    (x0 < x1 && y0 < y1).then_some((x0 as u32, y0 as u32, x1 as u32, y1 as u32))
+}
+
 /// [`GpuStylePrep`] of content `dims` at `offset` / `scale` whose alpha bounds are `bounds`.
+/// `view` (content pixels x0, y0, x1, y1), when given, is all of the result that will ever be
+/// seen: the region then keeps only the content within twice the styles' reach of it, which
+/// styles every seen pixel exactly as the whole content would (nothing farther reaches them).
+#[allow(clippy::too_many_arguments)]
 pub fn gpu_prepare_shape(
     ctx: &EvalCtx,
     layer: &Layer,
@@ -1028,6 +1041,7 @@ pub fn gpu_prepare_shape(
     scale: f64,
     bounds: Option<(u32, u32, u32, u32)>,
     layer_size: [f64; 2],
+    view: Option<[f64; 4]>,
 ) -> Option<GpuStylePrep> {
     let g = group(layer)?;
     let [w, h] = dims;
@@ -1088,6 +1102,14 @@ pub fn gpu_prepare_shape(
     };
     let bl = blending(ctx, layer);
     let pad = ((reach(&styles) * s).ceil() + 2.0).min(MAX_PAD) as u32;
+    // A gradient aligned with the layer spans its whole content: kept whole.
+    let view = view.filter(|_| !styles.gradient.as_ref().is_some_and(|g| g.align));
+    let bounds = match (bounds, view) {
+        // Content nowhere near the view: kept whole (one transparent pixel would do, but the
+        // region must stay inside the content's bounds).
+        (Some(b), Some(v)) => view_crop(b, v, f64::from(pad) * 2.0 + 4.0).or(bounds),
+        _ => bounds,
+    };
     // crop_to_content: nothing visible keeps one transparent pixel; the whole buffer stays.
     let (x0, y0, x1, y1) = bounds.unwrap_or((0, 0, 1.min(w), 1.min(h)));
     let whole = (x0, y0, x1, y1) == (0, 0, w, h) || x1 <= x0 || y1 <= y0;

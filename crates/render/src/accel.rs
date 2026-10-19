@@ -303,6 +303,13 @@ impl<'a> Renderer<'a> {
         three_d::compose::gpu_run(&Renderer { plane_bufs: Some(bufs), ..*self }, ctx, run, out)
     }
 
+    /// The layer-space rectangle of a classic 3D layer's plane that an `out` canvas can show
+    /// (see `three_d::compose::plane_view`): an accelerator making the plane need not make the
+    /// rest. `None` = no such bound (the whole plane may matter).
+    pub fn plane_view_rect(&self, ctx: &EvalCtx<'a>, layer: &Layer, out: (u32, u32)) -> Option<[f64; 4]> {
+        three_d::compose::plane_view(self, ctx, layer, out)
+    }
+
     /// A run of consecutive 3D layers of an Advanced 3D comp prepared for an accelerator's
     /// compositor ([`three_d::adv::Prepared`]): rendered as one scene and composited (Normal,
     /// premultiplied over) onto the canvas. `None` = not an Advanced 3D comp, or a layer needs the

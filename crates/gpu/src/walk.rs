@@ -184,7 +184,7 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
     // Layers whose effects and styles run on the GPU keep their planes there.
     let (bufs, made) = {
         let _profile = effectcraft_render::profile::span("plane3d_make");
-        crate::plane3d::make(e, r, ctx, run)
+        crate::plane3d::make(e, r, ctx, run, canvas.size())
     };
     let prep = {
         let _profile = effectcraft_render::profile::span("prepare_3d_run");
