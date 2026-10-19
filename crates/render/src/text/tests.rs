@@ -703,3 +703,75 @@ fn text_with_expressions_is_laid_out_once_per_frame_scope() {
     let _ = text_geom(&ctx, layer);
     assert_eq!(count(), 6 * once, "entries go with the scope");
 }
+
+/// Raw per-glyph selection (first component) of animator `anim` of layer 0.
+fn raw_selection(p: &Project, cid: ItemId, anim: usize) -> Vec<f64> {
+    let c = ctx(p, cid, 0.0);
+    let l = &p.comp(cid).unwrap().layers[0];
+    let lay = layout_doc(&source_text(&c, l).unwrap());
+    let a = l.props.group(&format!("text/animators/#{anim}")).unwrap();
+    animator_selection(&c, l, a, &lay).into_iter().map(|v| v[0]).collect()
+}
+
+fn glyph_colors(p: &Project, cid: ItemId) -> Vec<([f32; 4], [f32; 4])> {
+    let c = ctx(p, cid, 0.0);
+    let g = text_geom(&c, &p.comp(cid).unwrap().layers[0]).unwrap();
+    g.glyphs.iter().map(|g| (g.fill, g.stroke)).collect()
+}
+
+fn lerp4(a: [f32; 4], b: [f32; 4], k: f64) -> [f32; 4] {
+    let k = k as f32;
+    std::array::from_fn(|d| a[d] + (b[d] - a[d]) * k)
+}
+
+/// Stacked Fill / Stroke Color animators blend in order, each over the colour the ones above
+/// left (After Effects): red at 100 % then orange ramping 0→100 % gives a red→orange gradient,
+/// not all orange (the last colour with the amounts summed).
+#[test]
+fn stacked_fill_color_animators_blend_in_order() {
+    let (white, red, orange, blue): ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) = ([1.0; 4], [1.0, 0.0, 0.0, 1.0], [1.0, 0.5, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]);
+    let color = |c: [f32; 4]| Value::Color(c.map(f64::from));
+    let (mut p, cid, comp) = setup(400, 100);
+    let mut l = text_layer(&mut p, &comp, TextDoc { text: "ABCD".into(), size: 60.0, fill: white, stroke: white, ..Default::default() });
+    animator(&mut p, &mut l, &["fillColor", "strokeColor"], &["range"]);
+    set(&mut l, "text/animators/#1/properties/fillColor", color(red));
+    set(&mut l, "text/animators/#1/properties/strokeColor", color(blue));
+    set(&mut l, "text/animators/#1/selectors/#1/advanced/amount", Value::Scalar(60.0));
+    p.comp_mut(cid).unwrap().layers.push(l);
+
+    // One animator: unchanged, bit for bit lerp(base, f, k).
+    let k1 = raw_selection(&p, cid, 1);
+    let one = glyph_colors(&p, cid);
+    assert_eq!(one.len(), 4);
+    for (i, (f, s)) in one.iter().enumerate() {
+        assert_eq!(*f, lerp4(white, red, k1[i]), "glyph {i} fill");
+        assert_eq!(*s, lerp4(white, blue, k1[i]), "glyph {i} stroke");
+    }
+
+    // A second animator below: orange fill / white stroke, Ramp Up across the word.
+    let mut l = p.comp(cid).unwrap().layers[0].clone();
+    animator(&mut p, &mut l, &["fillColor", "strokeColor"], &["range"]);
+    set(&mut l, "text/animators/#2/properties/fillColor", color(orange));
+    set(&mut l, "text/animators/#2/properties/strokeColor", color(white));
+    set(&mut l, "text/animators/#2/selectors/#1/advanced/shape", Value::Enum(1));
+    p.comp_mut(cid).unwrap().layers[0] = l;
+    let k2 = raw_selection(&p, cid, 2);
+    assert!(k2.windows(2).all(|w| w[0] < w[1]) && k2[0] < 0.5 && k2[3] > 0.5, "ramp: {k2:?}");
+    let two = glyph_colors(&p, cid);
+    for (i, (f, s)) in two.iter().enumerate() {
+        let want_f = lerp4(lerp4(white, red, k1[i]), orange, k2[i]);
+        let want_s = lerp4(lerp4(white, blue, k1[i]), white, k2[i]);
+        for d in 0..4 {
+            assert!((f[d] - want_f[d]).abs() < 1e-5, "glyph {i} fill {f:?} want {want_f:?}");
+            assert!((s[d] - want_s[d]).abs() < 1e-5, "glyph {i} stroke {s:?} want {want_s:?}");
+        }
+    }
+    // The repro: red at 100 %, orange ramping below it gives red→orange along the word.
+    set(&mut p.comp_mut(cid).unwrap().layers[0], "text/animators/#1/selectors/#1/advanced/amount", Value::Scalar(100.0));
+    let ramp = glyph_colors(&p, cid);
+    for (i, (f, _)) in ramp.iter().enumerate() {
+        let want = lerp4(red, orange, k2[i]);
+        assert!(f.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "glyph {i} fill {f:?} want {want:?}");
+    }
+    assert!(ramp.windows(2).all(|w| w[0].0[1] < w[1].0[1]) && ramp[0].0[1] < 0.2 && ramp[3].0[1] > 0.4, "{ramp:?}");
+}

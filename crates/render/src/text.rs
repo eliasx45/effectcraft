@@ -258,6 +258,29 @@ pub fn animator_selection(ctx: &EvalCtx, layer: &Layer, anim: &PropGroup, lay: &
     acc
 }
 
+/// Blend an animator's colour `f` at selection `k` over the colour the animators above it left,
+/// as After Effects does: each animator lerps from the colour so far. `(acc, acc_k)` stays one
+/// lerp from the base colour (`lerp(base, acc, acc_k)`), composed exactly:
+/// `K' = 1 − (1−K)(1−k)`, `F' = (F·K·(1−k) + f·k) / K'`. The first animator sets `(f, k)` as is.
+fn blend_over(acc: &mut Option<[f32; 4]>, acc_k: &mut f32, f: [f32; 4], k: f64) {
+    let k = (k as f32).clamp(0.0, 1.0);
+    match *acc {
+        Some(prev) if *acc_k > 0.0 => {
+            if k <= 0.0 {
+                return;
+            }
+            let kk = 1.0 - (1.0 - *acc_k) * (1.0 - k);
+            let w = *acc_k * (1.0 - k);
+            *acc = Some(if kk > 0.0 { std::array::from_fn(|d| (prev[d] * w + f[d] * k) / kk) } else { f });
+            *acc_k = kk;
+        }
+        _ => {
+            *acc = Some(f);
+            *acc_k = k;
+        }
+    }
+}
+
 /// Evaluate animators for every glyph.
 pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &TextLayout) -> Vec<CharXf> {
     let mut out = vec![CharXf::default(); lay.glyphs.len()];
@@ -341,12 +364,10 @@ pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &Tex
                 c.opacity *= 1.0 + (o / 100.0 - 1.0) * k;
             }
             if let Some(f) = fill {
-                c.fill = Some(f);
-                c.fill_k = (c.fill_k + k as f32).clamp(0.0, 1.0);
+                blend_over(&mut c.fill, &mut c.fill_k, f, k);
             }
             if let Some(f) = stroke {
-                c.stroke = Some(f);
-                c.stroke_k = (c.stroke_k + k as f32).clamp(0.0, 1.0);
+                blend_over(&mut c.stroke, &mut c.stroke_k, f, k);
             }
             for d in 0..3 {
                 if let Some(v) = fill_hsb[d] {
@@ -407,8 +428,7 @@ pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &Tex
             }
             for ((s, sk), v) in c.surface.iter_mut().zip(&mut c.surface_k).zip(surface) {
                 if let Some(v) = v {
-                    *s = Some(v);
-                    *sk = (*sk + k as f32).clamp(0.0, 1.0);
+                    blend_over(s, sk, v, k);
                 }
             }
         }
