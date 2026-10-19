@@ -102,9 +102,9 @@ pub fn store(key: Key, t: Secs, reqs: Vec<Req>) {
         let mut l = l.borrow_mut();
         // Requests at other times that the evaluation before (of this unit) made at the same
         // absolute time.
-        let fixed = match l.get(&key) {
+        let fixed: Vec<bool> = match l.get(&key) {
             Some(old) if old.t != t && reqs.iter().any(|r| other_time(r, t)) => {
-                let before: std::collections::HashSet<&Req> = old.reqs.iter().filter(|r| other_time(r, old.t)).collect();
+                let before: std::collections::HashSet<&Req> = old.reqs.iter().filter(|r| other_time(*r, old.t)).collect();
                 reqs.iter().map(|r| other_time(r, t) && before.contains(r)).collect()
             }
             // The same time again (another unit or a re-render): keep what was known.
