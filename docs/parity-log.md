@@ -1116,3 +1116,20 @@ before.
   between Linear and Auto Bezier, and dragging from a key pulls out its handles (kept). After
   Effects has no segment drag on motion paths; the bend is an EffectCraft addition (as in
   Illustrator and Figma). Feature percentages are unchanged.
+
+## Update: viewer Sharp Zoom (19 October 2026)
+
+- View ▸ Sharp Zoom (on by default; beyond After Effects, which magnifies comp pixels): above
+  100 % at Full or Auto resolution, the Composition viewer also renders the visible region at the
+  magnification (up to 16 output pixels per comp pixel) and draws it over the magnified frame.
+  Text, shapes and solids are drawn at their on-screen size, footage and nested comps are
+  resampled from their own pixels, and pixel-sized effect parameters follow the buffer scale.
+- The tile renders on its own thread on the CPU, one at a time; until it lands (an edit, a pan
+  past the 256-pixel grid) the magnified comp-resolution frame shows. Not while playing,
+  scrubbing or dragging, in 3D comps, with Show Channel / exposure / display colour management,
+  snapshots or the cloud preview.
+- Renders flag it (`RenderOpts::sharp`, viewer only): each layer buffer stays within 16 Mpx
+  (bigger sources are drawn at a lower scale, never below 100 %), nested comps drawn whole are
+  held to it, and static nested comps are windowed to what shows. Without the flag (exports,
+  RAM preview, every viewer frame up to 100 %, upscaled outputs) nothing changes, and the
+  render options' cache keys keep their text. Feature percentages are unchanged.

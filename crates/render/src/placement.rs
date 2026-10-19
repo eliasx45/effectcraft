@@ -245,9 +245,13 @@ impl<'a> Renderer<'a> {
                 // Footage and comp proxies keep their own pixels (any scale).
                 let (scale, exact) = match &layer.source {
                     LayerSource::Solid { .. } => {
-                        let px = |v: u32| ((v as f64 * s).ceil() as u32).max(1);
-                        (Some(s), Some(([px(sw), px(sh)], [0.0; 2], s)))
+                        let k = self.solid_scale(sw, sh);
+                        let px = |v: u32| ((v as f64 * k).ceil() as u32).max(1);
+                        (Some(k), Some(([px(sw), px(sh)], [0.0; 2], k)))
                     }
+                    // Sharp zoom: a nested comp drawn whole may be drawn below the output
+                    // scale (see `source_window`), not known exactly here.
+                    LayerSource::Comp { item } if self.proxy_for(*item).is_none() && self.sharp() => (Some(1.0), None),
                     LayerSource::Comp { item } if self.proxy_for(*item).is_none() => {
                         // `comp_frame_cpu`'s frame at the nested renderer's scale (≥ `s`).
                         let (_, bs) = self.precomp_renderer(layer, *item);

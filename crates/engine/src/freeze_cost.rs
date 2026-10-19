@@ -190,7 +190,7 @@ impl Session {
 
     /// Layers of `scope` (every composition when `None`) that stay far above the frame budget
     /// and are not frozen or dismissed, the slowest first. Only what `freeze.freeze` accepts is
-    /// suggested: a layer it refuses on its own (for example expression dependencies) is
+    /// suggested: a layer it refuses on its own (for example one with expressions) is
     /// offered as its whole composition when that can be frozen, else not at all. A layer inside
     /// a precomp that is itself suggested is left out: freezing the precomp covers it.
     pub fn freeze_suggestions_in(&self, scope: Option<ItemId>) -> Vec<Suggestion> {

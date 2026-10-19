@@ -135,6 +135,7 @@ const PINNED_FRONTEND: &[&str] = &[
     "view.grid",
     "view.snapToGrid",
     "view.layerControls",
+    "view.sharpZoom",
     "view.options",
     "view.panelBackground",
     "view.fullScreen",
@@ -191,7 +192,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 150);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 151);
 }
 
 #[test]

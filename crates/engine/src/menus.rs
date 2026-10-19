@@ -1136,6 +1136,7 @@ View
   ---
   View Options... | view.options
   Show Layer Controls | view.layerControls
+  Sharp Zoom | view.sharpZoom
   ---
   Camera Settings... | layer.cameraSettings
   Reset 3D View | view.reset3DView

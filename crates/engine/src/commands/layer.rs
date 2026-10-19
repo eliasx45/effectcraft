@@ -929,12 +929,29 @@ fn check_parent_chain(comp: &Comp, ids: &[LayerId], parent: Option<LayerId>, max
 }
 
 fn set_parent(s: &mut Session, p: &Value) -> Result<Value> {
-    let (cid, ids) = layers_p(s, p)?;
+    let (cid, mut ids) = layers_p(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let parent = match p.get("parent") {
         None | Some(Value::Null) => None,
         Some(v) => Some(resolve_layer(comp, v).ok_or_else(|| bad("layer.setParent", "no such parent layer"))?),
     };
+    // Several layers (the pick whip or Parent menu on a selection): as in AE, the parent itself and
+    // the layers it descends from are skipped rather than failing the whole edit. One layer, or a
+    // set that is all skipped, still reports the cycle below.
+    if ids.len() > 1 {
+        if let Some(par) = parent {
+            let mut skip = vec![par];
+            let mut cur = comp.layer(par).and_then(|l| l.parent);
+            while let Some(id) = cur.filter(|id| !skip.contains(id) && skip.len() < 4096) {
+                skip.push(id);
+                cur = comp.layer(id).and_then(|l| l.parent);
+            }
+            let kept: Vec<LayerId> = ids.iter().copied().filter(|id| !skip.contains(id)).collect();
+            if !kept.is_empty() {
+                ids = kept;
+            }
+        }
+    }
     // A loaded cycle need not include a selected child. Validate before compensation or edit;
     // do not impose the renderer's 64-ancestor truncation as a new ordinary hierarchy limit.
     check_parent_chain(comp, &ids, parent, 4096, 1_048_576)?;
