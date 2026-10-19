@@ -7,6 +7,8 @@
 
 include!(concat!(env!("OUT_DIR"), "/commands.rs"));
 pub mod anim_tools;
+// Batch 1 lane C: the UI reads card masks (CX1).
+pub mod cards;
 pub mod content_fill;
 pub mod essential;
 pub mod expr_tools;

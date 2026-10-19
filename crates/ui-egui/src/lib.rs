@@ -2743,6 +2743,8 @@ impl EffectcraftApp {
         // Batch 1 wheels (AX1): drawn above the panels, then their slices registered.
         wheel::paint(&ctx);
         wheel::register_automation(&ctx, &mut self.auto);
+        // Batch 1 lane C: card / paste wheel picks, link fetches (CX1, CX2).
+        panels::cards::frame(self, &ctx);
         // Batch 1 lane B: finished transcriptions are imported (SX2).
         transcribe::poll(self, &ctx);
         panels::timeline::wheels::take_picks(self, &ctx);
