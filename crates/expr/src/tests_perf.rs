@@ -338,3 +338,88 @@ fn graph_expression_profile() {
         );
     }
 }
+
+/// EXPR-PERF1/2: a bisection over layer A's keyed rotation (0 → 90 over 0–1 s), 18 reads whose
+/// times each depend on the read before (the shape of a "start when the reveal reaches this
+/// unit" bounce).
+const BISECT: &str = "var o = thisComp.layer(\"A\").transform.rotation; var target = 30; var lo = o.key(1).time, hi = o.key(o.numKeys).time; for (var n = 0; n < 18; n++) { var m = (lo + hi) / 2; if (o.valueAtTime(m) < target) lo = m; else hi = m; } hi + time";
+
+/// [`BISECT`] computed in Rust from the keyframes.
+fn bisect_oracle(f: &Fx, target: f64, t: f64) -> f64 {
+    let rot = f.p.comp(f.cid).unwrap().layer(f.a).unwrap().props.prop(ROT).unwrap();
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    for _ in 0..18 {
+        let m = (lo + hi) / 2.0;
+        if rot.value_at(Tick::from_seconds_f64(m)).as_f64() < target {
+            lo = m;
+        } else {
+            hi = m;
+        }
+    }
+    // The script's `time` is the comp time as ticks.
+    hi + Tick::from_seconds_f64(t).seconds()
+}
+
+#[test]
+fn a_bisection_over_keyframes_runs_once_per_evaluation() {
+    let f = fx();
+    // Each read used to get a stand-in 0 until answered, sending the rest of the run down the
+    // wrong branch: about one run per step (18 + the lookups). The keyframed rotation is now
+    // read inside the run once its keys are known.
+    let (first, v) = runs_of(&f, f.b, ROT, BISECT, 0.5);
+    assert_eq!(v.as_f64(), bisect_oracle(&f, 30.0, 0.5));
+    assert!(first <= 8, "first evaluation ran {first} times");
+    for t in [0.6, 0.7, 2.0] {
+        let (n, v) = runs_of(&f, f.b, ROT, BISECT, t);
+        assert_eq!(n, 1, "at {t}");
+        assert_eq!(v.as_f64(), bisect_oracle(&f, 30.0, t), "at {t}");
+    }
+}
+
+#[test]
+fn inline_reads_match_the_evaluator_bit_for_bit() {
+    let f = fx();
+    let rot = f.p.comp(f.cid).unwrap().layer(f.a).unwrap().props.prop(ROT).unwrap();
+    for t in [-0.2, 0.05, 0.33, 0.5, 0.95, 1.4] {
+        let direct = rot.value_at(Tick::from_seconds_f64(t)).as_f64();
+        // Answered by the evaluator (the first read of the rotation).
+        let one = format!("thisComp.layer(\"A\").transform.rotation.valueAtTime({t})");
+        assert_eq!(f.ev(f.b, ROT, &one, 0.4).unwrap().as_f64().to_bits(), direct.to_bits(), "at {t}");
+        // Answered inside the run: the time needs the keys (key 2 is at 1 s), which make the
+        // rotation a known curve first. `pre` reads (thisProperty) go the same way.
+        let inside = format!("var o = thisComp.layer(\"A\").transform.rotation; o.valueAtTime(o.key(2).time * {t})");
+        assert_eq!(f.ev(f.b, ROT, &inside, 0.4).unwrap().as_f64().to_bits(), direct.to_bits(), "inside, at {t}");
+        let own = format!("thisProperty.valueAtTime(thisProperty.key(2).time * {t})");
+        assert_eq!(f.ev(f.a, ROT, &own, 0.4).unwrap().as_f64().to_bits(), direct.to_bits(), "own, at {t}");
+    }
+}
+
+/// `eval_text_selector` for every unit of an `n`-unit text at comp time `t`: (runs, amounts).
+fn units(f: &Fx, n: usize, t: f64) -> Vec<(u64, f64)> {
+    use effectcraft_render::{EvalCtx, ExprHost};
+    let comp = f.p.comp(f.cid).unwrap();
+    let layer = comp.layer(f.b).unwrap();
+    let prop = layer.props.prop(ROT).unwrap();
+    let ctx = EvalCtx::new(&f.p, f.cid, comp, Tick::from_seconds_f64(t));
+    (0..n)
+        .map(|i| {
+            let before = script_runs();
+            let v = crate::Expressions.eval_text_selector(&ctx, layer, prop, i, n, [100.0; 3]).unwrap();
+            (script_runs() - before, v[0])
+        })
+        .collect()
+}
+
+#[test]
+fn a_bisection_per_text_unit_runs_once_per_unit() {
+    let mut f = fx();
+    // The bisection per unit (the bounce's shape): once per unit from the second frame.
+    f.set_expr(f.b, ROT, &BISECT.replace("var target = 30", "var target = (textIndex - 0.5) / textTotal * 90"));
+    let _ = units(&f, 6, 0.5);
+    let got = units(&f, 6, 0.6);
+    assert!(got.iter().all(|(n, _)| *n == 1), "{got:?}");
+    for (i, (_, v)) in got.iter().enumerate() {
+        // The amount is the script result (hi + time) as a number.
+        assert_eq!(*v, bisect_oracle(&f, (i as f64 + 0.5) / 6.0 * 90.0, 0.6), "unit {i}");
+    }
+}

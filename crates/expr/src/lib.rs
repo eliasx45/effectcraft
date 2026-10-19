@@ -248,13 +248,24 @@ fn evaluate_out(
 
 /// Resolve `reqs` not answered yet into the memo of the frame at `depth`.
 fn answer(resolver: &Resolver, depth: usize, reqs: impl IntoIterator<Item = Req>) {
+    let now = secs(resolver.ctx.time.seconds());
     for req in reqs {
         if FRAMES.with(|f| f.borrow().get(depth).is_none_or(|fr| fr.has(&req))) {
             continue;
         }
         // May evaluate other expressions (nested frames above ours).
         let r = resolver.resolve(&req);
-        FRAMES.with(|f| f.borrow_mut().get_mut(depth).map(|fr| fr.insert(req, r)));
+        // The key API and reads at other times than the evaluation's own (`valueAtTime(t)`,
+        // bisections over a keyframed property) let the run answer further reads of the same
+        // property itself (see `host::Curve`).
+        let curve = matches!(req, Req::Keys { .. }) || (matches!(req, Req::Value { .. }) && req.time() != Some(now));
+        let curve = (curve && FRAMES.with(|f| f.borrow().get(depth).is_some_and(|fr| !fr.has_curve(&req)))).then(|| resolver.curve(&req)).flatten();
+        FRAMES.with(|f| {
+            f.borrow_mut().get_mut(depth).map(|fr| {
+                fr.curves.extend(curve);
+                fr.insert(req, r)
+            })
+        });
     }
 }
 

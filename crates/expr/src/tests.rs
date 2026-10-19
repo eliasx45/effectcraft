@@ -122,7 +122,7 @@ impl Fx {
             Err(e) => e,
         }
     }
-    fn set_expr(&mut self, layer: LayerId, path: &str, text: &str) {
+    pub(crate) fn set_expr(&mut self, layer: LayerId, path: &str, text: &str) {
         let l = self.p.comp_mut(self.cid).unwrap().layer_mut(layer).unwrap();
         l.props.prop_mut(path).unwrap().expr = Some(Expression { text: text.into(), enabled: true });
     }

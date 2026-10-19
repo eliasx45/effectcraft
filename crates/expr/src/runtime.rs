@@ -51,6 +51,10 @@ pub struct Frame {
     speculate: bool,
     /// What this frame evaluates: an evaluation that needs itself is a cycle.
     pub owner: Option<Owner>,
+    /// Keyframed properties whose `Value` reads are answered inside the run (see
+    /// [`crate::host::Curve`]), added as the evaluator resolves their first `Keys` or
+    /// other-time `Value` read.
+    pub curves: Vec<crate::host::Curve>,
 }
 
 /// One expression evaluation: the property (comp, layer, uid), the comp time and the text.
@@ -76,6 +80,18 @@ impl Frame {
     }
     pub fn answer(&self, req: &Req) -> Option<&Resp> {
         self.memo.get(req).map(|a| &a.resp)
+    }
+    /// Whether a curve for the property `req` reads is known already.
+    pub fn has_curve(&self, req: &Req) -> bool {
+        match req {
+            Req::Value { comp, layer, path, .. } | Req::Keys { comp, layer, path } => self.curves.iter().any(|c| c.is(*comp, *layer, path)),
+            _ => false,
+        }
+    }
+    /// The answer to a `Value` read from a known curve, without the evaluator.
+    fn inline(&self, req: &Req) -> Option<Resp> {
+        let Req::Value { comp, layer, path, t, pre } = req else { return None };
+        self.curves.iter().find(|c| c.is(*comp, *layer, path))?.value(*t, *pre)
     }
     /// Move the answers to `reqs` (each listed once) out of the memo.
     pub fn take_answers(&mut self, reqs: &[Req]) -> Option<Vec<Resp>> {
@@ -294,6 +310,16 @@ fn native_host(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
                 frame.used.push(req);
             }
             return Some(to_js(&a.resp, ctx));
+        }
+        // A keyframed property read at a new time: answered here, recorded as if the evaluator
+        // had answered it (memoised, and in `used` for the memo and the next prefetch), so the
+        // run goes on with the real value instead of a stand-in.
+        if let Some(resp) = frame.inline(&req) {
+            let v = to_js(&resp, ctx);
+            let run = frame.run;
+            frame.used.push(req.clone());
+            frame.memo.insert(req, Answer { resp, run });
+            return Some(v);
         }
         let stop = !frame.speculate || frame.misses.len() >= MAX_MISSES;
         let stand_in = (!stop).then(|| to_js(&placeholder(&req), ctx));

@@ -8,6 +8,8 @@
 //! script again. Expressions are pure functions of these answers, so re-running is exact, and
 //! the runtime stays free of borrowed state.
 
+use std::sync::Arc;
+
 use effectcraft_geom::{Mat3, Mat4};
 use effectcraft_keyframe::Value;
 use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerId, LayerSource, Node, PropGroup, Property};
@@ -247,6 +249,44 @@ pub struct Resolver<'a> {
     pub own: Own<'a>,
 }
 
+/// A keyframed property whose `Value` reads at any time the script can answer without leaving
+/// the run (see [`crate::runtime::Frame::inline`]): the layer handle the property was found in
+/// (`Arc`, so nothing borrowed enters the thread's runtime state) and the request path.
+///
+/// Without this a read whose time depends on an earlier read (a bisection over `valueAtTime`)
+/// cost one script run per step: the stand-in answer sent the rest of the run down the wrong
+/// branch. Answers are computed exactly as [`Resolver::resolve`] computes them.
+pub struct Curve {
+    pub comp: u64,
+    pub layer_id: u64,
+    pub path: String,
+    pub layer: Arc<Layer>,
+    /// Reads without `pre` give the keyframed value too: the property has no expression and isn't
+    /// a Position (Separate Dimensions reads X/Y/Z Position instead, see `EvalCtx::value`).
+    pub plain: bool,
+}
+
+impl Curve {
+    /// Whether this curve answers reads of `path` on layer `layer` of comp `comp`.
+    pub fn is(&self, comp: u64, layer: u64, path: &str) -> bool {
+        self.comp == comp && self.layer_id == layer && self.path == path
+    }
+
+    /// The answer to `Value { t, pre }` on this property, `None` when only the evaluator may
+    /// answer it (an expression to run).
+    pub fn value(&self, t: Secs, pre: bool) -> Option<Resp> {
+        if !pre && !self.plain {
+            return None;
+        }
+        let l: &Layer = &self.layer;
+        let p = l.props.prop(&self.path)?;
+        // `Resolver::try_resolve`'s `Req::Value`: `pre` reads `value_at` at the layer time; the
+        // other reads go through `EvalCtx::value`, which for a plain property is the same.
+        let v = p.value_at(l.layer_time(Tick::from_seconds_f64(f64::from_bits(t))));
+        Some(value_resp(&v, prop_dims(l, p)))
+    }
+}
+
 fn mat3(m: &Mat3) -> Resp {
     Resp::nums(m.0.iter().flatten().copied())
 }
@@ -316,6 +356,19 @@ impl<'a> Resolver<'a> {
             return Some((layer, self.own.prop));
         }
         Some((layer, layer.props.prop(path)?))
+    }
+
+    /// The [`Curve`] of the property `req` (a `Keys` or `Value` read) names, when it can be
+    /// answered from its layer alone: the layer found is the comp's own `Arc` (not a stand-in
+    /// copy) and the path finds the very same property in it.
+    pub fn curve(&self, req: &Req) -> Option<Curve> {
+        let (Req::Value { comp, layer, path, .. } | Req::Keys { comp, layer, path }) = req else { return None };
+        let (l, p) = self.prop(*comp, *layer, path)?;
+        let arc = self.comp(*comp)?.layers.arcs().iter().find(|a| a.id.0 == *layer)?;
+        if !std::ptr::eq(&**arc, l) || !arc.props.prop(path).is_some_and(|q| std::ptr::eq(q, p)) {
+            return None;
+        }
+        Some(Curve { comp: *comp, layer_id: *layer, path: path.clone(), layer: Arc::clone(arc), plain: !p.has_expression() && p.match_id != "position" })
     }
 
     pub fn resolve(&self, req: &Req) -> Resp {
