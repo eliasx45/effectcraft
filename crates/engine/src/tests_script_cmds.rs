@@ -48,7 +48,7 @@ fn copy_ref_names_the_comp_line_frames_and_words() {
     let text = r["text"].as_str().unwrap();
     assert!(text.starts_with("10-10 MAIN · script line 1"), "{text}");
     assert!(text.contains("really WORKS every single time"), "{text}");
-    assert!(text.contains("f55"), "{text}"); // "really" starts at 1.8 s
+    assert!(text.contains("f45"), "{text}"); // "really" starts at 1.8 s
 }
 
 #[test]
