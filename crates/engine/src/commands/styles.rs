@@ -17,9 +17,11 @@
 //! replaces the card. The engine checks and selects them; the app saves (`Event::Frontend`, the
 //! Motion Library plug's `save_asset`). `text.presetFamilies` / `text.apply` read those cards.
 //!
-//! Unit bounce (CX9): a spring on a Range Selector's Start / End / Offset does nothing visible
-//! (Ramp Up clamps the selection to 0..1). `text.unitBounce` adds an animator with an Expression
-//! Selector that springs each unit's Position / Scale when the reveal reaches it.
+//! Unit bounce (CX9; CX9c): a spring on a Range Selector's Start / End / Offset does nothing
+//! visible (Ramp Up clamps the selection to 0..1). `text.unitBounce` applies Elias's own bounce
+//! text preset instead (the card "Bounce In", else one with a "Bounce Overshoot (%)" control)
+//! through `text.apply`, with the Bounce panel's Strength → "Bounce Overshoot (%)" and Bounces/s →
+//! "Bounce Speed (bounces/s)". Nothing about the bounce is built here.
 
 use effectcraft_project::build::Ids;
 use effectcraft_project::styles::{self as st, GROUP, STYLES};
@@ -454,10 +456,7 @@ fn save_text_preset(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"saving": name, "folder": TEXT_PRESET_FOLDER, "layer": lid.0, "comp": cid.0, "effects": n_fx, "animators": n_anim}))
 }
 
-// ── Per-unit bounce on a text reveal (CX9) ─────────────────────────────────────────────────
-
-/// The animator `text.unitBounce` adds (and reuses on the same layer).
-pub const UNIT_BOUNCE: &str = "Unit bounce";
+// ── Per-unit bounce on a text reveal (CX9, CX9c) ──────────────────────────────────────────────
 
 /// Whether a property match path is a Range Selector's Start, End or Offset
 /// (`text/animators/animator#2/selectors/rangeSelector/offset`).
@@ -522,122 +521,64 @@ fn reveal_target(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, LayerId, 
     Err(bad(cmd, "select the keys of a text animator's Range Selector Start, End or Offset (two keys or more)"))
 }
 
-/// The Expression Selector amount: a damped cosine per unit, starting when the reveal reaches it.
-/// `t0`..`t1` (comp seconds) is the reveal; `reverse` reveals the last unit first.
-pub fn unit_bounce_expr(t0: f64, t1: f64, reverse: bool, frequency: f64, decay: f64, bounce: bool) -> String {
-    let order = if reverse { "(textTotal - textIndex + 0.5)" } else { "(textIndex - 0.5)" };
-    let wave = if bounce { "Math.abs(Math.cos(2 * Math.PI * f * t))" } else { "Math.cos(2 * Math.PI * f * t)" };
-    format!(
-        "// Unit bounce (Motion Library ▸ Bounce on a text reveal): each unit springs when the reveal reaches it.\n\
-         var t0 = {t0:.4}, t1 = {t1:.4}, f = {frequency:.4}, d = {decay:.4};\n\
-         var reach = t0 + (t1 - t0) * {order} / Math.max(textTotal, 1);\n\
-         var t = time - reach;\n\
-         t < 0 ? 0 : 100 * Math.exp(-d * t) * {wave}"
-    )
-}
+/// The Bounce panel's settings → Elias's bounce preset's controls (when the preset has them).
+const BOUNCE_CONTROLS: [(&[&str], &str); 2] = [(&["overshoot", "strength"], "Bounce Overshoot (%)"), (&["speed", "frequency"], "Bounce Speed (bounces/s)")];
 
 fn unit_bounce(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "text.unitBounce";
-    let (cid, lid, sel_uid) = reveal_target(s, p, cmd)?;
-    let mode = str_p(p, "mode").unwrap_or("overshoot");
-    if !matches!(mode, "overshoot" | "bounce") {
-        return Err(bad(cmd, "`mode`: overshoot or bounce"));
-    }
-    let num = |k: &str, d: f64, lo: f64, hi: f64| f_p(p, k).filter(|x| x.is_finite()).unwrap_or(d).clamp(lo, hi);
-    let strength = num("strength", 50.0, 0.0, 200.0);
-    let frequency = num("frequency", 3.0, 0.1, 20.0);
-    let decay = num("decay", 6.0, 0.1, 30.0);
-    let moves: Vec<String> = match p.get("moves") {
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).filter(|k| k == "position" || k == "scale").collect(),
-        Some(Value::String(k)) if k == "position" || k == "scale" => vec![k.clone()],
-        _ => vec!["position".into()],
-    };
-    if moves.is_empty() {
-        return Err(bad(cmd, "`moves`: position and/or scale"));
-    }
-    // The reveal's span and direction, from the selector property's first and last keys.
-    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
-    let layer = comp.layer(lid).ok_or_else(|| bad(cmd, "no such layer"))?;
-    let sel = layer.props.find(sel_uid).ok_or_else(|| bad(cmd, "the range selector property is gone"))?;
-    let sel_name = sel.name.clone();
-    let (Some(first), Some(last)) = (sel.keys.first(), sel.keys.last()) else {
-        return Err(bad(cmd, "the range selector property needs two keys or more"));
-    };
-    // TODO(batch1-verify): `time` in a text selector expression is comp time (prelude.js); key times are layer time.
-    let t0 = layer.comp_time(first.time).seconds();
-    let t1 = layer.comp_time(last.time).seconds();
-    let rising = last.value.as_f64() >= first.value.as_f64();
-    // TODO(batch1-verify): a rising Start / Offset / End is taken to reveal from the first unit; `reverse` flips it.
-    let reverse = b_p(p, "reverse").unwrap_or(false) != !rising;
-    let expr = unit_bounce_expr(t0.min(t1), t0.max(t1), reverse, frequency, decay, mode == "bounce");
-    // At 100 % the units sit this far from rest: strength 50 → 20 px up, +15 % scale.
-    // TODO(batch1-verify): amplitudes chosen by eye (toolkit_bounce's strength is a velocity percent).
-    let lift = strength * 0.4;
-    let grow = strength * 0.3;
-    let (reused, anim_uid) = s.edit("Unit Bounce", None, |proj, _| {
-        let mut next = proj.next_id;
-        let mut ids = Ids(&mut next);
-        let l = layer_mut(proj, cid, lid)?;
-        let anims = l.props.group_mut("text/animators").ok_or_else(|| bad(cmd, "not a text layer"))?;
-        let at = anims.children.iter().position(|n| n.as_group().is_some_and(|g| g.name == UNIT_BOUNCE));
-        let reused = at.is_some();
-        let idx = match at {
-            Some(i) => i,
-            None => {
-                let mut g = effectcraft_project::build::text_animator(&mut ids, UNIT_BOUNCE, vec![]);
-                if let Some(sels) = g.sub_mut("selectors") {
-                    sels.children.clear();
+    // The layer: the reveal's (its first key is where the preset starts), else the given or
+    // first selected text layer (from its in point).
+    let (cid, lid, at) = match reveal_target(s, p, cmd) {
+        Ok((cid, lid, uid)) => {
+            let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+            let l = comp.layer(lid).ok_or_else(|| bad(cmd, "no such layer"))?;
+            let at = l.props.find(uid).and_then(|pr| pr.keys.first()).map(|k| l.comp_time(k.time).seconds());
+            (cid, lid, at)
+        }
+        Err(e) => {
+            let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
+            let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+            let lid = match p.get("layer").filter(|v| !v.is_null()) {
+                Some(v) => super::resolve_layer(comp, v),
+                None => {
+                    s.state.selected_layers.iter().copied().find(|l| comp.layer(*l).is_some_and(|x| matches!(x.source, effectcraft_project::LayerSource::Text)))
                 }
-                anims.children.push(g.into());
-                anims.children.len().saturating_sub(1)
-            }
-        };
-        let g = anims.children.get_mut(idx).and_then(|n| n.as_group_mut()).ok_or_else(|| bad(cmd, "the animator is not a group"))?;
-        // Its Expression Selector (added when missing).
-        if g.sub("selectors").is_none() {
-            g.children.push(ids.group("selectors", "Selectors").into());
-        }
-        let sels = g.sub_mut("selectors").ok_or_else(|| bad(cmd, "no selectors group"))?;
-        if sels.sub("expressionSelector").is_none() {
-            let es =
-                effectcraft_project::build::text_selector(&mut ids, "expression", "Expression Selector 1").ok_or_else(|| bad(cmd, "no expression selector"))?;
-            sels.children.push(es.into());
-        }
-        let amount = sels.sub_mut("expressionSelector").and_then(|e| e.get_mut("amount")).ok_or_else(|| bad(cmd, "the Expression Selector has no Amount"))?;
-        amount.expr = Some(effectcraft_project::props::Expression { text: expr.clone(), enabled: true });
-        // Its properties: Position and/or Scale at the full-swing offset; the reveal keeps opacity.
-        if g.sub("properties").is_none() {
-            g.children.push(ids.group("properties", "Properties").into());
-        }
-        let props = g.sub_mut("properties").ok_or_else(|| bad(cmd, "no properties group"))?;
-        for k in &moves {
-            if props.get(k).is_none() {
-                for pr in effectcraft_project::build::text_anim_props(&mut ids, k, false) {
-                    props.children.push(pr.into());
-                }
-            }
-            let v = if k == "position" {
-                effectcraft_keyframe::Value::Vec3([0.0, -lift, 0.0])
-            } else {
-                effectcraft_keyframe::Value::Vec3([100.0 + grow, 100.0 + grow, 100.0])
             };
-            if let Some(pr) = props.get_mut(k) {
-                pr.keys.clear();
-                pr.value = v;
+            match lid.filter(|l| comp.layer(*l).is_some_and(|x| matches!(x.source, effectcraft_project::LayerSource::Text))) {
+                Some(lid) => (cid, lid, None),
+                None => return Err(e),
             }
         }
-        let uid = g.uid;
-        proj.next_id = next;
-        Ok((reused, uid))
-    })?;
-    let what = moves.join(" and ");
+    };
+    let preset = super::text_presets::bounce_preset(s, p, cmd)?;
+    let have = super::text_presets::controls(&preset.doc);
+    let mut controls = serde_json::Map::new();
+    if let Some(Value::Object(given)) = p.get("controls") {
+        controls.extend(given.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    for (keys, name) in BOUNCE_CONTROLS {
+        if let Some(v) = keys.iter().find_map(|k| f_p(p, k)).filter(|v| v.is_finite())
+            && have.iter().any(|c| c.name == name)
+            && !controls.contains_key(name)
+        {
+            controls.insert(name.to_string(), json!(v));
+        }
+    }
+    let target = preset.path.clone().or_else(|| preset.id.clone()).unwrap_or_else(|| preset.name.clone());
+    let mut q = json!({"preset": target, "layers": [lid.0], "controls": controls, "comp": cid.0});
+    if let Some(at) = at {
+        q["at"] = json!(at);
+    }
+    if let Some(c) = p.get("category").filter(|v| !v.is_null()) {
+        q["category"] = c.clone();
+    }
+    let r = s.execute("text.apply", q)?;
     let message = format!(
-        "{sel_name} only reveals: Ramp Up keeps every unit 0–100 %, so a spring there shows nothing. {} animator “{UNIT_BOUNCE}” with an Expression Selector: each unit springs its {what} as the reveal reaches it (strength {strength:.0}, {frequency:.1} bounces/s, settle {decay:.1}); the reveal keeps the opacity.",
-        if reused { "Updated the" } else { "Added the" }
+        "Applied your text preset “{}”{}: its own animators bounce each unit; Strength sets “Bounce Overshoot (%)”, Bounces / s sets “Bounce Speed (bounces/s)” (when the preset has them).",
+        preset.name,
+        if at.is_some() { " from the reveal's first key" } else { " from the layer's in point" }
     );
-    Ok(
-        json!({"animator": anim_uid, "layer": lid.0, "selector": sel_uid, "reused": reused, "reveal": [t0.min(t1), t0.max(t1)], "reverse": reverse, "moves": moves, "message": message}),
-    )
+    Ok(json!({"layer": lid.0, "preset": preset.name, "controls": controls, "applied": r, "message": message}))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -647,7 +588,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Unit Bounce",
             [],
             None,
-            "{layer?, selector? (uid of a keyed Range Selector Start/End/Offset; default the selected keys'), mode? (overshoot|bounce), strength? (0..200), frequency? (bounces/s), decay? (settle speed), moves? ([position, scale]; default position), reverse?} → {animator, reused, message}: adds (or updates) the animator \"Unit bounce\" whose Expression Selector springs each unit when the reveal reaches it; one undo step",
+            "{layer?, selector? (uid of a keyed Range Selector Start/End/Offset; default the selected keys'), preset? (default the card “Bounce In”, else one with a “Bounce Overshoot (%)” control), overshoot? | strength? (→ “Bounce Overshoot (%)”), speed? | frequency? (→ “Bounce Speed (bounces/s)”), controls? ({name: value}, more controls), category?, mode? (ignored), decay? (ignored: the spring settles by itself), moves? (ignored)} → {layer, preset, controls, applied, message}: applies Elias's bounce text preset to the text layer through text.apply (from the reveal's first key); one undo step",
             has_comp,
             unit_bounce
         ),

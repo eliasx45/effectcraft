@@ -331,11 +331,19 @@ fn keyed_props(s: &effectcraft_engine::Session) -> Vec<String> {
 }
 
 /// Whether a selected key is on a text Range Selector's Start, End or Offset (CX9): a spring there
-/// shows nothing (Ramp Up clamps the selection to 0..1), so Bounce springs each unit instead
-/// (`text.unitBounce`).
+/// shows nothing (Ramp Up clamps the selection to 0..1), so Bounce applies Elias's bounce text
+/// preset instead (`text.unitBounce`, CX9c).
 fn reveal_keys(s: &effectcraft_engine::Session) -> bool {
     let Some(c) = s.active_comp() else { return false };
     s.state.selected_keys.iter().any(|k| c.layer(k.layer).and_then(|l| l.props.match_path_of(k.prop)).is_some_and(|m| is_range_reveal(&m)))
+}
+
+/// Only text layers are selected, and no keys (CX9c): Bounce applies the bounce text preset.
+fn text_layers_only(s: &effectcraft_engine::Session) -> bool {
+    let Some(c) = s.active_comp() else { return false };
+    s.state.selected_keys.is_empty()
+        && !s.state.selected_layers.is_empty()
+        && s.state.selected_layers.iter().all(|l| c.layer(*l).is_some_and(|x| matches!(x.source, effectcraft_engine::project::LayerSource::Text)))
 }
 
 /// `text/animators/animator#2/selectors/rangeSelector/offset` and the like
@@ -510,18 +518,16 @@ fn start(app: &mut EffectcraftApp, ctx: &egui::Context, tool: &str, p: &Value) -
         Ok(b) => b,
         Err(e) => return fail(app, e),
     };
-    // CX9: a spring on a Range Selector's Start / End / Offset does nothing visible; bounce each
-    // unit with an Expression Selector animator instead (the reveal keeps the opacity).
+    // CX9c: a spring on a Range Selector's Start / End / Offset does nothing visible, and a text
+    // layer bounces per unit: apply Elias's bounce text preset (a Motion Library card) instead,
+    // Strength → "Bounce Overshoot (%)", Bounces / s → "Bounce Speed (bounces/s)". Settle speed
+    // isn't passed: the preset's spring settles by itself. No preset = a clear error.
     if let Plan::Plug { op: "toolkit_bounce", args } = &built.plan
-        && args["property"] == json!("selected")
         && args["mode"] != json!("remove")
-        && reveal_keys(&app.session)
+        && ((args["property"] == json!("selected") && reveal_keys(&app.session)) || text_layers_only(&app.session))
     {
-        let mut a = json!({"mode": args["mode"], "strength": args["strength"], "frequency": args["frequency"], "decay": args["decay"]});
-        if let Some(m) = p.get("moves") {
-            a["moves"] = m.clone();
-        }
-        built = Built { plan: Plan::Native { cmd: "text.unitBounce", args: a }, section: BOUNCE, label: "Unit bounce".into() };
+        let a = json!({"overshoot": args["strength"], "speed": args["frequency"]});
+        built = Built { plan: Plan::Native { cmd: "text.unitBounce", args: a }, section: BOUNCE, label: "Bounce text preset".into() };
     }
     match built.plan {
         Plan::Native { cmd, args } => {
@@ -1048,21 +1054,24 @@ fn bounce_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set:
         kit::dropdown(app, ui, ctrl, "motionLibrary.tools.bounce.property", &[label.as_str()], 0);
         c.y += 30.0 * c.s;
     }
-    // CX9: Range Selector keys get a per-unit bounce (native, no plug needed).
-    let reveal = reveal_keys(&app.session);
+    // CX9c: Range Selector keys or text layers get Elias's bounce text preset (native, no plug).
+    let reveal = reveal_keys(&app.session) || text_layers_only(&app.session);
     if reveal {
         let t = app.tokens;
         note(
             ui,
             c,
             &t,
-            "Range Selector keys only reveal (Ramp Up clamps them), so Apply spring bounces each unit as the reveal reaches it: an animator with an Expression Selector moves Position; the reveal keeps the opacity.",
+            "On text, Apply spring applies your bounce text preset (Motion Library ▸ Elias ▸ Text animations, “Bounce In”): Strength sets its Bounce Overshoot (%), Bounces / s its Bounce Speed. The spring settles by itself. No preset yet: save one first.",
         );
     }
     choice_row(app, ui, c, "motionLibrary.tools.bounce.motion", "Motion", &MOTIONS, &mut set.motion);
     set.strength = number_row(app, ui, c, "motionLibrary.tools.bounce.strength", "Strength (%)", set.strength, STRENGTH, 0);
     set.frequency = number_row(app, ui, c, "motionLibrary.tools.bounce.frequency", "Bounces / s", set.frequency, FREQUENCY, 1);
-    set.decay = number_row(app, ui, c, "motionLibrary.tools.bounce.decay", "Settle speed", set.decay, DECAY, 1);
+    // The text preset's spring has no settle speed of its own (it follows from the overshoot).
+    if !reveal {
+        set.decay = number_row(app, ui, c, "motionLibrary.tools.bounce.decay", "Settle speed", set.decay, DECAY, 1);
+    }
     let items = [("apply", "Apply spring", true, (reveal && en.idle) || en.plug()), ("remove", "Remove spring", false, en.plug())];
     match button_rows(app, ui, c, "bounce", &items, 110.0) {
         Some(0) => Some(("bounce", json!({}))),
