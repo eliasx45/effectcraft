@@ -224,14 +224,29 @@ fn remove_all(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// `effect.toggle`: the effect on or off (`value`, else the opposite). With `selected: true` and the
+/// effect among the selected ones (an fx switch clicked in Effect Controls or the Timeline), every
+/// selected effect, on any layer, gets that effect's new state, in one undo step (After Effects).
 fn toggle(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = find_fx(s, p, "effect.toggle")?;
     let v = b_p(p, "value");
+    let mut targets = vec![(lid, uid)];
+    if b_p(p, "selected") == Some(true) && s.state.selected_props.contains(&(lid, uid)) {
+        let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+        // Only effect groups: the selection can hold properties and masks too.
+        let is_fx = |l: &LayerId, u: &Uid| comp.layer(*l).and_then(|l| l.effects()).is_some_and(|fx| fx.groups().any(|g| g.uid == *u));
+        targets.extend(s.state.selected_props.iter().filter(|t| **t != (lid, uid) && is_fx(&t.0, &t.1)).copied());
+    }
     let r = s.edit("Toggle Effect", None, |proj, _| {
         let l = layer_mut(proj, cid, lid)?;
         let g = l.props.find_group_mut(uid).ok_or_else(|| bad("effect.toggle", "gone"))?;
-        g.enabled = v.unwrap_or(!g.enabled);
-        Ok(g.enabled)
+        let on = v.unwrap_or(!g.enabled);
+        for (tl, tu) in &targets {
+            if let Some(g) = layer_mut(proj, cid, *tl).ok().and_then(|l| l.props.find_group_mut(*tu)) {
+                g.enabled = on;
+            }
+        }
+        Ok(on)
     })?;
     Ok(json!(r))
 }
@@ -656,7 +671,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("effect.applyLast", "Last Effect", ["Effect"], Some("Cmd+Alt+Shift+E"), "{layers?}", has_layers, last),
         cmd!("effect.removeAll", "Remove All", ["Effect"], Some("Cmd+Shift+E"), "{layers?}", has_layers, remove_all),
         cmd!("effect.remove", "Remove Effect", [], None, "{layer?, effect: index|uid|name}", has_layers, remove),
-        cmd!("effect.toggle", "Toggle Effect", [], None, "{layer?, effect, value?}", has_layers, toggle),
+        cmd!("effect.toggle", "Toggle Effect", [], None, "{layer?, effect, value?, selected?: every selected effect}", has_layers, toggle),
         cmd!("effect.setLabel", "Effect Label", [], None, "{layer?, effect, label: name|index 0-16 (None clears)}", has_layers, set_label),
         cmd!(
             "effect.reorder",

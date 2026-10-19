@@ -101,3 +101,34 @@ fn new_mask_adds_a_mask_to_every_selected_layer() {
     s.execute("layer.addMask", json!({"layer": ids[2], "shape": "ellipse", "rect": [10, 10, 40, 40]})).unwrap();
     assert_eq!(ids.iter().map(|l| masks(&s, *l)).collect::<Vec<_>>(), [0, 1, 2]);
 }
+
+/// The fx switch of one of several selected effects (what Effect Controls and the Timeline send:
+/// `effect.toggle {selected: true}`) gives every selected effect, on any layer, its new state, in
+/// one undo step; on an unselected effect it toggles that one alone.
+#[test]
+fn the_fx_switch_toggles_every_selected_effect() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    let a = s.execute("layer.newSolid", json!({"name": "A", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+    let b = s.execute("layer.newSolid", json!({"name": "B", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+    for l in [a, a, b] {
+        s.execute("effect.apply", json!({"layers": [l], "effect": "Invert"})).unwrap();
+    }
+    let uids = |s: &Session, l: u64| -> Vec<u64> { s.active_comp().unwrap().layer(LayerId(l)).unwrap().effects().unwrap().groups().map(|g| g.uid).collect() };
+    let on = |s: &Session| -> Vec<bool> {
+        let comp = s.active_comp().unwrap();
+        [a, b].iter().flat_map(|l| comp.layer(LayerId(*l)).unwrap().effects().unwrap().groups().map(|g| g.enabled).collect::<Vec<_>>()).collect()
+    };
+    // Select A's first effect and B's effect.
+    s.execute("prop.select", json!({"layer": a, "path": "effects/#1"})).unwrap();
+    s.execute("prop.select", json!({"layer": b, "path": "effects/#1", "add": true})).unwrap();
+    let before = s.project.clone();
+    s.execute("effect.toggle", json!({"layer": b, "effect": uids(&s, b)[0], "selected": true})).unwrap();
+    assert_eq!(on(&s), [false, true, false], "both selected effects off, A's second untouched");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.same_content(&before), "one undo step");
+
+    // The unselected second effect of A: that one alone.
+    s.execute("effect.toggle", json!({"layer": a, "effect": uids(&s, a)[1], "selected": true})).unwrap();
+    assert_eq!(on(&s), [true, false, true]);
+}

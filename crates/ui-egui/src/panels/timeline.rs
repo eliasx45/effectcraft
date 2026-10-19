@@ -2341,7 +2341,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if let Some(en) = fx.as_ref().filter(|_| vis.switches) {
                     let fr_ = Rect::from_center_size(pos2(cw.switches + SW * 3.0 + SW / 2.0, cy), vec2(16.0, 16.0));
                     if widgets::icon_toggle(ui, fr_, Icon::Fx, *en, &t, egui::Id::new(("gfx", uid)), Sense::click()).clicked() {
-                        actions.push(("effect.toggle".into(), json!({"layer": layer.id.0, "effect": uid})));
+                        actions.push(("effect.toggle".into(), json!({"layer": layer.id.0, "effect": uid, "selected": true})));
                     }
                     app.auto.add(&format!("timeline.group.{uid}.fx"), fr_, name);
                 }
