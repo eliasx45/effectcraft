@@ -142,7 +142,8 @@ fn load_card(s: &Session, c: &CardRef, cmd: &str) -> Result<TextPreset> {
         return Ok(TextPreset { name: c.name.clone(), id: Some(c.id.clone()), path: Some(f.clone()), source: "library", doc });
     }
     let client = s.motion_library().map_err(|e| bad(cmd, e))?;
-    // TODO(batch1-verify): a preset card's published blob (`card.project`) is its .ecpreset.
+    // A preset card's published blob (`card.project`) is its library entry's `file`, the .ecpreset
+    // (motionlib publish.rs).
     #[cfg(not(target_arch = "wasm32"))]
     let prepared = client.prepare_blocking(&c.id, std::time::Duration::from_secs(60));
     #[cfg(target_arch = "wasm32")]
@@ -525,8 +526,8 @@ fn reveal_peak(s: &Session, cid: ItemId, l: &Layer, word: &str) -> Option<f64> {
     let offset_of = |g: &PropGroup| g.prop("selectors/rangeSelector/offset").filter(|o| o.keys.len() >= 2).cloned();
     let (master, off) = fade.iter().copied().find_map(|g| offset_of(g).map(|o| (g, o)))?;
     let (k0, k1) = (off.keys.first()?.time, off.keys.last()?.time);
-    // TODO(batch1-verify): EvalCtx::value runs the Amount expression of a text range selector
-    // (it reads `effect("Animate By")("Menu")`).
+    // EvalCtx::value runs the Amount expression (it reads `effect("Animate By")("Menu")`) when
+    // the session has an expression host (the app); without one the keyed copy is used.
     let ctx = effectcraft_render::EvalCtx { project: &s.project, comp_id: cid, comp, time: l.comp_time(k0), expr: s.expr.as_deref(), footage: None };
     let active = fade
         .iter()
@@ -937,8 +938,9 @@ fn copy_look(tpl: &Layer, dst: &mut Layer, next: &mut u64) -> usize {
             }
         }
     }
-    // TODO(batch1-verify): a layer without a `layerStyles` group gets the template's appended at
-    // the end of its property tree; check the renderer and the Timeline find it there.
+    // A layer without a `layerStyles` group gets the template's right after Transform, where
+    // styles::add_style puts a new one (the renderer finds it anywhere; the Timeline lists it
+    // in tree order).
     if dst.can_have_styles()
         && let Some(st_t) = tpl.props.sub(effectcraft_project::styles::GROUP)
     {
@@ -951,7 +953,10 @@ fn copy_look(tpl: &Layer, dst: &mut Layer, next: &mut u64) -> usize {
                     *slot = Node::Group(g);
                 }
             }
-            None => dst.props.children.push(Node::Group(g)),
+            None => {
+                let at = dst.props.children.iter().position(|c| c.match_id() == "transform").map_or(dst.props.children.len(), |i| i + 1);
+                dst.props.children.insert(at, Node::Group(g));
+            }
         }
         n += 1;
     }

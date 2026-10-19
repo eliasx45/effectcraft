@@ -3,7 +3,6 @@
 //! text.apply applies one through anim.applyPreset and sets controls by name.
 //! The fixtures are a library folder written by the test (library.json + an .ecpreset saved with
 //! anim.savePreset), never the real library.
-//! Not run yet (batch 1): TODO(batch1-verify) run `cargo test -p effectcraft-engine tests_text_presets`.
 
 use effectcraft_keyframe::{Keyframe, Value as KV};
 use effectcraft_project::build::{self, Ids};
@@ -270,4 +269,19 @@ fn unknown_presets_controls_and_bad_params_are_errors_not_crashes() {
     // A failed apply leaves the layer as it was.
     let main = s.active_comp_id().unwrap();
     assert_eq!(layer(&s, main, cap).props.group("text/animators").unwrap().groups().count(), 0);
+}
+
+#[test]
+fn glow_from_a_project_layer_puts_its_layer_styles_after_transform() {
+    let (mut s, main, cap) = studio();
+    let tpl = s.execute("layer.newText", json!({"text": "Glow", "name": crate::commands::text_presets::GLOW_STYLE})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.style.outerGlow", json!({"layers": [tpl]})).unwrap();
+    assert!(layer(&s, main, cap).props.sub(effectcraft_project::styles::GROUP).is_none());
+    let r = s.execute_checked("text.apply", json!({"preset": "Slide In", "layers": [cap], "glow": true})).unwrap();
+    assert_eq!(r["glow"]["source"], "project", "{r:#}");
+    let l = layer(&s, main, cap);
+    let top: Vec<&str> = l.props.children.iter().map(|c| c.match_id()).collect();
+    let t = top.iter().position(|m| *m == "transform").unwrap();
+    assert_eq!(top.get(t + 1), Some(&effectcraft_project::styles::GROUP), "where styles::add_style puts it: {top:?}");
+    assert!(l.props.sub(effectcraft_project::styles::GROUP).unwrap().sub("outerGlow").is_some());
 }
