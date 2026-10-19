@@ -5176,7 +5176,7 @@ pub fn save_text_preset(app: &mut EffectcraftApp, ctx: &egui::Context, params: &
         let r = ml_rpc("effectcraft_plug.py", &[], Some(port), "save_asset", args)?;
         let new_id = r.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
         wait_for_preview(&new_id);
-        // TODO(batch1-verify): delete_entry's arguments as the card menu's Delete uses them.
+        // delete_entry with the arguments the card menu's Delete sends.
         for (id, old_name) in old {
             if id != new_id {
                 backend_rpc("delete_entry", json!({"id": id, "confirm_delete": true, "expected_name": old_name, "expected_category": cat2}))?;

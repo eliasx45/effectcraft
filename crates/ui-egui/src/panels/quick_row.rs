@@ -323,7 +323,8 @@ fn divider(ui: &egui::Ui, x: f32, r: Rect, c: Color32) {
 }
 
 /// Draws the row at the top of `rect` and returns the rest of `rect` for the Timeline.
-// TODO(batch1-verify): nothing else in the Timeline reads the panel rect it was given (drop zones, the empty-comp drop).
+// The Timeline lays out everything from the returned rect; the empty-comp drop runs before the row
+// (no comp, no row), and the panel clip is restored before returning.
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
     if !app.ui.timeline.quick_row.shown || rect.height() < ROW_H * 3.0 {
         return rect;
