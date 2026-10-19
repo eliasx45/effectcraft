@@ -564,7 +564,10 @@ fn unit_bounce(s: &mut Session, p: &Value) -> Result<Value> {
             controls.insert(name.to_string(), json!(v));
         }
     }
-    let target = preset.path.clone().or_else(|| preset.id.clone()).unwrap_or_else(|| preset.name.clone());
+    // A card by its id (text.apply then names it, and its undo step, after the card); only a
+    // preset given as a file goes by path. By path, a card read as "preset" (its file is
+    // assets/<id>/preset.ecpreset): "Text Preset preset" in History (BUILD2 AX4/CX9).
+    let target = preset.id.clone().or_else(|| preset.path.clone()).unwrap_or_else(|| preset.name.clone());
     let mut q = json!({"preset": target, "layers": [lid.0], "controls": controls, "comp": cid.0});
     if let Some(at) = at {
         q["at"] = json!(at);

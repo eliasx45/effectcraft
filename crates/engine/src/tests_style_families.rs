@@ -107,6 +107,7 @@ fn unit_bounce_applies_the_bounce_text_preset() {
     let r = s.execute("text.unitBounce", json!({"layer": l, "selector": off, "strength": 30, "frequency": 2, "decay": 6})).unwrap();
     assert_eq!(r["preset"], "Springy", "{r:#}");
     assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    assert_eq!(s.history.undo.last().map(|(label, _)| label.as_str()), Some("Text Preset Springy"), "named after the card, not its file");
     let layer = s.active_comp().unwrap().layer(LayerId(l)).unwrap().clone();
     let value = |n: &str| layer.effects().unwrap().groups().find(|g| g.name == n).unwrap().props().next().unwrap().value.clone();
     assert_eq!(value("Bounce Overshoot (%)"), KV::Scalar(30.0));
