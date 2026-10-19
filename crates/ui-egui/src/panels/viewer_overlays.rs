@@ -1000,102 +1000,6 @@ pub(crate) fn update(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn info(vertices: Vec<[f64; 2]>, closed: bool) -> PathInfo {
-        let n = vertices.len();
-        let sp = ShapePath { vertices, in_tangents: vec![[0.0; 2]; n], out_tangents: vec![[0.0; 2]; n], closed, feather: Vec::new() };
-        PathInfo { layer: LayerId(3), uid: 7, m: Mat3::IDENTITY, sp, is_mask: true, feather: Vec::new() }
-    }
-
-    /// The free-transform box fits the points in its own (turned) frame, widens a line of points
-    /// so its handles stay apart, and a scale from a handle maps the grabbed point onto the pointer.
-    #[test]
-    fn free_transform_box_fits_turns_and_scales() {
-        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
-        let pts = [[10.0, 20.0], [50.0, 20.0], [50.0, 80.0]];
-        let f = fit_box(&pts, 0.0, 1.0).unwrap();
-        assert!(near(af_apply(&f, [0.0, 0.0]), [10.0, 20.0]) && near(af_apply(&f, [1.0, 1.0]), [50.0, 80.0]));
-        // A vertical line of points: the box gets the minimum width about the line.
-        let line = fit_box(&[[5.0, 0.0], [5.0, 100.0]], 0.0, 8.0).unwrap();
-        assert!(near(af_apply(&line, [0.0, 0.0]), [1.0, 0.0]) && near(af_apply(&line, [1.0, 1.0]), [9.0, 100.0]));
-        // Turned 90°: the box's first corner follows the turn.
-        let t = fit_box(&pts, 90.0, 1.0).unwrap();
-        for p in pts {
-            let uv = af_apply(&af_inv(&t).unwrap(), p);
-            assert!((-1e-9..=1.0 + 1e-9).contains(&uv[0]) && (-1e-9..=1.0 + 1e-9).contains(&uv[1]), "{uv:?}");
-        }
-        assert!(fit_box(&[], 0.0, 1.0).is_none());
-        // Bottom-right handle dragged from (50, 80) to (90, 140), pivot the first corner.
-        let mode = FtMode::Scale { pivot: [0.0, 0.0], axes: [true, true] };
-        let (m, turn) = ft_total(mode, &f, [0.5, 0.5], [50.0, 80.0], [90.0, 140.0], false).unwrap();
-        assert!(near(af_apply(&m, [50.0, 80.0]), [90.0, 140.0]) && near(af_apply(&m, [10.0, 20.0]), [10.0, 20.0]) && turn == 0.0);
-        // Past the pivot: the box flips and the anchor's place in it mirrors.
-        let (m, _) = ft_total(mode, &f, [0.25, 0.5], [50.0, 80.0], [-30.0, 80.0], false).unwrap();
-        assert_eq!(ft_anchor_after(mode, &m, &f, [0.25, 0.5]), [0.75, 0.5]);
-        // Shift on a rotation snaps to 45°.
-        let (_, turn) = ft_total(FtMode::Rotate, &f, [0.5, 0.5], [60.0, 50.0], [30.0, 75.0], true).unwrap();
-        assert_eq!(turn.rem_euclid(45.0), 0.0);
-        assert!(ft_total(FtMode::Anchor, &f, [0.5, 0.5], [0.0; 2], [1.0; 2], false).is_none());
-    }
-
-    /// #912: clicking the last vertex of an open path with the Pen resumes that path.
-    #[test]
-    fn pen_resumes_an_open_path_at_its_last_vertex() {
-        let map = ViewerMap { origin: Pos2::ZERO, zoom: 1.0, comp: [100.0, 100.0], area: Rect::EVERYTHING };
-        let open = info(vec![[10.0, 10.0], [50.0, 10.0], [50.0, 50.0]], false);
-        assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(52.0, 49.0), 8.0), Some((LayerId(3), 7)));
-        assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(10.0, 10.0), 8.0), None, "first vertex");
-        assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(80.0, 80.0), 8.0), None, "far away");
-        let closed = info(vec![[10.0, 10.0], [50.0, 10.0], [50.0, 50.0]], true);
-        assert_eq!(open_end_at(&[closed], &map, egui::pos2(50.0, 50.0), 8.0), None, "closed path");
-    }
-
-    /// The Pen on a motion path: one decision for the pointer, the click and the drag. A key's
-    /// square wins, then a tangent handle (they lie on the line of a straight path), then the
-    /// line itself, which adds a key on the nearest frame that has none; between keys on
-    /// adjacent frames there is nothing to add.
-    #[test]
-    fn pen_target_picks_key_then_handle_then_free_frame() {
-        let (l, p) = (LayerId(1), 7);
-        let fd = Tick::from_seconds_f64(1.0 / 30.0);
-        let t = |f: i64| Tick(fd.0 * f);
-        let key = |f: i64, x: f32, tangent: Option<bool>| KeyHit {
-            layer: l,
-            prop: p,
-            time: t(f),
-            pos: egui::pos2(x, 100.0),
-            tangent,
-            value: [0.0; 3],
-            p2c: Mat3::IDENTITY,
-            curved: true,
-        };
-        // Keys on frames 0, 3 and 4 (20 pt a frame); frame 0's out handle at x = 12.
-        let hits = vec![key(0, 0.0, None), key(0, 12.0, Some(true)), key(3, 60.0, None), key(4, 80.0, None)];
-        let frames: Vec<PathFrame> = (0..=4).map(|f| PathFrame { layer: l, prop: p, time: t(f), pos: egui::pos2(f as f32 * 20.0, 100.0) }).collect();
-        let segments: Vec<MotionSegment> = (0..4)
-            .map(|f| MotionSegment {
-                layer: l,
-                prop: p,
-                from: egui::pos2(f as f32 * 20.0, 100.0),
-                to: egui::pos2(f as f32 * 20.0 + 20.0, 100.0),
-                start: t(f),
-                end: t(f + 1),
-                p2c: Mat3::IDENTITY,
-            })
-            .collect();
-        let at = |x: f32, y: f32| pen_target(&hits, &segments, &frames, egui::pos2(x, y));
-        assert!(matches!(at(1.0, 101.0), PenTarget::Key(k) if k.time == t(0)));
-        assert!(matches!(at(13.0, 100.0), PenTarget::Tangent), "the handle on the line");
-        assert!(matches!(at(19.0, 100.0), PenTarget::AddFrame(f) if f.time == t(1)), "past the handle's reach: nearest frame");
-        assert!(matches!(at(37.0, 100.0), PenTarget::AddFrame(f) if f.time == t(2)), "nearest frame");
-        assert!(matches!(at(70.0, 100.0), PenTarget::PathFull), "keys on adjacent frames");
-        assert!(matches!(at(40.0, 120.0), PenTarget::None), "off the path");
-    }
-}
-
 // ── Claude's version and suggestion previews (batch 1, CX4 / CX5) ─────────────────────────────
 
 static ALT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1272,4 +1176,100 @@ fn ui_button_hold(ctx: &egui::Context, r: Rect) -> (bool, bool, bool) {
     ctx.data_mut(|d| d.insert_temp(id, held));
     // TODO(batch1-verify): the viewer's own press handling also sees this press (a click-select under the button).
     (over, held, was && (released || !down))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(vertices: Vec<[f64; 2]>, closed: bool) -> PathInfo {
+        let n = vertices.len();
+        let sp = ShapePath { vertices, in_tangents: vec![[0.0; 2]; n], out_tangents: vec![[0.0; 2]; n], closed, feather: Vec::new() };
+        PathInfo { layer: LayerId(3), uid: 7, m: Mat3::IDENTITY, sp, is_mask: true, feather: Vec::new() }
+    }
+
+    /// The free-transform box fits the points in its own (turned) frame, widens a line of points
+    /// so its handles stay apart, and a scale from a handle maps the grabbed point onto the pointer.
+    #[test]
+    fn free_transform_box_fits_turns_and_scales() {
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        let pts = [[10.0, 20.0], [50.0, 20.0], [50.0, 80.0]];
+        let f = fit_box(&pts, 0.0, 1.0).unwrap();
+        assert!(near(af_apply(&f, [0.0, 0.0]), [10.0, 20.0]) && near(af_apply(&f, [1.0, 1.0]), [50.0, 80.0]));
+        // A vertical line of points: the box gets the minimum width about the line.
+        let line = fit_box(&[[5.0, 0.0], [5.0, 100.0]], 0.0, 8.0).unwrap();
+        assert!(near(af_apply(&line, [0.0, 0.0]), [1.0, 0.0]) && near(af_apply(&line, [1.0, 1.0]), [9.0, 100.0]));
+        // Turned 90°: the box's first corner follows the turn.
+        let t = fit_box(&pts, 90.0, 1.0).unwrap();
+        for p in pts {
+            let uv = af_apply(&af_inv(&t).unwrap(), p);
+            assert!((-1e-9..=1.0 + 1e-9).contains(&uv[0]) && (-1e-9..=1.0 + 1e-9).contains(&uv[1]), "{uv:?}");
+        }
+        assert!(fit_box(&[], 0.0, 1.0).is_none());
+        // Bottom-right handle dragged from (50, 80) to (90, 140), pivot the first corner.
+        let mode = FtMode::Scale { pivot: [0.0, 0.0], axes: [true, true] };
+        let (m, turn) = ft_total(mode, &f, [0.5, 0.5], [50.0, 80.0], [90.0, 140.0], false).unwrap();
+        assert!(near(af_apply(&m, [50.0, 80.0]), [90.0, 140.0]) && near(af_apply(&m, [10.0, 20.0]), [10.0, 20.0]) && turn == 0.0);
+        // Past the pivot: the box flips and the anchor's place in it mirrors.
+        let (m, _) = ft_total(mode, &f, [0.25, 0.5], [50.0, 80.0], [-30.0, 80.0], false).unwrap();
+        assert_eq!(ft_anchor_after(mode, &m, &f, [0.25, 0.5]), [0.75, 0.5]);
+        // Shift on a rotation snaps to 45°.
+        let (_, turn) = ft_total(FtMode::Rotate, &f, [0.5, 0.5], [60.0, 50.0], [30.0, 75.0], true).unwrap();
+        assert_eq!(turn.rem_euclid(45.0), 0.0);
+        assert!(ft_total(FtMode::Anchor, &f, [0.5, 0.5], [0.0; 2], [1.0; 2], false).is_none());
+    }
+
+    /// #912: clicking the last vertex of an open path with the Pen resumes that path.
+    #[test]
+    fn pen_resumes_an_open_path_at_its_last_vertex() {
+        let map = ViewerMap { origin: Pos2::ZERO, zoom: 1.0, comp: [100.0, 100.0], area: Rect::EVERYTHING };
+        let open = info(vec![[10.0, 10.0], [50.0, 10.0], [50.0, 50.0]], false);
+        assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(52.0, 49.0), 8.0), Some((LayerId(3), 7)));
+        assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(10.0, 10.0), 8.0), None, "first vertex");
+        assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(80.0, 80.0), 8.0), None, "far away");
+        let closed = info(vec![[10.0, 10.0], [50.0, 10.0], [50.0, 50.0]], true);
+        assert_eq!(open_end_at(&[closed], &map, egui::pos2(50.0, 50.0), 8.0), None, "closed path");
+    }
+
+    /// The Pen on a motion path: one decision for the pointer, the click and the drag. A key's
+    /// square wins, then a tangent handle (they lie on the line of a straight path), then the
+    /// line itself, which adds a key on the nearest frame that has none; between keys on
+    /// adjacent frames there is nothing to add.
+    #[test]
+    fn pen_target_picks_key_then_handle_then_free_frame() {
+        let (l, p) = (LayerId(1), 7);
+        let fd = Tick::from_seconds_f64(1.0 / 30.0);
+        let t = |f: i64| Tick(fd.0 * f);
+        let key = |f: i64, x: f32, tangent: Option<bool>| KeyHit {
+            layer: l,
+            prop: p,
+            time: t(f),
+            pos: egui::pos2(x, 100.0),
+            tangent,
+            value: [0.0; 3],
+            p2c: Mat3::IDENTITY,
+            curved: true,
+        };
+        // Keys on frames 0, 3 and 4 (20 pt a frame); frame 0's out handle at x = 12.
+        let hits = vec![key(0, 0.0, None), key(0, 12.0, Some(true)), key(3, 60.0, None), key(4, 80.0, None)];
+        let frames: Vec<PathFrame> = (0..=4).map(|f| PathFrame { layer: l, prop: p, time: t(f), pos: egui::pos2(f as f32 * 20.0, 100.0) }).collect();
+        let segments: Vec<MotionSegment> = (0..4)
+            .map(|f| MotionSegment {
+                layer: l,
+                prop: p,
+                from: egui::pos2(f as f32 * 20.0, 100.0),
+                to: egui::pos2(f as f32 * 20.0 + 20.0, 100.0),
+                start: t(f),
+                end: t(f + 1),
+                p2c: Mat3::IDENTITY,
+            })
+            .collect();
+        let at = |x: f32, y: f32| pen_target(&hits, &segments, &frames, egui::pos2(x, y));
+        assert!(matches!(at(1.0, 101.0), PenTarget::Key(k) if k.time == t(0)));
+        assert!(matches!(at(13.0, 100.0), PenTarget::Tangent), "the handle on the line");
+        assert!(matches!(at(19.0, 100.0), PenTarget::AddFrame(f) if f.time == t(1)), "past the handle's reach: nearest frame");
+        assert!(matches!(at(37.0, 100.0), PenTarget::AddFrame(f) if f.time == t(2)), "nearest frame");
+        assert!(matches!(at(70.0, 100.0), PenTarget::PathFull), "keys on adjacent frames");
+        assert!(matches!(at(40.0, 120.0), PenTarget::None), "off the path");
+    }
 }

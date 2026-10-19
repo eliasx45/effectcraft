@@ -215,10 +215,8 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
             o["coverage"] = Value::Array(coverage(&s.project, comp, voice, a, b));
             o["gap"] = json!(gap_list.iter().any(|(x, y)| *x < b && *y > a));
         }
-        if summary {
-            if let Some(m) = o.as_object_mut() {
-                m.remove("tokens");
-            }
+        if summary && let Some(m) = o.as_object_mut() {
+            m.remove("tokens");
         }
         out_lines.push(o);
     }

@@ -253,8 +253,8 @@ pub fn word_at_playhead(app: &EffectcraftApp) -> Option<String> {
         .iter()
         .copied()
         .filter(stressed)
-        .min_by(|a, b| dist(*a).total_cmp(&dist(*b)))
-        .or_else(|| heard.iter().copied().min_by(|a, b| dist(*a).total_cmp(&dist(*b))))?;
+        .min_by(|a, b| dist(a).total_cmp(&dist(b)))
+        .or_else(|| heard.iter().copied().min_by(|a, b| dist(a).total_cmp(&dist(b))))?;
     Some(best.word.clone())
 }
 

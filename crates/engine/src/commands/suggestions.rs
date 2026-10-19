@@ -108,7 +108,7 @@ fn propose(s: &mut Session, p: &Value) -> Result<Value> {
     let layers: Vec<u64> = p.get("layers").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).take(256).collect()).unwrap_or_default();
     let range = p.get("range").and_then(Value::as_array).and_then(|a| {
         let (x, y) = (a.first()?.as_f64()?, a.get(1)?.as_f64()?);
-        (x.is_finite() && y.is_finite()).then(|| if x <= y { [x, y] } else { [y, x] })
+        (x.is_finite() && y.is_finite()).then_some(if x <= y { [x, y] } else { [y, x] })
     });
     let comp = match p.get("comp") {
         Some(v) if !v.is_null() => Some(s.resolve_comp(Some(v)).map_err(|e| bad(cmd, e.to_string()))?.0),

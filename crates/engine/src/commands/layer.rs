@@ -949,18 +949,18 @@ fn set_parent(s: &mut Session, p: &Value) -> Result<Value> {
     // Several layers (the pick whip or Parent menu on a selection): as in AE, the parent itself and
     // the layers it descends from are skipped rather than failing the whole edit. One layer, or a
     // set that is all skipped, still reports the cycle below.
-    if ids.len() > 1 {
-        if let Some(par) = parent {
-            let mut skip = vec![par];
-            let mut cur = comp.layer(par).and_then(|l| l.parent);
-            while let Some(id) = cur.filter(|id| !skip.contains(id) && skip.len() < 4096) {
-                skip.push(id);
-                cur = comp.layer(id).and_then(|l| l.parent);
-            }
-            let kept: Vec<LayerId> = ids.iter().copied().filter(|id| !skip.contains(id)).collect();
-            if !kept.is_empty() {
-                ids = kept;
-            }
+    if ids.len() > 1
+        && let Some(par) = parent
+    {
+        let mut skip = vec![par];
+        let mut cur = comp.layer(par).and_then(|l| l.parent);
+        while let Some(id) = cur.filter(|id| !skip.contains(id) && skip.len() < 4096) {
+            skip.push(id);
+            cur = comp.layer(id).and_then(|l| l.parent);
+        }
+        let kept: Vec<LayerId> = ids.iter().copied().filter(|id| !skip.contains(id)).collect();
+        if !kept.is_empty() {
+            ids = kept;
         }
     }
     // A loaded cycle need not include a selected child. Validate before compensation or edit;
@@ -1294,10 +1294,10 @@ fn precompose(s: &mut Session, p: &Value) -> Result<Value> {
         for l in &mut layers {
             if let Some(p) = l.parent.filter(|p| !ids.contains(p)) {
                 l.parent = link(p);
-                if l.parent.is_none() {
-                    if let Some(f) = fixes.iter().find(|f| f.layer == l.id) {
-                        f.apply(l);
-                    }
+                if l.parent.is_none()
+                    && let Some(f) = fixes.iter().find(|f| f.layer == l.id)
+                {
+                    f.apply(l);
                 }
             }
             if l.track_matte.is_some_and(|m| !ids.contains(&m.layer)) {

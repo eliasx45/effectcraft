@@ -68,12 +68,12 @@ pub fn parse(url: &str) -> Option<Link> {
     // Handles: letters, digits, `_` and `.` (glow.with.valentina).
     let ok_handle = |c: &str| !c.is_empty() && !c.starts_with('.') && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.');
     match segs.as_slice() {
-        [kind @ ("reel" | "reels" | "p" | "tv"), code, ..] if ok_code(*code) => {
+        [kind @ ("reel" | "reels" | "p" | "tv"), code, ..] if ok_code(code) => {
             Some(Link::Post { code: code.to_string(), reel: matches!(*kind, "reel" | "reels" | "tv") })
         }
         // instagram.com/<handle>/reel/<code> (shared from a profile grid)
-        [_, kind @ ("reel" | "p"), code, ..] if ok_code(*code) => Some(Link::Post { code: code.to_string(), reel: *kind == "reel" }),
-        [handle, ..] if ok_handle(*handle) && handle.len() <= 30 && !NOT_PROFILES.contains(handle) && !matches!(*handle, "reel" | "p" | "tv") => {
+        [_, kind @ ("reel" | "p"), code, ..] if ok_code(code) => Some(Link::Post { code: code.to_string(), reel: *kind == "reel" }),
+        [handle, ..] if ok_handle(handle) && handle.len() <= 30 && !NOT_PROFILES.contains(handle) && !matches!(*handle, "reel" | "p" | "tv") => {
             Some(Link::Profile { handle: handle.to_string() })
         }
         _ => None,

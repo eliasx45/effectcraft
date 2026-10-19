@@ -1299,182 +1299,6 @@ pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn colours_parse_to_six_digits() {
-        assert_eq!(hex6("#FFF").as_deref(), Some("#ffffff"));
-        assert_eq!(hex6(" 1C8CFF ").as_deref(), Some("#1c8cff"));
-        assert_eq!(hex6("#12345"), None);
-        assert_eq!(hex6("red"), None);
-        assert_eq!(hex6("#ééé"), None);
-        assert_eq!(rgb_of("#ff0000"), [1.0, 0.0, 0.0]);
-        assert_eq!(rgb_of("nope"), [1.0; 3]);
-        for c in shuffled_colors() {
-            assert_eq!(hex6(&c).as_deref(), Some(c.as_str()));
-        }
-    }
-
-    /// Regression (19 Oct): with Opacity keys selected and the dropdown left on Position, Apply
-    /// spring bounced Position ("Nothing to bounce: … › Position (needs 2 keyframes)"). Selected
-    /// keys now win: the plug gets `selected` and springs the keys' own properties.
-    #[test]
-    fn bounce_springs_the_selected_keys_not_the_dropdown_property() {
-        let mut s = effectcraft_engine::Session::default();
-        s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
-        let l = s.execute("layer.newSolid", json!({"name": "Tag", "width": 10, "height": 10})).unwrap()["layer"].as_u64().unwrap();
-        for (t, v) in [(0.0, 0.0), (0.5, 100.0), (1.0, 80.0)] {
-            s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "time": t, "value": v})).unwrap();
-        }
-        let set = ToolSettings::default();
-        assert_eq!(set.property, "position");
-        assert!(keyed_props(&s).is_empty(), "no keys selected yet");
-        let keys: Vec<Value> = [0.0, 0.5, 1.0].iter().map(|t| json!({"layer": l, "path": "transform/opacity", "time": t})).collect();
-        s.execute("keys.select", json!({"keys": keys})).unwrap();
-        let keyed = keyed_props(&s);
-        assert_eq!(keyed, vec!["Opacity".to_string()]);
-        let b = build("bounce", &json!({}), &set, &keyed).unwrap();
-        assert_eq!(
-            b.plan,
-            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "selected", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
-        );
-        let b = build("bounce", &json!({"mode": "remove"}), &set, &keyed).unwrap();
-        assert_eq!(b.plan, Plan::Plug { op: "toolkit_bounce", args: json!({"property": "selected", "mode": "remove"}) });
-        // An explicit property still wins, and `selected` can be asked for by name.
-        let b = build("bounce", &json!({"property": "scale"}), &set, &keyed).unwrap();
-        assert_eq!(
-            b.plan,
-            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "scale", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
-        );
-        assert!(build("bounce", &json!({"property": "selected"}), &set, &[]).is_ok());
-    }
-
-    #[test]
-    fn tools_take_the_panel_values_and_check_their_arguments() {
-        let set = ToolSettings::default();
-        let b = build("bounce", &json!({}), &set, &[]).unwrap();
-        assert_eq!(b.section, BOUNCE);
-        assert_eq!(
-            b.plan,
-            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "position", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
-        );
-        let b = build("bounce", &json!({"mode": "remove", "property": "scale"}), &set, &[]).unwrap();
-        assert_eq!(b.plan, Plan::Plug { op: "toolkit_bounce", args: json!({"property": "scale", "mode": "remove"}) });
-        assert!(build("bounce", &json!({"strength": 201}), &set, &[]).unwrap_err().contains("strength must be between 0 and 200"));
-        assert!(build("bounce", &json!({"frequency": 0}), &set, &[]).is_err());
-        assert!(build("bounce", &json!({"decay": "fast"}), &set, &[]).is_err());
-        assert!(build("bounce", &json!({"property": "skew"}), &set, &[]).is_err());
-
-        let b = build("anchor", &json!({"at": "bottomRight"}), &set, &[]).unwrap();
-        assert_eq!(b.plan, Plan::Plug { op: "toolkit_anchor", args: json!({"x": 1.0, "y": 1.0}) });
-        let b = build("anchor", &json!({"x": 0.0}), &set, &[]).unwrap();
-        assert_eq!(b.plan, Plan::Plug { op: "toolkit_anchor", args: json!({"x": 0.0, "y": 0.5}) });
-        assert!(build("anchor", &json!({"at": "middle"}), &set, &[]).is_err());
-        assert!(build("anchor", &json!({"x": 1.5}), &set, &[]).is_err());
-
-        let b = build("create", &json!({"kind": "solid", "color": "#F00"}), &set, &[]).unwrap();
-        assert_eq!(b.plan, Plan::Native { cmd: "layer.newSolid", args: json!({"color": "#ff0000"}) });
-        assert!(build("create", &json!({"kind": "camera"}), &set, &[]).is_err());
-        let b = build("fill", &json!({}), &set, &[]).unwrap();
-        assert_eq!(b.plan, Plan::Plug { op: "toolkit_style", args: json!({"kind": "fill", "colors": ["#ffffff", "#ffffff", "#ffffff", "#ffffff"]}) });
-
-        let b = build("style", &json!({"kind": "four", "animate": true}), &set, &[]).unwrap();
-        assert_eq!(b.section, COLOUR);
-        assert_eq!(b.plan, Plan::Plug { op: "toolkit_style", args: json!({"kind": "four", "colors": DEFAULT_COLORS, "duration": 2.0, "animate": true}) });
-        assert!(build("style", &json!({"colors": ["#fff"]}), &set, &[]).is_err());
-        assert!(build("style", &json!({"colors": ["#fff", "#000", "#123456", "blue"]}), &set, &[]).is_err());
-        assert!(build("style", &json!({"duration": 0.01}), &set, &[]).is_err());
-        assert!(build("style", &json!({"kind": "plaid"}), &set, &[]).is_err());
-
-        let b = build("precompGroups", &json!({"count": 3, "name": "  "}), &set, &[]).unwrap();
-        assert_eq!(b.plan, Plan::Native { cmd: "layer.multiPrecompose", args: json!({"name": "Precomp", "count": 3}) });
-        assert!(build("precompGroups", &json!({"count": 2.5}), &set, &[]).is_err());
-        assert!(build("precompGroups", &json!({"count": 0}), &set, &[]).is_err());
-        assert!(build("precompGroups", &json!({"count": 257}), &set, &[]).is_err());
-        assert_eq!(build("purge", &json!({}), &set, &[]).unwrap().plan, Plan::Native { cmd: "edit.purge", args: json!({"what": "memory"}) });
-        assert!(build("explode", &json!({}), &set, &[]).is_err());
-    }
-
-    #[test]
-    fn text_split_needs_a_phrase_only_to_isolate_one() {
-        let mut set = ToolSettings::default();
-        let b = build("split", &json!({"reverse": true}), &set, &[]).unwrap();
-        assert_eq!(b.plan, Plan::Native { cmd: "text.split", args: json!({"mode": "words", "text": "", "reverse": true, "deleteOriginal": false}) });
-        assert!(build("split", &json!({"mode": "custom"}), &set, &[]).is_err());
-        set.split_text = "Hello".into();
-        let b = build("split", &json!({"mode": "custom"}), &set, &[]).unwrap();
-        assert_eq!(b.plan, Plan::Native { cmd: "text.split", args: json!({"mode": "custom", "text": "Hello", "reverse": false, "deleteOriginal": false}) });
-        assert!(build("split", &json!({"mode": "sentences"}), &set, &[]).is_err());
-        assert!(build("split", &json!({"mode": "custom", "text": "x".repeat(1025)}), &set, &[]).is_err());
-    }
-
-    #[test]
-    fn images_come_from_a_path_data_a_dialog_or_the_clipboard() {
-        let set = ToolSettings::default();
-        let src = |p: Value| match build("image", &p, &set, &[]).unwrap().plan {
-            Plan::Image(s) => s,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(src(json!({})), ImageSource::Clipboard);
-        assert_eq!(src(json!({"dialog": true})), ImageSource::Dialog);
-        assert_eq!(src(json!({"path": "/a.png"})), ImageSource::Path("/a.png".into()));
-        assert_eq!(src(json!({"png": "iVBO"})), ImageSource::Png("iVBO".into()));
-        assert!(build("image", &json!({"png": "A".repeat(7_000_001)}), &set, &[]).is_err());
-        assert!(check_png(b"\x89PNG\r\n\x1a\nrest").is_ok());
-        assert!(check_png(b"GIF89a").is_err());
-        assert!(read_png("/definitely/not/here.png").is_err());
-    }
-
-    #[test]
-    fn settings_patch_checks_every_field() {
-        let set = ToolSettings::default();
-        let patch = |v: Value| patched(&set, v.as_object().unwrap());
-        let next = patch(json!({"op": "settings", "strength": 40, "colors": ["#FFF", "#000000", "#123", "#abcdef"], "collapsed": []})).unwrap();
-        assert_eq!(next.strength, 40.0);
-        assert_eq!(next.colors[0], "#ffffff");
-        assert_eq!(next.colors[2], "#112233");
-        assert!(!next.is_collapsed(BOUNCE));
-        assert!(patch(json!({"strength": 500})).is_err());
-        assert!(patch(json!({"color": "white"})).is_err());
-        assert!(patch(json!({"colors": ["#fff"]})).is_err());
-        assert!(patch(json!({"splitMode": "regex"})).is_err());
-        assert!(patch(json!({"collapsed": ["curves"]})).is_err());
-        assert!(patch(json!({"wobble": 1})).is_err());
-        assert!(patch(json!({"count": -1})).is_err());
-        // The defaults are valid, and round-trip.
-        let mut d = ToolSettings::default();
-        d.validate().unwrap();
-        let back: ToolSettings = serde_json::from_value(serde_json::to_value(&d).unwrap()).unwrap();
-        assert_eq!(back, d);
-    }
-
-    #[test]
-    fn sections_fold_independently() {
-        let mut set = ToolSettings::default();
-        assert!(!set.is_collapsed(WORKFLOW) && set.is_collapsed(TEXT));
-        set.set_collapsed(TEXT, false);
-        set.set_collapsed(WORKFLOW, true);
-        set.set_collapsed(WORKFLOW, true);
-        assert!(set.is_collapsed(WORKFLOW) && !set.is_collapsed(TEXT) && set.is_collapsed(BOUNCE));
-        assert_eq!(set.collapsed.iter().filter(|c| *c == "workflow").count(), 1);
-        set.set_collapsed(9, true);
-        assert!(!set.is_collapsed(9));
-    }
-
-    #[test]
-    fn messages_drop_the_reminders() {
-        assert_eq!(
-            result_message(&json!({"message": "Applied overshoot after the last keyframe. Original keyframes kept."})),
-            "Applied overshoot after the last keyframe."
-        );
-        assert_eq!(result_message(&json!({"message": "Created null layer. Undo with Cmd+Z."})), "Created null layer.");
-        assert_eq!(result_message(&json!({})), "Done.");
-        assert_eq!(native_message("gradientLock", &json!({}), &json!({"locked": 2, "already": 1})), "Gradient lock: 2 locked, 1 already.");
-    }
-}
-
 // ── Style families (batch 1, CX3) ──────────────────────────────────────────────────────────────
 
 /// The Motion Library's Families tab: every style family of the project (`style.family.list`)
@@ -1659,5 +1483,181 @@ fn text_animations(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Cont
             },
             None => app.ui.status = "Select the workshop layer to save (Creating Text Presets)".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colours_parse_to_six_digits() {
+        assert_eq!(hex6("#FFF").as_deref(), Some("#ffffff"));
+        assert_eq!(hex6(" 1C8CFF ").as_deref(), Some("#1c8cff"));
+        assert_eq!(hex6("#12345"), None);
+        assert_eq!(hex6("red"), None);
+        assert_eq!(hex6("#ééé"), None);
+        assert_eq!(rgb_of("#ff0000"), [1.0, 0.0, 0.0]);
+        assert_eq!(rgb_of("nope"), [1.0; 3]);
+        for c in shuffled_colors() {
+            assert_eq!(hex6(&c).as_deref(), Some(c.as_str()));
+        }
+    }
+
+    /// Regression (19 Oct): with Opacity keys selected and the dropdown left on Position, Apply
+    /// spring bounced Position ("Nothing to bounce: … › Position (needs 2 keyframes)"). Selected
+    /// keys now win: the plug gets `selected` and springs the keys' own properties.
+    #[test]
+    fn bounce_springs_the_selected_keys_not_the_dropdown_property() {
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+        let l = s.execute("layer.newSolid", json!({"name": "Tag", "width": 10, "height": 10})).unwrap()["layer"].as_u64().unwrap();
+        for (t, v) in [(0.0, 0.0), (0.5, 100.0), (1.0, 80.0)] {
+            s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "time": t, "value": v})).unwrap();
+        }
+        let set = ToolSettings::default();
+        assert_eq!(set.property, "position");
+        assert!(keyed_props(&s).is_empty(), "no keys selected yet");
+        let keys: Vec<Value> = [0.0, 0.5, 1.0].iter().map(|t| json!({"layer": l, "path": "transform/opacity", "time": t})).collect();
+        s.execute("keys.select", json!({"keys": keys})).unwrap();
+        let keyed = keyed_props(&s);
+        assert_eq!(keyed, vec!["Opacity".to_string()]);
+        let b = build("bounce", &json!({}), &set, &keyed).unwrap();
+        assert_eq!(
+            b.plan,
+            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "selected", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
+        );
+        let b = build("bounce", &json!({"mode": "remove"}), &set, &keyed).unwrap();
+        assert_eq!(b.plan, Plan::Plug { op: "toolkit_bounce", args: json!({"property": "selected", "mode": "remove"}) });
+        // An explicit property still wins, and `selected` can be asked for by name.
+        let b = build("bounce", &json!({"property": "scale"}), &set, &keyed).unwrap();
+        assert_eq!(
+            b.plan,
+            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "scale", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
+        );
+        assert!(build("bounce", &json!({"property": "selected"}), &set, &[]).is_ok());
+    }
+
+    #[test]
+    fn tools_take_the_panel_values_and_check_their_arguments() {
+        let set = ToolSettings::default();
+        let b = build("bounce", &json!({}), &set, &[]).unwrap();
+        assert_eq!(b.section, BOUNCE);
+        assert_eq!(
+            b.plan,
+            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "position", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
+        );
+        let b = build("bounce", &json!({"mode": "remove", "property": "scale"}), &set, &[]).unwrap();
+        assert_eq!(b.plan, Plan::Plug { op: "toolkit_bounce", args: json!({"property": "scale", "mode": "remove"}) });
+        assert!(build("bounce", &json!({"strength": 201}), &set, &[]).unwrap_err().contains("strength must be between 0 and 200"));
+        assert!(build("bounce", &json!({"frequency": 0}), &set, &[]).is_err());
+        assert!(build("bounce", &json!({"decay": "fast"}), &set, &[]).is_err());
+        assert!(build("bounce", &json!({"property": "skew"}), &set, &[]).is_err());
+
+        let b = build("anchor", &json!({"at": "bottomRight"}), &set, &[]).unwrap();
+        assert_eq!(b.plan, Plan::Plug { op: "toolkit_anchor", args: json!({"x": 1.0, "y": 1.0}) });
+        let b = build("anchor", &json!({"x": 0.0}), &set, &[]).unwrap();
+        assert_eq!(b.plan, Plan::Plug { op: "toolkit_anchor", args: json!({"x": 0.0, "y": 0.5}) });
+        assert!(build("anchor", &json!({"at": "middle"}), &set, &[]).is_err());
+        assert!(build("anchor", &json!({"x": 1.5}), &set, &[]).is_err());
+
+        let b = build("create", &json!({"kind": "solid", "color": "#F00"}), &set, &[]).unwrap();
+        assert_eq!(b.plan, Plan::Native { cmd: "layer.newSolid", args: json!({"color": "#ff0000"}) });
+        assert!(build("create", &json!({"kind": "camera"}), &set, &[]).is_err());
+        let b = build("fill", &json!({}), &set, &[]).unwrap();
+        assert_eq!(b.plan, Plan::Plug { op: "toolkit_style", args: json!({"kind": "fill", "colors": ["#ffffff", "#ffffff", "#ffffff", "#ffffff"]}) });
+
+        let b = build("style", &json!({"kind": "four", "animate": true}), &set, &[]).unwrap();
+        assert_eq!(b.section, COLOUR);
+        assert_eq!(b.plan, Plan::Plug { op: "toolkit_style", args: json!({"kind": "four", "colors": DEFAULT_COLORS, "duration": 2.0, "animate": true}) });
+        assert!(build("style", &json!({"colors": ["#fff"]}), &set, &[]).is_err());
+        assert!(build("style", &json!({"colors": ["#fff", "#000", "#123456", "blue"]}), &set, &[]).is_err());
+        assert!(build("style", &json!({"duration": 0.01}), &set, &[]).is_err());
+        assert!(build("style", &json!({"kind": "plaid"}), &set, &[]).is_err());
+
+        let b = build("precompGroups", &json!({"count": 3, "name": "  "}), &set, &[]).unwrap();
+        assert_eq!(b.plan, Plan::Native { cmd: "layer.multiPrecompose", args: json!({"name": "Precomp", "count": 3}) });
+        assert!(build("precompGroups", &json!({"count": 2.5}), &set, &[]).is_err());
+        assert!(build("precompGroups", &json!({"count": 0}), &set, &[]).is_err());
+        assert!(build("precompGroups", &json!({"count": 257}), &set, &[]).is_err());
+        assert_eq!(build("purge", &json!({}), &set, &[]).unwrap().plan, Plan::Native { cmd: "edit.purge", args: json!({"what": "memory"}) });
+        assert!(build("explode", &json!({}), &set, &[]).is_err());
+    }
+
+    #[test]
+    fn text_split_needs_a_phrase_only_to_isolate_one() {
+        let mut set = ToolSettings::default();
+        let b = build("split", &json!({"reverse": true}), &set, &[]).unwrap();
+        assert_eq!(b.plan, Plan::Native { cmd: "text.split", args: json!({"mode": "words", "text": "", "reverse": true, "deleteOriginal": false}) });
+        assert!(build("split", &json!({"mode": "custom"}), &set, &[]).is_err());
+        set.split_text = "Hello".into();
+        let b = build("split", &json!({"mode": "custom"}), &set, &[]).unwrap();
+        assert_eq!(b.plan, Plan::Native { cmd: "text.split", args: json!({"mode": "custom", "text": "Hello", "reverse": false, "deleteOriginal": false}) });
+        assert!(build("split", &json!({"mode": "sentences"}), &set, &[]).is_err());
+        assert!(build("split", &json!({"mode": "custom", "text": "x".repeat(1025)}), &set, &[]).is_err());
+    }
+
+    #[test]
+    fn images_come_from_a_path_data_a_dialog_or_the_clipboard() {
+        let set = ToolSettings::default();
+        let src = |p: Value| match build("image", &p, &set, &[]).unwrap().plan {
+            Plan::Image(s) => s,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(src(json!({})), ImageSource::Clipboard);
+        assert_eq!(src(json!({"dialog": true})), ImageSource::Dialog);
+        assert_eq!(src(json!({"path": "/a.png"})), ImageSource::Path("/a.png".into()));
+        assert_eq!(src(json!({"png": "iVBO"})), ImageSource::Png("iVBO".into()));
+        assert!(build("image", &json!({"png": "A".repeat(7_000_001)}), &set, &[]).is_err());
+        assert!(check_png(b"\x89PNG\r\n\x1a\nrest").is_ok());
+        assert!(check_png(b"GIF89a").is_err());
+        assert!(read_png("/definitely/not/here.png").is_err());
+    }
+
+    #[test]
+    fn settings_patch_checks_every_field() {
+        let set = ToolSettings::default();
+        let patch = |v: Value| patched(&set, v.as_object().unwrap());
+        let next = patch(json!({"op": "settings", "strength": 40, "colors": ["#FFF", "#000000", "#123", "#abcdef"], "collapsed": []})).unwrap();
+        assert_eq!(next.strength, 40.0);
+        assert_eq!(next.colors[0], "#ffffff");
+        assert_eq!(next.colors[2], "#112233");
+        assert!(!next.is_collapsed(BOUNCE));
+        assert!(patch(json!({"strength": 500})).is_err());
+        assert!(patch(json!({"color": "white"})).is_err());
+        assert!(patch(json!({"colors": ["#fff"]})).is_err());
+        assert!(patch(json!({"splitMode": "regex"})).is_err());
+        assert!(patch(json!({"collapsed": ["curves"]})).is_err());
+        assert!(patch(json!({"wobble": 1})).is_err());
+        assert!(patch(json!({"count": -1})).is_err());
+        // The defaults are valid, and round-trip.
+        let mut d = ToolSettings::default();
+        d.validate().unwrap();
+        let back: ToolSettings = serde_json::from_value(serde_json::to_value(&d).unwrap()).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn sections_fold_independently() {
+        let mut set = ToolSettings::default();
+        assert!(!set.is_collapsed(WORKFLOW) && set.is_collapsed(TEXT));
+        set.set_collapsed(TEXT, false);
+        set.set_collapsed(WORKFLOW, true);
+        set.set_collapsed(WORKFLOW, true);
+        assert!(set.is_collapsed(WORKFLOW) && !set.is_collapsed(TEXT) && set.is_collapsed(BOUNCE));
+        assert_eq!(set.collapsed.iter().filter(|c| *c == "workflow").count(), 1);
+        set.set_collapsed(9, true);
+        assert!(!set.is_collapsed(9));
+    }
+
+    #[test]
+    fn messages_drop_the_reminders() {
+        assert_eq!(
+            result_message(&json!({"message": "Applied overshoot after the last keyframe. Original keyframes kept."})),
+            "Applied overshoot after the last keyframe."
+        );
+        assert_eq!(result_message(&json!({"message": "Created null layer. Undo with Cmd+Z."})), "Created null layer.");
+        assert_eq!(result_message(&json!({})), "Done.");
+        assert_eq!(native_message("gradientLock", &json!({}), &json!({"locked": 2, "already": 1})), "Gradient lock: 2 locked, 1 already.");
     }
 }

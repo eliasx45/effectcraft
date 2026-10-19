@@ -163,9 +163,9 @@ fn cascade(s: &mut Session, p: &Value) -> Result<Value> {
         for (j, lid) in order.iter().enumerate() {
             let Some(l) = comp.layer_mut(*lid) else { continue };
             let d = Tick(fd.0.saturating_mul(frames.saturating_mul(j as i64)));
-            l.start_time = l.start_time + d;
-            l.in_point = l.in_point + d;
-            l.out_point = l.out_point + d;
+            l.start_time += d;
+            l.in_point += d;
+            l.out_point += d;
             done.push(json!({"layer": lid.0, "offsetFrames": frames.saturating_mul(j as i64)}));
         }
         Ok(done)
