@@ -125,6 +125,7 @@ const LIGHT_BYTES: usize = 6 * 16;
 
 /// Composite a prepared Classic 3D run over `canvas`. `None` when it cannot run here (the
 /// caller draws it on the CPU).
+#[cfg(test)]
 pub(crate) fn draw_run(e: &mut Enc, run: &Run3d, canvas: &GpuImage) -> Option<GpuImage> {
     draw_run_made(e, run, canvas, &HashMap::new())
 }
