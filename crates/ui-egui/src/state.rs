@@ -518,6 +518,9 @@ pub struct TimelineState {
     /// A scroll asked for by a shortcut (D, X), done when the Timeline is next drawn.
     #[serde(skip)]
     pub scroll_to: Option<ScrollTo>,
+    /// Batch 1 (AX5): the quick-button row above the layers (pins, Fast In pick, find box).
+    #[serde(default)]
+    pub quick_row: crate::panels::quick_row::QuickRowState,
 }
 
 pub fn default_tl_columns() -> BTreeSet<String> {
@@ -577,6 +580,7 @@ impl Default for TimelineState {
             column_order: Vec::new(),
             column_widths: BTreeMap::new(),
             scroll_to: None,
+            quick_row: Default::default(),
         }
     }
 }

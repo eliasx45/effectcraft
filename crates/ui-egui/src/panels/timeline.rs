@@ -1331,6 +1331,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         return;
     };
     let Some(comp) = app.session.project.comp_arc(cid) else { return };
+    // Batch 1 (AX5/AX7): the quick-button row and Find word box take a strip at the top.
+    let rect = super::quick_row::show(app, ui, rect);
     let freeze_badges = super::smart_freeze::timeline_badges(app, cid);
     let p = ui.painter().clone();
     let time = app.session.time();
