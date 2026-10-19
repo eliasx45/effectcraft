@@ -1219,6 +1219,7 @@ Window
   Progress | window.panel {"panel":"progress"}
   Smart Freeze | window.panel {"panel":"smartFreeze"}
   Properties | window.panel {"panel":"properties"}
+  Script | window.panel {"panel":"script"}
   Script Console | window.panel {"panel":"scriptConsole"}
   Smoother | window.panel {"panel":"smoother"}
   Tools | window.panel {"panel":"tools"} | Cmd+1
