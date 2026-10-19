@@ -3214,6 +3214,24 @@ impl<'g> Enc<'g> {
         out
     }
 
+    /// Copy the `w` × `h` region of `src` at (`x`, `y`) into `out` at (`dx`, `dy`) (the caller
+    /// checks that both lie inside their images).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn copy_region_to(&mut self, src: &GpuImage, out: &GpuImage, x: u32, y: u32, w: u32, h: u32, dx: u32, dy: u32) {
+        self.timed("copy", |enc| {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &out.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: dx, y: dy, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            )
+        });
+    }
+
     /// Copy the `w` × `h` region of `src` at (`x`, `y`) to the top-left of `out`.
     pub(crate) fn copy_region(&mut self, src: &GpuImage, out: &GpuImage, x: u32, y: u32, w: u32, h: u32) {
         self.timed("copy", |enc| {

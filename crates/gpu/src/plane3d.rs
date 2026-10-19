@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use effectcraft_effects::Buf;
 use effectcraft_project::{Layer, LayerSource};
 use effectcraft_raster::Image;
 use effectcraft_render::three_d::{PlaneBufs, plane_key};
-use effectcraft_effects::Buf;
 use effectcraft_render::{EvalCtx, Renderer, styles};
 
 use crate::context::{Enc, GpuImage, Params};
@@ -74,9 +74,14 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Option<(Buf
         return None;
     }
     let [x0, y0, x1, y1] = prep.region;
-    let padded = e.zeros(prep.shape.img.width, prep.shape.img.height);
-    let part = e.crop(&img, x0, y0, x1 - x0, y1 - y0);
-    e.copy_into(&part, &padded, prep.pad, prep.pad);
+    let (pw, ph) = (prep.shape.img.width, prep.shape.img.height);
+    if !e.g.fits(pw, ph) || x1 > img.width || y1 > img.height || x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    // A fresh zeroed image of its own: `Enc::zeros` is shared and must never be written.
+    let padded = e.image(pw, ph);
+    e.copy_region_to(&img, &padded, x0, y0, x1 - x0, y1 - y0, prep.pad, prep.pad);
+    drop(img);
     let st = crate::fx_styles::render(e, &padded, &prep.plan)?;
     finish(e, prep.shape, st.body)
 }
