@@ -7,8 +7,9 @@
 //! width (8.6 % by default). Because the layer stays the same layer, its keys, effects, parent and
 //! timing stay as they are, and `link.paste` / `layer.replaceSource` only swap its pixels.
 //!
-//! **No outline or stroke on cards** (Elias, 19 Oct 2026): nothing here adds a Stroke style or a
-//! border.
+//! **Devin's hairline** (Elias, 19 Oct 2026, SYSTEM.md "Post/reel cards"): every card gets a
+//! Stroke layer style of 1 px on screen, white at 32 % opacity, inside the card's edge
+//! ([`put_hairline`]). Only thick solid strokes (the old 3 px white rim) are banned.
 //!
 //! - `card.make {layers?, style?}`: pictures become cards (cards are restyled).
 //! - `card.style {layers?, style}`: restyle cards.
@@ -18,6 +19,7 @@
 
 use effectcraft_keyframe::{ShapePath, Value as KV};
 use effectcraft_project::build::Ids;
+use effectcraft_project::styles::{self as layer_styles, GlobalLight};
 use effectcraft_project::{ItemId, Layer, LayerId, MaskMode, Node, PropGroup, build};
 use serde_json::{Value, json};
 
@@ -69,6 +71,10 @@ const BUILTIN: [(&str, &str, [f64; 2], f64); 6] = [
     ("sharp", "Sharp", [2.0, 3.0], 0.0),
 ];
 
+/// The hairline's opacity (percent) and width on screen (px): Devin's 1 px white at ~32 %.
+pub const HAIRLINE_OPACITY: f64 = 32.0;
+pub const HAIRLINE_PX: f64 = 1.0;
+
 /// Most saved styles kept (the wheel shows at most 16 slices).
 const MAX_SAVED: usize = 8;
 
@@ -90,8 +96,10 @@ fn saved_styles(s: &Session) -> Vec<CardStyle> {
 
 /// Every style, built-in first.
 pub fn styles(s: &Session) -> Vec<CardStyle> {
-    let mut out: Vec<CardStyle> =
-        BUILTIN.iter().map(|(id, label, aspect, radius)| CardStyle { id: id.to_string(), label: label.to_string(), aspect: *aspect, radius: *radius, saved: false }).collect();
+    let mut out: Vec<CardStyle> = BUILTIN
+        .iter()
+        .map(|(id, label, aspect, radius)| CardStyle { id: id.to_string(), label: label.to_string(), aspect: *aspect, radius: *radius, saved: false })
+        .collect();
     out.extend(saved_styles(s));
     out
 }
@@ -178,6 +186,42 @@ pub(crate) fn put_card_mask(l: &mut Layer, next: &mut u64, size: (f64, f64), st:
     Ok(true)
 }
 
+/// Give the card `l` its hairline: a Stroke layer style, white, [`HAIRLINE_OPACITY`] %, inside,
+/// [`HAIRLINE_PX`] on screen (its size divided by the layer's own scale; a parent's scale or the
+/// viewer zoom aren't counted). A card that already has a Stroke keeps it as the user set it.
+/// False when the layer can't take layer styles.
+// TODO(batch1-verify): the renderer strokes the layer's alpha after its masks (the card's rounded
+// edge), as After Effects does; check a card with a hairline in the viewer.
+pub(crate) fn put_hairline(l: &mut Layer, next: &mut u64, gl: &GlobalLight) -> bool {
+    let had = l.layer_styles().and_then(|g| g.sub("stroke")).is_some();
+    let scale = l
+        .props
+        .prop("transform/scale")
+        .and_then(|p| p.value.components().first().copied())
+        .map(f64::abs)
+        .filter(|v| v.is_finite() && *v > 1e-6)
+        .unwrap_or(100.0);
+    let Some(uid) = layer_styles::add_style(l, &mut Ids(&mut *next), "stroke", gl, true) else { return false };
+    if had {
+        return true;
+    }
+    let Some(g) = l.props.find_group_mut(uid) else { return false };
+    if let Some(p) = g.get_mut("color") {
+        p.value = KV::Color([1.0, 1.0, 1.0, 1.0]);
+    }
+    if let Some(p) = g.get_mut("size") {
+        p.value = KV::Scalar((HAIRLINE_PX * 100.0 / scale).clamp(0.25, 250.0));
+    }
+    if let Some(p) = g.get_mut("opacity") {
+        p.value = KV::Scalar(HAIRLINE_OPACITY);
+    }
+    // STROKE_POSITION: Outside, Inside, Center.
+    if let Some(p) = g.get_mut("position") {
+        p.value = KV::Enum(1);
+    }
+    true
+}
+
 /// Multiply a layer's Scale (its value and every key) by `ratio`: the card keeps its size on
 /// screen when its picture changes size.
 pub(crate) fn scale_layer(l: &mut Layer, ratio: f64) {
@@ -204,6 +248,7 @@ fn apply(s: &mut Session, cid: ItemId, ids: &[LayerId], st: &CardStyle, label: &
     let st2 = st.clone();
     let cmd_s = cmd.to_string();
     let done = s.edit(label, None, |proj, _| {
+        let gl = proj.comp(cid).ok_or(EngineError::NoComp)?.global_light.clone();
         let mut next = proj.next_id;
         let mut cards = vec![];
         let mut skipped = vec![];
@@ -211,7 +256,10 @@ fn apply(s: &mut Session, cid: ItemId, ids: &[LayerId], st: &CardStyle, label: &
             let l = layer_mut(proj, cid, *lid)?;
             let n = l.masks().map(|m| m.children.len()).unwrap_or(0);
             match put_card_mask(l, &mut next, *size, &st2, crate::prefs::mask_color(cycle, n)) {
-                Ok(true) => cards.push(json!({"layer": lid.0, "name": l.name, "style": st2.id})),
+                Ok(true) => {
+                    let hairline = put_hairline(l, &mut next, &gl);
+                    cards.push(json!({"layer": lid.0, "name": l.name, "style": st2.id, "hairline": hairline}));
+                }
                 Ok(false) => skipped.push(json!({"layer": lid.0, "why": "this layer can't have masks"})),
                 Err(why) => skipped.push(json!({"layer": lid.0, "why": why})),
             }
@@ -324,7 +372,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Make Card",
             [],
             None,
-            "{layers?, style?: devin|reel|post|square|round|sharp or a saved style's id or name (default devin: 2:3, corners 8.6 % of the width)} → {cards: [{layer, name, style}], skipped: [{layer, why}], style}: each picture becomes a card (a rounded mask of the card's aspect, centred, no outline); keys, effects and timing stay; one undo step",
+            "{layers?, style?: devin|reel|post|square|round|sharp or a saved style's id or name (default devin: 2:3, corners 8.6 % of the width)} → {cards: [{layer, name, style, hairline}], skipped: [{layer, why}], style}: each picture becomes a card (a rounded mask of the card's aspect, centred, with Devin's hairline: a Stroke layer style, 1 px on screen, white 32 %, inside; never a thick stroke); keys, effects and timing stay; one undo step",
             has_layers,
             make
         ),

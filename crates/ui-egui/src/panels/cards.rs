@@ -4,6 +4,9 @@
 //! Picking a style runs `card.make` (pictures become cards, cards are restyled) or `card.style`
 //! (every selected layer is a card already); "+ Save mine" runs `card.saveStyle`.
 //!
+//! Every style gets Devin's hairline (1 px on screen, white 32 %, a Stroke layer style that
+//! `card.make` adds); never a thick stroke.
+//!
 //! Everything is a command, so agents use `card.make {layers, style}` directly.
 //!
 //! ⌘V link paste (CX2): with a layer selected and an Instagram link on the clipboard, ⌘V opens
@@ -40,7 +43,7 @@ fn wheel_items(styles: &Value) -> Vec<WheelItem> {
                     let id = st.get("id")?.as_str()?;
                     let label = st.get("label")?.as_str()?;
                     let hint = format!(
-                        "{} · corners {} % of the width{}",
+                        "{} · corners {} % of the width · 1 px white hairline{}",
                         st.get("aspect").and_then(Value::as_str).unwrap_or(""),
                         st.get("radius").and_then(Value::as_f64).unwrap_or(0.0),
                         if st.get("saved").and_then(Value::as_bool) == Some(true) { " · Motion Library ▸ Elias ▸ Cards" } else { "" }
@@ -104,16 +107,21 @@ fn pick_style(app: &mut EffectcraftApp, ctx: &egui::Context, pick: &str) -> Resu
     }
     // Restyle when every selected layer is a card already; otherwise make cards (which also
     // restyles the cards among them).
-    let all_cards = app.session.active_comp().is_some_and(|c| {
-        app.session.state.selected_layers.iter().all(|id| c.layer(*id).is_some_and(effectcraft_engine::commands::cards::is_card))
-    });
+    let all_cards = app
+        .session
+        .active_comp()
+        .is_some_and(|c| app.session.state.selected_layers.iter().all(|id| c.layer(*id).is_some_and(effectcraft_engine::commands::cards::is_card)));
     let id = if all_cards { "card.style" } else { "card.make" };
     let r = crate::menus::invoke(app, ctx, id, json!({"style": pick}))?;
     let label = r["style"]["label"].as_str().unwrap_or(pick);
     let n = r["cards"].as_array().map(Vec::len).unwrap_or(0);
     let skipped = r["skipped"].as_array().map(Vec::len).unwrap_or(0);
     let what = if all_cards { "Restyled" } else { "Card made" };
-    Ok(if skipped > 0 { format!("{what}: {label} on {n} layer(s); {skipped} skipped") } else { format!("{what}: {label} · from Motion Library ▸ Elias ▸ Cards") })
+    Ok(if skipped > 0 {
+        format!("{what}: {label} on {n} layer(s); {skipped} skipped")
+    } else {
+        format!("{what}: {label} · from Motion Library ▸ Elias ▸ Cards")
+    })
 }
 
 // ── ⌘V link paste (CX2) ────────────────────────────────────────────────────────────────────
@@ -218,7 +226,8 @@ fn link_frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
             match crate::menus::invoke(app, ctx, "link.paste", params) {
                 Ok(r) => {
                     let n = r["pasted"].as_array().map(Vec::len).unwrap_or(0);
-                    let msg = if n > 1 { format!("✓ Done: {n} layers, only their pictures changed") } else { "✓ Done: only the picture changed".to_string() };
+                    let msg =
+                        if n > 1 { format!("✓ Done: {n} layers, only their pictures changed") } else { "✓ Done: only the picture changed".to_string() };
                     log_line(now, msg.clone());
                     app.toast = Some((msg, now));
                 }
@@ -453,13 +462,25 @@ pub fn link_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: f32)
         y += 24.0 * s;
     }
     // The log, newest last.
-    p.text(pos2(x0, y + 6.0 * s), Align2::LEFT_CENTER, if with_link(|st| st.busy) { "Steps · fetching…" } else { "Steps" }, Tokens::medium(11.0 * s), t.text_faint);
+    p.text(
+        pos2(x0, y + 6.0 * s),
+        Align2::LEFT_CENTER,
+        if with_link(|st| st.busy) { "Steps · fetching…" } else { "Steps" },
+        Tokens::medium(11.0 * s),
+        t.text_faint,
+    );
     y += 18.0 * s;
     let lines: Vec<(f64, String)> = with_link(|st| st.log.clone());
     let room = ((area.max.y - y) / (16.0 * s)).floor().max(0.0) as usize;
     let skip = lines.len().saturating_sub(room);
     for (at, line) in lines.iter().skip(skip) {
-        let color = if line.starts_with('✓') { t.cache_green } else if line.starts_with('✗') { t.danger } else { t.text };
+        let color = if line.starts_with('✓') {
+            t.cache_green
+        } else if line.starts_with('✗') {
+            t.danger
+        } else {
+            t.text
+        };
         p.text(pos2(x0, y + 7.0 * s), Align2::LEFT_CENTER, format!("{} {line}", super::panel_kit::seconds(*at)), Tokens::mono(10.5 * s), color);
         y += 16.0 * s;
     }

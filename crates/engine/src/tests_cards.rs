@@ -42,8 +42,13 @@ fn make_card_is_a_centred_two_by_three_mask_in_one_undo_step() {
     // 2:3 inside a square: full height, two thirds of the width (rounded corners keep the box).
     assert!((h - 600.0).abs() < 1.0, "{h}");
     assert!((w - 400.0).abs() < 1.0, "{w}");
-    // No outline: no layer styles were added.
-    assert!(s.active_comp().unwrap().layer(LayerId(a)).unwrap().layer_styles().is_none());
+    // Devin's hairline: a Stroke style, white, 32 %, 1 px (the layer is at 100 %), inside.
+    let l = s.active_comp().unwrap().layer(LayerId(a)).unwrap();
+    let stroke = l.layer_styles().and_then(|g| g.sub("stroke")).expect("the card's hairline");
+    assert_eq!(stroke.get("opacity").unwrap().value, KV::Scalar(cards::HAIRLINE_OPACITY));
+    assert_eq!(stroke.get("size").unwrap().value, KV::Scalar(1.0));
+    assert_eq!(stroke.get("position").unwrap().value, KV::Enum(1));
+    assert_eq!(r["cards"][0]["hairline"], json!(true));
     s.execute("edit.undo", json!({})).unwrap();
     assert!(card_box(&s, a).is_none());
 }
@@ -58,6 +63,9 @@ fn restyle_reshapes_the_same_mask() {
     assert!((w - h).abs() < 1.0);
     let masks = s.active_comp().unwrap().layer(LayerId(a)).unwrap().masks().unwrap().children.len();
     assert_eq!(masks, 1, "restyled, not a second mask");
+    // Still one hairline.
+    let l = s.active_comp().unwrap().layer(LayerId(a)).unwrap();
+    assert_eq!(l.layer_styles().unwrap().groups().filter(|g| g.match_id == "stroke").count(), 1);
     // A layer that isn't a card can't be restyled.
     let b = s.execute("layer.newSolid", json!({"color": "#000000", "width": 100, "height": 100})).unwrap()["layer"].as_u64().unwrap();
     assert!(s.execute("card.style", json!({"layers": [b], "style": "reel"})).is_err());
