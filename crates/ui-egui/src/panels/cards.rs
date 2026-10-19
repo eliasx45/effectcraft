@@ -88,6 +88,8 @@ pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
     link_frame(app, ctx);
     // Claude's version follows the agents' steps (CX5).
     effectcraft_engine::commands::suggestions::observe(&app.session);
+    // History and the learning loop's usage log (CX7).
+    super::history_panel::frame(app, ctx);
 }
 
 /// Run the picked slice on the selected layers.

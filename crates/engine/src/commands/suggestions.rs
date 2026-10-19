@@ -330,6 +330,67 @@ fn why_answer(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"recorded": record}))
 }
 
+/// Commands that only select or navigate: not "actions" in History.
+pub const NOT_ACTIONS: &[&str] = &[
+    "layer.select", "layer.selectNext", "layer.selectPrevious", "prop.select", "prop.deselect", "keys.select", "comp.open", "comp.close", "time.", "view.", "timeline.", "window.", "viewer.",
+];
+
+/// Whether `id` is a user action History lists (not a selection or navigation).
+pub fn is_action(id: &str) -> bool {
+    !NOT_ACTIONS.iter().any(|n| if n.ends_with('.') { id.starts_with(n) } else { id == *n })
+}
+
+/// The spoken word nearest comp time `t` in `comp` (within a second): (word, comp seconds).
+pub fn nearest_word(comp: &effectcraft_project::Comp, t: effectcraft_time::Tick) -> Option<(String, f64)> {
+    let sp = comp.speech.as_ref()?;
+    let ts = t.seconds();
+    sp.words
+        .iter()
+        .map(|w| (w, ((w.start.seconds() + w.end.seconds()) / 2.0 - ts).abs()))
+        .filter(|(_, d)| d.is_finite() && *d <= 1.0)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(w, _)| (w.word.clone(), w.start.seconds()))
+}
+
+/// Layer references in a command's params (`layer`, `layers`), as ids in `comp`.
+pub fn param_layers(comp: &effectcraft_project::Comp, p: &Value) -> Vec<u64> {
+    let mut refs: Vec<&Value> = vec![];
+    if let Some(v) = p.get("layer") {
+        refs.push(v);
+    }
+    if let Some(Value::Array(a)) = p.get("layers") {
+        refs.extend(a.iter().take(64));
+    }
+    refs.into_iter().filter_map(|v| super::resolve_layer(comp, v)).map(|l| l.0).collect()
+}
+
+/// `history.usage {limit?, since?}`: the user's actions from the command journal, newest last.
+fn usage(s: &mut Session, p: &Value) -> Result<Value> {
+    let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 1000) as usize;
+    let since = p.get("since").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let comp = s.active_comp();
+    let t = s.time();
+    let rows: Vec<Value> = s
+        .journal
+        .iter()
+        .enumerate()
+        .skip(since)
+        .filter(|(_, (id, _))| is_action(id))
+        .map(|(i, (id, params))| {
+            let label = super::find(id).map(|c| c.label).unwrap_or("");
+            let layers: Vec<Value> = comp
+                .map(|c| param_layers(c, params).into_iter().filter_map(|l| c.layer(effectcraft_project::LayerId(l)).map(|x| json!({"id": l, "name": x.name}))).collect())
+                .unwrap_or_default();
+            // The action's own time when it has one, else the playhead now.
+            let at = super::f_p(params, "time").map(effectcraft_time::Tick::from_seconds_f64).unwrap_or(t);
+            let near = comp.and_then(|c| nearest_word(c, at)).map(|(w, at)| json!({"word": w, "time": at}));
+            json!({"n": i, "command": id, "label": label, "layers": layers, "near": near})
+        })
+        .collect();
+    let skip = rows.len().saturating_sub(limit);
+    Ok(json!({"actions": rows.into_iter().skip(skip).collect::<Vec<_>>(), "journal": s.journal.len()}))
+}
+
 const fn spec(id: &'static str, label: &'static str, params: &'static str, run: super::Run, journal: bool) -> CommandSpec {
     CommandSpec { id, label, menu: &[], shortcut: None, alt_shortcuts: &[], params, enabled: always, run, journal }
 }
@@ -364,6 +425,13 @@ pub fn specs() -> Vec<CommandSpec> {
             "Why? (Answer)",
             "{why? (a reason chip: too early/late | wrong word | too big/small | not my style, or free text), skip?: bool, what? (the change), comp? {id, name}, layers? [{id, name}], agent?} → {recorded}: the app appends it to the learning loop's why log (~/.claude/speech-edit/why-log.jsonl)",
             why_answer,
+            false,
+        ),
+        spec(
+            "history.usage",
+            "Usage History",
+            "{limit? (default 50), since? (journal index)} → {actions: [{n, command, label, layers: [{id, name}], near: {word, time}|null}], journal}: the user's actions from the command journal (selection and navigation left out), for the learning loop",
+            usage,
             false,
         ),
         spec("agent.version", "Claude's Version", "{} → {has, by, same}: whether there is a Claude's version to compare with", version, false),

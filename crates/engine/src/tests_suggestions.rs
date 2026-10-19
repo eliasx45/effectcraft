@@ -91,3 +91,16 @@ fn why_answer_goes_to_the_app() {
     s.execute("why.answer", json!({"why": "too big/small", "what": "Scale"})).unwrap();
     assert!(s.events.iter().any(|e| matches!(e, crate::Event::Frontend { command, params } if command == "why.answer" && params["why"] == json!("too big/small"))));
 }
+
+#[test]
+fn usage_lists_actions_not_selection() {
+    let (mut s, a) = session();
+    s.execute("layer.select", json!({"layers": [a]})).unwrap();
+    s.execute("layer.rename", json!({"layer": a, "name": "Card"})).unwrap();
+    let r = s.execute("history.usage", json!({})).unwrap();
+    let cmds: Vec<&str> = r["actions"].as_array().unwrap().iter().filter_map(|x| x["command"].as_str()).collect();
+    assert!(cmds.contains(&"layer.rename"));
+    assert!(!cmds.contains(&"layer.select"));
+    let rename = r["actions"].as_array().unwrap().iter().find(|x| x["command"] == json!("layer.rename")).unwrap();
+    assert_eq!(rename["layers"][0]["name"], json!("Card"));
+}
