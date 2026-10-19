@@ -212,8 +212,9 @@ fn card_presets(s: &Session) -> Vec<Preset> {
             out.push(Preset { name: e.name.clone(), parsed, source: Source::Card { id: e.id.clone(), kind: e.kind.to_lowercase(), local: true } });
         }
     }
-    // TODO(batch1-verify): lane C's `ml.saveTextPreset` (CX8) decides where text presets live
-    // (category "Text animations"?); this reads any card named like one.
+    // Lane C's `ml.saveTextPreset` (CX8) saves them to `styles::TEXT_PRESET_FOLDER`
+    // ("Elias/Text animations") with the layer's preset name; this reads any card named like one,
+    // so those are found wherever they sit.
     if let Ok(client) = s.motion_library()
         && let Some(cat) = client.catalog()
     {
