@@ -472,3 +472,18 @@ fn plain_evaluations_for_cache_keys_run_once() {
         assert_eq!(v.as_f64(), bisect_oracle(&f, 30.0, t), "at {t}");
     }
 }
+
+/// EXPR-PERF4: hot property methods read their fields through `__t` (the property itself, not
+/// its Proxy, so the handler's trap runs once instead of about eight times per read). Scripts
+/// see the same objects and the same values.
+#[test]
+fn property_objects_look_the_same_to_scripts() {
+    let f = fx();
+    assert_eq!(f.text("Object.keys(thisComp.layer(\"A\").transform.rotation).join(',')", 0.0), "__c,__l,__p,__i,__k,__self");
+    let rot = "thisComp.layer(\"A\").transform.rotation";
+    assert_eq!(f.ev(f.b, ROT, &format!("{rot}.valueAtTime(0.5) + {rot}.key(2).value + {rot}.key(1).time"), 0.0).unwrap().as_f64(), 135.0);
+    // The own property: `valueAtTime(time)` is the keyframed value, other times read the keys.
+    assert_eq!(f.ev(f.a, ROT, "thisProperty.valueAtTime(time) + thisProperty.valueAtTime(0.25) * 1000", 0.5).unwrap().as_f64(), 45.0 + 22_500.0);
+    // A method called without its property fails as before.
+    assert!(f.ev(f.b, ROT, &format!("var g = {rot}.valueAtTime; g(0.5)"), 0.0).is_err());
+}

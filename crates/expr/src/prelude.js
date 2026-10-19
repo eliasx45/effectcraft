@@ -756,6 +756,10 @@ Prop.prototype = {
   get numKeys() { return this.__info[4]; },
   get propertyIndex() { return this.__info[7]; },
   get matchName() { return this.__info[8]; },
+  // The property itself, not its Proxy (see `__mkProp`): reading `this.__c` through the Proxy runs
+  // the handler's trap each time, which for these own fields returns `t[k]` anyway. Hot methods
+  // read their fields from `this.__t` (one trap) instead.
+  get __t() { return this; },
   __wrap: function (v) {
     var kind = this.__info[2];
     if (kind === 'layer') return v === null ? null : new Layer(this.__c, v);
@@ -764,9 +768,10 @@ Prop.prototype = {
   },
   get value() { return this.__self ? value : this.valueAtTime(time); },
   valueAtTime: function (t) {
+    var s = this.__t;
     t = __v(t);
-    if (this.__self && t === time) return value;
-    return this.__wrap(__h(__VALUE, this.__c, this.__l, this.__p, t, this.__self));
+    if (s.__self && t === time) return value;
+    return s.__wrap(__h(__VALUE, s.__c, s.__l, s.__p, t, s.__self));
   },
   velocityAtTime: function (t) {
     var h = 1e-3;
@@ -776,11 +781,12 @@ Prop.prototype = {
   speedAtTime: function (t) { return length(this.velocityAtTime(t)); },
   get speed() { return this.speedAtTime(time); },
   key: function (n) {
-    var N = this.__info[4];
+    var s = this.__t;
+    var N = s.__info[4];
     if (!(n >= 1 && n <= N)) __err('Key index ' + n + ' out of range (property has ' + N + ' keys)');
     n = Math.floor(n);
-    var keys = this.__keys;
-    return { time: keys[0][n - 1], value: this.__wrap(keys[1][n - 1]), index: n };
+    var keys = s.__keys;
+    return { time: keys[0][n - 1], value: s.__wrap(keys[1][n - 1]), index: n };
   },
   nearestKey: function (t) {
     if (this.__info[4] === 0) __err('Property has no keyframes');
