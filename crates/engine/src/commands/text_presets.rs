@@ -85,12 +85,15 @@ pub struct TextPreset {
     pub doc: Value,
 }
 
-/// A text animation card: (id, name, file on this machine).
+/// A text animation card: (id, name, file on this machine, when it was made).
 #[derive(Clone, Debug)]
 struct CardRef {
     id: String,
     name: String,
     file: Option<String>,
+    /// Unix seconds: the index's `created_at`, else the file's modification time, else 0 (a
+    /// catalog card).
+    created: f64,
 }
 
 fn category_p(p: &Value) -> String {
@@ -103,12 +106,21 @@ fn in_category(cat: &str, want: &str) -> bool {
     c == w || c.starts_with(&format!("{w}/"))
 }
 
-/// The preset cards of `category`: this Mac's library folders first, then the catalog's.
+/// The preset cards of `category`, one per name (see [`one_per_name`]).
 fn cards(s: &Session, category: &str) -> Vec<CardRef> {
+    let mut out = one_per_name(all_cards(s, category));
+    out.truncate(MAX_PRESETS);
+    out
+}
+
+/// Every preset card of `category`, by name: this Mac's library folders first, then the catalog's.
+fn all_cards(s: &Session, category: &str) -> Vec<CardRef> {
     let mut out: Vec<CardRef> = vec![];
     for e in s.motion_library_local().values() {
         if e.kind.eq_ignore_ascii_case("preset") && in_category(&e.category, category) {
-            out.push(CardRef { id: e.id.clone(), name: e.name.clone(), file: Some(e.file.clone()).filter(|f| !f.is_empty()) });
+            let file = Some(e.file.clone()).filter(|f| !f.is_empty());
+            let created = e.created.or_else(|| file.as_deref().and_then(modified)).unwrap_or(0.0);
+            out.push(CardRef { id: e.id.clone(), name: e.name.clone(), file, created });
         }
     }
     if let Ok(client) = s.motion_library()
@@ -116,13 +128,46 @@ fn cards(s: &Session, category: &str) -> Vec<CardRef> {
     {
         for c in &cat.cards {
             if c.kind.eq_ignore_ascii_case("preset") && in_category(&c.category, category) && !out.iter().any(|x| x.id == c.id) {
-                out.push(CardRef { id: c.id.clone(), name: c.name.clone(), file: None });
+                out.push(CardRef { id: c.id.clone(), name: c.name.clone(), file: None, created: 0.0 });
             }
         }
     }
     out.sort_by_key(|c| c.name.to_lowercase());
-    out.truncate(MAX_PRESETS);
+    out.truncate(MAX_PRESETS.saturating_mul(4));
     out
+}
+
+/// One card per name (case and outer spaces ignored): when a name repeats (an old card and its
+/// remake, e.g. two "Slide In"), the newest one wins; the others stay reachable by id.
+fn one_per_name(list: Vec<CardRef>) -> Vec<CardRef> {
+    let mut out: Vec<CardRef> = vec![];
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for c in list {
+        let key = c.name.trim().to_lowercase();
+        match at.get(&key).and_then(|i| out.get_mut(*i)) {
+            Some(x) if c.created > x.created => *x = c,
+            Some(_) => {}
+            None => {
+                at.insert(key, out.len());
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// A file's modification time in Unix seconds (none on the web or when it can't be read).
+fn modified(path: &str) -> Option<f64> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let t = std::fs::metadata(path).ok()?.modified().ok()?;
+        Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        None
+    }
 }
 
 fn parse_preset(bytes: &[u8], what: &str, cmd: &str) -> Result<Value> {
@@ -184,8 +229,10 @@ pub fn find_preset(s: &Session, p: &Value, query: &str, cmd: &str) -> Result<Tex
         return Ok(TextPreset { name, id: None, path: Some(q.to_string()), source: "file", doc });
     }
     let category = category_p(p);
-    let list = cards(s, &category);
-    let hit = list.iter().find(|c| c.id == q).or_else(|| list.iter().find(|c| c.name.trim().eq_ignore_ascii_case(q)));
+    let all = all_cards(s, &category);
+    let list = one_per_name(all.clone());
+    // By id any card (an older one with a repeated name too); by name the newest.
+    let hit = all.iter().find(|c| c.id == q).or_else(|| list.iter().find(|c| c.name.trim().eq_ignore_ascii_case(q)));
     match hit {
         Some(c) => load_card(s, c, cmd),
         None => Err(bad(cmd, format!("no text preset “{q}” in Motion Library ▸ {category}; there are: {}", names_of(&list, &category)))),

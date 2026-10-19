@@ -11,7 +11,8 @@
 //!            "kinds": [], "agent": "claude-code-…", "ts": "…"}}`
 //!
 //! Nothing is written when that folder doesn't exist (another machine). The time is UTC.
-// TODO(batch1-verify): loopd matches whys to its own bursts by burst id; "app-…" ids are new to it.
+//! loopd (`learn.py`, CX6) matches an "app-…" why to its own burst of that comp and those layers
+//! by time (the id's Unix seconds), gives that burst the why and logs it under the burst's id.
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};

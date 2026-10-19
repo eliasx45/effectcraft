@@ -181,6 +181,11 @@ pub fn fair_order<T>(reqs: Vec<(ControlRequest, T)>) -> Vec<(ControlRequest, T)>
 /// Run an engine command. A waiting command (`wait: true`) runs with `wait: false` instead, and
 /// the reply waits for the job it started ([`Outcome::AwaitJobs`]), so the UI keeps drawing and
 /// other clients' requests run while it works. `jobs.wait` likewise waits for the running tasks.
+/// An engine command that only reads (not journaled, e.g. `speech.get`, `comp.info`).
+fn is_query(id: &str) -> bool {
+    effectcraft_engine::find_command(id).is_some_and(|c| !c.journal)
+}
+
 fn execute_engine(app: &mut EffectcraftApp, id: &str, params: Value) -> Result<Outcome, String> {
     Ok(match effectcraft_engine::job_waiter::start(&mut app.session, id, params)? {
         effectcraft_engine::job_waiter::Started::Done(v) => ok(v),
@@ -241,7 +246,12 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             match r {
                 Ok(o) => o,
                 Err(e) => {
-                    app.ui.status = e.clone();
+                    // A failed query (a read: `speech.get`, `comp.info`, …) changed nothing; only its
+                    // caller hears about it. Background readers (the learning loop asks `speech.get`
+                    // on every comp, and most comps have no speech map) must not toast the user.
+                    if !is_query(id) {
+                        app.ui.status = e.clone();
+                    }
                     err(e)
                 }
             }

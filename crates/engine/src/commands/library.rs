@@ -54,6 +54,8 @@ struct Entry {
     frames: String,
     /// The visible artwork inside a transparent thumbnail.
     crop: Option<effectcraft_motionlib::Crop>,
+    /// When the card was made (Unix seconds; a number or a numeric string), when the index says.
+    created_at: Option<Value>,
 }
 
 /// A library folder, read.
@@ -112,6 +114,8 @@ pub struct LocalEntry {
     /// The visible artwork inside its transparent thumbnail and frames.
     pub crop: Option<effectcraft_motionlib::Crop>,
     pub folder: String,
+    /// When the card was made (the index's `created_at`, Unix seconds), when it says.
+    pub created: Option<f64>,
 }
 
 /// Local entries by id (the first folder listing an id wins).
@@ -162,6 +166,11 @@ pub(crate) fn local_entries(s: &Session) -> Arc<LocalIndex> {
                 },
                 crop: e.crop.and_then(effectcraft_motionlib::Crop::valid),
                 folder: lib.folder.clone(),
+                created: e
+                    .created_at
+                    .as_ref()
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|t| t.trim().parse().ok())))
+                    .filter(|t: &f64| t.is_finite()),
             });
         }
     }

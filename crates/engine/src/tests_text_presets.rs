@@ -177,6 +177,68 @@ fn families_list_the_cards_with_the_controls_from_their_files() {
     assert_eq!(r["presets"], json!([]));
 }
 
+/// Batch 1: the Motion Library had an old broken "Slide In" card and its remake, so the quick row
+/// showed "Slide In ↑" twice. One preset per name: the newest card (`created_at`, else its file's
+/// time); the older one stays reachable by id.
+#[test]
+fn a_repeated_card_name_lists_once_and_the_newest_card_wins() {
+    let (mut s, _, cap) = studio();
+    let lib = std::path::PathBuf::from(s.prefs.libraries[0].clone());
+    // The old card: same name, another file (one control only).
+    let old = s.execute("layer.newText", json!({"text": "old", "name": "Old"})).unwrap()["layer"].as_u64().unwrap();
+    let main = s.active_comp_id().unwrap();
+    add_control(&mut s, main, old, "ec.control.slider", "Old Travel", KV::Scalar(10.0), &[]);
+    add_fade(&mut s, main, old, "Fade Up", 2, true, "100");
+    let mut cards =
+        vec![json!({"id": "slide-in", "name": "Slide In", "kind": "preset", "category": "Elias/Text animations", "file": "assets/slide-in/preset.ecpreset"})];
+    save_card(&mut s, &lib, &mut cards, old, "slide-in-old", " slide in", "Elias/Text animations");
+    let write = |cards: &[Value]| {
+        let index = json!({"format": "effectcraft-library", "version": 1, "name": "Fixture", "entries": cards});
+        // A different size each time, so the library cache sees the change.
+        std::fs::write(lib.join("library.json"), format!("{index}{}", " ".repeat(pad()))).unwrap();
+    };
+    let listed = |s: &mut Session| -> Vec<(String, String)> {
+        let r = s.execute("text.presetFamilies", json!({})).unwrap();
+        r["presets"].as_array().unwrap().iter().map(|p| (p["name"].as_str().unwrap().to_string(), p["id"].as_str().unwrap().to_string())).collect()
+    };
+    // created_at says which is newer (19 Oct: the remake at 20:46, the broken one at 19:13).
+    cards[0]["created_at"] = json!(1_792_435_580.67);
+    cards[1]["created_at"] = json!(1_792_430_029.52);
+    write(&cards);
+    assert_eq!(listed(&mut s), [("Slide In".to_string(), "slide-in".to_string())]);
+    let r = s.execute_checked("text.apply", json!({"preset": "Slide In", "layers": [cap]})).unwrap();
+    assert_eq!(r["preset"]["id"], "slide-in", "the button applies the newest card: {r:#}");
+    // The other way round (a numeric string counts too).
+    cards[1]["created_at"] = json!("1792439999");
+    write(&cards);
+    assert_eq!(listed(&mut s), [(" slide in".to_string(), "slide-in-old".to_string())]);
+    // By id the hidden card is still there.
+    cards[1]["created_at"] = json!(1.0);
+    write(&cards);
+    let r = s.execute_checked("text.apply", json!({"preset": "slide-in-old", "layers": [cap]})).unwrap();
+    assert_eq!(r["preset"]["id"], "slide-in-old");
+    // Without created_at: the newer file wins.
+    for c in &mut cards {
+        c.as_object_mut().unwrap().remove("created_at");
+    }
+    write(&cards);
+    let at = |id: &str, secs: u64| {
+        let f = std::fs::File::options().write(true).open(lib.join("assets").join(id).join("preset.ecpreset")).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
+    };
+    at("slide-in", 1_792_400_000);
+    at("slide-in-old", 1_792_500_000);
+    assert_eq!(listed(&mut s), [(" slide in".to_string(), "slide-in-old".to_string())]);
+    at("slide-in-old", 1_792_300_000);
+    assert_eq!(listed(&mut s), [("Slide In".to_string(), "slide-in".to_string())]);
+}
+
+/// 1000 bytes more on every call (the library cache keys on the index's size and time).
+fn pad() -> usize {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * 1000
+}
+
 #[test]
 fn apply_brings_the_preset_and_sets_controls_by_name_in_one_undo_step() {
     let (mut s, main, cap) = studio();
