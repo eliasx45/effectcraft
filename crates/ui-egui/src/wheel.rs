@@ -182,7 +182,8 @@ pub fn paint(ctx: &egui::Context) {
     let n = o.items.len();
     let ptr = ctx.input(|i| i.pointer.hover_pos());
     o.hover = ptr.and_then(|p| slice_at(o.center, p, n));
-    // TODO(batch1-verify): a wheel opened by a button click: is that click's pass still `opened_pass` here?
+    // A wheel opened by a button click: that click's pass is `opened_pass`, so it never picks (checked
+    // by hand: Make card ▾, BUILD2).
     let fresh = ctx.cumulative_pass_nr() == o.opened_pass;
     // Escape: close, no pick.
     let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
@@ -217,7 +218,7 @@ pub fn paint(ctx: &egui::Context) {
     }
 
     let c = o.center;
-    // TODO(batch1-verify): check that the Area really keeps the Timeline from also taking a slice click.
+    // (Checked by hand: a slice click over a layer row leaves the Timeline selection alone, BUILD2.)
     // An area over the ring takes the pointer, so the panels under it don't get its clicks
     // (egui hit-tests against the previous frame's areas).
     let side = R_CLICK * 2.0;
