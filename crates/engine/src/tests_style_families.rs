@@ -58,3 +58,51 @@ fn save_text_preset_checks_and_selects_the_workshop_layer() {
     assert_eq!(s.state.selected_layers, vec![LayerId(t)]);
     assert!(s.events.iter().any(|e| matches!(e, crate::Event::Frontend { command, .. } if command == "ml.saveTextPreset")));
 }
+
+/// CX9: Bounce on a Range Selector's Offset keys adds a per-unit bounce animator (Expression
+/// Selector), once; the second run updates it.
+#[test]
+fn unit_bounce_follows_the_reveal() {
+    use effectcraft_keyframe::Keyframe;
+    use effectcraft_time::Tick;
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "T", "width": 400, "height": 200, "frameRate": 30, "duration": 3})).unwrap();
+    let l = s.execute("layer.newText", json!({"text": "Bounce"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.addTextAnimator", json!({"layer": l, "properties": ["opacity"]})).unwrap();
+    // Offset 0 → 100 over 0.5..1.5 s (the reveal).
+    let cid = s.active_comp_id().unwrap();
+    let off = s
+        .edit("keys", None, |proj, _| {
+            let layer = crate::commands::layer_mut(proj, cid, LayerId(l))?;
+            let pr = layer.props.prop_mut("text/animators/animator/selectors/rangeSelector/offset").unwrap();
+            pr.keys = vec![Keyframe::new(Tick::from_seconds_f64(0.5), KV::Scalar(0.0)), Keyframe::new(Tick::from_seconds_f64(1.5), KV::Scalar(100.0))];
+            Ok(pr.uid)
+        })
+        .unwrap();
+    // No keyed reveal: a clear error.
+    assert!(s.execute("text.unitBounce", json!({"layer": l, "selector": 1})).is_err());
+    let r = s.execute("text.unitBounce", json!({"layer": l, "selector": off, "strength": 50, "frequency": 3, "decay": 6})).unwrap();
+    assert_eq!(r["reused"], json!(false));
+    assert!(r["message"].as_str().unwrap().contains("Expression Selector"));
+    let comp = s.active_comp().unwrap();
+    let layer = comp.layer(LayerId(l)).unwrap();
+    let anims = layer.props.group("text/animators").unwrap();
+    assert_eq!(anims.groups().count(), 2);
+    let ub = anims.groups().find(|g| g.name == "Unit bounce").unwrap();
+    let amount = ub.group("selectors/expressionSelector").unwrap().get("amount").unwrap();
+    let text = &amount.expr.as_ref().unwrap().text;
+    assert!(text.contains("t0 = 0.5000") && text.contains("t1 = 1.5000") && text.contains("Math.cos"));
+    assert!(ub.group("selectors").unwrap().sub("rangeSelector").is_none(), "no 0–100 % range selector of its own");
+    assert_eq!(ub.prop("properties/position").unwrap().value, KV::Vec3([0.0, -20.0, 0.0]));
+    // Again with bounce + scale: the same animator, updated, one undo step each.
+    let undo = s.history.undo.len();
+    let r = s.execute("text.unitBounce", json!({"layer": l, "selector": off, "mode": "bounce", "moves": ["position", "scale"]})).unwrap();
+    assert_eq!(r["reused"], json!(true));
+    assert_eq!(s.history.undo.len(), undo + 1);
+    let layer = s.active_comp().unwrap().layer(LayerId(l)).unwrap();
+    let anims = layer.props.group("text/animators").unwrap();
+    assert_eq!(anims.groups().count(), 2);
+    let ub = anims.groups().find(|g| g.name == "Unit bounce").unwrap();
+    assert!(ub.prop("properties/scale").is_some());
+    assert!(ub.group("selectors/expressionSelector").unwrap().get("amount").unwrap().expr.as_ref().unwrap().text.contains("Math.abs"));
+}

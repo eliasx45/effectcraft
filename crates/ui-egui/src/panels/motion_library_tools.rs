@@ -330,6 +330,28 @@ fn keyed_props(s: &effectcraft_engine::Session) -> Vec<String> {
     names
 }
 
+/// Whether a selected key is on a text Range Selector's Start, End or Offset (CX9): a spring there
+/// shows nothing (Ramp Up clamps the selection to 0..1), so Bounce springs each unit instead
+/// (`text.unitBounce`).
+fn reveal_keys(s: &effectcraft_engine::Session) -> bool {
+    let Some(c) = s.active_comp() else { return false };
+    s.state.selected_keys.iter().any(|k| {
+        c.layer(k.layer).and_then(|l| l.props.match_path_of(k.prop)).is_some_and(|m| is_range_reveal(&m))
+    })
+}
+
+/// `text/animators/animator#2/selectors/rangeSelector/offset` and the like
+/// (the engine's `styles::is_range_reveal_path`, which the UI can't reach).
+fn is_range_reveal(path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').collect();
+    let base = |s: &str| s.split('#').next().unwrap_or("").to_string();
+    let n = segs.len();
+    n >= 2
+        && segs.first().copied() == Some("text")
+        && segs.get(n - 2).is_some_and(|s| base(s) == "rangeSelector")
+        && segs.get(n - 1).is_some_and(|s| matches!(base(s).as_str(), "start" | "end" | "offset"))
+}
+
 /// The tool `tool` with the arguments in `p`; missing arguments take the panel's current values.
 /// `keyed` names the properties with selected keyframes ([`keyed_props`]): when there are any,
 /// Bounce without a `property` springs those keys instead of the dropdown's property.
@@ -486,10 +508,23 @@ fn start(app: &mut EffectcraftApp, ctx: &egui::Context, tool: &str, p: &Value) -
         app.ui.status = e.clone();
         Err(e)
     };
-    let built = match build(tool, p, &settings(), &keyed_props(&app.session)) {
+    let mut built = match build(tool, p, &settings(), &keyed_props(&app.session)) {
         Ok(b) => b,
         Err(e) => return fail(app, e),
     };
+    // CX9: a spring on a Range Selector's Start / End / Offset does nothing visible; bounce each
+    // unit with an Expression Selector animator instead (the reveal keeps the opacity).
+    if let Plan::Plug { op: "toolkit_bounce", args } = &built.plan
+        && args["property"] == json!("selected")
+        && args["mode"] != json!("remove")
+        && reveal_keys(&app.session)
+    {
+        let mut a = json!({"mode": args["mode"], "strength": args["strength"], "frequency": args["frequency"], "decay": args["decay"]});
+        if let Some(m) = p.get("moves") {
+            a["moves"] = m.clone();
+        }
+        built = Built { plan: Plan::Native { cmd: "text.unitBounce", args: a }, section: BOUNCE, label: "Unit bounce".into() };
+    }
     match built.plan {
         Plan::Native { cmd, args } => {
             let r = app.session.execute(cmd, args).map_err(|e| e.to_string()).map(|mut v| {
@@ -1015,11 +1050,17 @@ fn bounce_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set:
         kit::dropdown(app, ui, ctrl, "motionLibrary.tools.bounce.property", &[label.as_str()], 0);
         c.y += 30.0 * c.s;
     }
+    // CX9: Range Selector keys get a per-unit bounce (native, no plug needed).
+    let reveal = reveal_keys(&app.session);
+    if reveal {
+        let t = app.tokens;
+        note(ui, c, &t, "Range Selector keys only reveal (Ramp Up clamps them), so Apply spring bounces each unit as the reveal reaches it: an animator with an Expression Selector moves Position; the reveal keeps the opacity.");
+    }
     choice_row(app, ui, c, "motionLibrary.tools.bounce.motion", "Motion", &MOTIONS, &mut set.motion);
     set.strength = number_row(app, ui, c, "motionLibrary.tools.bounce.strength", "Strength (%)", set.strength, STRENGTH, 0);
     set.frequency = number_row(app, ui, c, "motionLibrary.tools.bounce.frequency", "Bounces / s", set.frequency, FREQUENCY, 1);
     set.decay = number_row(app, ui, c, "motionLibrary.tools.bounce.decay", "Settle speed", set.decay, DECAY, 1);
-    let items = [("apply", "Apply spring", true, en.plug()), ("remove", "Remove spring", false, en.plug())];
+    let items = [("apply", "Apply spring", true, (reveal && en.idle) || en.plug()), ("remove", "Remove spring", false, en.plug())];
     match button_rows(app, ui, c, "bounce", &items, 110.0) {
         Some(0) => Some(("bounce", json!({}))),
         Some(_) => Some(("bounce", json!({"mode": "remove"}))),
