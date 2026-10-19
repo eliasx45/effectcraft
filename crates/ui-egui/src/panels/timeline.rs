@@ -2217,6 +2217,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     app.auto.add(&format!("timeline.layer.{}.bar", layer.id.0), bar, &layer.name);
                     // Interactions: move body, trim edges.
+                    // Batch 1 lane B (SX3): the voice layer's words on its bar.
+                    super::timeline_words::paint(app, ui, &gp, bar, tm, &comp, layer);
                     let (body_r, in_r, out_r) = trim_zones(bar);
                     let body = ui.interact(body_r, egui::Id::new(("bar", layer.id.0)), Sense::click_and_drag());
                     let lin = ui.interact(in_r, egui::Id::new(("bar-in", layer.id.0)), Sense::drag());
