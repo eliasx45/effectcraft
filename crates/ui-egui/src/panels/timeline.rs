@@ -4064,7 +4064,9 @@ fn layer_context_menu(
 
 /// Shared layer actions for Timeline rows and Composition context menus.
 pub(crate) fn layer_menu(ui: &mut egui::Ui, layers: &[u64], caps: LayerMenuCaps, actions: &mut Vec<(String, serde_json::Value)>) {
-    let Some(&id) = layers.first() else { return };
+    if layers.is_empty() {
+        return;
+    }
     let mut item = |ui: &mut egui::Ui, label: &str, cmd: &str, params: serde_json::Value| {
         if ui.button(label).clicked() {
             actions.push(("layer.select".into(), json!({"layers": layers})));
@@ -4091,7 +4093,7 @@ pub(crate) fn layer_menu(ui: &mut egui::Ui, layers: &[u64], caps: LayerMenuCaps,
     }
     ui.separator();
     ui.menu_button(crate::i18n::tr("Masks"), |ui| {
-        item(ui, "New Mask", "layer.addMask", json!({"layer": id}));
+        item(ui, "New Mask", "layer.addMask", json!({"layers": layers}));
     });
     ui.menu_button(crate::i18n::tr("Transform"), |ui| {
         item(ui, "Reset", "layer.transform", json!({"layers": layers, "op": "reset"}));

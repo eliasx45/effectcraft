@@ -72,3 +72,32 @@ fn a_switch_on_a_selected_layer_sets_every_selected_layer() {
     assert!(s.execute("layer.setTrackMatte", json!({"layers": [ids[0]], "matte": ids[0]})).is_err());
     assert!(s.execute("layer.setTrackMatte", json!({"layer": ids[0], "matte": ids[0]})).is_err());
 }
+
+/// Layer ▸ Mask ▸ New Mask adds a mask to every selected layer (locked ones skipped), in one undo
+/// step; the result names the first layer's mask and lists them all. A named `layer` (a mask drawn
+/// in the viewer) still gets it alone.
+#[test]
+fn new_mask_adds_a_mask_to_every_selected_layer() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    let ids: Vec<u64> =
+        ["C", "B", "A"].iter().map(|name| s.execute("layer.newSolid", json!({"name": name, "color": "#406080"})).unwrap()["layer"].as_u64().unwrap()).collect();
+    let masks = |s: &Session, l: u64| s.active_comp().unwrap().layer(LayerId(l)).unwrap().props.sub("masks").map_or(0, |m| m.children.len());
+    s.execute("layer.select", json!({"layers": ids})).unwrap();
+    let before = s.project.clone();
+    let r = s.execute("layer.addMask", json!({})).unwrap();
+    assert!(ids.iter().all(|l| masks(&s, *l) == 1), "every selected layer has a mask");
+    assert_eq!(r["path"], json!("masks/#1"));
+    assert_eq!(r["masks"].as_array().map(Vec::len), Some(3));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.same_content(&before), "one undo step");
+
+    // A locked layer is left alone.
+    s.execute("layer.setSwitch", json!({"layers": [ids[0]], "switch": "lock", "value": true})).unwrap();
+    s.execute("layer.addMask", json!({"layers": ids})).unwrap();
+    assert_eq!(ids.iter().map(|l| masks(&s, *l)).collect::<Vec<_>>(), [0, 1, 1]);
+
+    // One named layer: that layer only, whatever is selected.
+    s.execute("layer.addMask", json!({"layer": ids[2], "shape": "ellipse", "rect": [10, 10, 40, 40]})).unwrap();
+    assert_eq!(ids.iter().map(|l| masks(&s, *l)).collect::<Vec<_>>(), [0, 1, 2]);
+}

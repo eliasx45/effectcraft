@@ -1273,35 +1273,73 @@ fn precompose(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"comp": new.0.0, "layer": new.1.0}))
 }
 
+/// `layer.addMask`: a new mask on `layer`, else on each of `layers` (or the selected layers, as
+/// Layer ▸ Mask ▸ New Mask in After Effects), locked layers left alone, in one undo step. Without
+/// `rect` each layer's mask is sized to that layer. The result names the first layer's mask, and
+/// `masks` lists one per layer.
 fn add_mask(s: &mut Session, p: &Value) -> Result<Value> {
-    let (cid, lid) = layer_p(s, p, "layer.addMask")?;
-    let layer = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?.clone();
-    let (w, h) = effectcraft_render::source_size(&s.project, &layer);
-    let (w, h) = if w == 0 { (400.0, 300.0) } else { (w as f64, h as f64) };
+    // One named layer (a mask drawn in the viewer, scripts): that layer, an error if it can't
+    // have masks. Several: those that can't (cameras, lights) are skipped.
+    let single = p.get("layer").is_some_and(|v| !v.is_null()) && !matches!(p.get("layers"), Some(Value::Array(_)));
+    let (cid, ids) = if single {
+        let (cid, lid) = layer_p(s, p, "layer.addMask")?;
+        (cid, vec![lid])
+    } else {
+        let (cid, ids) = layers_p(s, p)?;
+        (cid, unlocked(s, cid, ids, "layer.addMask")?)
+    };
+    if ids.is_empty() {
+        return Err(bad("layer.addMask", "no `layer` given and no layer selected"));
+    }
     let shape = str_p(p, "shape").unwrap_or("rect");
     let r = p.get("rect").and_then(Value::as_array).map(|a| [0, 1, 2, 3].map(|i| a.get(i).and_then(Value::as_f64).unwrap_or(0.0)));
-    let (cx, cy, rw, rh) = match r {
-        Some([x, y, rw, rh]) => (x + rw / 2.0, y + rh / 2.0, rw, rh),
-        None => (if w > 0.0 { w / 2.0 } else { 0.0 }, h / 2.0, w * 0.6, h * 0.6),
-    };
-    // The shape tools' masks: rectangle, ellipse, rounded rectangle, polygon or star.
-    let path = super::shape_tool::mask_path(shape, [cx, cy], [rw, rh])
-        .ok_or_else(|| bad("layer.addMask", format!("unknown shape `{shape}`; one of rect, ellipse, rounded, polygon, star")))?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let mut paths = Vec::with_capacity(ids.len());
+    for lid in &ids {
+        let layer = comp.layer(*lid).ok_or(EngineError::NoComp)?;
+        let (w, h) = effectcraft_render::source_size(&s.project, layer);
+        let (w, h) = if w == 0 { (400.0, 300.0) } else { (w as f64, h as f64) };
+        let (cx, cy, rw, rh) = match r {
+            Some([x, y, rw, rh]) => (x + rw / 2.0, y + rh / 2.0, rw, rh),
+            None => (if w > 0.0 { w / 2.0 } else { 0.0 }, h / 2.0, w * 0.6, h * 0.6),
+        };
+        // The shape tools' masks: rectangle, ellipse, rounded rectangle, polygon or star.
+        let path = super::shape_tool::mask_path(shape, [cx, cy], [rw, rh])
+            .ok_or_else(|| bad("layer.addMask", format!("unknown shape `{shape}`; one of rect, ellipse, rounded, polygon, star")))?;
+        paths.push((*lid, path));
+    }
     let mode = str_p(p, "mode").and_then(MaskMode::from_name).unwrap_or(MaskMode::Add);
     let cycle = s.prefs.appearance.cycle_mask_colors;
-    let (uid, nth) = s.edit("New Mask", None, |proj, _| {
+    let added = s.edit("New Mask", None, |proj, _| {
         let mut next = proj.next_id;
-        let l = layer_mut(proj, cid, lid)?;
-        let masks = l.props.sub_mut("masks").ok_or_else(|| bad("layer.addMask", "this layer can't have masks"))?;
-        let n = masks.children.len();
-        let g = build::mask(&mut Ids(&mut next), &format!("Mask {}", n + 1), path, mode, crate::prefs::mask_color(cycle, n));
-        let uid = g.uid;
-        masks.children.push(g.into());
+        let mut added = Vec::with_capacity(paths.len());
+        for (lid, path) in &paths {
+            let l = layer_mut(proj, cid, *lid)?;
+            let Some(masks) = l.props.sub_mut("masks") else {
+                if single {
+                    return Err(bad("layer.addMask", "this layer can't have masks"));
+                }
+                continue;
+            };
+            let n = masks.children.len();
+            let g = build::mask(&mut Ids(&mut next), &format!("Mask {}", n + 1), path.clone(), mode, crate::prefs::mask_color(cycle, n));
+            added.push((*lid, g.uid, n + 1));
+            masks.children.push(g.into());
+        }
+        if added.is_empty() {
+            return Err(bad("layer.addMask", "none of these layers can have masks"));
+        }
         proj.next_id = next;
-        Ok((uid, n + 1))
+        Ok(added)
     })?;
     // `path` addresses the mask's properties (`masks/#2/feather`); `name` is how layer.setMask finds it.
-    Ok(json!({"mask": uid, "path": format!("masks/#{nth}"), "name": format!("Mask {nth}")}))
+    let entry = |(lid, uid, nth): &(LayerId, u64, usize)| json!({"layer": lid.0, "mask": uid, "path": format!("masks/#{nth}"), "name": format!("Mask {nth}")});
+    let masks: Vec<Value> = added.iter().map(entry).collect();
+    let mut out = masks.first().cloned().unwrap_or(Value::Null);
+    if let Value::Object(o) = &mut out {
+        o.insert("masks".into(), Value::Array(masks));
+    }
+    Ok(out)
 }
 
 fn mask_props(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1815,7 +1853,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Mask",
             ["Layer", "Mask"],
             Some("Cmd+Shift+N"),
-            "{layer?, shape?: rect|ellipse|rounded|polygon|star, rect? [x,y,w,h] (layer space; a polygon or star fits its width), mode?} → {mask: uid, path: masks/#n, name}",
+            "{layer? | layers? (default the selected layers), shape?: rect|ellipse|rounded|polygon|star, rect? [x,y,w,h] (layer space; a polygon or star fits its width), mode?} → {mask: uid, path: masks/#n, name} of the first layer, masks: [{layer, mask, path, name}] one per layer",
             has_layers,
             add_mask
         ),
