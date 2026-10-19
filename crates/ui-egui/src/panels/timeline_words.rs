@@ -35,6 +35,11 @@ fn accent(s: &effectcraft_engine::project::speech::Syllable, fps: f64) -> f64 {
     if fps > 0.0 { (v - 1.0 / fps).max(t) } else { t }
 }
 
+/// A word's dot at `x` is drawn only inside the visible part of the bar (`clip`).
+fn dot_visible(x: f32, clip: Rect) -> bool {
+    x >= clip.min.x && x <= clip.max.x
+}
+
 /// Paint the words of `layer` on its bar `bar` (when it is the comp's voice layer).
 pub(crate) fn paint(app: &mut EffectcraftApp, ui: &egui::Ui, gp: &egui::Painter, bar: Rect, tm: TMap, comp: &Comp, layer: &Layer) {
     let Some(map) = comp.speech.as_ref() else { return };
@@ -84,6 +89,11 @@ pub(crate) fn paint(app: &mut EffectcraftApp, ui: &egui::Ui, gp: &egui::Painter,
             r
         } else {
             let x = tm.x(stress.unwrap_or((a + b) / 2.0));
+            // A word that starts before the in point (or ends after the out point) can have its
+            // dot in the trimmed part: hidden like the rest (BUILD2 SX3).
+            if !dot_visible(x, clip) {
+                continue;
+            }
             let (rad, col) = if stress.is_some() { (2.5, DOT_STRESSED) } else { (1.6, DOT) };
             gp.circle_filled(pos2(x, mid), rad, col);
             Rect::from_center_size(pos2(x, mid), vec2(8.0, h))
@@ -104,5 +114,21 @@ pub(crate) fn paint(app: &mut EffectcraftApp, ui: &egui::Ui, gp: &egui::Painter,
     if let Some((i, tip)) = hovered {
         egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new(("tl-word-tip", layer.id.0, i)), egui::PopupAnchor::Pointer)
             .show(|ui| ui.label(tip));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dot_in_the_trimmed_part_of_the_bar_is_hidden() {
+        // BUILD2 SX3: "studying" starts 0.17 s before the in point; its stress dot was drawn left
+        // of the bar, on the trimmed part.
+        let bar = Rect::from_min_max(pos2(761.0, 760.0), pos2(1400.0, 777.0));
+        assert!(!dot_visible(735.0, bar));
+        assert!(dot_visible(761.0, bar));
+        assert!(dot_visible(900.0, bar));
+        assert!(!dot_visible(1400.5, bar));
     }
 }
