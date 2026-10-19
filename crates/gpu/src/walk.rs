@@ -182,10 +182,17 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
         return Some(());
     }
     // Layers whose effects and styles run on the GPU keep their planes there.
-    let (bufs, made) = crate::plane3d::make(e, r, ctx, run);
-    let prep = if bufs.is_empty() { r.prepare_3d_run(ctx, run, canvas.size()) } else { r.prepare_3d_run_with(ctx, run, canvas.size(), &bufs) };
+    let (bufs, made) = {
+        let _profile = effectcraft_render::profile::span("plane3d_make");
+        crate::plane3d::make(e, r, ctx, run)
+    };
+    let prep = {
+        let _profile = effectcraft_render::profile::span("prepare_3d_run");
+        if bufs.is_empty() { r.prepare_3d_run(ctx, run, canvas.size()) } else { r.prepare_3d_run_with(ctx, run, canvas.size(), &bufs) }
+    };
     let drawn = match prep {
         Some(prep) => {
+            let _profile = effectcraft_render::profile::span("draw_3d_run_gpu");
             let below = canvas.float(e)?;
             crate::classic3d::draw_run_made(e, &prep, &below, &made)
         }
@@ -193,7 +200,10 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
     };
     match drawn {
         Some(img) => *canvas = img.into(),
-        None => on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?,
+        None => {
+            let _profile = effectcraft_render::profile::span("draw_3d_cpu_fallback");
+            on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?
+        }
     }
     Some(())
 }
@@ -664,7 +674,11 @@ fn draw_cached_precomp(
         let (sub, item, lt, bs) = source;
         // The window of the nested frame the key stands for.
         let sub = sub.with_clip(clip);
-        let Some(src) = crate::cull::nested(e, ctx, &sub, *item, *lt) else {
+        let nested = {
+            let _profile = effectcraft_render::profile::span("precomp_nested_walk");
+            crate::cull::nested(e, ctx, &sub, *item, *lt)
+        };
+        let Some(src) = nested else {
             return if e.g.check_health().is_ok() { None } else { Some(None) };
         };
         prepare_processed(e, r, ctx, layer, src, *bs, clip.offset(), true)?
@@ -776,6 +790,7 @@ fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, src
 /// source's offset (buffer pixels).
 #[allow(clippy::too_many_arguments)]
 fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut src: Pixels, bs: f64, at: [f64; 2], codes: bool) -> Option<SourceImage> {
+    let _profile = effectcraft_render::profile::span("prepare_processed");
     let pipe = r.pipe();
     let effects = layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty());
     // `masked_source` quantises a non-solid source to the project's depth.

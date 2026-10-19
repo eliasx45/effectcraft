@@ -307,6 +307,7 @@ impl<'a> Renderer<'a> {
     /// what effect `effects` sees. Served from / stored in the layer cache under its own key,
     /// so scrubbing reuses frames rendered for earlier output frames.
     pub fn layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
+        let _profile = crate::profile::span("layer_input");
         let src = match layer.source {
             LayerSource::Comp { .. } if self.cache.is_some() => self.precomp_key(ctx, layer),
             LayerSource::Footage { item } => Some(self.proxy_for(item).is_some() as u64),
