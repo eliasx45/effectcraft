@@ -855,6 +855,12 @@ Property.prototype.property = function () { return null; };
       function fit(a) { var o = []; for (var i = 0; i < n; i++) o.push(a && a[i] ? [a[i][0], a[i][1]] : [0, 0]); return o; }
       return { vertices: fit(v.vertices), in_tangents: fit(v.inTangents), out_tangents: fit(v.outTangents), closed: v.closed !== false };
     }
+    // A gradient (text Gradient Fill Colors, shape gradients): the engine reads
+    // {colors: [[pos, [r, g, b, a]], …], opacities: [[pos, a], …]}, [[pos, colour], …] or [colour, …].
+    if (info.type === "gradient") {
+      if (!v || typeof v !== "object") throw __err("value must be a gradient: {colors: [[position, [r, g, b, a]], …]} or [[position, colour], …]");
+      return v;
+    }
     if (t === "LAYER_INDEX") {
       var idx = v && v.__id !== undefined ? v.index : __num(v);
       if (!idx) return null;

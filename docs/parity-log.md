@@ -1133,3 +1133,33 @@ before.
   held to it, and static nested comps are windowed to what shows. Without the flag (exports,
   RAM preview, every viewer frame up to 100 %, upscaled outputs) nothing changes, and the
   render options' cache keys keep their text. Feature percentages are unchanged.
+
+## Update: text Gradient Fill animator (19 October 2026)
+
+- GRADFILL, an EffectCraft extension (After Effects has no gradient text animator): Animate
+  Text ▸ Gradient Fill adds Gradient Type (Linear / Radial), Gradient Start, Gradient End and
+  Gradient Fill Colors to a text animator. The selected characters are filled with a smooth
+  gradient per pixel, blended over the fill by the selection and stacked in order with Fill
+  Color animators. Start and End are in percent of the box of the group the first selector
+  picks (Based On Words: each word; Lines: each line; Characters: each run of consecutive
+  selected characters; no selector: the whole text), 0,0 top left to 100,100 bottom right,
+  default 0,50 → 100,50; each character carries its part of the gradient when animators move,
+  rotate or scale it. Composition viewer: Gradient Start / End dots on the first group, where
+  the animation draws it (drag = one undo step, snaps to the box's edges and centre, Alt places
+  freely). Properties panel: a colour stops bar per Gradient Fill animator. Animation presets,
+  scripts (`EC Text Gradient Fill`) and expressions carry it; Lottie export drops it with a
+  note; `.aep` import never produces it. Glyphs without a selected gradient draw on the solid
+  path as before (bit-identical). Extruded (Advanced 3D) characters and text → shapes use the colour
+  at the gradient's middle.
+
+## Update: deleting one text animator property (19 October 2026)
+
+- PROP-REMOVE: a single property of a text animator's Properties (Fill Color, Blur, Rotation,
+  Tracking…) can be deleted, as in After Effects: Edit ▸ Clear / the Delete key with it
+  selected in the Timeline, Delete in its row's context menu, scripting's `Property.remove()`,
+  and `prop.removeGroup` (which now also takes these properties and returns `{removed}`).
+  Properties one Animate entry adds together go together: Tracking Type with Tracking Amount,
+  Skew Axis with Skew, Character Alignment / Range with Character Offset (Character Range stays
+  while Character Value uses it), and the four Gradient Fill properties. Fixed properties
+  (a selector's Start / End / Offset, Transform, Source Text…) are refused with an error. One
+  undo step; the removed properties and their keyframes leave the selection.

@@ -1,7 +1,10 @@
 //! Generic edits of property-tree groups by uid: rename, enable, remove, duplicate and reorder an
 //! effect, mask, shape item or text animator (what scripting's `PropertyGroup.name`, `enabled`,
 //! `remove()`, `duplicate()` and `moveTo()` do, and what agents need without a UI selection).
+//! Removing also takes a property a text animator's Properties holds (Fill Color, Blur,
+//! Tracking…), as After Effects' Delete and `Property.remove()` do.
 
+use effectcraft_project::build;
 use effectcraft_project::{ItemId, LayerId, LayerSource, Node, PropGroup, Uid};
 use serde_json::{Value, json};
 
@@ -50,13 +53,65 @@ fn set_enabled(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
-fn remove(s: &mut Session, p: &Value) -> Result<Value> {
-    let (cid, lid, uid) = group_ref(s, p, "prop.removeGroup", true)?;
-    remove_groups(s, cid, &[(lid, uid)], "Delete")?;
-    Ok(Value::Null)
+/// The text animator properties to delete when the properties `uids` of a layer (property tree
+/// `root`) are deleted: each with the rest of its set (Tracking Type with Tracking Amount, the
+/// four Gradient Fill properties; see [`build::TEXT_ANIM_PROP_SETS`]), worked out per animator
+/// so a companion that two deleted properties share goes too. Uids that aren't text animator
+/// properties are skipped.
+fn animator_prop_targets(root: &PropGroup, uids: &[Uid]) -> Vec<Uid> {
+    let mut per: Vec<(&PropGroup, Vec<&str>)> = vec![];
+    for u in uids {
+        let Some(props) = build::text_animator_props_holding(root, *u) else { continue };
+        let Some(m) = props.children.iter().find(|n| n.uid() == *u).map(Node::match_id) else { continue };
+        match per.iter_mut().find(|(g, _)| g.uid == props.uid) {
+            Some((_, picked)) => picked.push(m),
+            None => per.push((props, vec![m])),
+        }
+    }
+    let mut out: Vec<Uid> = vec![];
+    for (props, picked) in &per {
+        for u in build::text_animator_prop_removal(props, picked) {
+            if !out.contains(&u) {
+                out.push(u);
+            }
+        }
+    }
+    out
 }
 
-/// Remove groups of comp `cid` in one undo step.
+/// `prop.removeGroup {layer?, prop: uid}`: deletes an effect, mask, shape item, text animator,
+/// selector or tracker, or a property of a text animator's Properties (with its set). Fixed
+/// groups and properties (Transform, a Range Selector's Start / End / Offset, Source Text…) are
+/// refused. One undo step; returns `{removed: [uid…]}`.
+fn remove(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "prop.removeGroup";
+    let (cid, lid) = layer_p(s, p, C)?;
+    let uid = p.get("prop").and_then(Value::as_u64).ok_or_else(|| bad(C, "missing `prop` (uid)"))?;
+    let l = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
+    let uids = if let Some(g) = l.props.find_group(uid) {
+        if !is_instance(g) {
+            return Err(bad(C, format!("`{}` is a fixed group (only effects, masks, shape items, animators, selectors and trackers)", g.name)));
+        }
+        vec![uid]
+    } else if let Some(prop) = l.props.find(uid) {
+        let set = animator_prop_targets(&l.props, &[uid]);
+        if set.is_empty() {
+            return Err(bad(
+                C,
+                format!("`{}` is a fixed property: only properties added to a text animator's Properties (Animate / Add ▸ Property) can be deleted", prop.name),
+            ));
+        }
+        set
+    } else {
+        return Err(bad(C, format!("no property or property group @{uid}")));
+    };
+    let items: Vec<(LayerId, Uid)> = uids.iter().map(|u| (lid, *u)).collect();
+    remove_groups(s, cid, &items, "Delete")?;
+    Ok(json!({"removed": uids}))
+}
+
+/// Remove groups or text animator properties of comp `cid` in one undo step; selected
+/// properties and keyframes that went with them are deselected.
 fn remove_groups(s: &mut Session, cid: ItemId, groups: &[(LayerId, Uid)], label: &str) -> Result<()> {
     s.edit(label, None, |proj, st| {
         for (lid, uid) in groups {
@@ -65,22 +120,43 @@ fn remove_groups(s: &mut Session, cid: ItemId, groups: &[(LayerId, Uid)], label:
                 parent.children.retain(|n| n.uid() != *uid);
             }
         }
-        st.selected_props.retain(|(_, u)| !groups.iter().any(|(_, g)| g == u));
+        let touched: Vec<LayerId> = groups.iter().map(|(l, _)| *l).collect();
+        let comp = proj.comp(cid);
+        let exists = |l: LayerId, u: Uid| comp.and_then(|c| c.layer(l)).is_some_and(|l| l.props.find(u).is_some() || l.props.find_group(u).is_some());
+        st.selected_props.retain(|(l, u)| !groups.iter().any(|(_, g)| g == u) && (!touched.contains(l) || exists(*l, *u)));
+        st.selected_keys.retain(|k| !touched.contains(&k.layer) || exists(k.layer, k.prop));
         Ok(())
     })
 }
 
-/// Edit ▸ Clear with masks, shape items, text animators or trackers selected in the active comp:
-/// removes those groups (not their layers) in one undo step. None when none are selected.
+/// Edit ▸ Clear with masks, shape items, text animators, selectors or trackers, or properties of
+/// a text animator's Properties (Fill Color, Tracking…, with their sets), selected in the active
+/// comp: removes those (not their layers) in one undo step. None when none are selected.
 pub(crate) fn remove_selected(s: &mut Session) -> Result<Option<Value>> {
     let (Some(cid), Some(c)) = (s.active_comp_id(), s.active_comp()) else { return Ok(None) };
-    let groups: Vec<(LayerId, Uid)> =
-        s.state.selected_props.iter().filter(|(lid, uid)| c.layer(*lid).and_then(|l| l.props.find_group(*uid)).is_some_and(is_instance)).copied().collect();
-    if groups.is_empty() {
+    let sel = &s.state.selected_props;
+    let mut items: Vec<(LayerId, Uid)> =
+        sel.iter().filter(|(lid, uid)| c.layer(*lid).and_then(|l| l.props.find_group(*uid)).is_some_and(is_instance)).copied().collect();
+    let mut layers: Vec<LayerId> = vec![];
+    for (lid, _) in sel {
+        if !layers.contains(lid) {
+            layers.push(*lid);
+        }
+    }
+    for lid in layers {
+        let Some(l) = c.layer(lid) else { continue };
+        let uids: Vec<Uid> = sel.iter().filter(|(sl, _)| *sl == lid).map(|(_, u)| *u).collect();
+        for u in animator_prop_targets(&l.props, &uids) {
+            if !items.contains(&(lid, u)) {
+                items.push((lid, u));
+            }
+        }
+    }
+    if items.is_empty() {
         return Ok(None);
     }
-    remove_groups(s, cid, &groups, "Delete")?;
-    Ok(Some(json!(groups.len())))
+    remove_groups(s, cid, &items, "Delete")?;
+    Ok(Some(json!(items.len())))
 }
 
 /// Shape items (groups, paths, paints and path operations) selected in the Contents of the
@@ -236,7 +312,15 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("prop.renameGroup", "Rename Property Group", [], None, "{layer?, prop: uid, name}", has_layers, rename),
         cmd!("prop.setGroupEnabled", "Enable Property Group", [], None, "{layer?, prop: uid, value?}", has_layers, set_enabled),
-        cmd!("prop.removeGroup", "Delete Property Group", [], None, "{layer?, prop: uid}", has_layers, remove),
+        cmd!(
+            "prop.removeGroup",
+            "Delete Property Group",
+            [],
+            None,
+            "{layer?, prop: uid (an effect, mask, shape item, animator, selector or tracker, or a text animator property: Fill Color, Tracking…)} → {removed: [uid]}",
+            has_layers,
+            remove
+        ),
         cmd!("prop.duplicateGroup", "Duplicate Property Group", [], None, "{layer?, prop: uid} → {prop: new uid}", has_layers, duplicate),
         cmd!("prop.moveGroup", "Reorder Property Group", [], None, "{layer?, prop: uid, index (1-based among its siblings)}", has_layers, move_to),
     ]

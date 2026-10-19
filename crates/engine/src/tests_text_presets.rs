@@ -6,7 +6,7 @@
 
 use effectcraft_keyframe::{Keyframe, Value as KV};
 use effectcraft_project::build::{self, Ids};
-use effectcraft_project::{Expression, ItemId, LayerId};
+use effectcraft_project::{Expression, ItemId, LayerId, Marker};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
@@ -177,6 +177,68 @@ fn families_list_the_cards_with_the_controls_from_their_files() {
     assert_eq!(r["presets"], json!([]));
 }
 
+/// Batch 1: the Motion Library had an old broken "Slide In" card and its remake, so the quick row
+/// showed "Slide In ↑" twice. One preset per name: the newest card (`created_at`, else its file's
+/// time); the older one stays reachable by id.
+#[test]
+fn a_repeated_card_name_lists_once_and_the_newest_card_wins() {
+    let (mut s, _, cap) = studio();
+    let lib = std::path::PathBuf::from(s.prefs.libraries[0].clone());
+    // The old card: same name, another file (one control only).
+    let old = s.execute("layer.newText", json!({"text": "old", "name": "Old"})).unwrap()["layer"].as_u64().unwrap();
+    let main = s.active_comp_id().unwrap();
+    add_control(&mut s, main, old, "ec.control.slider", "Old Travel", KV::Scalar(10.0), &[]);
+    add_fade(&mut s, main, old, "Fade Up", 2, true, "100");
+    let mut cards =
+        vec![json!({"id": "slide-in", "name": "Slide In", "kind": "preset", "category": "Elias/Text animations", "file": "assets/slide-in/preset.ecpreset"})];
+    save_card(&mut s, &lib, &mut cards, old, "slide-in-old", " slide in", "Elias/Text animations");
+    let write = |cards: &[Value]| {
+        let index = json!({"format": "effectcraft-library", "version": 1, "name": "Fixture", "entries": cards});
+        // A different size each time, so the library cache sees the change.
+        std::fs::write(lib.join("library.json"), format!("{index}{}", " ".repeat(pad()))).unwrap();
+    };
+    let listed = |s: &mut Session| -> Vec<(String, String)> {
+        let r = s.execute("text.presetFamilies", json!({})).unwrap();
+        r["presets"].as_array().unwrap().iter().map(|p| (p["name"].as_str().unwrap().to_string(), p["id"].as_str().unwrap().to_string())).collect()
+    };
+    // created_at says which is newer (19 Oct: the remake at 20:46, the broken one at 19:13).
+    cards[0]["created_at"] = json!(1_792_435_580.67);
+    cards[1]["created_at"] = json!(1_792_430_029.52);
+    write(&cards);
+    assert_eq!(listed(&mut s), [("Slide In".to_string(), "slide-in".to_string())]);
+    let r = s.execute_checked("text.apply", json!({"preset": "Slide In", "layers": [cap]})).unwrap();
+    assert_eq!(r["preset"]["id"], "slide-in", "the button applies the newest card: {r:#}");
+    // The other way round (a numeric string counts too).
+    cards[1]["created_at"] = json!("1792439999");
+    write(&cards);
+    assert_eq!(listed(&mut s), [(" slide in".to_string(), "slide-in-old".to_string())]);
+    // By id the hidden card is still there.
+    cards[1]["created_at"] = json!(1.0);
+    write(&cards);
+    let r = s.execute_checked("text.apply", json!({"preset": "slide-in-old", "layers": [cap]})).unwrap();
+    assert_eq!(r["preset"]["id"], "slide-in-old");
+    // Without created_at: the newer file wins.
+    for c in &mut cards {
+        c.as_object_mut().unwrap().remove("created_at");
+    }
+    write(&cards);
+    let at = |id: &str, secs: u64| {
+        let f = std::fs::File::options().write(true).open(lib.join("assets").join(id).join("preset.ecpreset")).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
+    };
+    at("slide-in", 1_792_400_000);
+    at("slide-in-old", 1_792_500_000);
+    assert_eq!(listed(&mut s), [(" slide in".to_string(), "slide-in-old".to_string())]);
+    at("slide-in-old", 1_792_300_000);
+    assert_eq!(listed(&mut s), [("Slide In".to_string(), "slide-in".to_string())]);
+}
+
+/// 1000 bytes more on every call (the library cache keys on the index's size and time).
+fn pad() -> usize {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * 1000
+}
+
 #[test]
 fn apply_brings_the_preset_and_sets_controls_by_name_in_one_undo_step() {
     let (mut s, main, cap) = studio();
@@ -243,6 +305,111 @@ fn sync_makes_a_layer_for_the_words_with_the_reveal_on_the_stressed_syllable() {
     let k = offset_keys(&l);
     assert!((k[0] * 25.0 - 4.0).abs() < 0.01, "{k:?} {r:#}");
     assert!(l.in_point.seconds() <= k[0] + 1e-6 && l.out_point.seconds() >= 1.5);
+    assert!(l.markers.is_empty(), "a preset without markers brings none: {:?}", l.markers);
+}
+
+/// Elias's "In" marker clock (DX1b): the "Fade Up" Offset plays its keys from the "In" marker
+/// over the marker's duration.
+const IN_CLOCK: &str = "var m=null; try{ m=thisLayer.marker.key(\"In\"); }catch(e){}\n\
+if(!m || numKeys<2){ value; } else {\n\
+  var k1=key(1).time, k2=key(numKeys).time, d=Math.max(thisComp.frameDuration, m.duration);\n\
+  valueAtTime(Math.max(k1, Math.min(k2, k1+(time-m.time)/d*(k2-k1))));\n\
+}";
+
+/// A "Marker Fade" card: "Fade Up" by words, Offset keyed −100 → 100 over 0..2 s with the
+/// In-marker expression; "In" at the first key, 0.8 s long (so the reveal runs 0.8 s, not the
+/// keys' 2 s); "Out" (0.3 s long) 0.5 s before the out point. And a 25 fps "Main" comp whose
+/// speech map has "WORKS" stressed at 1.2 s (accent 1.16 s, frame 29). Returns (session, main).
+fn marker_studio() -> (Session, ItemId) {
+    let mut s = Session { expr: Some(std::sync::Arc::new(effectcraft_expr::Expressions)), ..Session::default() };
+    s.execute("comp.new", json!({"name": "Creating Text Presets", "width": 320, "height": 180, "frameRate": 25, "duration": 4.0})).unwrap();
+    let ws = s.active_comp_id().unwrap();
+    let t = s.execute("layer.newText", json!({"text": "Marker fade", "name": "Marker Fade"})).unwrap()["layer"].as_u64().unwrap();
+    add_fade(&mut s, ws, t, "Fade Up", 2, true, "100");
+    s.edit("fixture", None, |proj, _| {
+        let l = crate::commands::layer_mut(proj, ws, LayerId(t))?;
+        l.props.prop_mut("text/animators/#1/selectors/rangeSelector/offset").unwrap().expr = Some(Expression { text: IN_CLOCK.into(), enabled: true });
+        let m = |at: f64, dur: f64, c: &str| Marker {
+            time: Tick::from_seconds_f64(at),
+            duration: Tick::from_seconds_f64(dur),
+            comment: c.into(),
+            ..Default::default()
+        };
+        l.out_point = Tick::from_seconds_f64(4.0);
+        l.markers = vec![m(0.0, 0.8, "In"), m(3.5, 0.3, "Out")];
+        Ok(())
+    })
+    .unwrap();
+    let lib = temp_dir("marker-lib");
+    save_card(&mut s, &lib, &mut vec![], t, "marker-fade", "Marker Fade", "Elias/Text animations");
+
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 25, "duration": 4.0})).unwrap();
+    let main = s.active_comp_id().unwrap();
+    let voice = s.execute("layer.newSolid", json!({"name": "Voice", "width": 20, "height": 20, "color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute(
+        "speech.import",
+        json!({"layer": voice, "map": {"engine": "test", "words": [
+            {"word": "this", "start": 0.4, "end": 0.6},
+            {"word": "WORKS", "start": 1.1, "end": 1.5, "syllables": [{"t": 1.1, "vowel": 1.2, "stress": 1}]}
+        ]}}),
+    )
+    .unwrap();
+    (s, main)
+}
+
+#[test]
+fn sync_moves_the_in_marker_that_times_the_reveal_and_leaves_out_alone() {
+    let (mut s, main) = marker_studio();
+    // A text layer that starts at 0.2 s (its layer time is not comp time) and ends at 3.5 s.
+    let mk = |s: &mut Session| {
+        let c = s.execute("layer.newText", json!({"text": "WORKS", "name": "Caption"})).unwrap()["layer"].as_u64().unwrap();
+        s.edit("fixture", None, |proj, _| {
+            let l = crate::commands::layer_mut(proj, main, LayerId(c))?;
+            (l.start_time, l.in_point, l.out_point) = (Tick::from_seconds_f64(0.2), Tick::from_seconds_f64(0.2), Tick::from_seconds_f64(3.5));
+            Ok(())
+        })
+        .unwrap();
+        c
+    };
+    // Comp seconds of the layer's markers.
+    let marks = |s: &Session, c: u64| -> Vec<(String, f64)> {
+        let l = layer(s, main, c);
+        l.markers.iter().map(|m| (m.comment.clone(), l.comp_time(m.time).seconds())).collect()
+    };
+    let near =
+        |got: &[(String, f64)], want: &[(&str, f64)]| got.len() == want.len() && got.iter().zip(want).all(|(g, w)| g.0 == w.0 && (g.1 - w.1).abs() < 1e-6);
+    let offset_at = |s: &mut Session, c: u64, at: f64| -> f64 {
+        let v = s.execute("prop.get", json!({"layer": c, "path": "text/animators/#1/selectors/rangeSelector/offset", "time": at})).unwrap();
+        assert!(v.get("expressionError").is_none(), "{v:#}");
+        v["evaluated"].as_f64().unwrap_or_else(|| panic!("{v:#}"))
+    };
+
+    // Without sync, `at` places the "In" marker (and the keys) there; "Out" 0.5 s before the out point.
+    let plain = mk(&mut s);
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    s.execute_checked("text.apply", json!({"preset": "Marker Fade", "layers": [plain], "at": 0.6})).unwrap();
+    assert!(near(&marks(&s, plain), &[("In", 0.6), ("Out", 3.0)]), "{:?}", marks(&s, plain));
+    let k = layer(&s, main, plain).comp_time(Tick::from_seconds_f64(offset_keys(&layer(&s, main, plain))[0])).seconds();
+    assert!((k - 0.6).abs() < 1e-6, "{k}");
+
+    // Sync from 0.32 s (frame 8): on the marker's clock the word is half revealed (Offset 0) 0.4 s after
+    // "In", so "In" and the keys move to 1.16 − 0.4 = 0.76 s (frame 19). The keys' own clock
+    // (half way at 1 s) would put them at 0.16 s and leave "In" at 0.32 s.
+    let cap = mk(&mut s);
+    let r = s.execute_checked("text.apply", json!({"preset": "Marker Fade", "layers": [cap], "word": "works", "sync": true, "at": 0.32})).unwrap();
+    let rep = &r["layers"][0];
+    assert_eq!(rep["sync"]["by"], "reveal", "{r:#}");
+    assert!(rep["sync"]["offsetFrames"].as_f64().unwrap().abs() <= 0.6, "{r:#}");
+    assert_eq!(rep["startFrame"], json!(19), "{r:#}");
+    assert!(near(&marks(&s, cap), &[("In", 0.76), ("Out", 3.0)]), "the In marker moved, Out stayed: {:?}", marks(&s, cap));
+    let l = layer(&s, main, cap);
+    let k: Vec<f64> = offset_keys(&l).iter().map(|t| l.comp_time(Tick::from_seconds_f64(*t)).seconds()).collect();
+    assert!((k[0] - 0.76).abs() < 1e-6 && (k[1] - 2.76).abs() < 1e-6, "the keys keep their relation to In: {k:?}");
+    // The real expression: half revealed on the accent, not yet a frame before, fully in after "In" ends.
+    let on = offset_at(&mut s, cap, 1.16);
+    assert!(on.abs() < 1e-6, "Offset on the accent: {on} {r:#}");
+    assert!(offset_at(&mut s, cap, 1.12) < -5.0);
+    assert!((offset_at(&mut s, cap, 1.6) - 100.0).abs() < 1e-6);
 }
 
 #[test]
@@ -284,4 +451,27 @@ fn glow_from_a_project_layer_puts_its_layer_styles_after_transform() {
     let t = top.iter().position(|m| *m == "transform").unwrap();
     assert_eq!(top.get(t + 1), Some(&effectcraft_project::styles::GROUP), "where styles::add_style puts it: {top:?}");
     assert!(l.props.sub(effectcraft_project::styles::GROUP).unwrap().sub("outerGlow").is_some());
+}
+
+#[test]
+fn a_made_layer_keeps_the_out_marker_before_its_new_out_point() {
+    let (mut s, main) = marker_studio();
+    // `words` makes the layer; step 4 trims it to its keys + a hold, after anim.applyPreset put
+    // "Out" 0.5 s before its first out point.
+    let r = s.execute_checked("text.apply", json!({"preset": "Marker Fade", "words": "works", "sync": true})).unwrap();
+    let rep = &r["layers"][0];
+    assert_eq!(rep["created"], json!(true), "{r:#}");
+    let lid = rep["layer"].as_u64().unwrap();
+    let l = layer(&s, main, lid);
+    let out = l.out_point.seconds();
+    // The keys end at 2.76 s (In at 0.76 s, as when syncing an existing layer), + 0.5 s hold,
+    // on the nearest frame (3.24 s): well before the comp's end, where "Out" was first put.
+    assert!((out - 3.24).abs() < 1e-6, "{out} {r:#}");
+    let marks: Vec<(String, f64, f64)> = l.markers.iter().map(|m| (m.comment.clone(), l.comp_time(m.time).seconds(), m.duration.seconds())).collect();
+    let find = |c: &str| marks.iter().find(|m| m.0 == c).cloned().unwrap_or_else(|| panic!("no {c}: {marks:?}"));
+    assert!((find("In").1 - 0.76).abs() < 1e-6, "{marks:?}");
+    let (_, at, dur) = find("Out");
+    assert!((at - (out - 0.5)).abs() < 1e-6, "Out keeps its 0.5 s before the new out point: {marks:?}");
+    assert!(at >= l.in_point.seconds() && at + dur < out, "the exit shows while the layer does: {marks:?}");
+    assert_eq!(marks.len(), 2, "{marks:?}");
 }

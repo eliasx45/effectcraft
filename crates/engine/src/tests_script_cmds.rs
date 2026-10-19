@@ -84,3 +84,19 @@ fn board_splits_a_line_around_its_strongest_word() {
     let b = s.execute("script.board", json!({"lines": [1], "send": false})).unwrap();
     assert!(b["frames"].as_array().unwrap().len() >= 2);
 }
+
+#[test]
+fn gaps_stay_inside_the_comp() {
+    // BUILD2 SX5: words after the comp's end made a gap past it (12 s..573 s in a 12 s comp).
+    let (mut s, l) = talk();
+    let words = json!([{"word": "this", "start": 1.0, "end": 1.3}, {"word": "later", "start": 5.0, "end": 5.4}]);
+    s.execute("speech.import", json!({"layer": l, "map": {"words": words}})).unwrap();
+    s.execute("script.load", json!({"text": "this later", "name": "t.txt"})).unwrap();
+    s.execute("comp.settings", json!({"duration": 3.0})).unwrap();
+    let g = s.execute("script.get", json!({"gapSeconds": 1.0})).unwrap();
+    let gaps = g["gaps"].as_array().unwrap();
+    assert!(!gaps.is_empty(), "{g}");
+    for gap in gaps {
+        assert!(gap["end"].as_f64().unwrap() <= 3.0, "{gap}");
+    }
+}

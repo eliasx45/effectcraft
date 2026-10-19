@@ -4,7 +4,7 @@ use effectcraft_color::{BlendMode, Label};
 use effectcraft_keyframe::{Gradient, ShapePath, TextDoc, Value};
 use effectcraft_time::Tick;
 
-use crate::props::{GroupKind, MaskMode, ParamUi, PropGroup, Property};
+use crate::props::{GroupKind, MaskMode, Node, ParamUi, PropGroup, Property, Uid};
 use crate::{Comp, Layer, LayerId, LayerSource, LightKind, Project, Switches};
 
 /// Id allocator borrowing the project's counter.
@@ -258,6 +258,7 @@ pub const TEXT_ANIMATOR_KINDS: &[(&str, &str)] = &[
     ("fillSaturation", "Fill Color: Saturation"),
     ("fillBrightness", "Fill Color: Brightness"),
     ("fillOpacity", "Fill Color: Opacity"),
+    ("gradientFill", "Gradient Fill"),
     ("strokeColor", "Stroke Color: RGB"),
     ("strokeHue", "Stroke Color: Hue"),
     ("strokeSaturation", "Stroke Color: Saturation"),
@@ -317,6 +318,9 @@ pub fn text_anim_props(ids: &mut Ids, kind: &str, three_d: bool) -> Vec<Property
         "fillSaturation" => vec![pct_slider(ids, "fillSaturation", "Fill Saturation", 0.0, -100.0)],
         "fillBrightness" => vec![pct_slider(ids, "fillBrightness", "Fill Brightness", 0.0, -100.0)],
         "fillOpacity" => vec![pct_slider(ids, "fillOpacity", "Fill Opacity", 100.0, 0.0)],
+        // EffectCraft extension (After Effects has no gradient text animator): see
+        // [`text_gradient_fill_props`].
+        "gradientFill" => text_gradient_fill_props(ids),
         "strokeColor" => vec![ids.prop("strokeColor", "Stroke Color", Value::Color([1.0, 0.0, 0.0, 1.0])).with_ui(ParamUi::Color)],
         "strokeHue" => vec![ids.prop("strokeHue", "Stroke Hue", Value::Scalar(0.0)).with_ui(ParamUi::Angle)],
         "strokeSaturation" => vec![pct_slider(ids, "strokeSaturation", "Stroke Saturation", 0.0, -100.0)],
@@ -334,6 +338,93 @@ pub fn text_anim_props(ids: &mut Ids, kind: &str, three_d: bool) -> Vec<Property
         }
         _ => vec![],
     }
+}
+
+/// Match ids of the Gradient Fill animator properties (an EffectCraft extension).
+pub const GRADIENT_FILL_PROPS: [&str; 4] = ["gradientType", "gradientStart", "gradientEnd", "gradientFillColors"];
+
+/// Properties one Animate / Add ▸ Property entry adds together, as (main properties, companion
+/// settings): deleting any of them deletes the set, as After Effects deletes Tracking Type with
+/// Tracking Amount. A companion stays while another main property that uses it is still there
+/// (Character Range serves both Character Offset and Character Value). Properties in no set
+/// (Fill Color, Blur, X Rotation…) go alone.
+pub const TEXT_ANIM_PROP_SETS: &[(&[&str], &[&str])] = &[
+    (&["tracking"], &["trackingType"]),
+    (&["skew"], &["skewAxis"]),
+    (&["characterOffset"], &["characterAlignment", "characterRange"]),
+    (&["characterValue"], &["characterRange"]),
+    // TODO(verify-tonight): `&[&str; 4]` → `&[&str]` coercion inside the const tuple.
+    (&GRADIENT_FILL_PROPS, &[]),
+];
+
+fn has(list: &[&str], m: &str) -> bool {
+    list.contains(&m)
+}
+
+/// The Properties group of the text animator that holds property `uid` (directly), found from a
+/// layer's property tree `root`: the properties Animate / Add ▸ Property adds, which Delete and
+/// scripting's `remove()` can delete. None for anything else: selectors' Start / End / Offset,
+/// Transform, Source Text, Path Options…
+pub fn text_animator_props_holding(root: &PropGroup, uid: Uid) -> Option<&PropGroup> {
+    let chain = root.node_chain(uid)?;
+    // … / Animators / Animator n / Properties / the property.
+    let i = chain.len().checked_sub(4)?;
+    let tail = (chain.get(i).copied()?, chain.get(i + 1).copied()?, chain.get(i + 2).copied()?, chain.get(i + 3).copied()?);
+    let (Node::Group(anims), Node::Group(anim), Node::Group(props), Node::Prop(_)) = tail else { return None };
+    (anims.match_id == "animators" && anim.match_id == "animator" && anim.is_instance() && props.match_id == "properties").then_some(props)
+}
+
+/// The uids of the properties to delete from a text animator's Properties group `props` when
+/// the ones with match ids `picked` are deleted: each with the rest of its set
+/// ([`TEXT_ANIM_PROP_SETS`]), and companions nothing left needs. Match ids not in `props` are
+/// ignored.
+pub fn text_animator_prop_removal(props: &PropGroup, picked: &[&str]) -> Vec<Uid> {
+    let mut gone: Vec<&str> = picked.to_vec();
+    for (mains, companions) in TEXT_ANIM_PROP_SETS {
+        if picked.iter().any(|m| has(mains, m) || has(companions, m)) {
+            gone.extend(mains.iter().copied());
+        }
+    }
+    let mut extra: Vec<&str> = vec![];
+    for (mains, companions) in TEXT_ANIM_PROP_SETS {
+        if !mains.iter().any(|m| has(&gone, m)) {
+            continue;
+        }
+        for c in companions.iter().copied() {
+            let needed = TEXT_ANIM_PROP_SETS.iter().any(|(others, theirs)| has(theirs, c) && others.iter().any(|m| !has(&gone, m) && props.get(m).is_some()));
+            if !needed {
+                extra.push(c);
+            }
+        }
+    }
+    gone.extend(extra);
+    props.children.iter().filter(|n| matches!(n, Node::Prop(_)) && has(&gone, n.match_id())).map(Node::uid).collect()
+}
+
+/// The default Gradient Fill Colors of a text animator: yellow → orange → red.
+pub fn text_gradient_fill_default() -> Gradient {
+    Gradient {
+        colors: vec![(0.0, [1.0, 0.86, 0.1, 1.0]), (0.5, [1.0, 0.5, 0.05, 1.0]), (1.0, [0.92, 0.12, 0.1, 1.0])],
+        opacities: vec![(0.0, 1.0), (1.0, 1.0)],
+        ..Gradient::default()
+    }
+}
+
+/// Gradient Fill (EffectCraft extension, not in After Effects): the selected characters are
+/// filled with a smooth gradient, per pixel, blended over the fill by the selection like Fill
+/// Color. Gradient Start and End are in percent of the box of the group of characters the
+/// animator's first selector picks (Based On Words: each word; Lines: each line; Characters:
+/// each run of consecutive selected characters; no selector: the whole text): 0,0 is the box's
+/// top left, 100,100 its bottom right, so the default 0,50 → 100,50 runs left to right across
+/// the middle. The box is the characters' outlines in the unanimated layout, and each character
+/// carries its part of the gradient when animators move, rotate or scale it.
+pub fn text_gradient_fill_props(ids: &mut Ids) -> Vec<Property> {
+    vec![
+        fixed(ids.prop("gradientType", "Gradient Type", Value::Enum(0)).with_ui(popup(&["Linear", "Radial"]))),
+        ids.prop("gradientStart", "Gradient Start", Value::Vec2([0.0, 50.0])).with_ui(ParamUi::Percent),
+        ids.prop("gradientEnd", "Gradient End", Value::Vec2([100.0, 50.0])).with_ui(ParamUi::Percent),
+        ids.prop("gradientFillColors", "Gradient Fill Colors", Value::gradient(text_gradient_fill_default())).with_ui(ParamUi::Gradient),
+    ]
 }
 
 fn char_alignment(ids: &mut Ids) -> Property {

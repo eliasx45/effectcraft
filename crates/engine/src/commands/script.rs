@@ -204,7 +204,10 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
     let lines = align_script(script, &map.words);
     let emph = emphasis(&map.words);
     let voice = map.layer;
+    // Only where the voice is heard in the comp: a 575 s voice-over in a 12 s comp reported
+    // 12 s..573 s as a gap.
     let (va, vb) = (map.words.first().map_or(0.0, |w| w.start.seconds()), map.words.last().map_or(0.0, |w| w.end.seconds()));
+    let (va, vb) = (va.max(0.0), vb.min(comp.duration.seconds()).max(va.max(0.0)));
     let gap_list = gaps(&animation_times(&s.project, comp, voice), va, vb, min_gap);
     let summary = b_p(p, "summary").unwrap_or(false);
     let mut out_lines = vec![];

@@ -49,6 +49,7 @@ pub const USAGE_FILE: &str = "usage-log.jsonl";
 /// One stamped action.
 #[derive(Clone, Debug)]
 pub struct Entry {
+    /// The local wall clock, `HH:MM` (the usage log's `ts` stays UTC).
     pub clock: String,
     pub command: String,
     pub label: String,
@@ -97,7 +98,8 @@ pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
         return;
     }
     let (ts, unix) = super::why_chip::iso_now();
-    let clock = ts.get(11..16).unwrap_or("").to_string();
+    // The tab shows the local clock; the log keeps UTC (`ts`) and Unix seconds.
+    let clock = local_clock(unix);
     let by = s.history.author(&s.project).unwrap_or("user").to_string();
     let undo = s.history.undo.last().map(|(l, _)| l.clone());
     let comp = s.active_comp();
@@ -161,6 +163,86 @@ pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
     }
 }
 
+/// `HH:MM` on the local clock for Unix seconds `unix` (UTC when the offset can't be read).
+pub(crate) fn local_clock(unix: u64) -> String {
+    clock_at(unix, local_offset_secs().unwrap_or(0))
+}
+
+/// `HH:MM` of Unix seconds `unix` at `offset` seconds east of UTC.
+pub(crate) fn clock_at(unix: u64, offset: i64) -> String {
+    let t = i64::try_from(unix).unwrap_or(0).saturating_add(offset).rem_euclid(86_400);
+    format!("{:02}:{:02}", t / 3600, t % 3600 / 60)
+}
+
+/// The local UTC offset in seconds, from the OS (`date +%z`; on Windows the registry's
+/// ActiveTimeBias), read again every 10 minutes so a DST change shows up. `None` on the web or when
+/// the OS doesn't say.
+pub(crate) fn local_offset_secs() -> Option<i64> {
+    static CACHE: Mutex<Option<(u64, Option<i64>)>> = Mutex::new(None);
+    let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut g = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((at, off)) = *g
+        && now.abs_diff(at) < 600
+    {
+        return off;
+    }
+    let off = os_offset();
+    *g = Some((now, off));
+    off
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+fn os_offset() -> Option<i64> {
+    let out = std::process::Command::new("date").arg("+%z").output().ok()?;
+    parse_z(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+fn os_offset() -> Option<i64> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("reg")
+        .args(["query", r"HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation", "/v", "ActiveTimeBias"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    parse_reg_bias(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn os_offset() -> Option<i64> {
+    None
+}
+
+/// `date +%z` output (`+0200`, `-0530`) as seconds east of UTC.
+#[cfg_attr(any(windows, target_arch = "wasm32"), allow(dead_code))]
+fn parse_z(text: &str) -> Option<i64> {
+    let t = text.trim();
+    let sign = match t.get(..1)? {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let digits = t.get(1..)?;
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let h: i64 = digits.get(..2)?.parse().ok()?;
+    let m: i64 = digits.get(2..)?.parse().ok()?;
+    (h <= 14 && m < 60).then_some(sign * (h * 3600 + m * 60))
+}
+
+/// `reg query … /v ActiveTimeBias` output (`ActiveTimeBias  REG_DWORD  0xffffff88`: minutes to add
+/// to local time for UTC, as a signed 32-bit value) as seconds east of UTC.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_reg_bias(text: &str) -> Option<i64> {
+    let line = text.lines().find(|l| l.contains("ActiveTimeBias"))?;
+    let hex = line.split_whitespace().find_map(|w| w.strip_prefix("0x"))?;
+    let bias = u32::from_str_radix(hex, 16).ok()? as i32;
+    let off = -i64::from(bias) * 60;
+    (off.abs() <= 14 * 3600).then_some(off)
+}
+
 /// The Motion Library's History tab: newest first, with the command each one ran.
 pub fn history_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: f32) {
     let t = app.tokens;
@@ -202,5 +284,45 @@ pub fn history_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: f
         p.text(pos2(x0, y + 24.0 * s), Align2::LEFT_CENTER, &cmd, Tokens::mono(10.5 * s), t.text_dim);
         app.auto.add(&format!("motionLibrary.history.{i}"), Rect::from_min_max(pos2(x0, y), pos2(area.max.x, y + 32.0 * s)), &head);
         y += 38.0 * s;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 19 Oct 2026 15:40:07 UTC (CX7: the tab showed 15:40 for 17:40 CEST).
+    const T: u64 = 1_792_424_407;
+
+    #[test]
+    fn the_tab_clock_is_local_time() {
+        assert_eq!(clock_at(T, 0), "15:40");
+        assert_eq!(clock_at(T, 2 * 3600), "17:40");
+        assert_eq!(clock_at(T, -(5 * 3600 + 30 * 60)), "10:10");
+        // Across midnight both ways.
+        assert_eq!(clock_at(T, 9 * 3600), "00:40");
+        assert_eq!(clock_at(T - 15 * 3600, -3600), "23:40");
+    }
+
+    #[test]
+    fn os_offsets_parse() {
+        assert_eq!(parse_z("+0200\n"), Some(7200));
+        assert_eq!(parse_z("-0530"), Some(-19_800));
+        assert_eq!(parse_z("+0000"), Some(0));
+        for bad in ["", "0200", "+02", "+2a00", "+9900", "CEST"] {
+            assert_eq!(parse_z(bad), None, "{bad}");
+        }
+        let reg = "\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation\r\n    ActiveTimeBias    REG_DWORD    0xffffff88\r\n";
+        assert_eq!(parse_reg_bias(reg), Some(7200));
+        assert_eq!(parse_reg_bias("    ActiveTimeBias    REG_DWORD    0x12c"), Some(-18_000));
+        assert_eq!(parse_reg_bias("nothing"), None);
+    }
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[test]
+    fn the_os_gives_an_offset() {
+        let off = local_offset_secs().expect("date +%z");
+        assert!(off.abs() <= 14 * 3600);
+        assert_eq!(local_clock(T), clock_at(T, off));
     }
 }

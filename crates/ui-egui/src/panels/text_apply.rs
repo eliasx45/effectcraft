@@ -58,6 +58,11 @@ fn parse_presets(r: &Value) -> Vec<(String, String)> {
     let mut out = vec![];
     for p in r.get("presets").and_then(Value::as_array).into_iter().flatten() {
         let Some(name) = p.get("name").and_then(Value::as_str) else { continue };
+        // One button per name: `text.presetFamilies` already keeps the newest card of a repeated
+        // name; a listing that still repeats one keeps its first.
+        if out.iter().any(|(n, _): &(String, String)| n.trim().eq_ignore_ascii_case(name.trim())) {
+            continue;
+        }
         let controls: Vec<&str> =
             p.get("controls").and_then(Value::as_array).into_iter().flatten().filter_map(|c| c.get("name").and_then(Value::as_str)).collect();
         let label = if controls.is_empty() { name.to_string() } else { format!("{name} · {}", controls.join(", ")) };
@@ -82,5 +87,13 @@ mod tests {
         assert_eq!(got, [("Slide In".to_string(), "Slide In · Travel Distance (px), Animate By".to_string()), ("Bounce In".into(), "Bounce In".into())]);
         assert!(parse_presets(&Value::Null).is_empty());
         assert_eq!(distance_label("far"), "far 150px");
+    }
+
+    /// Batch 1: "Slide In ↑" showed twice (an old card and its remake in the library).
+    #[test]
+    fn a_repeated_name_is_one_button() {
+        let r = json!({"presets": [{"name": "Slide In", "id": "new"}, {"name": "slide in ", "id": "old"}, {"name": "Bounce In"}]});
+        let names: Vec<String> = parse_presets(&r).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["Slide In", "Bounce In"]);
     }
 }

@@ -336,6 +336,34 @@ pub fn align_script(script: &Script, words: &[SpeechWord]) -> Vec<AlignedLine> {
     };
     // The line ad-libs go to: the line of the last script token placed, else the next one's.
     let line_of = |i: usize, last: Option<usize>| last.or_else(|| toks.get(i).map(|t| t.0)).unwrap_or(0);
+    // SX5: where three script words in a row are said, for a resync past a long unscripted stretch
+    // (an intro, a cut line): said trigram -> its word indices, ascending.
+    let mut tri: std::collections::HashMap<[&str; 3], Vec<usize>> = std::collections::HashMap::new();
+    for (k, t) in said.windows(3).enumerate() {
+        if let [a, b, c] = t
+            && !a.is_empty()
+            && !b.is_empty()
+            && !c.is_empty()
+        {
+            tri.entry([a.as_str(), b.as_str(), c.as_str()]).or_default().push(k);
+        }
+    }
+    let far_resync = |i: usize, j: usize| -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for di in 0..n.saturating_sub(i) {
+            if best.is_some_and(|(a, b)| di >= a + b) {
+                break;
+            }
+            let key = (0..3).map(|k| toks.get(i + di + k).map(|t| t.2.as_str()).filter(|x| !x.is_empty())).collect::<Option<Vec<&str>>>();
+            let Some([a, b, c]) = key.as_deref() else { continue };
+            let Some(at) = tri.get(&[*a, *b, *c]) else { continue };
+            let Some(&jj) = at.get(at.partition_point(|&x| x < j)) else { continue };
+            if best.is_none_or(|(x, y)| di + (jj - j) < x + y) {
+                best = Some((di, jj - j));
+            }
+        }
+        best
+    };
     let (mut i, mut j) = (0usize, 0usize);
     let mut last_line: Option<usize> = None;
     while i < n && j < m {
@@ -368,15 +396,20 @@ pub fn align_script(script: &Script, words: &[SpeechWord]) -> Vec<AlignedLine> {
                 }
             }
         }
-        let (di, dj) = resync.unwrap_or((1, 1));
+        // Nothing near: the next place three words in a row agree; nothing anywhere: the rest of
+        // the script isn't said (one wrong word used to throw every later line off).
+        let Some((di, dj)) = resync.or_else(|| far_resync(i, j)) else { break };
         for k in i..(i + di).min(n) {
             if let Some((li, text, _)) = toks.get(k).cloned() {
                 push_said(&mut lines, li, text, None);
                 last_line = Some(li);
             }
         }
-        for k in j..(j + dj).min(m) {
-            push_adlib(&mut lines, line_of(i + di, last_line), k);
+        // A long unscripted stretch (more than LOOKAHEAD words) isn't an ad-lib of a line.
+        if dj <= LOOKAHEAD {
+            for k in j..(j + dj).min(m) {
+                push_adlib(&mut lines, line_of(i + di, last_line), k);
+            }
         }
         i += di;
         j += dj;
@@ -387,8 +420,10 @@ pub fn align_script(script: &Script, words: &[SpeechWord]) -> Vec<AlignedLine> {
             last_line = Some(li);
         }
     }
-    for k in j..m {
-        push_adlib(&mut lines, line_of(n, last_line), k);
+    if m.saturating_sub(j) <= LOOKAHEAD {
+        for k in j..m {
+            push_adlib(&mut lines, line_of(n, last_line), k);
+        }
     }
     lines
 }
@@ -435,6 +470,26 @@ mod tests {
         assert_eq!(lines[0].adlibs(), 1, "“really” is an ad-lib");
         assert_eq!((lines[0].first, lines[0].last), (Some(0), Some(6)));
         assert!(lines[1].cut());
+    }
+
+    #[test]
+    fn a_script_finds_its_words_after_a_long_unscripted_intro() {
+        // BUILD2 SX5: a voice-over with 30 unscripted words before the script's first line put
+        // every script word on "not said" (the look-ahead is 8 words) and the intro on line 1.
+        let script = Script::from_text("s.txt", "Studying the best AI influencer pages in the whole world.\nFrom everyday people posting.");
+        let mut said: Vec<String> = (0..30).map(|k| format!("intro{k}")).collect();
+        said.extend("studying the best ai influencer pages in the world from everyday people posting and more".split(' ').map(String::from));
+        let words: Vec<SpeechWord> = said.iter().enumerate().map(|(i, x)| w(x, i as f64, i as f64 + 0.5)).collect();
+        let lines = align_script(&script, &words);
+        assert_eq!(lines[0].not_said(), 1, "only “whole” wasn't said");
+        assert_eq!(lines[0].adlibs(), 0, "the intro isn't an ad-lib of line 1");
+        assert_eq!((lines[0].first, lines[0].last), (Some(30), Some(38)));
+        assert_eq!((lines[1].first, lines[1].not_said()), (Some(39), 0));
+        // A script that is never said stays unsaid (and fast).
+        let other = Script::from_text("o.txt", "Nothing here matches at all today.");
+        let l = align_script(&other, &words);
+        assert_eq!(l[0].not_said(), 6);
+        assert!(l[0].cut());
     }
 
     #[test]

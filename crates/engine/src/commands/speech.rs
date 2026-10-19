@@ -395,7 +395,7 @@ fn find(s: &mut Session, p: &Value) -> Result<Value> {
         "words": phrase.iter().map(|(i, x)| word_json(*i, x, fps, lead)).collect::<Vec<_>>(),
         "occurrences": all,
     });
-    // TODO(batch1-verify): the playhead moves only when the comp searched is the open one.
+    // The playhead moves only when the comp searched is the open one (checked by hand, BUILD2).
     if b_p(p, "go").unwrap_or(true) && s.active_comp_id() == Some(cid) {
         s.set_time(fr.tick_of(frame));
     }

@@ -19,7 +19,9 @@
 //!   makes a new text layer for a phrase of the speech map. `sync` shifts the preset's keys so the
 //!   stressed syllable of `word` (else the first stressed word) lands on the reveal: when the
 //!   preset has a "Fade Up" animator with keyed Range Selector Offset, the time that Offset
-//!   half-reveals the word's unit; else the speed peak of its main move. `glow` also applies the
+//!   half-reveals the word's unit (on the clock of the layer's "In" marker when the Offset's
+//!   expression plays the keys over it, and that marker moves with the keys; "Out" stays); else
+//!   the speed peak of its main move. `glow` also applies the
 //!   Motion Library style "Caption glow + double shadow". One undo step.
 
 use effectcraft_keyframe::Value as KValue;
@@ -45,6 +47,10 @@ pub const GLOW_STYLE: &str = "Caption glow + double shadow";
 pub const TRAVEL: [(&str, f64); 3] = [("near", 40.0), ("mid", 90.0), ("far", 150.0)];
 /// The animator whose keyed Range Selector Offset `sync` aims (and its copies, "Fade Up · …").
 pub const REVEAL_ANIMATOR: &str = "Fade Up";
+/// The layer marker (by comment) that times Elias's reveal: its expression reads
+/// `thisLayer.marker.key("In")`; `sync` moves it with the keys (DX1b). The exit's "Out" marker
+/// stays where `anim.applyPreset` put it (before the out point).
+pub const IN_MARKER: &str = "In";
 /// Where in a unit's reveal (0 = it starts to appear, 1 = fully in) the sync puts the accent.
 // TODO(batch1-verify): half-revealed is a guess for "the peak" of a Ramp Up reveal with Ease
 // High −100; check the frame with speech.accents / the off-accent lint and tune.
@@ -79,12 +85,15 @@ pub struct TextPreset {
     pub doc: Value,
 }
 
-/// A text animation card: (id, name, file on this machine).
+/// A text animation card: (id, name, file on this machine, when it was made).
 #[derive(Clone, Debug)]
 struct CardRef {
     id: String,
     name: String,
     file: Option<String>,
+    /// Unix seconds: the index's `created_at`, else the file's modification time, else 0 (a
+    /// catalog card).
+    created: f64,
 }
 
 fn category_p(p: &Value) -> String {
@@ -97,12 +106,21 @@ fn in_category(cat: &str, want: &str) -> bool {
     c == w || c.starts_with(&format!("{w}/"))
 }
 
-/// The preset cards of `category`: this Mac's library folders first, then the catalog's.
+/// The preset cards of `category`, one per name (see [`one_per_name`]).
 fn cards(s: &Session, category: &str) -> Vec<CardRef> {
+    let mut out = one_per_name(all_cards(s, category));
+    out.truncate(MAX_PRESETS);
+    out
+}
+
+/// Every preset card of `category`, by name: this Mac's library folders first, then the catalog's.
+fn all_cards(s: &Session, category: &str) -> Vec<CardRef> {
     let mut out: Vec<CardRef> = vec![];
     for e in s.motion_library_local().values() {
         if e.kind.eq_ignore_ascii_case("preset") && in_category(&e.category, category) {
-            out.push(CardRef { id: e.id.clone(), name: e.name.clone(), file: Some(e.file.clone()).filter(|f| !f.is_empty()) });
+            let file = Some(e.file.clone()).filter(|f| !f.is_empty());
+            let created = e.created.or_else(|| file.as_deref().and_then(modified)).unwrap_or(0.0);
+            out.push(CardRef { id: e.id.clone(), name: e.name.clone(), file, created });
         }
     }
     if let Ok(client) = s.motion_library()
@@ -110,13 +128,46 @@ fn cards(s: &Session, category: &str) -> Vec<CardRef> {
     {
         for c in &cat.cards {
             if c.kind.eq_ignore_ascii_case("preset") && in_category(&c.category, category) && !out.iter().any(|x| x.id == c.id) {
-                out.push(CardRef { id: c.id.clone(), name: c.name.clone(), file: None });
+                out.push(CardRef { id: c.id.clone(), name: c.name.clone(), file: None, created: 0.0 });
             }
         }
     }
     out.sort_by_key(|c| c.name.to_lowercase());
-    out.truncate(MAX_PRESETS);
+    out.truncate(MAX_PRESETS.saturating_mul(4));
     out
+}
+
+/// One card per name (case and outer spaces ignored): when a name repeats (an old card and its
+/// remake, e.g. two "Slide In"), the newest one wins; the others stay reachable by id.
+fn one_per_name(list: Vec<CardRef>) -> Vec<CardRef> {
+    let mut out: Vec<CardRef> = vec![];
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for c in list {
+        let key = c.name.trim().to_lowercase();
+        match at.get(&key).and_then(|i| out.get_mut(*i)) {
+            Some(x) if c.created > x.created => *x = c,
+            Some(_) => {}
+            None => {
+                at.insert(key, out.len());
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// A file's modification time in Unix seconds (none on the web or when it can't be read).
+fn modified(path: &str) -> Option<f64> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let t = std::fs::metadata(path).ok()?.modified().ok()?;
+        Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        None
+    }
 }
 
 fn parse_preset(bytes: &[u8], what: &str, cmd: &str) -> Result<Value> {
@@ -178,8 +229,10 @@ pub fn find_preset(s: &Session, p: &Value, query: &str, cmd: &str) -> Result<Tex
         return Ok(TextPreset { name, id: None, path: Some(q.to_string()), source: "file", doc });
     }
     let category = category_p(p);
-    let list = cards(s, &category);
-    let hit = list.iter().find(|c| c.id == q).or_else(|| list.iter().find(|c| c.name.trim().eq_ignore_ascii_case(q)));
+    let all = all_cards(s, &category);
+    let list = one_per_name(all.clone());
+    // By id any card (an older one with a repeated name too); by name the newest.
+    let hit = all.iter().find(|c| c.id == q).or_else(|| list.iter().find(|c| c.name.trim().eq_ignore_ascii_case(q)));
     match hit {
         Some(c) => load_card(s, c, cmd),
         None => Err(bad(cmd, format!("no text preset “{q}” in Motion Library ▸ {category}; there are: {}", names_of(&list, &category)))),
@@ -547,21 +600,45 @@ fn reveal_peak(s: &Session, cid: ItemId, l: &Layer, word: &str) -> Option<f64> {
     let target = c - 100.0 + 100.0 * UNIT_PEAK;
     const STEPS: u32 = 64;
     let (a0, span) = (k0.seconds(), (k1 - k0).seconds());
+    // Key time (layer s) → comp s: through the "In" marker when the Offset's expression plays
+    // the keys over it (DX1b), else the layer's clock.
+    let marker = in_marker_clock(l, &off, comp.frame_rate.frame_duration());
+    let to_comp = |tk: f64| match marker {
+        Some((m, d)) if span > 0.0 => m + (tk - a0) / span * d,
+        _ => l.comp_time(Tick::from_seconds_f64(tk)).seconds(),
+    };
     let at = |t: f64| off.value_at(Tick::from_seconds_f64(t)).as_f64();
     let mut prev = (a0, at(a0));
     if (prev.1 - target).abs() < 1e-9 {
-        return Some(l.comp_time(k0).seconds());
+        return Some(to_comp(a0));
     }
     for j in 1..=STEPS {
         let t = a0 + span * f64::from(j) / f64::from(STEPS);
         let v = at(t);
         if (prev.1 - target) * (v - target) <= 0.0 && (v - prev.1).abs() > 1e-12 {
             let tl = prev.0 + (target - prev.1) / (v - prev.1) * (t - prev.0);
-            return Some(l.comp_time(Tick::from_seconds_f64(tl)).seconds());
+            return Some(to_comp(tl));
         }
         prev = (t, v);
     }
     None
+}
+
+/// The layer marker whose comment is [`IN_MARKER`] (the first, as `marker.key("In")` finds it).
+fn in_marker(l: &Layer) -> Option<&effectcraft_project::Marker> {
+    l.markers.iter().find(|m| m.comment == IN_MARKER)
+}
+
+/// When the reveal is timed by the layer's "In" marker (Elias's presets since PRESET-MARKERS:
+/// the Offset's expression plays its keys from the marker's time over its duration,
+/// `valueAtTime(k1 + (time − m.time)/d·(k2 − k1))`, `d = max(frameDuration, m.duration)`): the
+/// marker's comp time and `d` (s). `None` when the layer has no "In" marker or the Offset has no
+/// enabled expression that reads markers (then its keys play on the layer's clock).
+fn in_marker_clock(l: &Layer, off: &effectcraft_project::Property, frame: Tick) -> Option<(f64, f64)> {
+    let reads_marker = off.expr.as_ref().is_some_and(|e| e.enabled && e.text.contains("marker"));
+    let m = in_marker(l).filter(|_| reads_marker)?;
+    let d = m.duration.max(frame).seconds();
+    (d.is_finite() && d > 0.0).then(|| (l.comp_time(m.time).seconds(), d))
 }
 
 /// The time (comp s) `sync` lands on the accent, and how it was found.
@@ -800,7 +877,7 @@ fn set_controls(s: &mut Session, cid: ItemId, lid: LayerId, sets: &[(String, Val
 }
 
 /// Move every key the preset put on the layer (its animators, effects and properties, by name
-/// and path) by `shift`.
+/// and path) and its "In" marker by `shift`.
 fn shift_preset_keys(s: &mut Session, cid: ItemId, lid: LayerId, doc: &Value, shift: Tick) -> Result<()> {
     let anims = animator_names(doc);
     let fx_names: Vec<String> =
@@ -835,8 +912,52 @@ fn shift_preset_keys(s: &mut Session, cid: ItemId, lid: LayerId, doc: &Value, sh
                 move_keys(pr);
             }
         }
+        // The "In" marker moves with the keys, so the reveal it times moves too (DX1b); "Out"
+        // stays. Locked markers stay (anim.applyPreset already skipped them with a note).
+        if !l.markers_locked
+            && let Some(m) = l.markers.iter_mut().find(|m| m.comment == IN_MARKER)
+        {
+            m.time += shift;
+            l.markers.sort_by_key(|m| m.time);
+        }
         Ok(())
     })
+}
+
+/// The preset's markers anchored to the out point (`anim.savePreset` writes `anchor: "out"` and
+/// `time` = how long before the out point): (comment, that distance).
+fn out_anchored(doc: &Value) -> Vec<(String, Tick)> {
+    doc.get("markers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("anchor").and_then(Value::as_str) == Some("out"))
+        .filter_map(|m| {
+            let mk: effectcraft_project::Marker = serde_json::from_value(m.clone()).ok()?;
+            Some((mk.comment, mk.time.clamp(Tick::MIN, Tick::MAX)))
+        })
+        .collect()
+}
+
+/// Moves the out-anchored markers `anim.applyPreset` placed (at `old_out` − their distance, layer
+/// time) to the layer's out point now − their distance, the rule it places them by. Locked markers
+/// stay (applyPreset skipped them).
+fn follow_out_point(l: &mut Layer, outs: &[(String, Tick)], old_out: Tick) {
+    let new_out = l.layer_time(l.out_point);
+    if outs.is_empty() || l.markers_locked || new_out == old_out {
+        return;
+    }
+    let mut moved = false;
+    for (comment, dist) in outs {
+        let placed = old_out - *dist;
+        if let Some(m) = l.markers.iter_mut().find(|m| m.comment == *comment && m.time == placed) {
+            m.time = new_out - *dist;
+            moved = true;
+        }
+    }
+    if moved {
+        l.markers.sort_by_key(|m| m.time);
+    }
 }
 
 fn run(s: &mut Session, p: &Value, cid: ItemId, preset: &TextPreset, sets: &[(String, Value)], o: &Opts, notes: &mut Vec<String>) -> Result<Value> {
@@ -844,6 +965,7 @@ fn run(s: &mut Session, p: &Value, cid: ItemId, preset: &TextPreset, sets: &[(St
     let fr = s.project.comp(cid).ok_or(EngineError::NoComp)?.frame_rate;
     let fps = fr.as_f64();
     let mut reports = vec![];
+    let out_markers = out_anchored(&preset.doc);
     for job in &jobs {
         // 1. The preset, from the start (same-named effects and animators replaced).
         let start = fr.snap_nearest(Tick::from_seconds_f64(job.start));
@@ -892,8 +1014,12 @@ fn run(s: &mut Session, p: &Value, cid: ItemId, preset: &TextPreset, sets: &[(St
             if let (true, Some((a, b))) = (job.created, job.span) {
                 let inn = first.map_or(fr.snap_nearest(Tick::from_seconds_f64(a)), |f| f.min(fr.snap_nearest(Tick::from_seconds_f64(a))));
                 let end = last.unwrap_or(inn).max(Tick::from_seconds_f64(b)) + Tick::from_seconds_f64(HOLD);
+                let old_out = l.layer_time(l.out_point);
                 l.in_point = inn;
                 l.out_point = fr.snap_nearest(end).max(inn + fr.frame_duration());
+                // anim.applyPreset put the out-anchored markers ("Out") before the made layer's
+                // first out point; they keep their distance from the new one (DX1c).
+                follow_out_point(l, &out_markers, old_out);
             }
             Ok((l.name.clone(), first.is_some_and(|f| f < l.in_point)))
         })?;
@@ -1020,7 +1146,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Text Preset",
             [],
             None,
-            "{preset (a text preset card of Motion Library ▸ Elias ▸ Text animations by name or id, e.g. \"Slide In\" (text.presetFamilies lists them), or a .ecpreset path), layers? (text layers; default the selected ones unless `words` is given), words? (a phrase of the comp's speech map as text, or [from, to] / {from, to} speech-map word indices: a new text layer shows it, timed to it), word? (the word to sync on; also the text when neither layers nor words are given), occurrence? (1-based, of words or word), controls? ({\"Travel Distance (px)\": 40, \"Animate By\": \"Words\"}: the preset's Expression Controls by exact name; a dropdown takes an item name or 0-based index; an unknown name is an error), distance? (near|mid|far or px: every control named with “Travel” to 40/90/150 px, when the preset has one), sync? (bool: the stressed syllable of `word`, else the first stressed word, lands on the “Fade Up” reveal of its unit (else the main move's speed peak); the preset's keys shift), glow? (bool: also the Motion Library style “Caption glow + double shadow”), at? (comp s: where the preset's keys start; default the layer's in point), category? (default \"Elias/Text animations\"), comp?} → {preset: {name, id, path, source, controls}, comp, sync, layers: [{layer, name, created, start, startFrame, applied, controls, skipped?, warning?, sync?: {word, by (reveal|speedPeak), accentFrame, peakFrame, offsetFrames}}], glow?, followUp? ([{command, params}] the app runs next), notes}. One undo step",
+            "{preset (a text preset card of Motion Library ▸ Elias ▸ Text animations by name or id, e.g. \"Slide In\" (text.presetFamilies lists them), or a .ecpreset path), layers? (text layers; default the selected ones unless `words` is given), words? (a phrase of the comp's speech map as text, or [from, to] / {from, to} speech-map word indices: a new text layer shows it, timed to it), word? (the word to sync on; also the text when neither layers nor words are given), occurrence? (1-based, of words or word), controls? ({\"Travel Distance (px)\": 40, \"Animate By\": \"Words\"}: the preset's Expression Controls by exact name; a dropdown takes an item name or 0-based index; an unknown name is an error), distance? (near|mid|far or px: every control named with “Travel” to 40/90/150 px, when the preset has one), sync? (bool: the stressed syllable of `word`, else the first stressed word, lands on the “Fade Up” reveal of its unit (else the main move's speed peak); the preset's keys and its \"In\" marker shift, \"Out\" stays), glow? (bool: also the Motion Library style “Caption glow + double shadow”), at? (comp s: where the preset's keys start; default the layer's in point), category? (default \"Elias/Text animations\"), comp?} → {preset: {name, id, path, source, controls}, comp, sync, layers: [{layer, name, created, start, startFrame, applied, controls, skipped?, warning?, sync?: {word, by (reveal|speedPeak), accentFrame, peakFrame, offsetFrames}}], glow?, followUp? ([{command, params}] the app runs next), notes}. One undo step",
             has_comp,
             apply
         ),

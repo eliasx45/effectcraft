@@ -155,6 +155,8 @@ mod ui_tabs;
 mod ui_tail;
 #[path = "../ui_text_edit.rs"]
 mod ui_text_edit;
+#[path = "../ui_text_gradient.rs"]
+mod ui_text_gradient;
 #[path = "../ui_theme_favorites.rs"]
 mod ui_theme_favorites;
 #[path = "../ui_time_zoom_controls.rs"]
@@ -217,6 +219,8 @@ mod ui_quick_offset;
 #[path = "../ui_video_preview_off.rs"]
 mod ui_video_preview_off;
 
+#[path = "../ui_animator_prop_delete.rs"]
+mod ui_animator_prop_delete;
 #[path = "../ui_effect_drop_highlight.rs"]
 mod ui_effect_drop_highlight;
 #[path = "../ui_media_browser_cache.rs"]

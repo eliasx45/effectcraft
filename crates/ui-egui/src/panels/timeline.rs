@@ -4059,6 +4059,11 @@ fn prop_menu(
     let (key, label) = if prop.expr.is_some() { ("removeExpression", "Remove Expression") } else { ("addExpression", "Add Expression") };
     item(ui, key, label, false, "prop.setExpression", json!({"layer": l, "prop": uid}));
     item(ui, "essentialGraphics", "Add Property to Essential Graphics", false, "essential.addProperty", json!({"comp": comp.0, "layer": l, "prop": uid}));
+    // A text animator's property (Fill Color, Tracking…) can be deleted on its own, with its set.
+    if effectcraft_engine::project::build::text_animator_props_holding(&layer.props, uid).is_some() {
+        ui.separator();
+        item(ui, "delete", "Delete", false, "prop.removeGroup", json!({"comp": comp.0, "layer": l, "prop": uid}));
+    }
 }
 
 /// Whether `layer` shows vector footage (SVG, PDF, AI, EPS).

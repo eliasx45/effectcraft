@@ -354,7 +354,7 @@ fn save_style(s: &mut Session, p: &Value) -> Result<Value> {
     s.prefs.extra.insert(SAVED_KEY.into(), Value::Array(saved));
     s.save_prefs();
     s.prefs_revision += 1;
-    // TODO(batch1-verify): the Motion Library backend (backend.py save_asset) has no card-style kind
+    // The Motion Library backend (backend.py save_asset) has no card-style kind
     // yet, so the style lives in the settings (shown as Motion Library ▸ Elias ▸ Cards on the wheel)
     // and not as a library card.
     let st = CardStyle { id, label, aspect, radius, saved: true };
