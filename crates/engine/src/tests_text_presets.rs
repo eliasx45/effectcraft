@@ -6,7 +6,7 @@
 
 use effectcraft_keyframe::{Keyframe, Value as KV};
 use effectcraft_project::build::{self, Ids};
-use effectcraft_project::{Expression, ItemId, LayerId};
+use effectcraft_project::{Expression, ItemId, LayerId, Marker};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
@@ -243,6 +243,106 @@ fn sync_makes_a_layer_for_the_words_with_the_reveal_on_the_stressed_syllable() {
     let k = offset_keys(&l);
     assert!((k[0] * 25.0 - 4.0).abs() < 0.01, "{k:?} {r:#}");
     assert!(l.in_point.seconds() <= k[0] + 1e-6 && l.out_point.seconds() >= 1.5);
+    assert!(l.markers.is_empty(), "a preset without markers brings none: {:?}", l.markers);
+}
+
+/// Elias's "In" marker clock (DX1b): the "Fade Up" Offset plays its keys from the "In" marker
+/// over the marker's duration.
+const IN_CLOCK: &str = "var m=null; try{ m=thisLayer.marker.key(\"In\"); }catch(e){}\n\
+if(!m || numKeys<2){ value; } else {\n\
+  var k1=key(1).time, k2=key(numKeys).time, d=Math.max(thisComp.frameDuration, m.duration);\n\
+  valueAtTime(Math.max(k1, Math.min(k2, k1+(time-m.time)/d*(k2-k1))));\n\
+}";
+
+#[test]
+fn sync_moves_the_in_marker_that_times_the_reveal_and_leaves_out_alone() {
+    // A "Marker Fade" card: "Fade Up" by words, Offset keyed −100 → 100 over 0..2 s with the
+    // In-marker expression; "In" at the first key, 0.8 s long (so the reveal runs 0.8 s, not the
+    // keys' 2 s); "Out" 0.5 s before the out point.
+    let mut s = Session { expr: Some(std::sync::Arc::new(effectcraft_expr::Expressions)), ..Session::default() };
+    s.execute("comp.new", json!({"name": "Creating Text Presets", "width": 320, "height": 180, "frameRate": 25, "duration": 4.0})).unwrap();
+    let ws = s.active_comp_id().unwrap();
+    let t = s.execute("layer.newText", json!({"text": "Marker fade", "name": "Marker Fade"})).unwrap()["layer"].as_u64().unwrap();
+    add_fade(&mut s, ws, t, "Fade Up", 2, true, "100");
+    s.edit("fixture", None, |proj, _| {
+        let l = crate::commands::layer_mut(proj, ws, LayerId(t))?;
+        l.props.prop_mut("text/animators/#1/selectors/rangeSelector/offset").unwrap().expr = Some(Expression { text: IN_CLOCK.into(), enabled: true });
+        let m = |at: f64, dur: f64, c: &str| Marker {
+            time: Tick::from_seconds_f64(at),
+            duration: Tick::from_seconds_f64(dur),
+            comment: c.into(),
+            ..Default::default()
+        };
+        l.out_point = Tick::from_seconds_f64(4.0);
+        l.markers = vec![m(0.0, 0.8, "In"), m(3.5, 0.3, "Out")];
+        Ok(())
+    })
+    .unwrap();
+    let lib = temp_dir("marker-lib");
+    save_card(&mut s, &lib, &mut vec![], t, "marker-fade", "Marker Fade", "Elias/Text animations");
+
+    // Main: "WORKS" stressed at 1.2 s (accent 1.16 s, frame 29); a text layer that starts at
+    // 0.2 s (its layer time is not comp time) and ends at 3.5 s.
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 25, "duration": 4.0})).unwrap();
+    let main = s.active_comp_id().unwrap();
+    let voice = s.execute("layer.newSolid", json!({"name": "Voice", "width": 20, "height": 20, "color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute(
+        "speech.import",
+        json!({"layer": voice, "map": {"engine": "test", "words": [
+            {"word": "this", "start": 0.4, "end": 0.6},
+            {"word": "WORKS", "start": 1.1, "end": 1.5, "syllables": [{"t": 1.1, "vowel": 1.2, "stress": 1}]}
+        ]}}),
+    )
+    .unwrap();
+    let mk = |s: &mut Session| {
+        let c = s.execute("layer.newText", json!({"text": "WORKS", "name": "Caption"})).unwrap()["layer"].as_u64().unwrap();
+        s.edit("fixture", None, |proj, _| {
+            let l = crate::commands::layer_mut(proj, main, LayerId(c))?;
+            (l.start_time, l.in_point, l.out_point) = (Tick::from_seconds_f64(0.2), Tick::from_seconds_f64(0.2), Tick::from_seconds_f64(3.5));
+            Ok(())
+        })
+        .unwrap();
+        c
+    };
+    // Comp seconds of the layer's markers.
+    let marks = |s: &Session, c: u64| -> Vec<(String, f64)> {
+        let l = layer(s, main, c);
+        l.markers.iter().map(|m| (m.comment.clone(), l.comp_time(m.time).seconds())).collect()
+    };
+    let near =
+        |got: &[(String, f64)], want: &[(&str, f64)]| got.len() == want.len() && got.iter().zip(want).all(|(g, w)| g.0 == w.0 && (g.1 - w.1).abs() < 1e-6);
+    let offset_at = |s: &mut Session, c: u64, at: f64| -> f64 {
+        let v = s.execute("prop.get", json!({"layer": c, "path": "text/animators/#1/selectors/rangeSelector/offset", "time": at})).unwrap();
+        assert!(v.get("expressionError").is_none(), "{v:#}");
+        v["evaluated"].as_f64().unwrap_or_else(|| panic!("{v:#}"))
+    };
+
+    // Without sync, `at` places the "In" marker (and the keys) there; "Out" 0.5 s before the out point.
+    let plain = mk(&mut s);
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    s.execute_checked("text.apply", json!({"preset": "Marker Fade", "layers": [plain], "at": 0.6})).unwrap();
+    assert!(near(&marks(&s, plain), &[("In", 0.6), ("Out", 3.0)]), "{:?}", marks(&s, plain));
+    let k = layer(&s, main, plain).comp_time(Tick::from_seconds_f64(offset_keys(&layer(&s, main, plain))[0])).seconds();
+    assert!((k - 0.6).abs() < 1e-6, "{k}");
+
+    // Sync from 0.32 s (frame 8): on the marker's clock the word is half revealed (Offset 0) 0.4 s after
+    // "In", so "In" and the keys move to 1.16 − 0.4 = 0.76 s (frame 19). The keys' own clock
+    // (half way at 1 s) would put them at 0.16 s and leave "In" at 0.32 s.
+    let cap = mk(&mut s);
+    let r = s.execute_checked("text.apply", json!({"preset": "Marker Fade", "layers": [cap], "word": "works", "sync": true, "at": 0.32})).unwrap();
+    let rep = &r["layers"][0];
+    assert_eq!(rep["sync"]["by"], "reveal", "{r:#}");
+    assert!(rep["sync"]["offsetFrames"].as_f64().unwrap().abs() <= 0.6, "{r:#}");
+    assert_eq!(rep["startFrame"], json!(19), "{r:#}");
+    assert!(near(&marks(&s, cap), &[("In", 0.76), ("Out", 3.0)]), "the In marker moved, Out stayed: {:?}", marks(&s, cap));
+    let l = layer(&s, main, cap);
+    let k: Vec<f64> = offset_keys(&l).iter().map(|t| l.comp_time(Tick::from_seconds_f64(*t)).seconds()).collect();
+    assert!((k[0] - 0.76).abs() < 1e-6 && (k[1] - 2.76).abs() < 1e-6, "the keys keep their relation to In: {k:?}");
+    // The real expression: half revealed on the accent, not yet a frame before, fully in after "In" ends.
+    let on = offset_at(&mut s, cap, 1.16);
+    assert!(on.abs() < 1e-6, "Offset on the accent: {on} {r:#}");
+    assert!(offset_at(&mut s, cap, 1.12) < -5.0);
+    assert!((offset_at(&mut s, cap, 1.6) - 100.0).abs() < 1e-6);
 }
 
 #[test]

@@ -19,7 +19,9 @@
 //!   makes a new text layer for a phrase of the speech map. `sync` shifts the preset's keys so the
 //!   stressed syllable of `word` (else the first stressed word) lands on the reveal: when the
 //!   preset has a "Fade Up" animator with keyed Range Selector Offset, the time that Offset
-//!   half-reveals the word's unit; else the speed peak of its main move. `glow` also applies the
+//!   half-reveals the word's unit (on the clock of the layer's "In" marker when the Offset's
+//!   expression plays the keys over it, and that marker moves with the keys; "Out" stays); else
+//!   the speed peak of its main move. `glow` also applies the
 //!   Motion Library style "Caption glow + double shadow". One undo step.
 
 use effectcraft_keyframe::Value as KValue;
@@ -45,6 +47,10 @@ pub const GLOW_STYLE: &str = "Caption glow + double shadow";
 pub const TRAVEL: [(&str, f64); 3] = [("near", 40.0), ("mid", 90.0), ("far", 150.0)];
 /// The animator whose keyed Range Selector Offset `sync` aims (and its copies, "Fade Up · …").
 pub const REVEAL_ANIMATOR: &str = "Fade Up";
+/// The layer marker (by comment) that times Elias's reveal: its expression reads
+/// `thisLayer.marker.key("In")`; `sync` moves it with the keys (DX1b). The exit's "Out" marker
+/// stays where `anim.applyPreset` put it (before the out point).
+pub const IN_MARKER: &str = "In";
 /// Where in a unit's reveal (0 = it starts to appear, 1 = fully in) the sync puts the accent.
 // TODO(batch1-verify): half-revealed is a guess for "the peak" of a Ramp Up reveal with Ease
 // High −100; check the frame with speech.accents / the off-accent lint and tune.
@@ -547,21 +553,45 @@ fn reveal_peak(s: &Session, cid: ItemId, l: &Layer, word: &str) -> Option<f64> {
     let target = c - 100.0 + 100.0 * UNIT_PEAK;
     const STEPS: u32 = 64;
     let (a0, span) = (k0.seconds(), (k1 - k0).seconds());
+    // Key time (layer s) → comp s: through the "In" marker when the Offset's expression plays
+    // the keys over it (DX1b), else the layer's clock.
+    let marker = in_marker_clock(l, &off, comp.frame_rate.frame_duration());
+    let to_comp = |tk: f64| match marker {
+        Some((m, d)) if span > 0.0 => m + (tk - a0) / span * d,
+        _ => l.comp_time(Tick::from_seconds_f64(tk)).seconds(),
+    };
     let at = |t: f64| off.value_at(Tick::from_seconds_f64(t)).as_f64();
     let mut prev = (a0, at(a0));
     if (prev.1 - target).abs() < 1e-9 {
-        return Some(l.comp_time(k0).seconds());
+        return Some(to_comp(a0));
     }
     for j in 1..=STEPS {
         let t = a0 + span * f64::from(j) / f64::from(STEPS);
         let v = at(t);
         if (prev.1 - target) * (v - target) <= 0.0 && (v - prev.1).abs() > 1e-12 {
             let tl = prev.0 + (target - prev.1) / (v - prev.1) * (t - prev.0);
-            return Some(l.comp_time(Tick::from_seconds_f64(tl)).seconds());
+            return Some(to_comp(tl));
         }
         prev = (t, v);
     }
     None
+}
+
+/// The layer marker whose comment is [`IN_MARKER`] (the first, as `marker.key("In")` finds it).
+fn in_marker(l: &Layer) -> Option<&effectcraft_project::Marker> {
+    l.markers.iter().find(|m| m.comment == IN_MARKER)
+}
+
+/// When the reveal is timed by the layer's "In" marker (Elias's presets since PRESET-MARKERS:
+/// the Offset's expression plays its keys from the marker's time over its duration,
+/// `valueAtTime(k1 + (time − m.time)/d·(k2 − k1))`, `d = max(frameDuration, m.duration)`): the
+/// marker's comp time and `d` (s). `None` when the layer has no "In" marker or the Offset has no
+/// enabled expression that reads markers (then its keys play on the layer's clock).
+fn in_marker_clock(l: &Layer, off: &effectcraft_project::Property, frame: Tick) -> Option<(f64, f64)> {
+    let reads_marker = off.expr.as_ref().is_some_and(|e| e.enabled && e.text.contains("marker"));
+    let m = in_marker(l).filter(|_| reads_marker)?;
+    let d = m.duration.max(frame).seconds();
+    (d.is_finite() && d > 0.0).then(|| (l.comp_time(m.time).seconds(), d))
 }
 
 /// The time (comp s) `sync` lands on the accent, and how it was found.
@@ -800,7 +830,7 @@ fn set_controls(s: &mut Session, cid: ItemId, lid: LayerId, sets: &[(String, Val
 }
 
 /// Move every key the preset put on the layer (its animators, effects and properties, by name
-/// and path) by `shift`.
+/// and path) and its "In" marker by `shift`.
 fn shift_preset_keys(s: &mut Session, cid: ItemId, lid: LayerId, doc: &Value, shift: Tick) -> Result<()> {
     let anims = animator_names(doc);
     let fx_names: Vec<String> =
@@ -834,6 +864,14 @@ fn shift_preset_keys(s: &mut Session, cid: ItemId, lid: LayerId, doc: &Value, sh
             if let Some(pr) = l.props.prop_mut(path) {
                 move_keys(pr);
             }
+        }
+        // The "In" marker moves with the keys, so the reveal it times moves too (DX1b); "Out"
+        // stays. Locked markers stay (anim.applyPreset already skipped them with a note).
+        if !l.markers_locked
+            && let Some(m) = l.markers.iter_mut().find(|m| m.comment == IN_MARKER)
+        {
+            m.time += shift;
+            l.markers.sort_by_key(|m| m.time);
         }
         Ok(())
     })
@@ -1020,7 +1058,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Text Preset",
             [],
             None,
-            "{preset (a text preset card of Motion Library ▸ Elias ▸ Text animations by name or id, e.g. \"Slide In\" (text.presetFamilies lists them), or a .ecpreset path), layers? (text layers; default the selected ones unless `words` is given), words? (a phrase of the comp's speech map as text, or [from, to] / {from, to} speech-map word indices: a new text layer shows it, timed to it), word? (the word to sync on; also the text when neither layers nor words are given), occurrence? (1-based, of words or word), controls? ({\"Travel Distance (px)\": 40, \"Animate By\": \"Words\"}: the preset's Expression Controls by exact name; a dropdown takes an item name or 0-based index; an unknown name is an error), distance? (near|mid|far or px: every control named with “Travel” to 40/90/150 px, when the preset has one), sync? (bool: the stressed syllable of `word`, else the first stressed word, lands on the “Fade Up” reveal of its unit (else the main move's speed peak); the preset's keys shift), glow? (bool: also the Motion Library style “Caption glow + double shadow”), at? (comp s: where the preset's keys start; default the layer's in point), category? (default \"Elias/Text animations\"), comp?} → {preset: {name, id, path, source, controls}, comp, sync, layers: [{layer, name, created, start, startFrame, applied, controls, skipped?, warning?, sync?: {word, by (reveal|speedPeak), accentFrame, peakFrame, offsetFrames}}], glow?, followUp? ([{command, params}] the app runs next), notes}. One undo step",
+            "{preset (a text preset card of Motion Library ▸ Elias ▸ Text animations by name or id, e.g. \"Slide In\" (text.presetFamilies lists them), or a .ecpreset path), layers? (text layers; default the selected ones unless `words` is given), words? (a phrase of the comp's speech map as text, or [from, to] / {from, to} speech-map word indices: a new text layer shows it, timed to it), word? (the word to sync on; also the text when neither layers nor words are given), occurrence? (1-based, of words or word), controls? ({\"Travel Distance (px)\": 40, \"Animate By\": \"Words\"}: the preset's Expression Controls by exact name; a dropdown takes an item name or 0-based index; an unknown name is an error), distance? (near|mid|far or px: every control named with “Travel” to 40/90/150 px, when the preset has one), sync? (bool: the stressed syllable of `word`, else the first stressed word, lands on the “Fade Up” reveal of its unit (else the main move's speed peak); the preset's keys and its \"In\" marker shift, \"Out\" stays), glow? (bool: also the Motion Library style “Caption glow + double shadow”), at? (comp s: where the preset's keys start; default the layer's in point), category? (default \"Elias/Text animations\"), comp?} → {preset: {name, id, path, source, controls}, comp, sync, layers: [{layer, name, created, start, startFrame, applied, controls, skipped?, warning?, sync?: {word, by (reveal|speedPeak), accentFrame, peakFrame, offsetFrames}}], glow?, followUp? ([{command, params}] the app runs next), notes}. One undo step",
             has_comp,
             apply
         ),
