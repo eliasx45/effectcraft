@@ -590,8 +590,16 @@ fn blend(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// `layer.setTrackMatte`: `layer` (or the first selected layer) gets the matte; with `layers`, each
+/// of them does (After Effects 2023+ sets every selected layer), the matte layer itself skipped.
 fn track_matte(s: &mut Session, p: &Value) -> Result<Value> {
-    let (cid, lid) = layer_p(s, p, "layer.setTrackMatte")?;
+    let (cid, ids) = match p.get("layers") {
+        Some(Value::Array(_)) => layers_p(s, p)?,
+        _ => {
+            let (cid, lid) = layer_p(s, p, "layer.setTrackMatte")?;
+            (cid, vec![lid])
+        }
+    };
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let matte = match p.get("matte") {
         None | Some(Value::Null) => None,
@@ -607,15 +615,18 @@ fn track_matte(s: &mut Session, p: &Value) -> Result<Value> {
         .unwrap_or(MatteKind::Alpha);
     s.edit("Track Matte", None, |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        if let Some(m) = matte {
-            if m == lid {
-                return Err(bad("layer.setTrackMatte", "a layer can't be its own matte"));
-            }
-            if let Some(ml) = comp.layer_mut(m) {
-                ml.switches.video = false;
-            }
+        // The matte layer can't matte itself: an error when it is the only layer named, else it is
+        // left out.
+        let targets: Vec<LayerId> = ids.iter().copied().filter(|l| Some(*l) != matte).collect();
+        if targets.is_empty() {
+            return Err(bad("layer.setTrackMatte", "a layer can't be its own matte"));
         }
-        comp.layer_mut(lid).ok_or(EngineError::NoComp)?.track_matte = matte.map(|layer| TrackMatte { layer, kind });
+        if let Some(ml) = matte.and_then(|m| comp.layer_mut(m)) {
+            ml.switches.video = false;
+        }
+        for lid in targets {
+            comp.layer_mut(lid).ok_or(EngineError::NoComp)?.track_matte = matte.map(|layer| TrackMatte { layer, kind });
+        }
         Ok(())
     })?;
     Ok(Value::Null)
@@ -1735,7 +1746,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Track Matte",
             [],
             None,
-            "{layer?, matte: layer|null, kind?: alpha|alphaInverted|luma|lumaInverted}",
+            "{layer?, layers?, matte: layer|null, kind?: alpha|alphaInverted|luma|lumaInverted} (`layers`: each gets the matte, the matte layer itself skipped)",
             has_layers,
             track_matte
         ),

@@ -200,10 +200,11 @@ fn pick_whip_id() -> egui::Id {
     egui::Id::new("tl-pickwhip")
 }
 
-/// The layers a Parent pick whip or Parent menu on layer `id` sets: every selected layer when `id`
-/// is one of them (as in After Effects), else just `id`. `layer.setParent` skips the parent and
-/// any layer that would make a cycle.
-fn parent_targets(selected: &[LayerId], id: u64) -> Vec<u64> {
+/// The layers a control used on layer `id` sets (Parent pick whip and menu, switches, Mode, Track
+/// Matte, label, an effect dropped on it): every selected layer when `id` is one of them (as in
+/// After Effects), else just `id`. `layer.setParent` skips the parent and any layer that would make
+/// a cycle; `layer.setTrackMatte` skips the matte layer.
+pub(crate) fn selection_targets(selected: &[LayerId], id: u64) -> Vec<u64> {
     if selected.contains(&LayerId(id)) { selected.iter().map(|l| l.0).collect() } else { vec![id] }
 }
 
@@ -1195,6 +1196,7 @@ fn layer_switch(
     layer: u64,
     name: &'static str,
     others: bool,
+    selected: &[LayerId],
     actions: &mut Vec<(String, serde_json::Value)>,
 ) {
     let resp = widgets::icon_toggle(ui, br, icon, on, t, id, Sense::click_and_drag());
@@ -1204,11 +1206,15 @@ fn layer_switch(
         actions.push(("layer.setSwitch".into(), json!({"layers": [layer], "switch": name, "others": true})));
         return;
     }
+    // The press on a selected layer sets every selected layer (After Effects); rows the drag then
+    // passes over are set one by one.
+    let pressed = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
     if let Some((value, merge)) = switch_gesture(ui, &resp, row, name, on) {
-        actions.push(("layer.setSwitch".into(), json!({"layers": [layer], "switch": name, "value": value, "merge": merge})));
+        let layers = if pressed { selection_targets(selected, layer) } else { vec![layer] };
+        actions.push(("layer.setSwitch".into(), json!({"layers": layers, "switch": name, "value": value, "merge": merge})));
     } else if resp.clicked() && !resp.clicked_by(egui::PointerButton::Primary) {
         // Keyboard or accessibility activation (a pointer press was handled above).
-        actions.push(("layer.setSwitch".into(), json!({"layers": [layer], "switch": name})));
+        actions.push(("layer.setSwitch".into(), json!({"layers": selection_targets(selected, layer), "switch": name, "value": !on})));
     }
 }
 
@@ -1894,7 +1900,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         continue;
                     }
                     lp.rect_filled(br.shrink(0.5), 1.0, t.switch_well);
-                    layer_switch(ui, &t, r, br, icon, on, egui::Id::new(("av", layer.id.0, i)), layer.id.0, name, true, &mut actions);
+                    layer_switch(ui, &t, r, br, icon, on, egui::Id::new(("av", layer.id.0, i)), layer.id.0, name, true, &selected, &mut actions);
                     app.auto.add(&format!("timeline.layer.{}.{name}", layer.id.0), br, name);
                 }
                 // Label swatch.
@@ -1909,7 +1915,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         widgets::open_popup(ui, pop);
                     }
                     if let Some(lab) = widgets::label_popup(ui, pop, lr.left_bottom(), layer.label, |l| app.session.prefs.label_name(l), &t) {
-                        actions.push(("edit.label".into(), json!({"layers": [layer.id.0], "label": lab.name()})));
+                        actions.push(("edit.label".into(), json!({"layers": selection_targets(&selected, layer.id.0), "label": lab.name()})));
                     }
                 }
                 if vis.num {
@@ -2038,7 +2044,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     let br = Rect::from_center_size(pos2(cw.switches + SW * i as f32 + SW / 2.0, cy), vec2(16.0, 16.0));
                     lp.rect_filled(br.shrink(1.0), 1.0, t.switch_well);
-                    layer_switch(ui, &t, r, br, icon, on, egui::Id::new(("sw", layer.id.0, i)), layer.id.0, name, false, &mut actions);
+                    layer_switch(ui, &t, r, br, icon, on, egui::Id::new(("sw", layer.id.0, i)), layer.id.0, name, false, &selected, &mut actions);
                     app.auto.add(&format!("timeline.layer.{}.switch.{name}", layer.id.0), br, name);
                 }
                 // Modes.
@@ -2056,11 +2062,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         .flat_map(|m| if m.ends_group() { vec![m.label().to_string(), "-".to_string()] } else { vec![m.label().to_string()] })
                         .collect();
                     if let Some(i) = widgets::popup_menu(ui, pop, mr.left_bottom(), &opts, opts.iter().position(|o| o == layer.blend_mode.label())) {
-                        actions.push(("layer.setBlendMode".into(), json!({"layers": [layer.id.0], "mode": opts[i]})));
+                        actions.push(("layer.setBlendMode".into(), json!({"layers": selection_targets(&selected, layer.id.0), "mode": opts[i]})));
                     }
                     let tr = Rect::from_center_size(pos2(cw.mode + 76.0 + 6.0, cy), vec2(14.0, 14.0));
                     if widgets::checkbox(ui, tr, layer.preserve_transparency, &t, egui::Id::new(("pt", layer.id.0))).clicked() {
-                        actions.push(("layer.setSwitch".into(), json!({"layers": [layer.id.0], "switch": "preserveTransparency"})));
+                        actions.push(("layer.setSwitch".into(), json!({"layers": selection_targets(&selected, layer.id.0), "switch": "preserveTransparency", "value": !layer.preserve_transparency})));
                     }
                     // Track matte: layer picker + kind.
                     let mr = Rect::from_min_size(pos2(cw.trkmat + 2.0, cy - 9.0), vec2(104.0, 18.0));
@@ -2093,7 +2099,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let current = layer.track_matte.and_then(|m| opts.iter().position(|o| o == m.kind.label()));
                     if let Some(i) = widgets::popup_menu(ui, pop, mr.left_bottom(), &opts, current) {
                         let ids: Vec<LayerId> = candidates.iter().map(|l| l.id).collect();
-                        if let Some(a) = opts.get(i).and_then(|o| track_matte_pick(layer, &ids, i, o)) {
+                        if let Some(a) = opts.get(i).and_then(|o| track_matte_pick(layer, &selection_targets(&selected, layer.id.0), &ids, i, o)) {
                             actions.push(a);
                         }
                     }
@@ -2132,7 +2138,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     if let Some(i) = widgets::popup_menu(ui, pop, pr_rect.left_bottom(), &popts, None) {
                         let par = if i == 0 { serde_json::Value::Null } else { json!(cands[i - 2].id.0) };
-                        actions.push(("layer.setParent".into(), json!({"layers": parent_targets(&selected, layer.id.0), "parent": par})));
+                        actions.push(("layer.setParent".into(), json!({"layers": selection_targets(&selected, layer.id.0), "parent": par})));
                     }
                 }
                 // Layer bar.
@@ -3014,7 +3020,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             };
             match (kind, target, prop_target) {
                 (WHIP_PARENT, Some((_, row)), _) if row.layer.0 != src_layer => {
-                    actions.push(("layer.setParent".into(), json!({"layers": parent_targets(&selected, src_layer), "parent": row.layer.0})));
+                    actions.push(("layer.setParent".into(), json!({"layers": selection_targets(&selected, src_layer), "parent": row.layer.0})));
                 }
                 // The property pick whip replaces the expression with the reference (or adds one),
                 // as the expression pick whip does when its expression isn't being edited.
@@ -3937,17 +3943,18 @@ fn text_anim_popups(
 
 /// The command for the Track Matte menu item `i` (`choice`) of `layer`, whose menu lists "No Track
 /// Matte", a separator, the matte `candidates`, a separator and the modes. A mode without a matte
-/// layer takes the layer above, like Layer ▸ Track Matte (#864: it used to do nothing).
-fn track_matte_pick(layer: &Layer, candidates: &[LayerId], i: usize, choice: &str) -> Option<(String, serde_json::Value)> {
+/// layer takes the layer above, like Layer ▸ Track Matte (#864: it used to do nothing). The pick
+/// sets every layer of `targets` ([`selection_targets`]), the matte layer itself left out.
+fn track_matte_pick(layer: &Layer, targets: &[u64], candidates: &[LayerId], i: usize, choice: &str) -> Option<(String, serde_json::Value)> {
     if i == 0 {
-        return Some(("layer.setTrackMatte".into(), json!({"layer": layer.id.0, "matte": null})));
+        return Some(("layer.setTrackMatte".into(), json!({"layers": targets, "matte": null})));
     }
     if let Some(m) = i.checked_sub(2).and_then(|j| candidates.get(j)) {
         let kind = layer.track_matte.map(|m| m.kind).unwrap_or_default();
-        return Some(("layer.setTrackMatte".into(), json!({"layer": layer.id.0, "matte": m.0, "kind": kind_name(kind)})));
+        return Some(("layer.setTrackMatte".into(), json!({"layers": targets, "matte": m.0, "kind": kind_name(kind)})));
     }
     let k = MatteKind::ALL.into_iter().find(|k| k.label() == choice)?;
-    Some(("layer.trackMatte".into(), json!({"layers": [layer.id.0], "op": kind_name(k)})))
+    Some(("layer.trackMatte".into(), json!({"layers": targets, "op": kind_name(k)})))
 }
 
 fn kind_name(k: MatteKind) -> &'static str {
@@ -4441,7 +4448,8 @@ mod tests {
         let (bottom, matte, top) = (find(&s, "Chain Bottom"), find(&s, "Matte"), find(&s, "Chain Top"));
         let candidates = [top.id, matte.id];
         let pick = |s: &mut effectcraft_engine::Session, name: &str, i: usize, choice: &str| {
-            let (id, params) = track_matte_pick(&find(s, name), &candidates, i, choice).expect("a menu item is an action");
+            let l = find(s, name);
+            let (id, params) = track_matte_pick(&l, &[l.id.0], &candidates, i, choice).expect("a menu item is an action");
             s.execute(&id, params)
         };
         pick(&mut s, "Chain Bottom", 5, "Alpha Inverted Matte").unwrap();
@@ -4459,7 +4467,7 @@ mod tests {
         assert!(pick(&mut s, "Chain Top", 5, "Alpha Matte").is_err());
         pick(&mut s, "Chain Bottom", 0, "No Track Matte").unwrap();
         assert!(find(&s, "Chain Bottom").track_matte.is_none());
-        assert!(track_matte_pick(&bottom, &candidates, 1, "-").is_none(), "a separator does nothing");
+        assert!(track_matte_pick(&bottom, &[bottom.id.0], &candidates, 1, "-").is_none(), "a separator does nothing");
     }
 
     /// #957: vector footage gets the Continuously Rasterize switch; raster footage does not.

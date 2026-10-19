@@ -1446,7 +1446,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     {
         p.rect_stroke(rect, 0.0, Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
         if ctx.input(|i| i.pointer.any_released()) {
-            actions.push(("effect.apply".into(), json!({"effect": e, "layers": [layer.id.0]})));
+            // The shown layer, with the rest of the selection when it is selected (After Effects).
+            let layers = super::timeline::selection_targets(&app.session.state.selected_layers, layer.id.0);
+            actions.push(("effect.apply".into(), json!({"effect": e, "layers": layers})));
             egui::DragAndDrop::clear_payload(&ctx);
         }
     }

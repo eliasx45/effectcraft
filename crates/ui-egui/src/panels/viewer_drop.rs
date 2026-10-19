@@ -1,6 +1,7 @@
 //! Dropping onto the Composition viewer: footage, comps and solids from the
 //! Project panel and files from the Media Browser become layers centred where they are dropped
-//! (#85), and an effect from Effects & Presets goes on the layer under the pointer, outlined
+//! (#85), and an effect from Effects & Presets goes on the layer under the pointer (and the rest of the
+//! selection when that layer is selected), outlined
 //! while it is dragged (#88). Agents do the same with `layer.addItem {position}`,
 //! `mediaBrowser.import {position}` and `effect.apply {layers}`.
 
@@ -29,7 +30,8 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &egui::Ui, painter: &egui::Pain
                 if let Some((_, q, _)) = layer_quad(ectx, l) {
                     painter.add(egui::Shape::closed_line(q.iter().map(|c| map.to_screen(*c)).collect(), stroke));
                 }
-                ("effect.apply", json!({"effect": effect, "layers": [l.id.0]}))
+                // Onto a selected layer: every selected layer gets it (After Effects).
+                ("effect.apply", json!({"effect": effect, "layers": super::timeline::selection_targets(&app.session.state.selected_layers, l.id.0)}))
             })
             .into_iter()
             .collect(),

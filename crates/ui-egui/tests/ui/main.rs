@@ -223,9 +223,11 @@ mod ui_effect_drop_highlight;
 mod ui_media_browser_cache;
 #[path = "../ui_media_browser_copy_path.rs"]
 mod ui_media_browser_copy_path;
+#[path = "../ui_multi_selection.rs"]
+mod ui_multi_selection;
+#[path = "../ui_parent_selection.rs"]
+mod ui_parent_selection;
 #[path = "../ui_timeline_effect_label.rs"]
 mod ui_timeline_effect_label;
 #[path = "../ui_viewer_trackpad.rs"]
 mod ui_viewer_trackpad;
-#[path = "../ui_parent_selection.rs"]
-mod ui_parent_selection;
