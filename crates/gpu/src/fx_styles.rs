@@ -1,19 +1,23 @@
 //! GPU Layer Styles (kernels in `shaders/fx_styles.wgsl`, every entry point prefixed `sty_`):
 //! `render::styles::render`'s steps for the styles that need no distance field (Drop Shadow,
 //! Inner Shadow, Softer Outer and Inner Glow, Satin, Color and Gradient Overlay; spread and
-//! choke 0), on the content cropped to its visible part and padded by the styles' reach
+//! choke 0) and Bevel and Emboss (an exact distance field within its size), on the content cropped to its visible part and padded by the styles' reach
 //! (`styles::gpu_prepare`). The soft shapes are the shared box-pass Gaussian; each pass and
 //! interior style is one kernel. A styled layer then stays on the GPU: the CPU path styled it
 //! on the CPU (on a comp-sized canvas for a shape layer with effects) and uploaded every pass.
 
 use effectcraft_color::BlendMode;
-use effectcraft_render::styles::{GpuGlow, GpuShadow, GpuStyles};
+use effectcraft_render::styles::{GpuBevel, GpuGlow, GpuShadow, GpuStyles};
 
 use crate::context::{Enc, GpuImage, Params};
 use crate::effects::gaussian_blur;
 
 /// Compute entry points in `fx_styles.wgsl`.
-pub(crate) const KERNELS: &[&str] = &["sty_alpha", "sty_pack", "sty_scale", "sty_pass", "sty_body"];
+pub(crate) const KERNELS: &[&str] =
+    &["sty_alpha", "sty_pack", "sty_scale", "sty_pass", "sty_body", "sty_edt_rows", "sty_edt_cols", "sty_bev_height", "sty_bev_pack", "sty_bevel"];
+
+/// Rows (or columns) a distance-field tile covers (`BEV_T` in `fx_styles.wgsl`).
+const BEV_TILE: u32 = 256;
 
 /// A styled layer on the GPU: exterior passes (bottom first, with their modes) and the body,
 /// all the size of the padded content they were made from.
@@ -185,8 +189,45 @@ pub(crate) fn render(e: &mut Enc, content: &GpuImage, plan: &GpuStyles) -> Optio
     if plan.interior_group && plan.fill < 1.0 {
         body = scale(e, &body, plan.fill);
     }
+    if let Some(bv) = &plan.bevel {
+        body = bevel(e, content, &body, plan, bv);
+    }
     if e.take_missing() || e.g.check_health().is_err() {
         return None;
     }
     Some(GpuStyled { passes, body })
+}
+
+/// Bevel and Emboss (`styles::bevel`) over `body`: the content's distance field (exact within
+/// `bv.reach` pixels of its edge, see `fx_styles.wgsl`), the smoothed height profile, then the
+/// shadow and highlight blended by the light.
+fn bevel(e: &mut Enc, content: &GpuImage, body: &GpuImage, plan: &GpuStyles, bv: &GpuBevel) -> GpuImage {
+    let (w, h) = (content.width, content.height);
+    let mut p = Params::default();
+    p.u[0] = [bv.reach, BEV_TILE, bv.style, 0];
+    p.f[0] = [bv.size, 0.0, 0.0, 0.0];
+    let rows = e.scratch(w, h);
+    e.dispatch("sty_edt_rows", &p, content, None, &rows, None, (h.div_ceil(64), w.div_ceil(BEV_TILE)));
+    let field = e.scratch(w, h);
+    e.dispatch("sty_edt_cols", &p, &rows, None, &field, None, (w.div_ceil(64), h.div_ceil(BEV_TILE)));
+    let height = e.scratch(w, h);
+    e.pixels("sty_bev_height", &p, &field, None, &height, None);
+    let mut smooth = gaussian_blur(e, &height, bv.sigma, bv.sigma, true);
+    if bv.soften > 0.0 {
+        smooth = gaussian_blur(e, &smooth, bv.soften, bv.soften, true);
+    }
+    let packed = e.scratch(w, h);
+    e.pixels("sty_bev_pack", &p, &smooth, Some(&field), &packed, None);
+    let (sh_mode, sh_color, sh_opacity) = bv.shadow;
+    let (hl_mode, hl_color, hl_opacity) = bv.highlight;
+    let mut q = Params::default();
+    let dissolve = |m: BlendMode, bit: u32| if m == BlendMode::Dissolve { bit } else { 0 };
+    q.u[0] = [0, crate::ops::mode_id(sh_mode), plan.seed, dissolve(sh_mode, 16) | dissolve(hl_mode, 32)];
+    q.u[1] = [plan.org[0], plan.org[1], crate::ops::mode_id(hl_mode), 0];
+    q.f[0] = rgb_opacity(sh_color, sh_opacity);
+    q.f[1] = rgb_opacity(hl_color, hl_opacity);
+    q.f[2] = [bv.k, bv.light[0], bv.light[1], bv.light[2]];
+    let out = e.scratch(w, h);
+    e.pixels("sty_bevel", &q, body, Some(&packed), &out, None);
+    out
 }

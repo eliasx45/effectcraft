@@ -791,8 +791,29 @@ fn gradient_frame(go: &GradOverlay, buf: &Buf, alpha: &Plane, layer_size: [f64; 
 }
 
 /// Bevel and Emboss: a height field from the content edge, lit by a directional light.
-fn bevel(o: Org, body: &mut Image, alpha: &Plane, d: &Lazy, bv: &Bevel, s: f64, seed: u32) {
+/// Bevel and Emboss in buffer pixels at scale `s`: its profile size, the two smoothing
+/// sigmas (the second 0 without Soften), the slope `k` and the light (shared by the CPU and the
+/// GPU plan, [`GpuBevel`]).
+fn bevel_frame(bv: &Bevel, s: f64) -> (f32, f64, f64, f32, [f32; 3]) {
     let size = (bv.size * s).max(0.5) as f32;
+    // The distance field is exact at pixel centres only; smoothing the profile removes the
+    // stair-steps on diagonal edges that lighting would otherwise amplify. Smooth rounds the
+    // profile over the bevel size; Chisel Hard keeps it crisp, Chisel Soft slightly softer.
+    let sigma = match bv.technique {
+        0 => (size as f64 / 4.0).max(1.0),
+        2 => 1.5,
+        _ => 0.75,
+    };
+    let soften = if bv.soften > 0.0 { bv.soften * s / 2.0 } else { 0.0 };
+    let sign = if bv.down { -1.0 } else { 1.0 };
+    let k = (size as f64 * bv.depth) as f32 * sign;
+    let (th, al) = (bv.angle.to_radians(), bv.altitude.to_radians());
+    let light = [(al.cos() * th.cos()) as f32, (-al.cos() * th.sin()) as f32, al.sin() as f32];
+    (size, sigma, soften, k, light)
+}
+
+fn bevel(o: Org, body: &mut Image, alpha: &Plane, d: &Lazy, bv: &Bevel, s: f64, seed: u32) {
+    let (size, sigma, soften, k, light) = bevel_frame(bv, s);
     let sd = d.get(alpha);
     let w = alpha.w;
     // Height profile 0..1 and the region the bevel paints.
@@ -803,23 +824,10 @@ fn bevel(o: Org, body: &mut Image, alpha: &Plane, d: &Lazy, bv: &Bevel, s: f64, 
         3 => (v.abs() / size).clamp(0.0, 1.0),
         _ => (-v / size + 0.5 / size).clamp(0.0, 1.0),
     });
-    // The distance field is exact at pixel centres only; smoothing the profile removes the
-    // stair-steps on diagonal edges that lighting would otherwise amplify. Smooth rounds the
-    // profile over the bevel size; Chisel Hard keeps it crisp, Chisel Soft slightly softer.
-    let sigma = match bv.technique {
-        0 => (size as f64 / 4.0).max(1.0),
-        2 => 1.5,
-        _ => 0.75,
-    };
     height = gauss_plane(&height, sigma, sigma);
-    if bv.soften > 0.0 {
-        let sg = bv.soften * s / 2.0;
-        height = gauss_plane(&height, sg, sg);
+    if soften > 0.0 {
+        height = gauss_plane(&height, soften, soften);
     }
-    let sign = if bv.down { -1.0 } else { 1.0 };
-    let k = (size as f64 * bv.depth) as f32 * sign;
-    let (th, al) = (bv.angle.to_radians(), bv.altitude.to_radians());
-    let light = [(al.cos() * th.cos()) as f32, (-al.cos() * th.sin()) as f32, al.sin() as f32];
     let flat = light[2];
     let region = |i: usize| -> f32 {
         let a = alpha.data[i];
@@ -910,9 +918,32 @@ pub struct GpuSatin {
     pub invert: bool,
 }
 
+/// Bevel and Emboss for an accelerator, in buffer pixels (see `bevel_frame`). Its distance
+/// field only matters up to `reach` pixels from the content edge (the profile and the region
+/// are flat past `size`), so an accelerator computes it exactly within that window.
+#[derive(Clone, Debug)]
+pub struct GpuBevel {
+    pub style: u32,
+    pub size: f32,
+    pub sigma: f64,
+    /// Soften's second smoothing; 0 = none.
+    pub soften: f64,
+    pub k: f32,
+    pub light: [f32; 3],
+    /// Pixels the distance field is exact to: ⌈size⌉ + 3.
+    pub reach: u32,
+    pub highlight: (BlendMode, [f32; 3], f32),
+    pub shadow: (BlendMode, [f32; 3], f32),
+}
+
+/// Widest Bevel and Emboss (in buffer pixels) an accelerator renders: its distance field
+/// works on 256-row tiles with this much context on both sides.
+pub const GPU_BEVEL_REACH: u32 = 256;
+
 /// A layer's styles as an accelerator renders them (see [`gpu_prepare`]): the steps of
 /// [`render`] with every distance in buffer pixels. Only styles that need no distance field
-/// (spread / choke 0, Softer glows; no Stroke or Bevel and Emboss) have a plan.
+/// (spread / choke 0, Softer glows; no Stroke) or a short one (Bevel and Emboss up to
+/// [`GPU_BEVEL_REACH`]) have a plan.
 #[derive(Clone, Debug)]
 pub struct GpuStyles {
     /// Noise origin: where the buffer's pixel (0, 0) sat before it was cropped.
@@ -927,6 +958,7 @@ pub struct GpuStyles {
     pub satin: Option<GpuSatin>,
     pub inner_glow: Option<GpuGlow>,
     pub inner_shadows: Vec<GpuShadow>,
+    pub bevel: Option<GpuBevel>,
 }
 
 impl GpuStyles {
@@ -954,17 +986,29 @@ pub fn pack_gradient(g: &Gradient) -> Vec<f32> {
 /// The layer's styles as an accelerator renders them, and the buffer they render around: the
 /// content cropped to its visible part and padded by their reach, as [`render`] does. `None`
 /// when the layer has no styles, its content is empty, or a style needs the CPU (a distance
-/// field: spread or choke, Precise glows, Stroke, Bevel and Emboss; a stencil pass mode).
+/// field: spread or choke, Precise glows, Stroke, a Bevel and Emboss wider than
+/// [`GPU_BEVEL_REACH`]; a stencil pass mode).
 pub fn gpu_prepare(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2]) -> Option<(Buf, GpuStyles)> {
     let g = group(layer)?;
     if content.img.is_empty() || pass_modes(ctx, layer).iter().any(|m| m.is_stencil()) {
         return None;
     }
     let styles = evaluate(ctx, layer, g);
-    if styles.stroke.is_some() || styles.bevel.is_some() {
+    if styles.stroke.is_some() {
         return None;
     }
     let s = content.scale.max(1e-6);
+    let bevel = match &styles.bevel {
+        Some(bv) => {
+            let (size, sigma, soften, k, light) = bevel_frame(bv, s);
+            let reach = (size.ceil() as u32).saturating_add(3);
+            if reach > GPU_BEVEL_REACH || !size.is_finite() {
+                return None;
+            }
+            Some(GpuBevel { style: bv.style, size, sigma, soften, k, light, reach, highlight: bv.hl, shadow: bv.sh })
+        }
+        None => None,
+    };
     let hard = |size: f64, spread: f64| size * s * spread;
     let soft = |size: f64, spread: f64| (size * s - hard(size, spread)).max(0.0) / 2.0;
     let shadow = |d: &Shadow| {
@@ -1042,6 +1086,7 @@ pub fn gpu_prepare(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64
         satin,
         inner_glow,
         inner_shadows,
+        bevel,
     };
     Some((buf, plan))
 }

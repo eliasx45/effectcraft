@@ -250,3 +250,240 @@ fn sty_body(@builtin(global_invocation_id) gid: vec3<u32>) {
     let b = blend_pixel(P.u[0].y, d / k, vec4<f32>(c * a, a), n);
     textureStore(out, p, b * k);
 }
+
+// ---------------------------------------------------------------- Bevel and Emboss
+// styles::bevel on a distance field exact up to H = u[0].x pixels from the content edge (its
+// profile and region are flat past the bevel size, so farther distances only need to stay
+// >= H): squared distances are integers, computed in i32 on tiles of T = u[0].y pixels with
+// H pixels of context on both sides (styles::edt is Felzenszwalb & Huttenlocher over the
+// whole buffer; inside the window its minimum is the same number).
+
+const BEV_T: i32 = 256;
+const BEV_N: i32 = 768;
+
+// Row pass: per row tile, the squared distance along the row to the nearest pixel with alpha
+// >= 0.5 (x) and < 0.5 (y), capped at H²; w = alpha. Dispatched over (rows, tiles).
+@compute @workgroup_size(64, 1)
+fn sty_edt_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let y = i32(gid.x);
+    let x0 = i32(gid.y) * BEV_T;
+    if (y >= dims.y || x0 >= dims.x) {
+        return;
+    }
+    let hh = i32(P.u[0].x);
+    let x1 = min(x0 + BEV_T, dims.x);
+    var left_in: array<i32, 256>;
+    var left_out: array<i32, 256>;
+    var last_in = -1000000;
+    var last_out = -1000000;
+    for (var x = max(x0 - hh, 0); x < x1; x++) {
+        if (textureLoad(src, vec2<i32>(x, y), 0).w >= 0.5) {
+            last_in = x;
+        } else {
+            last_out = x;
+        }
+        if (x >= x0) {
+            left_in[x - x0] = x - last_in;
+            left_out[x - x0] = x - last_out;
+        }
+    }
+    var next_in = 1000000;
+    var next_out = 1000000;
+    for (var x = min(x1 + hh, dims.x) - 1; x >= x0; x--) {
+        let a = textureLoad(src, vec2<i32>(x, y), 0).w;
+        if (a >= 0.5) {
+            next_in = x;
+        } else {
+            next_out = x;
+        }
+        if (x < x1) {
+            let di = min(min(left_in[x - x0], next_in - x), hh);
+            let dout = min(min(left_out[x - x0], next_out - x), hh);
+            textureStore(out, vec2<i32>(x, y), vec4<f32>(f32(di * di), f32(dout * dout), 0.0, a));
+        }
+    }
+}
+
+// Lower envelope of the parabolas f(i) + (q - i)² over a column window (styles::dt1d with
+// the intersections kept as exact fractions zn / zd), written for the window's rows
+// [o0, o1); returns nothing, stores channel `c` into `res`.
+var<private> bev_f: array<i32, 768>;
+var<private> bev_v: array<i32, 768>;
+var<private> bev_zn: array<i32, 769>;
+var<private> bev_zd: array<i32, 769>;
+var<private> bev_res: array<vec2<i32>, 256>;
+
+fn bev_envelope(n: i32, o0: i32, o1: i32, c: i32, cap: i32) {
+    var k = 0;
+    bev_v[0] = 0;
+    for (var q = 1; q < n; q++) {
+        let fq = bev_f[q] + q * q;
+        var p = bev_v[k];
+        var sn = fq - (bev_f[p] + p * p);
+        var sd = 2 * (q - p);
+        // s <= z[k] for k > 0 (both fractions with positive denominators).
+        while (k > 0 && sn * bev_zd[k] <= bev_zn[k] * sd) {
+            k -= 1;
+            p = bev_v[k];
+            sn = fq - (bev_f[p] + p * p);
+            sd = 2 * (q - p);
+        }
+        k += 1;
+        bev_v[k] = q;
+        bev_zn[k] = sn;
+        bev_zd[k] = sd;
+    }
+    let last = k;
+    k = 0;
+    for (var q = 0; q < o1; q++) {
+        // z[k + 1] < q (z[last + 1] is +infinity).
+        while (k < last && bev_zn[k + 1] < q * bev_zd[k + 1]) {
+            k += 1;
+        }
+        if (q >= o0) {
+            let dq = q - bev_v[k];
+            let d = min(dq * dq + bev_f[bev_v[k]], cap);
+            if (c == 0) {
+                bev_res[q - o0].x = d;
+            } else {
+                bev_res[q - o0].y = d;
+            }
+        }
+    }
+}
+
+// Column pass over the row pass (src): squared distances (x: to alpha >= 0.5, y: to < 0.5)
+// exact below H², else H²; w = alpha. Dispatched over (columns, tiles).
+@compute @workgroup_size(64, 1)
+fn sty_edt_cols(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let x = i32(gid.x);
+    let y0 = i32(gid.y) * BEV_T;
+    if (x >= dims.x || y0 >= dims.y) {
+        return;
+    }
+    let hh = i32(P.u[0].x);
+    let cap = hh * hh;
+    let y1 = min(y0 + BEV_T, dims.y);
+    let w0 = max(y0 - hh, 0);
+    let w1 = min(y1 + hh, dims.y);
+    let n = w1 - w0;
+    for (var c = 0; c < 2; c++) {
+        for (var i = 0; i < n; i++) {
+            let t = textureLoad(src, vec2<i32>(x, w0 + i), 0);
+            bev_f[i] = i32(select(t.y, t.x, c == 0));
+        }
+        bev_envelope(n, y0 - w0, y1 - w0, c, cap);
+    }
+    for (var y = y0; y < y1; y++) {
+        let r = bev_res[y - y0];
+        textureStore(out, vec2<i32>(x, y), vec4<f32>(f32(r.x), f32(r.y), 0.0, textureLoad(src, vec2<i32>(x, y), 0).w));
+    }
+}
+
+// styles::sdf from the column pass texel (x: to inside², y: to outside², w: alpha).
+fn bev_sdf(t: vec4<f32>) -> f32 {
+    let a = t.w;
+    if (a > 0.0 && a < 1.0) {
+        return 0.5 - a;
+    }
+    if (a >= 0.5) {
+        return -(sqrt(t.y) - 0.5);
+    }
+    return sqrt(t.x) - 0.5;
+}
+
+// The bevel's height profile (styles::bevel). u[0].z = style, f[0].x = size.
+@compute @workgroup_size(16, 16)
+fn sty_bev_height(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!sty_inside(p)) {
+        return;
+    }
+    let v = bev_sdf(textureLoad(src, p, 0));
+    let size = P.f[0].x;
+    var h = 0.0;
+    switch P.u[0].z {
+        case 0u: {
+            h = clamp(1.0 - max(v, 0.0) / size, 0.0, 1.0);
+        }
+        case 2u, 4u: {
+            h = clamp(0.5 - v / (2.0 * size), 0.0, 1.0);
+        }
+        case 3u: {
+            h = clamp(abs(v) / size, 0.0, 1.0);
+        }
+        default: {
+            h = clamp(-v / size + 0.5 / size, 0.0, 1.0);
+        }
+    }
+    textureStore(out, p, vec4<f32>(h, 0.0, 0.0, 0.0));
+}
+
+// (smoothed height, region the bevel paints, 0, 0): src = smoothed height, aux = column pass.
+@compute @workgroup_size(16, 16)
+fn sty_bev_pack(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!sty_inside(p)) {
+        return;
+    }
+    let t = textureLoad(aux, p, 0);
+    let size = P.f[0].x;
+    // styles::grown(sd, size).
+    let grown = clamp(size + 0.5 - bev_sdf(t), 0.0, 1.0);
+    var region = grown;
+    if (P.u[0].z == 0u) {
+        region = max(grown - t.w, 0.0);
+    } else if (P.u[0].z == 1u) {
+        region = t.w;
+    }
+    textureStore(out, p, vec4<f32>(textureLoad(src, p, 0).x, region, 0.0, 0.0));
+}
+
+fn bev_h(x: i32, y: i32) -> f32 {
+    let d = vec2<i32>(textureDimensions(aux));
+    return textureLoad(aux, vec2<i32>(clamp(x, 0, d.x - 1), clamp(y, 0, d.y - 1)), 0).x;
+}
+
+// Shadow, then highlight, blended onto the body (styles::bevel's two blend_into passes).
+// src = body, aux = sty_bev_pack. u[0] = (0, shadow mode, seed, flags: 16 shadow dissolves,
+// 32 highlight dissolves); u[1] = (org x, org y, highlight mode, 0); f[0] = (shadow colour,
+// opacity); f[1] = (highlight colour, opacity); f[2] = (k, light x, light y, light z).
+@compute @workgroup_size(16, 16)
+fn sty_bevel(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!sty_inside(p)) {
+        return;
+    }
+    var d = textureLoad(src, p, 0);
+    let region = textureLoad(aux, p, 0).y;
+    let k = P.f[2].x;
+    let light = P.f[2].yzw;
+    let fl = light.z;
+    let gx = (bev_h(p.x + 1, p.y) - bev_h(p.x - 1, p.y)) * 0.5 * k;
+    let gy = (bev_h(p.x, p.y + 1) - bev_h(p.x, p.y - 1)) * 0.5 * k;
+    let n = vec3<f32>(-gx, -gy, 1.0);
+    let len = sqrt(n.x * n.x + n.y * n.y + 1.0);
+    let dt = (n.x * light.x + n.y * light.y + n.z * light.z) / len;
+    let hl = clamp((dt - fl) / max(1.0 - fl, 1e-4), 0.0, 1.0);
+    let shd = clamp((fl - dt) / max(fl, 1e-4), 0.0, 1.0);
+    let seed = P.u[0].z;
+    let sa = shd * P.f[0].w * region;
+    if (sa > 0.0) {
+        var nz = 0.5;
+        if ((P.u[0].w & 16u) != 0u) {
+            nz = sty_noise(p, seed);
+        }
+        d = blend_pixel(P.u[0].y, d, vec4<f32>(P.f[0].xyz * sa, sa), nz);
+    }
+    let ha = hl * P.f[1].w * region;
+    if (ha > 0.0) {
+        var nz = 0.5;
+        if ((P.u[0].w & 32u) != 0u) {
+            nz = sty_noise(p, seed);
+        }
+        d = blend_pixel(P.u[1].z, d, vec4<f32>(P.f[1].xyz * ha, ha), nz);
+    }
+    textureStore(out, p, d);
+}

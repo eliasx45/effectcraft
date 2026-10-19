@@ -1,8 +1,9 @@
 //! GPU Layer Styles (`fx_styles`) vs the CPU styles (the oracle): Drop Shadow (knockout, noise),
 //! Softer Outer and Inner Glow (colour and gradient, jitter), Inner Shadow, Satin, Color and
 //! Gradient Overlay (every style), Fill Opacity, Blend Interior Styles as Group, Knockout and
-//! the channel switches, at 8 and 32 bpc and Half, with linear blending, and a layer whose
-//! Gaussian Blur makes the styles' content.
+//! the channel switches, Bevel and Emboss (every style and technique, Soften, Dissolve), at 8
+//! and 32 bpc and Half, with linear blending, and a layer whose Gaussian Blur makes the styles'
+//! content.
 
 use std::sync::atomic::Ordering;
 
@@ -152,11 +153,45 @@ fn blending_options_half_and_linear_match_the_cpu() {
     check("linear blending", compare_at(&s, opts(), Tick::ZERO), 0.0);
 }
 
+#[test]
+fn bevel_and_emboss_matches_the_cpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        for (st, tech) in [(0, 0), (1, 0), (2, 1), (3, 2), (4, 0), (1, 2)] {
+            case(&format!("bevel style {st} technique {tech} {depth:?}"), depth, opts(), |s, l| {
+                style(
+                    s,
+                    l,
+                    "bevelEmboss",
+                    &[
+                        ("style", Value::Enum(st)),
+                        ("technique", Value::Enum(tech)),
+                        ("size", Value::Scalar(7.0 + st as f64)),
+                        ("depth", Value::Scalar(140.0)),
+                        ("direction", Value::Enum(st % 2)),
+                        ("useGlobalLight", Value::Bool(false)),
+                        ("angle", Value::Scalar(120.0)),
+                        ("altitude", Value::Scalar(30.0)),
+                        ("highlightMode", Value::Enum(SCREEN)),
+                        ("shadowMode", Value::Enum(MULTIPLY)),
+                    ],
+                );
+            });
+        }
+        case(&format!("softened bevel over a gradient overlay {depth:?}"), depth, opts(), |s, l| {
+            style(s, l, "gradientOverlay", &[("colors", gradient()), ("alignWithLayer", Value::Bool(true))]);
+            style(s, l, "bevelEmboss", &[("size", Value::Scalar(12.0)), ("soften", Value::Scalar(3.0)), ("highlightMode", Value::Enum(DISSOLVE))]);
+        });
+        case(&format!("bevel at half resolution {depth:?}"), depth, RenderOpts { scale: 0.5, ..opts() }, |s, l| {
+            style(s, l, "bevelEmboss", &[("size", Value::Scalar(9.0))]);
+        });
+    }
+}
+
 /// Styles the GPU doesn't render (a distance field) still match: the layer goes to the CPU.
 #[test]
 fn distance_field_styles_fall_back_to_the_cpu() {
     for (id, vals) in
-        [("dropShadow", vec![("spread", Value::Scalar(40.0))]), ("outerGlow", vec![("technique", Value::Enum(1))]), ("bevelEmboss", vec![]), ("stroke", vec![])]
+        [("dropShadow", vec![("spread", Value::Scalar(40.0))]), ("outerGlow", vec![("technique", Value::Enum(1))]), ("bevelEmboss", vec![("size", Value::Scalar(400.0))]), ("stroke", vec![])]
     {
         let mut s = Scene::new(BitDepth::Bpc32);
         let bg = s.footage(97, 61);
