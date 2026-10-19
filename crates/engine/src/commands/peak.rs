@@ -367,7 +367,7 @@ fn dims(v: &KValue, spatial: bool) -> usize {
 /// Puts `g` on the segment `i` → `i + 1`: the first key's out side, the second key's in side,
 /// both Bezier. Auto-Bezier or continuous keys are broken first, freezing the neighbouring
 /// segments' sides as they were.
-fn apply_graph(keys: &mut [Keyframe], i: usize, spatial: bool, g: &Graph) -> Result<()> {
+pub(crate) fn apply_graph(keys: &mut [Keyframe], i: usize, spatial: bool, g: &Graph) -> Result<()> {
     let j = i.checked_add(1).ok_or_else(|| bad(C, "no key pair"))?;
     let (Some(a), Some(b)) = (keys.get(i), keys.get(j)) else { return Err(bad(C, "no key pair")) };
     let n = dims(&a.value, spatial);

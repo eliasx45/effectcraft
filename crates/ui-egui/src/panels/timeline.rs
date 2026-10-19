@@ -15,6 +15,7 @@ use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
 mod inline;
+pub(crate) mod wheels;
 
 use crate::i18n::tr;
 use crate::icons::{self, Icon, SourceIcon};

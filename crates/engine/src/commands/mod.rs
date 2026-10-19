@@ -11,6 +11,7 @@ pub mod content_fill;
 pub mod essential;
 pub mod expr_tools;
 pub mod footage_panel;
+pub mod graph_cmds;
 pub mod inline_comp;
 pub mod markers;
 pub mod mask_interp;
