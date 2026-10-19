@@ -64,3 +64,22 @@ fn bad_proposals_and_failed_accepts() {
     assert_ne!(name(&s, a), "Half");
     assert_eq!(suggestions::list(&s).len(), 1);
 }
+
+#[test]
+fn claude_version_follows_agent_steps_and_stays_while_the_user_edits() {
+    let (mut s, a) = session();
+    assert_eq!(s.execute("agent.version", json!({})).unwrap()["has"], json!(false));
+    s.execute("layer.rename", json!({"layer": a, "name": "Claude's", "client": "claude-test"})).unwrap();
+    suggestions::observe(&s);
+    let (v, by) = suggestions::claude_version(&s).unwrap();
+    assert_eq!(by.as_deref(), Some("claude-test"));
+    // The user's fix: Claude's version stays as the agent left it.
+    s.execute("layer.rename", json!({"layer": a, "name": "Mine"})).unwrap();
+    suggestions::observe(&s);
+    let (v2, _) = suggestions::claude_version(&s).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&v, &v2));
+    assert_eq!(v2.comp(s.active_comp_id().unwrap()).unwrap().layer(LayerId(a)).unwrap().name, "Claude's");
+    // agent.snapshot marks the current state.
+    s.execute("agent.snapshot", json!({"client": "claude-test"})).unwrap();
+    assert_eq!(s.execute("agent.version", json!({})).unwrap()["same"], json!(true));
+}

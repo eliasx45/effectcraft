@@ -1204,8 +1204,31 @@ pub(crate) fn agent_compare(app: &mut EffectcraftApp, ctx: &egui::Context, paint
             label = Some((format!("SUGGESTION {} · ✓ to keep", sg.n), blue));
         }
     }
-    let _ = area;
-    if label.is_none() && !effectcraft_engine::commands::suggestions::list(&app.session).is_empty() {
+    // CX5: Claude's version while `\` or the button is held.
+    let claude = effectcraft_engine::commands::suggestions::claude_version(&app.session);
+    if let Some((proj, by)) = &claude {
+        // The button, top right of the viewer: held = Claude's version.
+        let b = Rect::from_min_size(egui::pos2(area.max.x - 196.0, area.min.y + 8.0), vec2(188.0, 22.0));
+        let resp = ui_button_hold(ctx, b);
+        let hot = resp.0;
+        painter.rect_filled(b, 4.0, Color32::from_black_alpha(if hot { 170 } else { 120 }));
+        painter.text(b.center(), egui::Align2::CENTER_CENTER, "Hold: Claude’s version  \\", crate::theme::Tokens::ui(11.0), blue);
+        app.auto.add("viewer.compare.hold", b, "Hold: Claude's version");
+        if resp.1 != super::suggestions::flipped(ctx) && (resp.1 || resp.2) {
+            super::suggestions::set_flipped(ctx, resp.1);
+        }
+        if label.is_none() && super::suggestions::flipped(ctx) && !std::sync::Arc::ptr_eq(proj, &app.session.project) {
+            let e = claude_epoch(ctx, proj);
+            if let Some(tex) = alt_texture(app, ctx, proj, e, cid, app.session.time(), scale) {
+                painter.image(tex.id(), comp_rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            let who = by.as_deref().unwrap_or("Claude");
+            label = Some((format!("CLAUDE’S VERSION · {who}"), blue));
+        } else if label.is_none() && super::suggestions::flipped(ctx) {
+            label = Some(("CLAUDE’S VERSION (no edits since)".into(), blue));
+        }
+    }
+    if label.is_none() && (claude.is_some() || !effectcraft_engine::commands::suggestions::list(&app.session).is_empty()) {
         label = Some(("YOURS".into(), green));
     }
     if let Some((text, color)) = label {
@@ -1215,4 +1238,30 @@ pub(crate) fn agent_compare(app: &mut EffectcraftApp, ctx: &egui::Context, paint
         painter.galley(r.min + vec2(8.0, 3.0), g, color);
         app.auto.add("viewer.compare.label", r, &text);
     }
+}
+
+/// The frame epoch of Claude's version `proj` (one per snapshot).
+fn claude_epoch(ctx: &egui::Context, proj: &std::sync::Arc<effectcraft_engine::project::Project>) -> u64 {
+    let id = egui::Id::new("claude-version-epoch");
+    let ptr = std::sync::Arc::as_ptr(proj) as usize;
+    if let Some((p, e)) = ctx.data(|d| d.get_temp::<(usize, u64)>(id))
+        && p == ptr
+    {
+        return e;
+    }
+    let e = next_alt_epoch();
+    ctx.data_mut(|d| d.insert_temp(id, (ptr, e)));
+    e
+}
+
+/// A press-and-hold area: (hovered, held now, released this frame).
+fn ui_button_hold(ctx: &egui::Context, r: Rect) -> (bool, bool, bool) {
+    let (pos, down, released) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down(), i.pointer.primary_released()));
+    let over = pos.is_some_and(|p| r.contains(p));
+    let id = egui::Id::new("viewer-compare-held");
+    let was: bool = ctx.data(|d| d.get_temp(id)).unwrap_or(false);
+    let held = if was { down } else { down && over && ctx.input(|i| i.pointer.primary_pressed()) };
+    ctx.data_mut(|d| d.insert_temp(id, held));
+    // TODO(batch1-verify): the viewer's own press handling also sees this press (a click-select under the button).
+    (over, held, was && (released || !down))
 }

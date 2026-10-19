@@ -55,8 +55,74 @@ fn decide(app: &mut EffectcraftApp, ctx: &egui::Context, id: Option<&str>, keep:
     }
 }
 
-/// Before the shortcuts (from `cards::before_shortcuts`): Y / N while the pointer is over the row.
+// ── Claude's version vs yours (CX5) ─────────────────────────────────────────────────────────
+
+/// How long `\` is held before Claude's version shows (a tap keeps Switch Between Composition and
+/// Timeline Panel).
+const FLIP_HOLD: f64 = 0.2;
+
+fn flip_id() -> egui::Id {
+    egui::Id::new("agent-flip")
+}
+fn flip_press_id() -> egui::Id {
+    egui::Id::new("agent-flip-press")
+}
+
+/// Whether Claude's version is on screen (`\` or the viewer button held).
+pub fn flipped(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(flip_id())).unwrap_or(false)
+}
+
+/// Show (or stop showing) Claude's version: the viewer button.
+pub fn set_flipped(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(flip_id(), on));
+    ctx.request_repaint();
+}
+
+/// A held `\`: Claude's version after [`FLIP_HOLD`], yours again on release; a tap is replayed to
+/// the shortcuts (as lane A's G / A wheels do).
+fn hold_backslash(app: &EffectcraftApp, ctx: &egui::Context) {
+    let key = egui::Key::Backslash;
+    let now = ctx.input(|i| i.time);
+    if let Some(since) = ctx.data(|d| d.get_temp::<f64>(flip_press_id())) {
+        let down = ctx.input(|i| i.key_down(key));
+        if !down {
+            ctx.data_mut(|d| d.remove::<f64>(flip_press_id()));
+            if flipped(ctx) {
+                set_flipped(ctx, false);
+            } else {
+                // A tap: `\`'s own meaning through the normal shortcut path.
+                // TODO(batch1-verify): same replay as timeline/wheels.rs hold_keys (egui `Event::Key` fields).
+                ctx.input_mut(|i| i.events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }));
+            }
+            return;
+        }
+        if now - since >= FLIP_HOLD && !flipped(ctx) {
+            set_flipped(ctx, true);
+        }
+        ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        return;
+    }
+    if ctx.egui_wants_keyboard_input() || app.dialog.is_some() || crate::widgets::any_menu_open(ctx) {
+        return;
+    }
+    // Only with a Claude's version to show: otherwise `\` is untouched.
+    if effectcraft_engine::commands::suggestions::claude_version(&app.session).is_none() {
+        return;
+    }
+    let pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, modifiers, .. } if *k == key && !modifiers.any())));
+    if pressed {
+        ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
+        ctx.data_mut(|d| d.insert_temp(flip_press_id(), now));
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+    }
+}
+
+/// Before the shortcuts (from `cards::before_shortcuts`): the held `\` (CX5), and Y / N while
+/// the pointer is over the suggestion row (CX4).
 pub fn before_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
+    hold_backslash(app, ctx);
     if !ctx.data(|d| d.get_temp::<bool>(row_hot_id())).unwrap_or(false) || ctx.egui_wants_keyboard_input() {
         return;
     }

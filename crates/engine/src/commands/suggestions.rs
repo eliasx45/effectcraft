@@ -12,6 +12,10 @@
 //! afterwards: document, undo history, selection, journal), so the viewer can show it while the
 //! pointer is over its pill.
 //!
+//! Claude's version (CX5): the document as an agent left it, kept while the user edits after it.
+//! [`observe`] (each UI frame) keeps the newest state an agent's step made; `agent.snapshot` marks
+//! it explicitly ("I finished building"); the viewer shows it while `\` is held.
+//!
 //! Suggestions belong to the running session, not the document: they are not saved with the
 //! project.
 // TODO(batch1-verify): they live in a process-wide table keyed by `Session::session_id`; a field on
@@ -268,6 +272,40 @@ pub fn preview(s: &mut Session, id: &str) -> Result<Arc<Project>> {
     r.map(|_| scratch)
 }
 
+/// Clients whose steps are bookkeeping, not building (loopd's snapshots, previews).
+const NOT_BUILDERS: &[&str] = &["loop-snap", "loopd", "suggestion-preview"];
+
+/// Keep Claude's version current: when the document's latest step is an agent's, that state is
+/// Claude's version (until another agent step replaces it). Cheap: call it every frame.
+pub fn observe(s: &Session) {
+    let Some(by) = s.history.author(&s.project).map(str::to_string) else { return };
+    if NOT_BUILDERS.contains(&by.as_str()) {
+        return;
+    }
+    with_side(s, |a| {
+        if !a.claude.as_ref().is_some_and(|(p, _)| Arc::ptr_eq(p, &s.project)) {
+            a.claude = Some((s.project.clone(), Some(by)));
+        }
+    });
+}
+
+/// Claude's version and the agent that left it.
+pub fn claude_version(s: &Session) -> Option<(Arc<Project>, Option<String>)> {
+    with_side(s, |a| a.claude.clone())
+}
+
+fn snapshot(s: &mut Session, _p: &Value) -> Result<Value> {
+    let by = s.client.clone();
+    let project = s.project.clone();
+    with_side(s, |a| a.claude = Some((project, by.clone())));
+    Ok(json!({"saved": true, "by": by, "revision": s.revision}))
+}
+
+fn version(s: &mut Session, _p: &Value) -> Result<Value> {
+    let v = claude_version(s);
+    Ok(json!({"has": v.is_some(), "by": v.and_then(|(_, b)| b), "same": claude_version(s).is_some_and(|(p, _)| Arc::ptr_eq(&p, &s.project))}))
+}
+
 const fn spec(id: &'static str, label: &'static str, params: &'static str, run: super::Run, journal: bool) -> CommandSpec {
     CommandSpec { id, label, menu: &[], shortcut: None, alt_shortcuts: &[], params, enabled: always, run, journal }
 }
@@ -290,6 +328,14 @@ pub fn specs() -> Vec<CommandSpec> {
             accept,
             true,
         ),
+        spec(
+            "agent.snapshot",
+            "Keep Claude's Version",
+            "{} → {saved, by, revision}: agents call it when a build is done; the viewer shows this state while \\ is held (Claude's version vs yours). Agent steps also update it on their own.",
+            snapshot,
+            false,
+        ),
+        spec("agent.version", "Claude's Version", "{} → {has, by, same}: whether there is a Claude's version to compare with", version, false),
         spec("suggestion.reject", "Drop Suggestion", "{id | all: true} → {dropped, waiting}: nothing changes", reject, true),
     ]
 }
