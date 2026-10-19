@@ -877,11 +877,48 @@ fn shift_preset_keys(s: &mut Session, cid: ItemId, lid: LayerId, doc: &Value, sh
     })
 }
 
+/// The preset's markers anchored to the out point (`anim.savePreset` writes `anchor: "out"` and
+/// `time` = how long before the out point): (comment, that distance).
+fn out_anchored(doc: &Value) -> Vec<(String, Tick)> {
+    doc.get("markers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("anchor").and_then(Value::as_str) == Some("out"))
+        .filter_map(|m| {
+            let mk: effectcraft_project::Marker = serde_json::from_value(m.clone()).ok()?;
+            Some((mk.comment, mk.time.clamp(Tick::MIN, Tick::MAX)))
+        })
+        .collect()
+}
+
+/// Moves the out-anchored markers `anim.applyPreset` placed (at `old_out` − their distance, layer
+/// time) to the layer's out point now − their distance, the rule it places them by. Locked markers
+/// stay (applyPreset skipped them).
+fn follow_out_point(l: &mut Layer, outs: &[(String, Tick)], old_out: Tick) {
+    let new_out = l.layer_time(l.out_point);
+    if outs.is_empty() || l.markers_locked || new_out == old_out {
+        return;
+    }
+    let mut moved = false;
+    for (comment, dist) in outs {
+        let placed = old_out - *dist;
+        if let Some(m) = l.markers.iter_mut().find(|m| m.comment == *comment && m.time == placed) {
+            m.time = new_out - *dist;
+            moved = true;
+        }
+    }
+    if moved {
+        l.markers.sort_by_key(|m| m.time);
+    }
+}
+
 fn run(s: &mut Session, p: &Value, cid: ItemId, preset: &TextPreset, sets: &[(String, Value)], o: &Opts, notes: &mut Vec<String>) -> Result<Value> {
     let jobs = jobs(s, p, cid, o, notes)?;
     let fr = s.project.comp(cid).ok_or(EngineError::NoComp)?.frame_rate;
     let fps = fr.as_f64();
     let mut reports = vec![];
+    let out_markers = out_anchored(&preset.doc);
     for job in &jobs {
         // 1. The preset, from the start (same-named effects and animators replaced).
         let start = fr.snap_nearest(Tick::from_seconds_f64(job.start));
@@ -930,8 +967,12 @@ fn run(s: &mut Session, p: &Value, cid: ItemId, preset: &TextPreset, sets: &[(St
             if let (true, Some((a, b))) = (job.created, job.span) {
                 let inn = first.map_or(fr.snap_nearest(Tick::from_seconds_f64(a)), |f| f.min(fr.snap_nearest(Tick::from_seconds_f64(a))));
                 let end = last.unwrap_or(inn).max(Tick::from_seconds_f64(b)) + Tick::from_seconds_f64(HOLD);
+                let old_out = l.layer_time(l.out_point);
                 l.in_point = inn;
                 l.out_point = fr.snap_nearest(end).max(inn + fr.frame_duration());
+                // anim.applyPreset put the out-anchored markers ("Out") before the made layer's
+                // first out point; they keep their distance from the new one (DX1c).
+                follow_out_point(l, &out_markers, old_out);
             }
             Ok((l.name.clone(), first.is_some_and(|f| f < l.in_point)))
         })?;

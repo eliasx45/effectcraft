@@ -254,11 +254,11 @@ if(!m || numKeys<2){ value; } else {\n\
   valueAtTime(Math.max(k1, Math.min(k2, k1+(time-m.time)/d*(k2-k1))));\n\
 }";
 
-#[test]
-fn sync_moves_the_in_marker_that_times_the_reveal_and_leaves_out_alone() {
-    // A "Marker Fade" card: "Fade Up" by words, Offset keyed −100 → 100 over 0..2 s with the
-    // In-marker expression; "In" at the first key, 0.8 s long (so the reveal runs 0.8 s, not the
-    // keys' 2 s); "Out" 0.5 s before the out point.
+/// A "Marker Fade" card: "Fade Up" by words, Offset keyed −100 → 100 over 0..2 s with the
+/// In-marker expression; "In" at the first key, 0.8 s long (so the reveal runs 0.8 s, not the
+/// keys' 2 s); "Out" (0.3 s long) 0.5 s before the out point. And a 25 fps "Main" comp whose
+/// speech map has "WORKS" stressed at 1.2 s (accent 1.16 s, frame 29). Returns (session, main).
+fn marker_studio() -> (Session, ItemId) {
     let mut s = Session { expr: Some(std::sync::Arc::new(effectcraft_expr::Expressions)), ..Session::default() };
     s.execute("comp.new", json!({"name": "Creating Text Presets", "width": 320, "height": 180, "frameRate": 25, "duration": 4.0})).unwrap();
     let ws = s.active_comp_id().unwrap();
@@ -281,8 +281,6 @@ fn sync_moves_the_in_marker_that_times_the_reveal_and_leaves_out_alone() {
     let lib = temp_dir("marker-lib");
     save_card(&mut s, &lib, &mut vec![], t, "marker-fade", "Marker Fade", "Elias/Text animations");
 
-    // Main: "WORKS" stressed at 1.2 s (accent 1.16 s, frame 29); a text layer that starts at
-    // 0.2 s (its layer time is not comp time) and ends at 3.5 s.
     s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 25, "duration": 4.0})).unwrap();
     let main = s.active_comp_id().unwrap();
     let voice = s.execute("layer.newSolid", json!({"name": "Voice", "width": 20, "height": 20, "color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
@@ -294,6 +292,13 @@ fn sync_moves_the_in_marker_that_times_the_reveal_and_leaves_out_alone() {
         ]}}),
     )
     .unwrap();
+    (s, main)
+}
+
+#[test]
+fn sync_moves_the_in_marker_that_times_the_reveal_and_leaves_out_alone() {
+    let (mut s, main) = marker_studio();
+    // A text layer that starts at 0.2 s (its layer time is not comp time) and ends at 3.5 s.
     let mk = |s: &mut Session| {
         let c = s.execute("layer.newText", json!({"text": "WORKS", "name": "Caption"})).unwrap()["layer"].as_u64().unwrap();
         s.edit("fixture", None, |proj, _| {
@@ -384,4 +389,27 @@ fn glow_from_a_project_layer_puts_its_layer_styles_after_transform() {
     let t = top.iter().position(|m| *m == "transform").unwrap();
     assert_eq!(top.get(t + 1), Some(&effectcraft_project::styles::GROUP), "where styles::add_style puts it: {top:?}");
     assert!(l.props.sub(effectcraft_project::styles::GROUP).unwrap().sub("outerGlow").is_some());
+}
+
+#[test]
+fn a_made_layer_keeps_the_out_marker_before_its_new_out_point() {
+    let (mut s, main) = marker_studio();
+    // `words` makes the layer; step 4 trims it to its keys + a hold, after anim.applyPreset put
+    // "Out" 0.5 s before its first out point.
+    let r = s.execute_checked("text.apply", json!({"preset": "Marker Fade", "words": "works", "sync": true})).unwrap();
+    let rep = &r["layers"][0];
+    assert_eq!(rep["created"], json!(true), "{r:#}");
+    let lid = rep["layer"].as_u64().unwrap();
+    let l = layer(&s, main, lid);
+    let out = l.out_point.seconds();
+    // The keys end at 2.76 s (In at 0.76 s, as when syncing an existing layer), + 0.5 s hold,
+    // on the nearest frame (3.24 s): well before the comp's end, where "Out" was first put.
+    assert!((out - 3.24).abs() < 1e-6, "{out} {r:#}");
+    let marks: Vec<(String, f64, f64)> = l.markers.iter().map(|m| (m.comment.clone(), l.comp_time(m.time).seconds(), m.duration.seconds())).collect();
+    let find = |c: &str| marks.iter().find(|m| m.0 == c).cloned().unwrap_or_else(|| panic!("no {c}: {marks:?}"));
+    assert!((find("In").1 - 0.76).abs() < 1e-6, "{marks:?}");
+    let (_, at, dur) = find("Out");
+    assert!((at - (out - 0.5)).abs() < 1e-6, "Out keeps its 0.5 s before the new out point: {marks:?}");
+    assert!(at >= l.in_point.seconds() && at + dur < out, "the exit shows while the layer does: {marks:?}");
+    assert_eq!(marks.len(), 2, "{marks:?}");
 }
