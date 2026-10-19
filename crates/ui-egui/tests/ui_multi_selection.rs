@@ -160,3 +160,40 @@ fn dragging_selected_effects_moves_them_as_a_block() {
     s.execute("effect.reorder", json!({"layer": l, "effect": u[0], "index": 3})).unwrap();
     assert_eq!(order(&s), [u[1], u[2], u[0], u[3], u[4]]);
 }
+
+/// Mask Mode and Inverted changed on one of several selected masks (what the Timeline sends:
+/// `layer.setMask {selected: true}`) go to every selected mask, on any layer, in one undo step;
+/// on an unselected mask, to that one alone.
+#[test]
+fn mask_mode_and_inverted_go_to_every_selected_mask() {
+    use effectcraft_engine::project::{GroupKind, MaskMode};
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    let a = s.execute("layer.newSolid", json!({"name": "A", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+    let b = s.execute("layer.newSolid", json!({"name": "B", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+    let ma = s.execute("layer.addMask", json!({"layer": a})).unwrap()["mask"].as_u64().unwrap();
+    let ma2 = s.execute("layer.addMask", json!({"layer": a})).unwrap()["mask"].as_u64().unwrap();
+    let mb = s.execute("layer.addMask", json!({"layer": b})).unwrap()["mask"].as_u64().unwrap();
+    let state = |s: &Session| -> Vec<(MaskMode, bool)> {
+        let comp = s.active_comp().unwrap();
+        [(a, ma), (a, ma2), (b, mb)]
+            .iter()
+            .map(|(l, m)| match comp.layer(LayerId(*l)).unwrap().props.find_group(*m).unwrap().kind {
+                GroupKind::Mask { mode, inverted, .. } => (mode, inverted),
+                _ => panic!("not a mask"),
+            })
+            .collect()
+    };
+    s.execute("prop.select", json!({"layer": a, "prop": ma})).unwrap();
+    s.execute("prop.select", json!({"layer": b, "prop": mb, "add": true})).unwrap();
+    let before = s.project.clone();
+    s.execute("layer.setMask", json!({"layer": a, "mask": ma, "mode": "Subtract", "selected": true})).unwrap();
+    assert_eq!(state(&s), [(MaskMode::Subtract, false), (MaskMode::Add, false), (MaskMode::Subtract, false)]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.same_content(&before), "one undo step");
+    s.execute("layer.setMask", json!({"layer": b, "mask": mb, "inverted": true, "selected": true})).unwrap();
+    assert_eq!(state(&s), [(MaskMode::Add, true), (MaskMode::Add, false), (MaskMode::Add, true)]);
+    // The unselected second mask of A: that one alone.
+    s.execute("layer.setMask", json!({"layer": a, "mask": ma2, "mode": "Intersect", "selected": true})).unwrap();
+    assert_eq!(state(&s), [(MaskMode::Add, true), (MaskMode::Intersect, false), (MaskMode::Add, true)]);
+}

@@ -1342,24 +1342,34 @@ fn add_mask(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// `layer.setMask`: the mask's mode and Inverted. With `selected: true` and the mask among the
+/// selected masks (the Timeline's Mask Mode menu and Inverted box), every selected mask, on any
+/// layer of the comp, gets the change, in one undo step (After Effects).
 fn mask_props(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid) = layer_p(s, p, "layer.setMask")?;
     let target = p.get("mask").cloned().unwrap_or(json!("#1"));
     let mode = str_p(p, "mode").and_then(MaskMode::from_name);
     let inverted = b_p(p, "inverted");
+    let no_mask = || bad("layer.setMask", format!("no mask {target} (a number is the mask's uid; use \"#n\" for the n-th mask)"));
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let masks = comp.layer(lid).and_then(|l| l.masks()).ok_or_else(|| bad("layer.setMask", "the layer has no masks (add one with layer.addMask)"))?;
+    let uid = super::mask::mask_index(masks, &target).and_then(|i| masks.children.get(i)).map(|c| c.uid()).ok_or_else(no_mask)?;
+    let mut targets = vec![(lid, uid)];
+    if b_p(p, "selected") == Some(true) && s.state.selected_props.contains(&(lid, uid)) {
+        // Only masks: the selection can hold effects and properties too.
+        let is_mask = |l: &LayerId, u: &u64| comp.layer(*l).and_then(|l| l.masks()).is_some_and(|m| m.children.iter().any(|c| c.uid() == *u));
+        targets.extend(s.state.selected_props.iter().filter(|t| **t != (lid, uid) && is_mask(&t.0, &t.1)).copied());
+    }
     s.edit("Mask Settings", None, |proj, _| {
-        let l = layer_mut(proj, cid, lid)?;
-        let masks = l.props.sub_mut("masks").ok_or_else(|| bad("layer.setMask", "the layer has no masks (add one with layer.addMask)"))?;
-        let g = super::mask::mask_index(masks, &target)
-            .and_then(|i| masks.children.get_mut(i))
-            .and_then(|c| c.as_group_mut())
-            .ok_or_else(|| bad("layer.setMask", format!("no mask {target} (a number is the mask's uid; use \"#n\" for the n-th mask)")))?;
-        if let GroupKind::Mask { mode: m, inverted: inv, .. } = &mut g.kind {
-            if let Some(mm) = mode {
-                *m = mm;
-            }
-            if let Some(i) = inverted {
-                *inv = i;
+        for (tl, tu) in &targets {
+            let Some(g) = layer_mut(proj, cid, *tl).ok().and_then(|l| l.props.find_group_mut(*tu)) else { continue };
+            if let GroupKind::Mask { mode: m, inverted: inv, .. } = &mut g.kind {
+                if let Some(mm) = mode {
+                    *m = mm;
+                }
+                if let Some(i) = inverted {
+                    *inv = i;
+                }
             }
         }
         Ok(())
@@ -1857,7 +1867,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layers,
             add_mask
         ),
-        cmd!("layer.setMask", "Mask Mode", [], None, "{layer?, mask: uid|\"#n\"|name (default the first), mode?, inverted?}", has_layers, mask_props),
+        cmd!(
+            "layer.setMask",
+            "Mask Mode",
+            [],
+            None,
+            "{layer?, mask: uid|\"#n\"|name (default the first), mode?, inverted?, selected?: every selected mask}",
+            has_layers,
+            mask_props
+        ),
         cmd!(
             "layer.addShapeItem",
             "Add (Shape)",
