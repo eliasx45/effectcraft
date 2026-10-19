@@ -1013,6 +1013,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     vt::draw_frame(app, &ctx, &painter, comp_rect, cid, &ectx);
     // Above 100 %: the visible region at the magnification over it, once rendered.
     crate::sharp_zoom::show(app, &ctx, &painter, &map, cid, &comp, &key);
+    // Batch 1 lane C (CX4, CX5): a hovered suggestion or Claude's version over the frame.
+    ov::agent_compare(app, &ctx, &painter, comp_rect, area, cid, scale);
     if app.ui.viewer.extended.is_some() {
         // The comp frame outlined over the extended render.
         painter.rect_stroke(comp_rect, 0.0, Stroke::new(1.0, Color32::from_gray(150)), StrokeKind::Outside);

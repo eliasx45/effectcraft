@@ -3509,6 +3509,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // The outline / time graph splitter, registered last so it wins over the rows beside it.
     ui.set_clip_rect(full_clip);
     super::timeline_columns::splitter(app, ui, graph_x0 - 1.0, top, rect.max.y - footer_h, left_w, rect.width());
+    // Batch 1 lane C (CX4, CX6): Claude's suggestions (badge, pills, dashed layers) and the Why? strip.
+    super::suggestions::timeline_overlay(app, ui, rect);
     if ui.input(|i| i.pointer.primary_down()) && actions.iter().any(|(id, _)| id == "prop.set") {
         app.ui.viewer.property_interacting = true;
         ctx.request_repaint();

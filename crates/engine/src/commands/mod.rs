@@ -27,6 +27,8 @@ pub mod round_corners;
 pub mod scripts;
 pub mod shape_stroke;
 pub mod shape_tool;
+// Batch 1 lane C: the UI lists and previews suggestions (CX4).
+pub mod suggestions;
 pub mod text_edit;
 pub mod time;
 pub mod viewer_cmds;

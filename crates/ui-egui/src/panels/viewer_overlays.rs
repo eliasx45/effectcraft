@@ -1095,3 +1095,124 @@ mod tests {
         assert!(matches!(at(40.0, 120.0), PenTarget::None), "off the path");
     }
 }
+
+// ── Claude's version and suggestion previews (batch 1, CX4 / CX5) ─────────────────────────────
+
+static ALT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh number for another scratch document (its frames never share a key with the document's).
+pub(crate) fn next_alt_epoch() -> u64 {
+    ALT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Frame `t` of comp `cid` in another document (`project`: a suggestion's scratch copy, Claude's
+/// version), rendered like the viewer's own (CPU pixels), keyed apart by `epoch`.
+pub(crate) fn alt_texture(
+    app: &EffectcraftApp,
+    ctx: &egui::Context,
+    project: &std::sync::Arc<effectcraft_engine::project::Project>,
+    epoch: u64,
+    cid: effectcraft_engine::project::ItemId,
+    t: Tick,
+    scale: f64,
+) -> Option<egui::TextureHandle> {
+    use crate::frames::{FrameImage, FrameKey, RenderSource};
+    use std::hash::{Hash, Hasher};
+    let c = project.comp(cid)?;
+    let frame = c.frame_rate.frame_at(t);
+    let opts = app.frame_opts(cid, scale);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (crate::frames::comp_content(project, cid), 0xC1A0_DE00_u64, epoch).hash(&mut h);
+    let key = FrameKey {
+        // The document's revision: the frame queue drops jobs of older revisions.
+        revision: app.session.revision,
+        content: h.finish(),
+        comp: cid.0,
+        frame,
+        scale: (scale * 1000.0).round() as u32,
+        view: app.view_hash(cid),
+        opts: crate::frames::opts_hash(&opts),
+    };
+    let id = egui::Id::new(("agent-compare-tex", epoch));
+    let cached: Option<(FrameKey, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
+    if let Some((k, tex)) = &cached
+        && *k == key
+    {
+        return Some(tex.clone());
+    }
+    // TODO(batch1-verify): RenderSource's other fields (freeze feedback, layer cache) with another project.
+    let src = RenderSource { gpu_display: false, project: project.clone(), ..app.render_source() };
+    app.frames.request_urgent(&src, key, cid, c.frame_rate.tick_of(frame), opts);
+    match app.frames.get(&key) {
+        Some(FrameImage::Cpu(img)) => {
+            let tex = crate::frames::load_fitted(ctx, "agent-compare", (*img).clone(), egui::TextureOptions::LINEAR);
+            ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
+            Some(tex)
+        }
+        _ => {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            cached.map(|(_, tex)| tex)
+        }
+    }
+}
+
+/// The scratch copy for suggestion `id` at the document's revision (made once, then kept).
+fn suggestion_project(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str) -> Option<(std::sync::Arc<effectcraft_engine::project::Project>, u64)> {
+    type Cached = (String, u64, std::sync::Arc<effectcraft_engine::project::Project>, u64);
+    let cid = egui::Id::new("suggestion-preview-project");
+    let rev = app.session.revision;
+    if let Some((i, r, p, e)) = ctx.data(|d| d.get_temp::<Cached>(cid))
+        && i == id
+        && r == rev
+    {
+        return Some((p, e));
+    }
+    match effectcraft_engine::commands::suggestions::preview(&mut app.session, id) {
+        Ok(p) => {
+            let e = next_alt_epoch();
+            ctx.data_mut(|d| d.insert_temp::<Cached>(cid, (id.to_string(), rev, p.clone(), e)));
+            Some((p, e))
+        }
+        Err(e) => {
+            app.ui.status = format!("Can't preview this suggestion: {e}");
+            None
+        }
+    }
+}
+
+/// Over the viewer's frame: a hovered suggestion (its range looping) or, while `\` or the header
+/// button is held, Claude's version; and the corner label saying which one is on screen.
+pub(crate) fn agent_compare(app: &mut EffectcraftApp, ctx: &egui::Context, painter: &egui::Painter, comp_rect: Rect, area: Rect, cid: effectcraft_engine::project::ItemId, scale: f64) {
+    let blue = super::suggestions::CLAUDE_BLUE;
+    let green = Color32::from_rgb(0x8f, 0xe0, 0xb4);
+    let mut label: Option<(String, Color32)> = None;
+    // CX4: the hovered suggestion, on a scratch copy, its range looping.
+    if let Some((id, since)) = super::suggestions::hovered(ctx) {
+        let sg = effectcraft_engine::commands::suggestions::list(&app.session).into_iter().find(|s| s.id == id);
+        if let Some(sg) = sg
+            && let Some((proj, epoch)) = suggestion_project(app, ctx, &id)
+        {
+            let now = ctx.input(|i| i.time);
+            let t = match sg.range {
+                Some([a, b]) if b > a => a + (now - since).max(0.0) % (b - a),
+                _ => app.session.time().seconds(),
+            };
+            if let Some(tex) = alt_texture(app, ctx, &proj, epoch, cid, Tick::from_seconds_f64(t), scale) {
+                painter.image(tex.id(), comp_rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            ctx.request_repaint();
+            label = Some((format!("SUGGESTION {} · ✓ to keep", sg.n), blue));
+        }
+    }
+    let _ = area;
+    if label.is_none() && !effectcraft_engine::commands::suggestions::list(&app.session).is_empty() {
+        label = Some(("YOURS".into(), green));
+    }
+    if let Some((text, color)) = label {
+        let g = painter.layout_no_wrap(text.clone(), crate::theme::Tokens::mono(11.0), color);
+        let r = Rect::from_min_size(comp_rect.min + vec2(8.0, 8.0), g.size() + vec2(16.0, 6.0));
+        painter.rect_filled(r, 4.0, Color32::from_black_alpha(140));
+        painter.galley(r.min + vec2(8.0, 3.0), g, color);
+        app.auto.add("viewer.compare.label", r, &text);
+    }
+}

@@ -155,6 +155,8 @@ fn log_line(now: f64, line: impl Into<String>) {
 /// Before the shortcuts run (from the app's frame): ⌘V with an Instagram link on the clipboard
 /// and a layer selected opens the paste wheel instead of Edit ▸ Paste.
 pub fn before_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
+    // Y / N over the suggestion row (CX4), the held `\` (CX5).
+    super::suggestions::before_shortcuts(app, ctx);
     if app.session.state.text_edit.is_some() || ctx.egui_wants_keyboard_input() || app.session.state.selected_layers.is_empty() {
         return;
     }
