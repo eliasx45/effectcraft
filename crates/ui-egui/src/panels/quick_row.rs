@@ -68,6 +68,13 @@ pub struct QuickRowState {
     pub pins: Option<Vec<QuickPin>>,
     /// Fast In's property pick (`p`, `o`, `s`, `r`); `None` follows the selected keys.
     pub fast_in_pick: Option<String>,
+    /// AX9: the Text group's add-on chips. `sync`: the preset's speed peak on the stressed
+    /// syllable; `glow`: also Caption glow; `distance`: near | mid | far; `on_word`: aim at the
+    /// word under the playhead.
+    pub text_sync: bool,
+    pub text_glow: bool,
+    pub text_distance: String,
+    pub text_on_word: bool,
     /// The Find word box.
     #[serde(skip)]
     pub find: String,
@@ -79,7 +86,18 @@ pub struct QuickRowState {
 
 impl Default for QuickRowState {
     fn default() -> Self {
-        QuickRowState { shown: true, pins: None, fast_in_pick: None, find: String::new(), found: None, find_error: None }
+        QuickRowState {
+            shown: true,
+            pins: None,
+            fast_in_pick: None,
+            text_sync: true,
+            text_glow: false,
+            text_distance: "mid".into(),
+            text_on_word: false,
+            find: String::new(),
+            found: None,
+            find_error: None,
+        }
     }
 }
 
@@ -190,8 +208,44 @@ pub fn run_pin(app: &mut EffectcraftApp, ctx: &egui::Context, pin: &QuickPin, at
     }
 }
 
-/// AX9 hook: the Text add-on chips' options (filled in by AX9).
-fn add_text_options(_app: &EffectcraftApp, _params: &mut Value) {}
+/// AX9: the Text add-on chips' options on a `text.apply` call (lane D's command).
+fn add_text_options(app: &EffectcraftApp, params: &mut Value) {
+    let q = &app.ui.timeline.quick_row;
+    params["sync"] = json!(q.text_sync);
+    params["glow"] = json!(q.text_glow);
+    params["distance"] = json!(q.text_distance);
+    if q.text_on_word
+        && let Some(w) = word_at_playhead(app)
+    {
+        params["word"] = json!(w);
+    }
+}
+
+/// The word of the comp's speech map nearest the playhead (stressed words first).
+// TODO(batch1-verify): lane B (SX1) may move the speech map onto the voice layer; this reads `comp.speech`.
+pub fn word_at_playhead(app: &EffectcraftApp) -> Option<String> {
+    let comp = app.session.active_comp()?;
+    let map = comp.speech.as_ref()?;
+    let now = app.session.time().seconds();
+    let dist = |w: &effectcraft_engine::project::speech::SpeechWord| {
+        let (a, b) = (w.start.seconds(), w.end.seconds());
+        if now < a {
+            a - now
+        } else if now > b {
+            now - b
+        } else {
+            0.0
+        }
+    };
+    let stressed = |w: &&effectcraft_engine::project::speech::SpeechWord| w.syllables.iter().any(|s| s.stress == 1);
+    let best = map
+        .words
+        .iter()
+        .filter(stressed)
+        .min_by(|a, b| dist(*a).total_cmp(&dist(*b)))
+        .or_else(|| map.words.iter().min_by(|a, b| dist(*a).total_cmp(&dist(*b))))?;
+    Some(best.word.clone())
+}
 
 /// A pin for the card selected in the Motion Library.
 fn pin_selected_card(app: &mut EffectcraftApp, ctx: &egui::Context) {
@@ -322,9 +376,60 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
     rest
 }
 
-/// AX9 hook: the Text add-on chips (filled in by AX9). Returns the x after them.
-fn text_chips(_app: &mut EffectcraftApp, _ui: &mut egui::Ui, at: Pos2, _limit: f32) -> f32 {
-    at.x
+/// One add-on chip: a small toggle; returns (its rect, clicked).
+fn chip(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, text: &str, auto: &str, tip: &str, on: bool) -> (Rect, bool) {
+    let t = app.tokens;
+    let g = ui.painter().layout_no_wrap(text.to_string(), Tokens::ui(10.5), if on { Color32::WHITE } else { t.text_dim });
+    let r = Rect::from_min_size(pos2(at.x, at.y + 2.0), vec2(g.size().x + 10.0, ROW_H - 12.0));
+    let resp = ui.interact(r, egui::Id::new(("tl-quick-chip", auto)), Sense::click()).on_hover_text(tip);
+    if on {
+        ui.painter().rect_filled(r, 8.0, t.accent);
+    } else {
+        ui.painter().rect_stroke(r, 8.0, Stroke::new(1.0, if resp.hovered() { t.text_dim } else { t.field_border }), StrokeKind::Inside);
+    }
+    ui.painter().galley(pos2(r.min.x + 5.0, r.center().y - g.size().y / 2.0), g, if on { Color32::WHITE } else { t.text_dim });
+    app.auto.add(&format!("timeline.quick.text.{auto}"), r, &format!("{text}{}", if on { " (on)" } else { "" }));
+    (r, resp.clicked())
+}
+
+/// AX9: the Text group's add-on chips (`sync`, `+glow`, `near/mid/far`, `on "<word>"`): toggles
+/// for how the Text buttons apply (`text.apply {sync, glow, distance, word}`). Returns the x
+/// after them.
+fn text_chips(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, limit: f32) -> f32 {
+    let mut x = at.x;
+    let q = app.ui.timeline.quick_row.clone();
+    let word = word_at_playhead(app);
+    let word_label = format!("on “{}”", word.as_deref().unwrap_or("word"));
+    let chips: [(&str, String, &str, bool); 4] = [
+        ("sync", "sync".into(), "Put the preset's speed peak on the stressed syllable", q.text_sync),
+        ("glow", "+glow".into(), "Also apply Caption glow + double shadow", q.text_glow),
+        ("distance", q.text_distance.clone(), "How far the text travels: near (0.5×), mid (1×), far (1.6×); click to change", true),
+        ("word", word_label, "Aim at the word under the playhead (else the first stressed word)", q.text_on_word),
+    ];
+    for (id, text, tip, on) in chips {
+        if x > limit - 30.0 {
+            break;
+        }
+        let (r, clicked) = chip(app, ui, pos2(x, at.y), &text, id, tip, on);
+        if clicked {
+            let st = &mut app.ui.timeline.quick_row;
+            match id {
+                "sync" => st.text_sync = !st.text_sync,
+                "glow" => st.text_glow = !st.text_glow,
+                "distance" => {
+                    st.text_distance = match st.text_distance.as_str() {
+                        "near" => "mid",
+                        "mid" => "far",
+                        _ => "near",
+                    }
+                    .into();
+                }
+                _ => st.text_on_word = !st.text_on_word,
+            }
+        }
+        x = r.max.x + 4.0;
+    }
+    x
 }
 
 /// The Fast In split button; returns its right edge.
