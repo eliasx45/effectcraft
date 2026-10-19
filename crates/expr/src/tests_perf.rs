@@ -11,6 +11,7 @@ use crate::tests::{Fx, fx};
 
 const ROT: &str = "transform/rotation";
 const POS: &str = "transform/position";
+const OPA: &str = "transform/opacity";
 
 /// Representative expressions as `(layer, property, text)`, evaluated at [`TIMES`].
 fn representative(f: &Fx) -> Vec<(LayerId, &'static str, &'static str)> {

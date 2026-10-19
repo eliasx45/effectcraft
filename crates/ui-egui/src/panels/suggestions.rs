@@ -228,8 +228,12 @@ pub fn timeline_overlay(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect)
     // The hovered pill previews; the time it started is kept while it stays.
     match (&hover_now, hovered(&ctx)) {
         (Some(id), Some((was, _))) if *id == was => {}
-        (Some(id), _) => ctx.data_mut(|d| d.insert_temp(hover_id(), (id.clone(), now))),
-        (None, Some(_)) => ctx.data_mut(|d| d.remove::<(String, f64)>(hover_id())),
+        (Some(id), _) => ctx.data_mut(|d| {
+            d.insert_temp(hover_id(), (id.clone(), now));
+        }),
+        (None, Some(_)) => ctx.data_mut(|d| {
+            d.remove::<(String, f64)>(hover_id());
+        }),
         (None, None) => {}
     }
     if hover_now.is_some() {

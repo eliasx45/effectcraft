@@ -1926,8 +1926,6 @@ mod tests {
         assert_eq!(PanelKind::from_name("Composition"), Some(PanelKind::Composition));
     }
 
-    use super::*;
-
     /// More tabs than fit: the strip scrolls to show a newly shown tab, never past the point
     /// where the last tabs fill it, and keeps a scrolled position otherwise.
     #[test]
