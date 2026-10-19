@@ -143,6 +143,15 @@ impl PanelKind {
     }
     pub fn from_name(s: &str) -> Option<PanelKind> {
         let n = s.to_ascii_lowercase().replace([' ', '_', '-', '&'], "");
+        // The id-carrying kinds (`id()`: "ScriptPanel(1)", "Viewer(2)"), so the panel menu's
+        // commands (`window.closePanel {panel}` ...) find them too.
+        let numbered = |prefix: &str| n.strip_prefix(prefix).and_then(|r| r.strip_suffix(')')).and_then(|d| d.parse::<u32>().ok());
+        if let Some(id) = numbered("scriptpanel(") {
+            return Some(PanelKind::ScriptPanel(id));
+        }
+        if let Some(id) = numbered("viewer(") {
+            return Some(PanelKind::Viewer(id));
+        }
         Self::ALL.iter().copied().find(|p| format!("{p:?}").to_ascii_lowercase() == n || p.title().to_ascii_lowercase().replace([' ', '&', '-'], "") == n)
     }
     /// Window-menu shortcut.
@@ -1899,6 +1908,20 @@ pub fn placeholder(ui: &mut egui::Ui, rect: Rect, t: &Tokens, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn from_name_round_trips_the_id_carrying_panels() {
+        // The panel menu sends `id()`: a ScriptUI panel or an extra Composition viewer must
+        // resolve, or Close Panel / Undock Panel on them fail with "unknown panel".
+        for p in [PanelKind::ScriptPanel(1), PanelKind::Viewer(2), PanelKind::MotionLibrary] {
+            assert_eq!(PanelKind::from_name(&p.id()), Some(p), "{}", p.id());
+        }
+        assert_eq!(PanelKind::from_name("scriptpanel(7)"), Some(PanelKind::ScriptPanel(7)));
+        assert_eq!(PanelKind::from_name("ScriptPanel(x)"), None);
+        assert_eq!(PanelKind::from_name("Composition"), Some(PanelKind::Composition));
+    }
+
     use super::*;
 
     /// More tabs than fit: the strip scrolls to show a newly shown tab, never past the point
