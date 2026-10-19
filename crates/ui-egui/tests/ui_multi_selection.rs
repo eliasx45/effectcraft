@@ -197,3 +197,59 @@ fn mask_mode_and_inverted_go_to_every_selected_mask() {
     s.execute("layer.setMask", json!({"layer": a, "mask": ma2, "mode": "Intersect", "selected": true})).unwrap();
     assert_eq!(state(&s), [(MaskMode::Add, true), (MaskMode::Intersect, false), (MaskMode::Add, true)]);
 }
+
+/// Where the centre of the 100×60 solid `l` of comp `cid` is in that comp at `secs`.
+fn solid_centre(s: &Session, cid: u64, l: u64, secs: f64) -> (f64, f64) {
+    use effectcraft_engine::project::ItemId;
+    let comp = s.project.comp(ItemId(cid)).unwrap();
+    let t = effectcraft_engine::time::Tick::from_seconds_f64(secs);
+    let ctx = effectcraft_engine::render::EvalCtx::new(&s.project, ItemId(cid), comp, t);
+    let (m, _) = ctx.layer_to_comp(comp.layer(LayerId(l)).unwrap());
+    let c = m.apply(effectcraft_engine::geom::vec2(50.0, 30.0));
+    (c.x, c.y)
+}
+
+/// Beyond After Effects: pre-composing layers whose parent stays outside keeps them where they
+/// were on screen (AE drops the link and they jump). A still parent is baked into their
+/// transform; an animated one is copied into the new comp, hidden, so they keep moving with it.
+#[test]
+fn precompose_keeps_children_of_an_outside_parent_in_place() {
+    for animated in [false, true] {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "Main", "width": 640, "height": 360, "frameRate": 30, "duration": 4})).unwrap();
+        let outer = s.active_comp_id().unwrap().0;
+        let n = s.execute("layer.newNull", json!({})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("prop.set", json!({"layer": n, "path": "transform/position", "value": [400, 250]})).unwrap();
+        s.execute("prop.set", json!({"layer": n, "path": "transform/scale", "value": [150, 150]})).unwrap();
+        let solids: Vec<u64> = [[70, 130], [200, 90]]
+            .iter()
+            .map(|p| {
+                let l = s.execute("layer.newSolid", json!({"color": "#406080", "width": 100, "height": 60})).unwrap()["layer"].as_u64().unwrap();
+                s.execute("prop.set", json!({"layer": l, "path": "transform/position", "value": p})).unwrap();
+                l
+            })
+            .collect();
+        s.execute("layer.setParent", json!({"layers": solids, "parent": n})).unwrap();
+        if animated {
+            s.execute("prop.addKey", json!({"layer": n, "path": "transform/position", "time": 0.0, "value": [400, 250]})).unwrap();
+            s.execute("prop.addKey", json!({"layer": n, "path": "transform/position", "time": 2.0, "value": [300, 150]})).unwrap();
+        }
+        let times = [0.0, 1.0, 2.0];
+        let before: Vec<(f64, f64)> = times.iter().map(|t| solid_centre(&s, outer, solids[0], *t)).collect();
+        let inner = s.execute("layer.precompose", json!({"layers": solids, "mode": "move"})).unwrap()["comp"].as_u64().unwrap();
+        for (t, want) in times.iter().zip(&before) {
+            let got = solid_centre(&s, inner, solids[0], *t);
+            assert!((got.0 - want.0).abs() < 1e-6 && (got.1 - want.1).abs() < 1e-6, "animated {animated}, t {t}: {got:?} vs {want:?}");
+        }
+        let inner_comp = s.project.comp(effectcraft_engine::project::ItemId(inner)).unwrap();
+        let a = inner_comp.layer(LayerId(solids[0])).unwrap();
+        if animated {
+            let rig = a.parent.and_then(|p| inner_comp.layer(p)).expect("a copy of the null carries it");
+            assert!(!rig.switches.video && rig.id != LayerId(n));
+        } else {
+            assert!(a.parent.is_none(), "a still parent is baked in");
+        }
+        // The original null stays in the outer comp.
+        assert!(s.project.comp(effectcraft_engine::project::ItemId(outer)).unwrap().layer(LayerId(n)).is_some());
+    }
+}

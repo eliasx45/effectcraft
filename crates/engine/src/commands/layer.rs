@@ -1239,16 +1239,73 @@ fn precompose(s: &mut Session, p: &Value) -> Result<Value> {
         (a, b)
     };
     let (offset, dur) = if adjust && span.1 > span.0 { (span.0, span.1 - span.0) } else { (Tick(0), comp.duration) };
+    // Beyond After Effects (which drops the link and lets the layer jump): a layer parented to a
+    // layer left outside keeps its place on screen. A still parent chain is baked into the
+    // layer's transform; an animated one is copied into the new comp (hidden, same names and
+    // links) so the motion carries on. The originals stay for their other children.
+    let ancestors = |l: &effectcraft_project::Layer, stop_inside: bool| -> Vec<LayerId> {
+        let mut out = vec![];
+        let mut cur = l.parent;
+        while let Some(pid) = cur {
+            if (stop_inside && ids.contains(&pid)) || out.contains(&pid) || out.len() >= 64 {
+                break;
+            }
+            out.push(pid);
+            cur = comp.layer(pid).and_then(|p| p.parent);
+        }
+        out
+    };
+    let animated = |chain: &[LayerId]| chain.iter().filter_map(|id| comp.layer(*id)).any(|a| a.transform().is_some_and(|tr| tr.any_animated()));
+    let outside: Vec<&effectcraft_project::Layer> = comp.layers.iter().filter(|l| ids.contains(&l.id) && l.parent.is_some_and(|p| !ids.contains(&p))).collect();
+    let (rigged, baked): (Vec<&effectcraft_project::Layer>, Vec<&effectcraft_project::Layer>) =
+        outside.into_iter().partition(|l| animated(&ancestors(l, false)));
+    let baked: Vec<LayerId> = baked.iter().map(|l| l.id).collect();
+    let fixes = parent_fixes(s, cid, &baked, None);
+    // The outside ancestors to copy, in stack order.
+    let rig: Vec<LayerId> = {
+        let mut want: Vec<LayerId> = rigged.iter().flat_map(|l| ancestors(l, true)).collect();
+        want.sort_unstable_by_key(|id| id.0);
+        want.dedup();
+        comp.layers.iter().map(|l| l.id).filter(|id| want.contains(id)).collect()
+    };
     let new = s.edit("Pre-compose", None, |proj, st| {
         let mut inner = comp.nested_like(comp.width, comp.height, dur);
-        inner.layers = comp.layers.iter().filter(|l| ids.contains(&l.id)).cloned().collect();
-        for l in &mut inner.layers {
-            if l.parent.is_some_and(|p| !ids.contains(&p)) {
-                l.parent = None;
+        let mut next = proj.next_id;
+        let mut copies: Vec<effectcraft_project::Layer> = vec![];
+        let mut map: Vec<(LayerId, LayerId)> = vec![];
+        for aid in &rig {
+            let Some(src) = comp.layer(*aid) else { continue };
+            let mut c = src.clone();
+            super::edit::reid(&mut c, &mut next);
+            // A parent only: it doesn't render or play in the new comp.
+            c.switches.video = false;
+            c.switches.audio = false;
+            c.switches.solo = false;
+            c.track_matte = None;
+            map.push((*aid, c.id));
+            copies.push(c);
+        }
+        proj.next_id = next;
+        let link = |p: LayerId| if ids.contains(&p) { Some(p) } else { map.iter().find(|(o, _)| *o == p).map(|(_, c)| *c) };
+        for c in &mut copies {
+            c.parent = c.parent.and_then(link);
+        }
+        let mut layers: Vec<effectcraft_project::Layer> = comp.layers.iter().filter(|l| ids.contains(&l.id)).cloned().collect();
+        for l in &mut layers {
+            if let Some(p) = l.parent.filter(|p| !ids.contains(p)) {
+                l.parent = link(p);
+                if l.parent.is_none() {
+                    if let Some(f) = fixes.iter().find(|f| f.layer == l.id) {
+                        f.apply(l);
+                    }
+                }
             }
             if l.track_matte.is_some_and(|m| !ids.contains(&m.layer)) {
                 l.track_matte = None;
             }
+        }
+        inner.layers = copies.into_iter().chain(layers).collect();
+        for l in &mut inner.layers {
             l.start_time -= offset;
             l.in_point -= offset;
             l.out_point -= offset;
