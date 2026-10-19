@@ -190,8 +190,8 @@ pub(crate) fn put_card_mask(l: &mut Layer, next: &mut u64, size: (f64, f64), st:
 /// [`HAIRLINE_PX`] on screen (its size divided by the layer's own scale; a parent's scale or the
 /// viewer zoom aren't counted). A card that already has a Stroke keeps it as the user set it.
 /// False when the layer can't take layer styles.
-// TODO(batch1-verify): the renderer strokes the layer's alpha after its masks (the card's rounded
-// edge), as After Effects does; check a card with a hairline in the viewer.
+// The renderer strokes the layer's alpha after its masks and effects (layer_buf: styles run on the
+// masked content), so the hairline follows the card's rounded edge, as in After Effects.
 pub(crate) fn put_hairline(l: &mut Layer, next: &mut u64, gl: &GlobalLight) -> bool {
     let had = l.layer_styles().and_then(|g| g.sub("stroke")).is_some();
     let scale = l

@@ -58,7 +58,13 @@ fn word_apply_pop_puts_its_peak_on_the_stressed_syllable_in_one_undo_step() {
     let r = s.execute("word.apply", json!({"index": 3, "item": "pop"})).unwrap();
     assert_eq!(r["onStress"], true);
     assert_eq!(s.active_comp().unwrap().layers.len(), before + 1);
-    // TODO(batch1-verify): check the speed peak frame with speech.accents once compiled.
+    // The pop's speed peak, as speech.accents measures it, lands on WORKS's accent.
+    let pop = r["layer"].as_u64().unwrap();
+    let acc = s.execute("speech.accents", json!({"layer": pop})).unwrap();
+    let list = acc["list"].as_array().unwrap();
+    let m = list.iter().find(|m| m["word"] == "WORKS").unwrap_or_else(|| panic!("{acc:#}"));
+    assert_eq!(m["hit"], true, "{m:#}");
+    assert!((m["frame"].as_f64().unwrap() - r["peakFrame"].as_f64().unwrap()).abs() <= 1.0, "{m:#} {r:#}");
     s.undo();
     assert_eq!(s.active_comp().unwrap().layers.len(), before, "one undo step");
 }

@@ -1,7 +1,6 @@
 //! Animation presets carry whole text animators (CX8d): anim.savePreset → anim.applyPreset on a
 //! fresh text layer gives the same animators (names, selectors, Based On, expressions), with the
 //! keys from the playhead; applying again replaces them; a non-text layer skips them with a note.
-//! Not run yet (batch 1): TODO(batch1-verify) run `cargo test -p effectcraft-engine tests_preset_animators`.
 
 use effectcraft_keyframe::{Keyframe, Value as KV};
 use effectcraft_project::build::{self, Ids};
@@ -109,7 +108,6 @@ fn text_animators_round_trip_through_a_preset_from_the_playhead() {
     assert_eq!(r["skipped"], json!([]), "{r:#}");
     let want = shifted(animators(&s, a), 1.0);
     let got = animators(&s, b);
-    // TODO(batch1-verify): PropGroup survives the serde round trip field for field (nothing skipped on save).
     assert_eq!(got, want, "same names, selectors, Based On, expressions and eases; keys from the playhead");
     let names: Vec<&str> = got.iter().map(|g| g.name.as_str()).collect();
     assert_eq!(names, ["Fade Up", "Bounce"]);

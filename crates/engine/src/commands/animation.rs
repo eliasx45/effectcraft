@@ -52,8 +52,8 @@ fn selected_effects(s: &Session) -> Vec<(LayerId, PropGroup)> {
 /// animator with its name, its selectors (range / wiggly / expression, Advanced ▸ Based On,
 /// expressions, keys and eases) and its properties. Selecting the layer's Animators group
 /// selects all of them.
-// TODO(batch1-verify): a click on an animator (or the Animators) row in the Timeline puts that
-// group's uid in `selected_props`, as Effect Controls does for an effect.
+// A click on an animator (or the Animators) row in the Timeline runs prop.select with that group's
+// uid, which puts it in `selected_props`, as Effect Controls does for an effect.
 fn selected_animators(s: &Session) -> Vec<(LayerId, PropGroup)> {
     let Some(c) = s.active_comp() else { return vec![] };
     let mut out: Vec<(LayerId, PropGroup)> = vec![];
@@ -137,7 +137,8 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
     // A folder that doesn't exist yet (a new card's assets/<id>/) is made.
-    // TODO(batch1-verify): FsServices::write_file (config::atomic_write) reports a missing folder as NotFound.
+    // FsServices::write_file (config::atomic_write) reports a missing folder as NotFound: its
+    // temporary file can't be created there.
     let written = match s.services.write_file(&path, text.as_bytes()) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => s.services.store_file(&path, text.as_bytes()),
         other => other,

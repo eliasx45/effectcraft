@@ -11,8 +11,6 @@
 //! - `word.apply {index, to?, item}`: build an item on a word or a phrase, its peak on the
 //!   stressed syllable (Pop text, Caption, Pill, Highlight, Zoom punch, SFX, a Motion Library
 //!   preset adapted to the phrase's length, Copy for Claude). One undo step.
-//!
-//! Not compiled yet (batch 1): see the TODO(batch1-verify) markers.
 
 use std::sync::Arc;
 

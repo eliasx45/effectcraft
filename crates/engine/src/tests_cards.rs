@@ -1,5 +1,4 @@
 //! Cards (batch 1, CX1): card.make / card.style / card.saveStyle / card.styles.
-//! Not run yet (batch 1): TODO(batch1-verify) run `cargo test -p effectcraft-engine tests_cards`.
 
 use effectcraft_keyframe::Value as KV;
 use effectcraft_project::LayerId;

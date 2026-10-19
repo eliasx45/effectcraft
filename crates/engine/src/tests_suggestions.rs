@@ -1,6 +1,5 @@
 //! Claude's suggestions (batch 1, CX4): propose changes nothing, accept is one undo step, reject
 //! drops, preview leaves the session as it was.
-//! Not run yet (batch 1): TODO(batch1-verify) run `cargo test -p effectcraft-engine tests_suggestions`.
 
 use effectcraft_project::LayerId;
 use serde_json::json;

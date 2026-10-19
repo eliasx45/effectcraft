@@ -1,5 +1,4 @@
 //! Style families (batch 1, CX3): link, change size once for every linked layer, unlink.
-//! Not run yet (batch 1): TODO(batch1-verify) run `cargo test -p effectcraft-engine tests_style_families`.
 
 use effectcraft_keyframe::Value as KV;
 use effectcraft_project::LayerId;
