@@ -2738,6 +2738,9 @@ impl EffectcraftApp {
         panels::dialogs::show(self, &ctx);
         panels::figma_pair::show(self, &ctx);
         panels::fx_console::show(self, &ctx);
+        // Batch 1 wheels (AX1): drawn above the panels, then their slices registered.
+        wheel::paint(&ctx);
+        wheel::register_automation(&ctx, &mut self.auto);
         panels::scriptui_view::sync_panels(self);
         panels::scriptui_view::show_windows(self, &ctx);
         panels::learn::coach(self, &ctx);
