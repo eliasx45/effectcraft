@@ -54,16 +54,19 @@ pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer], out
 /// `out` canvas can show (and what reaches it): a layer scaled up far past the frame keeps
 /// its styles' images small.
 fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Result<(Buf, GpuImage), &'static str> {
-    let styled = styles::active(ctx, layer);
-    let has_fx = layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty());
-    if !matches!(layer.source, LayerSource::Shape) || layer.switches.adjustment || !(styled || has_fx) {
-        return Err("not a shape with effects or styles");
-    }
     if r.pipe().to_blend().is_some() {
         return Err("linear blending");
     }
     if r.layer_is_static(ctx, layer) && r.layer_buf_in_memory(ctx, layer) {
         return Err("held, in the layer cache");
+    }
+    if matches!(layer.source, LayerSource::Comp { .. }) {
+        return precomp_plane(e, r, ctx, layer);
+    }
+    let styled = styles::active(ctx, layer);
+    let has_fx = layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty());
+    if !matches!(layer.source, LayerSource::Shape) || layer.switches.adjustment || !(styled || has_fx) {
+        return Err("not a shape with effects or styles, nor a precomp");
     }
     // Only this plane's own steps count (see `alpha_bounds`).
     e.take_missing();
@@ -125,6 +128,35 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32
     drop(img);
     let st = crate::fx_styles::render(e, &padded, &prep.plan).ok_or("style kernels failed")?;
     finish(e, prep.shape, st.body)
+}
+
+/// A 3D precomp layer's plane made on the GPU: its nested comp walked on the device
+/// (`cull::nested`, as a 2D precomp layer's `walk::draw_precomp`) and its own effects run there
+/// (`walk::prepare_processed`). The CPU path renders the nested comp on the CPU compositor, reads
+/// every GPU effect run inside it back and uploads the plane again (10-10 MAIN's Clock 1 and
+/// Clock 2: their glowing circles' effect canvases, about a second a frame). Masks, Layer
+/// Styles, a collapsed precomp and whatever `Renderer::precomp_source` declines stay on the CPU.
+fn precomp_plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Result<(Buf, GpuImage), &'static str> {
+    if layer.switches.collapse || layer.switches.adjustment {
+        return Err("a collapsed or adjustment precomp");
+    }
+    if layer.masks().is_some_and(|m| !m.children.is_empty()) || styles::active(ctx, layer) {
+        return Err("a precomp with masks or styles");
+    }
+    let (sub, item, lt, bs) = r.precomp_source(ctx, layer).ok_or("a precomp the CPU renders")?;
+    let clip = r.precomp_window(ctx, layer);
+    let sub = sub.with_clip(clip);
+    // Only this plane's own steps count (see `alpha_bounds`).
+    e.take_missing();
+    let src = crate::cull::nested(e, ctx, &sub, item, lt).ok_or("a nested comp the GPU declines")?;
+    let image = crate::walk::prepare_processed(e, r, ctx, layer, src, bs, clip.offset(), false).ok_or("an effect the GPU can't run")?;
+    let (w, h) = image.img.size();
+    if w == 0 || h == 0 {
+        return Err("empty precomp");
+    }
+    let img = image.img.float(e).ok_or("precomp to float")?;
+    let shape = Buf { img: Image { width: w, height: h, data: Vec::new() }, offset: image.offset, scale: image.scale };
+    finish(e, shape, img)
 }
 
 fn finish(e: &mut Enc, shape: Buf, img: GpuImage) -> Result<(Buf, GpuImage), &'static str> {

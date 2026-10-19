@@ -5,12 +5,13 @@
 
 use std::sync::atomic::Ordering;
 
+use effectcraft_color::Label;
 use effectcraft_keyframe::{Gradient, Keyframe, Value};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::styles::{self as st, GROUP};
-use effectcraft_project::{BitDepth, LayerSource};
+use effectcraft_project::{BitDepth, Comp, ItemKind, LayerSource};
 use effectcraft_render::RenderOpts;
-use effectcraft_time::Tick;
+use effectcraft_time::{FrameRate, Tick};
 
 use crate::tests::{Scene, check, compare_at, n, opts, set};
 
@@ -136,6 +137,47 @@ fn a_3d_styled_plane_far_past_the_frame_styles_only_what_is_seen() {
                 assert_eq!(crate::plane3d::CUT_TO_VIEW.load(Ordering::Relaxed) > cut, !align, "{depth:?}, aligned {align}: cut to the view");
             }
             check(&format!("3D circle at 1600%, {depth:?}, aligned gradient {align}"), d, 0.002);
+        }
+    }
+}
+
+/// A 3D precomp layer (10-10 MAIN's Clock 1 and Clock 2): its nested comp, a glowing shape with
+/// animated effects, walks on the GPU and the precomp's own effect runs there too; the plane is
+/// never read back to the CPU and uploaded again, and the frame matches the CPU's.
+#[test]
+fn a_3d_precomp_plane_is_made_on_the_gpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        for scale in [1.0, 0.5] {
+            let mut s = Scene::new(depth);
+            let inner = Comp::new(60, 40, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let inner_id = s.p.add_item("Clock", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+            let mut l = build::layer(&mut s.p, &inner, "Circle", LayerSource::Shape, (60, 40), None);
+            let mut next = s.p.next_id;
+            let mut ids = Ids(&mut next);
+            let e = build::shape_ellipse(&mut ids, [24.0, 24.0], [0.0, 0.0]);
+            let fill = build::shape_fill(&mut ids, [0.2, 0.5, 1.0, 1.0]);
+            let g = build::shape_group(&mut ids, "Ellipse 1", vec![e, fill]);
+            s.p.next_id = next;
+            l.props.sub_mut("contents").unwrap().children.push(g.into());
+            s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(1.5))]);
+            s.effect(&mut l, "ec.blur.ccradialfast", &[("center", Value::Vec2([30.0, 20.0])), ("amount", n(30.0))]);
+            s.effect(&mut l, "ec.stylize.glow", &[("radius", n(6.0)), ("threshold", n(40.0))]);
+            l.props.prop_mut("effects/#3/radius").unwrap().keys = vec![Keyframe::new(Tick::ZERO, n(6.0)), Keyframe::new(Tick::from_seconds_f64(1.0), n(9.0))];
+            s.p.comp_mut(inner_id).unwrap().layers = vec![l].into();
+            let bg = s.footage(97, 61);
+            s.push(bg);
+            let mut pre = build::layer(&mut s.p, &s.comp, "Clock 2", LayerSource::Comp { item: inner_id }, (60, 40), None);
+            pre.switches.three_d = true;
+            set(&mut pre, "transform/scale", Value::Vec3([140.0, 140.0, 100.0]));
+            set(&mut pre, "transform/rotationY", Value::Scalar(25.0));
+            s.effect(&mut pre, "ec.blur.gaussian", &[("blurriness", n(1.0))]);
+            s.push(pre);
+            let before = crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed);
+            let d = compare_at(&s, RenderOpts { scale, ..opts() }, Tick::from_seconds_f64(0.5));
+            if d.is_some() {
+                assert!(crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed) > before, "{depth:?} at {scale}: the precomp plane was made on the CPU");
+            }
+            check(&format!("3D precomp, {depth:?} at {scale}"), d, 0.002);
         }
     }
 }

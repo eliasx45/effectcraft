@@ -789,7 +789,16 @@ fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, src
 /// image quantised to the 8 bpc grid with no effects to run may stay (or become) codes. `at`: the
 /// source's offset (buffer pixels).
 #[allow(clippy::too_many_arguments)]
-fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut src: Pixels, bs: f64, at: [f64; 2], codes: bool) -> Option<SourceImage> {
+pub(crate) fn prepare_processed(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    mut src: Pixels,
+    bs: f64,
+    at: [f64; 2],
+    codes: bool,
+) -> Option<SourceImage> {
     let _profile = effectcraft_render::profile::span("prepare_processed");
     let pipe = r.pipe();
     let effects = layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty());
