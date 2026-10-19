@@ -4,7 +4,7 @@ use effectcraft_color::{BlendMode, Label};
 use effectcraft_keyframe::{Gradient, ShapePath, TextDoc, Value};
 use effectcraft_time::Tick;
 
-use crate::props::{GroupKind, MaskMode, ParamUi, PropGroup, Property};
+use crate::props::{GroupKind, MaskMode, Node, ParamUi, PropGroup, Property, Uid};
 use crate::{Comp, Layer, LayerId, LayerSource, LightKind, Project, Switches};
 
 /// Id allocator borrowing the project's counter.
@@ -342,6 +342,64 @@ pub fn text_anim_props(ids: &mut Ids, kind: &str, three_d: bool) -> Vec<Property
 
 /// Match ids of the Gradient Fill animator properties (an EffectCraft extension).
 pub const GRADIENT_FILL_PROPS: [&str; 4] = ["gradientType", "gradientStart", "gradientEnd", "gradientFillColors"];
+
+/// Properties one Animate / Add ▸ Property entry adds together, as (main properties, companion
+/// settings): deleting any of them deletes the set, as After Effects deletes Tracking Type with
+/// Tracking Amount. A companion stays while another main property that uses it is still there
+/// (Character Range serves both Character Offset and Character Value). Properties in no set
+/// (Fill Color, Blur, X Rotation…) go alone.
+pub const TEXT_ANIM_PROP_SETS: &[(&[&str], &[&str])] = &[
+    (&["tracking"], &["trackingType"]),
+    (&["skew"], &["skewAxis"]),
+    (&["characterOffset"], &["characterAlignment", "characterRange"]),
+    (&["characterValue"], &["characterRange"]),
+    // TODO(verify-tonight): `&[&str; 4]` → `&[&str]` coercion inside the const tuple.
+    (&GRADIENT_FILL_PROPS, &[]),
+];
+
+fn has(list: &[&str], m: &str) -> bool {
+    list.contains(&m)
+}
+
+/// The Properties group of the text animator that holds property `uid` (directly), found from a
+/// layer's property tree `root`: the properties Animate / Add ▸ Property adds, which Delete and
+/// scripting's `remove()` can delete. None for anything else: selectors' Start / End / Offset,
+/// Transform, Source Text, Path Options…
+pub fn text_animator_props_holding(root: &PropGroup, uid: Uid) -> Option<&PropGroup> {
+    let chain = root.node_chain(uid)?;
+    // … / Animators / Animator n / Properties / the property.
+    let i = chain.len().checked_sub(4)?;
+    let tail = (chain.get(i).copied()?, chain.get(i + 1).copied()?, chain.get(i + 2).copied()?, chain.get(i + 3).copied()?);
+    let (Node::Group(anims), Node::Group(anim), Node::Group(props), Node::Prop(_)) = tail else { return None };
+    (anims.match_id == "animators" && anim.match_id == "animator" && anim.is_instance() && props.match_id == "properties").then_some(props)
+}
+
+/// The uids of the properties to delete from a text animator's Properties group `props` when
+/// the ones with match ids `picked` are deleted: each with the rest of its set
+/// ([`TEXT_ANIM_PROP_SETS`]), and companions nothing left needs. Match ids not in `props` are
+/// ignored.
+pub fn text_animator_prop_removal(props: &PropGroup, picked: &[&str]) -> Vec<Uid> {
+    let mut gone: Vec<&str> = picked.to_vec();
+    for (mains, companions) in TEXT_ANIM_PROP_SETS {
+        if picked.iter().any(|m| has(mains, m) || has(companions, m)) {
+            gone.extend(mains.iter().copied());
+        }
+    }
+    let mut extra: Vec<&str> = vec![];
+    for (mains, companions) in TEXT_ANIM_PROP_SETS {
+        if !mains.iter().any(|m| has(&gone, m)) {
+            continue;
+        }
+        for c in companions.iter().copied() {
+            let needed = TEXT_ANIM_PROP_SETS.iter().any(|(others, theirs)| has(theirs, c) && others.iter().any(|m| !has(&gone, m) && props.get(m).is_some()));
+            if !needed {
+                extra.push(c);
+            }
+        }
+    }
+    gone.extend(extra);
+    props.children.iter().filter(|n| matches!(n, Node::Prop(_)) && has(&gone, n.match_id())).map(Node::uid).collect()
+}
 
 /// The default Gradient Fill Colors of a text animator: yellow → orange → red.
 pub fn text_gradient_fill_default() -> Gradient {

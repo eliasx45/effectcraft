@@ -1151,3 +1151,15 @@ before.
   note; `.aep` import never produces it. Glyphs without a selected gradient draw on the solid
   path as before (bit-identical). Extruded (Advanced 3D) characters and text → shapes use the colour
   at the gradient's middle.
+
+## Update: deleting one text animator property (19 October 2026)
+
+- PROP-REMOVE: a single property of a text animator's Properties (Fill Color, Blur, Rotation,
+  Tracking…) can be deleted, as in After Effects: Edit ▸ Clear / the Delete key with it
+  selected in the Timeline, Delete in its row's context menu, scripting's `Property.remove()`,
+  and `prop.removeGroup` (which now also takes these properties and returns `{removed}`).
+  Properties one Animate entry adds together go together: Tracking Type with Tracking Amount,
+  Skew Axis with Skew, Character Alignment / Range with Character Offset (Character Range stays
+  while Character Value uses it), and the four Gradient Fill properties. Fixed properties
+  (a selector's Start / End / Offset, Transform, Source Text…) are refused with an error. One
+  undo step; the removed properties and their keyframes leave the selection.

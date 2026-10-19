@@ -1704,3 +1704,38 @@ fn text_gradient_fill_stops_are_scriptable() {
     );
     assert_eq!(o.result, json!([true, "", 2, [0, 1, 0, 1], 1]), "uid {colors}");
 }
+
+/// PROP-REMOVE: `Property.remove()` on a text animator property deletes just it, as in After
+/// Effects (it used to fail with "no property group"); Tracking Type and Tracking Amount go
+/// together; a Range Selector's Offset is fixed and `remove()` throws.
+#[test]
+fn removing_a_text_animator_property_from_a_script() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("R", 640, 200, 1, 3, 30);
+        var t = c.layers.addText("REMOVE");
+        var animator = t.property("ADBE Text Properties").property("ADBE Text Animators").addProperty("ADBE Text Animator");
+        var props = animator.property("ADBE Text Animator Properties");
+        props.addProperty("ADBE Text Fill Color");
+        props.addProperty("ADBE Text Opacity");
+        props.addProperty("ADBE Text Tracking Amount");
+        var n0 = props.numProperties;
+        animator.property("ADBE Text Animator Properties").property("Fill Color").remove();
+        var n1 = props.numProperties;
+        var fillGone = props.property("Fill Color") === null;
+        props.property("Tracking Type").remove();
+        var n2 = props.numProperties;
+        var sel = animator.property("ADBE Text Selectors").addProperty("ADBE Text Selector");
+        var err = "";
+        try { sel.property("ADBE Text Percent Offset").remove(); } catch (e) { err = e.message; }
+        [n0, n1, fillGone, n2, props.property(1).name, err.indexOf("fixed") >= 0, sel.property("ADBE Text Percent Offset") !== null]
+        "#,
+    );
+    assert_eq!(o.result, json!([4, 3, true, 1, "Opacity", true, true]));
+    let (_, comp) = comp_named(&s, "R");
+    let l = layer(comp, "REMOVE");
+    let kinds: Vec<&str> = l.props.group("text/animators/#1/properties").unwrap().props().map(|p| p.match_id.as_str()).collect();
+    assert_eq!(kinds, ["opacity"]);
+}
