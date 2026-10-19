@@ -232,6 +232,9 @@ impl FxTarget for CpuFx<'_> {
             b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
         }
     }
+    fn extent(&self) -> Option<([u32; 2], [f64; 2], f64)> {
+        self.buf.as_ref().map(|b| ([b.img.width, b.img.height], b.offset, b.scale))
+    }
 }
 
 impl<'a> Renderer<'a> {
@@ -326,6 +329,72 @@ impl<'a> Renderer<'a> {
         still && !blurred
     }
 
+    /// The part of a text or shape layer's comp-sized effect canvas (`[0, size]`, effect-space
+    /// layer units) that `stack` can make non-transparent: the drawn buffer (`extent`) grown by
+    /// each effect's reach in turn, clipped to the canvas. Outside it every effect reads and
+    /// writes transparent pixels, so the effects run on it alone give the same pixels as on the
+    /// whole canvas (a 3D layer's canvas at its raster scale can hold 40 megapixels around a
+    /// small shape). `None` when an effect's reach is not known: the whole canvas then.
+    fn canvas_support(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        stack: &[(usize, &effectcraft_project::PropGroup, &'static effectcraft_effects::EffectSpec)],
+        size: [f64; 2],
+        (dims, offset, scale): ([u32; 2], [f64; 2], f64),
+    ) -> Option<([f64; 2], [f64; 2])> {
+        if WHOLE_TEXT_CANVAS.load(std::sync::atomic::Ordering::Relaxed) || !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        let px = 1.0 / scale;
+        // Blur sizes of a layer whose effects run in comp space are in comp pixels.
+        let c = fx_comp_space(ctx, layer).map_or([1.0; 2], |m| EffectEnv { comp_space: Some([m.0[0], m.0[1]]), ..Default::default() }.comp_px());
+        let c = c[0].max(c[1]).max(1.0);
+        let mut lo = [-offset[0] * px, -offset[1] * px];
+        let mut hi = [(f64::from(dims[0]) - offset[0]) * px, (f64::from(dims[1]) - offset[1]) * px];
+        // CC Radial Fast Blur samples around Center measured from the buffer's offset: a canvas
+        // that starts elsewhere rounds it differently (its sample count flips at a few pixels),
+        // so the canvas keeps its top-left corner then.
+        let mut anchored = false;
+        for (_, g, spec) in stack {
+            let p = self.effect_params(ctx, layer, g);
+            // Generous bounds (crates/effects misc.rs, blur2.rs): a larger region only costs time.
+            let grow = match spec.id {
+                "ec.blur.gaussian" => 4.0 * effectcraft_effects::gaussian_sigma(p.f("blurriness")).max(0.0) * c,
+                "ec.blur.fastbox" => (p.f("radius").max(0.0) * c + px) * p.f("iterations").round().clamp(1.0, 50.0),
+                "ec.blur.directional" => p.f("length").abs() * c,
+                "ec.stylize.glow" => 4.0 * (p.f("radius").max(0.0) * effectcraft_effects::GLOW_SIGMA_PER_RADIUS * c).max(0.5 * px),
+                "ec.blur.ccradialfast" => {
+                    // A pixel averages the source on its way to Center, at most halfway there:
+                    // what it shows lies at most 1 / (1 − Amount/200) times as far out.
+                    let k = 1.0 / (1.0 - (p.f("amount") / 100.0).clamp(0.0, 1.0) * 0.5);
+                    anchored = true;
+                    let o = p.v2("center");
+                    for i in 0..2 {
+                        lo[i] = lo[i].min(o[i] + (lo[i] - o[i]) * k);
+                        hi[i] = hi[i].max(o[i] + (hi[i] - o[i]) * k);
+                    }
+                    0.0
+                }
+                // Colour changes that keep transparent pixels transparent, Expression Controls.
+                _ if !text_needs_canvas(spec) => 0.0,
+                _ => return None,
+            } + 4.0 * px;
+            lo = lo.map(|v| v - grow);
+            hi = hi.map(|v| v + grow);
+        }
+        let from = if anchored { [0.0; 2] } else { [lo[0].max(0.0), lo[1].max(0.0)] };
+        let to = [hi[0].min(size[0]), hi[1].min(size[1])];
+        if from.iter().chain(&to).any(|v| !v.is_finite()) {
+            return None;
+        }
+        // Nothing reaches the canvas: the buffer as it is.
+        if to[0] < from[0] || to[1] < from[1] {
+            return Some(([-offset[0] * px, -offset[1] * px], [-offset[0] * px, -offset[1] * px]));
+        }
+        Some((from, to))
+    }
+
     /// Run the layer's video effect stack on `target` (in effect space, measured from `origin`
     /// in layer coordinates): runs of GPU-capable effects go to [`FxTarget::gpu`] (when an
     /// accelerator is active and supports them), the rest to [`FxTarget::cpu`] one by one
@@ -401,7 +470,10 @@ impl<'a> Renderer<'a> {
             && !adjustment
             && stack.iter().any(|(_, g, spec)| text_needs_canvas(spec) && !self.transform_moves_nothing(ctx, layer, g, spec))
         {
-            target.effect_canvas(layer_size);
+            match target.extent().and_then(|e| self.canvas_support(ctx, layer, &stack, layer_size, e)) {
+                Some((from, to)) => target.effect_canvas_in(from, to),
+                None => target.effect_canvas(layer_size),
+            }
         }
         let accel = self.active_accel();
         let mut k = 0;
@@ -483,6 +555,10 @@ pub(crate) fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
 /// `Renderer::transform_moves_nothing`).
 pub(crate) static ALWAYS_TEXT_CANVAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Test switch: text and shape effects run on the whole comp-sized canvas (the reference for
+/// `Renderer::canvas_support`).
+pub(crate) static WHOLE_TEXT_CANVAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Colour-only effects and expression controls neither move pixels nor create coverage.
 /// The colour effects listed here can modify zero alpha, so keep their larger canvas.
 pub(crate) fn text_needs_canvas(spec: &effectcraft_effects::EffectSpec) -> bool {
@@ -499,13 +575,23 @@ pub(crate) fn text_needs_canvas(spec: &effectcraft_effects::EffectSpec) -> bool 
 /// Bounded extent and integer copy offset for extending a buffer to its effect canvas.
 /// `None` means unchanged, invalid input, or over budget.
 pub fn effect_canvas_extent(dimensions: [u32; 2], offset: [f64; 2], scale: f64, size: [f64; 2]) -> Option<([u32; 2], [u32; 2])> {
+    effect_canvas_extent_in(dimensions, offset, scale, [0.0; 2], size)
+}
+
+/// [`effect_canvas_extent`] of the canvas region from `from` to `to` (effect-space layer units).
+pub fn effect_canvas_extent_in(dimensions: [u32; 2], offset: [f64; 2], scale: f64, from: [f64; 2], to: [f64; 2]) -> Option<([u32; 2], [u32; 2])> {
     // min/max would otherwise hide NaN inputs before the allocation checks.
-    if !scale.is_finite() || scale <= 0.0 || offset.iter().any(|v| !v.is_finite()) || size.iter().any(|v| !v.is_finite() || *v < 0.0) {
+    if !scale.is_finite()
+        || scale <= 0.0
+        || offset.iter().chain(&from).chain(&to).any(|v| !v.is_finite())
+        || to[0] < from[0]
+        || to[1] < from[1]
+    {
         log::warn!("Invalid text effect canvas bounds; keeping the existing extent");
         return None;
     }
-    let lo = [offset[0].floor().min(0.0), offset[1].floor().min(0.0)];
-    let hi = [(offset[0] + size[0] * scale).ceil().max(dimensions[0] as f64), (offset[1] + size[1] * scale).ceil().max(dimensions[1] as f64)];
+    let lo = [(offset[0] + from[0] * scale).floor().min(0.0), (offset[1] + from[1] * scale).floor().min(0.0)];
+    let hi = [(offset[0] + to[0] * scale).ceil().max(dimensions[0] as f64), (offset[1] + to[1] * scale).ceil().max(dimensions[1] as f64)];
     let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
     if !w.is_finite() || !h.is_finite() || w > 16384.0 || h > 16384.0 || w * h > 64_000_000.0 {
         log::warn!("Text effect canvas exceeds the render limit; reduce the composition size or preview resolution");
@@ -518,8 +604,14 @@ pub fn effect_canvas_extent(dimensions: [u32; 2], offset: [f64; 2], scale: f64, 
 }
 
 /// Extend without moving or resampling the original glyph pixels.
-pub(crate) fn text_effect_canvas(mut buf: Buf, size: [f64; 2]) -> Buf {
-    let Some(([width, height], pad)) = effect_canvas_extent([buf.img.width, buf.img.height], buf.offset, buf.scale, size) else { return buf };
+#[cfg(test)]
+pub(crate) fn text_effect_canvas(buf: Buf, size: [f64; 2]) -> Buf {
+    text_effect_canvas_in(buf, [0.0; 2], size)
+}
+
+/// [`text_effect_canvas`] of the canvas region from `from` to `to` (effect-space layer units).
+pub(crate) fn text_effect_canvas_in(mut buf: Buf, from: [f64; 2], to: [f64; 2]) -> Buf {
+    let Some(([width, height], pad)) = effect_canvas_extent_in([buf.img.width, buf.img.height], buf.offset, buf.scale, from, to) else { return buf };
     let Some(count) = (width as usize).checked_mul(height as usize) else { return buf };
     let mut data = Vec::new();
     if data.try_reserve_exact(count).is_err() {

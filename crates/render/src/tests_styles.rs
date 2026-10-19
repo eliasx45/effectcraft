@@ -750,3 +750,67 @@ fn a_fading_transform_effect_keeps_text_on_its_glyph_buffer() {
         }
     }
 }
+
+/// Blurs, Glow and CC Radial Fast Blur on a text layer run on the part of the comp-sized effect
+/// canvas they can reach (`Renderer::canvas_support`), with the frame the whole canvas gives:
+/// 2D and a 3D Continuously Rasterized layer at a raster scale over 1 (P01 Clock's circle).
+#[test]
+fn blurs_and_glows_run_on_the_reachable_part_of_the_text_canvas() {
+    use crate::fx::WHOLE_TEXT_CANVAS;
+    use crate::{EvalCtx, NoFootage, RenderOpts, Renderer};
+    use effectcraft_keyframe::TextDoc;
+    use std::sync::atomic::Ordering;
+    for (three_d, radial) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut p = Project::default();
+        let comp = Comp::new(400, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (400, 200), None);
+        l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "O".into(), size: 30.0, ..Default::default() }));
+        l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.7, 90.3, 0.0]);
+        if three_d {
+            l.switches.three_d = true;
+            l.switches.collapse = true;
+            l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([180.0, 180.0, 100.0]);
+        }
+        let mut next = p.next_id;
+        for (id, set) in [
+            ("ec.blur.gaussian", vec![("blurriness", Value::Scalar(3.0)), ("repeatEdge", Value::Bool(true))]),
+            ("ec.blur.ccradialfast", vec![("center", Value::Vec2([170.0, 110.0])), ("amount", Value::Scalar(60.0))]),
+            ("ec.stylize.glow", vec![("radius", Value::Scalar(14.0)), ("threshold", Value::Scalar(40.0))]),
+            ("ec.stylize.glow", vec![("radius", Value::Scalar(6.0)), ("based", Value::Enum(0))]),
+        ] {
+            if id == "ec.blur.ccradialfast" && !radial {
+                continue;
+            }
+            let spec = effectcraft_effects::find(id).unwrap();
+            let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
+            for (k, v) in set {
+                g.prop_mut(k).unwrap().value = v;
+            }
+            l.props.sub_mut("effects").unwrap().children.push(g.into());
+        }
+        p.next_id = next;
+        let bg = solid(&mut p, &comp, [0.3, 0.4, 0.5], 400, 200);
+        p.comp_mut(cid).unwrap().layers = vec![l, bg].into();
+        let c = p.comp(cid).unwrap();
+        let layer = c.layers.iter().next().unwrap();
+        let area = |scale: f64| {
+            let r = Renderer::new(&p, &NoFootage, RenderOpts { scale, ..Default::default() });
+            let b = r.content_buf(&EvalCtx::new(&p, cid, c, Tick::ZERO), layer).unwrap();
+            b.img.width as u64 * b.img.height as u64
+        };
+        for scale in [1.0, 0.5] {
+            WHOLE_TEXT_CANVAS.store(true, Ordering::Relaxed);
+            let whole = render_frame(&p, cid, Tick::ZERO, scale);
+            let big = area(scale);
+            WHOLE_TEXT_CANVAS.store(false, Ordering::Relaxed);
+            let part = render_frame(&p, cid, Tick::ZERO, scale);
+            let small = area(scale);
+            // With CC Radial Fast Blur the canvas keeps its top-left corner (`canvas_support`).
+            let shrunk = if radial { small < big } else { small * 3 < big * 2 };
+            assert!(shrunk, "3D {three_d}, radial {radial}, at {scale}: {small} vs {big} px");
+            let worst = whole.data.iter().zip(&part.data).flat_map(|(a, b)| (0..4).map(move |i| (a[i] - b[i]).abs())).fold(0.0f32, f32::max);
+            assert!(worst <= 1.0 / 255.0, "3D {three_d}, radial {radial}, at {scale}: differs by {worst}");
+        }
+    }
+}

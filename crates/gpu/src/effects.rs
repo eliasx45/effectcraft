@@ -181,9 +181,13 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
         self.b = self.e.g.upload_image(&out.img).map(|img| PBuf { img: img.into(), offset: out.offset, scale: out.scale });
     }
-    fn effect_canvas(&mut self, size: [f64; 2]) {
+    fn extent(&self) -> Option<([u32; 2], [f64; 2], f64)> {
+        self.b.as_ref().map(|b| ([b.img.width(), b.img.height()], b.offset, b.scale))
+    }
+
+    fn effect_canvas_in(&mut self, from: [f64; 2], to: [f64; 2]) {
         let Some(b) = self.float() else { return };
-        let Some(([width, height], pad)) = effectcraft_render::effect_canvas_extent([b.img.width, b.img.height], b.offset, b.scale, size) else {
+        let Some(([width, height], pad)) = effectcraft_render::effect_canvas_extent_in([b.img.width, b.img.height], b.offset, b.scale, from, to) else {
             return;
         };
         // Failure keeps the existing whole-layer CPU fallback contract; never submit an
