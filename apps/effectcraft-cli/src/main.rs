@@ -1854,17 +1854,17 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                     r.accel = Some(&gpu);
                     r.times = Some(&times);
                     let at = Tick(t.0.saturating_add(step.0.saturating_mul(i)));
-                    // Built with `--features profile`: the last frame's stages (inclusive CPU
+                    // Built with `--features profile`: the first counted frame's stages (inclusive CPU
                     // spans and GPU passes), summed by name.
                     #[cfg(feature = "profile")]
-                    if i == frames {
+                    if i == 1 {
                         effectcraft_render::profile::start();
                     }
                     let t0 = std::time::Instant::now();
                     std::hint::black_box(gpu.render_display(&r, cid, at));
                     gpu.wait();
                     #[cfg(feature = "profile")]
-                    if i == frames {
+                    if i == 1 {
                         let (events, _) = effectcraft_render::profile::finish();
                         let mut stages: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
                         for e in &events {
