@@ -25,7 +25,8 @@ fn propose_accept_reject() {
     let rev = s.revision;
     let undo = s.history.undo.len();
     let steps = json!([{"command": "layer.rename", "params": {"layer": a, "name": "Kept"}}]);
-    let r = s.execute("suggestion.propose", json!({"label": "Rename it", "steps": steps, "layers": [a], "range": [0.5, 0.2], "client": "claude-test"})).unwrap();
+    let r =
+        s.execute("suggestion.propose", json!({"label": "Rename it", "steps": steps, "layers": [a], "range": [0.5, 0.2], "client": "claude-test"})).unwrap();
     let id = r["id"].as_str().unwrap().to_string();
     assert_eq!(s.revision, rev, "proposing changes nothing");
     let list = suggestions::list(&s);
@@ -58,7 +59,8 @@ fn bad_proposals_and_failed_accepts() {
     assert!(s.execute("suggestion.propose", json!({"label": "x", "steps": [{"command": "no.such"}]})).is_err());
     assert!(s.execute("suggestion.propose", json!({"label": "x", "steps": [{"command": "engine.batch"}]})).is_err());
     // A step that fails rolls the whole suggestion back, and it stays waiting.
-    let steps = json!([{"command": "layer.rename", "params": {"layer": a, "name": "Half"}}, {"command": "layer.rename", "params": {"layer": 999999, "name": "x"}}]);
+    let steps =
+        json!([{"command": "layer.rename", "params": {"layer": a, "name": "Half"}}, {"command": "layer.rename", "params": {"layer": 999999, "name": "x"}}]);
     let id = s.execute("suggestion.propose", json!({"label": "Broken", "steps": steps})).unwrap()["id"].as_str().unwrap().to_string();
     assert!(s.execute("suggestion.accept", json!({"id": id})).is_err());
     assert_ne!(name(&s, a), "Half");
@@ -89,7 +91,9 @@ fn why_answer_goes_to_the_app() {
     let (mut s, _) = session();
     assert!(s.execute("why.answer", json!({})).is_err());
     s.execute("why.answer", json!({"why": "too big/small", "what": "Scale"})).unwrap();
-    assert!(s.events.iter().any(|e| matches!(e, crate::Event::Frontend { command, params } if command == "why.answer" && params["why"] == json!("too big/small"))));
+    assert!(
+        s.events.iter().any(|e| matches!(e, crate::Event::Frontend { command, params } if command == "why.answer" && params["why"] == json!("too big/small")))
+    );
 }
 
 #[test]

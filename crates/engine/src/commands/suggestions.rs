@@ -85,7 +85,10 @@ const NOT_IN_SUGGESTION: &[&str] = &["engine.batch", "file.runScript", "script.r
 
 fn propose(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "suggestion.propose";
-    let label = str_p(p, "label").map(str::trim).filter(|l| !l.is_empty()).ok_or_else(|| bad(cmd, "missing `label` (what the pill says, e.g. \"Card → Fast In, peak on WORKS\")"))?;
+    let label = str_p(p, "label")
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| bad(cmd, "missing `label` (what the pill says, e.g. \"Card → Fast In, peak on WORKS\")"))?;
     if label.chars().count() > 120 {
         return Err(bad(cmd, "`label`: at most 120 characters"));
     }
@@ -332,7 +335,19 @@ fn why_answer(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Commands that only select or navigate: not "actions" in History.
 pub const NOT_ACTIONS: &[&str] = &[
-    "layer.select", "layer.selectNext", "layer.selectPrevious", "prop.select", "prop.deselect", "keys.select", "comp.open", "comp.close", "time.", "view.", "timeline.", "window.", "viewer.",
+    "layer.select",
+    "layer.selectNext",
+    "layer.selectPrevious",
+    "prop.select",
+    "prop.deselect",
+    "keys.select",
+    "comp.open",
+    "comp.close",
+    "time.",
+    "view.",
+    "timeline.",
+    "window.",
+    "viewer.",
 ];
 
 /// Whether `id` is a user action History lists (not a selection or navigation).
@@ -340,13 +355,13 @@ pub fn is_action(id: &str) -> bool {
     !NOT_ACTIONS.iter().any(|n| if n.ends_with('.') { id.starts_with(n) } else { id == *n })
 }
 
-/// The spoken word nearest comp time `t` in `comp` (within a second): (word, comp seconds).
+/// The spoken word nearest comp time `t` in `comp` (within a second): (word, comp seconds). Only
+/// words heard on the voice layer count (lane B's `SpeechMap::audible`: trimmed words are hidden).
 pub fn nearest_word(comp: &effectcraft_project::Comp, t: effectcraft_time::Tick) -> Option<(String, f64)> {
     let sp = comp.speech.as_ref()?;
     let ts = t.seconds();
-    sp.words
-        .iter()
-        .map(|w| (w, ((w.start.seconds() + w.end.seconds()) / 2.0 - ts).abs()))
+    sp.audible(comp)
+        .map(|(_, w)| (w, ((w.start.seconds() + w.end.seconds()) / 2.0 - ts).abs()))
         .filter(|(_, d)| d.is_finite() && *d <= 1.0)
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(w, _)| (w.word.clone(), w.start.seconds()))
@@ -379,7 +394,12 @@ fn usage(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|(i, (id, params))| {
             let label = super::find(id).map(|c| c.label).unwrap_or("");
             let layers: Vec<Value> = comp
-                .map(|c| param_layers(c, params).into_iter().filter_map(|l| c.layer(effectcraft_project::LayerId(l)).map(|x| json!({"id": l, "name": x.name}))).collect())
+                .map(|c| {
+                    param_layers(c, params)
+                        .into_iter()
+                        .filter_map(|l| c.layer(effectcraft_project::LayerId(l)).map(|x| json!({"id": l, "name": x.name})))
+                        .collect()
+                })
                 .unwrap_or_default();
             // The action's own time when it has one, else the playhead now.
             let at = super::f_p(params, "time").map(effectcraft_time::Tick::from_seconds_f64).unwrap_or(t);
@@ -406,13 +426,7 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
         ),
         spec("suggestion.list", "List Suggestions", "{} → {suggestions: [{id, n, label, steps, layers, comp, range, by}]}", list_cmd, false),
-        spec(
-            "suggestion.accept",
-            "Keep Suggestion",
-            "{id | all: true} → {kept, failed, waiting}: each suggestion runs as one undo step",
-            accept,
-            true,
-        ),
+        spec("suggestion.accept", "Keep Suggestion", "{id | all: true} → {kept, failed, waiting}: each suggestion runs as one undo step", accept, true),
         spec(
             "agent.snapshot",
             "Keep Claude's Version",

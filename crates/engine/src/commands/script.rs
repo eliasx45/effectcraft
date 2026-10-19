@@ -557,7 +557,7 @@ fn build(s: &mut Session, p: &Value, b: &Build) -> Result<Value> {
                 (Some(id), _) => id.to_string(),
                 (None, Some(q)) => {
                     let r = s.execute("library.search", json!({"query": q, "limit": 1}))?;
-                    // TODO(batch1-verify): library.search's result shape ({entries: [{id}]}).
+                    // library.search → {total, entries: [{id, name, …}]} (checked in commands/library.rs).
                     r.get("entries")
                         .and_then(|e| e.get(0))
                         .and_then(|e| e.get("id"))
@@ -575,7 +575,7 @@ fn build(s: &mut Session, p: &Value, b: &Build) -> Result<Value> {
             {
                 let want = (b.end - b.start + 4.0 * f).max(f);
                 let cid = b.cid;
-                // TODO(batch1-verify): library.apply's `layer` is in this comp and starts at `time`.
+                // library.apply nests the card in `comp` at `time` and returns that `layer` (checked).
                 s.edit("Adapt Preset to Phrase", None, |proj, _| {
                     let l = super::layer_mut(proj, cid, LayerId(l))?;
                     let len = (l.out_point - l.in_point).seconds();

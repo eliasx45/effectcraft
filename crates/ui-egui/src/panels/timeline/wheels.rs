@@ -115,7 +115,8 @@ pub fn hold_keys(app: &mut EffectcraftApp, ctx: &egui::Context) {
         if !down {
             // A tap: the key's own meaning, through the normal shortcut path.
             ctx.data_mut(|d| d.remove::<Pending>(pending_id()));
-            // TODO(batch1-verify): egui 0.36 `Event::Key` fields; the replayed press reaches menus::handle_shortcuts this frame.
+            // egui 0.36 `Event::Key {key, physical_key, pressed, repeat, modifiers}`; this runs before
+            // menus::handle_shortcuts, which reads the frame's `Event::Key` presses (checked).
             ctx.input_mut(|i| {
                 i.events.push(egui::Event::Key { key: p.key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE })
             });

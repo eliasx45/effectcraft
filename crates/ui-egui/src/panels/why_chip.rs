@@ -62,8 +62,10 @@ fn watch(app: &EffectcraftApp, ctx: &egui::Context) -> Watch {
     }
     let Some((what, _)) = s.history.undo.last() else { return w };
     let comp = s.active_comp_id().and_then(|c| Some((c.0, s.project.item(c)?.name.clone())));
-    let layers: Vec<(u64, String)> =
-        s.active_comp().map(|c| s.state.selected_layers.iter().filter_map(|id| c.layer(*id).map(|l| (id.0, l.name.clone()))).take(8).collect()).unwrap_or_default();
+    let layers: Vec<(u64, String)> = s
+        .active_comp()
+        .map(|c| s.state.selected_layers.iter().filter_map(|id| c.layer(*id).map(|l| (id.0, l.name.clone()))).take(8).collect())
+        .unwrap_or_default();
     w.asked_for = ptr;
     w.open = Some(Ask { what: what.clone(), comp, layers, agent, text: String::new() });
     w

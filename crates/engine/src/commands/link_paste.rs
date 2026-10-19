@@ -68,7 +68,9 @@ pub fn parse(url: &str) -> Option<Link> {
     // Handles: letters, digits, `_` and `.` (glow.with.valentina).
     let ok_handle = |c: &str| !c.is_empty() && !c.starts_with('.') && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.');
     match segs.as_slice() {
-        [kind @ ("reel" | "reels" | "p" | "tv"), code, ..] if ok_code(*code) => Some(Link::Post { code: code.to_string(), reel: matches!(*kind, "reel" | "reels" | "tv") }),
+        [kind @ ("reel" | "reels" | "p" | "tv"), code, ..] if ok_code(*code) => {
+            Some(Link::Post { code: code.to_string(), reel: matches!(*kind, "reel" | "reels" | "tv") })
+        }
         // instagram.com/<handle>/reel/<code> (shared from a profile grid)
         [_, kind @ ("reel" | "p"), code, ..] if ok_code(*code) => Some(Link::Post { code: code.to_string(), reel: *kind == "reel" }),
         [handle, ..] if ok_handle(*handle) && handle.len() <= 30 && !NOT_PROFILES.contains(handle) && !matches!(*handle, "reel" | "p" | "tv") => {
@@ -266,7 +268,13 @@ mod tests {
         assert!(s.events.iter().any(|e| matches!(e, crate::Event::Frontend { command, .. } if command == "link.paste")));
         assert!(s.execute("link.paste", json!({"url": "https://www.instagram.com/reel/ABC123/", "choice": "avatar", "layers": [a]})).is_err());
         // A missing file rolls everything back.
-        assert!(s.execute("link.paste", json!({"url": "https://www.instagram.com/reel/ABC123/", "choice": "cover", "layers": [a], "files": ["/nonexistent/x.jpg"]})).is_err());
+        assert!(
+            s.execute(
+                "link.paste",
+                json!({"url": "https://www.instagram.com/reel/ABC123/", "choice": "cover", "layers": [a], "files": ["/nonexistent/x.jpg"]})
+            )
+            .is_err()
+        );
         assert_eq!(s.history.undo.len(), undo);
     }
 }

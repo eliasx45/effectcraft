@@ -601,8 +601,9 @@ fn template(s: &mut Session, p: &Preset, cid: ItemId, notes: &mut Vec<String>) -
             ),
         )),
         Source::Card { id, .. } => {
-            // TODO(batch1-verify): library.apply nests the card's comp in `cid`; the nested layer is
-            // removed right away and the imported comp stays as the template's home.
+            // library.apply nests the card's comp in `cid` ({item, layer, comp, …}, checked in
+            // commands/motion_library.rs); the nested layer is removed right away and the imported
+            // comp stays as the template's home.
             let r = s.execute("library.apply", json!({"id": id, "comp": cid.0}))?;
             if r.get("pending").and_then(Value::as_bool) == Some(true) {
                 return Err(bad(C, format!("“{}” is still downloading ({}/{}): run text.apply again in a moment", p.name, r["done"], r["total"])));

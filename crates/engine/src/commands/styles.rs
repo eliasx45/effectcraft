@@ -396,13 +396,10 @@ pub const TEXT_WORKSHOP: &str = "Creating Text Presets";
 pub const TEXT_PRESET_FOLDER: &str = "Elias/Text animations";
 
 /// Whether `name` reads as a text preset name (`T3b Pop · mid`: T, the family number, a variant
-/// letter, a title).
-// TODO(batch1-verify): lane D's `text_presets::parse_name` is the full reader; use it once both are in.
+/// letter, a title), by lane D's reader ([`super::text_presets::parse_name`]), so what
+/// `ml.saveTextPreset` saves is what `text.presetFamilies` lists.
 pub fn is_text_preset_name(name: &str) -> bool {
-    let n = name.trim();
-    let Some(rest) = n.strip_prefix('T').or_else(|| n.strip_prefix('t')) else { return false };
-    let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    (1..=4).contains(&digits) && n.chars().count() <= 120
+    name.trim().chars().count() <= 120 && super::text_presets::parse_name(name).is_some()
 }
 
 fn save_text_preset(s: &mut Session, p: &Value) -> Result<Value> {
@@ -471,7 +468,11 @@ fn reveal_target(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, LayerId, 
     };
     if let (Some(lid), Some(uid)) = (want_layer, p.get("selector").and_then(Value::as_u64)) {
         let l = comp.layer(lid).ok_or_else(|| bad(cmd, "no such layer"))?;
-        return if keyed(l, uid) { Ok((cid, lid, uid)) } else { Err(bad(cmd, "`selector` is not a keyed Range Selector Start, End or Offset (two keys or more)")) };
+        return if keyed(l, uid) {
+            Ok((cid, lid, uid))
+        } else {
+            Err(bad(cmd, "`selector` is not a keyed Range Selector Start, End or Offset (two keys or more)"))
+        };
     }
     for k in &s.state.selected_keys {
         if want_layer.is_some_and(|w| w != k.layer) {
@@ -581,7 +582,8 @@ fn unit_bounce(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let sels = g.sub_mut("selectors").ok_or_else(|| bad(cmd, "no selectors group"))?;
         if sels.sub("expressionSelector").is_none() {
-            let es = effectcraft_project::build::text_selector(&mut ids, "expression", "Expression Selector 1").ok_or_else(|| bad(cmd, "no expression selector"))?;
+            let es =
+                effectcraft_project::build::text_selector(&mut ids, "expression", "Expression Selector 1").ok_or_else(|| bad(cmd, "no expression selector"))?;
             sels.children.push(es.into());
         }
         let amount = sels.sub_mut("expressionSelector").and_then(|e| e.get_mut("amount")).ok_or_else(|| bad(cmd, "the Expression Selector has no Amount"))?;
@@ -597,7 +599,11 @@ fn unit_bounce(s: &mut Session, p: &Value) -> Result<Value> {
                     props.children.push(pr.into());
                 }
             }
-            let v = if k == "position" { effectcraft_keyframe::Value::Vec3([0.0, -lift, 0.0]) } else { effectcraft_keyframe::Value::Vec3([100.0 + grow, 100.0 + grow, 100.0]) };
+            let v = if k == "position" {
+                effectcraft_keyframe::Value::Vec3([0.0, -lift, 0.0])
+            } else {
+                effectcraft_keyframe::Value::Vec3([100.0 + grow, 100.0 + grow, 100.0])
+            };
             if let Some(pr) = props.get_mut(k) {
                 pr.keys.clear();
                 pr.value = v;
@@ -612,7 +618,9 @@ fn unit_bounce(s: &mut Session, p: &Value) -> Result<Value> {
         "{sel_name} only reveals: Ramp Up keeps every unit 0–100 %, so a spring there shows nothing. {} animator “{UNIT_BOUNCE}” with an Expression Selector: each unit springs its {what} as the reveal reaches it (strength {strength:.0}, {frequency:.1} bounces/s, settle {decay:.1}); the reveal keeps the opacity.",
         if reused { "Updated the" } else { "Added the" }
     );
-    Ok(json!({"animator": anim_uid, "layer": lid.0, "selector": sel_uid, "reused": reused, "reveal": [t0.min(t1), t0.max(t1)], "reverse": reverse, "moves": moves, "message": message}))
+    Ok(
+        json!({"animator": anim_uid, "layer": lid.0, "selector": sel_uid, "reused": reused, "reveal": [t0.min(t1), t0.max(t1)], "reverse": reverse, "moves": moves, "message": message}),
+    )
 }
 
 pub fn specs() -> Vec<CommandSpec> {

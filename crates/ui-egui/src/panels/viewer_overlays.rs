@@ -1182,7 +1182,15 @@ fn suggestion_project(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str) -
 
 /// Over the viewer's frame: a hovered suggestion (its range looping) or, while `\` or the header
 /// button is held, Claude's version; and the corner label saying which one is on screen.
-pub(crate) fn agent_compare(app: &mut EffectcraftApp, ctx: &egui::Context, painter: &egui::Painter, comp_rect: Rect, area: Rect, cid: effectcraft_engine::project::ItemId, scale: f64) {
+pub(crate) fn agent_compare(
+    app: &mut EffectcraftApp,
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    comp_rect: Rect,
+    area: Rect,
+    cid: effectcraft_engine::project::ItemId,
+    scale: f64,
+) {
     let blue = super::suggestions::CLAUDE_BLUE;
     let green = Color32::from_rgb(0x8f, 0xe0, 0xb4);
     let mut label: Option<(String, Color32)> = None;

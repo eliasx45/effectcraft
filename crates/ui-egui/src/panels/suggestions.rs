@@ -92,7 +92,7 @@ fn hold_backslash(app: &EffectcraftApp, ctx: &egui::Context) {
                 set_flipped(ctx, false);
             } else {
                 // A tap: `\`'s own meaning through the normal shortcut path.
-                // TODO(batch1-verify): same replay as timeline/wheels.rs hold_keys (egui `Event::Key` fields).
+                // The same replay as timeline/wheels.rs hold_keys (egui 0.36 `Event::Key` fields checked).
                 ctx.input_mut(|i| i.events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }));
             }
             return;
@@ -111,7 +111,9 @@ fn hold_backslash(app: &EffectcraftApp, ctx: &egui::Context) {
     if effectcraft_engine::commands::suggestions::claude_version(&app.session).is_none() {
         return;
     }
-    let pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, modifiers, .. } if *k == key && !modifiers.any())));
+    let pressed = ctx.input(|i| {
+        i.events.iter().any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, modifiers, .. } if *k == key && !modifiers.any()))
+    });
     if pressed {
         ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
         ctx.data_mut(|d| d.insert_temp(flip_press_id(), now));
@@ -196,7 +198,11 @@ pub fn timeline_overlay(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect)
         let pill = Rect::from_min_size(pos2(x, cy - 10.0), vec2(w, 20.0));
         let presp = ui.interact(pill, egui::Id::new(("suggestion-pill", sg.id.as_str())), Sense::hover());
         let hot = presp.hovered();
-        p.rect_filled(pill, 10.0, if hot { Color32::from_rgba_unmultiplied(0x8f, 0xc1, 0xff, 70) } else { Color32::from_rgba_unmultiplied(0x8f, 0xc1, 0xff, 28) });
+        p.rect_filled(
+            pill,
+            10.0,
+            if hot { Color32::from_rgba_unmultiplied(0x8f, 0xc1, 0xff, 70) } else { Color32::from_rgba_unmultiplied(0x8f, 0xc1, 0xff, 28) },
+        );
         p.galley(pos2(pill.min.x + 8.0, cy - g.size().y / 2.0), g, t.text);
         app.auto.add(&format!("timeline.suggestions.{}", sg.id), pill, &label);
         if hot {
@@ -238,7 +244,11 @@ pub fn timeline_overlay(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect)
         }
         let a = if hov == Some(sg.id.as_str()) { 1.0 } else { 0.55 };
         for layer in &sg.layers {
-            let Some(bar) = app.auto.find_current(&format!("timeline.layer.{layer}.bar")).map(|e| Rect::from_min_size(pos2(e.rect[0], e.rect[1]), vec2(e.rect[2], e.rect[3]))) else {
+            let Some(bar) = app
+                .auto
+                .find_current(&format!("timeline.layer.{layer}.bar"))
+                .map(|e| Rect::from_min_size(pos2(e.rect[0], e.rect[1]), vec2(e.rect[2], e.rect[3])))
+            else {
                 continue;
             };
             let (x0, x1) = match sg.range {

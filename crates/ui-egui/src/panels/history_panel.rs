@@ -117,7 +117,9 @@ pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
             }
             None => vec![],
         };
-        let layers: Vec<(u64, String)> = comp.map(|c| ids.iter().filter_map(|l| c.layer(effectcraft_engine::project::LayerId(*l)).map(|x| (*l, x.name.clone()))).take(16).collect()).unwrap_or_default();
+        let layers: Vec<(u64, String)> = comp
+            .map(|c| ids.iter().filter_map(|l| c.layer(effectcraft_engine::project::LayerId(*l)).map(|x| (*l, x.name.clone()))).take(16).collect())
+            .unwrap_or_default();
         let near = comp.and_then(|c| suggestions::nearest_word(c, s.time()));
         let text = params.to_string();
         let params_v = if text.len() > MAX_PARAMS { json!({"truncated": true}) } else { params.clone() };
@@ -188,7 +190,13 @@ pub fn history_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: f
         if e.by != "user" {
             head.push_str(&format!(" · {}", e.by));
         }
-        p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, &head, Tokens::medium(11.5 * s), if e.by == "user" { t.text } else { super::suggestions::CLAUDE_BLUE });
+        p.text(
+            pos2(x0, y + 8.0 * s),
+            Align2::LEFT_CENTER,
+            &head,
+            Tokens::medium(11.5 * s),
+            if e.by == "user" { t.text } else { super::suggestions::CLAUDE_BLUE },
+        );
         let cmd = format!("{} {}", e.command, e.line["params"]);
         let cmd: String = cmd.chars().take(140).collect();
         p.text(pos2(x0, y + 24.0 * s), Align2::LEFT_CENTER, &cmd, Tokens::mono(10.5 * s), t.text_dim);

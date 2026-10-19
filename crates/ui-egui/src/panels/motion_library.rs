@@ -5166,7 +5166,8 @@ pub fn save_text_preset(app: &mut EffectcraftApp, ctx: &egui::Context, params: &
         Err(_) => vec![],
     };
     let port = control_port(app)?;
-    let args = json!({"name": name, "category": category, "description": "Text animation preset (from the Creating Text Presets comp)", "preview_mode": "selected"});
+    let args =
+        json!({"name": name, "category": category, "description": "Text animation preset (from the Creating Text Presets comp)", "preview_mode": "selected"});
     app.ui.status = format!("Saving text preset “{name}” to {category}…");
     let replaced = old.len();
     let done = if replaced > 0 { format!("Updated text preset “{name}” in {category}") } else { format!("Saved text preset “{name}” to {category}") };

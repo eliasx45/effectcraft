@@ -32,16 +32,8 @@ fn first_start(s: &Session) -> f64 {
 fn words_move_with_their_layer_and_undo_back() {
     let (mut s, l) = talk();
     assert!((first_start(&s) - 0.4).abs() < 1e-6);
-    // TODO(batch1-verify): the command that moves a layer's start (layer.setStartTime or similar).
-    s.edit("Move", None, |proj, _| {
-        let cid = proj.comps().next().map(|(id, _)| *id).unwrap();
-        let layer = proj.comp_mut(cid).unwrap().layer_mut(LayerId(l)).unwrap();
-        layer.start_time += effectcraft_time::Tick::from_seconds_f64(1.0);
-        layer.in_point += effectcraft_time::Tick::from_seconds_f64(1.0);
-        layer.out_point += effectcraft_time::Tick::from_seconds_f64(1.0);
-        Ok(())
-    })
-    .unwrap();
+    // The Timeline's bar drag runs layer.timing {layers, delta} (seconds).
+    s.execute("layer.timing", json!({"layers": [l], "delta": 1.0})).unwrap();
     assert!((first_start(&s) - 1.4).abs() < 1e-6, "the words moved with the layer");
     s.undo();
     assert!((first_start(&s) - 0.4).abs() < 1e-6);
