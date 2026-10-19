@@ -1421,3 +1421,90 @@ mod tests {
         assert_eq!(native_message("gradientLock", &json!({}), &json!({"locked": 2, "already": 1})), "Gradient lock: 2 locked, 1 already.");
     }
 }
+
+// ── Style families (batch 1, CX3) ──────────────────────────────────────────────────────────────
+
+/// The Motion Library's Families tab: every style family of the project (`style.family.list`)
+/// with its size; dragging a size and letting go changes every linked layer
+/// (`style.family.set`, one undo step). "Link selected" adds the selected layers to a family.
+pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: f32) {
+    let t = app.tokens;
+    let ctx = ui.ctx().clone();
+    let p = ui.painter().with_clip_rect(area);
+    p.rect_filled(area, 0.0, t.panel_bg);
+    app.auto.add("motionLibrary.families", area, "Style families");
+    let x0 = area.min.x + 12.0 * s;
+    let w = (area.width() - 24.0 * s).max(80.0);
+    let mut y = area.min.y + 12.0 * s;
+    p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, tr("Style families · change one, all follow"), Tokens::semibold(12.5 * s), t.text);
+    y += 26.0 * s;
+    // The list, read again when the document changes.
+    let cache = egui::Id::new("ml-families-cache");
+    let rev = app.session.revision;
+    let list: Value = match ctx.data(|d| d.get_temp::<(u64, Value)>(cache)) {
+        Some((r, v)) if r == rev => v,
+        _ => {
+            let v = app.session.execute("style.family.list", json!({})).unwrap_or(Value::Null);
+            ctx.data_mut(|d| d.insert_temp(cache, (rev, v.clone())));
+            v
+        }
+    };
+    let fams = list["families"].as_array().cloned().unwrap_or_default();
+    if fams.is_empty() {
+        let g = p.layout(
+            tr("No families yet. Select the layers that share a style (all your captions), type a family name below and press Link selected.").to_string(),
+            Tokens::ui(11.0 * s),
+            t.text_dim,
+            w,
+        );
+        let gh = g.size().y;
+        p.galley(pos2(x0, y), g, t.text_dim);
+        y += gh + 10.0 * s;
+    }
+    for f in &fams {
+        let (Some(name), Some(count)) = (f["family"].as_str(), f["count"].as_u64()) else { continue };
+        let size = f["size"].as_f64().unwrap_or(100.0);
+        p.text(pos2(x0, y + 9.0 * s), Align2::LEFT_CENTER, name, Tokens::semibold(12.0 * s), t.text);
+        p.text(pos2(x0 + 150.0 * s, y + 9.0 * s), Align2::LEFT_CENTER, format!("{count} layer{}", if count == 1 { "" } else { "s" }), Tokens::ui(11.0 * s), t.text_dim);
+        // Size: the slider shows the value while dragging; letting go runs the command once.
+        let drag_id = egui::Id::new(("ml-family-size", name));
+        let mut v: f64 = ctx.data(|d| d.get_temp(drag_id)).unwrap_or(size);
+        let sr = Rect::from_min_size(pos2(x0, y + 20.0 * s), vec2(w.min(320.0 * s), 18.0 * s));
+        let resp = ui.put(sr, egui::Slider::new(&mut v, 50.0..=250.0).suffix(" %").text(tr("Size")));
+        app.auto.add_response(&format!("motionLibrary.families.{name}.size"), &resp, &format!("{name} size"));
+        if resp.dragged() || resp.has_focus() {
+            ctx.data_mut(|d| d.insert_temp(drag_id, v));
+        }
+        let commit = resp.drag_stopped() || (resp.changed() && !resp.dragged());
+        if commit && (v - size).abs() > 1e-6 {
+            ctx.data_mut(|d| d.remove::<f64>(drag_id));
+            match crate::menus::invoke(app, &ctx, "style.family.set", json!({"family": name, "size": v})) {
+                Ok(r) => {
+                    let n = r["layers"].as_u64().unwrap_or(0);
+                    app.toast = Some((format!("{n} {name} updated: size {v:.0} %"), ctx.input(|i| i.time)));
+                }
+                Err(e) => app.ui.status = e,
+            }
+        } else if !resp.dragged() && !resp.has_focus() {
+            ctx.data_mut(|d| d.remove::<f64>(drag_id));
+        }
+        y += 48.0 * s;
+    }
+    // Link the selection to a family (new or existing).
+    y += 6.0 * s;
+    let name_id = egui::Id::new("ml-family-new-name");
+    let mut fname: String = ctx.data(|d| d.get_temp(name_id)).unwrap_or_else(|| "Captions".to_string());
+    let fr = Rect::from_min_size(pos2(x0, y), vec2((w - 130.0 * s).max(60.0), 22.0 * s));
+    let fresp = ui.put(fr, egui::TextEdit::singleline(&mut fname).hint_text(tr("Family name")));
+    app.auto.add_response("motionLibrary.families.name", &fresp, "Family name");
+    ctx.data_mut(|d| d.insert_temp(name_id, fname.clone()));
+    let b = Rect::from_min_size(pos2(fr.max.x + 8.0 * s, y), vec2(120.0 * s, 22.0 * s));
+    if kit::button(app, ui, b, "motionLibrary.families.link", "Link selected", true) {
+        match crate::menus::invoke(app, &ctx, "style.family.link", json!({"family": fname.trim()})) {
+            Ok(r) => {
+                app.toast = Some((format!("Linked {} layer(s) to {}", r["linked"].as_u64().unwrap_or(0), fname.trim()), ctx.input(|i| i.time)));
+            }
+            Err(e) => app.ui.status = e,
+        }
+    }
+}

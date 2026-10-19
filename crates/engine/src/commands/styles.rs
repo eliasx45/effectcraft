@@ -4,6 +4,11 @@
 //! [`effectcraft_project::styles`]); their values are edited with `prop.set` like any other
 //! property (`layerStyles/dropShadow/distance`). Global Light is shared by every layer of a comp:
 //! editing one layer's `layerStyles/blendingOptions/globalLightAngle` updates them all.
+//!
+//! Style families (batch 1, CX3): layers linked to a family (the 17 captions in "Caption glow +
+//! double shadow") change together: `style.family.set {family, size}` scales every linked layer
+//! of the project, in one undo step; `props` sets the same values on all of them.
+//! `style.family.link`, `style.family.unlink`, `style.family.list`.
 
 use effectcraft_project::build::Ids;
 use effectcraft_project::styles::{self as st, GROUP, STYLES};
@@ -205,8 +210,197 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     )
 }
 
+// ── Style families (CX3) ───────────────────────────────────────────────────────────────────
+
+// TODO(batch1-verify): the family link lives in the layer's comment as `[family: NAME @SIZE%]`
+// (Layer has no metadata field yet); move it to a real field on `effectcraft_project::Layer`.
+const TAG_OPEN: &str = "[family: ";
+
+/// The family a layer's comment links it to, and the size (percent) it is at.
+pub fn family_of(comment: &str) -> Option<(String, f64)> {
+    let start = comment.find(TAG_OPEN)?;
+    let rest = comment.get(start + TAG_OPEN.len()..)?;
+    let body = rest.get(..rest.find(']')?)?;
+    let (name, size) = match body.rsplit_once(" @") {
+        Some((n, sz)) => (n, sz.trim_end_matches('%').trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0).unwrap_or(100.0)),
+        None => (body, 100.0),
+    };
+    let name = name.trim();
+    (!name.is_empty()).then(|| (name.to_string(), size))
+}
+
+/// `comment` without its family tag.
+fn untagged(comment: &str) -> String {
+    let Some(start) = comment.find(TAG_OPEN) else { return comment.to_string() };
+    let end = comment.get(start..).and_then(|r| r.find(']')).map(|e| start + e + 1).unwrap_or(comment.len());
+    let mut out = String::new();
+    out.push_str(comment.get(..start).unwrap_or(""));
+    out.push_str(comment.get(end..).unwrap_or(""));
+    out.trim().to_string()
+}
+
+/// `comment` linked to `family` at `size` percent.
+fn tagged(comment: &str, family: &str, size: f64) -> String {
+    let base = untagged(comment);
+    let tag = format!("{TAG_OPEN}{family} @{}%]", (size * 100.0).round() / 100.0);
+    if base.is_empty() { tag } else { format!("{base} {tag}") }
+}
+
+fn family_p<'a>(p: &'a Value, cmd: &str) -> Result<&'a str> {
+    let f = str_p(p, "family").map(str::trim).filter(|f| !f.is_empty()).ok_or_else(|| bad(cmd, "missing `family` (e.g. \"Captions\")"))?;
+    if f.contains(']') || f.contains(" @") || f.chars().count() > 80 {
+        return Err(bad(cmd, "`family`: a name without `]` or ` @`, at most 80 characters"));
+    }
+    Ok(f)
+}
+
+/// Every layer of the project linked to `family`: (comp, layer, size).
+fn family_members(s: &Session, family: &str) -> Vec<(ItemId, LayerId, f64)> {
+    let mut out = vec![];
+    for (cid, c) in s.project.comps() {
+        for l in c.layers.iter() {
+            if let Some((f, size)) = family_of(&l.comment)
+                && f.eq_ignore_ascii_case(family)
+            {
+                out.push((*cid, l.id, size));
+            }
+        }
+    }
+    out
+}
+
+fn family_link(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "style.family.link";
+    let family = family_p(p, cmd)?.to_string();
+    let (cid, ids) = layers_p(s, p)?;
+    if ids.is_empty() {
+        return Err(bad(cmd, "select the layers to link (or pass `layers`)"));
+    }
+    // New members join at the family's size (so the next change scales them the same way).
+    let size = super::f_p(p, "size").or_else(|| family_members(s, &family).first().map(|m| m.2)).unwrap_or(100.0);
+    if !(size.is_finite() && size > 0.0) {
+        return Err(bad(cmd, "`size`: a percentage above 0"));
+    }
+    let n = s.edit("Link to Style Family", None, |proj, _| {
+        for lid in &ids {
+            let l = layer_mut(proj, cid, *lid)?;
+            l.comment = tagged(&l.comment, &family, size);
+        }
+        Ok(ids.len())
+    })?;
+    Ok(json!({"family": family, "linked": n, "members": family_members(s, &family).len(), "size": size}))
+}
+
+fn family_unlink(s: &mut Session, p: &Value) -> Result<Value> {
+    let (cid, ids) = layers_p(s, p)?;
+    let n = s.edit("Unlink from Style Family", None, |proj, _| {
+        let mut n = 0;
+        for lid in &ids {
+            let l = layer_mut(proj, cid, *lid)?;
+            if family_of(&l.comment).is_some() {
+                l.comment = untagged(&l.comment);
+                n += 1;
+            }
+        }
+        Ok(n)
+    })?;
+    Ok(json!({"unlinked": n}))
+}
+
+/// Most `props` one call sets.
+const MAX_FAMILY_PROPS: usize = 32;
+
+fn family_set(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "style.family.set";
+    let family = family_p(p, cmd)?.to_string();
+    let size = super::f_p(p, "size");
+    if size.is_some_and(|v| !(v.is_finite() && v > 0.0 && v <= 10_000.0)) {
+        return Err(bad(cmd, "`size`: a percentage above 0"));
+    }
+    let props: Vec<(String, Value)> = match p.get("props") {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Object(o)) => o.iter().take(MAX_FAMILY_PROPS).map(|(k, v)| (k.clone(), v.clone())).collect(),
+        Some(_) => return Err(bad(cmd, "`props`: {path: value}, e.g. {\"effects/Deep Glow/radius\": 20}")),
+    };
+    if size.is_none() && props.is_empty() {
+        return Err(bad(cmd, "nothing to change: pass `size` and/or `props`"));
+    }
+    let members = family_members(s, &family);
+    if members.is_empty() {
+        return Err(bad(cmd, format!("no layer is linked to “{family}” (style.family.link)")));
+    }
+    let label = match size {
+        Some(v) => format!("Style Family: {family} size {v} %"),
+        None => format!("Style Family: {family}"),
+    };
+    let (fam, props2) = (family.clone(), props.clone());
+    let skipped = s.edit(&label, None, |proj, _| {
+        let mut skipped: Vec<Value> = vec![];
+        for (cid, lid, old) in &members {
+            let l = layer_mut(proj, *cid, *lid)?;
+            if let Some(new) = size {
+                super::cards::scale_layer(l, new / old);
+                l.comment = tagged(&l.comment, &fam, new);
+            }
+            for (path, v) in &props2 {
+                match l.props.prop_mut(path) {
+                    Some(pr) if pr.is_animated() => skipped.push(json!({"layer": lid.0, "path": path, "why": "animated"})),
+                    Some(pr) => {
+                        // The value read as prop.set reads it (units, dimensions, colours).
+                        let cur = pr.value.clone();
+                        match super::prop::coerce_for(pr, &cur, v, cmd) {
+                            Ok((kv, _)) => pr.value = kv,
+                            Err(e) => skipped.push(json!({"layer": lid.0, "path": path, "why": e.to_string()})),
+                        }
+                    }
+                    None => skipped.push(json!({"layer": lid.0, "path": path, "why": "no such property"})),
+                }
+            }
+        }
+        Ok(skipped)
+    })?;
+    Ok(json!({"family": family, "layers": members.len(), "size": size, "skipped": skipped}))
+}
+
+fn family_list(s: &mut Session, _p: &Value) -> Result<Value> {
+    let mut fams: std::collections::BTreeMap<String, (usize, f64, Vec<Value>)> = Default::default();
+    for (cid, c) in s.project.comps() {
+        for l in c.layers.iter() {
+            if let Some((f, size)) = family_of(&l.comment) {
+                let e = fams.entry(f).or_insert((0, size, vec![]));
+                e.0 += 1;
+                if e.2.len() < 50 {
+                    e.2.push(json!({"comp": cid.0, "layer": l.id.0, "name": l.name}));
+                }
+            }
+        }
+    }
+    let list: Vec<Value> = fams.into_iter().map(|(f, (n, size, layers))| json!({"family": f, "count": n, "size": size, "layers": layers})).collect();
+    Ok(json!({"families": list}))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(
+            "style.family.set",
+            "Change Style Family",
+            [],
+            None,
+            "{family, size? (percent: every linked layer's Scale, keys too, follows), props? ({path: value}: set on every linked layer; animated ones are skipped)} → {family, layers, size, skipped}: every layer of the project linked to the family changes, one undo step",
+            has_comp,
+            family_set
+        ),
+        cmd!(
+            "style.family.link",
+            "Link to Style Family",
+            [],
+            None,
+            "{family, layers?, size? (percent the layers are at now; default the family's)} → {family, linked, members, size}",
+            has_layers,
+            family_link
+        ),
+        cmd!("style.family.unlink", "Unlink from Style Family", [], None, "{layers?} → {unlinked}", has_layers, family_unlink),
+        crate::query!("style.family.list", "Style Families", "{} → {families: [{family, count, size, layers: [{comp, layer, name}]}]}", family_list),
         cmd!("layer.style.convertToEditable", "Convert to Editable Styles", ["Layer", "Layer Styles"], None, "{layers?}", no_psd_styles, convert),
         cmd!("layer.style.showAll", "Show All", ["Layer", "Layer Styles"], None, "{layers?}", has_layers, show_all),
         cmd!("layer.style.removeAll", "Remove All", ["Layer", "Layer Styles"], None, "{layers?}", has_layers, remove_all),

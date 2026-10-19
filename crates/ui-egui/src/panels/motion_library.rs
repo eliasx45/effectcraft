@@ -1394,7 +1394,7 @@ fn rail(
     let mut y = bar.min.y + 8.0 * s;
     let mut anchors: Vec<(&str, Rect)> = vec![];
     use crate::icons::Icon;
-    let top: [(&str, Icon, &str, bool); 8] = [
+    let top: [(&str, Icon, &str, bool); 9] = [
         (
             "assets",
             Icon::Grid,
@@ -1404,6 +1404,8 @@ fn rail(
         ("curves", Icon::Graph, "Curves: the graph editor and curve presets", view.workspace == "curves"),
         ("tools", Icon::Sparkle, "Tools: Workflow, Text Split, Bounce, Colour", view.workspace == "tools"),
         // Batch 1 lane C (CX2): ⌘V link paste's tab.
+        // CX3: style families (change one, all follow).
+        ("families", Icon::TextLayer, "Families: style families and Text animations", view.workspace == "families"),
         ("link", Icon::Link, "Link: paste an Instagram link onto a layer", view.workspace == "link"),
         ("search", Icon::Search, "Search assets", false),
         ("filters", Icon::Hamburger, "Filter cards by kind", view.popover == "filters" || !view.kind_filter.is_empty() || view.here_only),
@@ -1423,7 +1425,7 @@ fn rail(
                     view.query.clear();
                     view.scroll = 0.0;
                 }
-                "curves" | "tools" | "link" => {
+                "curves" | "tools" | "link" | "families" => {
                     view.workspace = if view.workspace == name { String::new() } else { name.to_string() };
                     view.popover.clear();
                 }
@@ -2246,6 +2248,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             "curves" => super::motion_library_curves::workspace(app, ui, &ctx, area, &mut view, s),
             "tools" => super::motion_library_tools::workspace(app, ui, &ctx, area, &mut view, s),
             "link" => super::cards::link_tab(app, ui, area, s),
+            "families" => super::motion_library_tools::families_tab(app, ui, area, s),
             _ => view.workspace.clear(),
         }
         rail(app, ui, &ctx, &client, &status, rail_r, &mut view, s);
@@ -3137,8 +3140,8 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
     }
     if let Some(w) = p.get("workspace") {
         let w = w.as_str().unwrap_or("");
-        if !["", "assets", "curves", "tools", "link"].contains(&w) {
-            return Err(format!("unknown workspace `{w}` (assets, curves, tools, link)"));
+        if !["", "assets", "curves", "tools", "link", "families"].contains(&w) {
+            return Err(format!("unknown workspace `{w}` (assets, curves, tools, link, families)"));
         }
         view.workspace = if w == "assets" { String::new() } else { w.to_string() };
     }
