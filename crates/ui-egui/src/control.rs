@@ -11,7 +11,7 @@
 //! - `ui.panel.show {panel}` / `ui.panel.close {panel}`
 //! - `ui.click {id | x,y, button?, count?, modifiers?}` / `ui.move {x,y}` / `ui.scroll {x,y,dx,dy,unit?,pinch?}`
 //! - `ui.drag {from:{id|x,y}, to:{id|x,y}, steps?, modifiers?}`: synthetic press-move-release
-//! - `ui.key {key, command?, shift?, alt?, ctrl?}` / `ui.type {text}`
+//! - `ui.key {key, command?, shift?, alt?, ctrl?, down?, up?}` (`down`/`up`: hold, then release) / `ui.type {text}`
 //! - `ui.viewer.locate {x, y}`: screen point of a comp pixel; `ui.viewer.hit {x, y}`: comp pixel at a screen point
 //! - `ui.timeline.locate {layer, time?}`: screen point of a layer bar (at a comp time)
 //! - `ui.playback {action: play|stop|toggle}`
@@ -472,10 +472,16 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             // As a US keyboard sends it: the key is also the physical key, so by-position
             // shortcuts (`Physical+=`, Zoom In Time) answer `=` too.
             let physical_key = Some(key);
-            let events = vec![
-                egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m },
-                egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m },
-            ];
+            // `down: true` presses and holds the key, `up: true` releases it (a hold in steps: the
+            // Graph / Layer wheels on G / A, Claude's version on `\`); neither = a tap.
+            let (down, up) = (p.get("down").and_then(Value::as_bool) == Some(true), p.get("up").and_then(Value::as_bool) == Some(true));
+            let mut events = vec![];
+            if down || !up {
+                events.push(egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m });
+            }
+            if up || !down {
+                events.push(egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m });
+            }
             // (To the window the last pointer input went to: an undocked one, or the main window.)
             crate::float_windows::send_keys(app, ctx, events);
             Outcome::AfterInput
@@ -918,5 +924,24 @@ mod tests {
         for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
             assert_eq!(super::base64(i.as_bytes()), o);
         }
+    }
+
+    #[test]
+    fn ui_key_holds_with_down_then_up() {
+        // BUILD2: the G / A wheels and `\` (Claude's version) open on a hold; agents test them
+        // with `down` and a later `up`.
+        use super::*;
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        let request = |method, params| ControlRequest::new(method, params).0;
+        let keys = |app: &mut EffectcraftApp| -> Vec<bool> {
+            app.take_synthetic_input().into_iter().filter_map(|e| if let egui::Event::Key { pressed, .. } = e { Some(pressed) } else { None }).collect()
+        };
+        assert!(matches!(handle(&mut app, &ctx, &request("ui.key", json!({"key": "G"}))), Outcome::AfterInput));
+        assert_eq!(keys(&mut app), [true, false], "a tap");
+        assert!(matches!(handle(&mut app, &ctx, &request("ui.key", json!({"key": "G", "down": true}))), Outcome::AfterInput));
+        assert_eq!(keys(&mut app), [true], "held down");
+        assert!(matches!(handle(&mut app, &ctx, &request("ui.key", json!({"key": "G", "up": true}))), Outcome::AfterInput));
+        assert_eq!(keys(&mut app), [false], "released");
     }
 }
