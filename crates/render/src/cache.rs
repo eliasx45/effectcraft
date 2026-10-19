@@ -2011,6 +2011,11 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
     ctx.comp.width.hash(&mut h);
     ctx.comp.height.hash(&mut h);
     scale.to_bits().hash(&mut h);
+    // Effects sized in comp pixels follow the layer's transform (and a 3D layer's camera),
+    // which the key otherwise leaves out.
+    if crate::fx::sizes_in_comp_px(layer) {
+        crate::fx::fx_comp_px(ctx, layer).map(|c| c.map(f64::to_bits)).hash(&mut h);
+    }
     draft.hash(&mut h);
     info.head.hash(&mut h);
     // Mask motion blur and effects that read the shutter depend on whether the layer is motion

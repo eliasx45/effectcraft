@@ -13,8 +13,19 @@ use crate::context::{Enc, GpuImage, Params};
 use crate::effects::gaussian_blur;
 
 /// Compute entry points in `fx_styles.wgsl`.
-pub(crate) const KERNELS: &[&str] =
-    &["sty_alpha", "sty_pack", "sty_scale", "sty_pass", "sty_body", "sty_edt_rows", "sty_edt_cols", "sty_bev_height", "sty_bev_pack", "sty_bevel", "sty_bounds"];
+pub(crate) const KERNELS: &[&str] = &[
+    "sty_alpha",
+    "sty_pack",
+    "sty_scale",
+    "sty_pass",
+    "sty_body",
+    "sty_edt_rows",
+    "sty_edt_cols",
+    "sty_bev_height",
+    "sty_bev_pack",
+    "sty_bevel",
+    "sty_bounds",
+];
 
 /// Rows (or columns) a distance-field tile covers (`BEV_T` in `fx_styles.wgsl`).
 const BEV_TILE: u32 = 256;

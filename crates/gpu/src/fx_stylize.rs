@@ -912,14 +912,15 @@ pub(crate) fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let intensity = ctx.params.f("intensity") as f32;
     let colors = ctx.params.e("colors");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
-    let s = (radius * effectcraft_effects::GLOW_SIGMA_PER_RADIUS).max(0.5);
+    let [cx, cy] = ctx.env.comp_px();
+    let (sx, sy) = effectcraft_effects::glow_sigmas(radius, cx, cy);
     if !ctx.adjustment {
-        b.pad(e, (s * 3.0).ceil() as u32 + 2)?;
+        b.pad(e, (sx.max(sy) * 3.0).ceil() as u32 + 2)?;
     }
     let mut p = crate::effects::glow_params(ctx);
     let bright = e.image(b.img.width, b.img.height);
     e.pixels("glow_bright", &p, &b.img, None, &bright, None);
-    let mut blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    let mut blurred = gaussian_blur(e, &bright, sx * kx, sy * ky, false);
     if colors == 2 {
         // Arbitrary Map: Curves tables per channel (see effects::curves).
         let mut parts = ctx.params.s("arbitraryMap").split('|');

@@ -348,7 +348,7 @@ impl<'a> Renderer<'a> {
         }
         let px = 1.0 / scale;
         // Blur sizes of a layer whose effects run in comp space are in comp pixels.
-        let c = fx_comp_space(ctx, layer).map_or([1.0; 2], |m| EffectEnv { comp_space: Some([m.0[0], m.0[1]]), ..Default::default() }.comp_px());
+        let c = fx_comp_px(ctx, layer).unwrap_or([1.0; 2]);
         let c = c[0].max(c[1]).max(1.0);
         let mut lo = [-offset[0] * px, -offset[1] * px];
         let mut hi = [(f64::from(dims[0]) - offset[0]) * px, (f64::from(dims[1]) - offset[1]) * px];
@@ -449,6 +449,7 @@ impl<'a> Renderer<'a> {
                 let m = m * Mat3::translate(vec2(origin[0], origin[1]));
                 [m.0[0], m.0[1]]
             }),
+            comp_px_3d: fx_comp_px_3d(ctx, layer),
         };
         // Video effects in stack order (index, group, spec); disabled and audio effects skipped.
         let stack: Vec<(usize, &effectcraft_project::PropGroup, &'static effectcraft_effects::EffectSpec)> = fx
@@ -545,6 +546,48 @@ pub(crate) fn fx_origin(ctx: &EvalCtx, layer: &Layer, adjustment: bool) -> [f64;
 /// measured with CC Light Sweep, its centre, angle and width stay put in the comp whatever the
 /// layer's position, scale and rotation. The layer → comp affine of such a 2D layer (see
 /// [`EffectEnv::comp_space`]).
+/// Layer units per comp pixel of a continuously rasterised 3D shape or text layer (see
+/// `EffectEnv::comp_px_3d`): the projection's local scale at its anchor, camera included.
+/// `None` for other layers, or a projection degenerate there.
+pub(crate) fn fx_comp_px_3d(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
+    if !layer.switches.collapse || !layer.is_3d() || !matches!(layer.source, LayerSource::Shape | LayerSource::Text) {
+        return None;
+    }
+    let h = ctx.layer_to_comp(layer).0 .0;
+    let a = layer.transform().map(|tr| ctx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
+    // The homography's Jacobian at the anchor: d(x', y') / d(x, y).
+    let w = h[2][0] * a[0] + h[2][1] * a[1] + h[2][2];
+    if !w.is_finite() || w.abs() < 1e-12 {
+        return None;
+    }
+    let (x, y) = ((h[0][0] * a[0] + h[0][1] * a[1] + h[0][2]) / w, (h[1][0] * a[0] + h[1][1] * a[1] + h[1][2]) / w);
+    let j = [[(h[0][0] - x * h[2][0]) / w, (h[0][1] - x * h[2][1]) / w, 0.0], [(h[1][0] - y * h[2][0]) / w, (h[1][1] - y * h[2][1]) / w, 0.0]];
+    let det = j[0][0] * j[1][1] - j[0][1] * j[1][0];
+    if !det.is_finite() || det.abs() < 1e-9 {
+        return None;
+    }
+    Some(EffectEnv { comp_space: Some(j), ..Default::default() }.comp_px())
+}
+
+/// Effects that read `EffectEnv::comp_px`: their sizes are comp pixels on a continuously
+/// rasterised layer.
+const COMP_PX_EFFECTS: &[&str] = &["ec.blur.gaussian", "ec.blur.fastbox", "ec.stylize.glow"];
+
+/// Does the layer run an effect sized in comp pixels ([`COMP_PX_EFFECTS`])?
+pub(crate) fn sizes_in_comp_px(layer: &Layer) -> bool {
+    layer.switches.effects
+        && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if COMP_PX_EFFECTS.contains(&effect.as_str()))))
+}
+
+/// Layer units per comp pixel of a layer whose effects size things in comp pixels: a 2D one in
+/// comp space ([`fx_comp_space`]) or a 3D one ([`fx_comp_px_3d`]); `None` = layer pixels.
+pub(crate) fn fx_comp_px(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
+    match fx_comp_space(ctx, layer) {
+        Some(m) => Some(EffectEnv { comp_space: Some([m.0[0], m.0[1]]), ..Default::default() }.comp_px()),
+        None => fx_comp_px_3d(ctx, layer),
+    }
+}
+
 pub(crate) fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
     if !layer.switches.collapse || layer.is_3d() || !matches!(layer.source, LayerSource::Shape | LayerSource::Text) {
         return None;

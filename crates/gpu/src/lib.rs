@@ -57,7 +57,6 @@ pub mod adapter_choice;
 mod adv3d;
 mod bokeh;
 mod classic3d;
-mod plane3d;
 mod codes;
 mod context;
 mod cull;
@@ -65,6 +64,7 @@ pub mod deferred;
 mod effects;
 mod fusion;
 mod mips;
+mod plane3d;
 mod warmup;
 pub use warmup::WarmupReport;
 /// Whether per-pixel effect fusion is enabled (profiling builds support an A/B override).
@@ -609,8 +609,6 @@ mod tests;
 #[cfg(test)]
 mod tests_3d;
 #[cfg(test)]
-mod tests_plane3d;
-#[cfg(test)]
 mod tests_adjust;
 #[cfg(test)]
 mod tests_adv3d;
@@ -668,6 +666,8 @@ mod tests_fx_transition;
 mod tests_fx_vr;
 #[cfg(test)]
 mod tests_fx_warp;
+#[cfg(test)]
+mod tests_glow_reach;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests_init;
 #[cfg(test)]
@@ -676,6 +676,8 @@ mod tests_inplace;
 mod tests_layer_times;
 #[cfg(test)]
 mod tests_particles;
+#[cfg(test)]
+mod tests_plane3d;
 #[cfg(test)]
 mod tests_precomp_clip;
 #[cfg(test)]

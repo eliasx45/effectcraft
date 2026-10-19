@@ -190,9 +190,12 @@ fn bevel_and_emboss_matches_the_cpu() {
 /// Styles the GPU doesn't render (a distance field) still match: the layer goes to the CPU.
 #[test]
 fn distance_field_styles_fall_back_to_the_cpu() {
-    for (id, vals) in
-        [("dropShadow", vec![("spread", Value::Scalar(40.0))]), ("outerGlow", vec![("technique", Value::Enum(1))]), ("bevelEmboss", vec![("size", Value::Scalar(400.0))]), ("stroke", vec![])]
-    {
+    for (id, vals) in [
+        ("dropShadow", vec![("spread", Value::Scalar(40.0))]),
+        ("outerGlow", vec![("technique", Value::Enum(1))]),
+        ("bevelEmboss", vec![("size", Value::Scalar(400.0))]),
+        ("stroke", vec![]),
+    ] {
         let mut s = Scene::new(BitDepth::Bpc32);
         let bg = s.footage(97, 61);
         s.push(bg);

@@ -201,6 +201,13 @@ fn glow_map(s: &str) -> [Option<crate::Curve>; 3] {
     [(); 3].map(|_| parts.next().and_then(crate::Curve::parse))
 }
 
+/// Glow's blur σ along x and y (buffer pixels) for a radius in buffer pixels and the layer units
+/// per comp pixel `cx`, `cy` (`EffectEnv::comp_px`): never under half a pixel.
+pub fn glow_sigmas(radius: f64, cx: f64, cy: f64) -> (f64, f64) {
+    let s = radius * GLOW_SIGMA_PER_RADIUS;
+    ((s * cx).max(0.5), (s * cy).max(0.5))
+}
+
 fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let thr = ctx.params.f("threshold") as f32 / 100.0;
     let radius = ctx.params.f("radius") * b.scale;
@@ -216,9 +223,11 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let ca = ctx.params.color("colorA");
     let cb = ctx.params.color("colorB");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
-    let s = (radius * GLOW_SIGMA_PER_RADIUS).max(0.5);
+    // Glow Radius in comp pixels on a layer whose effects size things there (see `comp_px`).
+    let [cx, cy] = ctx.env.comp_px();
+    let (sx, sy) = glow_sigmas(radius, cx, cy);
     if !ctx.adjustment {
-        b.pad((s * 3.0).ceil() as u32 + 2);
+        b.pad((sx.max(sy) * 3.0).ceil() as u32 + 2);
     }
     // Bright pass: a soft step at the threshold (see `GLOW_KNEE`). A & B Colors and the Arbitrary
     // Map glow by one value per pixel, the luminance or the alpha, coloured after the blur;
@@ -243,7 +252,7 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             *px = [r * a, g * a, bl * a, r.max(g).max(bl) * a];
         }
     });
-    let mut blurred = gaussian_blur(&bright, s * kx, s * ky, false);
+    let mut blurred = gaussian_blur(&bright, sx * kx, sy * ky, false);
     if scalar {
         // The colour follows the blurred glow's strength, so A & B Colors run across the falloff.
         blurred.data.par_iter_mut().for_each(|px| {
