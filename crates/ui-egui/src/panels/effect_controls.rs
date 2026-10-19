@@ -417,6 +417,25 @@ fn prop_row(
                 .clicked()
             {
                 toggle_pick(app, "color", layer, prop);
+                // macOS: the system loupe samples anywhere on screen (keyers keep picking from
+                // their input in the Composition panel). Elsewhere the viewer samples, as before.
+                let keyer = layer
+                    .effects()
+                    .and_then(|fx| fx.groups().find(|g| g.find(prop.uid).is_some()))
+                    .is_some_and(|g| effectcraft_engine::effects::find(&g.match_id).is_some_and(|s| s.category == "Keying"));
+                if !active && !keyer && crate::screen_sampler::start(ui.ctx(), egui::Id::new(("ec-screen-pick", uid))) {
+                    app.ui.status = format!("Click anywhere on screen to sample {} (Esc cancels)", prop.name);
+                }
+            }
+            // The loupe's colour: one `prop.set`, one undo step (a cancel just ends the pick).
+            if let Some(rgb) = crate::screen_sampler::take(ui.ctx(), egui::Id::new(("ec-screen-pick", uid))) {
+                if let Some(s) = rgb {
+                    set(actions, json!([s[0], s[1], s[2], 1.0]));
+                }
+                if app.ui.fx_pick.as_ref().is_some_and(|k| k.prop == uid && k.kind == "color") {
+                    app.ui.fx_pick = None;
+                    app.ui.status.clear();
+                }
             }
             app.auto.add(&format!("effectControls.prop.{uid}.eyedropper"), er, &prop.name);
             let mut rgb = [c[0] as f32, c[1] as f32, c[2] as f32];

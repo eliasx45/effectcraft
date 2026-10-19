@@ -49,6 +49,18 @@ pub fn color_popup(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f32; 3])
         *c = rgb;
         sampled = true;
     }
+    // The system loupe's colour (macOS), or the window pixel pressed (elsewhere): either ends the
+    // eyedropper.
+    let screen = crate::screen_sampler::take(ui.ctx(), id).or_else(|| crate::screen_sampler::take_window_sample(ui.ctx()).filter(|_| armed).map(Some));
+    if let Some(rgb) = screen {
+        disarm(ui.ctx(), id);
+        if let Some(rgb) = rgb
+            && rgb != *c
+        {
+            *c = rgb;
+            sampled = true;
+        }
+    }
     let mut out = Outcome::default();
     let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| out = color_picker(ui, id, c, original));
@@ -75,13 +87,21 @@ pub fn color_popup(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f32; 3])
     }
     // A press outside closes the picker, unless it is the armed eyedropper's press on the viewer.
     let on_viewer = armed && eyedropper_point(ui.ctx()).is_some();
+    // Without the system loupe, the armed eyedropper's press elsewhere in the window samples the
+    // window's pixel there (the viewer samples the frame itself, exactly).
+    let window_press = (armed && !on_viewer && pressed_outside(ui.ctx(), &area.response))
+        .then(|| ui.input(|i| i.pointer.primary_pressed().then(|| i.pointer.interact_pos()).flatten()))
+        .flatten();
+    if let Some(pos) = window_press {
+        crate::screen_sampler::request_window_sample(ui.ctx(), pos);
+    }
     // A press in the pass that first draws the picker must not close it: an Area's rect is only
     // at its requested position from its second pass on (the first pass reports it at the
     // origin), so the click that just opened the picker would be read as a press outside it and
     // the picker would flash and close in that one frame (#1476).
     let pass_id = id.with("open-pass");
     let drawn_before = ui.data(|d| d.get_temp::<u64>(pass_id)).is_some_and(|p| p < ui.ctx().cumulative_pass_nr());
-    if drawn_before && pressed_outside(ui.ctx(), &area.response) && !on_viewer {
+    if drawn_before && pressed_outside(ui.ctx(), &area.response) && !on_viewer && window_press.is_none() {
         out.close.get_or_insert(true);
     }
     note_overlay(ui.ctx(), area.response.rect);
@@ -262,7 +282,12 @@ pub fn take_automation(ctx: &egui::Context) -> Option<Rect> {
 fn eyedropper(ui: &mut Ui, popup: egui::Id) {
     let armed = armed_for(ui.ctx(), popup);
     let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-    let resp = resp.on_hover_text(tr("Eyedropper: click, then click in the Composition panel"));
+    let hint = if cfg!(target_os = "macos") {
+        "Eyedropper: click, then click anywhere on screen (Esc cancels)"
+    } else {
+        "Eyedropper: click, then click anywhere in the window"
+    };
+    let resp = resp.on_hover_text(tr(hint));
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Eyedropper"));
     let fill = if armed {
         ui.visuals().selection.bg_fill
@@ -279,6 +304,9 @@ fn eyedropper(ui: &mut Ui, popup: egui::Id) {
             disarm(ui.ctx(), popup);
         } else {
             arm(ui.ctx(), popup);
+            // macOS: the system loupe samples anywhere on screen; its colour arrives through
+            // `screen_sampler::take` (elsewhere this does nothing and the window is sampled).
+            crate::screen_sampler::start(ui.ctx(), popup);
         }
     }
     note_automation(ui.ctx(), rect);
