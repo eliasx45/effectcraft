@@ -56,6 +56,8 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Result<(Buf
     if r.layer_is_static(ctx, layer) && r.layer_buf_in_memory(ctx, layer) {
         return Err("held, in the layer cache");
     }
+    // Only this plane's own steps count (see `alpha_bounds`).
+    e.take_missing();
     let input = r.layer_input(ctx, layer, 0).ok_or("no source")?;
     if input.img.is_empty() {
         return Err("empty source");
@@ -105,6 +107,8 @@ fn finish(e: &mut Enc, shape: Buf, img: GpuImage) -> Result<(Buf, GpuImage), &'s
 /// thread (`sty_bounds`), the per-row spans read back. `Some(None)` = nothing visible; `None` =
 /// the device failed.
 fn alpha_bounds(e: &mut Enc, img: &GpuImage) -> Option<Option<(u32, u32, u32, u32)>> {
+    // A flag left by earlier work on this encoder isn't this step's (as `fx_styles::render`).
+    e.take_missing();
     let rows = e.scratch(img.height, 1);
     e.dispatch("sty_bounds", &Params::default(), img, None, &rows, None, (img.height.div_ceil(64), 1));
     if e.take_missing() {
