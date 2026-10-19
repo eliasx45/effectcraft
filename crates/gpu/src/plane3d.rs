@@ -83,6 +83,14 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32
         let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
         return finish(e, shape, img);
     }
+    log::debug!(
+        "3D plane {:?}: effect canvas {}x{}, seen {:?}",
+        layer.name,
+        img.width,
+        img.height,
+        r.plane_view_rect(ctx, layer, out)
+            .map(|v| [v[0] * scale + offset[0], v[1] * scale + offset[1], v[2] * scale + offset[0], v[3] * scale + offset[1]].map(|x| x.round()))
+    );
     let bounds = alpha_bounds(e, &img)?;
     let size = effectcraft_render::source_size(r.project, layer);
     let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
