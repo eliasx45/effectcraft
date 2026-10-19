@@ -405,6 +405,87 @@ fn project_segment(pc: &effectcraft_engine::geom::Mat4, a: effectcraft_engine::g
     s.iter().flatten().all(|v| v.is_finite()).then_some(s)
 }
 
+/// `content_bounds` of the layers the viewer draws, remembered while one document snapshot is
+/// drawn (EXPR-PERF5). A selected text layer's box used to lay the text out and run every
+/// animator selector's expressions, per unit, on the UI thread on every repaint (and again for
+/// each hit test). Entries are pure functions of the snapshot (held alive by the paint, so its
+/// address names its contents), the comp time, the expression host and the font set; the memo is
+/// only consulted inside a [`BoundsScope`] and for the snapshot that scope was opened with.
+#[derive(Default)]
+struct BoundsMemo {
+    /// The snapshot the open scope draws (address), `None` outside a scope.
+    active: Option<usize>,
+    /// (snapshot address, document revision, font revision) the entries belong to.
+    stamp: Option<(usize, u64, u64)>,
+    map: std::collections::HashMap<BoundsKey, Option<[f64; 4]>>,
+}
+
+/// (comp id, layer id, comp time, expression host address, footage address).
+type BoundsKey = (u64, u64, i64, usize, usize);
+
+/// Entries kept at most (looped playback over a few hundred frames of a few selected layers).
+const MAX_BOUNDS: usize = 8192;
+
+thread_local! {
+    static BOUNDS: std::cell::RefCell<BoundsMemo> = std::cell::RefCell::new(BoundsMemo::default());
+}
+
+/// While alive, [`layer_quad`] and [`layer_outline`] remember bounds for `project` (see
+/// [`BoundsMemo`]).
+pub(crate) struct BoundsScope;
+
+impl BoundsScope {
+    /// `project` must stay unchanged while the scope is open (the paint's own snapshot `Arc`);
+    /// `revision` is the session's document revision.
+    pub(crate) fn open(project: &effectcraft_engine::project::Project, revision: u64) -> BoundsScope {
+        let addr = project as *const effectcraft_engine::project::Project as usize;
+        let stamp = (addr, revision, effectcraft_engine::text::fonts::revision());
+        BOUNDS.with(|b| {
+            let mut b = b.borrow_mut();
+            if b.stamp != Some(stamp) {
+                b.map.clear();
+                b.stamp = Some(stamp);
+            }
+            b.active = Some(addr);
+        });
+        BoundsScope
+    }
+}
+
+impl Drop for BoundsScope {
+    fn drop(&mut self) {
+        BOUNDS.with(|b| b.borrow_mut().active = None);
+    }
+}
+
+/// `content_bounds(ctx, layer)`, from the memo when the open scope draws `ctx`'s snapshot and
+/// `ctx.comp` / `layer` are that snapshot's own (not stand-in copies).
+fn bounds(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 4]> {
+    let addr = ctx.project as *const effectcraft_engine::project::Project as usize;
+    let own = ctx.project.comp(ctx.comp_id).is_some_and(|c| std::ptr::eq(c, ctx.comp)) && ctx.comp.layer(layer.id).is_some_and(|l| std::ptr::eq(l, layer));
+    let fonts = effectcraft_engine::text::fonts::revision();
+    let usable = own && BOUNDS.with(|b| b.borrow().active == Some(addr) && b.borrow().stamp.is_some_and(|s| s.0 == addr && s.2 == fonts));
+    if !usable {
+        return effectcraft_engine::render::content_bounds(ctx, layer);
+    }
+    let expr = ctx.expr.map_or(0, |e| std::ptr::from_ref(e).cast::<()>() as usize);
+    let footage = ctx.footage.map_or(0, |f| std::ptr::from_ref(f).cast::<()>() as usize);
+    let key: BoundsKey = (ctx.comp_id.0, layer.id.0, ctx.time.0, expr, footage);
+    if let Some(b) = BOUNDS.with(|b| b.borrow().map.get(&key).copied()) {
+        return b;
+    }
+    // Computed outside the borrow: expressions may draw on other code that reads the memo.
+    let b = effectcraft_engine::render::content_bounds(ctx, layer);
+    BOUNDS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.map.len() >= MAX_BOUNDS {
+            m.map.clear();
+        }
+        m.map.insert(key, b);
+    });
+    b
+}
+
 /// The content box corners (layer pixels) of `layer`.
 fn box_corners(b: [f64; 4]) -> [[f64; 2]; 4] {
     [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
@@ -413,7 +494,7 @@ fn box_corners(b: [f64; 4]) -> [[f64; 2]; 4] {
 /// Layer → comp matrix and its bounds quad (in comp pixels). None for a 3D layer reaching to or
 /// behind the camera (its quad would flip; [`layer_outline`] draws the part in front).
 pub(crate) fn layer_quad(ctx: &EvalCtx, layer: &Layer) -> Option<(Mat3, [[f64; 2]; 4], [f64; 4])> {
-    let b = effectcraft_engine::render::content_bounds(ctx, layer)?;
+    let b = bounds(ctx, layer)?;
     let (m, _) = l2c(ctx, layer);
     let corners = box_corners(b);
     if corners.iter().any(|p| homogeneous(&m, *p)[2] < NEAR_W) {
@@ -428,7 +509,7 @@ pub(crate) fn layer_quad(ctx: &EvalCtx, layer: &Layer) -> Option<(Mat3, [[f64; 2
 
 /// The outline of a layer's content box in comp pixels, clipped at the camera's near plane.
 pub(crate) fn layer_outline(ctx: &EvalCtx, layer: &Layer) -> Vec<[f64; 2]> {
-    let Some(b) = effectcraft_engine::render::content_bounds(ctx, layer) else { return vec![] };
+    let Some(b) = bounds(ctx, layer) else { return vec![] };
     project_clipped(&l2c(ctx, layer).0, &box_corners(b))
 }
 
@@ -1009,6 +1090,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let snap_project = app.session.project.clone();
     let snap_expr = app.session.expr.clone();
     let ectx = EvalCtx { project: &snap_project, comp_id: cid, comp: &comp, time, expr: snap_expr.as_deref(), footage: None };
+    // Layer boxes are measured once per snapshot, time and layer (see `BoundsMemo`).
+    let _bounds = BoundsScope::open(&snap_project, app.session.revision);
     // The frame (or snapshot) through Show Channel and exposure; ROI frames cover the region.
     vt::draw_frame(app, &ctx, &painter, comp_rect, cid, &ectx);
     // Above 100 %: the visible region at the magnification over it, once rendered.
@@ -2980,6 +3063,51 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
 mod tests {
     use super::*;
     use effectcraft_engine::geom::{Mat4, vec3};
+
+    /// EXPR-PERF5: layer boxes are measured once per snapshot, time and layer while the viewer
+    /// draws, never for a stand-in copy, another snapshot or outside a paint, and the answers
+    /// are `content_bounds`'.
+    #[test]
+    fn layer_boxes_are_remembered_only_for_the_drawn_snapshot() {
+        use effectcraft_engine::project::{ItemKind, Project, Solid, build};
+        let mut p = Project::default();
+        let comp = Comp::new(200, 100, Default::default(), Tick::from_seconds_f64(10.0));
+        let cid = p.add_item("Main", effectcraft_engine::color::Label::Red, None, ItemKind::Comp(comp.clone().into()));
+        let sid =
+            p.add_item("S", effectcraft_engine::color::Label::Red, None, ItemKind::Solid(Solid { color: [1.0; 3], width: 30, height: 20, pixel_aspect: 1.0 }));
+        let l = build::layer(&mut p, &comp, "S", LayerSource::Solid { item: sid }, (30, 20), None);
+        let lid = l.id;
+        p.comp_mut(cid).unwrap().layers = vec![l].into();
+        let entries = || BOUNDS.with(|b| b.borrow().map.len());
+        let c = p.comp(cid).unwrap();
+        let layer = c.layer(lid).unwrap();
+        let ctx = EvalCtx::new(&p, cid, c, Tick::from_seconds_f64(0.5));
+        let want = effectcraft_engine::render::content_bounds(&ctx, layer);
+        assert_eq!(want, Some([0.0, 0.0, 30.0, 20.0]));
+        {
+            let _scope = BoundsScope::open(&p, 7);
+            assert_eq!(bounds(&ctx, layer), want);
+            assert_eq!(entries(), 1);
+            assert_eq!(bounds(&ctx, layer), want);
+            assert_eq!(entries(), 1, "the second call is a hit");
+            // A stand-in copy of the comp (or the layer) is measured, not remembered.
+            let copy = c.clone();
+            let cctx = EvalCtx::new(&p, cid, &copy, Tick::from_seconds_f64(0.5));
+            assert_eq!(bounds(&cctx, copy.layer(lid).unwrap()), want);
+            assert_eq!(entries(), 1);
+            // Another time is another entry.
+            assert_eq!(bounds(&ctx.at(Tick::from_seconds_f64(0.6)), layer), want);
+            assert_eq!(entries(), 2);
+        }
+        // Outside a paint nothing is remembered.
+        assert_eq!(bounds(&ctx.at(Tick::from_seconds_f64(0.7)), layer), want);
+        assert_eq!(entries(), 2);
+        // The same snapshot and revision keep the entries; a new revision drops them.
+        drop(BoundsScope::open(&p, 7));
+        assert_eq!(entries(), 2);
+        drop(BoundsScope::open(&p, 8));
+        assert_eq!(entries(), 0);
+    }
 
     /// #1544: Shift-clicking with the Pen keeps the new segment horizontal, vertical or diagonal.
     #[test]
