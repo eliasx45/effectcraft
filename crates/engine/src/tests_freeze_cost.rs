@@ -158,7 +158,7 @@ fn a_layer_freeze_refuses_is_offered_as_its_whole_comp_or_not_at_all() {
     f.s.execute("prop.setExpression", json!({"comp":f.outer.0, "layer":f.solid.0, "path":"transform/position", "expression":"[value[0], value[1]]"})).unwrap();
     play(&mut f, 12, 5.0, 900.0, 2.0);
     let refused = f.s.execute("freeze.freeze", json!({"comp":f.outer.0, "layers":[f.solid.0], "mode":"selection"})).unwrap_err().to_string();
-    assert!(refused.contains("expression dependencies"), "{refused}");
+    assert!(refused.contains("Red has expressions"), "{refused}");
 
     let found = f.s.freeze_suggestions();
     assert_eq!(found.len(), 1, "{found:?}");
@@ -186,4 +186,23 @@ fn a_layer_freeze_refuses_is_offered_as_its_whole_comp_or_not_at_all() {
     g.s.execute("comp.open", json!({"comp":g.outer.0})).unwrap();
     play(&mut g, 12, 5.0, 900.0, 2.0);
     assert!(g.s.freeze_suggestions().is_empty(), "neither the layer nor its comp can be frozen: {:?}", g.s.freeze_suggestions());
+}
+
+#[test]
+fn expressions_on_other_layers_do_not_block_a_selection_freeze() {
+    let mut f = fixture();
+    // The precomp layer carries an expression; the selected solid has none.
+    f.s.execute("prop.setExpression", json!({"comp":f.outer.0, "layer":f.stack.0, "path":"transform/position", "expression":"[value[0], value[1]]"})).unwrap();
+    let run = json!({"comp":f.outer.0, "layers":[f.solid.0], "mode":"selection", "wait":true, "quickDraft":false});
+    f.s.execute("freeze.freeze", run).expect("an unrelated expression leaves the selection self-contained");
+    assert!(f.s.project.freeze.sections[0].cache.is_some());
+}
+
+#[test]
+fn a_selection_parented_outside_names_the_parent() {
+    let mut f = fixture();
+    f.s.execute("layer.setParent", json!({"layers":[f.solid.0], "parent":f.stack.0})).unwrap();
+    let refused = f.s.execute("freeze.freeze", json!({"comp":f.outer.0, "layers":[f.solid.0], "mode":"selection"})).unwrap_err().to_string();
+    assert!(refused.contains("Red is parented to"), "{refused}");
+    assert!(refused.contains("which is not selected"), "{refused}");
 }
