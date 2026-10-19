@@ -230,7 +230,7 @@ fn gradient_fill_section(
                 bx -= tw + 4.0;
                 let r = Rect::from_min_size(pos2(bx, y + 2.0), vec2(tw, ROW_H - 4.0));
                 let on = (i == 1) == radial;
-                if widgets::text_button(ui, r, &tr(name), on, &t, egui::Id::new(("props-gradient-type", anim.uid, i))).clicked() && !on {
+                if widgets::text_button(ui, r, tr(name), on, &t, egui::Id::new(("props-gradient-type", anim.uid, i))).clicked() && !on {
                     actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": ty.uid, "value": i})));
                 }
                 app.auto.add(&format!("properties.gradientFill.{}.type.{}", anim.uid, name.to_ascii_lowercase()), r, name);

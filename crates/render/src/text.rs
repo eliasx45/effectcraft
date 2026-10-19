@@ -314,7 +314,7 @@ impl GlyphFill {
     fn color_at(spec: &GradSpec, s: [f64; 2], e: [f64; 2], p: [f64; 2]) -> [f32; 4] {
         let (dx, dy) = (e[0] - s[0], e[1] - s[1]);
         let len2 = dx * dx + dy * dy;
-        let t = if !(len2 > 1e-12) {
+        let t = if !len2.is_finite() || len2 <= 1e-12 {
             0.0
         } else if spec.radial {
             ((p[0] - s[0]).powi(2) + (p[1] - s[1]).powi(2)).sqrt() / len2.sqrt()

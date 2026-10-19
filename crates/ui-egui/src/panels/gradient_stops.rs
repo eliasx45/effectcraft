@@ -219,7 +219,7 @@ pub fn show(
         }
     }
     let er = Rect::from_min_size(pos2(bar.max.x - 56.0, row_y), vec2(56.0, 18.0));
-    if widgets::text_button(ui, er, &crate::i18n::tr("Edit…"), false, &t, egui::Id::new(("gradient-stops-edit", prop))).clicked() {
+    if widgets::text_button(ui, er, crate::i18n::tr("Edit…"), false, &t, egui::Id::new(("gradient-stops-edit", prop))).clicked() {
         actions.push(("prop.editGradient".into(), json!({"layer": layer, "prop": prop})));
     }
     app.auto.add(&format!("{prefix}.edit"), er, "Edit Gradient…");
