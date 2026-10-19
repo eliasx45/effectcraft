@@ -2707,6 +2707,8 @@ impl EffectcraftApp {
         }
         // Batch 1 (AX2/AX4): a held G / A opens the Graph / Layer wheel; a tap keeps its shortcut.
         panels::timeline::wheels::hold_keys(self, &ctx);
+        // Batch 1 lane C: ⌘V with an Instagram link opens the paste wheel (CX2).
+        panels::cards::before_shortcuts(self, &ctx);
         menus::handle_shortcuts(self, &ctx);
         if !ctx.input(|i| i.pointer.primary_down()) {
             self.ui.viewer.property_interacting = false;
