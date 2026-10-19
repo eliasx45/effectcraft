@@ -1413,7 +1413,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let ly = tops.get(slot).map(|(_, ty)| *ty).unwrap_or(y - 4.0);
             bp.line_segment([pos2(body.min.x + 4.0, ly), pos2(body.max.x - 4.0, ly)], Stroke::new(2.0, t.accent));
             if ctx.input(|i| i.pointer.any_released()) {
-                if let Some(from) = tops.iter().position(|(u, _)| *u == du) {
+                // A selected effect drags the layer's other selected effects along, as a block in
+                // their stack order (After Effects).
+                let sel = &app.session.state.selected_props;
+                let block: Vec<u64> =
+                    if sel.contains(&(layer.id, du)) { tops.iter().map(|(u, _)| *u).filter(|u| sel.contains(&(layer.id, *u))).collect() } else { vec![] };
+                if block.len() > 1 {
+                    actions.push(("effect.reorder".into(), json!({"layer": layer.id.0, "effect": du, "effects": block, "index": slot + 1})));
+                } else if let Some(from) = tops.iter().position(|(u, _)| *u == du) {
                     let to = if slot > from { slot - 1 } else { slot };
                     if to != from {
                         actions.push(("effect.reorder".into(), json!({"layer": layer.id.0, "effect": du, "index": to + 1})));

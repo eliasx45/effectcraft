@@ -270,11 +270,26 @@ fn set_label(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// `effect.reorder`: `effect` to 1-based `index` in the new stack. With `effects` (uids on the
+/// layer, the dragged ones in Effect Controls), they move as a block, in their stack order, to
+/// the insertion line before the effect now at `index` (one past the last for the end), in one
+/// undo step (After Effects).
 fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = find_fx(s, p, "effect.reorder")?;
     let to = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad("effect.reorder", "missing `index` (1-based)"))? as usize;
+    let block: Vec<Uid> = p.get("effects").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
     s.edit("Reorder Effect", None, |proj, _| {
         let fx = layer_mut(proj, cid, lid)?.props.sub_mut("effects").ok_or_else(|| bad("effect.reorder", "no effects"))?;
+        if !block.is_empty() {
+            // The insertion line counted among the effects that stay.
+            let line = to.saturating_sub(1).min(fx.children.len());
+            let at = fx.children.iter().take(line).filter(|c| !block.contains(&c.uid())).count();
+            let (moved, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut fx.children).into_iter().partition(|c| block.contains(&c.uid()));
+            fx.children = rest;
+            let at = at.min(fx.children.len());
+            fx.children.splice(at..at, moved);
+            return Ok(());
+        }
         let Some(i) = fx.children.iter().position(|c| c.uid() == uid) else { return Ok(()) };
         let g = fx.children.remove(i);
         let to = to.saturating_sub(1).min(fx.children.len());
@@ -678,7 +693,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Reorder Effect",
             [],
             None,
-            "{layer?, effect: index (1-based)|uid|name, index (1-based new stack position)} → {layer, effects: [{index, name, uid}]}",
+            "{layer?, effect: index (1-based)|uid|name, index (1-based new stack position), effects? [uid] (move these as a block to the line before the effect at `index`)} → {layer, effects: [{index, name, uid}]}",
             has_layers,
             reorder
         ),

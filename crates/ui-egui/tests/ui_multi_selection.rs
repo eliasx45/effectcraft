@@ -132,3 +132,31 @@ fn the_fx_switch_toggles_every_selected_effect() {
     s.execute("effect.toggle", json!({"layer": a, "effect": uids(&s, a)[1], "selected": true})).unwrap();
     assert_eq!(on(&s), [true, false, true]);
 }
+
+/// Dragging one of several selected effects in Effect Controls moves the layer's selected effects
+/// as a block, in their stack order, to the insertion line (`effect.reorder {effects, index}`), in
+/// one undo step.
+#[test]
+fn dragging_selected_effects_moves_them_as_a_block() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    let l = s.execute("layer.newSolid", json!({"name": "A", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+    for _ in 0..5 {
+        s.execute("effect.apply", json!({"layers": [l], "effect": "Invert"})).unwrap();
+    }
+    let order = |s: &Session| -> Vec<u64> { s.active_comp().unwrap().layer(LayerId(l)).unwrap().effects().unwrap().groups().map(|g| g.uid).collect() };
+    let u = order(&s);
+    let before = s.project.clone();
+    // Effects 1 and 3 dragged to the end (the line after effect 5).
+    s.execute("effect.reorder", json!({"layer": l, "effect": u[2], "effects": [u[2], u[0]], "index": 6})).unwrap();
+    assert_eq!(order(&s), [u[1], u[3], u[4], u[0], u[2]]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.same_content(&before), "one undo step");
+    // Effects 4 and 5 dragged to the top.
+    s.execute("effect.reorder", json!({"layer": l, "effect": u[3], "effects": [u[3], u[4]], "index": 1})).unwrap();
+    assert_eq!(order(&s), [u[3], u[4], u[0], u[1], u[2]]);
+    // Without `effects`, one effect to a stack position, as before.
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("effect.reorder", json!({"layer": l, "effect": u[0], "index": 3})).unwrap();
+    assert_eq!(order(&s), [u[1], u[2], u[0], u[3], u[4]]);
+}
