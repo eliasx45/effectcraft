@@ -34,6 +34,30 @@ pub(crate) fn graph_items() -> Vec<WheelItem> {
     ]
 }
 
+/// The Layer wheel's slices, clockwise from the top.
+pub(crate) fn layer_items() -> Vec<WheelItem> {
+    vec![
+        WheelItem::new("fade", "Fade exit", "Opacity to 0 over the last 8 frames (layer.fadeExit)"),
+        WheelItem::new("bounce", "Bounce", "Toolkit ▸ Bounce: a spring after the last key (motionLibrary.tool bounce)"),
+        WheelItem::new("slide", "Fast In slide-up", "Devin ▸ Graphs ▸ Fast In on a slide up from the in point (layer.fastIn)"),
+        WheelItem::new("cascade", "Cascade 1 f", "Each layer starts 1 frame after the one above (layer.cascade)"),
+        WheelItem::new("glow", "Caption glow", "Elias ▸ Text styles ▸ Caption glow + double shadow (motionLibrary.apply)"),
+        WheelItem::new("save", "Save to Library", "Save the selected layers to Motion Library ▸ Elias (motionLibrary.saveSelection)"),
+    ]
+}
+
+/// The Motion Library text style the Caption glow slice and button apply.
+pub(crate) const CAPTION_GLOW: &str = "Caption glow + double shadow";
+
+/// Opens the Layer wheel (a held A, or a button).
+pub(crate) fn open_layer(app: &mut EffectcraftApp, ctx: &egui::Context, center: Pos2, hold: Option<Key>) {
+    if app.session.state.selected_layers.is_empty() {
+        app.ui.status = "Select a layer first: click a layer name.".into();
+        return;
+    }
+    wheel::open(ctx, LAYER, center, "A", layer_items(), hold);
+}
+
 /// Where a wheel opens: the pointer, else the middle of the window.
 pub(crate) fn pointer_or_middle(ctx: &egui::Context) -> Pos2 {
     ctx.input(|i| i.pointer.hover_pos()).unwrap_or_else(|| ctx.content_rect().center())
@@ -63,7 +87,7 @@ fn pending_id() -> egui::Id {
 fn wheel_for(app: &EffectcraftApp, key: Key) -> Option<&'static str> {
     match key {
         Key::G if !app.session.state.selected_keys.is_empty() => Some(GRAPH),
-        // TODO(batch1-verify): AX4 adds A → Layer wheel here.
+        Key::A if !app.session.state.selected_layers.is_empty() => Some(LAYER),
         _ => None,
     }
 }
@@ -101,6 +125,7 @@ pub fn hold_keys(app: &mut EffectcraftApp, ctx: &egui::Context) {
             ctx.data_mut(|d| d.remove::<Pending>(pending_id()));
             match wheel_for(app, p.key) {
                 Some(GRAPH) => open_graph(app, ctx, pointer_or_middle(ctx), Some(p.key)),
+                Some(LAYER) => open_layer(app, ctx, pointer_or_middle(ctx), Some(p.key)),
                 _ => {}
             }
             return;
@@ -184,10 +209,72 @@ pub(crate) fn run_graph(app: &mut EffectcraftApp, ctx: &egui::Context, item: &st
     }
 }
 
+/// Applies the Motion Library card found by `query` (its name) to the selection.
+pub(crate) fn apply_library_named(app: &mut EffectcraftApp, ctx: &egui::Context, query: &str) -> Option<Value> {
+    let found = run(app, ctx, "library.search", json!({"query": query, "source": "motion", "limit": 5}))?;
+    let entries = found["entries"].as_array().cloned().unwrap_or_default();
+    // The exact name first, else the best hit.
+    let hit = entries.iter().find(|e| e["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(query))).or(entries.first());
+    let Some(id) = hit.and_then(|e| e["id"].as_str()).map(str::to_string) else {
+        app.ui.status = format!("No Motion Library item “{query}” (is the library synced?)");
+        return None;
+    };
+    // TODO(batch1-verify): a text-style preset card applies to the selected layers through motionLibrary.apply.
+    run(app, ctx, "motionLibrary.apply", json!({"id": id}))
+}
+
+/// Runs a Layer wheel slice (also the quick row's buttons).
+pub(crate) fn run_layer(app: &mut EffectcraftApp, ctx: &egui::Context, item: &str) {
+    let n = app.session.state.selected_layers.len();
+    match item {
+        "fade" => {
+            if run(app, ctx, "layer.fadeExit", json!({})).is_some() {
+                toast(app, ctx, "Fade exit: opacity 100 → 0 over the last 8 f".into());
+            }
+        }
+        "bounce" => {
+            // TODO(batch1-verify): the toolkit bounce springs the selected keys, else the Tools panel's property.
+            if run(app, ctx, "motionLibrary.tool", json!({"tool": "bounce"})).is_some() {
+                toast(app, ctx, "Bounce: Motion Library spring".into());
+            }
+        }
+        "slide" => {
+            if run(app, ctx, "layer.fastIn", json!({"property": "position"})).is_some() {
+                toast(app, ctx, "Fast In slide-up added".into());
+            }
+        }
+        "cascade" => {
+            if n < 2 {
+                app.ui.status = "Cascade needs two or more layers: Shift-click their names.".into();
+            } else if run(app, ctx, "layer.cascade", json!({"frames": 1})).is_some() {
+                toast(app, ctx, format!("Cascaded {n} layers, 1 f apart"));
+            }
+        }
+        "glow" => {
+            if apply_library_named(app, ctx, CAPTION_GLOW).is_some() {
+                toast(app, ctx, format!("{CAPTION_GLOW} applied"));
+            }
+        }
+        "save" => {
+            let first = app.session.state.selected_layers.first().copied();
+            let name = first
+                .and_then(|id| app.session.active_comp().and_then(|c| c.layer(id)).map(|l| format!("{} moves", l.name)))
+                .unwrap_or_else(|| "My moves".into());
+            if run(app, ctx, "motionLibrary.saveSelection", json!({"name": name, "category": "Elias", "kind": "layers"})).is_some() {
+                toast(app, ctx, format!("Saving “{name}” to Motion Library ▸ Elias"));
+            }
+        }
+        other => app.ui.status = format!("Unknown Layer wheel item `{other}`"),
+    }
+}
+
 /// Call after [`wheel::paint`] each frame: runs the slices picked on the Timeline's wheels.
 pub fn take_picks(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if let Some(item) = wheel::take_pick(ctx, GRAPH) {
         run_graph(app, ctx, &item);
+    }
+    if let Some(item) = wheel::take_pick(ctx, LAYER) {
+        run_layer(app, ctx, &item);
     }
     // AX3: an Ease card edited in Motion Library ▸ Curves updates the moves linked to it.
     crate::panels::motion_library_curves::drain_relink(app, ctx);
