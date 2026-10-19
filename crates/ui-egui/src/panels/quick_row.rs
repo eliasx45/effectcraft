@@ -321,7 +321,8 @@ const PIN_LABEL: &str = "+ pin";
 
 /// Whether the text preset cards read at revision `read_rev`, time `read_at` must be read again.
 pub(crate) fn presets_stale(read_rev: u64, read_at: f64, rev: u64, now: f64) -> bool {
-    read_rev != rev || !(now - read_at < 10.0)
+    let age = now - read_at;
+    read_rev != rev || age.is_nan() || age >= 10.0
 }
 
 /// A quick-row button's width for `text` (as `button` draws it).
