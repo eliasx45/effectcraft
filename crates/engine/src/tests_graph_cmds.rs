@@ -110,3 +110,16 @@ fn copy_paste_save_and_bad_input() {
     assert!(s.execute_checked("graph.relinkUpdate", json!({"from": "linear", "to": "fast-in"})).is_err());
     let _: Value = s.execute("graph.links", json!({})).unwrap();
 }
+
+#[test]
+fn a_renamed_library_graph_keeps_its_link_by_name() {
+    let (mut s, cid) = comp();
+    let a = solid(&mut s, "A");
+    mv(&mut s, a);
+    s.execute_checked("graph.apply", json!({"item": "fast-out", "layers": [a], "property": "position"})).unwrap();
+    // The card read back from its keys is close to, not exactly, Devin's values: the name finds it.
+    let r = s.execute_checked("graph.relinkUpdate", json!({"from": [0.9, 0.0, 0.5, 1.0], "to": [0.8, 0.0, 0.95, 1.0], "name": "Fast out"})).unwrap();
+    assert_eq!(r["updated"], 1, "{r:#}");
+    let pr = s.project.comp(cid).unwrap().layer(LayerId(a)).unwrap().props.prop("transform/position").unwrap();
+    assert_eq!(crate::commands::graph_cmds::linked_name(&pr.keys, 0, pr.spatial).as_deref(), Some("Fast out"));
+}

@@ -55,6 +55,24 @@ fn clip_set(c: Clip) {
     *CLIP.lock().unwrap_or_else(PoisonError::into_inner) = Some(c);
 }
 
+/// Library graphs edited or saved in this session (name, graph as it is now): a move carrying
+/// one is linked to it by name, like Devin's [`GRAPHS`].
+// TODO(batch1-verify): kept per process; a move linked to an edited Library graph shows its tag
+// again after a restart only once the Curves panel reports the graph (graph.relinkUpdate).
+static LIBRARY: Mutex<Vec<(String, Graph)>> = Mutex::new(Vec::new());
+
+/// Most Library graphs remembered.
+const MAX_LIBRARY: usize = 256;
+
+fn library_set(name: &str, g: Graph) {
+    let mut lib = LIBRARY.lock().unwrap_or_else(PoisonError::into_inner);
+    lib.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+    if lib.len() >= MAX_LIBRARY {
+        lib.remove(0);
+    }
+    lib.push((name.to_string(), g));
+}
+
 // ---------------------------------------------------------------- graph math
 
 /// The move `i` → `i + 1`'s graph, speeds normalised (1 = the move's linear speed) as in
@@ -102,6 +120,18 @@ pub fn same_graph(a: &Graph, b: &Graph) -> bool {
 pub fn linked_graph(keys: &[Keyframe], i: usize, spatial: bool) -> Option<&'static Graph> {
     let g = pair_graph(keys, i, spatial)?;
     GRAPHS.iter().find(|n| same_graph(n, &g))
+}
+
+/// The name of the Library graph the move `i` → `i + 1` is linked to: one edited or saved in
+/// this session, else one of Devin's [`GRAPHS`].
+pub fn linked_name(keys: &[Keyframe], i: usize, spatial: bool) -> Option<String> {
+    let g = pair_graph(keys, i, spatial)?;
+    let lib = LIBRARY.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((n, _)) = lib.iter().rev().find(|(_, x)| same_graph(x, &g)) {
+        return Some(n.clone());
+    }
+    drop(lib);
+    GRAPHS.iter().find(|n| same_graph(n, &g)).map(|n| n.name.to_string())
 }
 
 /// A Motion Library curve `[x1, y1, x2, y2]` (normalised cubic Bezier, time and value 0 → 1) as
@@ -369,6 +399,7 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let pr = comp.layer(q.layer).and_then(|l| l.props.find(q.prop)).ok_or_else(|| bad(C, "no property"))?;
     let g = pair_graph(&pr.keys, q.key, pr.spatial).ok_or_else(|| bad(C, "the move is linear or holds: there is no graph to save"))?;
+    library_set(&name, g);
     let mut v = clip_json(&Clip::Graph(g));
     v["name"] = json!(name);
     Ok(json!({
@@ -404,14 +435,27 @@ fn relink_update(s: &mut Session, p: &Value) -> Result<Value> {
         Clip::Linear => return Err(bad(C, "`from` can't be linear: linear moves aren't linked to anything")),
     };
     let to = spec_p(p.get("to").ok_or_else(|| bad(C, "missing `to`: the Library graph as it is now"))?, C)?;
-    let hits = carrying(s, &from);
+    let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty());
+    let mut hits = carrying(s, &from);
+    // The Library card's own name ("Fast In") also finds moves carrying Devin's original values,
+    // which a card read back from its keys may not match exactly.
+    if let Some(g) = name.and_then(graph_named).filter(|g| !same_graph(g, &from)) {
+        for h in carrying(s, &g) {
+            if !hits.contains(&h) {
+                hits.push(h);
+            }
+        }
+    }
+    if let (Some(n), Clip::Graph(g)) = (name, &to) {
+        library_set(n, *g);
+    }
     let n = hits.len();
     let mut comps: Vec<u64> = hits.iter().map(|(c, _)| c.0).collect();
     comps.dedup();
     if n == 0 {
         return Ok(json!({"updated": 0, "comps": [], "note": "no move carries that graph"}));
     }
-    let label = str_p(p, "name").map_or_else(|| "Update Linked Graphs".to_string(), |nm| format!("Update Linked Graphs {nm}"));
+    let label = name.map_or_else(|| "Update Linked Graphs".to_string(), |nm| format!("Update Linked Graphs {nm}"));
     s.edit(&label, None, move |proj, _| {
         for (cid, q) in &hits {
             let Some(comp) = proj.comp_mut(*cid) else { continue };
@@ -435,10 +479,11 @@ fn links(s: &mut Session, p: &Value) -> Result<Value> {
     for l in &comp.layers {
         l.props.walk("", &mut |path, pr| {
             for i in 0..pr.keys.len().saturating_sub(1) {
-                if let Some(g) = linked_graph(&pr.keys, i, pr.spatial)
+                if let Some(name) = linked_name(&pr.keys, i, pr.spatial)
                     && out.len() < MAX_PAIRS
                 {
-                    out.push(json!({"layer": l.id.0, "layerName": l.name, "property": pr.name, "path": path, "key": i, "graph": g.id, "graphName": g.name}));
+                    let id = linked_graph(&pr.keys, i, pr.spatial).map(|g| g.id);
+                    out.push(json!({"layer": l.id.0, "layerName": l.name, "property": pr.name, "path": path, "key": i, "graph": id, "graphName": name}));
                 }
             }
         });
@@ -489,7 +534,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Update Linked Graphs",
             [],
             None,
-            "{from (the Library graph as it was: a name, a curve [x1, y1, x2, y2] or {out, in}), to (as it is now), name?} → {updated, comps}: every move in the project still carrying `from` gets `to`, one undo step",
+            "{from (the Library graph as it was: a name, a curve [x1, y1, x2, y2] or {out, in}), to (as it is now), name? (the Library graph's name: also finds moves carrying Devin's graph of that name; moves carrying `to` are then tagged with it)} → {updated, comps}: every move in the project still carrying `from` gets `to`, one undo step",
             super::always,
             relink_update
         ),

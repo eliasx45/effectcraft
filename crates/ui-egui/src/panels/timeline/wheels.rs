@@ -189,4 +189,6 @@ pub fn take_picks(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if let Some(item) = wheel::take_pick(ctx, GRAPH) {
         run_graph(app, ctx, &item);
     }
+    // AX3: an Ease card edited in Motion Library ▸ Curves updates the moves linked to it.
+    crate::panels::motion_library_curves::drain_relink(app, ctx);
 }

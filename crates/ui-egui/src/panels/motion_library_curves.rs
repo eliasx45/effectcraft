@@ -474,6 +474,10 @@ pub struct CurvesState {
     /// Content heights of the two columns (last frame).
     #[serde(skip)]
     heights: [f32; 2],
+    /// An Ease card saved with a new curve: (curve before, curve now, card name), for
+    /// `graph.relinkUpdate` (batch 1, AX3: the moves linked to it follow).
+    #[serde(skip)]
+    pub relink: Option<(Curve, Curve, String)>,
 }
 
 impl Default for CurvesState {
@@ -505,6 +509,7 @@ impl Default for CurvesState {
             live_due: None,
             playing: None,
             heights: [0.0; 2],
+            relink: None,
         }
     }
 }
@@ -1002,13 +1007,19 @@ fn start_edit_card(ctx: &egui::Context, st: &mut CurvesState, id: String) {
 fn start_save_changes(ctx: &egui::Context, st: &mut CurvesState) -> Result<(), String> {
     let card = st.editing.clone().ok_or("No Ease card is open: open one with editCard")?;
     let args = json!({"id": card.id, "expected_keys": card.keys, "curve": parse_curve(&json!(st.curve))?});
+    // The curve before and after, so the moves linked to the card follow it (AX3).
+    let before = from_keys(&card.keys).ok();
+    let after = st.curve;
     spawn(
         ctx,
         st,
         "saveChanges",
         reindexed(backend("update_interpolation", args)),
-        Box::new(|st, r| match r {
+        Box::new(move |st, r| match r {
             Ok(v) => {
+                if let Some(before) = before.filter(|b| *b != after) {
+                    st.relink = Some((before, after, card.name.clone()));
+                }
                 let entry = v.get("entry").unwrap_or(&v);
                 if let Some(e) = &mut st.editing {
                     if let Some(keys) = entry.get("payload").and_then(|p| p.get("keys")) {
@@ -1026,6 +1037,25 @@ fn start_save_changes(ctx: &egui::Context, st: &mut CurvesState) -> Result<(), S
         }),
     );
     Ok(())
+}
+
+/// Runs a pending relink (an Ease card saved with a new curve): every move linked to the card
+/// gets the new curve, one undo step (`graph.relinkUpdate`). Called every frame (batch 1, AX3).
+pub fn drain_relink(app: &mut EffectcraftApp, ctx: &egui::Context) {
+    let shared = shared(ctx);
+    let Ok(mut st) = shared.try_lock() else { return };
+    let Some((before, after, name)) = st.relink.take() else { return };
+    drop(st);
+    let params = json!({"from": before, "to": after, "name": name});
+    match crate::menus::invoke(app, ctx, "graph.relinkUpdate", params) {
+        Ok(v) => {
+            let n = v.get("updated").and_then(Value::as_u64).unwrap_or(0);
+            if n > 0 {
+                app.toast = Some((format!("“{name}” changed: {n} linked move{} updated", if n == 1 { "" } else { "s" }), ctx.input(|i| i.time)));
+            }
+        }
+        Err(e) => app.ui.status = e,
+    }
 }
 
 /// The `save_asset` arguments of a new Ease card made from `curve`.

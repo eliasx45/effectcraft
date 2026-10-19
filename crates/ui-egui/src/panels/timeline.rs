@@ -14,6 +14,7 @@ use effectcraft_engine::time::Tick;
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
+mod beat;
 mod inline;
 pub(crate) mod wheels;
 
@@ -2216,9 +2217,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         }
                     }
                     app.auto.add(&format!("timeline.layer.{}.bar", layer.id.0), bar, &layer.name);
-                    // Interactions: move body, trim edges.
                     // Batch 1 lane B (SX3): the voice layer's words on its bar.
                     super::timeline_words::paint(app, ui, &gp, bar, tm, &comp, layer);
+                    // Interactions: move body, trim edges.
                     let (body_r, in_r, out_r) = trim_zones(bar);
                     let body = ui.interact(body_r, egui::Id::new(("bar", layer.id.0)), Sense::click_and_drag());
                     let lin = ui.interact(in_r, egui::Id::new(("bar-in", layer.id.0)), Sense::drag());
@@ -2753,6 +2754,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 // Keyframes.
                 if !graph_on {
+                    // Batch 1 (AX3): "Fast In · linked" on moves carrying a Library graph.
+                    beat::graph_tags(&gp, tm, layer, prop, cy, graph_x0, rect.max.x, t.text_dim);
                     for k in &prop.keys {
                         let ct = layer.comp_time(k.time);
                         let x = tm.x(ct.seconds());
