@@ -1313,6 +1313,16 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
     ("Panels are always drawn by the GPU (wgpu).", "面板始终由 GPU（wgpu）绘制。"),
     ("Previews", "预览"),
     ("Adaptive Resolution Limit", "自适应分辨率限制"),
+    ("Adaptive Resolution While Playing", "播放时自适应分辨率"),
+    (
+        "Playback that can't keep real time drops to Half, Third, then Quarter resolution, and renders full quality as soon as it stops or you scrub. Off: only Fast Previews ▸ Adaptive Resolution does. Exports are never affected.",
+        "无法保持实时的播放会依次降到二分之一、三分之一、四分之一分辨率，停止播放或拖动时立即以完整品质渲染。关闭：只有“快速预览 ▸ 自适应分辨率”会这样做。导出从不受影响。",
+    ),
+    ("Freeze Heavy Layers When Idle", "空闲时冻结繁重图层"),
+    (
+        "A layer or precomp that stays more than twice the frame time while playing is frozen (Smart Freeze, Auto) after 8 idle seconds. Off: the Timeline offers a Freeze button instead.",
+        "播放时耗时持续超过两倍帧时间的图层或预合成，在空闲 8 秒后被冻结（智能冻结，自动）。关闭：改为在时间轴中提供“冻结”按钮。",
+    ),
     ("Show Internal Wireframes", "显示内部线框"),
     ("Cache Frames When Idle", "空闲时缓存帧"),
     ("Viewer Zoom Quality", "查看器缩放品质"),
@@ -2091,6 +2101,16 @@ const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
     ("Panels are always drawn by the GPU (wgpu).", "面板一律由 GPU（wgpu）繪製。"),
     ("Previews", "預覽"),
     ("Adaptive Resolution Limit", "自適應解析度限制"),
+    ("Adaptive Resolution While Playing", "播放時自適應解析度"),
+    (
+        "Playback that can't keep real time drops to Half, Third, then Quarter resolution, and renders full quality as soon as it stops or you scrub. Off: only Fast Previews ▸ Adaptive Resolution does. Exports are never affected.",
+        "無法保持即時的播放會依序降到二分之一、三分之一、四分之一解析度，停止播放或拖曳時立即以完整品質算圖。關閉：只有「快速預覽 ▸ 自適應解析度」會這樣做。輸出從不受影響。",
+    ),
+    ("Freeze Heavy Layers When Idle", "閒置時凍結繁重圖層"),
+    (
+        "A layer or precomp that stays more than twice the frame time while playing is frozen (Smart Freeze, Auto) after 8 idle seconds. Off: the Timeline offers a Freeze button instead.",
+        "播放時耗時持續超過兩倍影格時間的圖層或預先合成，在閒置 8 秒後被凍結（智慧凍結，自動）。關閉：改為在時間軸中提供「凍結」按鈕。",
+    ),
     ("Show Internal Wireframes", "顯示內部線框"),
     ("Cache Frames When Idle", "閒置時快取影格"),
     ("Viewer Zoom Quality", "檢視器縮放品質"),
