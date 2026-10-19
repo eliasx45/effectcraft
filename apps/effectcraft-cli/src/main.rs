@@ -1854,9 +1854,30 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                     r.accel = Some(&gpu);
                     r.times = Some(&times);
                     let at = Tick(t.0.saturating_add(step.0.saturating_mul(i)));
+                    // Built with `--features profile`: the last frame's stages (inclusive CPU
+                    // spans and GPU passes), summed by name.
+                    #[cfg(feature = "profile")]
+                    if i == frames {
+                        effectcraft_render::profile::start();
+                    }
                     let t0 = std::time::Instant::now();
                     std::hint::black_box(gpu.render_display(&r, cid, at));
                     gpu.wait();
+                    #[cfg(feature = "profile")]
+                    if i == frames {
+                        let (events, _) = effectcraft_render::profile::finish();
+                        let mut stages: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
+                        for e in &events {
+                            let s = stages.entry(format!("{}:{}", e.cat, e.name)).or_default();
+                            s.0 += 1;
+                            s.1 += e.dur / 1000.0;
+                        }
+                        let mut stages: Vec<_> = stages.into_iter().collect();
+                        stages.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+                        for (name, (calls, ms)) in stages.iter().take(40) {
+                            note!("    stage {name:<40} {ms:9.2} ms {calls:>6} calls");
+                        }
+                    }
                     // Frame 0 fills the cache.
                     if i > 0 {
                         total += t0.elapsed().as_secs_f64() * 1e3;
