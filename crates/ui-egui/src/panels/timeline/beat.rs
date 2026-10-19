@@ -185,3 +185,25 @@ pub(crate) fn snap_line(p: &Painter, tm: TMap, rows: Rect, snap: &Snap) {
     p.rect_filled(r, 3.0, c);
     p.galley(r.min + egui::vec2(4.0, 2.0), g, Color32::BLACK);
 }
+
+// ---------------------------------------------------------------- AX8: layer starts snap too
+
+/// Where a dragged layer's in point goes (comp seconds) when the pointer asks for `desired_in`:
+/// its first move's speed peak (or, without keys, its in point) snaps onto the nearest stressed
+/// syllable within [`SNAP_FRAMES`]. `None` without a speech map (the Timeline's own drag then).
+pub(crate) fn layer_drag_target(comp: &Comp, layer: &Layer, desired_in: f64) -> Option<(f64, Option<Snap>)> {
+    let acc = accents(comp);
+    if acc.is_empty() {
+        return None;
+    }
+    let fps = comp.frame_rate.as_f64().max(1.0);
+    let cur_in = layer.in_point.seconds();
+    // The point that lands on the syllable, as an offset from the in point.
+    let po = layer_beat(comp, layer, &acc).map_or(0.0, |b| b.peak - cur_in);
+    let Some((word, accent)) = nearest(&acc, desired_in + po).cloned() else { return Some((desired_in, None)) };
+    let want = accent - po;
+    if ((want - desired_in) * fps).abs() <= SNAP_FRAMES {
+        return Some((want, Some(Snap { target: want, word, accent })));
+    }
+    Some((desired_in, None))
+}

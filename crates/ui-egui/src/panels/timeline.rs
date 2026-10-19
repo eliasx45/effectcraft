@@ -2270,6 +2270,37 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         if kind == "move" && quick {
                             continue;
                         }
+                        // Batch 1 (AX8): with a speech map, a moved layer follows the pointer from
+                        // where it started and its first peak (or in point) snaps onto a stressed
+                        // syllable, with the snap line and word.
+                        let start_in_id = egui::Id::new(("bar-start-in", layer.id.0));
+                        if kind == "move" && resp.drag_started() {
+                            ctx.data_mut(|d| d.insert_temp(start_in_id, layer.in_point.seconds()));
+                        }
+                        if kind == "move"
+                            && resp.dragged()
+                            && !mods.shift
+                            && let Some(start_in) = ctx.data(|d| d.get_temp::<f64>(start_in_id))
+                            && let (Some(o), Some(now)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+                            && let Some((to, snap)) = beat::layer_drag_target(&comp, layer, start_in + (now.x - o.x) as f64 / pps)
+                        {
+                            let frames = ((to - layer.in_point.seconds()) / fd).round() as i64;
+                            if frames != 0 {
+                                let targets = if is_sel { json!(selected.iter().map(|l| l.0).collect::<Vec<_>>()) } else { json!([layer.id.0]) };
+                                actions.push(("layer.timing".into(), json!({"layers": targets, "delta": frames as f64 * fd, "merge": drag_key})));
+                            }
+                            if let Some(sn) = &snap {
+                                beat::snap_line(&p, tm, rows_rect, sn);
+                            }
+                            ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-bar-syllable"), snap.map(|sn| sn.word)));
+                            continue;
+                        }
+                        if kind == "move" && resp.drag_stopped() {
+                            ctx.data_mut(|d| d.remove::<f64>(start_in_id));
+                            if let Some(Some(word)) = ctx.data_mut(|d| d.remove_temp::<Option<String>>(egui::Id::new("tl-bar-syllable"))) {
+                                app.toast = Some((format!("Snapped: layer on “{word}”"), ctx.input(|i| i.time)));
+                            }
+                        }
                         if resp.dragged() {
                             let acc_id = egui::Id::new(("bar-acc", layer.id.0, kind));
                             let mut acc: f32 = ctx.data(|d| d.get_temp(acc_id).unwrap_or(0.0));
