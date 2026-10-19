@@ -76,3 +76,33 @@ fn a_3d_shape_with_effects_and_styles_is_made_on_the_gpu() {
         }
     }
 }
+
+/// A held 3D plane (nothing on it changes) stays on the card: the layer cache hands the same
+/// buffer back and the upload is indexed by it, so later frames upload and read back nothing.
+#[test]
+fn a_held_3d_styled_plane_stays_on_the_card() {
+    use effectcraft_render::{Backend, LayerCache, Renderer};
+    let g = crate::tests::gpu();
+    assert!(g.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+    let Some(g) = g else { return };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        g.ctx.clear_uploads();
+        let mut s = circle(depth, true);
+        for l in &mut s.p.comp_mut(s.cid).unwrap().layers {
+            if let Some(p) = l.props.prop_mut("effects/#3/radius") {
+                p.keys.clear();
+            }
+        }
+        let cache = LayerCache::default();
+        let o = RenderOpts { backend: Backend::Gpu, ..opts() };
+        let mut r = Renderer::new(&s.p, &crate::tests::Pattern, o);
+        r.accel = Some(g);
+        r.cache = Some(&cache);
+        g.within_memory(|| g.render_display(&r, s.cid, Tick::from_seconds_f64(0.2))).unwrap().unwrap();
+        let before = g.ctx.transfer_stats();
+        g.within_memory(|| g.render_display(&r, s.cid, Tick::from_seconds_f64(0.6))).unwrap().unwrap();
+        let after = g.ctx.transfer_stats();
+        assert_eq!(after.uploads, before.uploads, "{depth:?}: the held plane uploads nothing");
+        assert_eq!(after.readbacks, before.readbacks, "{depth:?}: the held plane reads nothing back");
+    }
+}
