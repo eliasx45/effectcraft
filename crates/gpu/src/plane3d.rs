@@ -15,6 +15,9 @@ use effectcraft_render::{EvalCtx, Renderer, styles};
 
 use crate::context::{Enc, GpuImage, Params};
 
+/// Plane-sized images the GPU styles hold at once, at most (see [`plane`]).
+const STYLE_IMAGES: u64 = 9;
+
 #[cfg(test)]
 pub(crate) static MADE_ON_GPU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -85,6 +88,14 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Result<(Buf
     let (pw, ph) = (prep.shape.img.width, prep.shape.img.height);
     if !e.g.fits(pw, ph) || x1 > img.width || y1 > img.height || x0 >= x1 || y0 >= y1 {
         return Err("style canvas too large");
+    }
+    // The styles hold about this many plane-sized images at once (Bevel and Emboss: distance
+    // field, height, blurs, packed normals, the result). On a discrete card a third of its memory
+    // is the most they take: running out retires readbacks, and every GPU step after that falls
+    // back to the CPU.
+    let need = u64::from(pw).saturating_mul(u64::from(ph)).saturating_mul(16 * STYLE_IMAGES);
+    if e.g.video_memory().is_some_and(|m| need > m.total / 3) {
+        return Err("styles would need too much video memory");
     }
     // A fresh zeroed image of its own: `Enc::zeros` is shared and must never be written.
     let padded = e.image(pw, ph);
