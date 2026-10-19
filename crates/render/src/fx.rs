@@ -410,6 +410,7 @@ impl<'a> Renderer<'a> {
         origin: [f64; 2],
         target: &mut dyn FxTarget,
     ) {
+        let _profile = crate::profile::span("run_effect_stack");
         if !layer.switches.effects {
             return;
         }

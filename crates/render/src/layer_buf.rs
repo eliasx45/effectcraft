@@ -73,6 +73,18 @@ impl<'a> Renderer<'a> {
         nb
     }
 
+    /// Whether the layer cache holds [`Self::layer_buf`]'s result for `layer` in memory (drawing
+    /// it from there costs nothing; an accelerator that makes the plane itself skips it then).
+    pub fn layer_buf_in_memory(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        let (Some(c), Some(ck)) = (self.cache, self.content_cache_key(ctx, layer)) else { return false };
+        if !styles::active(ctx, layer) {
+            return c.peek(ck).is_some();
+        }
+        let k = cache::styles_key(ctx, layer, ck);
+        let k = if styles::pass_modes(ctx, layer).is_empty() { k } else { cache::derive(k, 0xf1a7) };
+        c.peek(k).is_some()
+    }
+
     fn layer_buf_keyed(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, Option<u64>)> {
         let st = self.styled(ctx, layer, None)?;
         if st.passes.is_empty() {
@@ -295,6 +307,7 @@ impl<'a> Renderer<'a> {
     /// what effect `effects` sees. Served from / stored in the layer cache under its own key,
     /// so scrubbing reuses frames rendered for earlier output frames.
     pub fn layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
+        let _profile = crate::profile::span("layer_input");
         let src = match layer.source {
             LayerSource::Comp { .. } if self.cache.is_some() => self.precomp_key(ctx, layer),
             LayerSource::Footage { item } => Some(self.proxy_for(item).is_some() as u64),

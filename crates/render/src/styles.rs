@@ -605,6 +605,7 @@ fn glow_intensity(alpha: &Plane, d: &Lazy, g: &Glow, s: f64, inner: bool) -> Pla
 /// drawn on a comp-sized canvas, mostly transparent; its styles cost 20–90 ms per frame there).
 /// The result is the same as styling the whole buffer: outside the crop every style is zero.
 pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2]) -> Styled {
+    let _profile = crate::profile::span("styles_cpu");
     render_in(ctx, layer, content, layer_size, true)
 }
 
