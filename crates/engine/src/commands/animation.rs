@@ -15,6 +15,9 @@ use crate::{EngineError, KeyRef, Result, Session, cmd};
 
 /// Preset file format version tag (`*.ecpreset`, JSON).
 pub const PRESET_TAG: &str = "effectcraftAnimationPreset";
+/// The version written: 2 adds `animators` (whole text animators, CX8d). Version 1 files still
+/// apply (they have no `animators`).
+pub const PRESET_VERSION: u32 = 2;
 
 fn has_selected_props(s: &Session) -> std::result::Result<(), String> {
     has_comp(s)?;
@@ -45,6 +48,27 @@ fn selected_effects(s: &Session) -> Vec<(LayerId, PropGroup)> {
         .collect()
 }
 
+/// Selected text animator groups (layer, `text/animators` child), saved whole (CX8d): each
+/// animator with its name, its selectors (range / wiggly / expression, Advanced ▸ Based On,
+/// expressions, keys and eases) and its properties. Selecting the layer's Animators group
+/// selects all of them.
+// TODO(batch1-verify): a click on an animator (or the Animators) row in the Timeline puts that
+// group's uid in `selected_props`, as Effect Controls does for an effect.
+fn selected_animators(s: &Session) -> Vec<(LayerId, PropGroup)> {
+    let Some(c) = s.active_comp() else { return vec![] };
+    let mut out: Vec<(LayerId, PropGroup)> = vec![];
+    for (l, u) in &s.state.selected_props {
+        let Some(anims) = c.layer(*l).and_then(|layer| layer.props.group("text/animators")) else { continue };
+        let picked: Vec<&PropGroup> = if anims.uid == *u { anims.groups().collect() } else { anims.groups().filter(|g| g.uid == *u).collect() };
+        for g in picked {
+            if !out.iter().any(|(ol, og)| ol == l && og.uid == g.uid) {
+                out.push((*l, g.clone()));
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------- presets
 
 fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
@@ -53,6 +77,8 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
     let t = s.time();
     let effects: Vec<(LayerId, PropGroup)> = selected_effects(s);
     let effect_uids: Vec<Uid> = effects.iter().map(|(_, g)| g.uid).collect();
+    let mut animators: Vec<(LayerId, PropGroup)> = selected_animators(s);
+    let animator_uids: Vec<Uid> = animators.iter().map(|(_, g)| g.uid).collect();
     let mut props = vec![];
     for (lid, uid) in selected_leaf_props(s) {
         let Some(l) = comp.layer(lid) else { continue };
@@ -60,17 +86,21 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
         if l.effects().is_some_and(|fx| fx.groups().any(|g| effect_uids.contains(&g.uid) && g.find(uid).is_some())) {
             continue;
         }
+        // So do the properties of a saved text animator.
+        if animators.iter().any(|(al, g)| *al == lid && animator_uids.contains(&g.uid) && g.find(uid).is_some()) {
+            continue;
+        }
         let (Some(pr), Some(mp)) = (l.props.find(uid), match_path_of(&l.props, uid)) else { continue };
         props.push((l.layer_time(t), mp, pr.clone()));
     }
-    if props.is_empty() && effects.is_empty() {
-        return Err(bad("anim.savePreset", "select properties or effects to save"));
+    if props.is_empty() && effects.is_empty() && animators.is_empty() {
+        return Err(bad("anim.savePreset", "select properties, effects or text animators to save"));
     }
-    // Key times are stored relative to the earliest key (of the properties and of the saved
-    // effects alike) so the preset applies at the CTI.
+    // Key times are stored relative to the earliest key (of the properties, the saved effects
+    // and the saved text animators alike) so the preset applies at the CTI.
     let mut effects = effects;
     let mut fx_first: Option<Tick> = None;
-    for (_, g) in &effects {
+    for (_, g) in effects.iter().chain(animators.iter()) {
         let mut first_in = |pr: &Property| {
             if let Some(t) = pr.keys.iter().map(|k| k.time).min() {
                 fx_first = Some(fx_first.map_or(t, |f| f.min(t)));
@@ -79,7 +109,7 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
         g.walk("", &mut |_, pr| first_in(pr));
     }
     let first = props.iter().flat_map(|(_, _, pr)| pr.keys.iter().map(|k| k.time)).chain(fx_first).min().unwrap_or(Tick::ZERO);
-    for (_, g) in &mut effects {
+    for (_, g) in effects.iter_mut().chain(animators.iter_mut()) {
         g.walk_mut(&mut |pr| {
             for k in &mut pr.keys {
                 k.time -= first;
@@ -100,10 +130,20 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name")
         .map(str::to_string)
         .unwrap_or_else(|| std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
-    let doc = json!({PRESET_TAG: 1, "name": name, "properties": props_json, "effects": fx_json});
+    let anim_json: Vec<Value> = animators.iter().map(|(_, g)| serde_json::to_value(g).unwrap_or_default()).collect();
+    let mut doc = json!({PRESET_TAG: PRESET_VERSION, "name": name, "properties": props_json, "effects": fx_json});
+    if !anim_json.is_empty() {
+        doc["animators"] = json!(anim_json);
+    }
     let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
-    s.services.write_file(&path, text.as_bytes()).map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
-    Ok(json!({"path": path, "properties": props.len(), "effects": effects.len()}))
+    // A folder that doesn't exist yet (a new card's assets/<id>/) is made.
+    // TODO(batch1-verify): FsServices::write_file (config::atomic_write) reports a missing folder as NotFound.
+    let written = match s.services.write_file(&path, text.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => s.services.store_file(&path, text.as_bytes()),
+        other => other,
+    };
+    written.map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
+    Ok(json!({"path": path, "properties": props.len(), "effects": effects.len(), "animators": animators.len()}))
 }
 
 fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
@@ -130,6 +170,12 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let effects: Vec<PropGroup> =
         doc["effects"].as_array().map(|a| a.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()).unwrap_or_default();
+    // Text animators saved whole (CX8c); text layers only.
+    let animators: Vec<PropGroup> =
+        doc["animators"].as_array().map(|a| a.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()).unwrap_or_default();
+    // `replace`: same-named effects are replaced too, so applying again doesn't stack them
+    // (text animators always are).
+    let replace = super::b_p(p, "replace").unwrap_or(false);
     let props: Vec<(String, Property)> = doc["properties"]
         .as_array()
         .map(|a| {
@@ -147,7 +193,11 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
                 .collect()
         })
         .unwrap_or_default();
-    let t = s.time();
+    // `at` (comp seconds): where the preset's keys start; default the CTI.
+    let t = match super::f_p(p, "at").filter(|x| x.is_finite() && x.abs() <= 86_400.0) {
+        Some(x) => Tick::from_seconds_f64(x),
+        None => s.time(),
+    };
     let mut applied = 0;
     let mut skipped = vec![];
     s.edit("Apply Animation Preset", None, |proj, _| {
@@ -155,8 +205,34 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
         for lid in &ids {
             let l = layer_mut(proj, cid, *lid)?;
             let lt = l.layer_time(t);
+            if !animators.is_empty() {
+                match l.props.group_mut("text/animators") {
+                    Some(anims) => {
+                        for g in &animators {
+                            // Same name = the same animator: applying again replaces it (the
+                            // names are kept exactly: expressions find them by name).
+                            anims.children.retain(|c| !matches!(c, Node::Group(x) if x.match_id == g.match_id && x.name == g.name));
+                            let mut g = g.clone();
+                            g.reassign_uids(&mut next);
+                            // reassign_uids leaves `next` on the last uid it gave.
+                            next += 1;
+                            g.walk_mut(&mut |pr| {
+                                for k in &mut pr.keys {
+                                    k.time += lt;
+                                }
+                            });
+                            anims.children.push(Node::Group(g));
+                            applied += 1;
+                        }
+                    }
+                    None => skipped.push("text animators (not a text layer)".to_string()),
+                }
+            }
             if let Some(fx) = l.props.sub_mut("effects") {
                 for g in &effects {
+                    if replace {
+                        fx.children.retain(|c| !matches!(c, Node::Group(x) if x.match_id == g.match_id && x.name == g.name));
+                    }
                     let mut g = g.clone();
                     g.reassign_uids(&mut next);
                     g.walk_mut(&mut |pr| {
@@ -498,11 +574,19 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save Animation Preset...",
             ["Animation"],
             None,
-            "{path (.ecpreset), name?} — saves the selected properties/effects",
+            "{path (.ecpreset), name?} — saves the selected properties, effects and text animators (whole)",
             has_selected_props,
             save_preset
         ),
-        cmd!("anim.applyPreset", "Apply Animation Preset...", ["Animation"], None, "{path | preset, layers?}", has_layers, apply_preset),
+        cmd!(
+            "anim.applyPreset",
+            "Apply Animation Preset...",
+            ["Animation"],
+            None,
+            "{path | preset, layers?, at? (comp s: where the keys start; default the CTI), replace? (bool: same-named effects are replaced, not stacked; text animators of the same name always are)}",
+            has_layers,
+            apply_preset
+        ),
         cmd!("anim.addKeyframe", "Add Keyframe", ["Animation"], None, "{} — keys the selected properties at the CTI", has_selected_props, add_keyframe),
         cmd!(
             "keys.exponentialScale",
