@@ -69,7 +69,10 @@ fn a_3d_shape_with_effects_and_styles_is_made_on_the_gpu() {
                 let before = crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed);
                 let d = compare_at(&s, RenderOpts { scale, ..opts() }, Tick::from_seconds_f64(0.5));
                 if d.is_some() {
-                    assert!(crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed) > before, "styled {styled} {depth:?} at {scale}: the plane was made on the CPU");
+                    assert!(
+                        crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed) > before,
+                        "styled {styled} {depth:?} at {scale}: the plane was made on the CPU"
+                    );
                 }
                 check(&format!("3D circle, styled {styled}, {depth:?} at {scale}"), d, 0.002);
             }
@@ -77,10 +80,12 @@ fn a_3d_shape_with_effects_and_styles_is_made_on_the_gpu() {
     }
 }
 
-/// A held 3D plane (nothing on it changes) stays on the card: the layer cache hands the same
-/// buffer back and the upload is indexed by it, so later frames upload and read back nothing.
+/// A held 3D plane (nothing on it changes) is made on the GPU too (the CPU would style it once,
+/// seconds for a large Bevel), and later frames upload nothing and read back only its alpha
+/// bounds (a few bytes per row): the source buffer comes from the layer cache, its upload is
+/// indexed by it.
 #[test]
-fn a_held_3d_styled_plane_stays_on_the_card() {
+fn a_held_3d_styled_plane_is_made_on_the_gpu_without_uploads() {
     use effectcraft_render::{Backend, LayerCache, Renderer};
     let g = crate::tests::gpu();
     assert!(g.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
@@ -100,9 +105,11 @@ fn a_held_3d_styled_plane_stays_on_the_card() {
         r.cache = Some(&cache);
         g.within_memory(|| g.render_display(&r, s.cid, Tick::from_seconds_f64(0.2))).unwrap().unwrap();
         let before = g.ctx.transfer_stats();
+        let made = crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed);
         g.within_memory(|| g.render_display(&r, s.cid, Tick::from_seconds_f64(0.6))).unwrap().unwrap();
         let after = g.ctx.transfer_stats();
         assert_eq!(after.uploads, before.uploads, "{depth:?}: the held plane uploads nothing");
-        assert_eq!(after.readbacks, before.readbacks, "{depth:?}: the held plane reads nothing back");
+        assert!(after.readback_bytes - before.readback_bytes < 64 << 10, "{depth:?}: the held plane reads back only its bounds");
+        assert!(crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed) > made, "{depth:?}: the held plane was made on the CPU");
     }
 }

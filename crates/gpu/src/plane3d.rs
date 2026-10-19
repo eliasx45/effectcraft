@@ -37,7 +37,9 @@ pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer]) -> 
 /// A 3D shape layer's plane made on the GPU: its source (with masks, from the CPU), its effect
 /// stack, then its Layer Styles when every one renders on the GPU and none paints outside the
 /// layer (Drop Shadow, Outer Glow: the CPU flattens those passes). `None` leaves the layer to
-/// the CPU: no effects or styles to run, an unchanged layer (the layer cache holds it),
+/// the CPU: no effects or styles to run, an unchanged layer the layer cache holds already (one
+/// it doesn't hold is made here: the CPU would style it once at its full raster size, seconds
+/// for a large Bevel and Emboss),
 /// linear blending, or a step the GPU can't do.
 fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Option<(Buf, GpuImage)> {
     let styled = styles::active(ctx, layer);
@@ -46,7 +48,7 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Option<(Buf
         || layer.switches.adjustment
         || !(styled || has_fx)
         || r.pipe().to_blend().is_some()
-        || r.layer_is_static(ctx, layer)
+        || (r.layer_is_static(ctx, layer) && r.layer_buf_in_memory(ctx, layer))
     {
         return None;
     }
