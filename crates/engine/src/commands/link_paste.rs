@@ -19,7 +19,8 @@
 
 use std::sync::Arc;
 
-use effectcraft_project::{ItemId, LayerId, Project};
+use effectcraft_keyframe::Value as KV;
+use effectcraft_project::{ItemId, Layer, LayerId, Project};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, bad, has_layers, layer_mut, layers_p, str_p, unlocked};
@@ -158,6 +159,36 @@ fn size_in(project: &Arc<Project>, cid: ItemId, lid: LayerId) -> (f64, f64) {
 
 const MAX_FILES: usize = 64;
 
+/// The anchor point moves with the new source (the same spot of the picture: a centred anchor stays
+/// centred), so the card stays where it was. Without it a card whose new picture had another size
+/// moved off its place (BUILD2 CX2).
+fn keep_anchor(l: &mut Layer, before: (f64, f64), after: (f64, f64)) {
+    let ok = |v: f64| v.is_finite() && v > 0.0;
+    if !(ok(before.0) && ok(before.1) && ok(after.0) && ok(after.1)) {
+        return;
+    }
+    let (fx, fy) = (after.0 / before.0, after.1 / before.1);
+    if (fx - 1.0).abs() < 1e-12 && (fy - 1.0).abs() < 1e-12 {
+        return;
+    }
+    let Some(pr) = l.props.prop_mut("transform/anchor") else { return };
+    let mul = |v: &mut KV| match v {
+        KV::Vec2(a) => {
+            a[0] *= fx;
+            a[1] *= fy;
+        }
+        KV::Vec3(a) => {
+            a[0] *= fx;
+            a[1] *= fy;
+        }
+        _ => {}
+    };
+    mul(&mut pr.value);
+    for k in &mut pr.keys {
+        mul(&mut k.value);
+    }
+}
+
 fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "link.paste";
     let link = link_p(p, cmd)?;
@@ -213,6 +244,7 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
                 s.edit("Fit Card", None, |proj, _| {
                     let mut next = proj.next_id;
                     let l = layer_mut(proj, cid, lid)?;
+                    keep_anchor(l, before, after);
                     super::cards::put_card_mask(l, &mut next, after, &st, crate::prefs::mask_color(cycle, 0)).map_err(EngineError::Other)?;
                     super::cards::scale_layer(l, ratio);
                     proj.next_id = next;
@@ -276,5 +308,24 @@ mod tests {
             .is_err()
         );
         assert_eq!(s.history.undo.len(), undo);
+    }
+
+    #[test]
+    fn a_new_picture_of_another_size_keeps_the_card_in_place() {
+        // BUILD2 CX2: an 800×1000 card got a 1080×1916 cover; the anchor stayed at (400, 500), so
+        // the card moved right and down.
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "L", "width": 1920, "height": 1080, "frameRate": 30, "duration": 1})).unwrap();
+        let a = s.execute("layer.newSolid", json!({"color": "#202020", "width": 800, "height": 1000})).unwrap()["layer"].as_u64().unwrap();
+        let cid = s.active_comp_id().unwrap();
+        let mut p = (*s.project).clone();
+        let l = layer_mut(&mut p, cid, LayerId(a)).unwrap();
+        keep_anchor(l, (800.0, 1000.0), (1080.0, 1916.0));
+        let v = l.props.prop_mut("transform/anchor").unwrap().value.clone();
+        match v {
+            KV::Vec2(x) => assert_eq!((x[0], x[1]), (540.0, 958.0)),
+            KV::Vec3(x) => assert_eq!((x[0], x[1]), (540.0, 958.0)),
+            other => panic!("anchor is {other:?}"),
+        }
     }
 }
