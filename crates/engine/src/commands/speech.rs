@@ -402,6 +402,20 @@ fn find(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// The part of its media (media seconds: start, duration) a layer plays inside the comp's
+/// 0..duration: a voice layer longer than the comp isn't heard past its end, so it isn't sent to
+/// the transcriber (BUILD2 SX2: a 575 s voice-over in a 12 s comp sent all 573 s).
+pub(crate) fn media_span(layer: &Layer, comp: &Comp) -> Option<(f64, f64)> {
+    let (a, b) = (layer.in_point.max(Tick::ZERO), layer.out_point.min(comp.duration));
+    if b <= a {
+        return None;
+    }
+    let (x, y) = (layer.layer_time(a).seconds(), layer.layer_time(b).seconds());
+    let start = x.min(y).max(0.0);
+    let dur = (x.max(y) - start).max(0.0);
+    (dur > 0.0).then_some((start, dur))
+}
+
 /// `speech.transcribe {layer}` (SX2): the voice layer's words. With `path` / `words` (the JSON
 /// `scribe-words` or `scripts/fork/speech-map` wrote, media seconds) it imports them through the
 /// layer, as `speech.import {layer}`. Without, the desktop app runs the transcriber in the
@@ -435,13 +449,9 @@ fn transcribe(s: &mut Session, p: &Value) -> Result<Value> {
     if layer.props.get("timeRemap").is_some_and(|t| !t.keys.is_empty() || t.has_expression()) {
         return Err(bad(C, format!("{} is time-remapped: transcribe its media and import with speech.import (times in comp seconds)", layer.name)));
     }
-    // The part of the media the layer plays (media seconds).
-    let (x, y) = (layer.layer_time(layer.in_point).seconds(), layer.layer_time(layer.out_point).seconds());
-    let start = x.min(y).max(0.0);
-    let dur = (x.max(y) - start).max(0.0);
-    if dur <= 0.0 {
-        return Err(bad(C, format!("{} plays no time of its media", layer.name)));
-    }
+    let Some((start, dur)) = media_span(layer, comp) else {
+        return Err(bad(C, format!("{} plays no time of its media inside the comp", layer.name)));
+    };
     let job = json!({
         "comp": cid.0,
         "layer": lid.0,

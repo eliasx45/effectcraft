@@ -84,3 +84,19 @@ fn transcribe_needs_a_layer_with_sound() {
     // A solid has no sound.
     assert!(s.execute("speech.transcribe", json!({"layer": l})).is_err());
 }
+
+#[test]
+fn transcribe_sends_only_the_part_inside_the_comp() {
+    // BUILD2 SX2: a voice layer starting 2 s before the comp and running past its 4 s end: media
+    // 2..6 s is heard, not all of it.
+    let (mut s, l) = talk();
+    s.execute("layer.timing", json!({"layers": [l], "start": -2.0, "in": -2.0, "out": 30.0})).unwrap();
+    let comp = s.active_comp().unwrap().clone();
+    let layer = comp.layer(LayerId(l)).unwrap();
+    let (start, dur) = crate::commands::speech::media_span(layer, &comp).unwrap();
+    assert!((start - 2.0).abs() < 1e-6, "{start}");
+    assert!((dur - 4.0).abs() < 1e-6, "{dur}");
+    s.execute("layer.timing", json!({"layers": [l], "start": 10.0})).unwrap();
+    let comp = s.active_comp().unwrap().clone();
+    assert!(crate::commands::speech::media_span(comp.layer(LayerId(l)).unwrap(), &comp).is_none(), "after the comp's end");
+}
