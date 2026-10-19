@@ -265,6 +265,9 @@ pub struct ViewerState {
     pub zoom: Option<f32>,
     /// Fit up to 100%: while fitting (`zoom` is None), the comp is never magnified past 100%.
     pub fit_up_to_100: bool,
+    /// View ▸ Sharp Zoom (beyond After Effects): above 100 % the visible region is also rendered
+    /// at the magnification, so text, shapes and footage stay sharp (see [`crate::sharp_zoom`]).
+    pub sharp_zoom: bool,
     /// Pan offset in points from the centred position.
     pub pan: [f32; 2],
     pub transparency_grid: bool,
@@ -307,6 +310,7 @@ impl Default for ViewerState {
         ViewerState {
             zoom: None,
             fit_up_to_100: false,
+            sharp_zoom: true,
             pan: [0.0, 0.0],
             transparency_grid: false,
             show_masks: true,

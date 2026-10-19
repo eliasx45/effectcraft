@@ -78,6 +78,14 @@ pub fn specs() -> Vec<CommandSpec> {
         fe!("view.snapToGrid", "Snap to Grid", ["View"], Some("Cmd+Shift+'"), "{value?}", always),
         fe!("view.options", "View Options...", ["View"], Some("Cmd+Alt+U"), "{}", has_comp),
         fe!("view.layerControls", "Show Layer Controls", ["View"], Some("Cmd+Shift+H"), "{value?}", always),
+        fe!(
+            "view.sharpZoom",
+            "Sharp Zoom",
+            ["View"],
+            None,
+            "{value?} — above 100 % the viewer also renders the visible region at the magnification (text, shapes and footage stay sharp; on by default)",
+            always
+        ),
         // macOS uses Control+Command+F for native full screen. On Windows and Linux,
         // Cmd maps to Ctrl; the After Effects-style Ctrl+\ is window.maximizeApp.
         fe!("view.fullScreen", "Enter Full Screen", ["View"], cfg!(target_os = "macos").then_some("Ctrl+Cmd+F"), "{}", always),

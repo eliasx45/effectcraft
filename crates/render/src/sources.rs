@@ -72,6 +72,15 @@ impl<'a> Renderer<'a> {
         if !k.is_finite() || k <= 1e-6 {
             return s;
         }
+        // Sharp zoom (an output above comp resolution: the viewer's magnified region): drawn at
+        // its size on screen, within the sharp-zoom pixel budget.
+        if self.sharp() && self.layer_view.is_none() {
+            let r = s * k.clamp(1.0 / 16.0, 64.0);
+            return match content_bounds(ctx, layer) {
+                Some(b) => self.sharp_fit(r, b[2] - b[0], b[3] - b[1], r.min(k.max(1.0))),
+                None => r,
+            };
+        }
         // The step is rounded up past rounding noise only: an unscaled layer whose position isn't
         // a whole number maps the unit vectors to lengths a hair over 1, which must stay 1 (#390:
         // rounded up to 2^¼, unscaled text was drawn larger and resampled, softer).
@@ -121,10 +130,10 @@ impl<'a> Renderer<'a> {
 
     /// Source pixels of a layer in layer space (before masks/effects).
     pub(crate) fn source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
-        let s = self.opts.scale;
         match &layer.source {
             LayerSource::Solid { item } => {
                 let ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
+                let s = self.solid_scale(sol.width, sol.height);
                 let w = ((sol.width as f64 * s).ceil() as u32).max(1);
                 let h = ((sol.height as f64 * s).ceil() as u32).max(1);
                 if layer.switches.adjustment {
@@ -188,7 +197,18 @@ impl<'a> Renderer<'a> {
         // values.
         let ov = essential_overrides(ctx, layer);
         let tmp = if ov.is_empty() { None } else { effectcraft_project::essential::with_overrides(self.project, *item, &ov) };
-        let (base, bs) = self.precomp_renderer(layer, *item);
+        let (mut base, mut bs) = self.precomp_renderer(layer, *item);
+        // Sharp zoom: a nested comp drawn whole (not windowed to what shows) stays within the
+        // sharp-zoom pixel budget, drawn at a lower scale and magnified.
+        if win.is_none()
+            && base.sharp()
+            && let Some(nc) = self.project.comp(*item)
+        {
+            let fit = base.sharp_fit(bs, f64::from(nc.width), f64::from(nc.height), 1.0);
+            if fit < bs {
+                (base.opts.scale, bs) = (fit, fit);
+            }
+        }
         let base = base.windowed(win);
         let offset = window_offset(win);
         let sub = match &tmp {

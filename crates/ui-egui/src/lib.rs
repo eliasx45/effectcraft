@@ -517,6 +517,8 @@ pub struct EffectcraftApp {
     /// Texture of the last CPU frame shown in the viewer, the key it came from and the factor it
     /// was averaged down by for the magnification (`panels::viewer::minify_factor`).
     pub(crate) viewer_tex: Option<(egui::TextureHandle, FrameKey, usize)>,
+    /// View ▸ Sharp Zoom: the visible region rendered at the magnification above 100 %.
+    pub(crate) sharp_zoom: sharp_zoom::SharpZoom,
     /// The frames the other (passive) Composition viewers show, by viewer id.
     pub(crate) passive_tex: std::collections::HashMap<u32, (FrameKey, panels::viewers::PassiveTexture)>,
     /// The last GPU frame shown: its egui texture id (registered with egui-wgpu), key and texture.
@@ -665,6 +667,7 @@ impl EffectcraftApp {
             latency: Default::default(),
             toast: None,
             viewer_tex: None,
+            sharp_zoom: Default::default(),
             passive_tex: std::collections::HashMap::new(),
             viewer_native: None,
             viewer_shown: None,
@@ -1622,6 +1625,7 @@ impl EffectcraftApp {
             backend: effectcraft_engine::render::Backend::Auto,
             nested_switches: self.session.prefs.general.switches_affect_nested_comps,
             draft_shadows: self.session.prefs.three_d.realtime_shadows,
+            sharp: false,
             proxy: Default::default(),
         }
     }

@@ -290,6 +290,7 @@ impl<'a> Cx<'a> {
             roi: None,
             nested_switches: self.job.nested_switches,
             draft_shadows: true,
+            sharp: false,
             proxy: s.proxy_use,
         };
         let mut r = Renderer::new(&self.project, self.job.source(), opts);

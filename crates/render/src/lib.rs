@@ -43,5 +43,5 @@ pub use fx::{effect_canvas_extent, effect_canvas_extent_in};
 pub use layer_buf::{ContentClip, StyledLayer};
 pub use motion_blur::adaptive_samples;
 pub use placement::Placement;
-pub use renderer::{LayerTimes, LayerTiming, RenderOpts, Renderer, extended_region, render_frame, roi_inside};
+pub use renderer::{LayerTimes, LayerTiming, RenderOpts, Renderer, SHARP_MAX_PIXELS, extended_region, render_frame, roi_inside};
 pub use sources::{content_bounds, essential_overrides, kurbo_path};

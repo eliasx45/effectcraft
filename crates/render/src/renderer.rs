@@ -7,7 +7,7 @@ use effectcraft_geom::Mat3;
 use effectcraft_project::{Comp, ItemId, Layer, LayerId, Project, Quality};
 use effectcraft_time::Tick;
 
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RenderOpts {
     /// Output scale relative to comp pixels (1 = Full, 0.5 = Half…).
@@ -32,12 +32,76 @@ pub struct RenderOpts {
     pub nested_switches: bool,
     /// Realtime Shadows in Draft (Settings ▸ 3D): draft renders (`draft`) still cast shadows.
     pub draft_shadows: bool,
+    /// Sharp zoom (viewer only): a `scale` above 1 is the viewer's magnification, so each layer
+    /// buffer is held within [`SHARP_MAX_PIXELS`] (drawn at a lower scale and magnified past it)
+    /// and nested comps are drawn only where they show. Exports to a larger output leave it off.
+    pub sharp: bool,
+}
+
+/// The `Debug` text keys caches (viewer frames on disk, nested comps): `sharp` shows only when on,
+/// so every other render keeps the text, and the keys, it had before the field.
+impl std::fmt::Debug for RenderOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let RenderOpts { scale, motion_blur, guides, draft, view, backend, roi, proxy, nested_switches, draft_shadows, sharp } = self;
+        let mut d = f.debug_struct("RenderOpts");
+        d.field("scale", scale)
+            .field("motion_blur", motion_blur)
+            .field("guides", guides)
+            .field("draft", draft)
+            .field("view", view)
+            .field("backend", backend)
+            .field("roi", roi)
+            .field("proxy", proxy)
+            .field("nested_switches", nested_switches)
+            .field("draft_shadows", draft_shadows);
+        if *sharp {
+            d.field("sharp", sharp);
+        }
+        d.finish()
+    }
 }
 
 impl RenderOpts {
     /// Whether 3D layers cast shadows in this render.
     pub fn shadows(&self) -> bool {
         !self.draft || self.draft_shadows
+    }
+}
+
+/// Sharp zoom ([`RenderOpts::sharp`]: the viewer's magnified region rendered at the
+/// magnification): the most pixels one layer buffer may take. A source bigger than this at the
+/// output scale is drawn at a lower scale and magnified (still no softer than at 100 %).
+pub const SHARP_MAX_PIXELS: f64 = 16.0e6;
+/// Sharp zoom: the longest side of one layer buffer (the rasterisers stop at 16384).
+const SHARP_MAX_SIDE: f64 = 16000.0;
+
+impl Renderer<'_> {
+    /// This is a sharp-zoom render above comp resolution ([`RenderOpts::sharp`]): the per-buffer
+    /// budget ([`SHARP_MAX_PIXELS`]) applies. Never at or below 100 % nor in exports, so those
+    /// frames are unchanged.
+    pub(crate) fn sharp(&self) -> bool {
+        self.opts.sharp && self.opts.scale > 1.0
+    }
+
+    /// The scale (buffer pixels per layer unit) to draw a `w`×`h` (layer units) buffer at for a
+    /// wanted `scale`: within the sharp-zoom budget, but never under `floor` (nor over `scale`).
+    /// `scale` itself outside sharp zoom.
+    pub(crate) fn sharp_fit(&self, scale: f64, w: f64, h: f64, floor: f64) -> f64 {
+        if !self.sharp() || !(w.is_finite() && h.is_finite()) {
+            return scale;
+        }
+        let (w, h) = (w.abs().max(1.0), h.abs().max(1.0));
+        let cap = (SHARP_MAX_PIXELS / (w * h)).sqrt().min(SHARP_MAX_SIDE / w.max(h));
+        if !cap.is_finite() {
+            return scale;
+        }
+        scale.min(cap.max(floor.min(scale)))
+    }
+
+    /// The scale a `w`×`h` solid's buffer is drawn at: the output scale (within the sharp-zoom
+    /// budget, see [`Self::sharp_fit`]).
+    pub(crate) fn solid_scale(&self, w: u32, h: u32) -> f64 {
+        self.sharp_fit(self.opts.scale, f64::from(w), f64::from(h), 1.0)
     }
 }
 
@@ -53,6 +117,7 @@ impl Default for RenderOpts {
             backend: Backend::Cpu,
             nested_switches: true,
             draft_shadows: true,
+            sharp: false,
             proxy: effectcraft_project::render_queue::ProxyUse::CurrentSettings,
         }
     }

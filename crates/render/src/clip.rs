@@ -137,8 +137,10 @@ impl<'a> Renderer<'a> {
         if (bw as u64) * (bh as u64) < MIN_PIXELS {
             return None;
         }
-        // Static content stays whole in the cache (drawn once wherever it moves).
-        if let (Some(c), Some(key)) = (self.cache, key)
+        // Static content stays whole in the cache (drawn once wherever it moves); not above
+        // comp resolution (sharp zoom), where the whole buffer can be many times the frame.
+        if !self.sharp()
+            && let (Some(c), Some(key)) = (self.cache, key)
             && c.content_held(cache::derive(ctx.comp_id.0, layer.id.0), key, ctx.time)
         {
             return None;

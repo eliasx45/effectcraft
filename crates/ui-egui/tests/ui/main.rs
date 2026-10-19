@@ -139,6 +139,8 @@ mod ui_scrolling;
 mod ui_scrub_expression;
 #[path = "../ui_settings_info.rs"]
 mod ui_settings_info;
+#[path = "../ui_sharp_zoom.rs"]
+mod ui_sharp_zoom;
 #[path = "../ui_smart_freeze.rs"]
 mod ui_smart_freeze;
 #[path = "../ui_solo_small_tabs.rs"]
