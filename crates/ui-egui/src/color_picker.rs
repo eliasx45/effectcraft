@@ -53,16 +53,25 @@ pub fn color_popup(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f32; 3])
     let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| out = color_picker(ui, id, c, original));
     });
-    // Sampling clicks the modal backdrop, which raises the parent. Keep its picker above it.
-    ui.ctx().set_sublayer(ui.layer_id(), area.response.layer_id);
-    // Escape is the picker's: consume it, so nothing later this pass takes it too. While the
-    // eyedropper is armed, Escape cancels it and the picker stays open.
+    // Sampling clicks the modal backdrop, which raises the parent. Keep its picker above it. Only
+    // for a parent in the picker's own order (a dialog): egui moves a sublayer to just above its
+    // parent whatever its order, so a picker opened from a docked panel (the Background layer) sank
+    // under every Middle and Foreground layer, and those took the press on OK and Cancel.
+    if ui.layer_id().order == area.response.layer_id.order {
+        ui.ctx().set_sublayer(ui.layer_id(), area.response.layer_id);
+    }
+    // Escape and Enter are the picker's: consume them, so nothing later this pass takes them too.
+    // While the eyedropper is armed, Escape cancels it and the picker stays open. Enter is OK,
+    // also from the hex and number fields (they have taken the typed value by now).
     if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
         if armed {
             disarm(ui.ctx(), id);
         } else {
             out.close = Some(false);
         }
+    }
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+        out.close.get_or_insert(true);
     }
     // A press outside closes the picker, unless it is the armed eyedropper's press on the viewer.
     let on_viewer = armed && eyedropper_point(ui.ctx()).is_some();

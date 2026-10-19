@@ -979,7 +979,8 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     // (Tab only gives way to typing: a focused button or checkbox doesn't keep it from opening
     // the Mini-Flowchart.)
     let keyboard_taken = if tab_only { ctx.text_edit_focused() } else { ctx.egui_wants_keyboard_input() };
-    if keyboard_taken || crate::widgets::any_menu_open(ctx) {
+    // An open colour picker takes Enter (OK) and Escape (Cancel) itself.
+    if keyboard_taken || crate::widgets::any_menu_open(ctx) || crate::color_picker::open_recently(ctx) {
         return;
     }
     // Text editing in the viewer takes the clipboard events itself.
