@@ -102,11 +102,12 @@ impl ExprHost for Expressions {
     }
 
     fn eval_text_selector(&self, ctx: &EvalCtx, layer: &Layer, prop: &Property, index: usize, total: usize, selector: [f64; 3]) -> Result<[f64; 3], String> {
+        // The keyframed Amount, once (it was evaluated twice per unit).
+        let value = prop.value_at(layer.layer_time(ctx.time));
         let Some(e) = prop.expr.as_ref().filter(|_| prop.has_expression()) else {
-            let v = prop.value_at(layer.layer_time(ctx.time)).components();
+            let v = value.components();
             return Ok([v.first().copied().unwrap_or(100.0), v.get(1).copied().unwrap_or(100.0), v.get(2).copied().unwrap_or(100.0)]);
         };
-        let value = prop.value_at(layer.layer_time(ctx.time));
         let out = evaluate_out(self, ctx, layer, prop, &value, &e.text, [index as f64 + 1.0, total as f64], selector)?;
         let num = |o: &runtime::Out| match o {
             runtime::Out::Num(x) => Some(*x),
