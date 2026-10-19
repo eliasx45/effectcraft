@@ -394,6 +394,22 @@ fn inline_reads_match_the_evaluator_bit_for_bit() {
     }
 }
 
+#[test]
+fn reads_at_a_fixed_time_are_predicted_from_the_third_frame() {
+    let mut f = fx();
+    // A's opacity has an expression, so its reads go through the evaluator (no inline answer).
+    f.set_expr(f.a, OPA, "time * 10");
+    let text = "thisComp.layer(\"A\").transform.opacity.valueAtTime(0.25)";
+    let (_, want) = runs_of(&f, f.b, ROT, text, 0.1);
+    let _ = runs_of(&f, f.b, ROT, text, 0.2);
+    // The read at 0.25 was made at the same absolute time twice: predicted from now on.
+    for t in [0.3, 0.4, 1.7] {
+        let (n, v) = runs_of(&f, f.b, ROT, text, t);
+        assert_eq!(n, 1, "at {t}");
+        assert_eq!(v, want, "at {t}");
+    }
+}
+
 /// `eval_text_selector` for every unit of an `n`-unit text at comp time `t`: (runs, amounts).
 fn units(f: &Fx, n: usize, t: f64) -> Vec<(u64, f64)> {
     use effectcraft_render::{EvalCtx, ExprHost};
@@ -408,6 +424,24 @@ fn units(f: &Fx, n: usize, t: f64) -> Vec<(u64, f64)> {
             (script_runs() - before, v[0])
         })
         .collect()
+}
+
+#[test]
+fn every_text_unit_keeps_its_own_prediction() {
+    let mut f = fx();
+    f.set_expr(f.a, OPA, "time * 10");
+    // Each unit reads A's opacity (an expression: answered by the evaluator) at its own time.
+    // (Off the frame times below: a read at the evaluation's own time is predicted another way.)
+    f.set_expr(f.b, ROT, "thisComp.layer(\"A\").transform.opacity.valueAtTime(textIndex / 10 + 0.01)");
+    let want: Vec<f64> = units(&f, 5, 0.5).into_iter().map(|(_, v)| v).collect();
+    let _ = units(&f, 5, 0.6);
+    // Units used to share one log (each predicted the unit before's time); now from the third
+    // frame every unit's own fixed-time read is answered up front.
+    for t in [0.7, 0.8] {
+        let got = units(&f, 5, t);
+        assert!(got.iter().all(|(n, _)| *n == 1), "at {t}: {got:?}");
+        assert_eq!(got.iter().map(|(_, v)| *v).collect::<Vec<_>>(), want, "at {t}");
+    }
 }
 
 #[test]

@@ -193,7 +193,7 @@ fn evaluate_out(
     frame.owner = Some(owner);
     FRAMES.with(|f| f.borrow_mut().push(frame));
     let _guard = FrameGuard;
-    let key = prefetch::Key::new(text, comp, layer.id.0, prop.uid);
+    let key = prefetch::Key::new(text, comp, layer.id.0, prop.uid, text_sel);
     let now = secs(ctx.time.seconds());
     // The same inputs evaluated before (by another layer reading this property, or another
     // frame): when everything that run read answers the same now, so does the result.
