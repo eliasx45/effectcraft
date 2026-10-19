@@ -747,7 +747,27 @@ pub fn to_value(out: &Out, current: &Value) -> Result<Value, String> {
             }
             _ => return Err("Error: expression result must be a path".into()),
         },
-        Value::Layer(_) | Value::Gradient(_) => current.clone(),
+        // A gradient (text Gradient Fill Colors, shape gradients): `[colour, colour, …]` (evenly
+        // spaced) or `[[position 0..1, colour], …]`, colours as `[r, g, b, a?]` (0..1) or
+        // "#rrggbb", e.g. `[effect("A")("Color"), effect("B")("Color")]`.
+        Value::Gradient(_) => {
+            fn json(o: &Out, depth: usize) -> serde_json::Value {
+                match o {
+                    _ if depth > 8 => serde_json::Value::Null,
+                    Out::Num(x) => serde_json::Number::from_f64(*x).map_or(serde_json::Value::Null, serde_json::Value::Number),
+                    Out::Str(s) => serde_json::Value::String(s.clone()),
+                    Out::Bool(b) => serde_json::Value::Bool(*b),
+                    Out::Arr(v) => serde_json::Value::Array(v.iter().map(|x| json(x, depth + 1)).collect()),
+                    Out::Object(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
+                    _ => serde_json::Value::Null,
+                }
+            }
+            current
+                .coerce_json(&json(out, 0))
+                .filter(|v| matches!(v, Value::Gradient(_)))
+                .ok_or_else(|| "Error: expression result must be a gradient: [colour, colour, …] or [[position, colour], …]".to_string())?
+        }
+        Value::Layer(_) => current.clone(),
     })
 }
 

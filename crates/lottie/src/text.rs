@@ -262,7 +262,11 @@ fn export_animator(ex: &mut Ex, a: &PropGroup, label: &str) -> Json {
                     let v = export_prop(ex, p, &conv_for(&p.value), &format!("{label} ▸ {}", p.name));
                     props.insert((*key).into(), v);
                 }
-                None if matches!(p.match_id.as_str(), "trackingType") => {}
+                None if matches!(p.match_id.as_str(), "trackingType" | "gradientType" | "gradientStart" | "gradientEnd") => {}
+                // Gradient Fill is an EffectCraft extension (no After Effects or Lottie equivalent).
+                None if p.match_id == "gradientFillColors" => {
+                    ex.warn(format!("{label} ▸ Gradient Fill: an EffectCraft extension with no Lottie equivalent; dropped (the characters keep their fill)"))
+                }
                 None => ex.warn(format!("{label} ▸ {}: text animator property not supported by Lottie", p.name)),
             }
         }

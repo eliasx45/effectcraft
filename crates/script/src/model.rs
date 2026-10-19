@@ -491,6 +491,9 @@ fn js_value(c: &Comp, v: &KV) -> J {
         KV::Layer(l) => json!(l.and_then(|id| c.index_of(LayerId(id))).unwrap_or(0)),
         KV::Path(p) => json!({"vertices": p.vertices, "inTangents": p.in_tangents, "outTangents": p.out_tangents, "closed": p.closed}),
         KV::Text(d) => text_json(d),
+        // `{colors: [[position, [r, g, b, a]], …], opacities: [[position, alpha], …]}` (0..1), the
+        // shape `setValue` takes back (it also takes `[colour, …]` or `[[position, colour], …]`).
+        KV::Gradient(g) => serde_json::to_value(&**g).unwrap_or(J::Null),
         v => v.to_json(),
     }
 }
@@ -766,6 +769,8 @@ fn text_animator_property(name: &str) -> Option<&'static str> {
         ("ADBE Text Character Offset", "characterOffset"),
         ("ADBE Text Character Replace", "characterValue"),
         ("ADBE Text Blur", "blur"),
+        // EffectCraft extension: After Effects has no gradient text animator.
+        ("EC Text Gradient Fill", "gradientFill"),
     ];
     if let Some((_, k)) = AE.iter().find(|(m, _)| m.eq_ignore_ascii_case(name)) {
         return Some(k);

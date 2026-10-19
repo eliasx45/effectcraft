@@ -1133,3 +1133,21 @@ before.
   held to it, and static nested comps are windowed to what shows. Without the flag (exports,
   RAM preview, every viewer frame up to 100 %, upscaled outputs) nothing changes, and the
   render options' cache keys keep their text. Feature percentages are unchanged.
+
+## Update: text Gradient Fill animator (19 October 2026)
+
+- GRADFILL, an EffectCraft extension (After Effects has no gradient text animator): Animate
+  Text ▸ Gradient Fill adds Gradient Type (Linear / Radial), Gradient Start, Gradient End and
+  Gradient Fill Colors to a text animator. The selected characters are filled with a smooth
+  gradient per pixel, blended over the fill by the selection and stacked in order with Fill
+  Color animators. Start and End are in percent of the box of the group the first selector
+  picks (Based On Words: each word; Lines: each line; Characters: each run of consecutive
+  selected characters; no selector: the whole text), 0,0 top left to 100,100 bottom right,
+  default 0,50 → 100,50; each character carries its part of the gradient when animators move,
+  rotate or scale it. Composition viewer: Gradient Start / End dots on the first group, where
+  the animation draws it (drag = one undo step, snaps to the box's edges and centre, Alt places
+  freely). Properties panel: a colour stops bar per Gradient Fill animator. Animation presets,
+  scripts (`EC Text Gradient Fill`) and expressions carry it; Lottie export drops it with a
+  note; `.aep` import never produces it. Glyphs without a selected gradient draw on the solid
+  path as before (bit-identical). Extruded (Advanced 3D) characters and text → shapes use the colour
+  at the gradient's middle.

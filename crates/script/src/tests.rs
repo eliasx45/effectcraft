@@ -1661,3 +1661,46 @@ fn layer_property_resolves_transform_and_source_text_shortcuts() {
     let (_, c) = comp_named(&s, "x");
     assert_eq!(layer(c, "s").props.prop("transform/opacity").unwrap().value, KV::Scalar(25.0));
 }
+
+/// Text Gradient Fill (EffectCraft extension, match name "EC Text Gradient Fill"): a script adds
+/// it to an animator, reads Gradient Fill Colors as `{colors: [[position, [r, g, b, a]], …],
+/// opacities: […]}` and sets stops in that shape or as `[[position, "#rrggbb"], …]`; Gradient
+/// Start / End are percent pairs; an expression can drive the stops from colour controls.
+#[test]
+fn text_gradient_fill_stops_are_scriptable() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r##"
+        var c = app.project.items.addComp("G", 640, 200, 1, 3, 30);
+        var t = c.layers.addText("TESTING THIS ANIMATION");
+        var a = t.property("ADBE Text Properties").property("ADBE Text Animators").addProperty("ADBE Text Animator");
+        var props = a.property("ADBE Text Animator Properties");
+        props.addProperty("EC Text Gradient Fill");
+        var g = props.property("Gradient Fill Colors");
+        var before = g.value;
+        g.setValue([[0, "#ffd500"], [0.5, "#ff7a00"], [1, "#e01010"]]);
+        var mid = g.value;
+        var v = g.value;
+        v.colors[0][1] = [0, 0, 1, 1];
+        g.setValue(v);
+        props.property("Gradient End").setValue([80, 50]);
+        [props.numProperties, before.colors.length, mid.colors[1][0], mid.colors[1][1][1] > 0.47 && mid.colors[1][1][1] < 0.49, g.value.colors[0][1],
+         props.property("Gradient End").value, props.property("Gradient Start").value]
+        "##,
+    );
+    assert_eq!(o.result, json!([4, 3, 0.5, true, [0, 0, 1, 1], [80, 50], [0, 50]]));
+    // Driven by an expression: two colours, evenly spaced.
+    let (_, comp) = comp_named(&s, "G");
+    let l = layer(comp, "TESTING THIS ANIMATION").clone();
+    let colors = l.props.prop("text/animators/#1/properties/gradientFillColors").unwrap().uid;
+    let o = ok(
+        &mut s,
+        r##"
+        var p = app.project.item(1).layer(1).property("ADBE Text Properties").property("ADBE Text Animators").property(1).property("ADBE Text Animator Properties").property("Gradient Fill Colors");
+        p.expression = '[[0, 1, 0, 1], "#0000ff"]';
+        [p.expressionEnabled, p.expressionError, p.value.colors.length, p.value.colors[0][1], p.value.colors[1][0]]
+        "##,
+    );
+    assert_eq!(o.result, json!([true, "", 2, [0, 1, 0, 1], 1]), "uid {colors}");
+}
