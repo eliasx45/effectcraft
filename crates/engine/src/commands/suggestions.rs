@@ -306,6 +306,30 @@ fn version(s: &mut Session, _p: &Value) -> Result<Value> {
     Ok(json!({"has": v.is_some(), "by": v.and_then(|(_, b)| b), "same": claude_version(s).is_some_and(|(p, _)| Arc::ptr_eq(&p, &s.project))}))
 }
 
+/// `why.answer` (CX6): why the user changed what an agent built. The app appends it to the
+/// learning loop's why log (its frontend half); agents call it with what the user told them.
+fn why_answer(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "why.answer";
+    let why = str_p(p, "why").map(str::trim).filter(|w| !w.is_empty());
+    let skip = b_p(p, "skip").unwrap_or(false);
+    if why.is_none() && !skip {
+        return Err(bad(cmd, "pass `why` (e.g. \"too big/small\") or `skip: true`"));
+    }
+    if why.is_some_and(|w| w.chars().count() > 500) {
+        return Err(bad(cmd, "`why`: at most 500 characters"));
+    }
+    let mut record = p.clone();
+    if let Some(o) = record.as_object_mut() {
+        o.remove("client");
+        if !o.contains_key("agent") {
+            let agent = claude_version(s).and_then(|(_, by)| by);
+            o.insert("agent".into(), json!(agent));
+        }
+    }
+    s.events.push(crate::Event::Frontend { command: cmd.into(), params: record.clone() });
+    Ok(json!({"recorded": record}))
+}
+
 const fn spec(id: &'static str, label: &'static str, params: &'static str, run: super::Run, journal: bool) -> CommandSpec {
     CommandSpec { id, label, menu: &[], shortcut: None, alt_shortcuts: &[], params, enabled: always, run, journal }
 }
@@ -333,6 +357,13 @@ pub fn specs() -> Vec<CommandSpec> {
             "Keep Claude's Version",
             "{} → {saved, by, revision}: agents call it when a build is done; the viewer shows this state while \\ is held (Claude's version vs yours). Agent steps also update it on their own.",
             snapshot,
+            false,
+        ),
+        spec(
+            "why.answer",
+            "Why? (Answer)",
+            "{why? (a reason chip: too early/late | wrong word | too big/small | not my style, or free text), skip?: bool, what? (the change), comp? {id, name}, layers? [{id, name}], agent?} → {recorded}: the app appends it to the learning loop's why log (~/.claude/speech-edit/why-log.jsonl)",
+            why_answer,
             false,
         ),
         spec("agent.version", "Claude's Version", "{} → {has, by, same}: whether there is a Claude's version to compare with", version, false),

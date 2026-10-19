@@ -83,3 +83,11 @@ fn claude_version_follows_agent_steps_and_stays_while_the_user_edits() {
     s.execute("agent.snapshot", json!({"client": "claude-test"})).unwrap();
     assert_eq!(s.execute("agent.version", json!({})).unwrap()["same"], json!(true));
 }
+
+#[test]
+fn why_answer_goes_to_the_app() {
+    let (mut s, _) = session();
+    assert!(s.execute("why.answer", json!({})).is_err());
+    s.execute("why.answer", json!({"why": "too big/small", "what": "Scale"})).unwrap();
+    assert!(s.events.iter().any(|e| matches!(e, crate::Event::Frontend { command, params } if command == "why.answer" && params["why"] == json!("too big/small"))));
+}
