@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
-use effectcraft_project::speech::{MAX_SYLLABLES, MAX_WORDS, SpeechMap, SpeechWord, Syllable};
-use effectcraft_project::{Comp, ItemId, Layer};
+use effectcraft_project::speech::{MAX_SYLLABLES, MAX_WORDS, SpeechMap, SpeechWord, Syllable, normalize};
+use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerSource};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, always, b_p, bad, comp_id, f_p, resolve_layer, str_p};
+use super::{CommandSpec, always, b_p, bad, comp_id, f_p, frontend, has_comp, layer_p, resolve_layer, str_p};
 use crate::lint;
 use crate::render_view::seconds_p;
 use crate::{EngineError, Result, Session, cmd, query};
@@ -71,7 +71,7 @@ pub fn parse_map(doc: &Value, layer: Option<&Layer>, cmd: &str) -> Result<(Speec
     }
     out.sort_by_key(|w| w.start);
     let text = |k: &str| str_p(doc, k).unwrap_or("").chars().take(2000).collect::<String>();
-    Ok((SpeechMap { engine: text("engine"), media: text("media"), layer: layer.map(|l| l.id), words: out }, dropped))
+    Ok((SpeechMap { engine: text("engine"), media: text("media"), layer: layer.map(|l| l.id), words: out, script: None }, dropped))
 }
 
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
@@ -103,7 +103,9 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
         }
         _ => return Err(bad(C, "give `path` (a speech-map JSON file) or `map` (its contents), not both")),
     };
-    let (map, dropped) = parse_map(doc, layer, C)?;
+    let (mut map, dropped) = parse_map(doc, layer, C)?;
+    // The comp's script stays (SX5).
+    map.script = comp.speech.as_ref().and_then(|m| m.script.clone());
     if map.words.is_empty() {
         return Err(bad(
             C,
@@ -282,14 +284,180 @@ fn accents(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn clear(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
-    let had = s.project.comp(cid).ok_or(EngineError::NoComp)?.speech.is_some();
+    let old = s.project.comp(cid).ok_or(EngineError::NoComp)?.speech.clone();
+    let had = old.as_ref().is_some_and(|m| !m.words.is_empty());
     if had {
+        // The script stays (SX5): only the words go.
+        let keep = old.and_then(|m| m.script.clone()).map(|script| Arc::new(SpeechMap { script: Some(script), ..SpeechMap::default() }));
         s.edit("Remove Speech Map", None, |proj, _| {
-            proj.comp_mut(cid).ok_or(EngineError::NoComp)?.speech = None;
+            proj.comp_mut(cid).ok_or(EngineError::NoComp)?.speech = keep;
             Ok(())
         })?;
     }
     Ok(json!({"comp": cid.0, "removed": had}))
+}
+
+/// One word as `layer.words` and `speech.find` list it: comp seconds and frames, and where a
+/// speed-graph peak should land on it (`stress`: its first primary-stressed syllable's accent).
+fn word_json(i: usize, w: &SpeechWord, fps: f64, lead: f64) -> Value {
+    let frame = |t: Tick| (t.seconds() * fps).round() as i64;
+    let mut o = json!({
+        "index": i,
+        "word": w.word,
+        "start": r3(w.start.seconds()),
+        "end": r3(w.end.seconds()),
+        "frames": [frame(w.start), frame(w.end)],
+    });
+    if let Some((k, syl)) = w.stressed() {
+        let accent = lint::accent_time(syl, fps, lead);
+        o["stress"] = json!((accent * fps).round() as i64);
+        o["stressTime"] = json!(r3(accent));
+        o["syllable"] = json!(k);
+        o["onsetFrame"] = json!(frame(syl.t));
+    }
+    o
+}
+
+/// `layer.words {layer}` (SX1): the words said inside a layer's in/out (the voice layer's own, or
+/// any layer's: the words a caption or card covers), with frames and stress.
+fn layer_words(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "layer.words";
+    let (cid, lid) = layer_p(s, p, C)?;
+    let map = the_map(s, cid, C)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let layer = comp.layer(lid).ok_or_else(|| bad(C, format!("no layer {}", lid.0)))?;
+    let fps = comp.frame_rate.as_f64();
+    let lead = lead_p(p, C)?;
+    let frame = |t: Tick| (t.seconds() * fps).round() as i64;
+    let (a, b) = (layer.in_point, layer.out_point);
+    let list: Vec<Value> = map.audible(comp).filter(|(_, w)| w.end > a && w.start < b).take(MAX_LIST).map(|(i, w)| word_json(i, w, fps, lead)).collect();
+    Ok(json!({
+        "comp": cid.0,
+        "layer": lid.0,
+        "name": layer.name,
+        "voiceLayer": map.layer.map(|l| l.0),
+        "span": {"in": r3(a.seconds()), "out": r3(b.seconds()), "inFrame": frame(a), "outFrame": frame(b)},
+        "fps": fps,
+        "count": list.len(),
+        "truncated": list.len() >= MAX_LIST,
+        "words": list,
+    }))
+}
+
+/// `speech.find {word, occurrence?}` (SX4): where a word (or a few words in a row) is said; the
+/// playhead goes there (its stressed syllable, else its start) unless `go: false`.
+fn find(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "speech.find";
+    let cid = comp_id(s, p)?;
+    let map = the_map(s, cid, C)?;
+    let text = str_p(p, "word").ok_or_else(|| bad(C, "missing `word` (a word, or a few said in a row)"))?;
+    let q: Vec<String> = text.split_whitespace().map(normalize).filter(|w| !w.is_empty()).take(32).collect();
+    if q.is_empty() {
+        return Err(bad(C, format!("{text:?} has no letters or digits to look for")));
+    }
+    let occurrence = match p.get("occurrence").filter(|v| !v.is_null()) {
+        None => 1,
+        Some(v) => v.as_u64().filter(|n| *n >= 1).ok_or_else(|| bad(C, format!("`occurrence` is 1 or more, not {v}")))? as usize,
+    };
+    let lead = lead_p(p, C)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let fr = comp.frame_rate;
+    let fps = fr.as_f64();
+    let audible: Vec<(usize, &SpeechWord)> = map.audible(comp).collect();
+    let norm: Vec<String> = audible.iter().map(|(_, w)| normalize(&w.word)).collect();
+    let hits: Vec<usize> = (0..norm.len()).filter(|&k| q.iter().enumerate().all(|(d, x)| norm.get(k + d) == Some(x))).collect();
+    let Some(&pos) = hits.get(occurrence - 1) else {
+        return Err(if hits.is_empty() {
+            bad(C, format!("{text:?} isn't said in this comp"))
+        } else {
+            bad(C, format!("{text:?} is said {} time(s); there is no occurrence {occurrence}", hits.len()))
+        });
+    };
+    let Some(&(first, w)) = audible.get(pos) else { return Err(bad(C, "the word moved while searching")) };
+    let phrase: Vec<(usize, &SpeechWord)> = (0..q.len()).filter_map(|d| audible.get(pos + d).copied()).collect();
+    let end = phrase.last().map_or(w.end, |(_, x)| x.end);
+    // The phrase's first stressed syllable (a peak lands there), else its first word's start.
+    let accent = phrase.iter().find_map(|(_, x)| x.stressed().map(|(_, syl)| lint::accent_time(syl, fps, lead)));
+    let at = accent.unwrap_or(w.start.seconds());
+    let frame = (at * fps).round() as i64;
+    let all: Vec<i64> = hits.iter().take(200).filter_map(|k| audible.get(*k)).map(|(_, x)| (x.start.seconds() * fps).round() as i64).collect();
+    let out = json!({
+        "comp": cid.0,
+        "word": text,
+        "index": first,
+        "occurrence": occurrence,
+        "of": hits.len(),
+        "time": r3(at),
+        "frame": frame,
+        "stressed": accent.is_some(),
+        "start": r3(w.start.seconds()),
+        "end": r3(end.seconds()),
+        "words": phrase.iter().map(|(i, x)| word_json(*i, x, fps, lead)).collect::<Vec<_>>(),
+        "occurrences": all,
+    });
+    // TODO(batch1-verify): the playhead moves only when the comp searched is the open one.
+    if b_p(p, "go").unwrap_or(true) && s.active_comp_id() == Some(cid) {
+        s.set_time(fr.tick_of(frame));
+    }
+    Ok(out)
+}
+
+/// `speech.transcribe {layer}` (SX2): the voice layer's words. With `path` / `words` (the JSON
+/// `scribe-words` or `scripts/fork/speech-map` wrote, media seconds) it imports them through the
+/// layer, as `speech.import {layer}`. Without, the desktop app runs the transcriber in the
+/// background (`speech-map`: Scribe text, forced alignment and onset snap, so stressed
+/// syllables are known; else `scribe-words`: words only) on the layer's part of its media, and
+/// imports the result with this command when it is done. The engine itself runs nothing.
+fn transcribe(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "speech.transcribe";
+    let (cid, lid) = layer_p(s, p, C)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let fps = comp.frame_rate.as_f64();
+    let layer = comp.layer(lid).ok_or_else(|| bad(C, format!("no layer {}", lid.0)))?;
+    let LayerSource::Footage { item } = layer.source else {
+        return Err(bad(C, format!("{} is not a footage layer: transcribe the layer with the voice-over", layer.name)));
+    };
+    let footage = match s.project.item(item).map(|i| &i.kind) {
+        Some(ItemKind::Footage(f)) if f.has_audio => f,
+        _ => return Err(bad(C, format!("{} has no sound to transcribe", layer.name))),
+    };
+    let given = match (p.get("words").filter(|v| !v.is_null()), str_p(p, "path")) {
+        (Some(w), None) => Some(json!({"comp": cid.0, "layer": lid.0, "map": w})),
+        (None, Some(path)) => Some(json!({"comp": cid.0, "layer": lid.0, "path": path})),
+        (None, None) => None,
+        _ => return Err(bad(C, "give `path` or `words`, not both")),
+    };
+    if let Some(q) = given {
+        let mut out = import(s, &q)?;
+        out["transcribed"] = json!(true);
+        return Ok(out);
+    }
+    if layer.props.get("timeRemap").is_some_and(|t| !t.keys.is_empty() || t.has_expression()) {
+        return Err(bad(C, format!("{} is time-remapped: transcribe its media and import with speech.import (times in comp seconds)", layer.name)));
+    }
+    // The part of the media the layer plays (media seconds).
+    let (x, y) = (layer.layer_time(layer.in_point).seconds(), layer.layer_time(layer.out_point).seconds());
+    let start = x.min(y).max(0.0);
+    let dur = (x.max(y) - start).max(0.0);
+    if dur <= 0.0 {
+        return Err(bad(C, format!("{} plays no time of its media", layer.name)));
+    }
+    let job = json!({
+        "comp": cid.0,
+        "layer": lid.0,
+        "name": layer.name,
+        "media": footage.path,
+        "start": r3(start),
+        "dur": r3(dur),
+        "fps": fps,
+        "local": b_p(p, "local").unwrap_or(false),
+        "aligned": b_p(p, "aligned").unwrap_or(true),
+    });
+    frontend(s, C, &job)?;
+    let mut out = job;
+    out["started"] = json!(true);
+    out["hint"] = json!("the desktop app transcribes in the background, then imports the words (one undo step); poll speech.get or layer.words");
+    Ok(out)
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -315,6 +483,30 @@ pub fn specs() -> Vec<CommandSpec> {
             "{comp?, layer?, start? (s), end? (s), accentLead? (frames, default 1)} → {peaks, hits, list: [{comp (the layer's comp: a precomp for nested moves), compName, via (precomp layer ids from this comp down, outermost first), layer, layerName, property, path, time, frame (this comp's), speed, word, onset, vowel, accent, accentFrame, offsetFrames (peak − accent; negative = early), hit (within 1 frame), alignPeak (keys.alignPeak params that land it on the accent)}], skipped (precomps not searched: time-remapped)}: every keyframed property's speed-graph peak, also inside precomps (mapped through each precomp layer's start and stretch; kept only where every precomp layer shows it), with its nearest stressed syllable; `layer` may be a precomp layer (everything in it)",
             accents
         ),
-        cmd!("speech.clear", "Remove Speech Map", [], None, "{comp?}", always, clear),
+        cmd!("speech.clear", "Remove Speech Map", [], None, "{comp?} (the comp's script stays)", always, clear),
+        query!(
+            "layer.words",
+            "Layer Words",
+            "{comp?, layer? (default: the selected layer; the voice layer or any layer: the words said inside its in/out), accentLead? (frames, default 1)} → {comp, layer, name, voiceLayer, span: {in, out, inFrame, outFrame}, fps, count, truncated, words: [{index (in the speech map), word, start, end (comp s), frames: [start, end], stress? (comp frame where a peak should land: the stressed syllable's vowel − accentLead), stressTime?, syllable?, onsetFrame?}]}. The words belong to the voice layer: moving, trimming, duplicating or precomposing it carries them",
+            layer_words
+        ),
+        cmd!(
+            "speech.find",
+            "Find Word",
+            [],
+            None,
+            "{comp?, word (a word or a few said in a row; case and punctuation ignored), occurrence? (1-based, default 1), go? (default true: the playhead goes there), accentLead? (frames, default 1)} → {comp, word, index, occurrence, of (how many times it is said), time, frame (its stressed syllable's accent, else its start), stressed, start, end, words: [...as layer.words], occurrences: [start frames]}",
+            has_comp,
+            find
+        ),
+        cmd!(
+            "speech.transcribe",
+            "Transcribe Voice Layer",
+            [],
+            None,
+            "{comp?, layer? (default: the selected layer; footage with sound), path? | words? (a scribe-words / speech-map JSON, media seconds: imported through the layer, undoable), local? (faster-whisper instead of ElevenLabs Scribe), aligned? (default true: speech-map with forced alignment, so stressed syllables are known; false: scribe-words, words only)} → without path/words the desktop app transcribes the layer's part of its media in the background and imports it: {started, comp, layer, media, start, dur, hint}; with them as speech.import {…, transcribed}",
+            has_comp,
+            transcribe
+        ),
     ]
 }

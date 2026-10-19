@@ -833,6 +833,8 @@ impl Session {
         effectcraft_project::styles::sync_global_light(&before, &mut p);
         // Essential Properties of precomp layers follow their comps' Essential Graphics.
         effectcraft_project::essential::sync_project(&before, &mut p);
+        // Speech maps follow their voice layers (moved, precomposed, copied: SX1).
+        effectcraft_project::speech::sync_project(&before, &mut p);
         // Another client's claimed composition stays as it is (checked before analyses are queued again).
         if let Some(e) = self.claim_conflict(&before, &p) {
             return Err(e);
