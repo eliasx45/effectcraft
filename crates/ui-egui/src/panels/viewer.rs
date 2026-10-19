@@ -439,6 +439,8 @@ impl BoundsScope {
     /// `revision` is the session's document revision.
     pub(crate) fn open(project: &effectcraft_engine::project::Project, revision: u64) -> BoundsScope {
         let addr = project as *const effectcraft_engine::project::Project as usize;
+        // TODO(batch1-verify): an edit that changes the project in place without bumping the
+        // session revision would leave boxes stale until the time or revision changes.
         let stamp = (addr, revision, effectcraft_engine::text::fonts::revision());
         BOUNDS.with(|b| {
             let mut b = b.borrow_mut();

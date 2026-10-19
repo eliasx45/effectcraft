@@ -25,6 +25,8 @@ use crate::host::{Req, Secs};
 
 /// Expressions remembered per thread (the map is cleared when full). Text Expression Selectors
 /// keep one log per unit, so this allows for many units.
+// TODO(batch1-verify): per-unit logs on a comp with hundreds of per-character text layers can
+// approach this bound (a full map is cleared, which costs a cold frame); check peak memory.
 const MAX_LOGS: usize = 16384;
 /// Longest request list worth remembering.
 const MAX_LOG_LEN: usize = 4096;
