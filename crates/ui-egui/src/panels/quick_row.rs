@@ -260,14 +260,13 @@ pub fn word_at_playhead(app: &EffectcraftApp) -> Option<String> {
 
 /// The text preset cards (name, label with their controls), read again when the project changes
 /// and every 10 s (a card saved in the Motion Library shows up).
-fn text_presets(app: &mut EffectcraftApp, ctx: &egui::Context) -> Vec<(String, String)> {
+pub(crate) fn text_presets(app: &mut EffectcraftApp, ctx: &egui::Context) -> Vec<(String, String)> {
     type Cached = (u64, f64, Vec<(String, String)>);
     let id = egui::Id::new("tl-quick-text-presets");
     let rev = app.session.revision;
     let now = ctx.input(|i| i.time);
     if let Some((r, t, list)) = ctx.data(|d| d.get_temp::<Cached>(id))
-        && r == rev
-        && now - t < 10.0
+        && !presets_stale(r, t, rev, now)
     {
         return list;
     }
@@ -319,6 +318,11 @@ fn button(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, text: &str, aut
 }
 
 const PIN_LABEL: &str = "+ pin";
+
+/// Whether the text preset cards read at revision `read_rev`, time `read_at` must be read again.
+pub(crate) fn presets_stale(read_rev: u64, read_at: f64, rev: u64, now: f64) -> bool {
+    read_rev != rev || !(now - read_at < 10.0)
+}
 
 /// A quick-row button's width for `text` (as `button` draws it).
 fn button_w(ui: &egui::Ui, text: &str) -> f32 {
@@ -619,5 +623,15 @@ mod tests {
         assert!(pin_end < find_left - 8.0 - note_w, "{pin_end}");
         // Without a note the pins get that room back.
         assert!(pins_limit(find_left, 0.0, pin_w) > limit);
+    }
+
+    // SX6: the Script popover read the text preset cards once, so a list read before the Motion
+    // Library loaded stayed empty; it now shares this cache, read again on an edit or after 10 s.
+    #[test]
+    fn text_preset_cards_are_read_again_after_an_edit_or_ten_seconds() {
+        assert!(!presets_stale(5, 100.0, 5, 105.0));
+        assert!(presets_stale(5, 100.0, 6, 101.0), "an edit");
+        assert!(presets_stale(5, 100.0, 5, 110.5), "10 s later");
+        assert!(presets_stale(5, 100.0, 5, f64::NAN));
     }
 }

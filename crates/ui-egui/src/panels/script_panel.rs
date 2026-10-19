@@ -58,7 +58,8 @@ struct PanelState {
     /// `script.get` cache: (comp, revision, result).
     #[serde(skip)]
     cache: Option<(u64, u64, Value)>,
-    /// `text.presetFamilies` (card name, label) and Motion Library presets (id, name), read once.
+    /// `text.presetFamilies` (card name, label; refreshed like the quick row's) and Motion Library
+    /// presets (id, name), read once.
     #[serde(skip)]
     text_presets: Option<Vec<(String, String)>>,
     #[serde(skip)]
@@ -420,10 +421,10 @@ fn phrase_popover(app: &mut EffectcraftApp, ctx: &egui::Context, st: &mut PanelS
     let text: String = words.iter().map(|w| w.word.as_str()).collect::<Vec<_>>().join(" ");
     let stressed = words.iter().find(|w| w.stressed().is_some()).map(|w| w.word.clone());
     let has_number = text.chars().any(|c| c.is_ascii_digit());
-    if st.text_presets.is_none() {
-        // Lane D's listing (`text.presets` is text_anim's built-in animator presets).
-        st.text_presets = Some(super::text_apply::preset_list(app));
-    }
+    // The quick row's listing (`text.presetFamilies`), read again on a new revision and every 10 s:
+    // read once, the list stayed empty when the popover first opened before the Motion Library
+    // had loaded, and a card saved later never showed.
+    st.text_presets = Some(super::quick_row::text_presets(app, ctx));
     if st.preset_list && st.library.is_none() {
         // library.search → {total, entries: [{id, name, …}]} (checked in commands/library.rs).
         let r = app.session.execute("library.search", json!({"query": "text", "limit": 24})).unwrap_or(Value::Null);
