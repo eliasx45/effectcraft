@@ -44,3 +44,17 @@ fn changing_the_family_size_scales_every_linked_layer_once() {
     assert_eq!(s.active_comp().unwrap().layer(LayerId(a)).unwrap().comment, "hand-made");
     assert!(s.execute("style.family.set", json!({"family": "Nope", "size": 120})).is_err());
 }
+
+#[test]
+fn save_text_preset_checks_and_selects_the_workshop_layer() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Creating Text Presets", "width": 200, "height": 100, "frameRate": 30, "duration": 2})).unwrap();
+    let t = s.execute("layer.newText", json!({"text": "TESTING"})).unwrap()["layer"].as_u64().unwrap();
+    let solid = s.execute("layer.newSolid", json!({"color": "#ffffff", "width": 40, "height": 40})).unwrap()["layer"].as_u64().unwrap();
+    assert!(s.execute("ml.saveTextPreset", json!({"layer": t, "name": "Pop"})).is_err(), "not a preset name");
+    assert!(s.execute("ml.saveTextPreset", json!({"layer": solid, "name": "T3b Pop · mid"})).is_err(), "not text");
+    let r = s.execute("ml.saveTextPreset", json!({"layer": t, "name": "T3b Pop · mid"})).unwrap();
+    assert_eq!(r["folder"], json!("Elias/Text animations"));
+    assert_eq!(s.state.selected_layers, vec![LayerId(t)]);
+    assert!(s.events.iter().any(|e| matches!(e, crate::Event::Frontend { command, .. } if command == "ml.saveTextPreset")));
+}

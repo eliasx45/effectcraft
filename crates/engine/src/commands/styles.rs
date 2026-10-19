@@ -9,6 +9,11 @@
 //! double shadow") change together: `style.family.set {family, size}` scales every linked layer
 //! of the project, in one undo step; `props` sets the same values on all of them.
 //! `style.family.link`, `style.family.unlink`, `style.family.list`.
+//!
+//! Text animation presets (batch 1b, CX8): `ml.saveTextPreset {layer, name}` saves one layer of the
+//! workshop comp "Creating Text Presets" as its own Motion Library preset (Elias ▸ Text
+//! animations, with a thumbnail); saving the same name again replaces it. The engine checks and
+//! selects the layer; the app saves it (`Event::Frontend`, the Motion Library plug).
 
 use effectcraft_project::build::Ids;
 use effectcraft_project::styles::{self as st, GROUP, STYLES};
@@ -379,8 +384,69 @@ fn family_list(s: &mut Session, _p: &Value) -> Result<Value> {
     Ok(json!({"families": list}))
 }
 
+// ── Text animation presets (CX8) ───────────────────────────────────────────────────────────
+
+/// Elias's workshop comp for text presets (lane D's `text_presets::WORKSHOP`).
+pub const TEXT_WORKSHOP: &str = "Creating Text Presets";
+/// Where saved text presets go in the Motion Library.
+pub const TEXT_PRESET_FOLDER: &str = "Elias/Text animations";
+
+/// Whether `name` reads as a text preset name (`T3b Pop · mid`: T, the family number, a variant
+/// letter, a title).
+// TODO(batch1-verify): lane D's `text_presets::parse_name` is the full reader; use it once both are in.
+pub fn is_text_preset_name(name: &str) -> bool {
+    let n = name.trim();
+    let Some(rest) = n.strip_prefix('T').or_else(|| n.strip_prefix('t')) else { return false };
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    (1..=4).contains(&digits) && n.chars().count() <= 120
+}
+
+fn save_text_preset(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "ml.saveTextPreset";
+    // The workshop comp unless `comp` names another.
+    let cid = match p.get("comp") {
+        Some(v) if !v.is_null() => super::comp_id(s, p)?,
+        _ => s
+            .project
+            .items
+            .values()
+            .find(|i| i.as_comp().is_some() && i.name.trim().eq_ignore_ascii_case(TEXT_WORKSHOP))
+            .map(|i| i.id)
+            .or_else(|| s.active_comp_id())
+            .ok_or_else(|| bad(cmd, format!("no “{TEXT_WORKSHOP}” comp in the project")))?,
+    };
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let lv = p.get("layer").ok_or_else(|| bad(cmd, "missing `layer` (the workshop layer to save)"))?;
+    let lid = super::resolve_layer(comp, lv).ok_or_else(|| bad(cmd, super::no_layer(lv)))?;
+    let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+    if !matches!(layer.source, effectcraft_project::LayerSource::Text) {
+        return Err(bad(cmd, format!("“{}” is not a text layer", layer.name)));
+    }
+    let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| layer.name.clone());
+    if !is_text_preset_name(&name) {
+        return Err(bad(cmd, format!("“{name}”: a text preset is named like “T3b Pop · mid” (T, family number, a/b/c for near/mid/far, title)")));
+    }
+    // The plug saves the selected layers of the open comp: that layer, alone.
+    s.open_comp(cid);
+    s.state.selected_layers = vec![lid];
+    s.state.selected_props.clear();
+    s.state.selected_keys.clear();
+    let params = json!({"name": name, "category": TEXT_PRESET_FOLDER, "comp": cid.0, "layer": lid.0, "replace": true});
+    s.events.push(crate::Event::Frontend { command: cmd.into(), params: params.clone() });
+    Ok(json!({"saving": name, "folder": TEXT_PRESET_FOLDER, "layer": lid.0, "comp": cid.0}))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(
+            "ml.saveTextPreset",
+            "Save Text Preset",
+            [],
+            None,
+            "{layer: a layer of the \"Creating Text Presets\" comp, name? (default the layer's name; like \"T3b Pop · mid\"), comp?} → {saving, folder}: saved as its own Motion Library preset (Elias ▸ Text animations) with a thumbnail; the same name again replaces it",
+            has_comp,
+            save_text_preset
+        ),
         cmd!(
             "style.family.set",
             "Change Style Family",

@@ -1507,4 +1507,81 @@ pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: 
             Err(e) => app.ui.status = e,
         }
     }
+    text_animations(app, ui, &ctx, area, y + 40.0 * s, s);
+}
+
+/// Text animations (CX8): the Motion Library's text presets as families (`T3 Pop`) with their
+/// near / mid / far variants (`T3b Pop · mid`), from `text.presetFamilies` (lane D). A variant
+/// applies to the selected text layers (`text.apply`); "Save selected as preset" saves the
+/// selected workshop layer (`ml.saveTextPreset`, again = update).
+fn text_animations(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, top: f32, s: f32) {
+    let t = app.tokens;
+    let p = ui.painter().with_clip_rect(area);
+    let x0 = area.min.x + 12.0 * s;
+    let w = (area.width() - 24.0 * s).max(80.0);
+    let mut y = top;
+    p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, tr("Text animations · families with near / mid / far"), Tokens::semibold(12.5 * s), t.text);
+    y += 26.0 * s;
+    let cache = egui::Id::new("ml-text-families-cache");
+    let rev = app.session.revision;
+    // TODO(batch1-verify): lane D's listing is `text.presetFamilies` (the brief said `text.presets`).
+    let list: Value = match ctx.data(|d| d.get_temp::<(u64, Value)>(cache)) {
+        Some((r, v)) if r == rev => v,
+        _ => {
+            let v = app.session.execute("text.presetFamilies", json!({})).unwrap_or(Value::Null);
+            ctx.data_mut(|d| d.insert_temp(cache, (rev, v.clone())));
+            v
+        }
+    };
+    let fams = list["families"].as_array().cloned().unwrap_or_default();
+    if fams.is_empty() {
+        p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, tr("No text presets yet (layers named like “T3b Pop · mid”)."), Tokens::ui(11.0 * s), t.text_dim);
+        y += 24.0 * s;
+    }
+    let mut apply: Option<String> = None;
+    for f in &fams {
+        if y > area.max.y - 60.0 * s {
+            break;
+        }
+        let fam = f["family"].as_str().unwrap_or("T?");
+        let title = f["name"].as_str().unwrap_or("");
+        p.text(pos2(x0, y + 10.0 * s), Align2::LEFT_CENTER, format!("{fam} {title}"), Tokens::semibold(11.5 * s), t.text);
+        let mut x = x0 + 110.0 * s;
+        for v in f["variants"].as_array().cloned().unwrap_or_default() {
+            let Some(short) = v["short"].as_str() else { continue };
+            let label = match v["distance"].as_str() {
+                Some(d) => format!("{short} · {d}"),
+                None => short.to_string(),
+            };
+            let bw = (label.chars().count() as f32 * 6.6 + 16.0) * s;
+            if x + bw > x0 + w {
+                break;
+            }
+            let b = Rect::from_min_size(pos2(x, y), vec2(bw, 20.0 * s));
+            if kit::button(app, ui, b, &format!("motionLibrary.textAnimations.{short}"), &label, false) {
+                apply = Some(short.to_string());
+            }
+            ui.interact(b, egui::Id::new(("ml-text-variant-tip", short)), Sense::hover()).on_hover_text(v["name"].as_str().unwrap_or(short));
+            x += bw + 6.0 * s;
+        }
+        y += 26.0 * s;
+    }
+    if let Some(short) = apply {
+        match crate::menus::invoke(app, ctx, "text.apply", json!({"preset": short})) {
+            Ok(_) => app.toast = Some((format!("{short} applied"), ctx.input(|i| i.time))),
+            Err(e) => app.ui.status = e,
+        }
+    }
+    // Save the selected workshop layer as its preset.
+    let b = Rect::from_min_size(pos2(x0, y + 4.0 * s), vec2(190.0 * s, 22.0 * s));
+    if kit::button(app, ui, b, "motionLibrary.textAnimations.save", "Save selected as preset", false) {
+        let layer = app.session.state.selected_layers.first().map(|l| l.0);
+        match layer {
+            Some(l) => match crate::menus::invoke(app, ctx, "ml.saveTextPreset", json!({"layer": l})) {
+                Ok(r) => app.ui.status = format!("Saving “{}” to Motion Library ▸ {}", r["saving"].as_str().unwrap_or(""), r["folder"].as_str().unwrap_or("")),
+                Err(e) => app.ui.status = e,
+            },
+            None => app.ui.status = "Select the workshop layer to save (Creating Text Presets)".into(),
+        }
+    }
 }

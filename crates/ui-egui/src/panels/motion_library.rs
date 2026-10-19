@@ -5143,3 +5143,46 @@ pub(crate) fn store_display(app: &mut EffectcraftApp, ctx: &egui::Context) {
     }
     app.motion_library_saved = Some(now);
 }
+
+// ── Text animation presets (batch 1b, CX8) ────────────────────────────────────────────────────
+
+/// The frontend half of `ml.saveTextPreset`: save the selected workshop layer as its own preset
+/// (the plug's `save_layers`, with its preview as the thumbnail); cards of the same name in that
+/// folder are deleted once the new one is saved, so saving again updates the preset.
+pub fn save_text_preset(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+    let name = params.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()).ok_or("ml.saveTextPreset: no name")?.to_string();
+    let category = params.get("category").and_then(Value::as_str).unwrap_or("Elias/Text animations").trim_matches('/').to_string();
+    // The cards it replaces: the same name in the same folder.
+    let old: Vec<(String, String)> = match app.session.motion_library() {
+        Ok(client) => {
+            let local = app.session.motion_library_local();
+            let lib = local_library(ctx, &app.session.prefs.libraries);
+            library_cards(ctx, &client, &local, &lib)
+                .iter()
+                .filter(|c| c.category == category && c.name.trim().eq_ignore_ascii_case(&name))
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect()
+        }
+        Err(_) => vec![],
+    };
+    let port = control_port(app)?;
+    let args = json!({"name": name, "category": category, "description": "Text animation preset (from the Creating Text Presets comp)", "preview_mode": "selected"});
+    app.ui.status = format!("Saving text preset “{name}” to {category}…");
+    let replaced = old.len();
+    let done = if replaced > 0 { format!("Updated text preset “{name}” in {category}") } else { format!("Saved text preset “{name}” to {category}") };
+    let cat2 = category.clone();
+    let save = move || {
+        let r = ml_rpc("effectcraft_plug.py", &[], Some(port), "save_layers", args)?;
+        let new_id = r.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        wait_for_preview(&new_id);
+        // TODO(batch1-verify): delete_entry's arguments as the card menu's Delete uses them.
+        for (id, old_name) in old {
+            if id != new_id {
+                backend_rpc("delete_entry", json!({"id": id, "confirm_delete": true, "expected_name": old_name, "expected_category": cat2}))?;
+            }
+        }
+        Ok(r)
+    };
+    spawn_ml_op(ctx, save, FolderChange::Created(category.clone()), done);
+    Ok(json!({"saving": name, "category": category, "replaces": replaced}))
+}
