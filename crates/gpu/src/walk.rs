@@ -181,11 +181,13 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
         }
         return Some(());
     }
-    let prep = r.prepare_3d_run(ctx, run, canvas.size());
+    // Layers whose effects and styles run on the GPU keep their planes there.
+    let (bufs, made) = crate::plane3d::make(e, r, ctx, run);
+    let prep = if bufs.is_empty() { r.prepare_3d_run(ctx, run, canvas.size()) } else { r.prepare_3d_run_with(ctx, run, canvas.size(), &bufs) };
     let drawn = match prep {
         Some(prep) => {
             let below = canvas.float(e)?;
-            crate::classic3d::draw_run(e, &prep, &below)
+            crate::classic3d::draw_run_made(e, &prep, &below, &made)
         }
         None => None,
     };

@@ -199,7 +199,11 @@ fn mb_samples(r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> usize {
 
 /// Prepare a layer (buffer, geometry, material). `None` when it shows nothing.
 pub(crate) fn prepare<'a>(r: &Renderer, ctx: &EvalCtx<'a>, layer: &'a Layer, order: usize, out: (u32, u32), in_run: bool) -> Option<Item<'a>> {
-    let buf = r.blend_layer_buf(ctx, layer)?;
+    let made = r.plane_bufs.and_then(|m| m.get(&plane_key(layer))).cloned();
+    let buf = match made {
+        Some(b) => b,
+        None => r.blend_layer_buf(ctx, layer)?,
+    };
     prepare_with(r, ctx, layer, order, out, in_run, buf, Mat4::IDENTITY)
 }
 
@@ -736,6 +740,17 @@ fn occlusion(c: &Item, p: Vec3, l: &LightState) -> [f32; 3] {
 }
 
 // ------------------------------------------------------------------ accelerator export
+
+/// Planes an accelerator made itself, by [`plane_key`]: buffers with the plane's size, offset
+/// and scale whose pixels live on the device (`Image::data` empty). The geometry only reads
+/// their shape; the accelerator draws its own pixels for them.
+pub type PlaneBufs = std::collections::HashMap<usize, Arc<Buf>>;
+
+/// The key of a layer's plane in [`PlaneBufs`]: the layer itself (layer ids repeat across the
+/// precomps a collapsed 3D run reaches into).
+pub fn plane_key(layer: &Layer) -> usize {
+    layer as *const Layer as usize
+}
 
 /// A Classic 3D run prepared for an accelerator ([`Renderer::prepare_3d_run`]): every plane
 /// with its geometry, material and buffer, ready for the per-pixel depth sort, lighting and

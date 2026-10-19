@@ -775,10 +775,19 @@ pub(crate) fn render_in(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size:
 
 /// Gradient Overlay frame in buffer pixels: centre and half extents.
 fn gradient_frame(go: &GradOverlay, buf: &Buf, alpha: &Plane, layer_size: [f64; 2]) -> (f64, f64, f64, f64) {
+    let bounds = go.align.then(|| {
+        let img = Image { width: alpha.w as u32, height: alpha.h as u32, data: alpha.data.iter().map(|&a| [0.0, 0.0, 0.0, a]).collect() };
+        img.alpha_bounds()
+    });
+    gradient_frame_in(go, buf, bounds.flatten(), layer_size)
+}
+
+/// [`gradient_frame`] from the buffer's alpha bounds (`Image::alpha_bounds`; only read when the
+/// overlay aligns with the layer). `buf`'s pixels are not read.
+fn gradient_frame_in(go: &GradOverlay, buf: &Buf, bounds: Option<(u32, u32, u32, u32)>, layer_size: [f64; 2]) -> (f64, f64, f64, f64) {
     let s = buf.scale;
     let (x0, y0, x1, y1) = if go.align {
-        let img = Image { width: alpha.w as u32, height: alpha.h as u32, data: alpha.data.iter().map(|&a| [0.0, 0.0, 0.0, a]).collect() };
-        match img.alpha_bounds() {
+        match bounds {
             Some((a, b, c, d)) => (a as f64, b as f64, c as f64, d as f64),
             None => (0.0, 0.0, 1.0, 1.0),
         }
@@ -989,15 +998,46 @@ pub fn pack_gradient(g: &Gradient) -> Vec<f32> {
 /// field: spread or choke, Precise glows, Stroke, a Bevel and Emboss wider than
 /// [`GPU_BEVEL_REACH`]; a stencil pass mode).
 pub fn gpu_prepare(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2]) -> Option<(Buf, GpuStyles)> {
+    let dims = [content.img.width, content.img.height];
+    let prep = gpu_prepare_shape(ctx, layer, dims, content.offset, content.scale, content.img.alpha_bounds(), layer_size)?;
+    let (mut buf, _) = crop_to_content(content).unwrap_or_else(|| (content.clone(), Org::default()));
+    buf.pad(prep.pad);
+    (buf.img.width == prep.shape.img.width && buf.img.height == prep.shape.img.height).then_some((buf, prep.plan))
+}
+
+/// [`gpu_prepare`] for content an accelerator holds: planned from its size, offset, scale and
+/// alpha bounds (`Image::alpha_bounds`) alone.
+#[derive(Clone, Debug)]
+pub struct GpuStylePrep {
+    pub plan: GpuStyles,
+    /// The part of the content to keep (x0, y0, x1, y1), as [`gpu_prepare`] crops it.
+    pub region: [u32; 4],
+    /// Transparent pixels added on every side of the region.
+    pub pad: u32,
+    /// The styled buffer's size, offset and scale (no pixels).
+    pub shape: Buf,
+}
+
+/// [`GpuStylePrep`] of content `dims` at `offset` / `scale` whose alpha bounds are `bounds`.
+pub fn gpu_prepare_shape(
+    ctx: &EvalCtx,
+    layer: &Layer,
+    dims: [u32; 2],
+    offset: [f64; 2],
+    scale: f64,
+    bounds: Option<(u32, u32, u32, u32)>,
+    layer_size: [f64; 2],
+) -> Option<GpuStylePrep> {
     let g = group(layer)?;
-    if content.img.is_empty() || pass_modes(ctx, layer).iter().any(|m| m.is_stencil()) {
+    let [w, h] = dims;
+    if w == 0 || h == 0 || pass_modes(ctx, layer).iter().any(|m| m.is_stencil()) {
         return None;
     }
     let styles = evaluate(ctx, layer, g);
     if styles.stroke.is_some() {
         return None;
     }
-    let s = content.scale.max(1e-6);
+    let s = scale.max(1e-6);
     let bevel = match &styles.bevel {
         Some(bv) => {
             let (size, sigma, soften, k, light) = bevel_frame(bv, s);
@@ -1047,11 +1087,22 @@ pub fn gpu_prepare(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64
     };
     let bl = blending(ctx, layer);
     let pad = ((reach(&styles) * s).ceil() + 2.0).min(MAX_PAD) as u32;
-    let (mut buf, o) = crop_to_content(content).unwrap_or_else(|| (content.clone(), Org::default()));
-    buf.pad(pad);
+    // crop_to_content: nothing visible keeps one transparent pixel; the whole buffer stays.
+    let (x0, y0, x1, y1) = bounds.unwrap_or((0, 0, 1.min(w), 1.min(h)));
+    let whole = (x0, y0, x1, y1) == (0, 0, w, h) || x1 <= x0 || y1 <= y0;
+    let (region, o) = if whole { ([0, 0, w, h], Org::default()) } else { ([x0, y0, x1, y1], Org(x0, y0)) };
+    let shape_w = (region[2] - region[0]).checked_add(pad.checked_mul(2)?)?;
+    let shape_h = (region[3] - region[1]).checked_add(pad.checked_mul(2)?)?;
+    let shape = Buf {
+        img: Image { width: shape_w, height: shape_h, data: Vec::new() },
+        offset: [offset[0] - region[0] as f64 + pad as f64, offset[1] - region[1] as f64 + pad as f64],
+        scale,
+    };
+    // The padded buffer's alpha bounds: the content's, moved into it.
+    let padded_bounds = bounds.map(|(a, b, c, d)| (a - region[0] + pad, b - region[1] + pad, c - region[0] + pad, d - region[1] + pad));
+    let buf = &shape;
     let gradient = styles.gradient.as_ref().map(|go| {
-        let alpha = Plane::alpha(&buf.img);
-        let (cx, cy, hw, hh) = gradient_frame(go, &buf, &alpha, layer_size);
+        let (cx, cy, hw, hh) = gradient_frame_in(go, buf, padded_bounds, layer_size);
         let (ux, uy) = (go.angle.to_radians().cos(), -go.angle.to_radians().sin());
         GpuGradient {
             mode: go.mode,
@@ -1088,5 +1139,5 @@ pub fn gpu_prepare(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64
         inner_shadows,
         bevel,
     };
-    Some((buf, plan))
+    Some(GpuStylePrep { plan, region, pad, shape })
 }

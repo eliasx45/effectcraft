@@ -296,6 +296,13 @@ impl<'a> Renderer<'a> {
         three_d::compose::gpu_run(self, ctx, run, out)
     }
 
+    /// [`Self::prepare_3d_run`] with the planes of some layers already made by the accelerator
+    /// (`bufs`: their size, offset and scale; their pixels stay on the device): those layers'
+    /// buffers aren't rendered on the CPU.
+    pub fn prepare_3d_run_with(&self, ctx: &EvalCtx<'a>, run: &[&Layer], out: (u32, u32), bufs: &three_d::PlaneBufs) -> Option<three_d::Run3d> {
+        three_d::compose::gpu_run(&Renderer { plane_bufs: Some(bufs), ..*self }, ctx, run, out)
+    }
+
     /// A run of consecutive 3D layers of an Advanced 3D comp prepared for an accelerator's
     /// compositor ([`three_d::adv::Prepared`]): rendered as one scene and composited (Normal,
     /// premultiplied over) onto the canvas. `None` = not an Advanced 3D comp, or a layer needs the

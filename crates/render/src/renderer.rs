@@ -90,6 +90,8 @@ pub struct Renderer<'a> {
     pub(crate) inherited: Option<Quality>,
     /// Classic 3D depth of field is left to an accelerator ([`three_d::Plane3d::dof`]).
     pub(crate) defer_dof: bool,
+    /// Classic 3D planes an accelerator already made (see [`Renderer::prepare_3d_run_with`]).
+    pub(crate) plane_bufs: Option<&'a three_d::PlaneBufs>,
     /// This renderer draws into the top-level frame's canvas (the top comp, or a collapsed
     /// precomp drawn straight into it): the region of interest's offset applies.
     pub(crate) top: bool,
@@ -215,6 +217,7 @@ impl<'a> Renderer<'a> {
             collapse3d: None,
             inherited: None,
             defer_dof: false,
+            plane_bufs: None,
             top: true,
             through: [None; MAX_THROUGH],
             through_lost: false,
@@ -270,6 +273,7 @@ impl<'a> Renderer<'a> {
             opacity_mul: 1.0,
             collapse3d: None,
             defer_dof: false,
+            plane_bufs: None,
             top: false,
             through: [None; MAX_THROUGH],
             through_lost: false,

@@ -57,6 +57,7 @@ pub mod adapter_choice;
 mod adv3d;
 mod bokeh;
 mod classic3d;
+mod plane3d;
 mod codes;
 mod context;
 mod cull;

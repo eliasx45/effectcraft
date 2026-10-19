@@ -126,6 +126,12 @@ const LIGHT_BYTES: usize = 6 * 16;
 /// Composite a prepared Classic 3D run over `canvas`. `None` when it cannot run here (the
 /// caller draws it on the CPU).
 pub(crate) fn draw_run(e: &mut Enc, run: &Run3d, canvas: &GpuImage) -> Option<GpuImage> {
+    draw_run_made(e, run, canvas, &HashMap::new())
+}
+
+/// [`draw_run`] with planes the GPU made itself (`crate::plane3d`): their images by the
+/// address of their (pixel-less) plane buffers.
+pub(crate) fn draw_run_made(e: &mut Enc, run: &Run3d, canvas: &GpuImage, made: &HashMap<usize, GpuImage>) -> Option<GpuImage> {
     let (w, h) = (canvas.width, canvas.height);
     let boxes: Vec<[i64; 4]> = run.planes.iter().filter(|p| p.draw).map(|p| p.bbox).collect();
     if boxes.is_empty() {
@@ -140,7 +146,10 @@ pub(crate) fn draw_run(e: &mut Enc, run: &Run3d, canvas: &GpuImage) -> Option<Gp
     // here when the plane has it.
     let mut texs: Vec<(GpuImage, [f64; 2])> = Vec::with_capacity(run.planes.len());
     for p in &run.planes {
-        let up = e.upload_buf(&p.buf)?;
+        let up = match made.get(&(std::sync::Arc::as_ptr(&p.buf) as usize)) {
+            Some(img) => img.clone(),
+            None => e.upload_buf(&p.buf)?,
+        };
         match &p.dof {
             Some(d) => {
                 let pad = d.pad as f64;

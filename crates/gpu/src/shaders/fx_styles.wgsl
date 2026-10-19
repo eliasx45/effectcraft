@@ -487,3 +487,29 @@ fn sty_bevel(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     textureStore(out, p, d);
 }
+
+// Image::alpha_bounds per row: texel y of the output = (first x with alpha > 1e-6, last x + 1,
+// 0, 1), or zeros for an empty row. src = the image; dispatched over rows.
+@compute @workgroup_size(64, 1)
+fn sty_bounds(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = vec2<i32>(textureDimensions(src));
+    let y = i32(gid.x);
+    if (y >= d.y) {
+        return;
+    }
+    var first = -1;
+    var last = -1;
+    for (var x = 0; x < d.x; x++) {
+        if (textureLoad(src, vec2<i32>(x, y), 0).w > 1e-6) {
+            if (first < 0) {
+                first = x;
+            }
+            last = x;
+        }
+    }
+    if (first < 0) {
+        textureStore(out, vec2<i32>(y, 0), vec4<f32>(0.0));
+    } else {
+        textureStore(out, vec2<i32>(y, 0), vec4<f32>(f32(first), f32(last + 1), 0.0, 1.0));
+    }
+}
