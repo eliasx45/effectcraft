@@ -25,10 +25,13 @@ pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer]) -> 
     let mut bufs = PlaneBufs::new();
     let mut made = HashMap::new();
     for &l in run {
-        if let Some((shape, img)) = plane(e, r, ctx, l) {
-            let shape = Arc::new(shape);
-            made.insert(Arc::as_ptr(&shape) as usize, img);
-            bufs.insert(plane_key(l), shape);
+        match plane(e, r, ctx, l) {
+            Ok((shape, img)) => {
+                let shape = Arc::new(shape);
+                made.insert(Arc::as_ptr(&shape) as usize, img);
+                bufs.insert(plane_key(l), shape);
+            }
+            Err(why) => log::debug!("3D plane {:?} on the CPU: {why}", l.name),
         }
     }
     (bufs, made)
@@ -41,60 +44,61 @@ pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer]) -> 
 /// it doesn't hold is made here: the CPU would style it once at its full raster size, seconds
 /// for a large Bevel and Emboss),
 /// linear blending, or a step the GPU can't do.
-fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Option<(Buf, GpuImage)> {
+fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Result<(Buf, GpuImage), &'static str> {
     let styled = styles::active(ctx, layer);
     let has_fx = layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty());
-    if !matches!(layer.source, LayerSource::Shape)
-        || layer.switches.adjustment
-        || !(styled || has_fx)
-        || r.pipe().to_blend().is_some()
-        || (r.layer_is_static(ctx, layer) && r.layer_buf_in_memory(ctx, layer))
-    {
-        return None;
+    if !matches!(layer.source, LayerSource::Shape) || layer.switches.adjustment || !(styled || has_fx) {
+        return Err("not a shape with effects or styles");
     }
-    let input = r.layer_input(ctx, layer, 0)?;
+    if r.pipe().to_blend().is_some() {
+        return Err("linear blending");
+    }
+    if r.layer_is_static(ctx, layer) && r.layer_buf_in_memory(ctx, layer) {
+        return Err("held, in the layer cache");
+    }
+    let input = r.layer_input(ctx, layer, 0).ok_or("no source")?;
     if input.img.is_empty() {
-        return None;
+        return Err("empty source");
     }
-    let src = e.upload_buf(&input)?;
+    let src = e.upload_buf(&input).ok_or("source upload")?;
     let mut fx = crate::effects::GpuFx::new(e, src, input.offset, input.scale, r.pipe().levels);
     let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
-    let (img, offset, scale) = fx.finish()?;
+    let (img, offset, scale) = fx.finish().ok_or("an effect the GPU can't run")?;
     let offset = [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale];
     if img.width == 0 || img.height == 0 {
-        return None;
+        return Err("empty after effects");
     }
     if !styled {
         let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
         return finish(e, shape, img);
     }
-    let bounds = alpha_bounds(e, &img)?;
+    let bounds = alpha_bounds(e, &img).ok_or("alpha bounds")?;
     let size = effectcraft_render::source_size(r.project, layer);
     let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-    let prep = styles::gpu_prepare_shape(ctx, layer, [img.width, img.height], offset, scale, bounds, layer_size)?;
+    let prep = styles::gpu_prepare_shape(ctx, layer, [img.width, img.height], offset, scale, bounds, layer_size).ok_or("a style the GPU can't run")?;
     if !prep.plan.pass_modes().is_empty() {
-        return None;
+        return Err("styles that paint outside the layer");
     }
     let [x0, y0, x1, y1] = prep.region;
     let (pw, ph) = (prep.shape.img.width, prep.shape.img.height);
     if !e.g.fits(pw, ph) || x1 > img.width || y1 > img.height || x0 >= x1 || y0 >= y1 {
-        return None;
+        return Err("style canvas too large");
     }
     // A fresh zeroed image of its own: `Enc::zeros` is shared and must never be written.
     let padded = e.image(pw, ph);
     e.copy_region_to(&img, &padded, x0, y0, x1 - x0, y1 - y0, prep.pad, prep.pad);
     drop(img);
-    let st = crate::fx_styles::render(e, &padded, &prep.plan)?;
+    let st = crate::fx_styles::render(e, &padded, &prep.plan).ok_or("style kernels failed")?;
     finish(e, prep.shape, st.body)
 }
 
-fn finish(e: &mut Enc, shape: Buf, img: GpuImage) -> Option<(Buf, GpuImage)> {
+fn finish(e: &mut Enc, shape: Buf, img: GpuImage) -> Result<(Buf, GpuImage), &'static str> {
     if e.take_missing() || e.g.check_health().is_err() {
-        return None;
+        return Err("a kernel is missing or the device failed");
     }
     #[cfg(test)]
     MADE_ON_GPU.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Some((shape, img))
+    Ok((shape, img))
 }
 
 /// `Image::alpha_bounds` of a GPU image (pixels with alpha over 1e-6): one row each per
