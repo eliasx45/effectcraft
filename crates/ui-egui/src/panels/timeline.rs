@@ -2219,6 +2219,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         }
                     }
                     app.auto.add(&format!("timeline.layer.{}.bar", layer.id.0), bar, &layer.name);
+                    // Batch 1 (AX6): the off-beat dot at the first key (green: peak on a stressed syllable).
+                    beat::beat_dot(app, &gp, tm, cid.0, &comp, layer, bar);
                     // Batch 1 lane B (SX3): the voice layer's words on its bar.
                     super::timeline_words::paint(app, ui, &gp, bar, tm, &comp, layer);
                     // Interactions: move body, trim edges.
@@ -3143,6 +3145,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     cands.push(time.seconds());
                     target = snap_time(&cands, target, 8.0 / pps);
                 }
+                // Batch 1 (AX6): without Shift, the move's speed peak snaps onto a stressed syllable.
+                let syllable = (!shift && kd.quick.is_none()).then(|| beat::key_snap(app, &comp, kd.anchor + kd.applied as f64 * fd, target)).flatten();
+                if let Some(sn) = &syllable {
+                    target = sn.target;
+                }
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-key-syllable"), syllable.as_ref().map(|sn| sn.word.clone())));
                 let total = ((target - kd.anchor) / fd).round() as i64;
                 if total != kd.applied {
                     actions.push(match kd.quick {
@@ -3161,9 +3169,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     None => format!("{}   {:+} f", super::timecode(&app.session, &comp, at), kd.applied),
                 };
                 drag_tip(&ctx, &t, ptr, note);
+                if let Some(sn) = &syllable {
+                    beat::snap_line(&p, tm, rows_rect, sn);
+                }
                 app.ui.status = format!("Keyframe at {}", super::timecode(&app.session, &comp, at));
             }
             None => {
+                if let Some(Some(word)) = ctx.data_mut(|d| d.remove_temp::<Option<String>>(egui::Id::new("tl-key-syllable"))) {
+                    app.toast = Some((format!("Snapped: speed peak on “{word}”"), ctx.input(|i| i.time)));
+                }
                 ctx.data_mut(|d| d.remove::<KeyDrag>(key_drag_id()));
                 ui_actions.push(UiAct::EndMerge);
             }
