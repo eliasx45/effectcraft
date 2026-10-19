@@ -8,13 +8,10 @@ use serde_json::Value;
 use super::dispatch::Handler;
 use crate::EffectcraftApp;
 
-// TODO(batch1-verify): tests_dispatch.rs pins the handled ids (PINNED_FRONTEND); add the ids below there.
+// tests_dispatch.rs pins these ids (PINNED_FRONTEND).
 pub(crate) fn handlers() -> &'static [Handler] {
-    const H: &[Handler] = &[
-        Handler::frontend("link.paste", link_paste),
-        Handler::frontend("why.answer", why_answer),
-        Handler::frontend("ml.saveTextPreset", save_text_preset),
-    ];
+    const H: &[Handler] =
+        &[Handler::frontend("link.paste", link_paste), Handler::frontend("why.answer", why_answer), Handler::frontend("ml.saveTextPreset", save_text_preset)];
     H
 }
 

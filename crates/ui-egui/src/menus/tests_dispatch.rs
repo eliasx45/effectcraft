@@ -162,6 +162,14 @@ const PINNED_FRONTEND: &[&str] = &[
     "timeline.revealProps",
     "window.maximizeApp",
     "project.deleteWithoutConfirmation",
+    // Batch 1 (menus/speech.rs, lane B).
+    "speech.transcribe",
+    "script.copyRef",
+    "script.board",
+    // Batch 1 (menus/agent_native.rs, lane C).
+    "link.paste",
+    "why.answer",
+    "ml.saveTextPreset",
 ];
 
 fn pinned(stage: Stage) -> &'static [&'static str] {
@@ -192,7 +200,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 151);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 157);
 }
 
 #[test]

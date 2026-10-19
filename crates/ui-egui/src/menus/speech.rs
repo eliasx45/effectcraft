@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::dispatch::Handler;
 use crate::EffectcraftApp;
 
-// TODO(batch1-verify): tests_dispatch.rs pins the handled ids; add these three there.
+// tests_dispatch.rs pins these ids (PINNED_FRONTEND).
 pub(crate) fn handlers() -> &'static [Handler] {
     const H: &[Handler] =
         &[Handler::frontend("speech.transcribe", transcribe), Handler::frontend("script.copyRef", copy_ref), Handler::frontend("script.board", board)];
