@@ -374,6 +374,8 @@ impl<'a> Renderer<'a> {
     /// Top-level frames go to the GPU when [`Self::active_accel`] is set and handles them.
     pub fn comp_frame(&self, comp_id: ItemId, t: Tick) -> Image {
         let _frame = self.begin_frame(comp_id);
+        // Text laid out once per layer and time in this frame (see `text::GeomScope`).
+        let _text = crate::text::GeomScope::open(self.project);
         // Classic 3D runs composite on the GPU too (M12.7), so Auto sends 3D comps there as well;
         // Auto renders each comp on whichever compositor measured faster ([`AutoPick`]).
         if self.depth == 0
@@ -472,6 +474,7 @@ impl<'a> Renderer<'a> {
     /// [`Self::comp_frame`] on the CPU compositor only.
     pub fn comp_frame_cpu(&self, comp_id: ItemId, t: Tick) -> Image {
         let _frame = self.begin_frame(comp_id);
+        let _text = crate::text::GeomScope::open(self.project);
         let Some(comp) = self.project.comp(comp_id) else { return Image::new(1, 1) };
         let s = self.opts.scale;
         let w = ((comp.width as f64 * s).round() as u32).max(1);

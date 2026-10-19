@@ -651,3 +651,55 @@ fn text_buffer_keeps_the_global_pixel_grid_at_integer_placement() {
         assert!(max_error <= 1.0 / 255.0 + 1e-6, "scale {scale}: {max_error}");
     }
 }
+
+/// Counts expression evaluations (and leaves every value as it is).
+struct CountingExpr(std::sync::atomic::AtomicUsize);
+
+impl crate::ExprHost for CountingExpr {
+    fn eval(&self, _: &EvalCtx, _: &Layer, _: &effectcraft_project::Property, value: &Value) -> Result<Value, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(value.clone())
+    }
+}
+
+/// EXPR-PERF6: inside a frame's scope a text layer with expressions is laid out (and its
+/// expressions run) once per time; stand-in copies, other times and calls outside a scope lay it
+/// out again, and the remembered geometry is the computed one.
+#[test]
+fn text_with_expressions_is_laid_out_once_per_frame_scope() {
+    let (mut p, cid, comp) = setup(200, 100);
+    let mut l = text_layer(&mut p, &comp, TextDoc { text: "Hi".into(), size: 40.0, ..Default::default() });
+    l.props.prop_mut("text/sourceText").unwrap().expr = Some(effectcraft_project::Expression { text: "value".into(), enabled: true });
+    let lid = l.id;
+    p.comp_mut(cid).unwrap().layers = vec![l].into();
+    let host = CountingExpr(std::sync::atomic::AtomicUsize::new(0));
+    let c = p.comp(cid).unwrap();
+    let layer = c.layer(lid).unwrap();
+    let ctx = EvalCtx { expr: Some(&host as &dyn crate::ExprHost), ..EvalCtx::new(&p, cid, c, Tick::from_seconds_f64(0.5)) };
+    let count = || host.0.load(std::sync::atomic::Ordering::Relaxed);
+    let outline = |g: Option<TextGeom>| g.map(|g| g.glyphs.iter().map(|x| format!("{:?} {:?}", x.path(), x.xf)).collect::<Vec<_>>());
+    let want = outline(text_geom(&ctx, layer));
+    let once = count();
+    assert!(once > 0 && want.as_ref().is_some_and(|w| !w.is_empty()));
+    let _ = text_geom(&ctx, layer);
+    assert_eq!(count(), 2 * once, "no scope: laid out again");
+    {
+        let _scope = GeomScope::open(&p);
+        assert_eq!(outline(text_geom(&ctx, layer)), want);
+        assert_eq!(count(), 3 * once);
+        assert_eq!(outline(text_geom(&ctx, layer)), want);
+        assert_eq!(count(), 3 * once, "the second layout is remembered");
+        // A nested open for the same project (a precomp's renderer) keeps the entries.
+        drop(GeomScope::open(&p));
+        let _ = text_geom(&ctx, layer);
+        assert_eq!(count(), 3 * once);
+        // A stand-in copy of the layer is laid out, not remembered.
+        let copy = layer.clone();
+        let _ = text_geom(&ctx, &copy);
+        assert_eq!(count(), 4 * once);
+        let _ = text_geom(&ctx.at(Tick::from_seconds_f64(0.6)), layer);
+        assert_eq!(count(), 5 * once, "another time");
+    }
+    let _ = text_geom(&ctx, layer);
+    assert_eq!(count(), 6 * once, "entries go with the scope");
+}

@@ -493,6 +493,7 @@ impl PlacedGlyph {
 }
 
 /// Laid-out, animated text of a layer at the context time.
+#[derive(Clone)]
 pub struct TextGeom {
     pub doc: TextDoc,
     pub glyphs: Vec<PlacedGlyph>,
@@ -570,8 +571,105 @@ fn align_index(j: Justify) -> u8 {
     }
 }
 
+/// Text geometry remembered while one frame renders (EXPR-PERF6). A text layer is laid out and
+/// animated by `text::render`, and again by `raster_scale` (measuring, several calls per layer
+/// and frame when the layer is scaled up or the viewer zoomed in) and by culling; each time ran
+/// every animator selector's expressions per unit. Entries are pure functions of the frame's
+/// project (immutably borrowed by the renderer for the whole scope, so its address names its
+/// contents), the comp time, the expression host and footage, and the font set; a scope's
+/// entries are dropped when it closes. Only layers whose text has expressions are remembered
+/// (for the others a copy would cost about as much as laying them out again).
+#[derive(Default)]
+struct GeomMemo {
+    /// The project the innermost open scope renders (address).
+    active: Option<usize>,
+    maps: std::collections::HashMap<usize, std::collections::HashMap<GeomKey, Option<TextGeom>>>,
+}
+
+/// (comp id, layer id, comp time, expression host address, footage address, font revision).
+type GeomKey = (u64, u64, i64, usize, usize, u64);
+
+/// Text layers remembered per scope at most.
+const MAX_GEOMS: usize = 256;
+
+thread_local! {
+    static GEOMS: std::cell::RefCell<GeomMemo> = std::cell::RefCell::new(GeomMemo::default());
+}
+
+/// While alive, [`text_geom`] remembers geometry for the project it was opened with, on this
+/// thread (see [`GeomMemo`]). Opened by the renderer around a frame; nested opens for the same
+/// project do nothing.
+pub(crate) struct GeomScope {
+    /// What was active before (restored on close) and whether this scope opened `addr`.
+    prev: Option<usize>,
+    addr: usize,
+    owns: bool,
+}
+
+impl GeomScope {
+    pub(crate) fn open(project: &effectcraft_project::Project) -> GeomScope {
+        let addr = std::ptr::from_ref(project) as usize;
+        GEOMS.with(|g| {
+            let mut g = g.borrow_mut();
+            let prev = g.active;
+            let owns = prev != Some(addr);
+            if owns {
+                g.maps.remove(&addr);
+                g.active = Some(addr);
+            }
+            GeomScope { prev, addr, owns }
+        })
+    }
+}
+
+impl Drop for GeomScope {
+    fn drop(&mut self) {
+        if self.owns {
+            GEOMS.with(|g| {
+                let mut g = g.borrow_mut();
+                g.maps.remove(&self.addr);
+                g.active = self.prev;
+            });
+        }
+    }
+}
+
+/// Whether any property under `g` has an expression.
+fn any_expression(g: &PropGroup) -> bool {
+    g.children.iter().any(|c| match c {
+        effectcraft_project::Node::Prop(p) => p.has_expression(),
+        effectcraft_project::Node::Group(sub) => any_expression(sub),
+    })
+}
+
 /// Lay out and animate a text layer.
 pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
+    let addr = std::ptr::from_ref(ctx.project) as usize;
+    let own = ctx.project.comp(ctx.comp_id).is_some_and(|c| std::ptr::eq(c, ctx.comp)) && ctx.comp.layer(layer.id).is_some_and(|l| std::ptr::eq(l, layer));
+    let usable = own && GEOMS.with(|g| g.borrow().active == Some(addr)) && layer.props.sub("text").is_some_and(any_expression);
+    if !usable {
+        return text_geom_uncached(ctx, layer);
+    }
+    let expr = ctx.expr.map_or(0, |e| std::ptr::from_ref(e).cast::<()>() as usize);
+    let footage = ctx.footage.map_or(0, |f| std::ptr::from_ref(f).cast::<()>() as usize);
+    let key: GeomKey = (ctx.comp_id.0, layer.id.0, ctx.time.0, expr, footage, effectcraft_text::fonts::revision());
+    if let Some(hit) = GEOMS.with(|g| g.borrow().maps.get(&addr).and_then(|m| m.get(&key)).cloned()) {
+        return hit;
+    }
+    // Computed outside the borrow: expressions may lay out other text layers (sourceRectAtTime).
+    let geom = text_geom_uncached(ctx, layer);
+    GEOMS.with(|g| {
+        let mut g = g.borrow_mut();
+        let m = g.maps.entry(addr).or_default();
+        if m.len() >= MAX_GEOMS {
+            m.clear();
+        }
+        m.insert(key, geom.clone());
+    });
+    geom
+}
+
+fn text_geom_uncached(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
     let doc = source_text(ctx, layer)?;
     let text = layer.props.sub("text")?;
     let lay = layout_doc(&doc);
