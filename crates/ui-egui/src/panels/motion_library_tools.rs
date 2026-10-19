@@ -53,6 +53,9 @@ const ANCHORS: [(&str, &str); 9] = [
 ];
 const SPLIT_MODES: [(&str, &str); 4] = [("words", "Words"), ("characters", "Characters / clusters"), ("lines", "Lines"), ("custom", "Isolate word or phrase")];
 const PROPERTIES: [(&str, &str); 4] = [("position", "Position"), ("scale", "Scale"), ("rotation", "Rotation"), ("opacity", "Opacity")];
+/// Bounce targets: the dropdown's properties, or `selected` (the properties with selected keys).
+const TARGETS: [(&str, &str); 5] =
+    [("selected", "Selected keys"), ("position", "Position"), ("scale", "Scale"), ("rotation", "Rotation"), ("opacity", "Opacity")];
 const MOTIONS: [(&str, &str); 2] = [("overshoot", "Overshoot / elastic"), ("bounce", "Bounce back")];
 const STYLES: [(&str, &str); 3] = [("ramp", "Ramp gradient"), ("four", "4-colour gradient"), ("sweep", "Light sweep")];
 const DEFAULT_COLORS: [&str; 4] = ["#1c8cff", "#8b5cf6", "#ff9640", "#22d3ee"];
@@ -311,8 +314,26 @@ fn arg_choice(p: &Value, key: &str, default: &str, options: &[(&str, &str)]) -> 
     Ok(s)
 }
 
+/// The names of the properties with selected keyframes in the active comp, in selection order.
+/// Bounce springs these rather than the Property dropdown, as After Effects tools act on the
+/// selected keys.
+fn keyed_props(s: &effectcraft_engine::Session) -> Vec<String> {
+    let Some(c) = s.active_comp() else { return vec![] };
+    let mut names: Vec<String> = vec![];
+    for k in &s.state.selected_keys {
+        if let Some(pr) = c.layer(k.layer).and_then(|l| l.props.find(k.prop))
+            && !names.contains(&pr.name)
+        {
+            names.push(pr.name.clone());
+        }
+    }
+    names
+}
+
 /// The tool `tool` with the arguments in `p`; missing arguments take the panel's current values.
-fn build(tool: &str, p: &Value, set: &ToolSettings) -> Result<Built, String> {
+/// `keyed` names the properties with selected keyframes ([`keyed_props`]): when there are any,
+/// Bounce without a `property` springs those keys instead of the dropdown's property.
+fn build(tool: &str, p: &Value, set: &ToolSettings, keyed: &[String]) -> Result<Built, String> {
     let native = |cmd: &'static str, args: Value, label: &str| Built { plan: Plan::Native { cmd, args }, section: WORKFLOW, label: label.to_string() };
     let plug = |op: &'static str, args: Value, section: usize, label: &str| Built { plan: Plan::Plug { op, args }, section, label: label.to_string() };
     Ok(match tool {
@@ -393,7 +414,10 @@ fn build(tool: &str, p: &Value, set: &ToolSettings) -> Result<Built, String> {
             Built { plan: Plan::Native { cmd: "text.split", args }, section: TEXT, label: "Split text".into() }
         }
         "bounce" => {
-            let property = arg_choice(p, "property", &set.property, &PROPERTIES)?;
+            let property = match p.get("property") {
+                None | Some(Value::Null) if !keyed.is_empty() => "selected".to_string(),
+                _ => arg_choice(p, "property", &set.property, &TARGETS)?,
+            };
             let mode = arg_choice(p, "mode", &set.motion, &[("overshoot", ""), ("bounce", ""), ("remove", "")])?;
             if mode == "remove" {
                 plug("toolkit_bounce", json!({"property": property, "mode": "remove"}), BOUNCE, "Remove spring")
@@ -462,7 +486,7 @@ fn start(app: &mut EffectcraftApp, ctx: &egui::Context, tool: &str, p: &Value) -
         app.ui.status = e.clone();
         Err(e)
     };
-    let built = match build(tool, p, &settings()) {
+    let built = match build(tool, p, &settings(), &keyed_props(&app.session)) {
         Ok(b) => b,
         Err(e) => return fail(app, e),
     };
@@ -665,7 +689,8 @@ fn section_index(p: &Value) -> Result<usize, String> {
 /// values): create {kind: null|solid|adjustment, color?}, fill {color?}, anchor {at: topLeft…
 /// bottomRight | x, y (0–1)}, precompose {name?}, precompGroups {name?, count?}, decompose,
 /// deepDuplicate, gradientLock, purge, image {path? | png? (base64) | dialog?; else the
-/// clipboard}, split {mode?, text?, reverse?, deleteOriginal?}, bounce {property?, mode?:
+/// clipboard}, split {mode?, text?, reverse?, deleteOriginal?}, bounce {property?: selected|position|
+/// scale|rotation|opacity (default: the selected keys, else the dropdown), mode?:
 /// overshoot|bounce|remove, strength?, frequency?, decay?}, style {kind: ramp|four|fill|sweep,
 /// colors?, duration?, animate?}. Native tools return their result; the others run in the
 /// background and return `{running}` (then `{op: "status"}` has the result).
@@ -979,7 +1004,17 @@ fn text_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set: &
 }
 
 fn bounce_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
-    choice_row(app, ui, c, "motionLibrary.tools.bounce.property", "Property", &PROPERTIES, &mut set.property);
+    let keyed = keyed_props(&app.session);
+    if keyed.is_empty() {
+        choice_row(app, ui, c, "motionLibrary.tools.bounce.property", "Property", &PROPERTIES, &mut set.property);
+    } else {
+        // Selected keys win over the dropdown (Apply spring springs them); deselect to pick one.
+        let t = app.tokens;
+        let ctrl = labelled(ui, c, &t, "Property");
+        let label = format!("{} ({})", tr("Selected keys"), keyed.join(", "));
+        kit::dropdown(app, ui, ctrl, "motionLibrary.tools.bounce.property", &[label.as_str()], 0);
+        c.y += 30.0 * c.s;
+    }
     choice_row(app, ui, c, "motionLibrary.tools.bounce.motion", "Motion", &MOTIONS, &mut set.motion);
     set.strength = number_row(app, ui, c, "motionLibrary.tools.bounce.strength", "Strength (%)", set.strength, STRENGTH, 0);
     set.frequency = number_row(app, ui, c, "motionLibrary.tools.bounce.frequency", "Bounces / s", set.frequency, FREQUENCY, 1);
@@ -1229,69 +1264,103 @@ mod tests {
         }
     }
 
+    /// Regression (19 Oct): with Opacity keys selected and the dropdown left on Position, Apply
+    /// spring bounced Position ("Nothing to bounce: … › Position (needs 2 keyframes)"). Selected
+    /// keys now win: the plug gets `selected` and springs the keys' own properties.
+    #[test]
+    fn bounce_springs_the_selected_keys_not_the_dropdown_property() {
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+        let l = s.execute("layer.newSolid", json!({"name": "Tag", "width": 10, "height": 10})).unwrap()["layer"].as_u64().unwrap();
+        for (t, v) in [(0.0, 0.0), (0.5, 100.0), (1.0, 80.0)] {
+            s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "time": t, "value": v})).unwrap();
+        }
+        let set = ToolSettings::default();
+        assert_eq!(set.property, "position");
+        assert!(keyed_props(&s).is_empty(), "no keys selected yet");
+        let keys: Vec<Value> = [0.0, 0.5, 1.0].iter().map(|t| json!({"layer": l, "path": "transform/opacity", "time": t})).collect();
+        s.execute("keys.select", json!({"keys": keys})).unwrap();
+        let keyed = keyed_props(&s);
+        assert_eq!(keyed, vec!["Opacity".to_string()]);
+        let b = build("bounce", &json!({}), &set, &keyed).unwrap();
+        assert_eq!(
+            b.plan,
+            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "selected", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
+        );
+        let b = build("bounce", &json!({"mode": "remove"}), &set, &keyed).unwrap();
+        assert_eq!(b.plan, Plan::Plug { op: "toolkit_bounce", args: json!({"property": "selected", "mode": "remove"}) });
+        // An explicit property still wins, and `selected` can be asked for by name.
+        let b = build("bounce", &json!({"property": "scale"}), &set, &keyed).unwrap();
+        assert_eq!(
+            b.plan,
+            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "scale", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
+        );
+        assert!(build("bounce", &json!({"property": "selected"}), &set, &[]).is_ok());
+    }
+
     #[test]
     fn tools_take_the_panel_values_and_check_their_arguments() {
         let set = ToolSettings::default();
-        let b = build("bounce", &json!({}), &set).unwrap();
+        let b = build("bounce", &json!({}), &set, &[]).unwrap();
         assert_eq!(b.section, BOUNCE);
         assert_eq!(
             b.plan,
             Plan::Plug { op: "toolkit_bounce", args: json!({"property": "position", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
         );
-        let b = build("bounce", &json!({"mode": "remove", "property": "scale"}), &set).unwrap();
+        let b = build("bounce", &json!({"mode": "remove", "property": "scale"}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_bounce", args: json!({"property": "scale", "mode": "remove"}) });
-        assert!(build("bounce", &json!({"strength": 201}), &set).unwrap_err().contains("strength must be between 0 and 200"));
-        assert!(build("bounce", &json!({"frequency": 0}), &set).is_err());
-        assert!(build("bounce", &json!({"decay": "fast"}), &set).is_err());
-        assert!(build("bounce", &json!({"property": "skew"}), &set).is_err());
+        assert!(build("bounce", &json!({"strength": 201}), &set, &[]).unwrap_err().contains("strength must be between 0 and 200"));
+        assert!(build("bounce", &json!({"frequency": 0}), &set, &[]).is_err());
+        assert!(build("bounce", &json!({"decay": "fast"}), &set, &[]).is_err());
+        assert!(build("bounce", &json!({"property": "skew"}), &set, &[]).is_err());
 
-        let b = build("anchor", &json!({"at": "bottomRight"}), &set).unwrap();
+        let b = build("anchor", &json!({"at": "bottomRight"}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_anchor", args: json!({"x": 1.0, "y": 1.0}) });
-        let b = build("anchor", &json!({"x": 0.0}), &set).unwrap();
+        let b = build("anchor", &json!({"x": 0.0}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_anchor", args: json!({"x": 0.0, "y": 0.5}) });
-        assert!(build("anchor", &json!({"at": "middle"}), &set).is_err());
-        assert!(build("anchor", &json!({"x": 1.5}), &set).is_err());
+        assert!(build("anchor", &json!({"at": "middle"}), &set, &[]).is_err());
+        assert!(build("anchor", &json!({"x": 1.5}), &set, &[]).is_err());
 
-        let b = build("create", &json!({"kind": "solid", "color": "#F00"}), &set).unwrap();
+        let b = build("create", &json!({"kind": "solid", "color": "#F00"}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Native { cmd: "layer.newSolid", args: json!({"color": "#ff0000"}) });
-        assert!(build("create", &json!({"kind": "camera"}), &set).is_err());
-        let b = build("fill", &json!({}), &set).unwrap();
+        assert!(build("create", &json!({"kind": "camera"}), &set, &[]).is_err());
+        let b = build("fill", &json!({}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_style", args: json!({"kind": "fill", "colors": ["#ffffff", "#ffffff", "#ffffff", "#ffffff"]}) });
 
-        let b = build("style", &json!({"kind": "four", "animate": true}), &set).unwrap();
+        let b = build("style", &json!({"kind": "four", "animate": true}), &set, &[]).unwrap();
         assert_eq!(b.section, COLOUR);
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_style", args: json!({"kind": "four", "colors": DEFAULT_COLORS, "duration": 2.0, "animate": true}) });
-        assert!(build("style", &json!({"colors": ["#fff"]}), &set).is_err());
-        assert!(build("style", &json!({"colors": ["#fff", "#000", "#123456", "blue"]}), &set).is_err());
-        assert!(build("style", &json!({"duration": 0.01}), &set).is_err());
-        assert!(build("style", &json!({"kind": "plaid"}), &set).is_err());
+        assert!(build("style", &json!({"colors": ["#fff"]}), &set, &[]).is_err());
+        assert!(build("style", &json!({"colors": ["#fff", "#000", "#123456", "blue"]}), &set, &[]).is_err());
+        assert!(build("style", &json!({"duration": 0.01}), &set, &[]).is_err());
+        assert!(build("style", &json!({"kind": "plaid"}), &set, &[]).is_err());
 
-        let b = build("precompGroups", &json!({"count": 3, "name": "  "}), &set).unwrap();
+        let b = build("precompGroups", &json!({"count": 3, "name": "  "}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Native { cmd: "layer.multiPrecompose", args: json!({"name": "Precomp", "count": 3}) });
-        assert!(build("precompGroups", &json!({"count": 2.5}), &set).is_err());
-        assert!(build("precompGroups", &json!({"count": 0}), &set).is_err());
-        assert!(build("precompGroups", &json!({"count": 257}), &set).is_err());
-        assert_eq!(build("purge", &json!({}), &set).unwrap().plan, Plan::Native { cmd: "edit.purge", args: json!({"what": "memory"}) });
-        assert!(build("explode", &json!({}), &set).is_err());
+        assert!(build("precompGroups", &json!({"count": 2.5}), &set, &[]).is_err());
+        assert!(build("precompGroups", &json!({"count": 0}), &set, &[]).is_err());
+        assert!(build("precompGroups", &json!({"count": 257}), &set, &[]).is_err());
+        assert_eq!(build("purge", &json!({}), &set, &[]).unwrap().plan, Plan::Native { cmd: "edit.purge", args: json!({"what": "memory"}) });
+        assert!(build("explode", &json!({}), &set, &[]).is_err());
     }
 
     #[test]
     fn text_split_needs_a_phrase_only_to_isolate_one() {
         let mut set = ToolSettings::default();
-        let b = build("split", &json!({"reverse": true}), &set).unwrap();
+        let b = build("split", &json!({"reverse": true}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Native { cmd: "text.split", args: json!({"mode": "words", "text": "", "reverse": true, "deleteOriginal": false}) });
-        assert!(build("split", &json!({"mode": "custom"}), &set).is_err());
+        assert!(build("split", &json!({"mode": "custom"}), &set, &[]).is_err());
         set.split_text = "Hello".into();
-        let b = build("split", &json!({"mode": "custom"}), &set).unwrap();
+        let b = build("split", &json!({"mode": "custom"}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Native { cmd: "text.split", args: json!({"mode": "custom", "text": "Hello", "reverse": false, "deleteOriginal": false}) });
-        assert!(build("split", &json!({"mode": "sentences"}), &set).is_err());
-        assert!(build("split", &json!({"mode": "custom", "text": "x".repeat(1025)}), &set).is_err());
+        assert!(build("split", &json!({"mode": "sentences"}), &set, &[]).is_err());
+        assert!(build("split", &json!({"mode": "custom", "text": "x".repeat(1025)}), &set, &[]).is_err());
     }
 
     #[test]
     fn images_come_from_a_path_data_a_dialog_or_the_clipboard() {
         let set = ToolSettings::default();
-        let src = |p: Value| match build("image", &p, &set).unwrap().plan {
+        let src = |p: Value| match build("image", &p, &set, &[]).unwrap().plan {
             Plan::Image(s) => s,
             other => panic!("{other:?}"),
         };
@@ -1299,7 +1368,7 @@ mod tests {
         assert_eq!(src(json!({"dialog": true})), ImageSource::Dialog);
         assert_eq!(src(json!({"path": "/a.png"})), ImageSource::Path("/a.png".into()));
         assert_eq!(src(json!({"png": "iVBO"})), ImageSource::Png("iVBO".into()));
-        assert!(build("image", &json!({"png": "A".repeat(7_000_001)}), &set).is_err());
+        assert!(build("image", &json!({"png": "A".repeat(7_000_001)}), &set, &[]).is_err());
         assert!(check_png(b"\x89PNG\r\n\x1a\nrest").is_ok());
         assert!(check_png(b"GIF89a").is_err());
         assert!(read_png("/definitely/not/here.png").is_err());
