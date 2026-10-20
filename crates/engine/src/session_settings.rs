@@ -115,7 +115,7 @@ impl Session {
     /// and attach it to the layer cache. Without a folder setting the platform cache folder is
     /// used, but only by frontends with a settings store (headless sessions stay off disk).
     pub fn configure_disk_cache(&mut self) {
-        use effectcraft_render::disk_cache::{DiskCache, default_folder, footage_salt};
+        use effectcraft_render::disk_cache::{DiskCache, default_folder};
         let d = &self.prefs.disk;
         let folder = if d.disk_cache_folder.trim().is_empty() {
             (self.config.is_some() && !cfg!(target_arch = "wasm32")).then(default_folder)
@@ -146,7 +146,9 @@ impl Session {
                 }
             },
         };
-        self.layer_cache.set_disk(Some((dc.clone(), footage_salt(&self.project))));
+        self.disk_cache = Some(dc.clone());
+        let salt = self.refresh_disk_salt(true).unwrap_or_default();
+        self.layer_cache.set_disk(Some((dc.clone(), salt)));
         // Stills slow to decode (PDF / SVG artwork with big pictures) are kept there too.
         self.footage.set_still_cache(Some(dc.clone()));
         // Roto Brush / Object Matte segmentations persist there too (held weakly: switching the
