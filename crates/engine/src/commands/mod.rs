@@ -12,6 +12,8 @@ pub mod cards;
 pub mod content_fill;
 pub mod essential;
 pub mod expr_tools;
+// The desktop app's FigCraft link reads the precomp tree and the place params.
+pub mod figcraft_link;
 pub mod footage_panel;
 pub mod graph_cmds;
 pub mod inline_comp;

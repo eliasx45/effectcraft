@@ -880,6 +880,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 actions.push(("comp.open".into(), json!({"comp": id.0})));
                 ui.close();
             }
+            // The FigCraft link: this comp's work area (its selected layers' span when it is the
+            // active comp) becomes a card on FigCraft's canvas.
+            if matches!(it.kind, ItemKind::Comp(_)) && ui.button(crate::i18n::tr("Send to FigCraft")).clicked() {
+                actions.push(("comp.sendToFigCraft".into(), json!({"comp": id.0})));
+                ui.close();
+            }
             if ui.button(crate::i18n::tr("Rename")).clicked() {
                 ctx.data_mut(|d| d.insert_temp::<Editing>(edit_id(), (id.0, "name".into(), it.name.clone())));
                 ui.close();

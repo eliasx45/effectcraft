@@ -725,6 +725,8 @@ Composition
   Composition Flowchart | comp.flowchart
   Composition Mini-Flowchart | comp.miniFlowchart
   ---
+  Send to FigCraft | comp.sendToFigCraft
+  ---
   VR
     Create VR Environment... | comp.vr.createEnvironment
     Extract Cubemap... | comp.vr.extractCubemap

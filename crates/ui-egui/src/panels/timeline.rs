@@ -4192,6 +4192,8 @@ pub(crate) fn layer_menu(ui: &mut egui::Ui, layers: &[u64], caps: LayerMenuCaps,
     });
     ui.separator();
     item(ui, "Pre-compose…", "layer.precompose", json!({"layers": layers}));
+    // The selected layers' span of the comp becomes a card on FigCraft's canvas.
+    item(ui, "Send to FigCraft", "comp.sendToFigCraft", json!({}));
     item(ui, "Duplicate", "edit.duplicate", json!({"layers": layers}));
     item(ui, "Split Layer", "edit.splitLayer", json!({"layers": layers}));
     item(ui, "Delete", "edit.clear", json!({"layers": layers}));

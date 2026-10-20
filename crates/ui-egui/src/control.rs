@@ -22,6 +22,9 @@
 //!   the app revision `have`, or the whole project) and the cursors ([`effectcraft_engine::remote_follow`])
 //! - `render.frame {comp?, item?, layer?, time?, max_side?, transparent?, region?, overlays?, path?, base64?}`: PNG of a frame rendered by the session
 //! - `ui.figmaPair {client}`: the one-time Figma pairing prompt; replies `{allowed}` once answered
+//! - `figcraft.frames {comp, frames, maxSide, quality?}` / `figcraft.audio {comp, start, end, rate?}` /
+//!   `figcraft.tree {comp, start?, end?, depth?}` / `figcraft.reveal {comp, time}`: the FigCraft link
+//!   ([`crate::figcraft_link`])
 //! - `ui.resize {width, height}` / `ui.focus` / `app.quit {force?}` (a modified project asks to save first unless `force`)
 //!
 //! The full reference with examples is `docs/control-protocol.md`.
@@ -588,6 +591,8 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             Err(e) => err(e),
         },
         "render.frame" => render_frame(app, p),
+        // The FigCraft link (crate::figcraft_link): frames, audio, the precomp tree, reveal.
+        "figcraft.frames" | "figcraft.audio" | "figcraft.tree" | "figcraft.reveal" => crate::figcraft_link::handle(app, ctx, req),
         "ui.resize" => {
             let w = p.get("width").and_then(Value::as_f64).unwrap_or(1600.0) as f32;
             let h = p.get("height").and_then(Value::as_f64).unwrap_or(1000.0) as f32;

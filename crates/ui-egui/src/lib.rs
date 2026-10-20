@@ -2749,6 +2749,8 @@ impl EffectcraftApp {
         panels::cards::frame(self, &ctx);
         // Batch 1 lane B: finished transcriptions are imported (SX2).
         transcribe::poll(self, &ctx);
+        // Send to FigCraft: toast the sends that finished.
+        figcraft_link::poll(self, &ctx);
         panels::timeline::wheels::take_picks(self, &ctx);
         panels::scriptui_view::sync_panels(self);
         panels::scriptui_view::show_windows(self, &ctx);

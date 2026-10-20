@@ -166,6 +166,8 @@ const PINNED_FRONTEND: &[&str] = &[
     "speech.transcribe",
     "script.copyRef",
     "script.board",
+    // The FigCraft link (menus/figcraft.rs).
+    "comp.sendToFigCraft",
     // Batch 1 (menus/agent_native.rs, lane C).
     "link.paste",
     "why.answer",

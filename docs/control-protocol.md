@@ -488,3 +488,62 @@ answers an error), keeps no checkpoints, is not in the host list, and `host.rele
   `render.contactSheet`, `render.lint`, `render.snapshot` and `render.compare` to the box and
   everything else to the app. Replies carry `renderedOn: render-box | app`. While the box is
   unreachable or out of sync, renders run in the app (retried on the box after 10 s).
+
+## FigCraft link
+
+FigCraft (the sibling design app) shows and plays EffectCraft comps on its canvas, like Dynamic
+Link: a card on FigCraft's canvas is a live view of a comp range. FigCraft calls these methods on
+the desktop app's control channel; they never open dialogs. `comp` is a composition id or name
+everywhere. Junk parameters are an error (`{"ok": false, "error": "figcraft.<method>: …"}`).
+
+- **`figcraft.frames {comp, frames: [int], maxSide: int, quality?: int}`** → `{comp: id, revision,
+  width, height (the comp's size), frameRate, frames: [{frame, w, h, jpeg: "<base64>"} | {frame,
+  pending: true} | {frame, failed: true}]}`.
+  - `frames` are comp frame numbers at the comp's frame rate, at most 64 per request; duplicates,
+    non-integers and frames outside the comp are dropped. `maxSide` (clamped to 32–1920) is the
+    longest side FigCraft wants; `quality` is the JPEG quality (30–95, default 80).
+  - The reply comes at once with what EffectCraft has **now** (no waiting for renders): a frame is
+    taken from the RAM preview of the comp's viewer at ¼, ⅓, ½ or full resolution (and the scale
+    the viewer shows now) — the smallest cached one whose longest side reaches `maxSide`, else the
+    largest — scaled down to fit `maxSide` and encoded as a JPEG over black (GPU frames are read
+    back first). Reading back, scaling and encoding run on a thread, not the UI thread.
+  - A frame that isn't cached is queued as a **prefetch** render (never urgent, so the viewer's
+    own frames keep their priority) at the smallest of ¼, ⅓, ½, full whose longest side reaches
+    `maxSide`, with the viewer's render options, so the viewer reuses it (and a frame in the disk
+    cache is just read back); it is reported `pending: true`. Ask again a little later: frames
+    appear as soon as EffectCraft has them. A frame already queued isn't queued twice.
+  - `failed: true`: the frame's render failed at this project revision (or couldn't be encoded).
+    `revision` changes with every edit: re-ask for frames after it changes.
+  - While four encoders are busy, cached frames are reported pending too.
+- **`figcraft.audio {comp, start, end, rate?}`** → `{rate, channels: 2, start, end, wav:
+  "<base64>"}` or `{silent: true}`. `start`/`end` are comp seconds (`end - start` ≤ 300; `start`
+  below 0 counts from 0); `rate` is 8000–96000 Hz (default 48000). The WAV is 16-bit PCM stereo
+  of the comp's mix (what previews play), mixed on a thread. `silent: true` when the comp has no
+  audible layers, or the range is all silence.
+- **`figcraft.tree {comp, start?, end?, depth?}`** → `{comp: {id, name, width, height, frameRate,
+  duration}, children: [{layer: {id, name}, comp: {…}, start, stretch, in, out, timeRemap,
+  children: […]}]}`: the precomp layers that show between `start` and `end` (comp seconds,
+  default the whole comp), top layer first, `depth` levels deep (1–4, default 3). A child's
+  `start` (where its time 0 sits), `in` and `out` are seconds in its parent comp and `stretch` is
+  in percent; its own `children` are those that show in the part of it its layer shows (the
+  whole comp when `timeRemap` is true).
+- **`figcraft.reveal {comp, time}`** → `{comp, time}`: opens the comp (its viewer and Timeline tab,
+  as double-clicking it in the Project panel does), moves the current time to `time` (comp
+  seconds, kept inside the comp) and brings the window to the front. FigCraft calls it when a card
+  is double-clicked.
+
+**Composition ▸ Send to FigCraft** (`comp.sendToFigCraft {comp?, start?, end?}`, also in the
+Timeline layer context menu and the Project panel's context menu of a comp) places a comp range on
+FigCraft's canvas. The comp is the active one (the right-clicked one in the Project panel); the
+range is the selected layers' span (earliest In point to latest Out point, clipped to the comp)
+when that comp's layers are selected, else its work area (`start`/`end` override it). The engine
+returns the place params; the desktop app connects to FigCraft (127.0.0.1, port
+`FIGCRAFT_CONTROL_PORT`, default 7979) on a thread and sends one line:
+
+```json
+{"id":1,"method":"engine.execute","params":{"command":"effectcraft.place","params":{"comp":"Promo","compId":12,"project":"/path/Promo.ecproj","start":1,"end":3,"fps":25,"width":1920,"height":1080,"name":"Promo · 0:01–0:03"}}}
+```
+
+`project` is the saved project's path (empty for an unsaved one). The toast says "Sent to
+FigCraft" when FigCraft answers `ok`, "FigCraft isn't open" when nothing listens on the port, else
+FigCraft's error. A headless session (CLI, MCP without the app) only returns the params.

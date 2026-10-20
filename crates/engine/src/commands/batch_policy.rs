@@ -258,6 +258,8 @@ mod tests {
             "agent.snapshot",
             "why.answer",
             "ml.saveTextPreset",
+            // Sends to another app (FigCraft).
+            "comp.sendToFigCraft",
         ] {
             assert!(!atomic_supported(id), "{id}");
         }
