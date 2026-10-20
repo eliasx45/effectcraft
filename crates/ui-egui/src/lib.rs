@@ -509,6 +509,9 @@ pub struct EffectcraftApp {
     /// When the user last did something (input or an edit): Cache Frames When Idle waits for
     /// a second of quiet. (time, project revision then)
     last_activity: (f64, u64),
+    /// Cache Frames When Idle waits for memory ([`idle_cache::memory_wait`]), and when it last
+    /// said so.
+    idle_memory_wait: (bool, f64),
     /// When the project last changed, and its revision then (see [`Self::editing`]).
     last_edit: (f64, u64),
     /// Edit → viewer frame latency, for `ui.inspect`'s `latency`.
@@ -663,6 +666,7 @@ impl EffectcraftApp {
             cloud_play: Default::default(),
             last_ui_time: 0.0,
             last_activity: (0.0, 0),
+            idle_memory_wait: (false, f64::NEG_INFINITY),
             last_edit: (0.0, 0),
             latency: Default::default(),
             toast: None,
@@ -781,6 +785,7 @@ impl EffectcraftApp {
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         ctx.set_zoom_factor(p.appearance.ui_scale as f32 / 100.0);
         self.ui.cache_when_idle = p.previews.cache_frames_when_idle;
+        self.frames.set_idle_threads(frames::idle_threads(effectcraft_engine::sysinfo::cpu_cores(), p.memory.idle_cache_cores));
         self.ui.viewer.fast_preview = p.previews.fast_previews;
         let budgets = p.cache_budgets(self.session.sys_memory);
         self.frames.set_budget(budgets.preview);
@@ -1598,6 +1603,14 @@ impl EffectcraftApp {
         self.request_frame_with(comp, frame, scale, false);
     }
 
+    /// Request a frame for Cache Frames When Idle ([`Frames::request_idle`]).
+    fn request_frame_idle(&self, comp: ItemId, frame: i64, scale: f64) {
+        let Some(c) = self.session.project.comp(comp) else { return };
+        let key = self.frame_key(comp, frame, scale);
+        let opts = self.frame_opts(comp, scale);
+        self.frames.request_idle(&self.render_source(), key, comp, c.frame_rate.tick_of(frame), opts);
+    }
+
     /// Request the frame on screen: rendered before any queued prefetch.
     pub fn request_frame_urgent(&self, comp: ItemId, frame: i64, scale: f64) {
         self.request_frame_with(comp, frame, scale, true);
@@ -2247,7 +2260,9 @@ impl EffectcraftApp {
 
     /// Composition ▸ Preview ▸ Cache Frames When Idle: after a second without input or edits,
     /// render the preview range's frames (from the current time on, then from its start) in the
-    /// background, a few at a time, until it is cached or the RAM preview budget is full.
+    /// background, one at a time on a few low-priority threads (`frames::idle`), until it is
+    /// cached or the RAM preview budget is full (then into the disk cache). It waits while the
+    /// system is short of memory ([`idle_cache::memory_wait`]).
     fn cache_when_idle(&mut self, ctx: &egui::Context, comp: &effectcraft_engine::project::Comp, series: &FrameKey, now: f64, (wa, wb): (i64, i64)) {
         // Moving the pointer over the window isn't activity (After Effects keeps caching):
         // clicks, keys, wheel and drags are.
@@ -2278,8 +2293,15 @@ impl EffectcraftApp {
         if self.cache_on_server(ctx, comp, series, (wa, wb), cur) {
             return;
         }
+        let remote = cfg!(target_arch = "wasm32") || self.frames.remote_active();
+        if !remote && self.idle_waits_for_memory(now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+            return;
+        }
         let fit = self.frames_that_fit(comp, series.scale as f64 / 1000.0).min(n);
-        let slots = (self.frames_parallelism() / 2).max(1);
+        // Rendered elsewhere (the cloud, the browser's workers), nothing here slows down; here,
+        // one frame at a time on the idle threads, and one queued behind it.
+        let slots = if remote { (self.frames_parallelism() / 2).max(1) } else { self.frames.idle_slots() };
         let mut queued = self.frames.inflight();
         let scale = series.scale as f64 / 1000.0;
         let mut pending = false;
@@ -2293,7 +2315,7 @@ impl EffectcraftApp {
             if queued >= slots {
                 break;
             }
-            self.request_frame(ItemId(series.comp), f, scale);
+            self.request_frame_idle(ItemId(series.comp), f, scale);
             queued += 1;
         }
         // The RAM preview is full: keep going into the disk cache (the blue bar), as After
@@ -2304,6 +2326,26 @@ impl EffectcraftApp {
         if pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+    }
+
+    /// Whether Cache Frames When Idle waits for memory now ([`idle_cache::memory_wait`]); says
+    /// so in a toast when it starts waiting (at most every five minutes).
+    fn idle_waits_for_memory(&mut self, now: f64) -> bool {
+        let why = idle_cache::memory_wait(self.session.sys_memory, self.session.memory_watch.pressure(), self.session.prefs.memory.ram_reserved_gb);
+        let (waiting, told) = self.idle_memory_wait;
+        if let Some(why) = why
+            && !waiting
+        {
+            log::info!("Cache Frames When Idle: paused, {why}");
+            if now - told > 300.0 {
+                self.session.toast(format!("Cache Frames When Idle paused: {why}"));
+                self.idle_memory_wait.1 = now;
+            }
+        } else if why.is_none() && waiting {
+            log::info!("Cache Frames When Idle: memory freed up, caching again");
+        }
+        self.idle_memory_wait.0 = why.is_some();
+        why.is_some()
     }
 
     /// [`Self::cache_when_idle`] with the cloud renderer: ask its server to cache the work area

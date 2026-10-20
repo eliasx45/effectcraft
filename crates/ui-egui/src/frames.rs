@@ -38,6 +38,8 @@ use rayon::prelude::*;
 
 mod fingerprint;
 mod frame_keys;
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+mod idle;
 #[cfg(not(target_arch = "wasm32"))]
 mod landing;
 mod property_reuse;
@@ -49,6 +51,12 @@ pub mod times;
 mod vram;
 #[cfg(not(target_arch = "wasm32"))]
 mod workers;
+
+pub(crate) use idle::idle_threads;
+pub use idle::set_thread_start as set_idle_thread_start;
+
+/// Idle frames (Cache Frames When Idle) that render at once ([`idle`]).
+const IDLE_FRAMES: usize = 1;
 
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
@@ -688,6 +696,9 @@ pub struct Frames {
     pool: Option<Arc<workers::Workers>>,
     #[cfg(not(target_arch = "wasm32"))]
     background_running: Arc<AtomicBool>,
+    /// The threads Cache Frames When Idle renders on ([`idle`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    idle: Arc<idle::IdlePool>,
     ctx: Option<egui::Context>,
     /// Render time of the last viewer (urgent) frame in ms, for the Info panel / perf readout.
     pub last_ms: Arc<Mutex<f64>>,
@@ -774,6 +785,8 @@ impl Default for Frames {
             pool: workers::Workers::new(threads).map(Arc::new),
             #[cfg(not(target_arch = "wasm32"))]
             background_running: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            idle: Arc::default(),
             ctx: None,
             last_ms: Arc::new(Mutex::new(0.0)),
             times: Arc::default(),
@@ -1529,18 +1542,38 @@ impl Frames {
 
     /// Queue a prefetch frame (no-op if cached or already queued/rendering).
     pub fn request(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
-        self.request_with(src, key, comp, t, opts, false, false);
+        self.request_with(src, key, comp, t, opts, false, false, false);
+    }
+
+    /// Queue a frame for Cache Frames When Idle: rendered after every viewer and prefetch frame,
+    /// one at a time, on the idle threads ([`idle`]: a few cores at background priority).
+    pub fn request_idle(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
+        self.request_with(src, key, comp, t, opts, false, false, true);
+    }
+
+    /// How many idle frames Cache Frames When Idle keeps in flight: one rendering and one
+    /// queued behind it, so the idle threads don't wait for the next UI frame.
+    pub fn idle_slots(&self) -> usize {
+        IDLE_FRAMES + 1
+    }
+
+    /// Render idle frames on `threads` threads from the next one on (see [`idle::idle_threads`]).
+    pub fn set_idle_threads(&self, threads: usize) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.idle.set_threads(threads);
+        #[cfg(target_arch = "wasm32")]
+        let _ = threads;
     }
 
     /// Queue the frame the viewer is showing: it jumps ahead of every prefetch job.
     pub fn request_urgent(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
-        self.request_with(src, key, comp, t, opts, true, false);
+        self.request_with(src, key, comp, t, opts, true, false, false);
     }
 
     /// [`Frames::request_urgent`] for the paused viewer: a draft frame of the cloud's stream
     /// ([`streamed`]) under the key is rendered exactly too (and replaced when it lands).
     pub fn request_exact(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
-        self.request_with(src, key, comp, t, opts, true, true);
+        self.request_with(src, key, comp, t, opts, true, true, false);
     }
 
     /// An urgent (viewer) frame is queued or rendering.
@@ -1549,7 +1582,8 @@ impl Frames {
     }
 
     /// Queue a frame for the disk cache only (Cache Frames When Idle once the RAM preview is
-    /// full): rendered after every other frame and written to disk without going through RAM.
+    /// full): rendered after every other frame, on the idle threads like [`Frames::request_idle`],
+    /// and written to disk without going through RAM.
     /// Returns whether it was queued: not without a disk cache, when the frame is in RAM, on
     /// disk, queued or failed, or while the disk cache's writer has no room for it (the
     /// caller tries again later).
@@ -1590,6 +1624,7 @@ impl Frames {
             opts,
             urgent: false,
             disk_only: true,
+            idle: true,
             seq,
             epoch,
             on_gpu: None,
@@ -1606,7 +1641,8 @@ impl Frames {
         true
     }
 
-    fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool, over_draft: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool, over_draft: bool, idle: bool) {
         let cached = if over_draft { self.is_exact(&key) } else { self.is_cached(&key) };
         if cached || self.failed(&key) {
             return;
@@ -1645,6 +1681,8 @@ impl Frames {
             });
             for j in q.jobs.iter_mut() {
                 j.urgent = j.key == key;
+                // Wanted on screen now: no longer an idle frame.
+                j.idle &= !j.urgent;
             }
             // The comp's viewer frames of other times that are rendering are called off too: a
             // movie seeking for each of them held the decoder the frame under the pointer
@@ -1657,9 +1695,11 @@ impl Frames {
             }
         }
         if !inf.insert(key) {
-            // Queued for the disk only: now wanted in RAM too.
+            // Queued for the disk only: now wanted in RAM too. Queued by Cache Frames When Idle:
+            // now wanted by playback or the viewer, at their priority.
             if let Some(j) = q.jobs.iter_mut().find(|j| j.key == key) {
                 j.disk_only = false;
+                j.idle &= idle;
             }
             return;
         }
@@ -1674,6 +1714,7 @@ impl Frames {
             opts,
             urgent,
             disk_only: false,
+            idle: idle && !urgent,
             seq,
             epoch,
             on_gpu: None,
@@ -1720,6 +1761,8 @@ impl Frames {
             epoch: self.epoch.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             pool: self.pool.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            idle: self.idle.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             landing: self.landing.clone(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1918,6 +1961,9 @@ struct Worker {
     /// The threads frames render on (`None`: rayon's global pool).
     #[cfg(not(target_arch = "wasm32"))]
     pool: Option<Arc<workers::Workers>>,
+    /// The threads idle frames render on.
+    #[cfg(not(target_arch = "wasm32"))]
+    idle: Arc<idle::IdlePool>,
     #[cfg(not(target_arch = "wasm32"))]
     landing: Arc<landing::Landing>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -2028,9 +2074,8 @@ impl Worker {
     /// Render the queued job that matters most right now. `false` when the queue was empty, or
     /// the job has to wait for memory (a finishing frame starts it, see [`Worker::release`]).
     fn run_next(&self) -> bool {
-        let Worker { queue, content_keys, salts, .. } = self;
-        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-        let mut job = {
+        let queue = &self.queue;
+        let job = {
             let Ok(mut q) = queue.lock() else { return false };
             let Some(i) = q.best() else { return false };
             let retired = self.gpu_retired.load(Ordering::Acquire);
@@ -2055,8 +2100,26 @@ impl Worker {
                 q.urgent_running += 1;
                 q.urgent_cancels.push((job.key, job.cancel.clone()));
             }
+            if job.idle {
+                q.idle.insert(job.key);
+            }
             job
         };
+        // An idle frame renders inside the idle pool: its parallel loops stay on those few
+        // low-priority threads ([`idle`]); this frame thread waits for it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if job.idle
+            && let Some(pool) = self.idle.pool()
+        {
+            let w = self.clone();
+            return pool.install(move || w.run_job(job));
+        }
+        self.run_job(job)
+    }
+
+    /// Render `job`, which [`Worker::run_next`] took from the queue.
+    fn run_job(&self, #[cfg_attr(target_arch = "wasm32", allow(unused_mut))] mut job: Job) -> bool {
+        let Worker { content_keys, salts, .. } = self;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(retry) = job.retry.take() {
             self.render_retry(job, *retry);
@@ -2417,6 +2480,7 @@ impl Worker {
         let mut restart = false;
         if let Ok(mut q) = self.queue.lock() {
             q.running.remove(&key);
+            q.idle.remove(&key);
             q.remote_running.remove(&key);
             if urgent {
                 q.urgent_running = q.urgent_running.saturating_sub(1);
@@ -2458,6 +2522,7 @@ impl Worker {
         {
             let Ok(mut q) = self.queue.lock() else { return };
             q.running.remove(&job.key);
+            q.idle.remove(&job.key);
             if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == job.key) {
                 q.urgent_cancels.swap_remove(i);
             }
@@ -2830,6 +2895,9 @@ struct Job {
     /// written to disk, never put in RAM (where it would evict the cached frames), and
     /// rendered after every viewer and prefetch frame.
     disk_only: bool,
+    /// Rendered by Cache Frames When Idle: after every viewer and prefetch frame, at most
+    /// [`IDLE_FRAMES`] at once, inside the idle pool ([`idle`]).
+    idle: bool,
     seq: u64,
     /// The [`Frames::clear`] generation it started rendering in: a frame of an older one is not
     /// published but renders again (Purge Caches, A7).
@@ -2871,6 +2939,8 @@ struct Retry {
 struct Queue {
     jobs: Vec<Job>,
     running: HashSet<FrameKey>,
+    /// The running idle frames ([`Job::idle`]).
+    idle: HashSet<FrameKey>,
     urgent_running: usize,
     /// The running viewer (urgent) frames and how to call them off.
     urgent_cancels: Vec<(FrameKey, Arc<AtomicBool>)>,
@@ -2897,11 +2967,15 @@ impl Queue {
     fn can_start(&self, job: &Job) -> bool {
         let limit = max_running_gated(job, self.threads, &self.gate);
         let rendering = self.running.len().saturating_sub(self.landing);
+        if job.idle && self.idle.len() >= IDLE_FRAMES {
+            return false;
+        }
         if job.urgent { self.urgent_running == 0 && rendering <= limit } else { rendering < limit }
     }
 
     /// The job that matters most: urgent first (newest), then prefetch: while a preview plays,
-    /// the frame it reaches first, then the rest in request order; disk-only frames last. In
+    /// the frame it reaches first, then the rest in request order; idle frames (Cache Frames When
+    /// Idle) after them, disk-only frames last. In
     /// request order alone, a frame asked for again after an eviction (right ahead of the
     /// playhead) waited behind every frame further ahead (#595).
     fn best(&self) -> Option<usize> {
@@ -2911,7 +2985,7 @@ impl Queue {
             .enumerate()
             .max_by_key(|(_, j)| {
                 let near = if j.urgent || j.disk_only { None } else { p.and_then(|p| p.ahead(&j.key)) };
-                (j.urgent, !j.disk_only, near.is_some(), near.map_or(0, |d| d.saturating_neg()), if j.urgent { j.seq as i64 } else { -(j.seq as i64) })
+                (j.urgent, !j.idle, !j.disk_only, near.is_some(), near.map_or(0, |d| d.saturating_neg()), if j.urgent { j.seq as i64 } else { -(j.seq as i64) })
             })
             .map(|(i, _)| i)
     }
@@ -3215,6 +3289,7 @@ mod tests {
                 opts,
                 urgent: false,
                 disk_only: false,
+                idle: false,
                 seq: i as u64,
                 epoch: 0,
                 on_gpu: Some(true),
@@ -3282,6 +3357,7 @@ mod tests {
             opts: RenderOpts { backend, ..Default::default() },
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: None,
@@ -3354,6 +3430,7 @@ mod tests {
             opts: RenderOpts { backend: Backend::Gpu, ..Default::default() },
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: Some(true),
@@ -3379,6 +3456,65 @@ mod tests {
         assert!(!f.gpu_retired.load(Ordering::Acquire), "GPU frames are kept again");
         assert!(cap() <= 4, "the replacement keeps the ceiling: {}", cap());
         assert!(cap() >= 1);
+    }
+
+    /// Cache Frames When Idle: its frames go after the viewer's and playback's, one renders at
+    /// a time, and a frame the viewer or playback asks for meanwhile is no longer idle.
+    #[test]
+    fn idle_frames_go_last_and_one_at_a_time() {
+        let project = Arc::new(Project::default());
+        let job = |frame: i64, urgent: bool, idle: bool, seq: u64| Job {
+            key: key(1, frame, 0),
+            src: RenderSource {
+                freeze_feedback: Default::default(),
+                project: project.clone(),
+                footage: Arc::new(effectcraft_engine::render::NoFootage),
+                expr: None,
+                layer_cache: Arc::new(LayerCache::new(1 << 30)),
+                gpu: None,
+                gpu_display: false,
+                disk: None,
+            },
+            comp: ItemId(1),
+            t: Tick::ZERO,
+            opts: RenderOpts::default(),
+            urgent,
+            disk_only: false,
+            idle,
+            seq,
+            epoch: 0,
+            on_gpu: Some(false),
+            retry: None,
+            cancel: Arc::default(),
+            print: None,
+        };
+        let mut q = Queue { threads: 8, gate: Arc::new(vram::Gate::warmed()), ..Queue::default() };
+        // Asked for first, the idle frame still waits for prefetch and the viewer's frame.
+        q.jobs = vec![job(1, false, true, 1), job(2, false, false, 2), job(3, true, false, 3)];
+        assert_eq!(q.best().map(|i| q.jobs[i].key.frame), Some(3));
+        q.jobs.retain(|j| j.key.frame != 3);
+        assert_eq!(q.best().map(|i| q.jobs[i].key.frame), Some(2));
+        q.jobs.retain(|j| j.key.frame != 2);
+        assert_eq!(q.best().map(|i| q.jobs[i].key.frame), Some(1));
+        // One idle frame renders at a time; prefetch and the viewer's frame still start.
+        assert!(q.can_start(&job(1, false, true, 1)));
+        q.running.insert(key(1, 9, 0));
+        q.idle.insert(key(1, 9, 0));
+        assert!(!q.can_start(&job(1, false, true, 1)), "a second idle frame waits");
+        assert!(q.can_start(&job(2, false, false, 2)));
+        assert!(q.can_start(&job(3, true, false, 3)));
+
+        // Through Frames: an idle frame asked for again by playback (or the viewer) is not idle.
+        let f = Frames::default();
+        let src = job(0, false, false, 0).src;
+        let opts = RenderOpts::default();
+        // Queued as an idle frame (put in the queue directly, so it doesn't start rendering).
+        let k = key(1, 5, 0);
+        f.queue.lock().unwrap().jobs.push(job(5, false, true, 1));
+        f.inflight.lock().unwrap().insert(k);
+        f.request(&src, k, ItemId(1), Tick::ZERO, opts);
+        assert!(f.queue.lock().unwrap().jobs.iter().any(|j| j.key == k && !j.idle), "wanted by playback now");
+        assert_eq!(f.idle_slots(), IDLE_FRAMES + 1);
     }
 
     fn key(content: u64, frame: i64, opts: u64) -> FrameKey {
@@ -3534,6 +3670,7 @@ mod tests {
             opts: RenderOpts { scale, ..Default::default() },
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: None,
@@ -3581,6 +3718,7 @@ mod tests {
             opts: RenderOpts { backend, ..Default::default() },
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: None,
@@ -3729,6 +3867,7 @@ mod tests {
             opts,
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: None,
@@ -3794,6 +3933,7 @@ mod tests {
             opts: RenderOpts::default(),
             urgent: true,
             disk_only: false,
+            idle: false,
             seq: 2,
             epoch: 0,
             on_gpu: None,
@@ -4001,7 +4141,7 @@ mod tests {
             gpu_display: false,
             disk: None,
         };
-        let request = |k: FrameKey, urgent: bool| f.request_with(&src, k, ItemId(k.comp), Tick::ZERO, RenderOpts::default(), urgent, false);
+        let request = |k: FrameKey, urgent: bool| f.request_with(&src, k, ItemId(k.comp), Tick::ZERO, RenderOpts::default(), urgent, false, false);
         let other = FrameKey { comp: 2, ..key(1, 0, 0) };
         request(other, true);
         request(key(1, 20, 0), false);
@@ -4288,6 +4428,7 @@ mod tests {
                 opts,
                 urgent: false,
                 disk_only: true,
+                idle: true,
                 seq: 1,
                 epoch: 0,
                 on_gpu: None,

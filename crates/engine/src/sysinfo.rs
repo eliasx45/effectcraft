@@ -27,11 +27,43 @@ impl SysMemory {
     }
 }
 
+/// How hard the operating system finds it to hand out memory (macOS's memory pressure level,
+/// as Activity Monitor's Memory Pressure graph shows it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum MemoryPressure {
+    Normal,
+    /// The system compresses and swaps memory to keep up (yellow in Activity Monitor).
+    Warning,
+    /// Apps are being asked to give memory back (red).
+    Critical,
+}
+
+/// Parse macOS `sysctl -n kern.memorystatus_vm_pressure_level` (1 normal, 2 warning, 4 critical).
+pub fn parse_pressure_level(text: &str) -> Option<MemoryPressure> {
+    match text.trim().parse::<u32>().ok()? {
+        1 => Some(MemoryPressure::Normal),
+        2 => Some(MemoryPressure::Warning),
+        4 => Some(MemoryPressure::Critical),
+        _ => None,
+    }
+}
+
+/// The system's memory pressure, where the system reports one (macOS).
+pub fn memory_pressure() -> Option<MemoryPressure> {
+    #[cfg(target_os = "macos")]
+    {
+        return parse_pressure_level(&run("sysctl", &["-n", "kern.memorystatus_vm_pressure_level"])?);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// The system's memory, read in the background: [`MemoryWatch::poll`] starts a reading (unless
 /// one is running) and [`MemoryWatch::latest`] returns the last one without waiting.
 #[derive(Clone, Default)]
 pub struct MemoryWatch {
     latest: Arc<Mutex<Option<SysMemory>>>,
+    pressure: Arc<Mutex<Option<MemoryPressure>>>,
     busy: Arc<AtomicBool>,
 }
 
@@ -42,11 +74,12 @@ impl MemoryWatch {
         if self.busy.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (latest, busy) = (self.latest.clone(), self.busy.clone());
+        let (latest, pressure, busy) = (self.latest.clone(), self.pressure.clone(), self.busy.clone());
         let read = move || {
             if let Some(m) = memory() {
                 *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(m);
             }
+            *pressure.lock().unwrap_or_else(PoisonError::into_inner) = memory_pressure();
             busy.store(false, Ordering::Release);
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -60,6 +93,12 @@ impl MemoryWatch {
     /// The last reading (`None` until one finished).
     pub fn latest(&self) -> Option<SysMemory> {
         *self.latest.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The memory pressure at the last reading (`None`: unknown, or the system has no such
+    /// level).
+    pub fn pressure(&self) -> Option<MemoryPressure> {
+        *self.pressure.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -234,5 +273,15 @@ mod tests {
         let m = parse_vm_stat(vm, 8 << 30).unwrap();
         assert_eq!(m.available, 4100 * 16384);
         assert!(m.is_low());
+    }
+
+    #[test]
+    fn parses_macos_memory_pressure_level() {
+        assert_eq!(parse_pressure_level("1\n"), Some(MemoryPressure::Normal));
+        assert_eq!(parse_pressure_level("2"), Some(MemoryPressure::Warning));
+        assert_eq!(parse_pressure_level(" 4 "), Some(MemoryPressure::Critical));
+        assert_eq!(parse_pressure_level("0"), None);
+        assert_eq!(parse_pressure_level("garbage"), None);
+        assert!(MemoryPressure::Warning > MemoryPressure::Normal && MemoryPressure::Critical > MemoryPressure::Warning);
     }
 }

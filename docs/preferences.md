@@ -60,7 +60,13 @@ Commands (CLI, MCP, control channel):
   Adaptive Resolution drops to while you drag, and adaptive playback while it plays)
 - `previews.cacheFramesWhenIdle`: Cache Frames When Idle (Composition ▸ Preview): after a second
   without input or edits, the viewer renders the work area into the RAM preview in the
-  background, from the current time on, until it is cached or the budget is full
+  background, from the current time on, until it is cached or the budget is full (then into
+  the disk cache). It is meant to stay on without slowing the machine down: one frame renders at
+  a time, on its own few threads (`memory.idleCacheCores`) whose parallel pixel loops stay
+  there, at background priority (macOS utility QoS), after the viewer's frame and playback. It
+  waits while the system is short of memory (macOS memory pressure Warning or Critical, the
+  system low on memory, or less memory available than `memory.ramReservedGb`; the desktop app
+  reads it every 5 s while this is on) and goes on when memory frees up
 - `previews.fastPreviews`: Fast Previews (Draft 3D, Faster Effects)
 - `appearance.appearanceMode`: Appearance Mode (`auto` / `dark` / `light`). `auto` (Sync with System) follows the operating system's light or dark appearance while the app runs: on Linux the desktop app reads the XDG desktop portal (`org.freedesktop.appearance` `color-scheme`) once and then listens for its `SettingChanged` signal on a worker thread, repainting only when the value changes (nothing polls); `gsettings` runs at most once at start-up, by absolute path, when the portal gives no answer. Elsewhere it uses what the window system reports. With no answer it shows the dark theme. New installs stay `dark`; Sync with System is opt-in. The Tools bar's appearance button (a monitor, sun or moon) cycles Sync with System, Light and Dark (`view.theme.toggle`, Next Appearance Mode).
 - `appearance.darkTheme`: Dark Theme (`dark` / `darker`), shown in dark appearance
@@ -156,6 +162,9 @@ Commands (CLI, MCP, control channel):
 - `memory.ramReservedGb`: the cache budgets together leave this much physical memory free
 - `memory.reduceCacheWhenLow`: cache budgets halve while the system is low on memory (checked
   every 30 s by the desktop app, on a background thread)
+- `memory.idleCacheCores`: CPU Cores for Cache Frames When Idle (0 = automatic: a quarter of the
+  cores, 1 to 4; otherwise that many, up to the cores there are). The viewer and playback keep
+  every core
 - `video.enableOutput`, `video.device`, `video.outputDuringPlayback`, `video.mirrorOnMonitor`,
   `video.disableWhenBackground`: Video Preview, a second window (or full screen on the display
   it is on) showing the composition frame, Mercury Transmit-style

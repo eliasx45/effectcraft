@@ -293,6 +293,10 @@ page!(Memory {
     /// RAM preview (viewer frame) cache budget (MB).
     preview_cache_mb: u32 = 3072,
     reduce_cache_when_low: bool = true,
+    /// CPU cores Cache Frames When Idle renders on (0 = automatic: a quarter of them, 1 to 4).
+    /// Its frames run on their own threads at background priority, so the viewer, playback and
+    /// other apps come first.
+    idle_cache_cores: u32 = 0,
 });
 
 page!(Video {
@@ -1439,6 +1443,8 @@ pub fn pages() -> Vec<Page> {
                 s("memory.mediaCacheMb", "Footage Frame Cache", Kind::Int(64, 1 << 20, "MB"), true),
                 s("memory.previewCacheMb", "Preview (RAM) Cache", Kind::Int(64, 1 << 20, "MB"), true),
                 s("memory.reduceCacheWhenLow", "Reduce Cache Size When System Is Low on Memory", B, true),
+                Section("CPU"),
+                s("memory.idleCacheCores", "CPU Cores for Cache Frames When Idle (0 = Automatic)", Kind::Int(0, 256, "cores"), true),
             ],
         },
         Page {

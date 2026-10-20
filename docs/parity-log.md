@@ -1163,3 +1163,16 @@ before.
   while Character Value uses it), and the four Gradient Fill properties. Fixed properties
   (a selector's Start / End / Offset, Transform, Source Text…) are refused with an error. One
   undo step; the removed properties and their keyframes leave the selection.
+
+## Update: Cache Frames When Idle without slowing the machine (20 October 2026)
+
+- Cache Frames When Idle rendered up to half the frame threads' worth of frames at normal
+  priority, and each frame's parallel pixel loops (blurs, shadows, quantisation) ran on every
+  core: 300–470 % CPU on the owner's Mac while the app sat idle, and the whole machine lagged.
+  Now one idle frame renders at a time inside its own small Rayon pool (a quarter of the cores,
+  1 to 4, or Memory & CPU ▸ CPU Cores for Cache Frames When Idle), whose threads run at macOS
+  utility QoS (`effectcraft_platform::background_thread`, ADR 0001 amendment); the viewer's
+  frame and playback keep every core and go first. It waits while the system is short of memory
+  (macOS memory pressure, low memory, or less available than RAM Reserved for Other
+  Applications, read every 5 s while it is on) and goes on when memory frees up, the disk-cache
+  phase included.

@@ -17,7 +17,10 @@
 //!   doesn't match the sample entry) is decoded by the software decoder instead. ProRes is
 //!   intra-only, so there is nothing to replay.
 //!
-//! This is the one crate allowed to use `unsafe` (OS FFI), and only in its FFI module
+//! [`background_thread`] lowers a thread to background quality of service (macOS), for the
+//! threads Cache Frames When Idle renders on.
+//!
+//! This is the one crate allowed to use `unsafe` (OS FFI), and only in its FFI modules
 //! (docs/adr/0001-platform-ffi.md).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
@@ -26,6 +29,9 @@
 mod convert;
 #[cfg(target_os = "macos")]
 pub mod prores;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod qos;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod videotoolbox;
@@ -56,6 +62,20 @@ pub fn register() -> Availability {
     #[cfg(not(target_os = "macos"))]
     {
         Availability::Unavailable("hardware ProRes decoding needs macOS")
+    }
+}
+
+/// Lower the calling thread's priority for background work that nobody waits for (Cache Frames
+/// When Idle): on macOS utility quality of service, so the UI, playback and other apps run first
+/// and it prefers efficiency cores. Elsewhere it does nothing. Whether it was lowered.
+pub fn background_thread() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        qos::utility()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 
