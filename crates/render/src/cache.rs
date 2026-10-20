@@ -2096,6 +2096,27 @@ fn reads_other_times(layer: &Layer) -> bool {
         })
 }
 
+/// Does the layer have an animated mask that motion blur may draw at other times (Layer ▸ Mask ▸
+/// Motion Blur On, or Same As Layer with the layer blurred)?
+fn mask_motion_blur(ctx: &EvalCtx, layer: &Layer, blur: bool) -> bool {
+    use effectcraft_project::{GroupKind, MaskMotionBlur};
+    fn animated(g: &PropGroup) -> bool {
+        g.children.iter().any(|c| match c {
+            Node::Prop(p) => !p.keys.is_empty() || p.has_expression(),
+            Node::Group(sub) => animated(sub),
+        })
+    }
+    ctx.comp.enable_motion_blur
+        && layer.masks().is_some_and(|m| {
+            m.groups().any(|g| match g.kind {
+                GroupKind::Mask { motion_blur, .. } => {
+                    (motion_blur == MaskMotionBlur::On || (motion_blur == MaskMotionBlur::SameAsLayer && blur)) && animated(g)
+                }
+                _ => false,
+            })
+        })
+}
+
 /// Does any property of `g` have an expression (other than a literal constant, which reads
 /// nothing)?
 fn has_expression(g: &PropGroup) -> bool {
@@ -2248,6 +2269,11 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
         for g in fx.groups().filter(|g| g.enabled && effectcraft_effects::paint::is_paint(g)) {
             effectcraft_effects::paint::cache_key(g, lt).0.hash(&mut h);
         }
+    }
+    // Mask motion blur draws animated masks at the shutter's other times too: their values at
+    // this time don't tell two frames apart (a hold before a move).
+    if mask_motion_blur(ctx, layer, blur) {
+        layer.layer_time(ctx.time).0.hash(&mut h);
     }
     if info.time_dependent && (effects != Some(0) || time_dependent(layer, false)) {
         layer.layer_time(ctx.time).0.hash(&mut h);
