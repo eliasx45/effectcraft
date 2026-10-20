@@ -928,12 +928,15 @@ impl LayerCache {
                 // Its owner is stuck (a wait for one of its renders ran out): render it here
                 // rather than wait for each of its renders in turn.
                 Some(f) if pool && m.stalled.contains_key(&f.owner.id()) => return Claim::Render,
+                // A background render (Cache Frames When Idle) runs on a few low-priority
+                // threads: the viewer and playback render it themselves rather than wait.
+                Some(f) if f.background && !BACKGROUND.get() => return Claim::Render,
                 Some(f) => f.clone(),
                 None => {
                     if m.map.len() >= 4096 || m.map.try_reserve(1).is_err() {
                         return Claim::Render;
                     }
-                    let f = Arc::new(Flight { owner: me, done: Mutex::new(false), cv: Condvar::new() });
+                    let f = Arc::new(Flight { owner: me, background: BACKGROUND.get(), done: Mutex::new(false), cv: Condvar::new() });
                     m.map.insert(key, f.clone());
                     return Claim::Owner(FlightGuard { inflight: Arc::downgrade(&self.inflight), key, flight: f });
                 }
@@ -1051,9 +1054,25 @@ pub fn wait_timeouts() -> u64 {
 /// How long any other thread waits.
 const WAIT_OTHER: std::time::Duration = std::time::Duration::from_secs(30);
 
+thread_local! {
+    /// This thread renders background work ([`set_background_thread`]).
+    static BACKGROUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the calling thread as one that renders background work nobody waits for (Cache Frames
+/// When Idle's low-priority threads): other threads never wait for a layer it is rendering
+/// ([`LayerCache::claim`] tells them to render it themselves), so a viewer or playback frame
+/// never waits on a slow background render. Background threads still wait for each other and
+/// for anyone else.
+pub fn set_background_thread() {
+    BACKGROUND.set(true);
+}
+
 /// A key being rendered.
 struct Flight {
     owner: std::thread::Thread,
+    /// Its owner is a background thread ([`set_background_thread`]).
+    background: bool,
     done: Mutex<bool>,
     cv: Condvar,
 }
@@ -2291,6 +2310,44 @@ mod retained_tests {
 mod tests_stalled_owner {
     use super::*;
     use std::time::Instant;
+
+    /// A layer a background thread is rendering: a foreground thread renders it itself at
+    /// once, another background thread waits for it.
+    #[test]
+    fn nobody_waits_for_a_background_render_but_background_threads() {
+        let cache = Arc::new(LayerCache::new(1 << 20));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let owner = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                set_background_thread();
+                let c = cache.claim(1);
+                assert!(matches!(c, Claim::Owner(_)));
+                held_tx.send(()).unwrap();
+                rx.recv().unwrap();
+                drop(c);
+            })
+        };
+        held_rx.recv().unwrap();
+        let t0 = Instant::now();
+        assert!(matches!(cache.claim(1), Claim::Render), "the viewer renders it itself");
+        assert!(t0.elapsed() < WAIT_POOL, "without waiting ({:?})", t0.elapsed());
+        let waiter = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                set_background_thread();
+                let t0 = Instant::now();
+                let c = cache.claim(1);
+                (matches!(c, Claim::Render), t0.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        tx.send(()).unwrap();
+        let (_, waited) = waiter.join().unwrap();
+        assert!(waited >= std::time::Duration::from_millis(100), "another background thread waited ({waited:?})");
+        owner.join().unwrap();
+    }
 
     /// A pool thread whose wait for another thread's render ran out doesn't wait for that
     /// owner's other renders until the one it gave up on ends: with a 250 ms wait per layer

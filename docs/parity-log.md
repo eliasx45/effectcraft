@@ -1176,3 +1176,8 @@ before.
   (macOS memory pressure, low memory, or less available than RAM Reserved for Other
   Applications, read every 5 s while it is on) and goes on when memory frees up, the disk-cache
   phase included.
+- Nothing interactive waits for an idle frame: the viewer or playback asking for the frame being
+  idle-rendered calls that render off and renders it at full speed (the idle render ends as an
+  orphan that frees only its idle slot), and a layer an idle thread is rendering is rendered
+  again by a viewer or playback frame instead of waited for
+  (`effectcraft_render::cache::set_background_thread`).

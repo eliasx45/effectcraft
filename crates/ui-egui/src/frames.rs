@@ -1694,7 +1694,17 @@ impl Frames {
                 }
             }
         }
-        if !inf.insert(key) {
+        // Rendering as an idle frame (a few low-priority threads): call that render off and render
+        // the frame again at this request's priority, so the viewer and playback never wait for
+        // it. The idle render becomes an orphan: the new job owns the key ([`Worker::release_seq`]).
+        let running_idle = q.idle.get(&key).filter(|(s, _)| !q.orphans.contains(s)).map(|(s, c)| (*s, c.clone()));
+        let promote = !idle && running_idle.is_some() && !q.jobs.iter().any(|j| j.key == key);
+        if promote && let Some((seq, cancel)) = running_idle {
+            cancel.store(true, Ordering::Relaxed);
+            q.orphans.insert(seq);
+            q.running.remove(&key);
+        }
+        if !promote && !inf.insert(key) {
             // Queued for the disk only: now wanted in RAM too. Queued by Cache Frames When Idle:
             // now wanted by playback or the viewer, at their priority.
             if let Some(j) = q.jobs.iter_mut().find(|j| j.key == key) {
@@ -2101,7 +2111,7 @@ impl Worker {
                 q.urgent_cancels.push((job.key, job.cancel.clone()));
             }
             if job.idle {
-                q.idle.insert(job.key);
+                q.idle.insert(job.key, (job.seq, job.cancel.clone()));
             }
             job
         };
@@ -2134,7 +2144,7 @@ impl Worker {
                 .lock()
                 .is_ok_and(|mut c| (c.map.contains_key(&job.key) && !c.drafts.contains(&job.key)) || job.print.is_some_and(|p| c.adopt(job.key, p)))
             {
-                self.release(job.key, job.urgent);
+                self.done(&job);
                 return true;
             }
         }
@@ -2152,7 +2162,7 @@ impl Worker {
         });
         if job.disk_only && disk.as_ref().is_none_or(|(dc, k)| dc.contains(disk_cache::Kind::Frame, *k)) {
             // Already on disk (or no disk cache any more): nothing to do.
-            self.release(job.key, false);
+            self.done(&job);
             return true;
         }
         let from_disk = disk.as_ref().and_then(|(dc, k)| dc.get_frame(*k));
@@ -2167,13 +2177,13 @@ impl Worker {
                 // Called off (frames it read may be missing): not cached, and the viewer asks
                 // for it again if it still wants it.
                 _ if job.called_off() => {
-                    self.release(job.key, job.urgent);
+                    self.done(&job);
                     return true;
                 }
                 Some(Rendered::Image(ci)) => ci,
                 None => {
                     // Not "in progress" forever; not asked for again until the project changes.
-                    self.give_up(job.key, job.urgent);
+                    self.give_up_job(&job);
                     return true;
                 }
             },
@@ -2207,7 +2217,7 @@ impl Worker {
             if let (Some((dc, k)), FrameImage::Cpu(img)) = (&tail.disk, &ci) {
                 dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
             }
-            self.release(job.key, false);
+            self.done(job);
             return;
         }
         // Publish the shared frame and wake the viewer first; the disk cache's writer thread
@@ -2249,16 +2259,16 @@ impl Worker {
 
     /// Store a finished frame and release its job.
     fn finish(&self, job: &Job, img: FrameImage, t0: web_time::Instant) {
-        self.finish_print(job.key, job.urgent, img, t0, job.print);
+        self.finish_print(job.key, job.urgent, img, t0, job.print, Some(job.seq));
     }
 
     #[cfg(test)]
     fn finish_key(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant) {
-        self.finish_print(key, urgent, img, t0, None);
+        self.finish_print(key, urgent, img, t0, None, None);
     }
 
     /// Store a finished frame, stamped with its fingerprint if it has one, and release its job.
-    fn finish_print(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant, print: Option<u64>) {
+    fn finish_print(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant, print: Option<u64>, seq: Option<u64>) {
         if urgent && let Ok(mut l) = self.last.lock() {
             *l = t0.elapsed().as_secs_f64() * 1000.0;
         }
@@ -2272,7 +2282,7 @@ impl Worker {
                 c.prints.stamp(key, p);
             }
         }
-        self.release(key, urgent);
+        self.release_seq(key, urgent, seq);
     }
 
     /// Hand queued frames to the remote renderer while it has free slots, most important first
@@ -2323,7 +2333,7 @@ impl Worker {
             };
             if job.disk_only && (!remote.disk() || remote.eager()) {
                 // Queued for this machine's disk cache before the frames went remote.
-                self.release(job.key, job.urgent);
+                self.done(&job);
                 continue;
             }
             // The GPU compositor here keeps the frame on the GPU, but runs layer effects on the
@@ -2374,7 +2384,7 @@ impl Worker {
             if let Ok(mut b) = link.busy.lock() {
                 *b = b.saturating_sub(1);
             }
-            self.release(job.key, job.urgent);
+            self.done(&job);
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint();
             }
@@ -2438,7 +2448,7 @@ impl Worker {
                     // Purge Caches since it was asked for: its pixels may be from before.
                     Ok(_) if fw.epoch.load(Ordering::Acquire) != epoch => fw.release(key, urgent),
                     Ok(img) => {
-                        fw.finish_print(key, urgent, FrameImage::Cpu(Arc::new(img)), t0, print);
+                        fw.finish_print(key, urgent, FrameImage::Cpu(Arc::new(img)), t0, print, None);
                         if urgent && let Ok(mut l) = next.latest.lock() {
                             // Never move back to an older frame finishing late.
                             if l.is_none_or(|old| old.comp != key.comp || old.revision <= key.revision) {
@@ -2461,6 +2471,16 @@ impl Worker {
         );
     }
 
+    /// The render of `job` failed: remember it (see [`Frames::failed`]) and release the job.
+    fn give_up_job(&self, job: &Job) {
+        // An orphaned idle frame failed (called off): the job that took its key over decides.
+        if self.queue.lock().is_ok_and(|q| q.orphans.contains(&job.seq)) {
+            self.done(job);
+            return;
+        }
+        self.give_up(job.key, job.urgent);
+    }
+
     /// The render of `key` failed: remember it (see [`Frames::failed`]) and release the job.
     fn give_up(&self, key: FrameKey, urgent: bool) {
         if let Ok(mut f) = self.failed.lock() {
@@ -2474,22 +2494,37 @@ impl Worker {
 
     /// The job of `key` is no longer queued or running (rendered or dropped).
     fn release(&self, key: FrameKey, urgent: bool) {
-        if let Ok(mut inf) = self.inflight.lock() {
-            inf.remove(&key);
-        }
+        self.release_seq(key, urgent, None);
+    }
+
+    /// [`Worker::release`] for `job` (an idle frame the viewer took over leaves the key alone).
+    fn done(&self, job: &Job) {
+        self.release_seq(job.key, job.urgent, Some(job.seq));
+    }
+
+    /// [`Worker::release`] for the job numbered `seq` (`None`: whichever has the key). An orphaned
+    /// idle frame ([`Queue::orphans`]) only frees its idle slot: the key belongs to the job that
+    /// took it over.
+    fn release_seq(&self, key: FrameKey, urgent: bool, seq: Option<u64>) {
         let mut restart = false;
+        let mut orphan = false;
         if let Ok(mut q) = self.queue.lock() {
-            q.running.remove(&key);
-            q.idle.remove(&key);
-            q.remote_running.remove(&key);
-            if urgent {
-                q.urgent_running = q.urgent_running.saturating_sub(1);
+            orphan = seq.is_some_and(|s| q.orphans.remove(&s));
+            if q.idle.get(&key).is_some_and(|(s, _)| seq.is_none_or(|seq| *s == seq)) {
+                q.idle.remove(&key);
+            }
+            if !orphan {
+                q.running.remove(&key);
+                q.remote_running.remove(&key);
+                if urgent {
+                    q.urgent_running = q.urgent_running.saturating_sub(1);
+                    if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
+                        q.urgent_cancels.swap_remove(i);
+                    }
+                }
                 if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
                     q.urgent_cancels.swap_remove(i);
                 }
-            }
-            if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
-                q.urgent_cancels.swap_remove(i);
             }
             // A job that waited for memory starts now (one per finished frame).
             if q.parked > 0 && !q.jobs.is_empty() {
@@ -2498,6 +2533,9 @@ impl Worker {
             } else if q.jobs.is_empty() {
                 q.parked = 0;
             }
+        }
+        if !orphan && let Ok(mut inf) = self.inflight.lock() {
+            inf.remove(&key);
         }
         #[cfg(not(target_arch = "wasm32"))]
         if restart {
@@ -2516,13 +2554,15 @@ impl Worker {
     fn requeue(&self, mut job: Job) {
         if job.called_off() {
             // The viewer no longer waits for it (#329).
-            self.release(job.key, job.urgent);
+            self.done(&job);
             return;
         }
         {
             let Ok(mut q) = self.queue.lock() else { return };
             q.running.remove(&job.key);
-            q.idle.remove(&job.key);
+            if q.idle.get(&job.key).is_some_and(|(s, _)| *s == job.seq) {
+                q.idle.remove(&job.key);
+            }
             if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == job.key) {
                 q.urgent_cancels.swap_remove(i);
             }
@@ -2546,9 +2586,9 @@ impl Worker {
         let Retry { gpu, auto, tail } = retry;
         let attempt = |f: &dyn Fn() -> Rendered| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
         match attempt(&|| self.display_fallback(&job, &gpu, auto)).or_else(|| attempt(&|| self.render_job(&job, false, None))) {
-            _ if job.called_off() => self.release(job.key, job.urgent),
+            _ if job.called_off() => self.done(&job),
             Some(Rendered::Image(ci)) => self.publish(&job, ci, &tail, false, std::time::Duration::ZERO),
-            _ => self.give_up(job.key, job.urgent),
+            _ => self.give_up_job(&job),
         }
     }
 
@@ -2939,8 +2979,11 @@ struct Retry {
 struct Queue {
     jobs: Vec<Job>,
     running: HashSet<FrameKey>,
-    /// The running idle frames ([`Job::idle`]).
-    idle: HashSet<FrameKey>,
+    /// The running idle frames ([`Job::idle`]): their job's `seq` and how to call them off.
+    idle: HashMap<FrameKey, (u64, Arc<AtomicBool>)>,
+    /// Running idle frames (by `seq`) whose key the viewer or playback took over with a job of
+    /// its own (see [`Frames::request_with`]): they end without touching the key's bookkeeping.
+    orphans: HashSet<u64>,
     urgent_running: usize,
     /// The running viewer (urgent) frames and how to call them off.
     urgent_cancels: Vec<(FrameKey, Arc<AtomicBool>)>,
@@ -3499,7 +3542,7 @@ mod tests {
         // One idle frame renders at a time; prefetch and the viewer's frame still start.
         assert!(q.can_start(&job(1, false, true, 1)));
         q.running.insert(key(1, 9, 0));
-        q.idle.insert(key(1, 9, 0));
+        q.idle.insert(key(1, 9, 0), (9, Arc::default()));
         assert!(!q.can_start(&job(1, false, true, 1)), "a second idle frame waits");
         assert!(q.can_start(&job(2, false, false, 2)));
         assert!(q.can_start(&job(3, true, false, 3)));
@@ -3515,6 +3558,35 @@ mod tests {
         f.request(&src, k, ItemId(1), Tick::ZERO, opts);
         assert!(f.queue.lock().unwrap().jobs.iter().any(|j| j.key == k && !j.idle), "wanted by playback now");
         assert_eq!(f.idle_slots(), IDLE_FRAMES + 1);
+
+        // The viewer asks for the frame an idle render is rendering: that render is called off
+        // and the frame renders again at the viewer's priority, without waiting for it.
+        let k = key(1, 6, 0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut q = f.queue.lock().unwrap();
+            q.running.insert(k);
+            q.idle.insert(k, (77, cancel.clone()));
+        }
+        f.inflight.lock().unwrap().insert(k);
+        f.request_urgent(&src, k, ItemId(1), Tick::ZERO, opts);
+        assert!(cancel.load(Ordering::Relaxed), "the idle render is called off");
+        assert!(f.queue.lock().unwrap().orphans.contains(&77));
+        // (The viewer's job is queued, or already rendering: this comp doesn't exist, so it fails.)
+        let w = f.worker();
+        // The orphan ends: it frees its idle slot and leaves the key to the viewer's job.
+        let orphan = Job { key: k, seq: 77, cancel, ..job(6, false, true, 77) };
+        w.give_up_job(&orphan);
+        let q = f.queue.lock().unwrap();
+        assert!(q.orphans.is_empty() && !q.idle.contains_key(&k), "its idle slot is free");
+        drop(q);
+        for _ in 0..2000 {
+            if !f.inflight.lock().unwrap().contains(&k) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!f.inflight.lock().unwrap().contains(&k), "the viewer's job ended and released the key");
     }
 
     fn key(content: u64, frame: i64, opts: u64) -> FrameKey {

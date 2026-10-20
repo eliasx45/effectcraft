@@ -63,7 +63,10 @@ Commands (CLI, MCP, control channel):
   background, from the current time on, until it is cached or the budget is full (then into
   the disk cache). It is meant to stay on without slowing the machine down: one frame renders at
   a time, on its own few threads (`memory.idleCacheCores`) whose parallel pixel loops stay
-  there, at background priority (macOS utility QoS), after the viewer's frame and playback. It
+  there, at background priority (macOS utility QoS), after the viewer's frame and playback. Nothing
+  interactive waits for it: the viewer or playback asking for the frame it is rendering calls
+  that render off and renders the frame at full speed, and a layer it is rendering is rendered
+  again rather than waited for. It
   waits while the system is short of memory (macOS memory pressure Warning or Critical, the
   system low on memory, or less memory available than `memory.ramReservedGb`; the desktop app
   reads it every 5 s while this is on) and goes on when memory frees up

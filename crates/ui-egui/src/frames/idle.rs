@@ -10,6 +10,13 @@
 //! (macOS utility QoS), so the UI, playback and other apps run first. The viewer's frame and
 //! playback keep the frame threads and the global pool, and go first in the queue.
 //!
+//! Nothing interactive ever waits for an idle frame, which renders slowly on purpose:
+//! - the viewer or playback asking for the frame that is rendering as an idle frame calls that
+//!   render off and renders the frame again at its own priority (`Frames::request_with`; the idle
+//!   render is an orphan that frees only its idle slot when it ends);
+//! - a layer an idle thread is rendering is rendered again by a viewer or playback frame that
+//!   needs it, not waited for (`effectcraft_render::cache::set_background_thread`).
+//!
 //! Inside the pool an idle frame runs on a Rayon worker, so a layer it waits for (another frame
 //! rendering it) is waited for at most the pool's short wait (`effectcraft_render::cache`); with
 //! one idle frame at a time, no other idle frame is ever started inside its parallel loops.
@@ -61,6 +68,8 @@ impl IdlePool {
                 .num_threads(threads)
                 .thread_name(|i| format!("ec-idle-{i}"))
                 .start_handler(|_| {
+                    // Nobody else waits for a layer these threads are rendering.
+                    effectcraft_engine::render::cache::set_background_thread();
                     if let Some(hook) = THREAD_START.get() {
                         hook();
                     }
