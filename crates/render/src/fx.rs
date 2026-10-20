@@ -364,6 +364,18 @@ impl<'a> Renderer<'a> {
                 "ec.blur.fastbox" => (p.f("radius").max(0.0) * c + px) * p.f("iterations").round().clamp(1.0, 50.0),
                 "ec.blur.directional" => p.f("length").abs() * c,
                 "ec.stylize.glow" => 4.0 * (p.f("radius").max(0.0) * effectcraft_effects::GLOW_SIGMA_PER_RADIUS * c).max(0.5 * px),
+                // The shadow moves by Distance and its blur (σ = Softness / 2) reaches 3σ.
+                "ec.perspective.dropshadow" => p.f("distance").abs() + 1.5 * p.f("softness").max(0.0) + 2.0 * px,
+                // The glow's widest Gaussian stays well inside 1.5 × Radius (its largest pad);
+                // a Mask Layer is fitted to the buffer, so it keeps the whole canvas.
+                "ec.stylize.deepglow" => {
+                    if p.get("PEDG-0056").and_then(|v| v.as_layer()).is_some() {
+                        return None;
+                    }
+                    1.5 * p.f("PEDG-0001").max(0.0) + 2.0 * px
+                }
+                // Shade or recolour the layer's own pixels: transparent ones stay transparent.
+                "ec.perspective.bevelalpha" | "ec.generate.fill" => 0.0,
                 "ec.blur.ccradialfast" => {
                     // A pixel averages the source on its way to Center, at most halfway there:
                     // what it shows lies at most 1 / (1 − Amount/200) times as far out.
@@ -553,7 +565,7 @@ pub(crate) fn fx_comp_px_3d(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
     if !layer.switches.collapse || !layer.is_3d() || !matches!(layer.source, LayerSource::Shape | LayerSource::Text) {
         return None;
     }
-    let h = ctx.layer_to_comp(layer).0 .0;
+    let h = ctx.layer_to_comp(layer).0.0;
     let a = layer.transform().map(|tr| ctx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
     // The homography's Jacobian at the anchor: d(x', y') / d(x, y).
     let w = h[2][0] * a[0] + h[2][1] * a[1] + h[2][2];
@@ -576,7 +588,9 @@ const COMP_PX_EFFECTS: &[&str] = &["ec.blur.gaussian", "ec.blur.fastbox", "ec.st
 /// Does the layer run an effect sized in comp pixels ([`COMP_PX_EFFECTS`])?
 pub(crate) fn sizes_in_comp_px(layer: &Layer) -> bool {
     layer.switches.effects
-        && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if COMP_PX_EFFECTS.contains(&effect.as_str()))))
+        && layer
+            .effects()
+            .is_some_and(|fx| fx.groups().any(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if COMP_PX_EFFECTS.contains(&effect.as_str()))))
 }
 
 /// Layer units per comp pixel of a layer whose effects size things in comp pixels: a 2D one in

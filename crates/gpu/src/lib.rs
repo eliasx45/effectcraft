@@ -615,6 +615,8 @@ mod tests_adv3d;
 #[cfg(test)]
 mod tests_box;
 #[cfg(test)]
+mod tests_canvas_support;
+#[cfg(test)]
 mod tests_codes;
 #[cfg(test)]
 mod tests_deferred;

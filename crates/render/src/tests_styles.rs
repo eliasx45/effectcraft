@@ -754,8 +754,12 @@ fn a_fading_transform_effect_keeps_text_on_its_glyph_buffer() {
 /// Blurs, Glow and CC Radial Fast Blur on a text layer run on the part of the comp-sized effect
 /// canvas they can reach (`Renderer::canvas_support`), with the frame the whole canvas gives:
 /// 2D and a 3D Continuously Rasterized layer at a raster scale over 1 (P01 Clock's circle).
+/// The canvas tests flip [`crate::fx::WHOLE_TEXT_CANVAS`]: one at a time.
+static CANVAS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn blurs_and_glows_run_on_the_reachable_part_of_the_text_canvas() {
+    let _serial = CANVAS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     use crate::fx::WHOLE_TEXT_CANVAS;
     use crate::{EvalCtx, NoFootage, RenderOpts, Renderer};
     use effectcraft_keyframe::TextDoc;
@@ -811,6 +815,87 @@ fn blurs_and_glows_run_on_the_reachable_part_of_the_text_canvas() {
             assert!(shrunk, "3D {three_d}, radial {radial}, at {scale}: {small} vs {big} px");
             let worst = whole.data.iter().zip(&part.data).flat_map(|(a, b)| (0..4).map(move |i| (a[i] - b[i]).abs())).fold(0.0f32, f32::max);
             assert!(worst <= 1.0 / 255.0, "3D {three_d}, radial {radial}, at {scale}: differs by {worst}");
+        }
+    }
+}
+
+/// Drop Shadow, Deep Glow, Bevel Alpha and Fill on a text or shape layer run on the part of the
+/// comp-sized effect canvas they can reach (`Renderer::canvas_support`), with the frame the whole
+/// canvas gives: each alone and stacked as on 10-10's captions (Deep Glow, two Drop Shadows,
+/// Bevel Alpha), 2D and a 3D Continuously Rasterized layer scaled up.
+#[test]
+fn shadows_deep_glow_and_bevel_run_on_the_reachable_part_of_the_canvas() {
+    let _serial = CANVAS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    use crate::fx::WHOLE_TEXT_CANVAS;
+    use crate::{EvalCtx, NoFootage, RenderOpts, Renderer};
+    use effectcraft_keyframe::TextDoc;
+    use std::sync::atomic::Ordering;
+    let shadow = |d: f64, s: f64| ("ec.perspective.dropshadow", vec![("distance", Value::Scalar(d)), ("softness", Value::Scalar(s))]);
+    let glow = ("ec.stylize.deepglow", vec![("PEDG-0001", Value::Scalar(24.0))]);
+    let bevel = ("ec.perspective.bevelalpha", vec![("edgeThickness", Value::Scalar(3.0))]);
+    let fill = ("ec.generate.fill", vec![("color", Value::Color([0.2, 0.9, 0.4, 1.0]))]);
+    let stacks = vec![vec![shadow(12.0, 20.0)], vec![glow.clone()], vec![bevel.clone(), fill.clone()], vec![glow, shadow(4.0, 9.0), shadow(0.0, 30.0), bevel]];
+    for (n, stack) in stacks.iter().enumerate() {
+        for (text, three_d) in [(true, false), (true, true), (false, false), (false, true)] {
+            let mut p = Project::default();
+            let comp = Comp::new(400, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+            let src = if text { LayerSource::Text } else { LayerSource::Shape };
+            let mut l = build::layer(&mut p, &comp, "L", src, (400, 200), None);
+            let mut next = p.next_id;
+            if text {
+                l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "Ok".into(), size: 30.0, ..Default::default() }));
+            } else {
+                let mut ids = Ids(&mut next);
+                let items = vec![build::shape_rect(&mut ids, [40.0, 26.0], [0.0, 0.0], 6.0), build::shape_fill(&mut ids, [0.9, 0.6, 0.2, 1.0])];
+                let g = build::shape_group(&mut ids, "R", items);
+                l.props.sub_mut("contents").unwrap().children.push(g.into());
+            }
+            l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.7, 90.3, 0.0]);
+            if three_d {
+                l.switches.three_d = true;
+                l.switches.collapse = true;
+                l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([180.0, 180.0, 100.0]);
+            }
+            for (id, set) in stack {
+                let spec = effectcraft_effects::find(id).unwrap();
+                let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
+                for (k, v) in set {
+                    g.prop_mut(k).unwrap().value = v.clone();
+                }
+                l.props.sub_mut("effects").unwrap().children.push(g.into());
+            }
+            p.next_id = next;
+            let bg = solid(&mut p, &comp, [0.3, 0.4, 0.5], 400, 200);
+            p.comp_mut(cid).unwrap().layers = vec![l, bg].into();
+            let c = p.comp(cid).unwrap();
+            let layer = c.layers.iter().next().unwrap();
+            let area = |scale: f64| {
+                let r = Renderer::new(&p, &NoFootage, RenderOpts { scale, ..Default::default() });
+                let b = r.content_buf(&EvalCtx::new(&p, cid, c, Tick::ZERO), layer).unwrap();
+                b.img.width as u64 * b.img.height as u64
+            };
+            for scale in [1.0, 0.5] {
+                let at = format!("stack {n}, text {text}, 3D {three_d}, at {scale}");
+                WHOLE_TEXT_CANVAS.store(true, Ordering::Relaxed);
+                let whole = render_frame(&p, cid, Tick::ZERO, scale);
+                let big = area(scale);
+                WHOLE_TEXT_CANVAS.store(false, Ordering::Relaxed);
+                let part = render_frame(&p, cid, Tick::ZERO, scale);
+                let small = area(scale);
+                // The whole caption stack reaches most of this small comp.
+                let shrunk = if stack.len() > 2 { small < big } else { small * 3 < big * 2 };
+                assert!(shrunk, "{at}: {small} vs {big} px");
+                // One 8-bit step at most (the float sums round either way). Deep Glow's
+                // Downsample pass resamples the whole canvas and its Dither follows buffer
+                // pixels, so its halo may move by two steps on a few pixels.
+                let deep = stack.iter().any(|(id, _)| *id == "ec.stylize.deepglow");
+                let (steps, share) = if deep { (2.0, 100) } else { (1.0, 1000) };
+                let diffs: Vec<f32> = whole.data.iter().zip(&part.data).flat_map(|(a, b)| (0..4).map(move |i| (a[i] - b[i]).abs())).collect();
+                let worst = diffs.iter().copied().fold(0.0f32, f32::max);
+                let off = diffs.iter().filter(|d| **d > 1e-6).count();
+                assert!(worst <= steps / 255.0 + 1e-6 && off * share <= diffs.len(), "{at}: differs by {worst} on {off} of {} channels", diffs.len());
+            }
         }
     }
 }
