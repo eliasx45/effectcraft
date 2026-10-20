@@ -12,7 +12,7 @@ use effectcraft_time::{FrameRate, Tick};
 use crate::{Image, LayerCache, NoFootage, RenderOpts, Renderer};
 
 /// The tests flip the process-wide switch: one at a time.
-static SERIAL: Mutex<()> = Mutex::new(());
+pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
 
 fn s(t: f64) -> Tick {
     Tick::from_seconds_f64(t)

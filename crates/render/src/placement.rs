@@ -358,6 +358,26 @@ impl<'a> Renderer<'a> {
                 }
                 "ec.stylize.glow" => 3.0 * (p.f("radius") * effectcraft_effects::GLOW_SIGMA_PER_RADIUS * c).max(0.5 * px) + 3.0 * px,
                 "ec.perspective.dropshadow" => (p.f("distance") + p.f("softness") * 1.5).max(0.0) + 3.0 * px,
+                // What it paints, or its pad (up to 1.5 × Radius) when that is larger.
+                "ec.stylize.deepglow" => crate::fx::deep_glow_reach(&p, scale)?.max(1.5 * p.f("PEDG-0001").max(0.0)) + px,
+                // Shades the layer's own pixels from its alpha blurred over 1.5 × Edge Thickness.
+                "ec.perspective.bevelalpha" => {
+                    if reach {
+                        1.5 * p.f("edgeThickness").max(0.0) + 3.0 * px
+                    } else {
+                        0.0
+                    }
+                }
+                "ec.generate.fill" => 0.0,
+                // Per-pixel paint placed in layer (or comp) coordinates; Light Sweep's edge light
+                // reads the alpha within Edge Thickness, shifted by it. They fill the comp-sized
+                // canvas of a text or shape layer, which isn't a known growth.
+                "ec.generate.gradientramp" | "ec.generate.cclightsweep" => {
+                    if !reach && matches!(layer.source, LayerSource::Text | LayerSource::Shape) {
+                        return None;
+                    }
+                    if spec.id == "ec.generate.cclightsweep" { 2.0 * p.f("edgeThickness").clamp(0.0, 1000.0) * c + 3.0 * px } else { 0.0 }
+                }
                 // Per-pixel colour changes and Expression Controls: the buffer as it is.
                 "ec.color.levels"
                 | "ec.color.curves"

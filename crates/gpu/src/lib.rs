@@ -689,6 +689,8 @@ mod tests_shape_clip;
 #[cfg(test)]
 mod tests_traffic_light;
 #[cfg(test)]
+mod tests_view_clip;
+#[cfg(test)]
 mod tests_warmup;
 
 mod yuv;

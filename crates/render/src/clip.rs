@@ -55,10 +55,11 @@ pub fn set_precomp_clip(on: bool) {
 }
 
 impl<'a> Renderer<'a> {
-    /// The window of a shape layer's whole raster buffer (see [`crate::shapes::buffer_rect`]) to
-    /// rasterise: what can reach this nested comp's frame. `None` draws the whole buffer: content
-    /// that held still over the last frames (cached whole, it is drawn once), a top-level,
-    /// collapsed or Layer panel render, a 3D, stencil, adjustment, motion-blurred or styled layer,
+    /// The window of a shape or text layer's whole raster buffer (see [`crate::shapes::buffer_rect`]
+    /// and `placement::drawn_buf_at`) to rasterise (a shape) or keep (text, cut after
+    /// rendering): what can reach the frame it is drawn into (the top comp's included). `None` draws
+    /// the whole buffer: content that held still over the last frames (cached whole, it is drawn
+    /// once), a collapsed, Sharp Zoom or Layer panel render, a 3D, stencil, adjustment, motion-blurred or styled layer,
     /// effects or masks whose reach is not known, a layer something else in the comp reads
     /// (track matte, effect layer parameter, `sampleImage`), or a window that saves little.
     /// `key` (the layer's content key, which fixes its buffer) memoises the buffer's rectangle.
@@ -66,9 +67,9 @@ impl<'a> Renderer<'a> {
         if NO_CLIP.load(Ordering::Relaxed) {
             return None;
         }
-        if !matches!(layer.source, LayerSource::Shape)
-            || self.top
-            || self.depth == 0
+        if !matches!(layer.source, LayerSource::Shape | LayerSource::Text)
+            || (self.top && self.depth != 0)
+            || self.opts.view.is_some()
             || self.outer.is_some()
             || self.collapse3d.is_some()
             || self.layer_view.is_some()
@@ -77,9 +78,11 @@ impl<'a> Renderer<'a> {
         {
             return None;
         }
-        let contents = layer.props.sub("contents")?;
         let k = self.raster_scale(ctx, layer);
-        let rect = || crate::shapes::buffer_rect(ctx, layer, contents, k);
+        let rect = || match layer.source {
+            LayerSource::Shape => crate::shapes::buffer_rect(ctx, layer, layer.props.sub("contents")?, k),
+            _ => crate::placement::drawn_buf_at(ctx, layer, k).map(|(bw, bh, off, _)| (bw, bh, off)),
+        };
         let (bw, bh, off) = match (self.cache, key) {
             (Some(c), Some(key)) => c.shape_rect(key, rect)?,
             _ => rect()?,
@@ -200,6 +203,94 @@ impl<'a> Renderer<'a> {
         Some(win)
     }
 
+    /// The part of a text or shape layer's comp-sized effect canvas (see `Renderer::canvas_support`)
+    /// that can reach this renderer's canvas: the frame mapped into the layer, grown by what its
+    /// masks and effects read (doubled) and the resampling footprint, snapped to [`GRID`] buffer
+    /// pixels; `[x0, y0, x1, y1]` in effect-space layer units. The effects then fill only that
+    /// part (the rest can't show: After Effects asks an effect only for the pixels it needs).
+    /// `None` keeps the whole canvas: the same cases as [`Self::shape_clip`] at any depth (top
+    /// level included), a stack that doesn't widen the canvas, content that held still (cached
+    /// whole, it is drawn once wherever it moves), or a part that saves little.
+    pub(crate) fn fx_view(&self, ctx: &EvalCtx, layer: &Layer, key: Option<u64>) -> Option<[f64; 4]> {
+        if NO_CLIP.load(Ordering::Relaxed)
+            || !matches!(layer.source, LayerSource::Text | LayerSource::Shape)
+            || self.outer.is_some()
+            || self.collapse3d.is_some()
+            || self.layer_view.is_some()
+            || self.canvas_origin != [0, 0]
+            || self.opts.view.is_some()
+            || !self.clippable(ctx, layer)
+        {
+            return None;
+        }
+        // Only a stack that widens the canvas (as `Renderer::run_effect_stack` decides).
+        let fx = layer.effects().filter(|_| layer.switches.effects)?;
+        let widens = fx.groups().filter(|g| g.enabled).any(|g| match &g.kind {
+            GroupKind::Effect { effect } => effectcraft_effects::find(effect).is_some_and(|spec| {
+                crate::fx::text_needs_canvas(spec)
+                    && !effectcraft_effects::audio_fx::is_audio_effect(spec.id)
+                    && !self.transform_moves_nothing(ctx, layer, g, spec)
+            }),
+            _ => false,
+        });
+        if !widens {
+            return None;
+        }
+        let k = self.raster_scale(ctx, layer);
+        let size = ctx.effect_bounds(layer).0;
+        if !(k.is_finite() && k > 0.0) || size[0] * size[1] * k * k < MIN_PIXELS as f64 {
+            return None;
+        }
+        if !self.sharp()
+            && let (Some(c), Some(key)) = (self.cache, key)
+            && c.content_held(cache::derive(ctx.comp_id.0, layer.id.0), key, ctx.time)
+        {
+            return None;
+        }
+        // Layer unit → output pixel (a buffer at scale 1 and offset 0 is the layer's own space).
+        let unit = Buf { img: Image { width: 1, height: 1, data: vec![] }, offset: [0.0; 2], scale: 1.0 };
+        let m = self.buf_matrix(ctx, layer, &unit, &MotionMemo::default());
+        if !m.is_affine() {
+            return None;
+        }
+        let inv = m.inverse()?;
+        let o = inv.apply(vec2(0.0, 0.0));
+        // Layer units per output pixel; buffer pixels per output pixel is that × k.
+        let per_px = [vec2(1.0, 0.0), vec2(0.0, 1.0)]
+            .into_iter()
+            .map(|v| {
+                let p = inv.apply(v);
+                (p.x - o.x).hypot(p.y - o.y)
+            })
+            .fold(0.0f64, f64::max);
+        let density = per_px * k;
+        if !(density.is_finite() && density > 0.0 && density <= MAX_DENSITY) {
+            return None;
+        }
+        let (cw, ch) = self.canvas_size(ctx);
+        let v = inv.map_rect(&Rect::new(-4.0, -4.0, f64::from(cw) + 4.0, f64::from(ch) + 4.0));
+        let reach = self.mask_reach(ctx, layer)? + self.fx_reach(ctx, layer, k)?;
+        let margin = 2.0 * reach + (8.0 + 4.0 * density.max(1.0)) / k;
+        let v = v.inflate(margin);
+        // Snapped to the grid of the layer's own pixels (downsampled blurs stay aligned, and the
+        // key holds while the layer moves a little).
+        let g = f64::from(GRID) / k;
+        let o = crate::fx::fx_origin(ctx, layer, false);
+        let r = [(v.x0 / g).floor() * g - o[0], (v.y0 / g).floor() * g - o[1], (v.x1 / g).ceil() * g - o[0], (v.y1 / g).ceil() * g - o[1]];
+        if r.iter().any(|x| !x.is_finite()) {
+            return None;
+        }
+        let kept = (r[2].min(size[0]) - r[0].max(0.0)).max(0.0) * (r[3].min(size[1]) - r[1].max(0.0)).max(0.0);
+        if kept > MAX_SHARE * size[0] * size[1] {
+            return None;
+        }
+        // Something else in the comp may read the layer's pixels anywhere (a scan of the comp).
+        if crate::layer_buf::working_read(ctx.comp, layer) {
+            return None;
+        }
+        Some(r)
+    }
+
     /// The size of the canvas this renderer draws into (output pixels): the comp's frame at the
     /// output scale, or the region of interest or nested window it covers.
     pub(crate) fn canvas_size(&self, ctx: &EvalCtx) -> (u32, u32) {
@@ -252,6 +343,11 @@ fn flat_2d(project: &effectcraft_project::Project, item: effectcraft_project::It
         LayerSource::Comp { item: sub } if l.switches.collapse => flat_2d(project, sub, depth + 1),
         _ => true,
     })
+}
+
+/// The key of a layer's content with its effect canvas cut to `view` ([`Renderer::fx_view`]).
+pub(crate) fn viewed_key(key: u64, view: [f64; 4]) -> u64 {
+    view.iter().fold(cache::derive(key, 0xf1e1_d0c5), |k, v| cache::derive(k, v.to_bits()))
 }
 
 /// The key of a clipped layer's content: its whole-buffer key and the window.

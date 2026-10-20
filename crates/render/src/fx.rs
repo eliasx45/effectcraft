@@ -259,7 +259,7 @@ impl<'a> Renderer<'a> {
         limit: usize,
         timing: Option<&mut Vec<(String, f64)>>,
     ) -> Buf {
-        self.apply_effects_kept(ctx, layer, buf, adjustment, limit, timing).0
+        self.apply_effects_kept(ctx, layer, buf, adjustment, limit, timing, None).0
     }
 
     /// [`Renderer::apply_effects_timed`], with the accelerator's copy of the result when the
@@ -272,6 +272,7 @@ impl<'a> Renderer<'a> {
         adjustment: bool,
         limit: usize,
         timing: Option<&mut Vec<(String, f64)>>,
+        view: Option<[f64; 4]>,
     ) -> (Buf, Option<Kept<'a>>) {
         let origin = fx_origin(ctx, layer, adjustment);
         buf.rebase(origin);
@@ -282,7 +283,7 @@ impl<'a> Renderer<'a> {
             buf: Some(buf),
             kept: None,
         };
-        self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
+        self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t, view);
         let mut out = t.buf.take().unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale });
         out.rebase([-origin[0], -origin[1]]);
         (out, t.kept.take())
@@ -308,7 +309,7 @@ impl<'a> Renderer<'a> {
             buf: Some(buf),
             kept: None,
         };
-        self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
+        self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t, None);
         t.buf.unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale })
     }
 
@@ -316,7 +317,13 @@ impl<'a> Renderer<'a> {
     /// 100 %, no Rotation or Skew) and isn't motion blurred: it only fades the layer, so a text
     /// or shape layer needs no comp-sized effect canvas for it (#659 is about effects that move
     /// pixels past the glyphs; the Transform effect grows its own buffer when it does).
-    fn transform_moves_nothing(&self, ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, spec: &effectcraft_effects::EffectSpec) -> bool {
+    pub(crate) fn transform_moves_nothing(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        g: &effectcraft_project::PropGroup,
+        spec: &effectcraft_effects::EffectSpec,
+    ) -> bool {
         if spec.id != "ec.distort.transform" || ALWAYS_TEXT_CANVAS.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
@@ -366,14 +373,8 @@ impl<'a> Renderer<'a> {
                 "ec.stylize.glow" => 4.0 * (p.f("radius").max(0.0) * effectcraft_effects::GLOW_SIGMA_PER_RADIUS * c).max(0.5 * px),
                 // The shadow moves by Distance and its blur (σ = Softness / 2) reaches 3σ.
                 "ec.perspective.dropshadow" => p.f("distance").abs() + 1.5 * p.f("softness").max(0.0) + 2.0 * px,
-                // The glow's widest Gaussian stays well inside 1.5 × Radius (its largest pad);
-                // a Mask Layer is fitted to the buffer, so it keeps the whole canvas.
-                "ec.stylize.deepglow" => {
-                    if p.get("PEDG-0056").and_then(|v| v.as_layer()).is_some() {
-                        return None;
-                    }
-                    1.5 * p.f("PEDG-0001").max(0.0) + 2.0 * px
-                }
+                // A Mask Layer is fitted to the buffer, so it keeps the whole canvas.
+                "ec.stylize.deepglow" => deep_glow_reach(&p, scale)?,
                 // Shade or recolour the layer's own pixels: transparent ones stay transparent.
                 "ec.perspective.bevelalpha" | "ec.generate.fill" => 0.0,
                 "ec.blur.ccradialfast" => {
@@ -421,6 +422,7 @@ impl<'a> Renderer<'a> {
         mut timing: Option<&mut Vec<(String, f64)>>,
         origin: [f64; 2],
         target: &mut dyn FxTarget,
+        view: Option<[f64; 4]>,
     ) {
         let _profile = crate::profile::span("run_effect_stack");
         if !layer.switches.effects {
@@ -484,9 +486,14 @@ impl<'a> Renderer<'a> {
             && !adjustment
             && stack.iter().any(|(_, g, spec)| text_needs_canvas(spec) && !self.transform_moves_nothing(ctx, layer, g, spec))
         {
-            match target.extent().and_then(|e| self.canvas_support(ctx, layer, &stack, layer_size, e)) {
-                Some((from, to)) => target.effect_canvas_in(from, to),
-                None => target.effect_canvas(layer_size),
+            let (from, to) = target.extent().and_then(|e| self.canvas_support(ctx, layer, &stack, layer_size, e)).unwrap_or(([0.0; 2], layer_size));
+            // Only the part that can show (and what it reads), see [`Renderer::fx_view`].
+            let (from, to) = match view {
+                Some(v) => ([from[0].max(v[0]), from[1].max(v[1])], [to[0].min(v[2]), to[1].min(v[3])]),
+                None => (from, to),
+            };
+            if to[0] >= from[0] && to[1] >= from[1] {
+                target.effect_canvas_in(from, to);
             }
         }
         let accel = self.active_accel();
@@ -547,6 +554,32 @@ impl<'a> Renderer<'a> {
     }
 }
 
+/// Layer units around a pixel that Deep Glow paints and reads (crates/effects misc.rs
+/// `deep_glow`): its widest Gaussian (σ = 0.42 × Radius in the display-space profile, stretched
+/// by Aspect Ratio) as its box passes spread it, in the downsampled pass and the reduced working
+/// resolution of a very wide glow too, plus their resampling. `None` with a Mask Layer (fitted to
+/// the buffer, it depends on the whole canvas).
+pub(crate) fn deep_glow_reach(p: &Params, scale: f64) -> Option<f64> {
+    if p.get("PEDG-0056").and_then(|v| v.as_layer()).is_some() || !(scale.is_finite() && scale > 0.0) {
+        return None;
+    }
+    let radius = (p.f("PEDG-0001") * scale).clamp(0.0, 2000.0);
+    if !radius.is_finite() || radius < 0.5 {
+        return Some(0.0);
+    }
+    let aspect = p.f("PEDG-0010").clamp(0.0, 2.0);
+    let work = (512.0 / radius).min(1.0);
+    let sigma = radius * work * 0.42 * aspect.max(2.0 - aspect);
+    let support = |s: f64| effectcraft_raster::gaussian_support(s) as f64;
+    let mut px = support(sigma) + 2.0;
+    let ds = (p.f("PEDG-0019") / 100.0).clamp(0.1, 1.0);
+    if ds < 0.999 {
+        px = px.max((support(sigma * ds) + 2.0) / ds + 2.0);
+    }
+    let px = px / work + 2.0 / work + 2.0;
+    px.is_finite().then_some(px / scale)
+}
+
 /// Where a layer's effect space starts, in layer coordinates (see [`EvalCtx::effect_bounds`]).
 /// The comp below an adjustment layer stays as it is, except that a shape layer's effects
 /// always measure from its comp-sized canvas centred on the anchor (as After Effects does).
@@ -584,6 +617,20 @@ pub(crate) fn fx_comp_px_3d(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
 /// Effects that read `EffectEnv::comp_px`: their sizes are comp pixels on a continuously
 /// rasterised layer.
 const COMP_PX_EFFECTS: &[&str] = &["ec.blur.gaussian", "ec.blur.fastbox", "ec.stylize.glow"];
+
+/// Effects that place what they draw in comp space on a continuously rasterised 2D layer
+/// (`EffectEnv::comp_space`: Gradient Ramp's points, CC Light Sweep's centre).
+const COMP_SPACE_EFFECTS: &[&str] = &["ec.generate.gradientramp", "ec.generate.cclightsweep"];
+
+/// The layer → comp affine that places a [`COMP_SPACE_EFFECTS`] effect of the layer, when it
+/// runs one ([`fx_comp_space`]): its pixels move with it, unlike the rest of its content.
+pub(crate) fn comp_space_placement(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
+    let runs = layer.switches.effects
+        && layer.effects().is_some_and(|fx| {
+            fx.groups().any(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if COMP_SPACE_EFFECTS.contains(&effect.as_str())))
+        });
+    if runs { fx_comp_space(ctx, layer) } else { None }
+}
 
 /// Does the layer run an effect sized in comp pixels ([`COMP_PX_EFFECTS`])?
 pub(crate) fn sizes_in_comp_px(layer: &Layer) -> bool {

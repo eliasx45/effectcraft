@@ -192,7 +192,7 @@ impl<'a> Renderer<'a> {
             fn shift(&mut self, _: [f64; 2]) {}
         }
         let adjustment = layer.switches.adjustment;
-        self.run_effect_stack(ctx, layer, adjustment, limit, None, fx_origin(ctx, layer, adjustment), &mut Plan(visitor));
+        self.run_effect_stack(ctx, layer, adjustment, limit, None, fx_origin(ctx, layer, adjustment), &mut Plan(visitor), None);
         true
     }
 
@@ -372,7 +372,7 @@ impl<'a> Renderer<'a> {
         let origin = fx_origin(ctx, layer, adjustment);
         let d = [origin[0] * self.opts.scale, origin[1] * self.opts.scale];
         target.shift([-d[0], -d[1]]);
-        self.run_effect_stack(ctx, layer, adjustment, usize::MAX, None, origin, target);
+        self.run_effect_stack(ctx, layer, adjustment, usize::MAX, None, origin, target, None);
         target.shift(d);
     }
 
@@ -380,8 +380,14 @@ impl<'a> Renderer<'a> {
     /// them in effect space (as [`Renderer::layer_input`] hands them out) and the result stays
     /// there. Returns the effect-space origin in layer coordinates (rebase by its negation).
     pub fn run_layer_effects_on(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget) -> [f64; 2] {
+        self.run_layer_effects_in(ctx, layer, target, crate::ContentClip::default())
+    }
+
+    /// [`Self::run_layer_effects_on`] for a source made in `clip` ([`Self::resident_content`]):
+    /// a text or shape layer's effect canvas only where it can show, as its key says.
+    pub fn run_layer_effects_in(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget, clip: crate::ContentClip) -> [f64; 2] {
         let origin = fx_origin(ctx, layer, false);
-        self.run_effect_stack(ctx, layer, false, usize::MAX, None, origin, target);
+        self.run_effect_stack(ctx, layer, false, usize::MAX, None, origin, target, clip.view());
         origin
     }
 

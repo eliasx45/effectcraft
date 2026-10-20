@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 /// A layer's content key, its precomp bookkeeping id and its shape clip window (see
 /// `Renderer::content_cache_key_noted`).
-type ContentKey = (Option<u64>, Option<u64>, Option<Window>);
+type ContentKey = (Option<u64>, Option<u64>, ContentClip);
 
 impl<'a> Renderer<'a> {
     /// Source → masks, clamped/quantised to the project depth. `clip`: only that window of a
@@ -26,6 +26,12 @@ impl<'a> Renderer<'a> {
                 self.authored(crate::shapes::render_window(ctx, layer, contents, k, Some([w.x, w.y, w.w, w.h])))
             }
             (None, Some(w), LayerSource::Comp { .. }) => self.source_window(ctx, layer, Some(w))?,
+            // Text renders whole (its glyphs are laid out together); the window is kept.
+            (None, Some(w), LayerSource::Text) => {
+                let b = self.source(ctx, layer)?;
+                let img = b.img.crop(i64::from(w.x), i64::from(w.y), w.w, w.h);
+                Buf { img, offset: [b.offset[0] - f64::from(w.x), b.offset[1] - f64::from(w.y)], scale: b.scale }
+            }
             (None, ..) => self.source(ctx, layer)?,
         };
         // A solid is filled with a quantised colour: only masks can take it off the grid.
@@ -140,13 +146,13 @@ impl<'a> Renderer<'a> {
             return None;
         }
         let (key, noted, clip) = self.content_cache_key_noted(ctx, layer);
-        Some((key?, noted?, ContentClip(clip)))
+        Some((key?, noted?, clip))
     }
 
     /// The window of its nested comp a precomp layer drawn uncached renders (see
     /// [`Self::precomp_clip`]); the whole frame when it is not windowed.
     pub fn precomp_window(&self, ctx: &EvalCtx, layer: &Layer) -> ContentClip {
-        ContentClip(self.precomp_clip(ctx, layer, None))
+        ContentClip { win: self.precomp_clip(ctx, layer, None), view: None }
     }
 
     /// Whether a precomp's pixels may change from frame to frame (its key then changes with
@@ -166,13 +172,13 @@ impl<'a> Renderer<'a> {
     /// (for [`Self::resident_source`]): decided together, once.
     pub fn resident_content(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, ContentClip)> {
         let (key, _, clip) = self.content_cache_key_noted(ctx, layer);
-        Some((key?, ContentClip(clip)))
+        Some((key?, clip))
     }
 
     /// Source and masks rebased into effect space, exactly as the CPU content producer, in the
     /// window `clip` that came with the layer's key ([`Self::resident_content`]).
     pub fn resident_source(&self, ctx: &EvalCtx, layer: &Layer, clip: ContentClip) -> Option<Buf> {
-        let mut buf = self.masked_source(ctx, layer, clip.0)?;
+        let mut buf = self.masked_source(ctx, layer, clip.win)?;
         buf.rebase(crate::fx::fx_origin(ctx, layer, false));
         Some(buf)
     }
@@ -207,12 +213,15 @@ impl<'a> Renderer<'a> {
     /// A shape layer drawn clipped (see [`Self::shape_clip`]) or a precomp layer drawn windowed
     /// (see [`Self::precomp_clip`]) has the window in its key, and the window is returned too.
     fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> ContentKey {
-        let Some(c) = self.cache else { return (None, None, self.shape_clip(ctx, layer, None).or_else(|| self.precomp_clip(ctx, layer, None))) };
+        let Some(c) = self.cache else {
+            let win = self.shape_clip(ctx, layer, None).or_else(|| self.precomp_clip(ctx, layer, None));
+            return (None, None, ContentClip { win, view: self.fx_view(ctx, layer, None) });
+        };
         let (src, noted) = match layer.source {
             LayerSource::Comp { .. } => {
                 let id = cache::derive(cache::derive(ctx.comp_id.0, layer.id.0), self.depth as u64);
                 if !c.precomp_try(id) {
-                    return (None, None, self.precomp_clip(ctx, layer, None));
+                    return (None, None, ContentClip { win: self.precomp_clip(ctx, layer, None), view: None });
                 }
                 (self.precomp_key(ctx, layer), Some(id))
             }
@@ -222,12 +231,17 @@ impl<'a> Renderer<'a> {
         };
         let key = cache::layer_key_src(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), src);
         let key = self.content_key(ctx, layer, key);
-        let clip = self.shape_clip(ctx, layer, key).or_else(|| self.precomp_clip(ctx, layer, key));
-        let key = match clip {
+        let win = self.shape_clip(ctx, layer, key).or_else(|| self.precomp_clip(ctx, layer, key));
+        let view = self.fx_view(ctx, layer, key);
+        let key = match win {
             Some(w) => key.map(|k| clip::clipped_key(k, w)),
             None => key,
         };
-        (key, noted, clip)
+        let key = match view {
+            Some(v) => key.map(|k| clip::viewed_key(k, v)),
+            None => key,
+        };
+        (key, noted, ContentClip { win, view })
     }
 
     /// `keyed`: [`Self::content_cache_key_noted`] when the caller has it already (a key is
@@ -268,9 +282,9 @@ impl<'a> Renderer<'a> {
             }
         }
         let t0 = web_time::Instant::now();
-        let buf = self.masked_source(ctx, layer, clip)?;
+        let buf = self.masked_source(ctx, layer, clip.win)?;
         let t1 = web_time::Instant::now();
-        let (buf, kept) = self.apply_effects_kept(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects));
+        let (buf, kept) = self.apply_effects_kept(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects), clip.view);
         if t0.elapsed() >= std::time::Duration::from_millis(400) {
             log::debug!(
                 target: "effectcraft_stall",
@@ -485,8 +499,8 @@ impl<'a> Renderer<'a> {
                 return Some(StyledLayer { passes: vec![], content: b.clone(), body: b, key: ckey, ckey, plain: true });
             }
         }
-        let buf = self.masked_source(ctx, layer, clip)?;
-        let mut buf = self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects));
+        let buf = self.masked_source(ctx, layer, clip.win)?;
+        let mut buf = self.apply_effects_kept(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects), clip.view).0;
         if let Some(c) = self.pipe.to_blend() {
             color::convert(&mut buf.img, &c);
         }
@@ -600,9 +614,11 @@ pub(crate) fn working_read(comp: &Comp, layer: &Layer) -> bool {
     })
 }
 
-/// Does a property of `g` take a layer (whatever its value)?
+/// Does a property of `g` take a layer (whatever its value)? Deep Glow's Mask Layer left at None
+/// reads nothing (an empty one doesn't stand for the layer itself there).
 fn names_a_layer(g: &PropGroup) -> bool {
     g.children.iter().any(|c| match c {
+        Node::Prop(p) if p.match_id == "PEDG-0056" => p.value != Value::Layer(None) || !p.keys.is_empty() || p.has_expression(),
         Node::Prop(p) => matches!(p.value, Value::Layer(_)),
         Node::Group(sub) => names_a_layer(sub),
     })
@@ -630,21 +646,30 @@ fn samples_pixels(g: &PropGroup) -> bool {
 /// the whole buffer, or the part of a shape layer's or a nested comp's frame that can show (see
 /// `clip.rs`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ContentClip(Option<Window>);
+pub struct ContentClip {
+    win: Option<Window>,
+    /// The part of a text or shape layer's comp-sized effect canvas that can show (effect-space
+    /// layer units, see [`Renderer::fx_view`]); `None` for the whole canvas.
+    view: Option<[f64; 4]>,
+}
 
 impl ContentClip {
     /// The window `[x, y, w, h]` (buffer pixels), `None` for the whole buffer.
     pub fn rect(&self) -> Option<[u32; 4]> {
-        self.0.map(|w| [w.x, w.y, w.w, w.h])
+        self.win.map(|w| [w.x, w.y, w.w, w.h])
     }
 
     /// The offset of the buffer holding this window of a whole buffer at offset 0.
     pub fn offset(&self) -> [f64; 2] {
-        crate::sources::window_offset(self.0)
+        crate::sources::window_offset(self.win)
     }
 
     pub(crate) fn window(&self) -> Option<Window> {
-        self.0
+        self.win
+    }
+
+    pub(crate) fn view(&self) -> Option<[f64; 4]> {
+        self.view
     }
 }
 

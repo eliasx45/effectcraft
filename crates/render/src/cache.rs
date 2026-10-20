@@ -2016,6 +2016,10 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
     if crate::fx::sizes_in_comp_px(layer) {
         crate::fx::fx_comp_px(ctx, layer).map(|c| c.map(f64::to_bits)).hash(&mut h);
     }
+    // Effects placed in comp space follow the whole transform, position included.
+    if let Some(m) = crate::fx::comp_space_placement(ctx, layer) {
+        m.0[..2].iter().flatten().map(|v| v.to_bits()).for_each(|b| b.hash(&mut h));
+    }
     draft.hash(&mut h);
     info.head.hash(&mut h);
     // Mask motion blur and effects that read the shutter depend on whether the layer is motion

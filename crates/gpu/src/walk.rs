@@ -561,7 +561,7 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         let buf = crate::prepass::resident_source(r, ctx, layer, key, clip)?;
         let src = e.g.upload_image(&buf.img)?;
         let mut fx = crate::effects::GpuFx::new(e, src, buf.offset, buf.scale, r.pipe().levels);
-        let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
+        let origin = r.run_layer_effects_in(ctx, layer, &mut fx, clip);
         let (img, offset, scale) = fx.finish()?;
         SourceImage { img: img.into(), offset: [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale], scale }
     };
