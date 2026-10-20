@@ -25,7 +25,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Send to FigCraft",
         ["Composition"],
         None,
-        "{comp?, start? (s), end? (s)} → {comp (name), compId, project (.ecproj path or empty), start, end (s), fps, width, height, name}: FigCraft's `effectcraft.place` params. The range is the selected layers' span (min In to max Out point, clipped to the comp) when the comp's layers are selected, else its work area. The desktop app sends it to FigCraft (127.0.0.1, port FIGCRAFT_CONTROL_PORT or 7979) and shows the outcome; a headless session only returns it",
+        "{comp?, start? (s), end? (s)} → {comp (name), compId, project (.ecproj path or empty), start, end (s), fps, width, height, name}: FigCraft's `effectcraft.place` params. The range is the selected layers' span (min In to max Out point, clipped to the comp) when the comp's layers are selected, else its work area, else (a work area that is empty or the whole comp) the span of its graphics layers (no footage, cameras, lights or whole-comp layers). The desktop app sends it to FigCraft (127.0.0.1, port FIGCRAFT_CONTROL_PORT or 7979) and shows the outcome; a headless session only returns it",
         can_send,
         send
     )]
@@ -70,7 +70,9 @@ fn send(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The span `comp.sendToFigCraft` sends: the selected layers' span (the earliest In point to the
-/// latest Out point) clipped to the comp, else the work area, else the whole comp.
+/// latest Out point) clipped to the comp, else the work area, else (a work area that is empty or
+/// the whole comp says nothing) the span of the edit's graphics ([`edit_span`]), else the whole
+/// comp.
 pub fn send_range(comp: &Comp, selected: &[LayerId]) -> (Tick, Tick) {
     let end = comp.duration.max(Tick::ZERO);
     let clip = |t: Tick| t.max(Tick::ZERO).min(end);
@@ -88,7 +90,38 @@ pub fn send_range(comp: &Comp, selected: &[LayerId]) -> (Tick, Tick) {
         }
     }
     let (a, b) = (clip(comp.work_area.0), clip(comp.work_area.1));
+    if a < b && b.seconds() - a.seconds() < end.seconds() * 0.95 {
+        return (a, b);
+    }
+    if let Some(span) = edit_span(comp) {
+        return span;
+    }
     if a < b { (a, b) } else { (Tick::ZERO, end) }
+}
+
+/// Where a comp's edit is: the span of its graphics layers (text, shapes, solids, precomps,
+/// nulls…), leaving out footage, cameras, lights and layers that run (nearly) the whole comp (a
+/// rig, a background). A 10-minute talking-head comp animated in its first two minutes sends
+/// those two minutes.
+pub fn edit_span(comp: &Comp) -> Option<(Tick, Tick)> {
+    let end = comp.duration.max(Tick::ZERO);
+    let whole = end.seconds();
+    let clip = |t: Tick| t.max(Tick::ZERO).min(end);
+    let mut span: Option<(Tick, Tick)> = None;
+    for l in &comp.layers {
+        if matches!(l.source, LayerSource::Footage { .. } | LayerSource::Camera | LayerSource::Light { .. }) {
+            continue;
+        }
+        let (a, b) = (clip(l.in_point.min(l.out_point)), clip(l.in_point.max(l.out_point)));
+        if a >= b || b.seconds() - a.seconds() >= whole * 0.9 {
+            continue;
+        }
+        span = Some(match span {
+            Some((x, y)) => (x.min(a), y.max(b)),
+            None => (a, b),
+        });
+    }
+    span
 }
 
 /// `m:ss` of a time (whole seconds, rounded down).
@@ -283,9 +316,16 @@ mod tests {
         assert_eq!(send_range(c, &[]), (secs(1.0), secs(3.0)));
         assert_eq!(send_range(c, &[far]), (secs(1.0), secs(3.0)));
         assert_eq!(send_range(c, &[LayerId(424_242)]), (secs(1.0), secs(3.0)));
-        // An empty work area: the whole comp.
+        // An empty or whole-comp work area: the span of the edit's graphics (here the two
+        // precomps showing in the comp, 2–10 s; "far" starts after the end).
         p.comp_mut(main).unwrap().work_area = (secs(4.0), secs(4.0));
-        assert_eq!(send_range(p.comp(main).unwrap(), &[]), (Tick::ZERO, secs(10.0)));
+        assert_eq!(send_range(p.comp(main).unwrap(), &[]), (secs(2.0), secs(10.0)));
+        p.comp_mut(main).unwrap().work_area = (secs(0.0), secs(10.0));
+        assert_eq!(send_range(p.comp(main).unwrap(), &[]), (secs(2.0), secs(10.0)));
+        // Nothing but a layer running the whole comp: the whole comp.
+        let only = comp(&mut p, "Only", 10.0);
+        nest(&mut p, only, a, "bg", [0.0, 0.0, 10.0], 100.0);
+        assert_eq!(send_range(p.comp(only).unwrap(), &[]), (Tick::ZERO, secs(10.0)));
         assert_eq!([mss(secs(0.0)), mss(secs(75.9)), mss(secs(-3.0)), mss(secs(f64::NAN))], ["0:00", "1:15", "0:00", "0:00"]);
     }
 
@@ -308,10 +348,11 @@ mod tests {
         assert_eq!(v["name"], "Promo · 0:01–0:03");
         let events = s.drain_events();
         assert!(events.iter().any(|e| matches!(e, crate::Event::Frontend { command, params } if command == C && params == &v)), "the desktop app sends it");
-        // Nothing selected: the work area (the whole comp here); explicit times win, clipped.
+        // Nothing selected and the work area is the whole comp: where the edit's graphics are
+        // (the solid, 1–3 s); explicit times win, clipped.
         s.state.selected_layers.clear();
         let v = s.execute(C, json!({"comp": cid})).unwrap();
-        assert_eq!((v["start"].as_f64(), v["end"].as_f64()), (Some(0.0), Some(10.0)));
+        assert_eq!((v["start"].as_f64(), v["end"].as_f64()), (Some(1.0), Some(3.0)));
         let v = s.execute(C, json!({"start": 2.5, "end": 99})).unwrap();
         assert_eq!((v["start"].as_f64(), v["end"].as_f64()), (Some(2.5), Some(10.0)));
         // Junk is refused, never a panic.

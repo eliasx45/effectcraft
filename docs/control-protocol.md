@@ -536,7 +536,10 @@ everywhere. Junk parameters are an error (`{"ok": false, "error": "figcraft.<met
 Timeline layer context menu and the Project panel's context menu of a comp) places a comp range on
 FigCraft's canvas. The comp is the active one (the right-clicked one in the Project panel); the
 range is the selected layers' span (earliest In point to latest Out point, clipped to the comp)
-when that comp's layers are selected, else its work area (`start`/`end` override it). The engine
+when that comp's layers are selected, else its work area, else (a work area that is empty or the
+whole comp says nothing) the span of its graphics layers: text, shapes, solids, precomps and nulls,
+leaving out footage, cameras, lights and layers that run nearly the whole comp
+(`start`/`end` override it). The engine
 returns the place params; the desktop app connects to FigCraft (127.0.0.1, port
 `FIGCRAFT_CONTROL_PORT`, default 7979) on a thread and sends one line:
 
