@@ -250,6 +250,9 @@ fn fonts_lists_bundled_and_installed_families() {
     // Compare against the independent directory inventory rather than assuming an empty OS.
     let mut expected_styles = std::collections::BTreeSet::from(["Regular".to_string()]);
     expected_styles.extend(installed.iter().filter(|face| face.family.eq_ignore_ascii_case("Noto Serif")).map(|face| face.style.clone()));
+    // An installed variable Noto Serif also offers its named instances.
+    expected_styles
+        .extend(installed.iter().filter(|face| face.family.eq_ignore_ascii_case("Noto Serif")).flat_map(|face| face.instances.iter().map(|n| n.name.clone())));
     let styles: Vec<String> = r["families"][0]["styles"].as_array().unwrap().iter().map(|style| style.as_str().unwrap().to_string()).collect();
     assert_eq!(styles.iter().cloned().collect::<std::collections::BTreeSet<_>>(), expected_styles);
     assert_eq!(styles.len(), expected_styles.len(), "style menu has no duplicates");
@@ -285,6 +288,82 @@ fn pinned_variable_font(family: &str) -> Vec<u8> {
     }
     out.extend(body);
     out
+}
+
+/// A variable font (just `name` + `fvar`: one `wght` axis 100–900) with named instances Regular
+/// (400, PostScript `<ps>-Regular`), Bold (700, `<ps>-Bold`) and Light (300).
+fn instances_font(family: &str, ps: &str) -> Vec<u8> {
+    let u16s = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_be_bytes()).collect() };
+    let names: Vec<(u16, String)> =
+        vec![(1, family.into()), (2, "Regular".into()), (6, format!("{ps}-Regular")), (256, "Bold".into()), (257, format!("{ps}-Bold")), (258, "Light".into())];
+    let strings: Vec<Vec<u8>> = names.iter().map(|(_, s)| s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()).collect();
+    let mut name = u16s(&[0, names.len() as u16, 6 + 12 * names.len() as u16]);
+    let mut off = 0;
+    for ((id, _), st) in names.iter().zip(&strings) {
+        name.extend(u16s(&[3, 1, 0x409, *id, st.len() as u16, off]));
+        off += st.len() as u16;
+    }
+    strings.iter().for_each(|st| name.extend(st));
+    let mut fvar = u16s(&[1, 0, 16, 2, 1, 20, 3, 10]);
+    fvar.extend(b"wght".iter().copied().chain(u16s(&[100, 0, 400, 0, 900, 0, 0, 256])));
+    for (name_id, wght, ps_id) in [(2u16, 400u16, 6u16), (256, 700, 257), (258, 300, 0xFFFF)] {
+        fvar.extend(u16s(&[name_id, 0, wght, 0, ps_id]));
+    }
+    let mut out = u16s(&[1, 0, 2, 0, 0, 0]);
+    let mut body: Vec<u8> = vec![];
+    for (tag, data) in [(b"fvar", fvar), (b"name", name)] {
+        out.extend(tag);
+        out.extend([0u8; 4]);
+        out.extend(((12 + 32 + body.len()) as u32).to_be_bytes());
+        out.extend((data.len() as u32).to_be_bytes());
+        body.extend(data);
+    }
+    out.extend(body);
+    out
+}
+
+/// A variable font named by its PostScript name (`SFPro-Regular`, as After Effects stores SF
+/// Pro): the style menus and `text.fonts` offer its named instances (not the generic
+/// Regular/Medium/SemiBold/Bold/Italic list), picking `Bold` makes the font its family so the
+/// style draws (the variable face at `wght` 700), and a style the font lacks warns instead of
+/// silently drawing another one.
+#[test]
+fn variable_font_named_instances_are_styles_end_to_end() {
+    const FAMILY: &str = "EffectCraft Engine Instance Test";
+    const PS: &str = "ECEngineInstanceTest";
+    assert_eq!(effectcraft_text::fonts::add_font_data(instances_font(FAMILY, PS)).len(), 1);
+    let mut s = Session::default();
+    let listed = s.execute("text.fonts", json!({"query": "engine instance test"})).unwrap();
+    assert_eq!(listed["families"][0]["styles"], json!(["Light", "Regular", "Bold"]), "{listed}");
+    assert_eq!(listed["families"][0]["variable"], true);
+    let styles = vec!["Light".to_string(), "Regular".into(), "Bold".into()];
+    assert_eq!(crate::font_styles(FAMILY), styles);
+    assert_eq!(crate::font_styles(&format!("{PS}-Regular")), styles, "a PostScript name offers its family's styles");
+
+    let (mut s, t) = session("Bold me");
+    s.execute("layer.setText", json!({"layer": t, "font": format!("{PS}-Regular")})).unwrap();
+    let r = s.execute("layer.setText", json!({"layer": t, "style": "Bold"})).unwrap();
+    assert!(r.get("warning").is_none(), "{r}");
+    let d = doc(&s, t);
+    assert_eq!((d.font.as_str(), d.style.as_str()), (FAMILY, "Bold"));
+    let resolved = effectcraft_text::resolve(&d.font, &d.style);
+    assert!(!resolved.synth_bold && !resolved.missing);
+    assert_eq!(effectcraft_text::fonts::instance_coords(&resolved), vec![("wght".to_string(), 700.0)]);
+    // Undo restores the PostScript name and the old style together.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(doc(&s, t).font, format!("{PS}-Regular"));
+    // A project already saved as `<ps>-Regular` + `Bold` draws Bold too.
+    let saved = effectcraft_text::resolve(&format!("{PS}-Regular"), "Bold");
+    assert_eq!(effectcraft_text::fonts::instance_coords(&saved), vec![("wght".to_string(), 700.0)]);
+
+    // A style the font doesn't have: kept (nearest face, synthesised), with a warning.
+    let r = s.execute("layer.setText", json!({"layer": t, "style": "Black"})).unwrap();
+    let w = r["warning"].as_str().unwrap_or_default();
+    assert!(w.contains("no style \"Black\"") && w.contains("Bold"), "{r}");
+    assert_eq!(doc(&s, t).font, format!("{PS}-Regular"), "an unknown style keeps the named face");
+    // Inter has Bold: no warning.
+    let r = s.execute("layer.setText", json!({"layer": t, "font": "Inter", "style": "Bold"})).unwrap();
+    assert!(r.get("warning").is_none(), "{r}");
 }
 
 /// The font menu's Variable Fonts filter (After Effects 26.3): `text.fonts {variable: true}`

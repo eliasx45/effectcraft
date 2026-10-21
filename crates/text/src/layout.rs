@@ -940,6 +940,22 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
     out
 }
 
+/// `style` with the axis values of its resolved named instance (`r`), under the style's own
+/// Variable Font Axes values (those win, tag by tag).
+fn with_instance(style: &TextStyle, r: &Resolved) -> TextStyle {
+    let mut coords = fonts::instance_coords(r);
+    if coords.is_empty() {
+        return style.clone();
+    }
+    for (t, v) in &style.variations {
+        match coords.iter_mut().find(|(c, _)| c.trim_end() == t.trim_end()) {
+            Some(c) => c.1 = *v,
+            None => coords.push((t.clone(), *v)),
+        }
+    }
+    TextStyle { variations: coords, ..style.clone() }
+}
+
 /// Lay out `text` (paragraphs separated by CR, LF or CRLF) in one style.
 pub fn layout_uncached(text: &str, style: &TextStyle, para: &ParagraphStyle) -> Layout {
     layout_rich_uncached(text, &[(0..text.len(), style.clone())], std::slice::from_ref(para))
@@ -955,6 +971,15 @@ pub fn layout_rich_uncached(text: &str, runs: &[(Range<usize>, TextStyle)], para
     let para_at = |i: usize| paras.get(i).or(paras.last()).unwrap_or(&default_para);
     let width = para_at(0).width;
     let primaries: Vec<Resolved> = runs.iter().map(|(_, s)| fonts::resolve(&s.family, &s.style)).collect();
+    // A variable font's named-instance style (SF Pro `Bold`) is the face at the instance's axis
+    // values: shaping, advances and outlines all read them from the run's variations.
+    let instanced: Vec<(Range<usize>, TextStyle)>;
+    let runs = if primaries.iter().any(|p| p.instance.is_some()) {
+        instanced = runs.iter().zip(&primaries).map(|((r, s), p)| (r.clone(), with_instance(s, p))).collect();
+        &instanced[..]
+    } else {
+        runs
+    };
     let mut lay = Layout { missing_font: primaries.iter().any(|p| p.missing), text_len: text.len(), ..Default::default() };
     let mut plines: Vec<(usize, ParaLine)> = Vec::new();
     for (pi, span) in paragraph_ranges(text).enumerate() {

@@ -152,7 +152,61 @@ fn apply_text_params(cmd: &str, p: &Value, d: &mut TextDoc, r: Option<std::ops::
             return Err(bad(cmd, format!("unknown text attribute {k}")));
         }
     }
+    if obj.contains_key("style") && !obj.contains_key("font") {
+        let n = d.char_len();
+        d.apply_style(r.unwrap_or(0..n.max(1)), style_picks_family);
+    }
     Ok(())
+}
+
+/// A style picked for text whose font is a PostScript or full name (`SFPro-Regular`, how After
+/// Effects and its projects name fonts) is a style of that name's family, so the font becomes
+/// the family and the style draws: a name otherwise pins its own face, and picking `Bold` in the
+/// style menu did nothing. Only when the family has the style; a linked or substituted font keeps
+/// its name.
+fn style_picks_family(cs: &mut effectcraft_keyframe::text_doc::CharStyle) {
+    use effectcraft_text::fonts;
+    if cs.font_file.is_some() || cs.render_font.is_some() || cs.style.is_empty() {
+        return;
+    }
+    let Some(family) = fonts::family_of(&cs.font) else { return };
+    if !family.eq_ignore_ascii_case(&cs.font) && fonts::has_style(&family, &cs.style) == Some(true) {
+        cs.font = family;
+    }
+}
+
+/// A warning for `layer.setText {style}` when the font (in the edited range) doesn't offer that
+/// style: it draws the nearest style instead (synthesised bold / italic when needed), which is
+/// easy to miss. `None` when every font has it, or isn't installed (reported as missing instead).
+fn unknown_style_warning(doc: &TextDoc, r: Option<std::ops::Range<usize>>) -> Option<String> {
+    use effectcraft_text::fonts;
+    // The runs the range touches (a caret or empty text: the run at it).
+    let mut styles = Vec::new();
+    let mut pos = 0usize;
+    for run in doc.runs() {
+        let end = pos.saturating_add(run.len);
+        if r.as_ref().is_none_or(|r| (pos < r.end && end > r.start) || (r.start == r.end && r.start >= pos && r.start <= end)) {
+            styles.push(run.style);
+        }
+        pos = end;
+    }
+    let mut checked: Vec<(String, String)> = Vec::new();
+    for cs in styles {
+        let key = (cs.font.clone(), cs.style.clone());
+        if checked.contains(&key) {
+            continue;
+        }
+        if fonts::has_style(&cs.font, &cs.style) == Some(false) {
+            let family = fonts::family_of(&cs.font).unwrap_or_else(|| cs.font.clone());
+            let offered = crate::font_styles(&family);
+            let resolved = effectcraft_text::resolve(&cs.font, &cs.style);
+            let drawn = fonts::face(resolved.face).info.style.clone();
+            let synth = if resolved.synth_bold { " with synthetic bold" } else { "" };
+            return Some(format!("{family} has no style \"{}\" (it has: {}); drawing {drawn}{synth} instead", cs.style, offered.join(", ")));
+        }
+        checked.push(key);
+    }
+    None
 }
 
 fn text_range_p(p: &Value) -> Option<std::ops::Range<usize>> {
@@ -1540,6 +1594,9 @@ fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
         for (k, v) in obj {
             any |= effectcraft_keyframe::text_doc::apply_char_attr(&mut st, k, v).map_err(|m| bad("layer.setText", m))?;
         }
+        if obj.contains_key("style") && !obj.contains_key("font") {
+            style_picks_family(&mut st);
+        }
         if any {
             e.pending = Some(st);
         }
@@ -1553,7 +1610,14 @@ fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
         set_text_doc(proj, cid, lid, t, p, range.clone())
     })?;
     // What the layer says now (the first 200 characters).
-    Ok(json!({"layer": lid.0, "text": text}))
+    let mut out = json!({"layer": lid.0, "text": text});
+    if str_p(p, "style").is_some()
+        && let Some(doc) = super::text_edit::layer_doc(s, lid)
+        && let Some(w) = unknown_style_warning(&doc, range)
+    {
+        out["warning"] = json!(w);
+    }
+    Ok(out)
 }
 
 /// With `selected: true` (the Properties, Character and Paragraph panels pass it) and no
