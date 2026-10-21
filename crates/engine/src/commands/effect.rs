@@ -464,11 +464,9 @@ fn copy(s: &mut Session, p: &Value) -> Result<Value> {
             retime_effect(group, 1.0, CMD, |t| Ok(Tick(t.0.checked_sub(first.0).ok_or_else(|| effect_time_error(CMD))?)))?;
         }
     }
-    s.state.clipboard.clear();
-    s.state.key_clipboard.clear();
-    s.state.contents_clipboard.clear();
-    s.state.link_clipboard = None;
-    s.state.clip_is_keys = false;
+    // Every other clipboard too: copied property values left behind would win at Paste over
+    // the effects (Edit ▸ Paste tries them first) and the effects would never be pasted.
+    super::edit::clear_clipboards(s);
     let n = groups.len();
     s.state.effect_clipboard = groups;
     Ok(json!({"effects": n}))

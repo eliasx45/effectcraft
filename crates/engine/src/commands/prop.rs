@@ -795,9 +795,17 @@ fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
         },
     };
     let add = b_p(p, "add").unwrap_or(false);
+    let select_keys = b_p(p, "selectKeys").unwrap_or(true);
+    let leaf = s.project.comp(cid).and_then(|c| c.layer(lid)).is_some_and(|l| l.props.find(uid).is_some());
     if !add {
         s.state.selected_props.clear();
         s.state.selected_vertices.clear();
+        // Clicking an effect or a group (Drop Shadow, Gradient Stroke 1) deselects the keyframes
+        // selected before, as in After Effects: left selected, Edit ▸ Copy would copy those keys
+        // instead of the effect.
+        if select_keys || !leaf {
+            s.state.selected_keys.clear();
+        }
     }
     if !s.state.selected_layers.contains(&lid) {
         s.state.selected_layers = vec![lid];
@@ -811,13 +819,8 @@ fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
         s.state.selected_vertices.extend((0..n).map(|index| VertexRef { layer: lid, mask, index }));
     }
     // Selecting a property selects all its keys (as in AE).
-    if b_p(p, "selectKeys").unwrap_or(true)
-        && let Some(pr) = s.active_comp().and_then(|c| c.layer(lid)).and_then(|l| l.props.find(uid))
-    {
+    if select_keys && let Some(pr) = s.active_comp().and_then(|c| c.layer(lid)).and_then(|l| l.props.find(uid)) {
         let keys: Vec<KeyRef> = pr.keys.iter().map(|k| KeyRef { layer: lid, prop: uid, time: k.time }).collect();
-        if !add {
-            s.state.selected_keys.clear();
-        }
         s.state.selected_keys.extend(keys);
     }
     Ok(Value::Null)

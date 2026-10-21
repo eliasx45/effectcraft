@@ -230,7 +230,8 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!(ids.len()))
 }
 
-fn clear_clipboards(s: &mut Session) {
+/// Empty every clipboard: whatever is copied next is the only thing Paste pastes.
+pub(crate) fn clear_clipboards(s: &mut Session) {
     s.state.clipboard.clear();
     s.state.key_clipboard.clear();
     s.state.effect_clipboard.clear();

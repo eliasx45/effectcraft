@@ -69,6 +69,7 @@ pub fn select_all_effects(app: &mut EffectcraftApp) {
         fx.groups().filter(|g| matches!(g.kind, GroupKind::Effect { .. })).map(|g| (layer.id, g.uid)).collect();
     if !uids.is_empty() {
         app.session.state.selected_props = uids;
+        app.session.state.selected_keys.clear();
     }
 }
 
@@ -1315,6 +1316,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
             } else if !selected || hresp.clicked() {
                 app.session.state.selected_props = vec![(layer.id, g.uid)];
+                // Keyframes selected before are deselected (After Effects): left selected,
+                // Edit ▸ Copy would copy them instead of the effect.
+                app.session.state.selected_keys.clear();
             }
         }
         if hresp.drag_started() {
