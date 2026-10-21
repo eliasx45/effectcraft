@@ -733,6 +733,51 @@ fn path_direction_uses_after_effects_values() {
     assert!(o.error.as_ref().is_some_and(|e| format!("{e:?}").contains("can not be set")), "{:?}", o.error);
 }
 
+/// Regression: `layer.property("Position")` on a shape layer is the layer's Transform ▸ Position
+/// (as `layer.position`), not the first shape group's Transform ▸ Position under Contents, which
+/// the nested-name search found first because Contents precedes Transform. Also for a layer made
+/// by `shape.newShape` and duplicated.
+#[test]
+fn shape_layer_property_position_is_the_layer_transform() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var comp = app.project.items.addComp("Main", 1920, 1080, 1, 2, 30);
+        var l = comp.layers.addShape();
+        var g = l.property("Contents").addProperty("ADBE Vector Group");
+        g.property("Contents").addProperty("ADBE Vector Shape - Ellipse");
+        l.property("Position").setValue([610, 540]);
+        l.property("Opacity").setValue(40);
+        l.property("Scale").setValue([50, 50, 100]);
+        var lt = l.property("Transform"), gt = g.property("Transform");
+        [lt.property("Position").value, gt.property("Position").value, lt.property("Opacity").value, gt.property("Opacity").value,
+         lt.property("Scale").value, gt.property("Scale").value, g.property("Position").value]
+        "#,
+    );
+    assert_eq!(o.result, json!([[610, 540, 0], [0, 0], 40, 100, [50, 50, 100], [100, 100], [0, 0]]));
+
+    // A shape layer from shape.newShape, duplicated by the script.
+    let mut s = session();
+    s.execute("comp.new", json!({"name": "N", "width": 1920, "height": 1080, "duration": 2})).unwrap();
+    s.execute("shape.newShape", json!({"kind": "ellipse", "size": [100, 100]})).unwrap();
+    let o = ok(
+        &mut s,
+        r#"
+        var comp = app.project.activeItem;
+        var sq = comp.layer(1).duplicate();
+        sq.property("Position").setValue([1310, 540, 0]);
+        [sq.property("ADBE Transform Group").property("ADBE Position").value, sq.position.value]
+        "#,
+    );
+    assert_eq!(o.result, json!([[1310, 540, 0], [1310, 540, 0]]));
+    let (_, c) = comp_named(&s, "N");
+    let dup =
+        c.layers.iter().find(|l| l.props.prop("transform/position").is_some_and(|p| p.value == KV::Vec3([1310.0, 540.0, 0.0]))).expect("the duplicate moved");
+    let gp = dup.props.prop("contents/#1/transform/position").expect("group position");
+    assert_eq!(gp.value, KV::Vec2([0.0, 0.0]), "the group's Position is unchanged");
+}
+
 /// After Effects compatibility the Reel builds tripped over: legacy string builtins, the
 /// Repeater's and gradient items' own match names, and adding dashes by match name.
 #[test]

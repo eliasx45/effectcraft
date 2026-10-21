@@ -439,8 +439,36 @@ fn alias(k: &str) -> Option<&'static str> {
 const NESTED_CHILD_DEPTH: u8 = 3;
 
 /// The child of `g` that a string key names. The direct children are searched first, then the
-/// groups nested below them, up to `depth` levels.
+/// groups nested below them level by level, up to `depth` levels: the shallowest match wins, so
+/// a shape layer's `property("Position")` is its Transform ▸ Position (one level down), not a
+/// shape group's Transform ▸ Position under Contents (three levels down), as in After Effects.
 fn find_child<'a>(l: &'a Layer, g: &'a PropGroup, k: &str, depth: u8) -> Option<&'a Node> {
+    let mut level: Vec<&'a PropGroup> = vec![g];
+    for d in 0..=depth {
+        if let Some(n) = level.iter().find_map(|grp| find_direct_child(l, grp, k)) {
+            return Some(n);
+        }
+        if d == depth {
+            break;
+        }
+        level = level
+            .iter()
+            .flat_map(|grp| grp.children.iter())
+            .filter_map(|n| match n {
+                Node::Group(sub) => Some(sub),
+                Node::Prop(_) => None,
+            })
+            .collect();
+        if level.is_empty() {
+            break;
+        }
+    }
+    None
+}
+
+/// The direct child of `g` that a string key names (match name, display name, match id, any
+/// case, loose spelling, AE alias, in that order).
+fn find_direct_child<'a>(l: &'a Layer, g: &'a PropGroup, k: &str) -> Option<&'a Node> {
     let chain_of = |n: &Node| -> String {
         let mut ch = if g.uid == l.props.uid { vec![] } else { chain(l, g.uid).unwrap_or_default() };
         ch.push(n);
@@ -455,15 +483,6 @@ fn find_child<'a>(l: &'a Layer, g: &'a PropGroup, k: &str, depth: u8) -> Option<
         .or_else(|| g.children.iter().find(|n| n.name().eq_ignore_ascii_case(k)))
         .or_else(|| g.children.iter().find(|n| loose(n.name()) == lk || loose(n.match_id()) == lk))
         .or_else(|| alias(&lk).and_then(|m| g.children.iter().find(|n| n.match_id() == m)))
-        .or_else(|| {
-            if depth == 0 {
-                return None;
-            }
-            g.children.iter().find_map(|n| match n {
-                Node::Group(sub) => find_child(l, sub, k, depth - 1),
-                Node::Prop(_) => None,
-            })
-        })
 }
 
 fn child(s: &Session, a: &J) -> R {
