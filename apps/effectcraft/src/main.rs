@@ -466,13 +466,20 @@ fn wgpu_options(backends: Option<eframe::wgpu::Backends>, gate: Option<std::sync
         // with an out-of-memory error the frame's error scope catches (the GPU preview backs off)
         // instead of overcommitting until the device is lost (`effectcraft_gpu::vram`).
         setup.instance_descriptor.memory_budget_thresholds = eframe::wgpu::MemoryBudgetThresholds { for_resource_creation: Some(90), for_device_loss: None };
-        setup.device_descriptor = std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
-            label: Some("EffectCraft device"),
-            required_limits: device_limits(adapter.limits()),
-            ..Default::default()
-        });
+        setup.device_descriptor = std::sync::Arc::new(|adapter| device_descriptor(adapter.limits()));
     }
     config
+}
+
+/// The window device's descriptor: the adapter's limits ([`device_limits`]) and `MemoryUsage`,
+/// so memory the compositor frees on the shared device goes back to the driver.
+fn device_descriptor(adapter: eframe::wgpu::Limits) -> eframe::wgpu::DeviceDescriptor<'static> {
+    eframe::wgpu::DeviceDescriptor {
+        label: Some("EffectCraft device"),
+        required_limits: device_limits(adapter),
+        memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
+        ..Default::default()
+    }
 }
 
 /// The limits to request from an adapter that offers `adapter`: all of them, with textures
@@ -789,6 +796,17 @@ mod tests {
         tx.send(d).unwrap();
         let _d = app.recv_timeout(Duration::from_secs(5)).unwrap();
         wait_for("held again", &|| held.load(Ordering::SeqCst) == 1);
+    }
+
+    /// The window device asks for `MemoryUsage`: the adapter's limits, unchanged.
+    #[test]
+    fn the_window_device_favours_memory_usage() {
+        use eframe::wgpu::Limits;
+        let big = Limits { max_texture_dimension_2d: 32768, ..Limits::default() };
+        let d = super::device_descriptor(big);
+        assert!(matches!(d.memory_hints, eframe::wgpu::MemoryHints::MemoryUsage));
+        assert_eq!(d.required_limits.max_texture_dimension_2d, 16384);
+        assert_eq!(d.label, Some("EffectCraft device"));
     }
 
     /// A positional .ecprojx is a project file, not an unsupported media import (#528).
