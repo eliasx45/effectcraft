@@ -1229,7 +1229,9 @@ fn navigation(app: &mut EffectcraftApp, ui: &mut egui::Ui, comp: &Comp, tm: TMap
         let horizontal = if mods.shift { scroll.x + scroll.y } else { scroll.x };
         app.ui.timeline.start = (app.ui.timeline.start - f64::from(horizontal) / tm.pps.max(1e-6)).clamp(0.0, comp.duration.seconds());
         if !mods.shift && !app.ui.timeline.graph_auto_zoom {
-            let offset = -f64::from(scroll.y) * value_per_pixel;
+            // The curve follows the fingers, as when dragging with the Hand (a wheel delta is
+            // the content's move, positive = down).
+            let offset = f64::from(scroll.y) * value_per_pixel;
             app.ui.timeline.graph_range = Some((lo + offset, hi + offset));
         }
     }
