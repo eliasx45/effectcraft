@@ -650,10 +650,32 @@ pub(crate) fn fx_comp_px(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
 }
 
 pub(crate) fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
-    if !layer.switches.collapse || layer.is_3d() || !matches!(layer.source, LayerSource::Shape | LayerSource::Text) {
+    if !comp_space_layer(layer) {
         return None;
     }
     Some(ctx.layer_to_comp(layer).0)
+}
+
+/// A 2D Continuously Rasterize shape or text layer: it runs its effects in comp space
+/// ([`fx_comp_space`]).
+fn comp_space_layer(layer: &Layer) -> bool {
+    layer.switches.collapse && !layer.is_3d() && matches!(layer.source, LayerSource::Shape | LayerSource::Text)
+}
+
+/// Are the point parameters of `effect` on `layer` comp pixels (`COMP_SPACE_EFFECTS` on a 2D
+/// Continuously Rasterize shape or text layer: Gradient Ramp's points, CC Light Sweep's centre)
+/// rather than effect space? Comp edits that move the picture (crop, resize with an anchor) move
+/// such points with it.
+pub fn effect_points_in_comp_space(layer: &Layer, effect: &str) -> bool {
+    COMP_SPACE_EFFECTS.contains(&effect) && comp_space_layer(layer)
+}
+
+/// Does `layer`'s effect space start at an origin set by the comp's size (`fx_origin`,
+/// [`crate::effect_bounds`]): a shape or text layer, whose effects run on a comp-sized canvas
+/// centred on the layer? Its effect point parameters must move by half the change when the
+/// comp is resized, to stay where they are on the layer.
+pub fn effect_space_follows_comp_size(project: &effectcraft_project::Project, layer: &Layer) -> bool {
+    !(layer.switches.adjustment && !matches!(layer.source, LayerSource::Shape)) && crate::eval::source_size(project, layer).0 == 0
 }
 
 /// Test switch: every distortion gets the comp-sized text canvas (the reference for

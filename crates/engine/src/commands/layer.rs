@@ -4,7 +4,7 @@ use effectcraft_color::{BlendMode, Label};
 use effectcraft_keyframe::{Justify, TextDoc, Value as KV};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{
-    Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Node, Project, PropGroup, Quality, Solid, TrackMatte,
+    Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Node, ParamUi, Project, PropGroup, Quality, Solid, TrackMatte,
     limits,
 };
 use effectcraft_time::Tick;
@@ -1690,6 +1690,82 @@ pub(crate) fn offset_position(tr: &mut PropGroup, dx: f64, dy: f64) {
         for k in &mut pr.keys {
             k.value = shift(&k.value);
         }
+    }
+}
+
+/// Layers of `comp` whose effect space follows the comp's size (shape and text layers, see
+/// [`effectcraft_render::effect_space_follows_comp_size`]), read before the comp is resized.
+pub(crate) fn comp_sized_fx_layers(project: &Project, comp: &Comp) -> Vec<LayerId> {
+    comp.layers.iter().filter(|l| effectcraft_render::effect_space_follows_comp_size(project, l)).map(|l| l.id).collect()
+}
+
+/// Keep the effect point parameters of `comp`'s layers where they are on screen when the comp
+/// is resized by `resize` (new − old size) and its picture moves by `shift` (the offset given to
+/// the unparented layers' positions; parented layers follow them). Points in comp space (see
+/// [`effectcraft_render::effect_points_in_comp_space`]) move by `shift`; points in a comp-sized
+/// effect space (the layers in `comp_sized`, from [`comp_sized_fx_layers`]) move by half the
+/// resize, as that space's origin does; points in a layer's own pixels already move with it.
+/// Every keyframe moves too; expressions are left as they are.
+pub(crate) fn offset_effect_points(comp: &mut Comp, comp_sized: &[LayerId], resize: [f64; 2], shift: [f64; 2]) {
+    let fx_space = [resize[0] / 2.0, resize[1] / 2.0];
+    // Only the layers with an effect to move are copied (and so changed).
+    let moves = |l: &Layer| {
+        let own = comp_sized.contains(&l.id) && fx_space != [0.0; 2];
+        l.effects().is_some_and(|fx| {
+            fx.groups().any(|g| match &g.kind {
+                GroupKind::Effect { effect } if effectcraft_render::effect_points_in_comp_space(l, effect) => shift != [0.0; 2],
+                GroupKind::Effect { .. } => own,
+                _ => false,
+            })
+        })
+    };
+    for l in comp.layers.iter_mut_where(moves) {
+        let own = if comp_sized.contains(&l.id) { fx_space } else { [0.0; 2] };
+        // Per effect, read before the effects are borrowed mutably.
+        let layer: &Layer = l;
+        let deltas: Vec<[f64; 2]> = match layer.effects() {
+            Some(fx) => fx
+                .children
+                .iter()
+                .map(|n| match n {
+                    Node::Group(g) => match &g.kind {
+                        GroupKind::Effect { effect } if effectcraft_render::effect_points_in_comp_space(layer, effect) => shift,
+                        _ => own,
+                    },
+                    Node::Prop(_) => [0.0; 2],
+                })
+                .collect(),
+            None => continue,
+        };
+        let Some(fx) = l.props.sub_mut("effects") else { continue };
+        for (n, d) in fx.children.iter_mut().zip(deltas) {
+            let Node::Group(g) = n else { continue };
+            if !matches!(g.kind, GroupKind::Effect { .. }) || d == [0.0; 2] {
+                continue;
+            }
+            g.walk_mut(&mut |pr| {
+                if matches!(pr.ui, ParamUi::Point) {
+                    shift_point(&mut pr.value, d);
+                    for k in &mut pr.keys {
+                        shift_point(&mut k.value, d);
+                    }
+                }
+            });
+        }
+    }
+}
+
+fn shift_point(v: &mut KV, d: [f64; 2]) {
+    match v {
+        KV::Vec2(a) => {
+            a[0] += d[0];
+            a[1] += d[1];
+        }
+        KV::Vec3(a) => {
+            a[0] += d[0];
+            a[1] += d[1];
+        }
+        _ => {}
     }
 }
 
