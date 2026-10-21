@@ -243,11 +243,12 @@ pub fn find(id: &str) -> Option<&'static CommandSpec> {
 
 // ---------- parameter validation (agents) ----------
 
-/// Top-level keys accepted by a params doc such as `{layers: [id|name|#n], add?, toggle?}` or
-/// `{time? (s) | frame? | timecode?}`; `None` when the doc isn't a `{…}` key list.
+/// Top-level keys accepted by a params doc such as `{layers: [id|name|#n], add?, toggle?}`,
+/// `{time? (s) | frame? | timecode?}` or `{fillType?/strokeType?: …}` (paired keys sharing one
+/// description); `None` when the doc isn't a `{…}` key list.
 pub fn accepted_params(doc: &str) -> Option<Vec<String>> {
     let body = doc.trim().strip_prefix('{')?;
-    // Top-level pieces up to the matching close brace, split at `,` and `|`; `:` starts a value.
+    // Top-level pieces up to the matching close brace, split at `,`, `|` and `/`; `:` starts a value.
     let (mut keys, mut cur, mut depth, mut in_value) = (Vec::new(), String::new(), 0i32, false);
     let push = |cur: &mut String, keys: &mut Vec<String>| {
         let k: String = cur.trim().chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
@@ -269,7 +270,7 @@ pub fn accepted_params(doc: &str) -> Option<Vec<String>> {
                 push(&mut cur, &mut keys);
                 in_value = false;
             }
-            '|' if depth == 0 && !in_value => push(&mut cur, &mut keys),
+            '|' | '/' if depth == 0 && !in_value => push(&mut cur, &mut keys),
             ':' if depth == 0 => {
                 push(&mut cur, &mut keys);
                 in_value = true;
