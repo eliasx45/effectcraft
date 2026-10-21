@@ -528,8 +528,10 @@ fn v3(v: &Value) -> [f64; 3] {
     v.as_vec3()
 }
 
-/// Two key values closer than this sit at the same spot (an auto-Bezier still point).
-const COINCIDENT: f64 = 1e-6;
+/// Two key values closer than this (half a pixel) sit at the same spot (an auto-Bezier still
+/// point): keys that read the same in the Timeline but differ by a rounding error (417.917 and
+/// 417.9) must not swing the layer out and back along AE's tangents between them.
+const COINCIDENT: f64 = 0.5;
 
 /// Auto-Bezier spatial tangents for key `i`, as After Effects computes them (Catmull-Rom): the out
 /// tangent is a sixth of the way from the previous key to the next, the in tangent its mirror, and
@@ -1567,6 +1569,18 @@ mod tests {
         assert_eq!(spatial_tangents(&keys, 1).1, sixth(p[0], p[2]));
         let v = evaluate(&keys, s(1.5), true).unwrap().as_vec3();
         assert!(v[0] < 400.0, "AE drifts left between coincident keys: {v:?}");
+    }
+
+    #[test]
+    fn spatial_auto_bezier_holds_still_between_keys_a_rounding_error_apart() {
+        // Elias's Tyson CTRL • Player Position: keys at 417.917 and 417.9 both read 417.9 in the
+        // Timeline, yet the layer swung ~26 px right and up between them.
+        let p = [[960.0, 587.6484375], [960.0, 417.9171875], [960.0, 417.9], [560.0, 445.8]];
+        let keys: Vec<Keyframe> = p.iter().enumerate().map(|(i, v)| Keyframe::new(s(i as f64), Value::Vec2(*v))).collect();
+        for n in 0..=20 {
+            let v = evaluate(&keys, s(1.0 + n as f64 / 20.0), true).unwrap().as_vec3();
+            assert!((v[0] - 960.0).abs() < 1e-9 && (v[1] - 417.9).abs() < 0.02, "t {n}: {v:?}");
+        }
     }
 
     #[test]
