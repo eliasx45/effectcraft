@@ -1472,21 +1472,7 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
             proj.next_id = next;
             return Ok(uid);
         }
-        let g = match kind.as_str() {
-            "group" => build::shape_group(&mut ids, "Group 1", vec![]),
-            "rect" | "rectangle" => build::shape_rect(&mut ids, [200.0, 200.0], [0.0, 0.0], 0.0),
-            "ellipse" => build::shape_ellipse(&mut ids, [200.0, 200.0], [0.0, 0.0]),
-            "star" => build::shape_star(&mut ids, true, 5.0, [0.0, 0.0], 100.0, 50.0),
-            "polygon" => build::shape_star(&mut ids, false, 5.0, [0.0, 0.0], 100.0, 0.0),
-            "fill" => build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]),
-            "stroke" => build::shape_stroke(&mut ids, [1.0, 1.0, 1.0, 1.0], 2.0),
-            "path" => build::shape_path(&mut ids, Default::default()),
-            "gfill" | "gradientFill" => build::shape_gradient_fill(&mut ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default()),
-            "gstroke" | "gradientStroke" => build::shape_gradient_stroke(&mut ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default(), 2.0),
-            "trim" | "trimPaths" => build::shape_trim(&mut ids, 0.0, 100.0, 0.0),
-            "repeater" => build::shape_repeater(&mut ids, 3.0, [100.0, 0.0]),
-            k => build::shape_simple_op(&mut ids, k).ok_or_else(|| bad("layer.addShapeItem", format!("unknown kind `{k}`")))?,
-        };
+        let g = new_shape_item(&mut ids, &kind).ok_or_else(|| bad("layer.addShapeItem", format!("unknown kind `{kind}`")))?;
         let uid = g.uid;
         proj.next_id = next;
         shape_item_target(proj, cid, lid, group_uid)?.children.push(g.into());
@@ -1495,6 +1481,27 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
     // The new item's property path, ready for prop.set / add_keyframe (`contents/trim#2/end`).
     let path = s.project.comp(cid).and_then(|c| c.layer(lid)).and_then(|l| l.props.match_path_of(uid));
     Ok(json!({"uid": uid, "path": path}))
+}
+
+/// A new shape contents item of `kind` with Add ▸ menu defaults (`group`, `rect`, `ellipse`,
+/// `star`, `polygon`, `fill`, `stroke`, `path`, `gfill`, `gstroke`, `trim`, `repeater` and the
+/// path operations of [`build::shape_simple_op`]); `None` for an unknown kind.
+pub(crate) fn new_shape_item(ids: &mut Ids, kind: &str) -> Option<PropGroup> {
+    Some(match kind {
+        "group" => build::shape_group(ids, "Group 1", vec![]),
+        "rect" | "rectangle" => build::shape_rect(ids, [200.0, 200.0], [0.0, 0.0], 0.0),
+        "ellipse" => build::shape_ellipse(ids, [200.0, 200.0], [0.0, 0.0]),
+        "star" => build::shape_star(ids, true, 5.0, [0.0, 0.0], 100.0, 50.0),
+        "polygon" => build::shape_star(ids, false, 5.0, [0.0, 0.0], 100.0, 0.0),
+        "fill" => build::shape_fill(ids, [1.0, 0.0, 0.0, 1.0]),
+        "stroke" => build::shape_stroke(ids, [1.0, 1.0, 1.0, 1.0], 2.0),
+        "path" => build::shape_path(ids, Default::default()),
+        "gfill" | "gradientFill" => build::shape_gradient_fill(ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default()),
+        "gstroke" | "gradientStroke" => build::shape_gradient_stroke(ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default(), 2.0),
+        "trim" | "trimPaths" => build::shape_trim(ids, 0.0, 100.0, 0.0),
+        "repeater" => build::shape_repeater(ids, 3.0, [100.0, 0.0]),
+        k => build::shape_simple_op(ids, k)?,
+    })
 }
 
 /// The contents a new shape item goes into: the shape group `group_uid` (its Contents), else the
