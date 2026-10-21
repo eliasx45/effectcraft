@@ -1240,7 +1240,6 @@ fn shift_range(ctx: &egui::Context, cid: ItemId, comp: &Comp, rows: &[Row], sele
     Some(span.iter().filter(|l| !l.switches.locked && rows.iter().any(|r| r.layer == l.id)).map(|l| l.id.0).collect())
 }
 
-/// Set on the frame the reorder drag is released.
 /// Where layers dropped at height `py` land among the visible layer rows: above the first row
 /// whose middle is below it (its index in `layer_rows`), else below the last row. Returns that
 /// and the y of the line that shows it (`top` without rows).
@@ -1253,8 +1252,16 @@ fn insertion(layer_rows: &[(Rect, LayerId)], py: f32, top: f32) -> (Option<usize
     (at, y)
 }
 
-fn layer_drop_id() -> egui::Id {
-    egui::Id::new("tl-layer-drop")
+/// The layer that `moving` layers dropped at `at` (from [`insertion`] over the `visible` layer
+/// rows, in stack order) go right above, searched in the whole `stack` so layers scrolled out
+/// of view count: at `Some(i)`, the first layer from `visible[i]` down that isn't moving; at
+/// `None` (below the last visible row), the first one after that row. `None`: to the back.
+fn drop_target(stack: &[u64], visible: &[u64], at: Option<usize>, moving: &[u64]) -> Option<u64> {
+    let from = match at {
+        Some(i) => stack.iter().position(|id| Some(id) == visible.get(i))?,
+        None => stack.iter().position(|id| Some(id) == visible.last())?.saturating_add(1),
+    };
+    stack.get(from..)?.iter().find(|id| !moving.contains(id)).copied()
 }
 
 pub(crate) fn clear_inline_focus(app: &mut EffectcraftApp) {
@@ -1807,6 +1814,17 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             ctx.request_repaint();
         }
     }
+    // So does a layer reorder drag (wherever the pointer is sideways), so a layer can be dragged
+    // to any place in a stack taller than the panel.
+    if ctx.data(|d| d.get_temp::<Vec<u64>>(layer_drag_id())).is_some()
+        && let Some(ptr) = ctx.input(|i| i.pointer.latest_pos().filter(|_| i.pointer.primary_down()))
+    {
+        let speed = edge_scroll_speed(rows_rect, ptr.y, rh);
+        if speed != 0.0 {
+            app.ui.timeline.scroll_y += speed * ctx.input(|i| i.stable_dt).min(0.1);
+            ctx.request_repaint();
+        }
+    }
     app.ui.timeline.scroll_y = app.ui.timeline.scroll_y.clamp(0.0, max_scroll);
     let snap_project = app.session.project.clone();
     let snap_expr = app.session.expr.clone();
@@ -2006,9 +2024,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         if is_sel { comp.layers.iter().filter(|l| selected.contains(&l.id)).map(|l| l.id.0).collect() } else { vec![layer.id.0] };
                     ctx.data_mut(|d| d.insert_temp(layer_drag_id(), moving));
                 }
-                if row_resp.drag_stopped() {
-                    ctx.data_mut(|d| d.insert_temp(layer_drop_id(), true));
-                }
+                // The release is read from the pointer (below), not from this row: the row may be
+                // scrolled out of view (and not laid out) by then.
                 app.auto.add(&format!("timeline.layer.{}.row", layer.id.0), left, &layer.name);
                 if row_resp.clicked() && !locked {
                     let m = ui.input(|i| i.modifiers);
@@ -3107,34 +3124,38 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         crate::widgets::marquee(&gp, br, &t);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-box"), br));
     }
-    // Layer reorder drag: a line where the layers will land; the release moves them there.
+    // Layer reorder drag: a line where the layers will land; the release moves them there. The
+    // release is the pointer's, so it ends the drag even when the dragged row has scrolled out of
+    // view; a drag whose release this panel missed (hidden, another comp) or Escape cancels it.
     if let Some(moving) = ctx.data(|d| d.get_temp::<Vec<u64>>(layer_drag_id())) {
-        let dropped = ctx.data_mut(|d| d.remove_temp::<bool>(layer_drop_id())).unwrap_or(false);
+        let (down, released, escape) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_released(), i.key_pressed(egui::Key::Escape)));
+        let stack: Vec<u64> = comp.layers.iter().map(|l| l.id.0).collect();
+        let moving: Vec<u64> = moving.into_iter().filter(|id| stack.contains(id)).collect();
         let layer_rows: Vec<(Rect, LayerId)> = hit_rows.iter().filter(|(_, r)| matches!(r.kind, RowKind::Layer)).map(|(rr, r)| (*rr, r.layer)).collect();
-        if let Some(py) = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos())).map(|p| p.y)
-            && !layer_rows.is_empty()
-        {
+        let py = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos())).map(|p| p.y);
+        let place = py.filter(|_| !layer_rows.is_empty() && !moving.is_empty()).map(|py| {
             let (at, line_y) = insertion(&layer_rows, py, rows_rect.min.y);
-            let target = at.and_then(|i| layer_rows[i..].iter().find(|(_, l)| !moving.contains(&l.0)).map(|(_, l)| *l));
-            if dropped {
-                ctx.data_mut(|d| d.remove::<Vec<u64>>(layer_drag_id()));
+            let visible: Vec<u64> = layer_rows.iter().map(|(_, l)| l.0).collect();
+            (drop_target(&stack, &visible, at, &moving), line_y)
+        });
+        if released || escape || !down || moving.is_empty() {
+            ctx.data_mut(|d| d.remove::<Vec<u64>>(layer_drag_id()));
+            if let Some((target, _)) = place.filter(|_| released && !escape) {
                 // Only when the order changes (no empty undo step for a drop in place).
-                let mut order: Vec<u64> = comp.layers.iter().map(|l| l.id.0).filter(|id| !moving.contains(id)).collect();
-                let at = target.and_then(|t| order.iter().position(|id| *id == t.0)).unwrap_or(order.len());
+                let mut order: Vec<u64> = stack.iter().copied().filter(|id| !moving.contains(id)).collect();
+                let at = target.and_then(|t| order.iter().position(|id| *id == t)).unwrap_or(order.len());
                 order.splice(at..at, moving.iter().copied());
-                if order != comp.layers.iter().map(|l| l.id.0).collect::<Vec<_>>() {
+                if order != stack {
                     let params = match target {
-                        Some(t) => json!({"layers": moving, "above": t.0}),
+                        Some(t) => json!({"layers": moving, "above": t}),
                         None => json!({"layers": moving, "to": "back"}),
                     };
                     actions.push(("layer.arrange".into(), params));
                 }
-            } else {
-                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                p.with_clip_rect(rows_rect).line_segment([pos2(rect.min.x, line_y), pos2(graph_x0, line_y)], Stroke::new(2.0, t.accent));
             }
-        } else if dropped {
-            ctx.data_mut(|d| d.remove::<Vec<u64>>(layer_drag_id()));
+        } else if let Some((_, line_y)) = place {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            p.with_clip_rect(rows_rect).line_segment([pos2(rect.min.x, line_y), pos2(graph_x0, line_y)], Stroke::new(2.0, t.accent));
         }
     }
     // Quick Offset of layer bars: the last selected layer moves by whole frames with the pointer
@@ -4451,6 +4472,22 @@ fn value_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reorder drop goes above the first non-moving layer from the insertion row down, counting
+    /// layers scrolled out of view: below the last visible row is above the next layer in the
+    /// stack (not the back), and a moving layer is never the target.
+    #[test]
+    fn layer_drops_count_layers_out_of_view() {
+        let stack = [1, 2, 3, 4, 5, 6, 7];
+        let visible = [2, 3, 4];
+        assert_eq!(drop_target(&stack, &visible, Some(1), &[1]), Some(3));
+        assert_eq!(drop_target(&stack, &visible, None, &[1]), Some(5), "below the visible rows: above the next layer");
+        assert_eq!(drop_target(&stack, &visible, None, &[1, 5]), Some(6), "skipping moving layers");
+        assert_eq!(drop_target(&stack, &visible, Some(1), &[3, 4]), Some(5));
+        assert_eq!(drop_target(&stack, &[5, 6, 7], None, &[1]), None, "below the last layer: to the back");
+        assert_eq!(drop_target(&stack, &[], None, &[1]), None);
+        assert_eq!(drop_target(&stack, &visible, Some(9), &[1]), None);
+    }
 
     /// Alt/Cmd-click twirls Audio's Waveform row (not in the property tree) with the rest.
     #[test]
