@@ -875,11 +875,21 @@ Property.prototype.property = function () { return null; };
     if (info.dims > 1) {
       if (!(v instanceof Array)) throw __err("value must be an array of " + info.dims + " numbers");
       var o = [];
-      for (var d = 0; d < info.dims; d++) o.push(d < v.length ? __num(v[d]) : (d === 2 ? 0 : __num(v[v.length - 1])));
+      // [x, y] for a 3D value keeps its z, as After Effects does (a 2D layer's Scale stays at 100).
+      for (var d = 0; d < info.dims; d++) o.push(d < v.length ? __num(v[d]) : (d === 2 ? this.__z(info, time) : __num(v[v.length - 1])));
       return o;
     }
     if (v instanceof Array) throw __err("value must be a number, not an array");
     return __num(v);
+  };
+  // The z a 2-number value leaves out: the property's current one (pre-expression, at `time` when
+  // keyed), else 100 for Scale and 0 for the rest.
+  P.__z = function (info, time) {
+    try {
+      var c = __get("value", { comp: this.__layer.__comp, layer: this.__layer.__id, uid: this.__uid, time: time === undefined ? 0 : __num(time, "time"), pre: true });
+      if (c instanceof Array && c.length > 2 && isFinite(c[2])) return c[2];
+    } catch (e) {}
+    return /Scale/.test(info.matchName || "") ? 100 : 0;
   };
   P.__fromEngine = function (v, info) {
     // The object model shows popups 1-based: our reversed (1) arrives as 2, After Effects says 3.

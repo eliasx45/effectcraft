@@ -1784,3 +1784,26 @@ fn removing_a_text_animator_property_from_a_script() {
     let kinds: Vec<&str> = l.props.group("text/animators/#1/properties").unwrap().props().map(|p| p.match_id.as_str()).collect();
     assert_eq!(kinds, ["opacity"]);
 }
+
+/// `setValue([x, y])` on a 3D-valued property (Scale, Position) keeps its z, as After Effects
+/// does: a 2D layer's Scale stays at z 100 instead of becoming `[x, y, 0]`.
+#[test]
+fn two_values_keep_the_z_of_three_d_properties() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var comp = app.project.items.addComp("Z", 320, 180, 1, 2, 30);
+        var l = comp.layers.addSolid([1, 0, 0], "S", 100, 100, 1);
+        l.property("Scale").setValue([50, 50]);
+        l.property("Position").setValue([10, 20]);
+        var before = [l.property("Scale").value, l.property("Position").value];
+        l.threeDLayer = true;
+        l.property("Position").setValue([30, 40, -50]);
+        l.property("Position").setValue([60, 70]);
+        l.property("Scale").setValueAtTime(1, [20, 30]);
+        before.concat([l.property("Position").value, l.property("Scale").valueAtTime(1, true)])
+        "#,
+    );
+    assert_eq!(o.result, json!([[50, 50, 100], [10, 20, 0], [60, 70, -50], [20, 30, 100]]));
+}
