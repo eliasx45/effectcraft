@@ -389,8 +389,8 @@ fn info(s: &mut Session, p: &Value) -> Result<Value> {
             json!("bezier")
         };
         out.push(json!({
-            "layer": l.id.0, "prop": pr.uid, "name": pr.name, "path": l.props.match_path_of(pr.uid),
-            "time": k.time.seconds(), "compTime": l.comp_time(k.time).seconds(), "value": k.value.to_json(),
+            "layer": l.id.0, "prop": pr.uid, "name": pr.name, "path": super::query::tree_path_of(&l.props, pr.uid),
+            "matchPath": l.props.match_path_of(pr.uid), "time": k.time.seconds(), "compTime": l.comp_time(k.time).seconds(), "value": k.value.to_json(),
             "in": interp_name(k.in_interp), "out": interp_name(k.out_interp), "temporal": temporal,
             "autoBezier": k.auto_bezier, "continuous": k.continuous, "roving": k.roving, "spatial": spatial_kind,
             "dims": dims, "units": units(pr), "inEase": side(false), "outEase": side(true),

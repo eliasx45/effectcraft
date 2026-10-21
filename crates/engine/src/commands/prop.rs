@@ -33,7 +33,9 @@ pub(crate) fn prop_ref(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, Lay
 /// Why `path` names no property under `root`: the level that failed, the closest ids there and
 /// the valid ids at that level (so an agent can fix the path without another lookup).
 pub(crate) fn missing_prop(root: &PropGroup, path: &str) -> String {
-    let segs: Vec<&str> = path.split(['/', '.']).filter(|x| !x.is_empty()).collect();
+    // Segments as the resolver reads them: a dotted match id (`ec.stylize.deepglow`) stays one.
+    let walk = root.resolve_path(path);
+    let segs: Vec<&str> = walk.segs.iter().chain(&walk.rest).map(String::as_str).collect();
     if path.trim().starts_with('@') || segs.is_empty() {
         return format!("no property `{path}` (get_layer / layer.tree lists every path)");
     }
