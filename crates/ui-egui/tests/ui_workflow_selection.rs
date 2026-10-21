@@ -414,6 +414,26 @@ fn project_edit_commands_do_not_target_timeline_layers() {
     assert_eq!(h.state().session.state.selected_layers, vec![id]);
 }
 
+/// "Why is pressing X not cutting a layer?" Elias AE binds X to Split Layer, but the Timeline's
+/// default X (Scroll Topmost Selected Layer to Top) won whenever the Timeline had focus: keys the
+/// user chose beat a default sharing them.
+#[test]
+fn user_bound_x_splits_the_layer_over_the_timelines_default_x() {
+    let mut h = harness();
+    let id = h.state().session.active_comp().unwrap().layers[0].id;
+    h.state_mut().session.execute("shortcuts.set", json!({"command":"edit.splitLayer","keys":"X"})).unwrap();
+    h.state_mut().session.execute("layer.select", json!({"layers":[id.0]})).unwrap();
+    h.state_mut().session.execute("time.set", json!({"time": 2.0})).unwrap();
+    h.state_mut().ui.focused = PanelKind::Timeline;
+    for pressed in [true, false] {
+        h.event(Event::Key { key: egui::Key::X, physical_key: Some(egui::Key::X), pressed, repeat: false, modifiers: Modifiers::NONE });
+        h.step();
+    }
+    assert_eq!(h.state().session.active_comp().unwrap().layers.len(), 5, "X split the selected layer");
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(h.state().session.active_comp().unwrap().layers.len(), 4);
+}
+
 #[test]
 fn compact_settings_keeps_confirmation_buttons_clickable() {
     let mut h = Harness::builder().with_size(vec2(1024.0, 768.0)).build_eframe(|_| EffectcraftApp::new(Session::default()));

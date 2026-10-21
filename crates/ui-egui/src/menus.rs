@@ -850,6 +850,19 @@ fn shifted_alias(k: egui::Key) -> Option<egui::Key> {
 /// A key binding: modifiers, key, command id and bound params.
 pub type Binding = (egui::Modifiers, egui::Key, String, Value);
 
+/// Whether the active shortcut preset gives the bindable `key` the keys `(m, k)` that aren't
+/// among its defaults: a shortcut the user chose, not a built-in one.
+fn user_assigned(session: &effectcraft_engine::Session, key: &str, m: egui::Modifiers, k: egui::Key) -> bool {
+    use effectcraft_engine::shortcuts::normalize;
+    let Some(keys) = session.keymaps.active_preset().and_then(|p| p.overrides.get(key)) else { return false };
+    let table = session.shortcuts();
+    let defaults: Vec<String> = table.find(key).map(|b| b.defaults.iter().filter_map(|d| normalize(d)).collect()).unwrap_or_default();
+    keys.iter()
+        .filter(|sc| normalize(sc).is_none_or(|n| !defaults.contains(&n)))
+        .filter_map(|sc| parse_shortcut(sc))
+        .any(|(om, ok)| om == m && (ok == k || shifted_alias(ok) == Some(k) || (ok == egui::Key::Backtick && k == egui::Key::IntlBackslash)))
+}
+
 /// All bindings of the active keyboard shortcut preset, most modifiers first.
 pub fn bindings(session: &effectcraft_engine::Session) -> Vec<Binding> {
     let mut v: Vec<Binding> = Vec::new();
@@ -1149,10 +1162,13 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                 && matches!(physical_key, Some(egui::Key::IntlBackslash | egui::Key::Backtick))
         };
         if let Some((_, _, id, params)) =
-            binds.iter().filter(|(m, k, id, _)| (*k == key || iso_maximize(*k, id)) && mods_match(*m, mods)).min_by_key(|(_, _, id, params)| {
-                // The focused panel wins over an application command sharing its chord.
+            binds.iter().filter(|(m, k, id, _)| (*k == key || iso_maximize(*k, id)) && mods_match(*m, mods)).min_by_key(|(m, k, id, params)| {
+                // Keys the user gave a command win over a default sharing them, whatever the
+                // panel (Elias AE: X is Split Layer, not the Timeline's Scroll Topmost Selected
+                // Layer to Top). Otherwise the focused panel wins over an application command
+                // sharing its chord.
                 let key = effectcraft_engine::shortcuts::binding_key(id, params);
-                app.session.shortcuts().find(&key).is_none_or(|b| b.scope != app.ui.focused.id())
+                (!user_assigned(&app.session, &key, *m, *k), app.session.shortcuts().find(&key).is_none_or(|b| b.scope != app.ui.focused.id()))
             })
         {
             let (id, params) = (id.clone(), if params.is_null() { json!({}) } else { params.clone() });

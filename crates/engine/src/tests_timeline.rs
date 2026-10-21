@@ -200,6 +200,24 @@ fn cut_removes_keys_and_paste_restores_them() {
     assert_eq!(prop(&s, l, "transform/opacity").keys.len(), 2);
 }
 
+/// Edit ▸ Cut (Cmd+X) with a layer selected takes it out of the comp onto the clipboard, as in
+/// After Effects: Paste brings it back and one Undo restores the cut.
+#[test]
+fn cut_removes_the_selected_layer_and_paste_restores_it() {
+    let (mut s, l) = setup();
+    let id = effectcraft_project::LayerId(l);
+    s.execute("layer.select", json!({"layers": [l]})).unwrap();
+    s.execute("edit.cut", json!({})).unwrap();
+    assert!(s.active_comp().unwrap().layers.is_empty());
+    assert_eq!(s.state.clipboard.len(), 1);
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.len(), 1);
+    s.undo();
+    assert!(s.active_comp().unwrap().layers.is_empty(), "Undo takes back the paste");
+    s.undo();
+    assert!(s.active_comp().unwrap().layer(id).is_some(), "one Undo restores the cut layer");
+}
+
 #[test]
 fn select_all_and_nudge_keys() {
     let (mut s, l) = setup();
