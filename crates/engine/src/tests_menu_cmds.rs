@@ -890,6 +890,96 @@ fn crop_comp_and_save_frame() {
     assert!(m.protected && (m.duration.seconds() - 2.0).abs() < 1e-6);
 }
 
+/// Regression: Crop Comp to Region of Interest (and a resize with an anchor) left CC Light
+/// Sweep's centre where it was, so the sweep slid off the layer and disappeared from the render.
+/// A shape layer's effect space is the comp-sized canvas centred on its anchor (its origin moves
+/// by half the size change), and on a Continuously Rasterize layer the centre is in comp space
+/// (it moves with the crop offset). Every key moves too, in the one undo step.
+#[test]
+fn crop_and_resize_keep_effect_points_in_place() {
+    let center = |s: &Session, l: u64| layer(s, l).props.prop("effects/#1/center").unwrap().clone();
+    let shape = |s: &mut Session| {
+        let sh = s.execute("layer.newShape", json!({"kind": "rect", "fill": "#ff0000", "size": [200, 100]})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("effect.apply", json!({"layers": [sh], "effect": "CC Light Sweep"})).unwrap();
+        // (300, 170) on the 640×360 canvas = 20 px left of and 10 px above the anchor, inside the
+        // 200×100 rectangle centred on (320, 180).
+        s.execute("prop.set", json!({"layer": sh, "path": "effects/#1/center", "value": [300, 170]})).unwrap();
+        sh
+    };
+    let frame = |s: &Session| s.render(s.active_comp_id().unwrap(), Tick::ZERO, Default::default());
+    // The cropped frame shows exactly the region [180, 100, 260, 160] of the frame before.
+    let same_picture = |before: &effectcraft_render::Image, after: &effectcraft_render::Image, what: &str| {
+        assert_eq!((after.width, after.height), (260, 160), "{what}");
+        let mut lit = 0;
+        let mut worst = 0.0f32;
+        for y in 0..after.height as i64 {
+            for x in 0..after.width as i64 {
+                let (a, b) = (after.get(x, y), before.get(x + 180, y + 100));
+                worst = (0..4usize).map(|c| (a[c] - b[c]).abs()).fold(worst, f32::max);
+                // The red rectangle has no green: green is the sweep's white light.
+                if b[1] > 0.1 {
+                    lit += 1;
+                }
+            }
+        }
+        assert!(lit > 100, "{what}: the sweep shows before the crop ({lit} px)");
+        assert!(worst < 0.01, "{what}: the cropped frame differs by {worst}");
+    };
+
+    // Effect space of a shape layer: half the size change, (260 − 640) / 2, (160 − 360) / 2.
+    let mut s = comp();
+    let sh = shape(&mut s);
+    let before = frame(&s);
+    s.execute("view.setRegionOfInterest", json!({"rect": [180, 100, 260, 160]})).unwrap();
+    s.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    assert_eq!(layer(&s, sh).props.prop("transform/position").unwrap().value.as_vec2(), [140.0, 80.0]);
+    assert_eq!(center(&s, sh).value.as_vec2(), [110.0, 70.0]);
+    same_picture(&before, &frame(&s), "shape layer");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(center(&s, sh).value.as_vec2(), [300.0, 170.0], "one undo step");
+
+    // Keyframed: every key moves.
+    s.execute("prop.addKey", json!({"layer": sh, "path": "effects/#1/center", "time": 0, "value": [300, 170]})).unwrap();
+    s.execute("prop.addKey", json!({"layer": sh, "path": "effects/#1/center", "time": 1, "value": [340, 190]})).unwrap();
+    s.execute("view.setRegionOfInterest", json!({"rect": [180, 100, 260, 160]})).unwrap();
+    s.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    let keys: Vec<[f64; 2]> = center(&s, sh).keys.iter().map(|k| k.value.as_vec2()).collect();
+    assert_eq!(keys, [[110.0, 70.0], [150.0, 90.0]]);
+    s.execute("edit.undo", json!({})).unwrap();
+    let keys: Vec<[f64; 2]> = center(&s, sh).keys.iter().map(|k| k.value.as_vec2()).collect();
+    assert_eq!(keys, [[300.0, 170.0], [340.0, 190.0]]);
+
+    // Continuously Rasterize: the centre is in comp space and moves with the crop offset.
+    let mut s = comp();
+    let sh = shape(&mut s);
+    s.execute("layer.setSwitch", json!({"layers": [sh], "switch": "collapse", "value": true})).unwrap();
+    let before = frame(&s);
+    s.execute("view.setRegionOfInterest", json!({"rect": [180, 100, 260, 160]})).unwrap();
+    s.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    assert_eq!(center(&s, sh).value.as_vec2(), [120.0, 70.0]);
+    same_picture(&before, &frame(&s), "continuously rasterized shape layer");
+
+    // Composition Settings resize: the centre anchor moves the layer by half the growth, and the
+    // effect space grows by half too; a top-left anchor moves no layer, but the space still grows.
+    let mut s = comp();
+    let sh = shape(&mut s);
+    s.execute("comp.settings", json!({"width": 800})).unwrap();
+    assert_eq!(layer(&s, sh).props.prop("transform/position").unwrap().value.as_vec2(), [400.0, 180.0]);
+    assert_eq!(center(&s, sh).value.as_vec2(), [380.0, 170.0]);
+    s.execute("comp.settings", json!({"width": 960, "anchor": 0})).unwrap();
+    assert_eq!(layer(&s, sh).props.prop("transform/position").unwrap().value.as_vec2(), [400.0, 180.0]);
+    assert_eq!(center(&s, sh).value.as_vec2(), [460.0, 170.0]);
+
+    // A solid's effect points are in its own pixels: the moved layer carries them.
+    let mut s = comp();
+    let a = solid(&mut s, "#ff0000");
+    s.execute("effect.apply", json!({"layers": [a], "effect": "CC Light Sweep"})).unwrap();
+    let was = center(&s, a).value.as_vec2();
+    s.execute("view.setRegionOfInterest", json!({"rect": [180, 100, 260, 160]})).unwrap();
+    s.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    assert_eq!(center(&s, a).value.as_vec2(), was);
+}
+
 #[test]
 fn guides_add_clear_import_export() {
     let mut s = comp();
