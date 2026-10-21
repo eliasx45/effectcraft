@@ -58,8 +58,8 @@ pub use misc::{
 };
 pub use sim::particle_state;
 pub use sim3::{PgBlit, PgPlan, playground_plan, playground_state};
-pub use stylize2::motion_tile_growth;
 pub use stylize2::strobe_on;
+pub use stylize2::{motion_tile_frame, motion_tile_growth, motion_tile_sample};
 // CPU helpers the GPU kernels share (effectcraft-gpu).
 pub use blur2::{camera_lens_plain, camera_lens_spans};
 pub use generate::gen_mode;

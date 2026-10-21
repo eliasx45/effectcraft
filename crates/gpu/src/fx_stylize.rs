@@ -643,7 +643,7 @@ fn motion_tile(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         let (ex, ey) = (effectcraft_effects::motion_tile_growth(ow - lw, s), effectcraft_effects::motion_tile_growth(oh - lh, s));
         (b.img.width.saturating_add(2 * ex), b.img.height.saturating_add(2 * ey), [b.offset[0] + ex as f64, b.offset[1] + ey as f64])
     } else {
-        ((ow * s).round().max(1.0) as u32, (oh * s).round().max(1.0) as u32, [(ow - lw) * 0.5 * s, (oh - lh) * 0.5 * s])
+        effectcraft_effects::motion_tile_frame(lw, lh, ow, oh, s, b.offset)
     };
     if !e.g.fits(nw, nh) {
         return None;
