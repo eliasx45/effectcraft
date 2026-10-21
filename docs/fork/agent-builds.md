@@ -152,6 +152,11 @@ happened in between:
   replaced: the click brings it to the front.
 - **Command line:** `scripts/fork/app.sh` (same thing; `--status` prints `running` / `stale` /
   `ready`, `--build-only` builds without opening).
+- The same build makes the CLI, `target/local/local/effectcraft-cli`, so agents that drive
+  EffectCraft headless (Claude Code, the motion kit) get the current version too. Point
+  `scripts/fork/cli.sh` runs it and rebuilds first when the sources changed (same lock and stamp,
+  so app and CLI build once between them): point agents there (`EFFECTCRAFT_CLI=…/scripts/fork/cli.sh`,
+  or a symlink named `effectcraft-cli` on `PATH`) and they never run a stale CLI.
 - It builds with `[profile.local]` in the root `Cargo.toml` (inherits `release`; `lto = false`,
   `codegen-units = 16`, `incremental = true`) in `target/local`, one build at a time (a lock), so a
   rebuild only recompiles what changed. Exit status 130 means the build was stopped, 1 that it

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Opens the EffectCraft desktop app, building it first only when the sources changed since the last
-# build (fork rule, docs/fork/agent-builds.md "Building the app"). Agents never build the app after
+# Opens the EffectCraft desktop app, building it (and effectcraft-cli, which agents drive) first only
+# when the sources changed since the last build (fork rule, docs/fork/agent-builds.md "Building the app"). Agents never build the app after
 # merging: merges pile up and the next launch builds once.
 #
 # The build uses the `local` profile (release without LTO, parallel codegen) in target/local, so a
@@ -19,6 +19,7 @@ export PATH
 root=$(cd "$(dirname "$0")/../.." && pwd)
 target="$root/target/local"
 bin="$target/local/effectcraft"
+cli="$target/local/effectcraft-cli"   # agents: point EFFECTCRAFT_CLI here, it's rebuilt with the app
 stamp="$target/built.stamp"
 lock="$target/build.lock"
 log="$target/build.log"
@@ -29,7 +30,7 @@ running() { pgrep -f "^$bin( |$)" >/dev/null 2>&1; }
 # Sources newer than the last successful build (any file: a change that doesn't affect the app
 # costs one no-op cargo run, then the stamp moves on).
 stale() {
-    [ -x "$bin" ] && [ -f "$stamp" ] || return 0
+    [ -x "$bin" ] && [ -x "$cli" ] && [ -f "$stamp" ] || return 0
     [ -n "$(find "$root/apps" "$root/crates" "$root/assets" "$root/Cargo.toml" "$root/Cargo.lock" -newer "$stamp" -type f -print 2>/dev/null | head -n 1)" ]
 }
 
@@ -73,7 +74,7 @@ build() {
     echo "building EffectCraft (local profile) $(date)" >"$log"
     # Job control puts the build in its own process group, so stopping it stops every rustc too.
     set -m
-    CARGO_TARGET_DIR="$target" cargo build --profile local -p effectcraft --manifest-path "$root/Cargo.toml" >>"$log" 2>&1 &
+    CARGO_TARGET_DIR="$target" cargo build --profile local -p effectcraft -p effectcraft-cli --manifest-path "$root/Cargo.toml" >>"$log" 2>&1 &
     build_pid=$!
     set +m
     wait "$build_pid"
