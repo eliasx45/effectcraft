@@ -6,6 +6,9 @@
 //! Every control dispatches an engine `renderQueue.*` command (so agents can do the same) and
 //! registers an automation id: `renderQueue.render`, `renderQueue.stop`, `renderQueue.notify`,
 //! `renderQueue.item.<n>.{row,twirl,render,renderSettings,outputModule,outputTo,outputPath,log}`.
+//! The header dividers resize the column to their left (`renderQueue.header.<column>.resize`;
+//! drag, or double-click to fit), kept in `UiState::render_queue_columns` (`ui.set
+//! {renderQueueColumns}`).
 //!
 //! The Render Settings and Output Module menus list the templates first (Edit ▸ Templates), then
 //! every setting; entries needing numbers (custom time span and frame rate, crop, resize, bitrate,
@@ -403,6 +406,51 @@ fn pick_output(app: &EffectcraftApp, it: &RenderQueueItem) -> Option<Option<Stri
     app.hooks.save_dialog(&app.session.resolve_output(it).unwrap_or_default())
 }
 
+/// The resizable queue columns (key, default width; Comp Name's 0 means it fills the room the
+/// other columns leave). Keys of `UiState::render_queue_columns` and of the header dividers'
+/// automation ids (`renderQueue.header.<key>.resize`).
+pub const COLUMNS: [(&str, f32); 7] = [("render", 48.0), ("label", 20.0), ("num", 28.0), ("name", 0.0), ("status", 112.0), ("started", 156.0), ("time", 92.0)];
+const MIN_COL_W: f32 = 18.0;
+const MIN_NAME_W: f32 = 60.0;
+const MAX_COL_W: f32 = 4000.0;
+
+/// `w` clamped to what column `key` allows; `None` for an unknown column or a width that is not
+/// a number.
+fn clamp_column(key: &str, w: f32) -> Option<f32> {
+    if !w.is_finite() || !COLUMNS.iter().any(|c| c.0 == key) {
+        return None;
+    }
+    Some(w.clamp(if key == "name" { MIN_NAME_W } else { MIN_COL_W }, MAX_COL_W))
+}
+
+/// Set column `key`'s width (clamped); `false` for an unknown column or a non-finite width.
+pub fn set_column_width(widths: &mut std::collections::BTreeMap<String, f32>, key: &str, w: f32) -> bool {
+    let Some(w) = clamp_column(key, w) else { return false };
+    widths.insert(key.to_owned(), w);
+    true
+}
+
+/// The left edge of each column in `COLUMNS` order, then the right edge of the last one. The
+/// columns start at `x0`; Comp Name fills up to the fixed columns right-aligned at `right`
+/// unless it has a width of its own (then everything lays out left to right and may end short
+/// of, or past, `right`). Bad stored widths fall back to the defaults.
+pub fn column_xs(x0: f32, right: f32, widths: &std::collections::BTreeMap<String, f32>) -> [f32; 8] {
+    let w = |i: usize| {
+        let (key, def) = COLUMNS.get(i).copied().unwrap_or(("", 0.0));
+        widths.get(key).and_then(|v| clamp_column(key, *v)).unwrap_or(def)
+    };
+    let fixed_right = w(4) + w(5) + w(6);
+    let mut xs = [x0; 8];
+    let mut x = if x0.is_finite() { x0 } else { 0.0 };
+    for (i, slot) in xs.iter_mut().enumerate() {
+        *slot = x;
+        let wi =
+            if i == 3 && !widths.get("name").is_some_and(|v| clamp_column("name", *v).is_some()) { (right - x - fixed_right).max(MIN_NAME_W) } else { w(i) };
+        x += if wi.is_finite() { wi } else { 0.0 };
+    }
+    xs
+}
+
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(rect);
@@ -503,24 +551,77 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let head = Rect::from_min_size(pos2(rect.min.x, top.max.y), vec2(rect.width(), HEAD_H));
     p.rect_filled(head, 0.0, t.panel_bg);
     p.line_segment([head.left_bottom(), head.right_bottom()], Stroke::new(1.0, t.separator));
-    // Columns: twirl | Render | label | # | Comp Name | Status | Started | Render Time
+    // Columns: twirl | Render | label | # | Comp Name | Status | Started | Render Time. Each
+    // divider in the header resizes the column to its left (the columns to its right shift);
+    // a double-click fits that column to its contents. Widths live in `app.ui.render_queue_columns`.
     let cx_twirl = rect.min.x + 4.0;
-    let cx_render = cx_twirl + 20.0;
-    let cx_label = cx_render + 48.0;
-    let cx_num = cx_label + 20.0;
-    let cx_name = cx_num + 28.0;
-    let w_time = 92.0;
-    let w_started = 156.0;
-    let w_status = 112.0;
-    let cx_time = (rect.max.x - w_time).max(cx_name + 120.0);
-    let cx_started = cx_time - w_started;
-    let cx_status = cx_started - w_status;
+    let xs = column_xs(cx_twirl + 20.0, rect.max.x, &app.ui.render_queue_columns);
+    let [cx_render, cx_label, cx_num, cx_name, cx_status, cx_started, cx_time, x_end] = xs;
+    let w_render = cx_label - cx_render;
+    let w_status = cx_started - cx_status;
+    let col_rect = |i: usize, r: Rect| {
+        let (a, b) = (xs.get(i).copied().unwrap_or(r.min.x), xs.get(i + 1).copied().unwrap_or(r.max.x));
+        Rect::from_min_max(pos2(a - 1.0, r.min.y), pos2((b - 4.0).max(a), r.max.y))
+    };
+    // Fit widths measured while drawing the header and rows last frame (for a double-click on
+    // a divider); this frame's are measured below.
+    let fit_id = egui::Id::new("rq-col-fit");
+    let last_fit: [f32; 7] = ui.data(|d| d.get_temp(fit_id)).unwrap_or_default();
+    let mut fit = [0.0f32; 7];
     let hy = head.center().y;
-    for (x, l) in [(cx_render, "Render"), (cx_num, "#"), (cx_name, "Comp Name"), (cx_status, "Status"), (cx_started, "Started"), (cx_time, "Render Time")] {
-        p.text(pos2(x + 2.0, hy), Align2::LEFT_CENTER, l, Tokens::ui(11.0), t.text_dim);
+    for (i, (x, l)) in [(cx_render, "Render"), (cx_num, "#"), (cx_name, "Comp Name"), (cx_status, "Status"), (cx_started, "Started"), (cx_time, "Render Time")]
+        .into_iter()
+        .enumerate()
+    {
+        let ci = if i == 0 { 0 } else { i + 1 };
+        let r = p.with_clip_rect(col_rect(ci, head).intersect(rect)).text(pos2(x + 2.0, hy), Align2::LEFT_CENTER, l, Tokens::ui(11.0), t.text_dim);
+        if let Some(f) = fit.get_mut(ci) {
+            *f = f.max(r.width() + 2.0);
+        }
     }
     for x in [cx_render, cx_label, cx_num, cx_name, cx_status, cx_started, cx_time] {
         p.line_segment([pos2(x - 3.0, head.min.y + 4.0), pos2(x - 3.0, head.max.y - 4.0)], Stroke::new(1.0, t.separator));
+    }
+    // The divider at the right of column `i` sits at the start of column `i + 1` (and, for the
+    // last column, at its end while that is inside the panel).
+    for (i, (key, _)) in COLUMNS.iter().enumerate() {
+        let Some(&b) = xs.get(i + 1) else { continue };
+        if b - 3.0 > rect.max.x - 2.0 {
+            continue;
+        }
+        if b >= x_end {
+            p.line_segment([pos2(b - 3.0, head.min.y + 4.0), pos2(b - 3.0, head.max.y - 4.0)], Stroke::new(1.0, t.separator));
+        }
+        let r = Rect::from_min_max(pos2(b - 6.0, head.min.y), pos2(b, head.max.y));
+        let resp = ui.interact(r, egui::Id::new(("rq-colw", *key)), Sense::click_and_drag());
+        app.auto.add(&format!("renderQueue.header.{key}.resize"), r, "Drag to resize the column; double-click to fit");
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+        }
+        let cur = |xs: &[f32; 8], i: usize| xs.get(i + 1).zip(xs.get(i)).map(|(b, a)| b - a).unwrap_or(0.0);
+        let start_id = egui::Id::new(("rq-colw-start", *key));
+        if resp.drag_started() {
+            // Freeze the filling Comp Name column first so the columns right of the divider
+            // shift with it instead of the divider moving against the drag.
+            app.ui.render_queue_columns.entry("name".into()).or_insert(cur(&xs, 3));
+            ui.data_mut(|d| d.insert_temp(start_id, cur(&xs, i)));
+        }
+        if resp.dragged()
+            && let (Some(origin), Some(ptr)) = ui.input(|inp| (inp.pointer.press_origin(), inp.pointer.latest_pos()))
+        {
+            let start = ui.data(|d| d.get_temp::<f32>(start_id)).unwrap_or_else(|| cur(&xs, i));
+            set_column_width(&mut app.ui.render_queue_columns, key, start + ptr.x - origin.x);
+        }
+        if resp.drag_stopped() {
+            ui.data_mut(|d| d.remove::<f32>(start_id));
+        }
+        if resp.double_clicked()
+            && let Some(&w) = last_fit.get(i)
+            && w > 0.0
+        {
+            app.ui.render_queue_columns.entry("name".into()).or_insert(cur(&xs, 3));
+            set_column_width(&mut app.ui.render_queue_columns, key, w + 8.0);
+        }
     }
 
     // ---------------------------------------------------------- items
@@ -588,7 +689,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
         app.auto.add(&aid("twirl"), tw, "Twirl");
-        let cb = Rect::from_center_size(pos2(cx_render + 20.0, row.center().y), vec2(18.0, 18.0));
+        let cb = Rect::from_center_size(pos2(cx_render + ((w_render - 8.0) / 2.0).max(9.0), row.center().y), vec2(18.0, 18.0));
         if widgets::checkbox(ui, cb, it.render, &t, egui::Id::new(("rq-cb", it.id))).clicked() && !rendering {
             actions.push(("renderQueue.setRender", json!({"item": it.id, "render": !it.render})));
         }
@@ -596,31 +697,38 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let comp_item = app.session.project.item(it.comp);
         let label_col = comp_item.map(|i| t.label(i.label)).unwrap_or(t.text_faint);
         lp.rect_filled(Rect::from_center_size(pos2(cx_label + 6.0, row.center().y), vec2(10.0, 10.0)), 2.0, label_col);
-        lp.text(pos2(cx_num + 2.0, row.center().y), Align2::LEFT_CENTER, n.to_string(), Tokens::ui(12.0), t.text_dim);
+        // A cell's text, clipped to its column; its width feeds the column's double-click fit.
+        let mut cell = |k: usize, x: f32, text: &str, font: egui::FontId, color: Color32| {
+            let r = lp.with_clip_rect(col_rect(k, row).intersect(list)).text(pos2(x + 2.0, row.center().y), Align2::LEFT_CENTER, text, font, color);
+            if let Some(f) = fit.get_mut(k) {
+                *f = f.max(r.width() + 2.0);
+            }
+        };
+        cell(2, cx_num, &n.to_string(), Tokens::ui(12.0), t.text_dim);
         let name = comp_item.map(|i| i.name.clone()).unwrap_or_else(|| "(missing composition)".into());
-        lp.text(pos2(cx_name + 2.0, row.center().y), Align2::LEFT_CENTER, &name, Tokens::ui(12.0), t.text);
+        cell(3, cx_name, &name, Tokens::ui(12.0), t.text);
         let status = if rendering && let Some(pr) = progress.as_ref().filter(|p| p.current == Some(it.id)) {
             format!("Rendering {:.0}%", if pr.total > 0 { pr.done as f64 * 100.0 / pr.total as f64 } else { 0.0 })
         } else {
             it.status.label().to_string()
         };
         let st_rect = Rect::from_min_size(pos2(cx_status, row.min.y), vec2(w_status, ROW_H));
-        lp.text(pos2(cx_status + 2.0, row.center().y), Align2::LEFT_CENTER, &status, Tokens::ui(12.0), status_color(&t, &it.status));
+        cell(4, cx_status, &status, Tokens::ui(12.0), status_color(&t, &it.status));
         if let RenderStatus::Failed(e) = &it.status {
             ui.interact(st_rect, egui::Id::new(("rq-st", it.id)), Sense::hover()).on_hover_text(e);
         }
         app.auto.add(&aid("status"), st_rect, &status);
         if let Some(s) = it.started {
-            lp.text(pos2(cx_started + 2.0, row.center().y), Align2::LEFT_CENTER, utc_stamp(s), Tokens::ui(11.5), t.text_dim);
+            cell(5, cx_started, &utc_stamp(s), Tokens::ui(11.5), t.text_dim);
         } else {
-            lp.text(pos2(cx_started + 2.0, row.center().y), Align2::LEFT_CENTER, "-", Tokens::ui(11.5), t.text_faint);
+            cell(5, cx_started, "-", Tokens::ui(11.5), t.text_faint);
         }
         let rt = if progress.as_ref().and_then(|p| p.current) == Some(it.id) && rendering {
             progress.as_ref().map(|p| hms(p.item_elapsed)).unwrap_or_default()
         } else {
             it.render_time.map(|s| if s < 60.0 { format!("{s:.1} s") } else { hms(s) }).unwrap_or_else(|| "-".into())
         };
-        lp.text(pos2(cx_time + 2.0, row.center().y), Align2::LEFT_CENTER, rt, Tokens::ui(11.5), t.text_dim);
+        cell(6, cx_time, &rt, Tokens::ui(11.5), t.text_dim);
 
         if !is_open {
             continue;
@@ -790,6 +898,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     open.retain(|id| queue.iter().any(|i| i.id == *id));
     ui.data_mut(|d| d.insert_temp(state_id, (open, selected)));
+    ui.data_mut(|d| d.insert_temp(fit_id, fit));
     let ctx = ui.ctx().clone();
     for (it, f) in forms {
         open_menu_form(app, &it, &f);
@@ -803,6 +912,31 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn columns_default_and_resize() {
+        use std::collections::BTreeMap;
+        // Defaults: Render 48, label 20, # 28, Comp Name fills, Status / Started / Render Time
+        // right-aligned (112 / 156 / 92), as before the columns were resizable.
+        let mut w = BTreeMap::new();
+        let xs = super::column_xs(24.0, 1000.0, &w);
+        assert_eq!(xs, [24.0, 72.0, 92.0, 120.0, 640.0, 752.0, 908.0, 1000.0]);
+        // Widening Status shifts Started and Render Time right once Comp Name has a width.
+        assert!(super::set_column_width(&mut w, "name", 520.0));
+        assert!(super::set_column_width(&mut w, "status", 150.0));
+        let xs = super::column_xs(24.0, 1000.0, &w);
+        assert_eq!(xs, [24.0, 72.0, 92.0, 120.0, 640.0, 790.0, 946.0, 1038.0]);
+        // Minimum widths, unknown columns and junk values.
+        assert!(super::set_column_width(&mut w, "started", -50.0));
+        assert_eq!(w.get("started"), Some(&18.0));
+        assert!(!super::set_column_width(&mut w, "bogus", 10.0));
+        assert!(!super::set_column_width(&mut w, "time", f32::NAN));
+        w.insert("time".into(), f32::INFINITY);
+        w.insert("name".into(), f32::NAN);
+        let xs = super::column_xs(24.0, 1000.0, &w);
+        assert!(xs.iter().all(|x| x.is_finite()));
+        assert_eq!(xs[7] - xs[6], 92.0);
+    }
+
     #[test]
     fn stamps() {
         assert_eq!(super::utc_stamp(0), "1970-01-01 00:00:00");

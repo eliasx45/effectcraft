@@ -757,6 +757,11 @@ pub struct UiState {
     /// Vertical scroll of the Project panel's item list (points); only visible rows are drawn.
     #[serde(default)]
     pub project_scroll: f32,
+    /// Render Queue column widths in points by column (`render`, `label`, `num`, `name`, `status`,
+    /// `started`, `time`; see `panels::render_queue::COLUMNS`), set by dragging the header
+    /// dividers. A missing column has its default width; without `name`, Comp Name fills.
+    #[serde(default)]
+    pub render_queue_columns: BTreeMap<String, f32>,
     /// Effect Controls twirl state (group uids that are collapsed).
     pub fx_closed: BTreeSet<u64>,
     /// Slider params whose slider row is twirled open (AE hides sliders by default).
@@ -862,6 +867,7 @@ impl Default for UiState {
             project_hscroll: 0.0,
             project_scroll: 0.0,
             project_columns: default_project_columns(),
+            render_queue_columns: BTreeMap::new(),
             fx_closed: BTreeSet::new(),
             fx_slider_open: BTreeSet::new(),
             fx_pick: None,

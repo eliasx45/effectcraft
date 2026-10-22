@@ -363,6 +363,17 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 }
                 app.ui.project_columns = cols;
             }
+            // Render Queue column widths, e.g. {"status": 140, "name": 300}; null resets a column
+            // to its default (and Comp Name to filling the panel).
+            if let Some(Value::Object(m)) = p.get("renderQueueColumns") {
+                for (k, v) in m {
+                    if v.is_null() {
+                        app.ui.render_queue_columns.remove(k);
+                    } else if !v.as_f64().is_some_and(|w| crate::panels::render_queue::set_column_width(&mut app.ui.render_queue_columns, k, w as f32)) {
+                        return err(format!("renderQueueColumns: `{k}` needs a width in points (columns: render, label, num, name, status, started, time)"));
+                    }
+                }
+            }
             // Wiggler / Smoother / Motion Sketch settings (fields of `AnimToolsState`).
             if let Some(Value::Object(m)) = p.get("animTools") {
                 let mut cur = serde_json::to_value(&app.ui.anim_tools).unwrap_or_default();
