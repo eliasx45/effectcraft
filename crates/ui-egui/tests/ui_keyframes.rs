@@ -359,11 +359,13 @@ fn k_follows_the_revealed_properties_and_auto_select_picks_the_speed_graph_for_p
     assert!(h.state().auto.find(&format!("timeline.graph.key.{pos}.1.0")).is_some(), "value graph: X and Y");
 }
 
-/// #1053: in the Graph Editor, dragging the handle of one selected key moves only that handle
-/// (After Effects), in one undo step; the other selected keys' handles stay. A handle at 100 %
-/// influence reaches halfway across its segment, so 0.2 s on keys 1 s apart is 40 %.
+/// Dragging the handle of one selected key in the Graph Editor moves the handles of every
+/// selected key with it (After Effects; Elias, 22 Oct 2026: only the grabbed one moved), in one
+/// undo step: the same side of each key, or, for a key without a segment there (the last key),
+/// its other side, by the same influence change. A handle at 100 % influence reaches halfway
+/// across its segment, so 0.2 s on keys 1 s apart is 40 %.
 #[test]
-fn a_graph_handle_drag_moves_only_that_handle() {
+fn a_graph_handle_drag_moves_the_handles_of_every_selected_key() {
     let (mut h, id, uid) = harness();
     let s = &mut h.state_mut().session;
     s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/opacity", "time": 2.0, "value": 0.0})).unwrap();
@@ -379,24 +381,54 @@ fn a_graph_handle_drag_moves_only_that_handle() {
         keys.iter().map(|k| (k.in_ease.first().map_or(0.0, |e| e.influence), k.out_ease.first().map_or(0.0, |e| e.influence))).collect()
     };
     let before = influences(&h);
-    let handle = |h: &Harness<'_, EffectcraftApp>, key: usize| {
-        let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.{key}.out")).unwrap_or_else(|| panic!("no handle {key}")).clone();
-        pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0)
-    };
+    let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.1.out")).expect("key 1's out handle").clone();
+    let k1 = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
     let px_per_s = {
         let at = |i: usize| h.state().auto.find(&format!("timeline.graph.key.{uid}.0.{i}")).unwrap().rect[0];
         at(1) - at(0)
     };
-    let (k0, k1) = (handle(&h, 0), handle(&h, 1));
     let undo = h.state().session.history.undo.len();
-    // Key 1's out handle 0.2 s further out (the keys are 1 s apart): key 0's stays.
+    // Key 1's out handle 0.2 s further out (the keys are 1 s apart).
     drag(&mut h, k1, k1 + egui::vec2(px_per_s * 0.2, 0.0), Default::default());
     let after = influences(&h);
-    assert!((after[1].1 - before[1].1 - 0.4).abs() < 0.02, "key 1: {:?} → {:?}", before[1], after[1]);
-    assert_eq!(after[0], before[0], "key 0's handles stay");
-    assert_eq!((after[1].0, after[2].0), (before[1].0, before[2].0), "the in handles stay");
+    let grew = |a: f64, b: f64| (b - a - 0.4).abs() < 0.02;
+    assert!(grew(before[1].1, after[1].1), "key 1 out: {:?} → {:?}", before[1], after[1]);
+    assert!(grew(before[0].1, after[0].1), "key 0 out follows: {:?} → {:?}", before[0], after[0]);
+    assert!(grew(before[2].0, after[2].0), "the last key's in follows: {:?} → {:?}", before[2], after[2]);
+    assert!((after[1].0 - before[1].0).abs() < 1e-9, "key 1's in handle stays");
     assert_eq!(h.state().session.history.undo.len(), undo + 1, "one undo step");
-    assert!((handle(&h, 0).x - k0.x).abs() < 1.0, "key 0's handle stayed on screen");
+    // A key that isn't selected keeps its handles when another key's handle is dragged alone.
+    h.state_mut().session.execute("keys.select", json!({"keys": [{"layer": id.0, "prop": uid, "time": 1.0}]})).unwrap();
+    h.run_steps(3);
+    let before = influences(&h);
+    let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.1.out")).expect("key 1's out handle").clone();
+    let k1 = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
+    drag(&mut h, k1, k1 - egui::vec2(px_per_s * 0.1, 0.0), Default::default());
+    let after = influences(&h);
+    assert!(after[1].1 < before[1].1 - 0.1, "key 1 out moved: {:?} → {:?}", before[1], after[1]);
+    assert_eq!((after[0], after[2]), (before[0], before[2]), "unselected keys stay");
+}
+
+/// The Timeline's speed rows (Elias, 22 Oct 2026): a handle drags up for speed (velocity) and
+/// sideways for influence, right next to the keys, and every selected key's handle follows.
+#[test]
+fn a_speed_row_handle_drags_speed_and_influence_of_every_selected_key() {
+    let (mut h, id, uid) = harness();
+    let s = &mut h.state_mut().session;
+    s.execute("keys.selectAll", json!({})).unwrap();
+    s.execute("keys.easyEase", json!({})).unwrap();
+    s.execute("keys.selectAll", json!({})).unwrap();
+    h.run_steps(4);
+    let e = h.state().auto.find(&format!("timeline.speed.{uid}.0.out")).expect("key 0's out handle in the row").clone();
+    let from = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
+    let undo = h.state().session.history.undo.len();
+    drag(&mut h, from, from + egui::vec2(30.0, -6.0), Default::default());
+    let keys = h.state().session.active_comp().unwrap().layer(id).unwrap().props.prop("transform/opacity").unwrap().keys.clone();
+    let (out0, in1) = (keys[0].out_ease.first().copied().unwrap(), keys[1].in_ease.first().copied().unwrap());
+    assert!(out0.influence > 0.4, "influence grew: {out0:?}");
+    assert!(out0.speed > 1.0, "speed rose: {out0:?}");
+    assert!((in1.influence - out0.influence).abs() < 1e-6 && (in1.speed - out0.speed).abs() < 1e-6, "key 1 follows: {in1:?} vs {out0:?}");
+    assert_eq!(h.state().session.history.undo.len(), undo + 1, "one undo step");
 }
 
 /// A handle at speed 0 (Easy Ease) dragged up in the speed graph speeds the value the way its
@@ -413,7 +445,7 @@ fn a_zero_speed_handle_dragged_in_the_speed_graph_keeps_its_segments_direction()
     h.state_mut().ui.timeline.graph_editor = true;
     h.state_mut().ui.timeline.graph_mode = "speed".into();
     h.run_steps(4);
-    // Each handle drags on its own (#1053): key 1's on the falling segment, then key 0's.
+    // Key 1's handle on the falling segment, then key 0's (every selected key follows each).
     for key in [1, 0] {
         let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.{key}.out")).unwrap_or_else(|| panic!("key {key}'s out handle")).clone();
         let p = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);

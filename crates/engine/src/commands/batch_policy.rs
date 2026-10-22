@@ -79,6 +79,7 @@ pub fn atomic_supported(id: &str) -> bool {
         "keys.selectPrevious",
         "keys.selectFollowing",
         "keys.setEase",
+        "keys.setEaseSelected",
         "keys.timeReverse",
         "effect.apply",
         "effect.applyLast",

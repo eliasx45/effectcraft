@@ -1,10 +1,12 @@
 //! Speed curves in the property rows (Timeline ▸ footer ∿ toggle, on by default): every eased
 //! segment between two keys draws its speed curve inside the row, scaled to that segment's own
 //! peak, with a dot on the peak (hover: speed, time and influences). Linear and hold segments
-//! draw nothing. Editing in place: a yellow influence handle on the baseline at each Bezier side
-//! (drag: `keys.setEase` influence, as the Graph Editor's speed handles), and ⌘-drag anywhere on
-//! the curve sculpts the side nearer the pointer (left of the peak: the first key's out
-//! influence, right of it: the second key's in influence). The speeds at the keys are kept.
+//! draw nothing. Editing in place: a yellow handle at each Bezier side, at the height of the
+//! speed there, as the Graph Editor's speed handles: dragging it sideways changes the influence,
+//! up or down the speed (velocity) at the key. ⌘-drag anywhere on the curve sculpts the side
+//! nearer the pointer (left of the peak: the first key's out influence, right of it: the second
+//! key's in influence), keeping the speeds. Every selected key's handle follows the dragged one
+//! (`keys.setEaseSelected`, After Effects).
 
 use effectcraft_engine::keyframe::{Interp, side_ease, speed};
 use effectcraft_engine::project::{Comp, Layer, ParamUi, Property};
@@ -39,6 +41,19 @@ struct Segment {
     in_inf: Option<f64>,
 }
 
+impl Segment {
+    /// The speed shown at the key on one side (the curve's end there).
+    fn speed_at(&self, out: bool) -> f64 {
+        let end = if out { self.pts.first() } else { self.pts.last() };
+        end.map_or(0.0, |(_, v)| *v)
+    }
+
+    /// The average of the speed shown (its units per second).
+    fn mean(&self) -> f64 {
+        if self.pts.is_empty() { 0.0 } else { self.pts.iter().map(|(_, v)| v).sum::<f64>() / self.pts.len() as f64 }
+    }
+}
+
 /// A handle or sculpt drag in progress (egui memory, per property).
 #[derive(Clone, Copy)]
 struct Grab {
@@ -49,6 +64,24 @@ struct Grab {
     x0: f32,
     inf0: f64,
     reach_px: f32,
+    /// A handle drag's speed: `None` for a sculpt (influence only).
+    speed: Option<SpeedGrab>,
+}
+
+/// What a handle's vertical drag starts from.
+#[derive(Clone, Copy)]
+struct SpeedGrab {
+    /// Pointer y at the press; the segment's peak and the row's height then, which keep the
+    /// vertical scale for the whole drag.
+    y0: f32,
+    peak: f64,
+    amp: f32,
+    /// The side's stored speed (first dimension) at the press.
+    ease: f64,
+    /// +1 or -1: the way the value moves on that side, so up always means faster.
+    dir: f64,
+    /// Stored speed units per shown speed unit (1 for one-dimensional values).
+    ratio: f64,
 }
 
 fn grab_id(uid: u64) -> egui::Id {
@@ -158,7 +191,9 @@ pub(crate) fn show(
     // Locked layers show their curves but take no edits.
     let editable = !layer.switches.locked;
     for s in &segs {
-        let y = |v: f64| base - (v / s.peak) as f32 * amp;
+        // A handle being dragged keeps its segment's scale from the press.
+        let peak = grab.filter(|g| if g.out { g.key == s.i } else { g.key == s.i + 1 }).and_then(|g| g.speed).map_or(s.peak, |sg| sg.peak);
+        let y = |v: f64| base - (v / peak.max(1e-9)).clamp(0.0, 1.0) as f32 * amp;
         let line: Vec<Pos2> = s.pts.iter().map(|(x, v)| pos2(*x, y(*v))).collect();
         // Faint fill under the curve, then the curve.
         let fill = Color32::from_rgba_unmultiplied(CURVE.r(), CURVE.g(), CURVE.b(), 34);
@@ -199,48 +234,87 @@ pub(crate) fn show(
                 let out = px.x < s.peak_x;
                 let (key, inf) = if out { (s.i, s.out_inf) } else { (s.i + 1, s.in_inf) };
                 let reach_px = ((s.xb - s.xa) as f64 * HANDLE_REACH) as f32;
-                let g = Grab { key, out, x0: px.x, inf0: inf.unwrap_or(1.0 / 6.0) * 100.0, reach_px };
+                let g = Grab { key, out, x0: px.x, inf0: inf.unwrap_or(1.0 / 6.0) * 100.0, reach_px, speed: None };
                 ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
                 grab = Some(g);
             }
-            drag(&ctx, &resp, prop, layer, grab, actions, |g, px| g.inf0 + ((px - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 });
+            drag(&ctx, &resp, prop, layer, grab, actions, |g, px| (g.inf0 + ((px.x - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 }, None));
         }
-        // Influence handles on the baseline.
+        // Handles at the speed of each Bezier side: sideways influence, up and down speed.
         let reach = (s.xb - s.xa) * HANDLE_REACH as f32;
         for (out, key, inf, kx) in [(true, s.i, s.out_inf, s.xa), (false, s.i + 1, s.in_inf, s.xb)] {
             let Some(inf) = inf else { continue };
             let hx = if out { kx + reach * inf as f32 } else { kx - reach * inf as f32 };
-            p.line_segment([pos2(kx, base), pos2(hx, base)], Stroke::new(1.5, HANDLE));
-            let hr = Rect::from_center_size(pos2(hx, base), vec2(5.0, 5.0));
+            let hy = y(s.speed_at(out));
+            p.line_segment([pos2(kx, hy), pos2(hx, hy)], Stroke::new(1.5, HANDLE));
+            let hr = Rect::from_center_size(pos2(hx, hy), vec2(5.0, 5.0));
             p.rect(hr, 0.0, HANDLE, Stroke::new(1.0, Color32::from_gray(20)), egui::StrokeKind::Inside);
             if !editable {
                 continue;
             }
-            let hit = Rect::from_center_size(pos2(hx, base - 2.0), vec2(12.0, 12.0));
+            let hit = Rect::from_center_size(pos2(hx, hy.min(base - 2.0)), vec2(12.0, 12.0));
             let resp = ui.interact(hit, egui::Id::new(("tl-speed-handle", uid, key, out)), Sense::drag());
             let side = if out { "out" } else { "in" };
-            app.auto.add(&format!("timeline.speed.{uid}.{key}.{side}"), hit, &format!("{} {side} influence {:.0}%", prop.name, inf * 100.0));
+            let shown = s.speed_at(out);
+            let tip = format!("{side} influence {:.0}% · speed {shown:.1} {unit}", inf * 100.0);
+            app.auto.add(&format!("timeline.speed.{uid}.{key}.{side}"), hit, &format!("{} {tip}", prop.name));
             if resp.hovered() || resp.dragged() {
-                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                ctx.set_cursor_icon(egui::CursorIcon::Move);
                 if !resp.dragged() {
-                    let _ = resp.clone().on_hover_text(format!("{side} influence {:.0}%", inf * 100.0));
+                    let _ = resp.clone().on_hover_text(format!("{tip}\nDrag sideways: influence · up/down: speed"));
                 }
             }
-            if resp.drag_started() {
-                // The handle follows the pointer: influence from the key's x.
-                let g = Grab { key, out, x0: kx, inf0: 0.0, reach_px: reach };
+            if resp.drag_started()
+                && let Some(press) = resp.interact_pointer_pos()
+            {
+                // The handle follows the pointer: influence from the key's x, speed from how far
+                // the pointer moved up or down at the press's scale.
+                let ease = side_ease(&prop.keys, key, 0, prop.spatial, out).map_or(0.0, |e| e.speed);
+                let lead = seg_velocity(prop, key, out);
+                let dir = if lead < 0.0 { -1.0 } else { 1.0 };
+                let mean = s.mean();
+                let ratio = if mean > 1e-9 && lead.abs() > 1e-9 { lead.abs() / mean } else { 1.0 };
+                let sg = SpeedGrab { y0: press.y, peak: s.peak, amp, ease, dir, ratio };
+                let g = Grab { key, out, x0: kx, inf0: 0.0, reach_px: reach, speed: Some(sg) };
                 ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
                 grab = Some(g);
             }
             if grab.is_some_and(|g| g.key == key && g.out == out) {
-                drag(&ctx, &resp, prop, layer, grab, actions, |g, px| ((px - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 });
+                drag(&ctx, &resp, prop, layer, grab, actions, |g, px| {
+                    let inf = ((px.x - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 };
+                    let speed = g.speed.map(|sg| {
+                        let more = f64::from(sg.y0 - px.y) / f64::from(sg.amp.max(1.0)) * sg.peak;
+                        let v = sg.ease + sg.dir * more * sg.ratio;
+                        // Down to a stop, never backwards.
+                        if v * sg.dir < 0.0 { 0.0 } else { v }
+                    });
+                    (inf, speed)
+                });
             }
         }
     }
 }
 
-/// Follows a handle or sculpt drag: `keys.setEase` with the influence `f` gives for the
-/// pointer x; on release ends the undo merge and forgets the grab.
+/// Average velocity of the first dimension (path speed for a spatial value) on one side of key
+/// `i`, signed the way the value moves.
+fn seg_velocity(prop: &Property, i: usize, out: bool) -> f64 {
+    let j = if out { i.checked_add(1) } else { i.checked_sub(1) };
+    let (Some(k), Some(n)) = (prop.keys.get(i), j.and_then(|j| prop.keys.get(j))) else { return 0.0 };
+    let dur = (n.time.seconds() - k.time.seconds()).abs();
+    if dur <= 0.0 {
+        return 0.0;
+    }
+    let (a, b) = (k.value.components(), n.value.components());
+    if prop.spatial && a.len() > 1 {
+        return a.iter().zip(&b).map(|(x, y)| (y - x).powi(2)).sum::<f64>().sqrt() / dur;
+    }
+    let dv = b.first().copied().unwrap_or(0.0) - a.first().copied().unwrap_or(0.0);
+    if out { dv / dur } else { -dv / dur }
+}
+
+/// Follows a handle or sculpt drag: `keys.setEaseSelected` (every selected key follows) with
+/// the influence and speed `f` gives for the pointer; on release ends the undo merge and forgets
+/// the grab.
 fn drag(
     ctx: &egui::Context,
     resp: &egui::Response,
@@ -248,18 +322,19 @@ fn drag(
     layer: &Layer,
     grab: Option<Grab>,
     actions: &mut Vec<(String, serde_json::Value)>,
-    f: impl Fn(&Grab, f32) -> f64,
+    f: impl Fn(&Grab, Pos2) -> (f64, Option<f64>),
 ) {
     let Some(g) = grab else { return };
     if resp.dragged()
         && let Some(px) = resp.interact_pointer_pos()
         && let Some(k) = prop.keys.get(g.key)
     {
-        let inf = f(&g, px.x).clamp(MIN_INFLUENCE, MAX_INFLUENCE);
-        actions.push((
-            "keys.setEase".into(),
-            json!({"layer": layer.id.0, "prop": prop.uid, "time": k.time.seconds(), "side": if g.out { "out" } else { "in" }, "influence": inf, "merge": "tl-speed-ease"}),
-        ));
+        let (inf, speed) = f(&g, px);
+        let mut params = json!({"layer": layer.id.0, "prop": prop.uid, "time": k.time.seconds(), "side": if g.out { "out" } else { "in" }, "influence": inf.clamp(MIN_INFLUENCE, MAX_INFLUENCE), "merge": "tl-speed-ease"});
+        if let Some(v) = speed.filter(|v| v.is_finite()) {
+            params["speed"] = json!(v);
+        }
+        actions.push(("keys.setEaseSelected".into(), params));
         ctx.request_repaint();
     }
     if resp.drag_stopped() {

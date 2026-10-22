@@ -182,17 +182,6 @@ fn lead_dim(l: &Layer, pr: &Property) -> usize {
     (0..shown_dims(l, pr)).max_by(|a, b| travel(*a).total_cmp(&travel(*b))).unwrap_or(0)
 }
 
-/// For a linked speed curve's handle on key `i` (`out` side): each shown dimension and its
-/// segment's change relative to the lead dimension's, so one drag gives every dimension the same
-/// share of its own speed and the same influence.
-fn linked_ratios(l: &Layer, pr: &Property, i: usize, out: bool, lead: usize) -> Vec<(usize, f64)> {
-    let j = if out { i.checked_add(1) } else { i.checked_sub(1) };
-    let (Some(a), Some(b)) = (pr.keys.get(i), j.and_then(|j| pr.keys.get(j))) else { return vec![] };
-    let delta = |d: usize| b.value.components().get(d).copied().unwrap_or(0.0) - a.value.components().get(d).copied().unwrap_or(0.0);
-    let base = delta(lead);
-    (0..shown_dims(l, pr)).map(|d| (d, if base.abs() > 1e-9 { delta(d) / base } else { 1.0 })).collect()
-}
-
 #[derive(Clone, Default)]
 struct CurveSamples {
     result: Vec<(f64, f64)>,
@@ -1039,9 +1028,10 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                         )
                     },
                 ));
-                // Only the grabbed handle moves (After Effects; #1053: other selected keys'
-                // handles moved with it). Option at the press splits a continuous key's handles or
-                // joins split ones, for the whole drag.
+                // Every selected key's handle follows the grabbed one (After Effects:
+                // `keys.setEaseSelected`, the same influence change and share of the speed; an
+                // unselected key's handle moves alone). Option at the press splits a continuous
+                // key's handles or joins split ones, for the whole drag.
                 if hresp.drag_started() {
                     let continuous = c.prop.keys.get(k.idx).is_some_and(|k| k.continuous);
                     let grab = HandleGrab {
@@ -1055,7 +1045,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                         negative: h.negative,
                         dur: h.dur,
                         toggle: ui.input(|i| i.modifiers.alt).then_some(!continuous),
-                        linked: if c.linked { linked_ratios(c.layer, c.prop, k.idx, h.out, c.dim) } else { vec![] },
+                        linked: if c.linked { (0..shown_dims(c.layer, c.prop)).collect() } else { vec![] },
                     };
                     let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(hp);
                     ctx.data_mut(|dd| {
@@ -1088,18 +1078,11 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                         if let Some(join) = g.toggle {
                             params["continuous"] = json!(join);
                         }
-                        if g.linked.is_empty() {
-                            actions.push(("keys.setEase".into(), params));
-                        } else {
-                            // Every dimension in the same undo step: the same influence, its share of the speed.
-                            let lead_speed = params.get("speed").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                            for &(dd, ratio) in &g.linked {
-                                let mut p = params.clone();
-                                p["dim"] = json!(dd);
-                                p["speed"] = json!(lead_speed * ratio);
-                                actions.push(("keys.setEase".into(), p));
-                            }
+                        if !g.linked.is_empty() {
+                            // A linked curve: every dimension, the same influence, its share of the speed.
+                            params["dims"] = json!(g.linked);
                         }
+                        actions.push(("keys.setEaseSelected".into(), params));
                     }
                 }
                 if hresp.drag_stopped() {
@@ -1614,8 +1597,8 @@ struct HandleGrab {
     /// Option was held at the press: `Some(true)` joins the key's handles (continuous),
     /// `Some(false)` splits them, for the whole drag.
     toggle: Option<bool>,
-    /// A linked speed curve's dimensions and their speed relative to the lead's (empty: only `dim`).
-    linked: Vec<(usize, f64)>,
+    /// A linked speed curve's dimensions, which all move (empty: only `dim`).
+    linked: Vec<usize>,
 }
 
 impl HandleGrab {
