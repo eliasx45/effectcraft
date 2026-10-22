@@ -93,6 +93,8 @@ mod tests_callable;
 #[cfg(test)]
 mod tests_ease_presets;
 #[cfg(test)]
+mod tests_gradient_generator;
+#[cfg(test)]
 mod tests_include;
 #[cfg(test)]
 mod tests_panels;
