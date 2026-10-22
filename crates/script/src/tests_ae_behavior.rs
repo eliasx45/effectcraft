@@ -153,3 +153,23 @@ fn numeric_bezier_insertion_keeps_original_middle_speed_with_requested_value() {
     }
     assert_eq!(result[3], json!(true));
 }
+
+#[test]
+fn effects_known_to_projects_add_by_match_name_and_dropdowns_take_items() {
+    let (mut s, _, _, _, _) = fixture();
+    let result = run(
+        &mut s,
+        &format!(
+            r#"{B_PROPERTY}
+        var fx=c.layer(1).property("ADBE Effect Parade");
+        var w=fx.addProperty("ADBE WRPMESH"), b=fx.addProperty("CC Blobbylize");
+        var m=fx.addProperty("ADBE Dropdown Control").property(1);
+        m.setValue(3);
+        var r=m.setPropertyParameters(["Blues","Fire"]);
+        var bad=false; try {{ w.property(1).setPropertyParameters(["x"]); }} catch(e) {{ bad=true; }}
+        [w.matchName,b.matchName,r===m,m.isDropdownEffect,w.property(1).isDropdownEffect,m.value,bad]
+    "#
+        ),
+    );
+    assert_eq!(result, json!(["ADBE WRPMESH", "CC Blobbylize", true, true, false, 2, true]));
+}

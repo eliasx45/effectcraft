@@ -814,7 +814,20 @@ Property.prototype.property = function () { return null; };
     for (var i = 0; i < k.length; i++) if (k[i].selected) out.push(i + 1);
     return out;
   });
-  def("isDropdownEffect", function () { return false; });
+  // The Menu of a Dropdown Menu Control.
+  def("isDropdownEffect", function () {
+    var g = this.parentProperty;
+    return !!g && g.matchName === "ADBE Dropdown Control";
+  });
+  // Dropdown Menu Control ▸ Menu: replace its items (a selection past the end moves to the last).
+  P.setPropertyParameters = function (items) {
+    if (!this.isDropdownEffect) throw __err("setPropertyParameters only works on the Menu of a Dropdown Menu Control");
+    if (!(items instanceof Array) || items.length === 0) throw __err("setPropertyParameters needs an array of item names");
+    var names = [];
+    for (var i = 0; i < items.length; i++) names.push(String(items[i]));
+    __call("effect.editDropdown", this.__ref({ items: names }));
+    return this;
+  };
 
   // Essential Graphics: expose this property in `comp` (its own composition).
   P.canAddToMotionGraphicsTemplate = function (comp) {
