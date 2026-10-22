@@ -521,6 +521,23 @@ pub struct TimelineState {
     /// Batch 1 (AX5): the quick-button row above the layers (pins, Fast In pick, find box).
     #[serde(default)]
     pub quick_row: crate::panels::quick_row::QuickRowState,
+    /// Where a Shift-drag in the time graph (a layer bar move, an In / Out trim, a slip or a
+    /// keyframe drag) is snapped right now, drawn as the guide line; `None` when nothing snaps.
+    /// Read-only for agents (`ui.get`): it is reset every frame and never restored.
+    #[serde(default, skip_deserializing)]
+    pub snap_guide: Option<SnapGuide>,
+}
+
+/// A Timeline snap (see `TimelineState::snap_guide`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapGuide {
+    /// The target's time (comp seconds).
+    pub time: f64,
+    /// `cti`, `key`, `layerIn`, `layerOut`, `compMarker`, `layerMarker`, `workAreaStart`,
+    /// `workAreaEnd`, `compStart` or `compEnd`.
+    pub kind: String,
+    /// The layer the target belongs to (In / Out point, layer marker, key).
+    pub layer: Option<u64>,
 }
 
 pub fn default_tl_columns() -> BTreeSet<String> {
@@ -581,6 +598,7 @@ impl Default for TimelineState {
             column_widths: BTreeMap::new(),
             scroll_to: None,
             quick_row: Default::default(),
+            snap_guide: None,
         }
     }
 }

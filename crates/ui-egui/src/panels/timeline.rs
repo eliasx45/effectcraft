@@ -16,6 +16,7 @@ use serde_json::json;
 
 mod beat;
 mod inline;
+mod snap;
 pub(crate) mod wheels;
 
 use crate::i18n::tr;
@@ -1344,6 +1345,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter().clone();
     let time = app.session.time();
     let fr = comp.frame_rate;
+    // Set again by a Shift-drag that snaps this frame (drawn with the CTI).
+    app.ui.timeline.snap_guide = None;
 
     // Geometry.
     let header_h = 48.0;
@@ -2215,6 +2218,45 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             if gresp.hovered() || gresp.dragged() {
                                 ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                             }
+                            // Shift: the source's start or end (whichever is closer) snaps
+                            // to the snap targets, as a moved bar's edges do.
+                            let slip_start_id = egui::Id::new(("slip-snap-start", layer.id.0));
+                            if gresp.drag_started() {
+                                ctx.data_mut(|d| d.insert_temp(slip_start_id, layer.start_time.seconds()));
+                            }
+                            if gresp.drag_stopped() {
+                                ctx.data_mut(|d| d.remove::<f64>(slip_start_id));
+                            }
+                            if gresp.dragged()
+                                && ui.input(|i| i.modifiers.shift)
+                                && let Some(start) = ctx.data(|dd| dd.get_temp::<f64>(slip_start_id))
+                                && let (Some(o), Some(now)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+                            {
+                                let (cur_s, cur_e) = (layer.start_time.seconds(), layer.comp_time(d).seconds());
+                                let want = start + f64::from(now.x - o.x) / pps.max(1e-6);
+                                let off = want - cur_s;
+                                let skip = snap::Skip { content: vec![layer.id], ..Default::default() };
+                                let hit = snap::resolve(
+                                    &snap::targets(&comp, &snap::key_props(&rows), time.seconds(), &skip),
+                                    &[cur_s + off, cur_e + off],
+                                    snap::tolerance(pps),
+                                );
+                                let to = match &hit {
+                                    Some(h) => want + h.delta,
+                                    None => start + ((want - start) / fd).round() * fd,
+                                };
+                                let frames = ((to - cur_s) / fd).round();
+                                if frames.is_finite() && frames != 0.0 && frames.abs() < 1e9 {
+                                    actions.push((
+                                        "layer.slip".into(),
+                                        json!({"layers": [layer.id.0], "frames": frames as i64, "merge": format!("slip-{}", layer.id.0)}),
+                                    ));
+                                }
+                                if let Some(h) = hit {
+                                    app.ui.timeline.snap_guide = Some(h.target.guide());
+                                }
+                                continue;
+                            }
                             let acc_id = egui::Id::new(("slip-acc", layer.id.0));
                             if gresp.dragged() {
                                 let mut acc: f32 = ctx.data(|d| d.get_temp(acc_id).unwrap_or(0.0));
@@ -2317,6 +2359,54 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             if let Some(Some(word)) = ctx.data_mut(|d| d.remove_temp::<Option<String>>(egui::Id::new("tl-bar-syllable"))) {
                                 app.toast = Some((format!("Snapped: layer on “{word}”"), ctx.input(|i| i.time)));
                             }
+                        }
+                        // Shift: the dragged edge (a moved bar's In or Out point, whichever is
+                        // closer) follows the pointer from where the drag started and snaps to
+                        // the CTI, keys, other layers' In / Out points, markers, the work area
+                        // and the comp's ends within 8 px, with a guide line (After Effects).
+                        let snap_start_id = egui::Id::new(("bar-snap-start", layer.id.0, kind));
+                        if resp.drag_started() {
+                            let edge = if kind == "out" { layer.out_point } else { layer.in_point };
+                            ctx.data_mut(|d| d.insert_temp(snap_start_id, edge.seconds()));
+                        }
+                        if resp.drag_stopped() {
+                            ctx.data_mut(|d| d.remove::<f64>(snap_start_id));
+                        }
+                        if resp.dragged()
+                            && mods.shift
+                            && let Some(start) = ctx.data(|d| d.get_temp::<f64>(snap_start_id))
+                            && let (Some(o), Some(now)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+                        {
+                            let moved: Vec<LayerId> = if is_sel { selected.clone() } else { vec![layer.id] };
+                            let skip = if kind == "move" {
+                                snap::Skip { edges: moved.clone(), content: moved, keys: vec![] }
+                            } else {
+                                snap::Skip { edges: moved, ..Default::default() }
+                            };
+                            let (cur_in, cur_out) = (layer.in_point.seconds(), layer.out_point.seconds());
+                            let cur = if kind == "out" { cur_out } else { cur_in };
+                            let want = start + f64::from(now.x - o.x) / pps.max(1e-6);
+                            let moving = if kind == "move" { vec![want, want + (cur_out - cur_in)] } else { vec![want] };
+                            let hit = snap::resolve(&snap::targets(&comp, &snap::key_props(&rows), time.seconds(), &skip), &moving, snap::tolerance(pps));
+                            let to = match &hit {
+                                Some(h) => want + h.delta,
+                                None => start + ((want - start) / fd).round() * fd,
+                            };
+                            let frames = ((to - cur) / fd).round();
+                            if frames.is_finite() && frames != 0.0 {
+                                let d = frames * fd;
+                                let targets = if is_sel { json!(selected.iter().map(|l| l.0).collect::<Vec<_>>()) } else { json!([layer.id.0]) };
+                                let params = match kind {
+                                    "move" => json!({"layers": targets, "delta": d, "merge": drag_key}),
+                                    "in" => json!({"layers": targets, "inDelta": d, "merge": drag_key}),
+                                    _ => json!({"layers": targets, "outDelta": d, "merge": drag_key}),
+                                };
+                                actions.push(("layer.timing".into(), params));
+                            }
+                            if let Some(h) = hit {
+                                app.ui.timeline.snap_guide = Some(h.target.guide());
+                            }
+                            continue;
                         }
                         if resp.dragged() {
                             let acc_id = egui::Id::new(("bar-acc", layer.id.0, kind));
@@ -3188,14 +3278,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Some(ptr) => {
                 let mut target = kd.anchor + (ptr.x - kd.origin_x) as f64 / pps;
                 if shift {
-                    // The current time and whatever it snaps to (keys, layer ends, markers), but
-                    // not the moving keys themselves.
-                    let moving: Vec<f64> =
-                        app.session.state.selected_keys.iter().filter_map(|k| comp.layer(k.layer).map(|l| l.comp_time(k.time).seconds())).collect();
-                    let mut cands = snap_candidates(&comp, &rows);
-                    cands.retain(|c| !moving.iter().any(|m| (m - c).abs() < 1e-9));
-                    cands.push(time.seconds());
-                    target = snap_time(&cands, target, 8.0 / pps);
+                    // The grabbed key snaps to the current time, the other keys (this layer's
+                    // and other layers'), layer In / Out points, markers, the work area and the
+                    // comp's ends within 8 px, with a guide line; the moving keys are no
+                    // targets, and the other selected keys follow (After Effects).
+                    let skip = snap::Skip { keys: app.session.state.selected_keys.iter().map(|k| (k.layer, k.prop, k.time)).collect(), ..Default::default() };
+                    let hit = snap::resolve(&snap::targets(&comp, &snap::key_props(&rows), time.seconds(), &skip), &[target], snap::tolerance(pps));
+                    if let Some(h) = hit {
+                        target += h.delta;
+                        app.ui.timeline.snap_guide = Some(h.target.guide());
+                    }
                 }
                 // Batch 1 (AX6): without Shift, the move's speed peak snaps onto a stressed syllable.
                 let syllable = (!shift && kd.quick.is_none()).then(|| beat::key_snap(app, &comp, kd.anchor + kd.applied as f64 * fd, target)).flatten();
@@ -3249,6 +3341,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
 
+    // The Shift-snap guide: a bright line through the ruler and the rows at the snap target.
+    if let Some(g) = &app.ui.timeline.snap_guide {
+        let gx = tm.x(g.time);
+        if gx >= graph_x0 && gx <= rect.max.x {
+            p.with_clip_rect(Rect::from_min_max(pos2(graph_x0, ruler.min.y), pos2(rect.max.x, rows_rect.max.y)))
+                .line_segment([pos2(gx, ruler.min.y), pos2(gx, rows_rect.max.y)], Stroke::new(1.5, t.accent_hover));
+        }
+        app.auto.add("timeline.snapGuide", Rect::from_center_size(pos2(gx, rows_rect.center().y), vec2(4.0, rows_rect.height())), &format!("Snap: {}", g.kind));
+    }
     // CTI.
     let cx = tm.x(time.seconds());
     if cx >= graph_x0 && cx <= rect.max.x {
