@@ -210,13 +210,14 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     if let Some(result) = crate::panels::timeline::invoke_inline(app, ctx, id, &params) {
         return result;
     }
-    // Cmd+T with path points selected, and Layer ▸ Mask and Shape Path ▸ Free Transform Points
-    // with a path to work on, enter Free Transform in the viewer (After Effects); otherwise
-    // Cmd+T is the Type tool and the menu item asks for numbers.
+    // Cmd+T and Layer ▸ Mask and Shape Path ▸ Free Transform Points with a path to work on (its
+    // points selected in the viewer, or the mask / shape path selected in the Timeline) enter
+    // Free Transform in the viewer (After Effects); otherwise Cmd+T is the Type tool and the menu
+    // item asks for numbers.
     if no_params(&params)
         && app.session.state.text_edit.is_none()
-        && ((id == "tool.type" && !app.session.state.selected_vertices.is_empty())
-            || (id == "path.freeTransform" && view::free_transform_target(app).is_some()))
+        && matches!(id, "tool.type" | "path.freeTransform")
+        && view::free_transform_target(app).is_some()
     {
         return invoke(app, ctx, "viewer.freeTransform", json!({}));
     }
@@ -1101,6 +1102,13 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
             continue;
         }
         if app.dialog.is_some() {
+            continue;
+        }
+        // Enter / Return and Escape end Free Transform Points in the viewer (After Effects);
+        // Enter must not also rename the selected layer.
+        if pressed && !mods.any() && matches!(key, egui::Key::Enter | egui::Key::Escape) && app.ui.viewer.free_transform.is_some() {
+            crate::panels::viewer_overlays::end_free_transform(app);
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
             continue;
         }
         // The Composition panel also accepts the familiar Cmd/Ctrl +/- magnification keys.

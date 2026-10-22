@@ -119,6 +119,33 @@ pub(crate) fn open_end_at(paths: &[PathInfo], map: &ViewerMap, pos: Pos2, tol: f
     })
 }
 
+/// The closed path (mask or shape path) with `pos` inside it (even-odd, as drawn on screen), the
+/// first one listed winning: a double-click there enters Free Transform Points on it.
+pub(crate) fn closed_path_at(paths: &[PathInfo], map: &ViewerMap, pos: Pos2) -> Option<(LayerId, u64)> {
+    paths.iter().filter(|p| p.sp.closed && p.sp.vertices.len() > 2).find(|p| point_in_polygon(pos, &flatten(&p.sp, &p.m, map))).map(|p| (p.layer, p.uid))
+}
+
+/// Even-odd point-in-polygon test; the polygon closes itself (last point back to the first).
+pub(crate) fn point_in_polygon(p: Pos2, poly: &[Pos2]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    for (a, b) in poly.iter().zip(poly.iter().cycle().skip(1)) {
+        if (a.y > p.y) != (b.y > p.y) {
+            let dy = b.y - a.y;
+            if dy.abs() < f32::EPSILON {
+                continue;
+            }
+            let x = a.x + (p.y - a.y) * (b.x - a.x) / dy;
+            if p.x < x {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
 /// A mask or shape path of a layer by group uid, evaluated at the context time.
 pub(crate) fn path_of(ectx: &EvalCtx, layer: LayerId, uid: u64) -> Option<PathInfo> {
     let l = ectx.comp.layer(layer)?;
@@ -1233,6 +1260,55 @@ mod tests {
         let (_, turn) = ft_total(FtMode::Rotate, &f, [0.5, 0.5], [60.0, 50.0], [30.0, 75.0], true).unwrap();
         assert_eq!(turn.rem_euclid(45.0), 0.0);
         assert!(ft_total(FtMode::Anchor, &f, [0.5, 0.5], [0.0; 2], [1.0; 2], false).is_none());
+    }
+
+    /// The path math of a free-transform drag on a 200 × 100 box at (100, 100): a move is the
+    /// pointer's offset (Shift keeps the larger axis), Cmd-scale and rotation pivot on the anchor
+    /// point wherever it was put, and the anchor itself never moves under them.
+    #[test]
+    fn free_transform_moves_scales_and_rotates_about_the_anchor() {
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        let f = fit_box(&[[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], 0.0, 1.0).unwrap();
+        // Move: drag inside by (15, 40).
+        let (m, turn) = ft_total(FtMode::Move, &f, [0.5, 0.5], [150.0, 150.0], [165.0, 190.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [115.0, 140.0]) && turn == 0.0);
+        // Shift-move keeps the larger axis only (here down).
+        let (m, _) = ft_total(FtMode::Move, &f, [0.5, 0.5], [150.0, 150.0], [165.0, 190.0], true).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [100.0, 140.0]), "{m:?}");
+        // Anchor moved to the top-left corner (uv 0, 0); Cmd-drag of the right edge's handle from
+        // x 300 to 500 doubles the width about it.
+        let mode = FtMode::Scale { pivot: [0.0, 0.0], axes: [true, false] };
+        let (m, _) = ft_total(mode, &f, [0.0, 0.0], [300.0, 150.0], [500.0, 150.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [100.0, 100.0]), "the anchor stays put");
+        assert!(near(af_apply(&m, [300.0, 200.0]), [500.0, 200.0]), "{m:?}");
+        // Corner with Shift: proportional about the centre anchor (uv 0.5, 0.5 = (200, 150)).
+        let mode = FtMode::Scale { pivot: [0.5, 0.5], axes: [true, true] };
+        let (m, _) = ft_total(mode, &f, [0.5, 0.5], [300.0, 200.0], [400.0, 210.0], true).unwrap();
+        assert!(near(af_apply(&m, [200.0, 150.0]), [200.0, 150.0]));
+        assert!(near(af_apply(&m, [300.0, 200.0]), [400.0, 250.0]), "both axes ×2: {m:?}");
+        // Rotate a quarter turn about the centre anchor: the top-right corner goes to bottom-right
+        // of the turned box ((300, 100) → (250, 250)), the anchor stays.
+        let (m, turn) = ft_total(FtMode::Rotate, &f, [0.5, 0.5], [400.0, 150.0], [200.0, 350.0], false).unwrap();
+        assert!((turn - 90.0).abs() < 1e-6, "{turn}");
+        assert!(near(af_apply(&m, [200.0, 150.0]), [200.0, 150.0]));
+        assert!(near(af_apply(&m, [300.0, 100.0]), [250.0, 250.0]), "{m:?}");
+        // Rotate about an anchor moved to the bottom-left corner (uv 0, 1 = (100, 200)).
+        let (m, _) = ft_total(FtMode::Rotate, &f, [0.0, 1.0], [200.0, 200.0], [100.0, 300.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 200.0]), [100.0, 200.0]));
+        assert!(near(af_apply(&m, [300.0, 200.0]), [100.0, 400.0]), "{m:?}");
+    }
+
+    /// A double-click inside a closed mask finds it (even-odd), not outside it or on an open path.
+    #[test]
+    fn closed_path_at_finds_the_mask_under_the_pointer() {
+        let map = ViewerMap { origin: Pos2::ZERO, zoom: 1.0, comp: [400.0, 400.0], area: Rect::EVERYTHING };
+        let square = info(vec![[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], true);
+        assert_eq!(closed_path_at(std::slice::from_ref(&square), &map, Pos2::new(200.0, 150.0)), Some((LayerId(3), 7)));
+        assert_eq!(closed_path_at(std::slice::from_ref(&square), &map, Pos2::new(350.0, 150.0)), None);
+        assert_eq!(closed_path_at(std::slice::from_ref(&square), &map, Pos2::new(200.0, 50.0)), None);
+        let open = info(vec![[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], false);
+        assert_eq!(closed_path_at(&[open], &map, Pos2::new(200.0, 150.0)), None);
+        assert!(!point_in_polygon(Pos2::new(1.0, 1.0), &[Pos2::ZERO, Pos2::new(5.0, 5.0)]));
     }
 
     /// #912: clicking the last vertex of an open path with the Pen resumes that path.

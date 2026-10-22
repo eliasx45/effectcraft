@@ -2316,11 +2316,18 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         // Double-click a path: all its points selected in a free-transform box (Layer ▸ Mask and
         // Shape Path ▸ Free Transform Points), so dragging any of them, or inside the box, moves
         // the whole path (After Effects).
-        if let Some(p) = paths.iter().find(|p| p.layer == l && p.uid == m) {
-            let all: Vec<serde_json::Value> = (0..p.sp.vertices.len()).map(|index| json!({"layer": l.0, "mask": m, "index": index})).collect();
-            let _ = app.session.execute("mask.selectVertices", json!({"vertices": all}));
-        }
-        ov::begin_free_transform(app, l, m);
+        free_transform_whole_path(app, &paths, l, m);
+    } else if resp.double_clicked()
+        && !text_owns
+        && app.ui.tool == Tool::Selection
+        && let Some(pos) = resp.interact_pointer_pos()
+        && let Some((l, m)) = ov::closed_path_at(&paths, &map, pos)
+        && !comp.layer(l).is_some_and(|ly| matches!(ly.source, LayerSource::Comp { .. }))
+    {
+        // Double-click inside a closed mask (or shape path) of a selected layer: the same box, so
+        // a mask can be found by its middle, not only by its outline. A precomp keeps its
+        // double-click (open it).
+        free_transform_whole_path(app, &paths, l, m);
     } else if resp.double_clicked()
         && !text_owns
         && !app.ui.tool.is_pen()
@@ -2371,6 +2378,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if err_h > 0.0 {
         super::expr_bar::draw(app, ui, err_bar, cid);
     }
+}
+
+/// Free Transform Points on a whole path (double-click its outline or inside it): all its points
+/// selected, so dragging any of them, or inside the box, moves the whole path.
+fn free_transform_whole_path(app: &mut EffectcraftApp, paths: &[ov::PathInfo], l: LayerId, m: u64) {
+    if let Some(p) = paths.iter().find(|p| p.layer == l && p.uid == m) {
+        let all: Vec<serde_json::Value> = (0..p.sp.vertices.len()).map(|index| json!({"layer": l.0, "mask": m, "index": index})).collect();
+        let _ = app.session.execute("mask.selectVertices", json!({"vertices": all}));
+    }
+    ov::begin_free_transform(app, l, m);
 }
 
 /// Parent-space position change per comp pixel of drag (x and y) for a layer: 2D layers map

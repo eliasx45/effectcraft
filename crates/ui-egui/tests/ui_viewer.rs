@@ -980,6 +980,64 @@ fn free_transform_anchor_drag_with_one_point_selected() {
     assert!(rect(&h, "viewer.freeTransform.handle.2").center().distance(screen(&h, [400.0, 260.0])) < 2.0, "the box still covers the whole path");
 }
 
+/// A mask can be grabbed by its middle: a double-click inside a rectangle mask (away from its
+/// outline) starts Free Transform Points; dragging inside the box moves the whole mask down in one
+/// undo step; Return ends it without renaming the layer; Cmd+T with only the mask selected in the
+/// Timeline (layer not selected) starts it again and selects the layer so the box shows.
+#[test]
+fn double_click_inside_a_mask_free_transforms_it() {
+    let mut h = harness();
+    let plate = layer_id(&h, "Plate");
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [plate]})).unwrap();
+    s.execute("view.snapping", json!({"value": false})).unwrap();
+    let m = s.execute("mask.new", json!({"layer": plate, "vertices": [[200, 100], [400, 100], [400, 260], [200, 260]], "closed": true})).unwrap()["mask"]
+        .as_u64()
+        .unwrap();
+    s.execute("mask.selectVertices", json!({"vertices": []})).unwrap();
+    h.state_mut().ui.tool = Tool::Selection;
+    h.run_steps(2);
+    let start = mask_path(&h, "Plate");
+    let at = screen(&h, [250.0, 150.0]);
+    h.input_mut().events.push(Event::PointerMoved(at));
+    h.step();
+    for pressed in [true, false, true, false] {
+        h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+    }
+    h.run_steps(3);
+    assert!(h.state().ui.viewer.free_transform.is_some(), "a double-click inside the mask starts Free Transform");
+    assert_eq!(h.state().session.state.selected_vertices.len(), 4);
+    assert_eq!(mask_path(&h, "Plate"), start, "the double-click edits nothing");
+    // Drag inside the box (not on the anchor): the whole mask moves down 40, one undo step.
+    drag_comp(&mut h, [250.0, 150.0], [250.0, 190.0]);
+    let moved = mask_path(&h, "Plate");
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1.0 && (a[1] - b[1]).abs() < 1.0;
+    assert!(moved.vertices.iter().zip(&start.vertices).all(|(v, c)| near(*v, [c[0], c[1] + 40.0])), "{moved:?}");
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    h.run_steps(2);
+    assert_eq!(mask_path(&h, "Plate"), start, "the drag is one undo step");
+    // Return ends Free Transform and does not start renaming the layer.
+    h.input_mut().events.push(Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.run_steps(3);
+    assert!(h.state().ui.viewer.free_transform.is_none(), "Return ends Free Transform");
+    assert!(!h.ctx.egui_wants_keyboard_input(), "Return did not open a rename field");
+    // Only the mask selected in the Timeline: Cmd+T is Free Transform Points, not the Type tool.
+    let st = &mut h.state_mut().session.state;
+    st.selected_layers.clear();
+    st.selected_vertices.clear();
+    st.selected_props = vec![(LayerId(plate), m)];
+    h.input_mut().events.push(Event::Key { key: egui::Key::T, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND });
+    h.run_steps(3);
+    assert_eq!(h.state().ui.tool, Tool::Selection, "Cmd+T with a mask selected is not the Type tool");
+    assert!(h.state().ui.viewer.free_transform.is_some(), "Cmd+T starts Free Transform");
+    assert!(h.state().session.state.selected_layers.contains(&LayerId(plate)), "its layer is selected so the box shows");
+    assert!(h.state().auto.find_current("viewer.freeTransform.anchor").is_some(), "the box is drawn");
+    // Escape ends it.
+    h.input_mut().events.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.run_steps(2);
+    assert!(h.state().ui.viewer.free_transform.is_none());
+}
+
 /// #513: clicking away from a mask's path, even on its own layer, deselects the mask's points;
 /// the layer stays selected.
 #[test]
