@@ -359,10 +359,11 @@ fn k_follows_the_revealed_properties_and_auto_select_picks_the_speed_graph_for_p
     assert!(h.state().auto.find(&format!("timeline.graph.key.{pos}.1.0")).is_some(), "value graph: X and Y");
 }
 
-/// #284: in the Graph Editor, dragging the handle of one selected key moves the same handle of
-/// every selected key with it (After Effects), in one undo step.
+/// #1053: in the Graph Editor, dragging the handle of one selected key moves only that handle
+/// (After Effects), in one undo step; the other selected keys' handles stay. A handle at 100 %
+/// influence reaches halfway across its segment, so 0.2 s on keys 1 s apart is 40 %.
 #[test]
-fn a_graph_handle_drag_moves_the_handles_of_every_selected_key() {
+fn a_graph_handle_drag_moves_only_that_handle() {
     let (mut h, id, uid) = harness();
     let s = &mut h.state_mut().session;
     s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/opacity", "time": 2.0, "value": 0.0})).unwrap();
@@ -388,15 +389,14 @@ fn a_graph_handle_drag_moves_the_handles_of_every_selected_key() {
     };
     let (k0, k1) = (handle(&h, 0), handle(&h, 1));
     let undo = h.state().session.history.undo.len();
-    // Key 1's out handle 0.2 s further out (the keys are 1 s apart): key 0's goes along.
+    // Key 1's out handle 0.2 s further out (the keys are 1 s apart): key 0's stays.
     drag(&mut h, k1, k1 + egui::vec2(px_per_s * 0.2, 0.0), Default::default());
     let after = influences(&h);
-    for i in [0, 1] {
-        assert!((after[i].1 - before[i].1 - 0.2).abs() < 0.01, "key {i}: {:?} → {:?}", before[i], after[i]);
-    }
+    assert!((after[1].1 - before[1].1 - 0.4).abs() < 0.02, "key 1: {:?} → {:?}", before[1], after[1]);
+    assert_eq!(after[0], before[0], "key 0's handles stay");
     assert_eq!((after[1].0, after[2].0), (before[1].0, before[2].0), "the in handles stay");
     assert_eq!(h.state().session.history.undo.len(), undo + 1, "one undo step");
-    assert!((handle(&h, 0).x - k0.x - px_per_s * 0.2).abs() < 2.0, "key 0's handle moved on screen");
+    assert!((handle(&h, 0).x - k0.x).abs() < 1.0, "key 0's handle stayed on screen");
 }
 
 /// A handle at speed 0 (Easy Ease) dragged up in the speed graph speeds the value the way its
@@ -753,9 +753,10 @@ fn option_drag_splits_and_rejoins_speed_handles_with_one_undo_each() {
     let start = center(&h);
     let plot = h.state().auto.find("timeline.graph").unwrap().rect;
     let delta = ((key(&h).out_ease[0].speed - 100.0) / 300.0) * f64::from(plot[3]);
+    // Option at the press on split handles joins them (decided once, not by how close they get).
     drag(&mut h, start, start + egui::vec2(0.0, delta as f32), egui::Modifiers::ALT);
     assert!(key(&h).continuous);
-    assert!((key(&h).out_ease[0].speed - 100.0).abs() < 1e-6);
+    assert!((key(&h).out_ease[0].speed - key(&h).in_ease[0].speed).abs() < 1e-9);
     assert_eq!(h.state().session.history.undo.len(), undo + 2);
 }
 

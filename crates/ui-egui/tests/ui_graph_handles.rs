@@ -156,3 +156,41 @@ fn auto_height_expands_for_a_handle_drag_beyond_the_plot() {
     assert!(key1(&h, id).1 > 0.0);
     assert!(h.state().ui.timeline.graph_auto_zoom);
 }
+
+/// After Effects draws a handle at 100 % influence halfway across its segment, so two handles at
+/// 100 % meet in the middle and never cross; dragging one to the middle sets 100 %.
+#[test]
+fn a_full_influence_handle_reaches_halfway_and_drags_to_100_percent() {
+    let (mut h, id, uid) = harness("speed");
+    let t1 = 23.0 / 30.0;
+    h.state_mut().session.execute("keys.setEase", json!({"layer": id.0, "prop": uid, "time": t1, "side": "in", "speed": 0.0, "influence": 100.0})).unwrap();
+    h.run_steps(3);
+    let k0 = rect(&h, &format!("timeline.graph.key.{uid}.0.0")).center();
+    let k1 = rect(&h, &format!("timeline.graph.key.{uid}.0.1")).center();
+    let hp = rect(&h, &format!("timeline.graph.handle.{uid}.0.1.in")).center();
+    let middle = (k0.x + k1.x) * 0.5;
+    assert!((hp.x - middle).abs() < 2.0, "100 % sits halfway: {} vs {middle}", hp.x);
+    h.state_mut().session.execute("keys.setEase", json!({"layer": id.0, "prop": uid, "time": t1, "side": "in", "speed": 0.0, "influence": 25.0})).unwrap();
+    h.run_steps(3);
+    let hp = rect(&h, &format!("timeline.graph.handle.{uid}.0.1.in")).center();
+    // Past the middle and on: it stops at 100 %.
+    drag(&mut h, hp, pos2(k0.x + 4.0, hp.y));
+    assert!((key1(&h, id).0 - 100.0).abs() < 1e-6, "dragged to the far key: {}", key1(&h, id).0);
+}
+
+/// Zooming in on time keeps the whole curve's height in view with Auto-zoom (After Effects): a
+/// speed spike outside the visible span still sets the top.
+#[test]
+fn auto_height_keeps_a_peak_out_of_view() {
+    let (mut h, _, _) = harness("speed");
+    h.state_mut().ui.timeline.graph_auto_zoom = true;
+    h.run_steps(3);
+    let whole = h.state().ui.timeline.graph_range.unwrap();
+    // Only the slow start in view: the spike before key 1 is off to the right.
+    let tl = &mut h.state_mut().ui.timeline;
+    tl.pps = Some(6000.0);
+    tl.start = 0.0;
+    h.run_steps(3);
+    let zoomed = h.state().ui.timeline.graph_range.unwrap();
+    assert!(zoomed.1 >= whole.1 * 0.99, "the top stays at the peak: {whole:?} → {zoomed:?}");
+}

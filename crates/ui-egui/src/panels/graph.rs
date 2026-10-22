@@ -40,7 +40,14 @@ struct Handle {
     negative: bool,
     /// Segment duration (layer seconds) the influence is relative to.
     dur: f64,
+    /// Graph value the handle starts from: the key's value, or in the speed graph this side's
+    /// speed (a key whose speeds differ shows two points joined by a line, as in After Effects).
+    kv: f64,
 }
+
+/// Share of its segment a handle at 100% influence reaches: After Effects draws it halfway, so
+/// two handles at 100% meet in the middle and never cross.
+const HANDLE_REACH: f64 = 0.5;
 
 struct KeyPt {
     idx: usize,
@@ -60,6 +67,8 @@ struct Curve<'a> {
     pts: Vec<(f64, f64)>,
     /// Unexpressed samples, only populated when expression comparison is enabled.
     base_pts: Vec<(f64, f64)>,
+    /// Extremes of each keyframe segment over the whole curve (see [`segment_peaks`]).
+    peaks: Vec<(f64, f64, f64, f64)>,
     keys: Vec<KeyPt>,
     /// Values editable in the value graph (not spatial / combined dimensions).
     editable: bool,
@@ -149,6 +158,58 @@ fn shown_dims(l: &Layer, pr: &Property) -> usize {
 struct CurveSamples {
     result: Vec<(f64, f64)>,
     base: Vec<(f64, f64)>,
+    /// Lowest and highest value of each keyframe segment (comp seconds `t0`, `t1`, `lo`, `hi`),
+    /// over the whole curve rather than the view.
+    peaks: Vec<(f64, f64, f64, f64)>,
+}
+
+/// Samples per keyframe segment when finding its extremes (fewer for long key lists).
+const PEAK_SAMPLES: usize = 48;
+
+/// The lowest and highest value of every keyframe segment of `pr` (dimension `d`), whatever
+/// part of it is in view. A sharp speed spike can fall between the per-pixel samples, and Auto-zoom
+/// keeps the whole curve's height (After Effects), so each segment is sampled and its extremes
+/// refined.
+fn segment_peaks(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool) -> Vec<(f64, f64, f64, f64)> {
+    let per = if pr.keys.len() > 200 { PEAK_SAMPLES / 4 } else { PEAK_SAMPLES };
+    let f = |t: f64| sample(ectx, l, pr, d, speed, t);
+    let mut out = Vec::with_capacity(pr.keys.len().saturating_sub(1));
+    for w in pr.keys.windows(2) {
+        let [a, b] = w else { continue };
+        let (ta, tb) = (l.comp_time(a.time).seconds(), l.comp_time(b.time).seconds());
+        let (t0, t1) = (ta.min(tb), ta.max(tb));
+        if !(t1 > t0) || !t0.is_finite() || !t1.is_finite() {
+            continue;
+        }
+        let step = (t1 - t0) / per as f64;
+        let vals: Vec<f64> = (0..=per).map(|i| f(t0 + step * i as f64)).collect();
+        let pick = |better: fn(f64, f64) -> bool| {
+            vals.iter().enumerate().filter(|(_, v)| v.is_finite()).fold(None, |best: Option<(usize, f64)>, (i, v)| match best {
+                Some((_, bv)) if !better(*v, bv) => best,
+                _ => Some((i, *v)),
+            })
+        };
+        // Refine around the best sample (ternary search over its two neighbouring steps).
+        let refine = |i: usize, v: f64, sign: f64| {
+            let (mut lo, mut hi) = (t0 + step * i.saturating_sub(1) as f64, (t0 + step * (i + 1) as f64).min(t1));
+            let score = |v: f64| if v.is_finite() { sign * v } else { f64::NEG_INFINITY };
+            let mut best = v;
+            for _ in 0..24 {
+                let (m1, m2) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
+                let (v1, v2) = (f(m1), f(m2));
+                for x in [v1, v2] {
+                    if score(x) > score(best) {
+                        best = x;
+                    }
+                }
+                if score(v1) < score(v2) { lo = m1 } else { hi = m2 }
+            }
+            best
+        };
+        let (Some((imax, vmax)), Some((imin, vmin))) = (pick(|a, b| a > b), pick(|a, b| a < b)) else { continue };
+        out.push((t0, t1, refine(imin, vmin, -1.0), refine(imax, vmax, 1.0)));
+    }
+    out
 }
 
 struct SampleCache {
@@ -271,11 +332,12 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
                         points.base.push((ct, sample_base(ectx, l, pr, d, speed, ct)));
                     }
                 }
+                points.peaks = segment_peaks(ectx, l, pr, d, speed);
             }
             if cached.is_none() {
                 sampled.push(points.clone());
             }
-            let CurveSamples { result: pts, base: base_pts } = points;
+            let CurveSamples { result: pts, base: base_pts, peaks } = points;
             let mut keys = vec![];
             // A pinned aggregate remains a useful readout after separation; only its followers
             // own editable keys now. Never offer edits to the ignored pre-separation keys.
@@ -291,8 +353,9 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
                     let j = if out_side { i + 1 } else { i - 1 };
                     let dur = (pr.keys[j].time.seconds() - k.time.seconds()).abs();
                     side_speeds.push(e.speed.abs());
-                    let dt = e.influence * dur * if out_side { 1.0 } else { -1.0 };
-                    let (hv, show) = if speed { (e.speed.abs(), true) } else { (k.value.components().get(d).copied().unwrap_or(0.0) + e.speed * dt, !spatial) };
+                    let dt = e.influence * dur * HANDLE_REACH * if out_side { 1.0 } else { -1.0 };
+                    let kv = if speed { e.speed.abs() } else { k.value.components().get(d).copied().unwrap_or(0.0) };
+                    let (hv, show) = if speed { (kv, true) } else { (kv + e.speed * dt, !spatial) };
                     let bezier = if out_side { k.out_interp == Interp::Bezier } else { k.in_interp == Interp::Bezier };
                     if ks && show && (bezier || speed) {
                         // A side at speed 0 has no sign of its own: it takes the direction its
@@ -306,7 +369,7 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
                             let (a, b) = if out_side { (at(k), other) } else { (other, at(k)) };
                             !pr.spatial && b < a
                         };
-                        handles.push(Handle { out: out_side, t: kt + dt, v: hv, negative, dur });
+                        handles.push(Handle { out: out_side, t: kt + dt, v: hv, negative, dur, kv });
                     }
                 }
                 let v = if speed {
@@ -316,7 +379,7 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
                 };
                 keys.push(KeyPt { idx: i, time: k.time, t: kt, v, sel: ks, handles });
             }
-            out.push(Curve { layer: l, prop: pr, dim: d, color, pts, base_pts, keys, editable: !spatial });
+            out.push(Curve { layer: l, prop: pr, dim: d, color, pts, base_pts, peaks, keys, editable: !spatial });
         }
     }
     if cached.is_none() {
@@ -540,6 +603,12 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
             lo = lo.min(*v);
             hi = hi.max(*v);
         }
+        // The whole curve's height, not just the part in view: zooming in on time never pushes
+        // a peak out of the top (After Effects).
+        for &(_, _, plo, phi) in &c.peaks {
+            lo = lo.min(plo);
+            hi = hi.max(phi);
+        }
         for k in &c.keys {
             for v in std::iter::once(k.v).chain(k.handles.iter().map(|h| h.v)) {
                 lo = lo.min(v);
@@ -558,19 +627,14 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     }
     let pad = (hi - lo) * 0.08;
     let auto = (lo - pad, hi + pad);
-    // Keep a stable scale during edits, expanding only for a handle pulled beyond the plot.
-    // Handle deltas use the gesture-start scale so expansion cannot feed back into the edit.
+    // Keep a stable scale while keys are dragged. A handle drag refits live (After Effects): the
+    // spike it pulls up stays in view. Handle deltas use the gesture-start scale, so the refit
+    // cannot feed back into the edit.
     let drag_id = egui::Id::new("graph-dragging");
     let dragging = ctx.data(|d| d.get_temp::<bool>(drag_id)).unwrap_or(false) && ctx.input(|i| i.pointer.any_down());
     let stored = app.ui.timeline.graph_range.filter(|(a, b)| a.is_finite() && b.is_finite() && b > a);
     let (lo, hi) = if app.ui.timeline.graph_auto_zoom {
-        if dragging {
-            let expanding = ctx.data(|d| d.get_temp::<HandleDrag>(handle_drag_id())).is_some()
-                && ctx.input(|i| i.pointer.interact_pos()).is_some_and(|q| q.y < plot.min.y || q.y > plot.max.y);
-            stored.map_or(auto, |old| if expanding { (old.0.min(auto.0), old.1.max(auto.1)) } else { old })
-        } else {
-            auto
-        }
+        if dragging && ctx.data(|d| d.get_temp::<HandleDrag>(handle_drag_id())).is_none() { stored.unwrap_or(auto) } else { auto }
     } else {
         stored.unwrap_or(auto)
     };
@@ -749,8 +813,22 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
             let kjson = json!({"layer": lid.0, "prop": uid, "time": k.time.seconds()});
             // Handle lines under the key (their ends and grips go on top, after every key).
             for h in &k.handles {
-                let hp = handle_pos(kp, pos2(tm.x(h.t), ymap(h.v)), h.out, plot);
-                pc.line_segment([kp, hp], Stroke::new(1.0, Color32::from_rgb(0xd8, 0xd8, 0x60)));
+                let ap = pos2(kp.x, ymap(h.kv));
+                let side = if h.out { "out" } else { "in" };
+                let pinned = !ctx.is_being_dragged(egui::Id::new(("ghandle", uid, d, k.idx, side)));
+                let hp = handle_pos(ap, pos2(tm.x(h.t), ymap(h.v)), h.out, plot, pinned);
+                pc.line_segment([ap, hp], Stroke::new(1.0, Color32::from_rgb(0xd8, 0xd8, 0x60)));
+            }
+            // Speed graph: a key entered and left at different speeds shows both, joined by a
+            // vertical line (After Effects).
+            if let [a, b] = k.handles.as_slice()
+                && speed
+                && (ymap(a.kv) - ymap(b.kv)).abs() > 1.0
+            {
+                pc.line_segment([pos2(kp.x, ymap(a.kv)), pos2(kp.x, ymap(b.kv))], Stroke::new(1.0, Color32::from_rgb(0xd8, 0xd8, 0x60)));
+                for h in [a, b] {
+                    pc.circle_filled(pos2(kp.x, ymap(h.kv)), 2.5, Color32::from_rgb(0xd8, 0xd8, 0x60));
+                }
             }
             // The key itself.
             // Drawn selected: what a marquee being dragged would select, else the selection.
@@ -898,11 +976,13 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                 continue;
             }
             for h in &k.handles {
-                let hp = handle_pos(kp, pos2(tm.x(h.t), ymap(h.v)), h.out, plot);
-                pc.circle_filled(hp, 3.5, Color32::from_rgb(0xd8, 0xd8, 0x60));
                 let side = if h.out { "out" } else { "in" };
-                let hr = Rect::from_center_size(hp, vec2(10.0, 10.0));
-                let hresp = ui.interact(hr, egui::Id::new(("ghandle", uid, d, k.idx, side)), if navigating { Sense::hover() } else { Sense::drag() });
+                let handle_id = egui::Id::new(("ghandle", uid, d, k.idx, side));
+                // The handle being dragged follows the pointer instead of staying pinned in the plot.
+                let hp = handle_pos(pos2(kp.x, ymap(h.kv)), pos2(tm.x(h.t), ymap(h.v)), h.out, plot, !ctx.is_being_dragged(handle_id));
+                pc.circle_filled(hp, 3.5, Color32::from_rgb(0xd8, 0xd8, 0x60));
+                let hr = Rect::from_center_size(hp, vec2(HANDLE_GRIP, HANDLE_GRIP));
+                let hresp = ui.interact(hr, handle_id, if navigating { Sense::hover() } else { Sense::drag() });
                 app.auto.add(&format!("timeline.graph.handle.{uid}.{d}.{}.{side}", k.idx), hr, "Bezier handle");
                 let ease = side_ease(&c.prop.keys, k.idx, d, c.prop.spatial, h.out);
                 let hresp = hresp.on_hover_text(ease.map_or_else(
@@ -918,31 +998,27 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                         )
                     },
                 ));
-                // The same side's handles of every selected key move with it, by as much as the
-                // pointer moved (After Effects), in one undo step.
+                // Only the grabbed handle moves (After Effects; #1053: other selected keys'
+                // handles moved with it). Option at the press splits a continuous key's handles or
+                // joins split ones, for the whole drag.
                 if hresp.drag_started() {
-                    let grabs: Vec<HandleGrab> = cs
-                        .iter()
-                        .flat_map(|c2| {
-                            c2.keys.iter().flat_map(move |k2| {
-                                k2.handles.iter().filter(|h2| h2.out == h.out).map(move |h2| HandleGrab {
-                                    layer: c2.layer.id,
-                                    prop: c2.prop.uid,
-                                    dim: c2.editable.then_some(c2.dim),
-                                    time: k2.time,
-                                    out: h2.out,
-                                    key: (k2.t, k2.v),
-                                    end: (h2.t, h2.v),
-                                    negative: h2.negative,
-                                    dur: h2.dur,
-                                    continuous: c2.prop.keys.get(k2.idx).is_some_and(|k| k.continuous),
-                                    opposite_speed: side_ease(&c2.prop.keys, k2.idx, c2.dim, c2.prop.spatial, !h2.out).map(|e| e.speed),
-                                })
-                            })
-                        })
-                        .collect();
+                    let continuous = c.prop.keys.get(k.idx).is_some_and(|k| k.continuous);
+                    let grab = HandleGrab {
+                        layer: c.layer.id,
+                        prop: c.prop.uid,
+                        dim: c.editable.then_some(c.dim),
+                        time: k.time,
+                        out: h.out,
+                        key: (k.t, h.kv),
+                        end: (h.t, h.v),
+                        negative: h.negative,
+                        dur: h.dur,
+                        toggle: ui.input(|i| i.modifiers.alt).then_some(!continuous),
+                    };
                     let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(hp);
-                    ctx.data_mut(|dd| dd.insert_temp::<HandleDrag>(handle_drag_id(), (press, grabs, (hi - lo) / f64::from(plot.height().max(1.0)), tm.pps)));
+                    ctx.data_mut(|dd| {
+                        dd.insert_temp::<HandleDrag>(handle_drag_id(), (press, vec![grab], (hi - lo) / f64::from(plot.height().max(1.0)), tm.pps))
+                    });
                 }
                 if hresp.dragged()
                     && let Some(pt) = hresp.interact_pointer_pos()
@@ -953,18 +1029,22 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                     let (time_ok, value_ok) = shift_axes(ui.input(|i| i.modifiers.shift), pt.x - press.x, pt.y - press.y);
                     let dt = if time_ok { f64::from(pt.x - press.x) / pixels_per_second.max(1e-6) } else { 0.0 };
                     let dv = if value_ok { -f64::from(pt.y - press.y) * value_per_pixel } else { 0.0 };
+                    // Graph Editor ▸ Snap: the handle's end to the current time and other keys.
+                    let snapping = app.ui.timeline.graph_snap != ui.input(|i| i.modifiers.command);
+                    let mut candidates = super::graph_tools::comp_snap_times(comp);
+                    candidates.extend(cs.iter().flat_map(|c2| c2.keys.iter().map(|k2| k2.t)).filter(|t| (t - k.t).abs() > 1e-9));
+                    candidates.push(app.session.time().seconds());
                     let merge = format!("ghandle-{uid}-{}", k.idx);
                     for g in &grabs {
-                        let mut params = g.ease(g.end.0 + dt, g.end.1 + dv, speed, &merge);
-                        if ui.input(|i| i.modifiers.alt) {
-                            let proposed = params.get("speed").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                            let influence = params.get("influence").and_then(serde_json::Value::as_f64).unwrap_or(0.1) / 100.0;
-                            let tolerance = value_per_pixel.abs() * 4.0 / if speed { 1.0 } else { (influence * g.dur).max(1e-9) };
-                            let join = !g.continuous && g.opposite_speed.is_some_and(|other| (other - proposed).abs() <= tolerance);
+                        let raw_t = g.end.0 + dt;
+                        let snapped =
+                            (snapping && time_ok).then(|| super::graph_tools::snap_target(raw_t, &candidates, 6.0 / pixels_per_second.max(1e-6))).flatten();
+                        if let Some(at) = snapped {
+                            pc.line_segment([pos2(tm.x(at), plot.min.y), pos2(tm.x(at), plot.max.y)], Stroke::new(1.0, Color32::from_rgb(255, 153, 51)));
+                        }
+                        let mut params = g.ease(snapped.unwrap_or(raw_t), g.end.1 + dv, speed, &merge);
+                        if let Some(join) = g.toggle {
                             params["continuous"] = json!(join);
-                            if join && let Some(other) = g.opposite_speed {
-                                params["speed"] = json!(other);
-                            }
                         }
                         actions.push(("keys.setEase".into(), params));
                     }
@@ -1080,7 +1160,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         ("Auto Bezier", "keys.interpolation", json!({"interpolation": "autoBezier"}), "Convert selected keyframes to Auto Bezier"),
         ("Easy Ease", "keys.easyEase", json!({}), "Easy Ease (F9)"),
         ("Ease In", "keys.easyEaseIn", json!({}), "Easy Ease In (Shift+F9)"),
-        ("Ease Out", "keys.easyEaseOut", json!({}), "Easy Ease Out (Ctrl+Shift+F9)"),
+        ("Ease Out", "keys.easyEaseOut", json!({}), "Easy Ease Out (Cmd+Shift+F9)"),
     ] {
         let id = cmd.trim_start_matches("keys.").to_string() + label.split_whitespace().next().unwrap_or("");
         if text_button(app, ui, p, &mut buttons, y, label, false, &id, tip) {
@@ -1247,14 +1327,18 @@ fn bounded_zoom((lo, hi): (f64, f64), factor: f64) -> Option<(f64, f64)> {
 /// Shortest on-screen length of a handle (points): a tiny influence would leave it under its key.
 const MIN_HANDLE_LEN: f32 = 12.0;
 
+/// Side of a handle's grab area (points), larger than its dot so it is easy to catch.
+const HANDLE_GRIP: f32 = 14.0;
+
 /// Where a key's handle is drawn and grabbed: its end `raw` (screen), at least
 /// [`MIN_HANDLE_LEN`] from the key `kp` (along its direction, or sideways when it has none) and
 /// pinned inside the plot when its value lies off the visible range (a speed spike), so it can
-/// always be grabbed. Drags move the handle by the pointer's travel, so the shown place only
-/// changes where the grab is, not the edit.
-fn handle_pos(kp: Pos2, raw: Pos2, out: bool, plot: Rect) -> Pos2 {
+/// always be grabbed (not while `pinned` is false: the handle being dragged follows the
+/// pointer). Drags move the handle by the pointer's travel, so the shown place only changes where
+/// the grab is, not the edit.
+fn handle_pos(kp: Pos2, raw: Pos2, out: bool, plot: Rect, pinned: bool) -> Pos2 {
     let inner = plot.shrink(4.0);
-    let pin = |q: Pos2| if inner.is_positive() { q.clamp(inner.min, inner.max) } else { q };
+    let pin = |q: Pos2| if pinned && inner.is_positive() { q.clamp(inner.min, inner.max) } else { q };
     let side = if out { 1.0 } else { -1.0 };
     let mut q = pin(raw);
     let dir = q - kp;
@@ -1398,6 +1482,11 @@ fn fit_keys(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool,
                 }
             }
         }
+        // A spike narrower than the samples above still fits: each framed segment's extremes.
+        for &(_, _, lo, hi) in c.peaks.iter().filter(|(a, b, ..)| *a >= t0 - 1e-9 && *b <= t1 + 1e-9) {
+            v0 = v0.min(lo);
+            v1 = v1.max(hi);
+        }
     }
     let span = (t1 - t0).max(0.2);
     let pps = plot.width() as f64 * 0.8 / span;
@@ -1464,16 +1553,19 @@ struct HandleGrab {
     negative: bool,
     /// Segment duration (layer seconds) the influence is relative to.
     dur: f64,
-    continuous: bool,
-    opposite_speed: Option<f64>,
+    /// Option was held at the press: `Some(true)` joins the key's handles (continuous),
+    /// `Some(false)` splits them, for the whole drag.
+    toggle: Option<bool>,
 }
 
 impl HandleGrab {
     /// `keys.setEase` putting the handle's end at (`t` comp seconds, `v` in the graph).
     fn ease(&self, t: f64, v: f64, speed: bool, merge: &str) -> serde_json::Value {
         let dir = if self.out { 1.0 } else { -1.0 };
-        let dt = ((t - self.key.0) * dir).max(self.dur * 0.001);
-        let influence = (dt / self.dur.max(1e-9) * 100.0).clamp(0.1, 100.0);
+        // 100% influence reaches HANDLE_REACH of the segment (halfway, After Effects).
+        let reach = self.dur * HANDLE_REACH;
+        let dt = ((t - self.key.0) * dir).max(reach * 0.001);
+        let influence = (dt / reach.max(1e-9) * 100.0).clamp(0.1, 100.0);
         let sp = if speed {
             let mag = v.max(0.0);
             if self.negative { -mag } else { mag }
@@ -1549,7 +1641,7 @@ mod tests {
         let eval = EvalCtx { expr: app.session.expr.as_deref(), ..EvalCtx::new(&app.session.project, app.session.active_comp_id().unwrap(), comp, Tick::ZERO) };
         curves(app, ctx, comp, &eval, TMap { x0: 0.0, start: 0.0, pps: 100.0 }, Rect::from_min_size(Pos2::ZERO, vec2(200.0, 200.0)), speed)
             .into_iter()
-            .map(|c| CurveSamples { result: c.pts, base: c.base_pts })
+            .map(|c| CurveSamples { result: c.pts, base: c.base_pts, peaks: c.peaks })
             .collect()
     }
 
