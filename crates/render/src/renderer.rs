@@ -240,6 +240,9 @@ impl<'a> Renderer<'a> {
     /// Run `f` (drawing or producing `layer` of `ctx`'s comp) and add its wall time to the
     /// layer's render time, when this render is timed ([`Self::times`]).
     pub fn timed<T>(&self, ctx: &EvalCtx, layer: &Layer, f: impl FnOnce() -> T) -> T {
+        // What `f` caches belongs to this layer (the Memory panel; a thread-local swap, see
+        // `cache::owner`). Every walk (CPU, GPU, prepass, 3D) draws its layers through here.
+        let _owner = crate::cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let Some(times) = self.times else { return f() };
         let t0 = web_time::Instant::now();
         let out = f();

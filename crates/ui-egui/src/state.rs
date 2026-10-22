@@ -696,6 +696,9 @@ pub struct UiState {
     /// Window ▸ Script Console input, output and history.
     #[serde(default)]
     pub script_console: crate::panels::script_console::ScriptConsole,
+    /// Window ▸ Memory: sort order and the rows twirled open.
+    #[serde(default)]
+    pub memory: crate::panels::memory_panel::MemoryView,
     /// Tool shown in each toolbar slot.
     pub slot_tools: Vec<Tool>,
     pub workspace: String,
@@ -840,6 +843,7 @@ impl Default for UiState {
         UiState {
             tool: Tool::Selection,
             script_console: Default::default(),
+            memory: Default::default(),
             slot_tools: Tool::SLOTS.iter().map(|s| s[0]).collect(),
             workspace: "Default".into(),
             dock: crate::dock::workspace("Default"),

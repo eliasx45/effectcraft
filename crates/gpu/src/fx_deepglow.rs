@@ -14,7 +14,7 @@ use effectcraft_geom::{Mat3, vec2};
 use effectcraft_raster::{Image, Sampling};
 
 use crate::context::{Enc, GpuImage, Params};
-use crate::effects::{GBuf, gaussian_blur};
+use crate::effects::{GBuf, Precision, gaussian_blur_owned};
 use crate::ops;
 
 /// Compute entry points in `fx_deepglow.wgsl`.
@@ -78,13 +78,15 @@ fn glow_reach(radius: f64, sigmas: [f64; 3], aspect: f64, downsample: f64) -> u3
     if reach.is_finite() { reach.ceil().min(f64::from(u32::MAX / 4)) as u32 } else { u32::MAX / 4 }
 }
 
-/// The weighted pass sum `a · wa · fa + b · wb · fb` (per channel, the CPU's operation order).
-fn weighted_sum(e: &mut Enc, a: &GpuImage, wa: f32, fa: [f32; 4], b: &GpuImage, wb: f32, fb: [f32; 4]) -> GpuImage {
+/// The weighted pass sum `a · wa · fa + b · wb · fb` (per channel, the CPU's operation order),
+/// as RGBA16F when `half` (see [`crate::half`]).
+#[allow(clippy::too_many_arguments)]
+fn weighted_sum(e: &mut Enc, a: &GpuImage, wa: f32, fa: [f32; 4], b: &GpuImage, wb: f32, fb: [f32; 4], half: bool) -> GpuImage {
     let mut p = Params::default();
     p.f[0] = fa;
     p.f[1] = fb;
     p.f[2] = [wa, wb, 0.0, 0.0];
-    let out = e.scratch(a.width, a.height);
+    let out = e.scratch_as(a.width, a.height, half);
     e.pixels("fdg_sum", &p, a, Some(b), &out, None);
     out
 }
@@ -138,7 +140,7 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     p.u[0] = [mask.is_some() as u32, (pr.e("PEDG-0057") == 1) as u32, pr.b("PEDG-0059") as u32, convert as u32];
     p.u[1] = [unmult as u32, pad, 0, 0];
     p.f[0] = [threshold, smooth, 0.0, 0.0];
-    let source = e.scratch(fw, fh);
+    let mut source = e.scratch(fw, fh);
     e.pixels("fdg_key", &p, &input, mask.as_ref(), &source, None);
     drop(mask);
     // View 1 (Glow Input): the keyed, masked input as it is.
@@ -162,7 +164,7 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let reach = if work_scale < 1.0 { pad } else { glow_reach(radius, sigmas, aspect, downsample).min(pad) };
     let origin = pad - reach;
     let (gw, gh) = (w0 + 2 * reach, h0 + 2 * reach);
-    let work = if work_scale < 1.0 {
+    let mut work = if work_scale < 1.0 {
         let w = ((fw as f64 * work_scale).round() as u32).max(1);
         let h = ((fh as f64 * work_scale).round() as u32).max(1);
         resample(e, &source, w, h)?
@@ -173,7 +175,14 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     };
     // The frame the working images stand for (their own size, or the region's whole frame).
     let (ww, wh) = if work_scale < 1.0 { (work.width, work.height) } else { (fw, fh) };
-    let mut parts = Vec::with_capacity(3);
+    // The three parts and their sums are read only here: half floats on a display render
+    // (see `crate::half`; `fdg_finish` writes the f32 result). Each part is summed as soon as
+    // the next one is made, so at most two parts and a sum are held at once (they used to be
+    // three parts, the sum and the halo to the end).
+    let half = Precision::pick(e, &["fdg_sum"], true) == Precision::Half;
+    let precision = if half { Precision::Half } else { Precision::F32 };
+    let fringe = |step: usize| [[1.0, 1.0, 1.0 + chroma][step], 1.0, [1.0 + chroma, 1.0, 1.0][step], 1.0];
+    let mut acc: Option<GpuImage> = None;
     for (step, sigma) in sigmas.into_iter().enumerate() {
         let (sx, sy) = (radius * work_scale * sigma * aspect, radius * work_scale * sigma * (2.0 - aspect));
         let part = if step == 2 && downsample < 0.999 {
@@ -182,19 +191,26 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
             let full = if work_scale < 1.0 { &work } else { &source };
             let (w, h) = ((ww as f64 * downsample).round().max(1.0) as u32, (wh as f64 * downsample).round().max(1.0) as u32);
             let small = resample(e, full, w, h)?;
-            let blurred = gaussian_blur(e, &small, sx * downsample, sy * downsample, false);
+            let blurred = gaussian_blur_owned(e, small, sx * downsample, sy * downsample, false, Precision::F32);
             enlarge(e, &blurred, ww, wh, work.width, work.height, if work_scale < 1.0 { 0 } else { origin })?
         } else {
-            gaussian_blur(e, &work, sx, sy, false)
+            gaussian_blur_owned(e, work.clone(), sx, sy, false, precision)
         };
-        parts.push(part);
+        if step == 2 {
+            // The last part: the sources are done with before the last sum.
+            drop(std::mem::replace(&mut work, e.zeros(1, 1)));
+            drop(std::mem::replace(&mut source, e.zeros(1, 1)));
+        }
+        acc = Some(match (acc.take(), step) {
+            // The first part waits for the second (the CPU sums the first two, then the third).
+            (None, _) => part,
+            (Some(p0), 1) => weighted_sum(e, &p0, weights[0], fringe(0), &part, weights[1], fringe(1), half),
+            (Some(first), _) => weighted_sum(e, &first, 1.0, [1.0; 4], &part, weights[2], fringe(2), half),
+        });
     }
     drop(work);
     drop(source);
-    let [p0, p1, p2] = <[GpuImage; 3]>::try_from(parts).ok()?;
-    let fringe = |step: usize| [[1.0, 1.0, 1.0 + chroma][step], 1.0, [1.0 + chroma, 1.0, 1.0][step], 1.0];
-    let first = weighted_sum(e, &p0, weights[0], fringe(0), &p1, weights[1], fringe(1));
-    let mut halo = weighted_sum(e, &first, 1.0, [1.0; 4], &p2, weights[2], fringe(2));
+    let mut halo = acc?;
     if work_scale < 1.0 {
         halo = resample(e, &halo, fw, fh)?;
     }

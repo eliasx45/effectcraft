@@ -57,6 +57,7 @@ impl<'a> Renderer<'a> {
 
     /// [`Self::layer_buf`] in the blending space (linear with Blend Colors Using 1.0 Gamma).
     pub fn blend_layer_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let (b, k) = self.layer_buf_keyed(ctx, layer)?;
         Some(self.to_blend(b, k))
     }
@@ -92,6 +93,8 @@ impl<'a> Renderer<'a> {
     }
 
     fn layer_buf_keyed(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, Option<u64>)> {
+        // Buffers kept below belong to this layer (the Memory panel, see `cache::owner`).
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let st = self.styled(ctx, layer, None)?;
         if st.passes.is_empty() {
             return Some((st.body, st.key));
@@ -253,6 +256,7 @@ impl<'a> Renderer<'a> {
         mut timing: Option<&mut LayerTiming>,
         keyed: Option<ContentKey>,
     ) -> Option<(Arc<Buf>, Option<u64>)> {
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let (key, noted, clip) = keyed.unwrap_or_else(|| self.content_cache_key_noted(ctx, layer));
         // An animated precomp's buffer isn't kept for other uses in its frame (see
         // [`cache::LayerCache::insert_once`]): no use waiting for another thread's render of it.
@@ -322,6 +326,7 @@ impl<'a> Renderer<'a> {
     /// so scrubbing reuses frames rendered for earlier output frames.
     pub fn layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
         let _profile = crate::profile::span("layer_input");
+        let _owner = cache::OwnerScope::effect(ctx.comp_id.0, layer.id.0, effects);
         let src = match layer.source {
             LayerSource::Comp { .. } if self.cache.is_some() => self.precomp_key(ctx, layer),
             LayerSource::Footage { item } => Some(self.proxy_for(item).is_some() as u64),
@@ -381,6 +386,7 @@ impl<'a> Renderer<'a> {
 
     /// [`Self::styled`] with the content key already computed (see [`Self::content_buf_timed`]).
     fn styled_keyed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>, keyed: Option<ContentKey>) -> Option<StyledLayer> {
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let (content, ckey) = self.content_buf_timed(ctx, layer, timing.as_deref_mut(), keyed)?;
         if !styles::active(ctx, layer) {
             return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true });
@@ -421,6 +427,7 @@ impl<'a> Renderer<'a> {
     /// were converted from aren't touched, so they go cold in the layer cache (packed or evicted
     /// under pressure) instead of being kept hot next to their converted copies.
     pub(crate) fn styled_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         // The content key, computed once for the lookups below (only linear blending has them).
         let keyed = (self.cache.is_some() && self.pipe.to_blend().is_some()).then(|| self.content_cache_key_noted(ctx, layer));
         if let Some(st) = keyed.and_then(|(ckey, _, _)| self.styled_blend_cached(ctx, layer, ckey?)) {

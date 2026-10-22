@@ -63,6 +63,7 @@ mod cull;
 pub mod deferred;
 mod effects;
 mod fusion;
+mod half;
 mod mips;
 mod plane3d;
 mod warmup;
@@ -107,7 +108,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "profile")]
 pub use context::take_pool_miss_sites;
-pub use context::{AllocStats, GpuContext, GpuImage, TransferStats, VramReport};
+pub use context::{AllocStats, GpuContext, GpuImage, ScratchMeter, TransferStats, VramReport, effect_scratch};
 use effectcraft_effects::Buf;
 use effectcraft_project::ItemId;
 use effectcraft_raster::Image;
@@ -274,6 +275,8 @@ impl Gpu {
         // Declared before the encoder: the frame lasts until its resident outputs are published.
         let _frame = r.frame_mark(comp);
         let mut e = Enc::with_resident(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
+        // Viewer frames only: effect intermediates may be half floats (exports stay f32).
+        e.half = self.ctx.half_intermediates();
         let img = walk::render(&mut e, r, comp, t)?;
         let texture = e.display_px(&img)?;
         e.submit();
@@ -670,6 +673,8 @@ mod tests_fx_vr;
 mod tests_fx_warp;
 #[cfg(test)]
 mod tests_glow_reach;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests_half;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests_init;
 #[cfg(test)]

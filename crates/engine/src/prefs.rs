@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 
 use effectcraft_color::Label;
+use effectcraft_render::cache::shared::{ShareKind, Split};
 use effectcraft_time::Tick;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -183,6 +184,10 @@ page!(Previews {
     /// the CPU and back (the GPU compositor shares the window's graphics device). Off: frames are
     /// read back as before (the compositor gets a device of its own at the next launch).
     zero_copy_display: bool = true,
+    /// Viewer frames keep effect working buffers (blur passes, glow parts, layer-style planes,
+    /// the Bevel and Emboss height profile) as 16-bit half floats on the GPU: half their memory,
+    /// visually identical (within 1/255). Effect results, renders and exports stay 32-bit.
+    half_float_effects: bool = true,
     /// Smart Freeze: freeze (and keep fresh, Auto) a layer or precomp that stays far above the
     /// frame budget while playing, once you have been idle for a few seconds. Off: the Timeline
     /// only offers to freeze it.
@@ -292,6 +297,18 @@ page!(Memory {
     media_cache_mb: u32 = 1024,
     /// RAM preview (viewer frame) cache budget (MB).
     preview_cache_mb: u32 = 3072,
+    /// The layer, footage and preview caches share one budget, what the three budgets add up
+    /// to: each keeps a floor (an eighth of the total, the footage cache at least 512 MB) and
+    /// can grow into the rest, and past the total the least recently used entry of any of them
+    /// goes (`plan/memory/shared-budget.md`). Off: each keeps to its own budget.
+    shared_cache_budget: bool = true,
+    /// Keep RAM preview frames LZ4-compressed away from the playhead (lossless, about 2.4× the
+    /// frames in the same memory; the budget counts the compressed bytes). A frame leaving RAM
+    /// that was worth caching goes to the disk cache first. Off: frames keep their pixels.
+    preview_compress: bool = true,
+    /// Frames around the playhead that keep their pixels while compression is on (shown
+    /// without a decode).
+    preview_raw_window: u32 = 8,
     reduce_cache_when_low: bool = true,
     /// CPU cores Cache Frames When Idle renders on (0 = automatic: a quarter of them, 1 to 4).
     /// Its frames run on their own threads at background priority, so the viewer, playback and
@@ -696,6 +713,7 @@ impl Prefs {
         m.layer_cache_mb = m.layer_cache_mb.clamp(64, 1 << 20);
         m.media_cache_mb = m.media_cache_mb.clamp(64, 1 << 20);
         m.preview_cache_mb = m.preview_cache_mb.clamp(64, 1 << 20);
+        m.preview_raw_window = m.preview_raw_window.min(240);
         self.grids.grid_spacing = self.grids.grid_spacing.clamp(1.0, 10_000.0);
         let n = self.general.recent_items as usize;
         self.recent_projects.truncate(n);
@@ -833,7 +851,8 @@ impl Prefs {
     /// The Memory & CPU cache budgets in effect: the configured layer / footage / preview
     /// budgets (on a machine with at least [`LARGE_MEMORY`], the layer and preview caches at
     /// their defaults grow with its memory: an eighth and a quarter of it, up to 16 and 32 GB, so
-    /// the layers and frames an edit doesn't change stay cached across the timeline), scaled
+    /// the layers and frames an edit doesn't change stay cached across the timeline; the preview
+    /// only up to [`COMPRESSED_PREVIEW_CACHE`] with Compress RAM Preview Frames on), scaled
     /// down so together they leave **RAM Reserved for Other Applications** free,
     /// and halved while the system is low on memory when **Reduce Cache Size When System Is Low
     /// on Memory** is on. `mem` = the system's memory (`None` = unknown: configured budgets).
@@ -854,7 +873,9 @@ impl Prefs {
                 l = l.max((total / 8).min(16 << 30));
             }
             if self.memory.preview_cache_mb == defaults.preview_cache_mb {
-                p = p.max((total / 4).min(32 << 30));
+                // Compressed frames take about 2.4× less: the same frames in less memory.
+                let grown = (total / 4).min(32 << 30);
+                p = p.max(if self.memory.preview_compress { grown.min(COMPRESSED_PREVIEW_CACHE) } else { grown });
             }
         }
         let floor = 64u64 << 20;
@@ -874,7 +895,10 @@ impl Prefs {
                 reduced = true;
             }
         }
-        CacheBudgets { layer: l.max(floor) as usize, media: m.max(floor) as usize, preview: p.max(floor) as usize, capped, reduced }
+        let (l, m, p) = (l.max(floor), m.max(floor), p.max(floor));
+        // One budget for the three (never in the browser: its caches keep their own limits).
+        let shared = (self.memory.shared_cache_budget && !web).then(|| Split::of(l, m, p));
+        CacheBudgets { layer: l as usize, media: m as usize, preview: p as usize, capped, reduced, shared }
     }
 
     /// Composition ▸ Motion Path: the layer-time span of a motion path to draw around `now`
@@ -1012,12 +1036,18 @@ pub const WEB_LAYER_CACHE: u64 = 512 << 20;
 /// of processed layers and 16 GB of RAM preview frames instead of 1 and 3).
 pub const LARGE_MEMORY: u64 = 32 << 30;
 
+/// The most a default RAM preview grows to on a large-memory machine with Compress RAM Preview
+/// Frames on (see [`Prefs::cache_budgets`]): 8 GB of compressed frames hold about what 19 GB of
+/// uncompressed ones did (`plan/memory/compressed-cache.md`).
+pub const COMPRESSED_PREVIEW_CACHE: u64 = 8 << 30;
+
 /// The most the footage frame cache holds in the browser (see [`WEB_LAYER_CACHE`]).
 pub const WEB_MEDIA_CACHE: u64 = 256 << 20;
 
 /// Effective cache budgets in bytes (see [`Prefs::cache_budgets`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct CacheBudgets {
+    /// Each cache's own budget (its fair share when they share one).
     pub layer: usize,
     pub media: usize,
     pub preview: usize,
@@ -1025,6 +1055,22 @@ pub struct CacheBudgets {
     pub capped: bool,
     /// Halved because the system is low on memory.
     pub reduced: bool,
+    /// The caches share one budget, the three above together (Share One Budget Between the
+    /// Caches; see [`effectcraft_render::cache::shared`]): its floors and limits.
+    pub shared: Option<Split>,
+}
+
+impl CacheBudgets {
+    /// What a cache is set to: its limit in the shared budget (the total less the other
+    /// caches' floors), else its own budget.
+    pub fn limit(&self, kind: ShareKind) -> usize {
+        let own = match kind {
+            ShareKind::Layer => self.layer,
+            ShareKind::Media => self.media,
+            ShareKind::Preview => self.preview,
+        };
+        self.shared.map_or(own, |s| usize::try_from(s.limit(kind)).unwrap_or(usize::MAX))
+    }
 }
 
 /// Colour of the `k`-th mask of a layer: Appearance ▸ Cycle Mask Colors cycles through the mask
@@ -1442,6 +1488,9 @@ pub fn pages() -> Vec<Page> {
                 s("memory.layerCacheMb", "Layer Cache", Kind::Int(64, 1 << 20, "MB"), true),
                 s("memory.mediaCacheMb", "Footage Frame Cache", Kind::Int(64, 1 << 20, "MB"), true),
                 s("memory.previewCacheMb", "Preview (RAM) Cache", Kind::Int(64, 1 << 20, "MB"), true),
+                s("memory.sharedCacheBudget", "Share One Budget Between the Caches", B, true),
+                s("memory.previewCompress", "Compress RAM Preview Frames", B, true),
+                s("memory.previewRawWindow", "Uncompressed Frames Around the Playhead", Kind::Int(0, 240, "frames"), true),
                 s("memory.reduceCacheWhenLow", "Reduce Cache Size When System Is Low on Memory", B, true),
                 Section("CPU"),
                 s("memory.idleCacheCores", "CPU Cores for Cache Frames When Idle (0 = Automatic)", Kind::Int(0, 256, "cores"), true),

@@ -64,6 +64,10 @@ pub(crate) mod free;
 /// [`LayerCache::set_disk`]).
 mod gpu;
 pub use gpu::{GpuOwner, GpuPending, GpuSlot, GpuStage, ResidentReadback};
+pub mod owner;
+pub use owner::{EntryUsage, Owner, OwnerScope, Purged, UsageKind};
+pub mod shared;
+use shared::{ShareKind, ShareLink, SharedBudget};
 
 pub struct LayerCache {
     storage_epoch: Arc<Mutex<Arc<()>>>,
@@ -84,6 +88,8 @@ pub struct LayerCache {
     /// Shape layers' last content key, when it was seen and for how many times since it held
     /// (see [`LayerCache::content_held`]).
     shape_keys: Mutex<HashMap<u64, (u64, effectcraft_time::Tick, u32)>>,
+    /// `Inner::bytes`, readable without the lock (the status bar's memory chip).
+    meter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A shape layer's whole raster buffer: width, height and offset (see
@@ -140,6 +146,8 @@ struct Entry {
     /// A first render on probation (see the module docs): admitted on its first hit, dropped
     /// first in first out when the probation window is full.
     probation: bool,
+    /// The comp / layer / effect it was rendered for (see [`owner`]).
+    owner: Owner,
 }
 
 /// How an entry keeps its pixels. Entries go in as `f32` buffers (a hit shares the `Arc`, and
@@ -190,14 +198,51 @@ struct Inner {
     gpu_probation_lru: BTreeSet<(u64, usize)>,
     /// GPU slots by content key ([`GpuOwner::resident`] lookups without a scan).
     gpu_content: HashMap<u64, Vec<usize>>,
+    /// Mirrors `bytes` for lock-free reads ([`LayerCache::bytes_now`]); every change of `bytes`
+    /// ends with [`Inner::sync_meter`].
+    meter: Arc<std::sync::atomic::AtomicU64>,
+    /// The owner each GPU slot was published under (see [`owner`]; slots published outside a
+    /// scope are left out and take their CPU twin's owner).
+    gpu_owners: HashMap<usize, Owner>,
+    /// Bytes of the GPU slots' allocations (what the budget counts besides `bytes`).
+    gpu_bytes: usize,
+    /// The shared cache budget, when the caches share one ([`shared`], [`LayerCache::share`]):
+    /// every change of `bytes`, `gpu_bytes` or of the oldest use is reported to it.
+    share: Option<ShareLink>,
 }
 
 impl Inner {
+    fn sync_meter(&self) {
+        self.meter.store(self.bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        self.report_share();
+    }
+
+    /// Tell the shared budget what this cache holds and its oldest use (two atomic stores; the
+    /// oldest pair may be stale, which only makes the cache look older until it is asked).
+    fn report_share(&self) {
+        let Some(link) = &self.share else { return };
+        let cpu = self.cpu_lru.first().map(|p| p.0);
+        let gpu = self.gpu_lru.first().map(|p| p.0);
+        let oldest = match (cpu, gpu) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        link.report(self.bytes.saturating_add(self.gpu_bytes) as u64, oldest);
+    }
+
+    /// The next use stamp: from the process-wide clock, so the shared budget can compare this
+    /// cache's uses with the other caches' ([`shared::stamp`]).
+    fn tick(&mut self) -> u64 {
+        self.clock = shared::stamp_after(self.clock);
+        self.clock
+    }
+
     fn index_cpu(&mut self, key: u64, last_use: u64, probation: bool) {
         self.cpu_lru.insert((last_use, key));
         if probation {
             self.probation_lru.insert((last_use, key));
         }
+        self.report_share();
     }
 
     fn unindex_cpu(&mut self, key: u64, last_use: u64) {
@@ -208,6 +253,10 @@ impl Inner {
     /// Keep GPU slot `id` (replacing one with the same id, which is returned).
     fn gpu_insert(&mut self, id: usize, entry: gpu::GpuEntry) -> Option<gpu::GpuEntry> {
         let old = self.gpu_remove(id);
+        let owner = owner::current();
+        if owner != Owner::NONE {
+            self.gpu_owners.insert(id, owner);
+        }
         self.gpu_lru.insert((entry.last_use, id));
         if entry.probation {
             self.gpu_probation_lru.insert((entry.last_use, id));
@@ -215,12 +264,16 @@ impl Inner {
         if let Some(content) = entry.slot.content() {
             self.gpu_content.entry(content).or_default().push(id);
         }
+        self.gpu_bytes = self.gpu_bytes.saturating_add(entry.slot.allocation().bytes());
         self.gpu.insert(id, entry);
+        self.report_share();
         old
     }
 
     fn gpu_remove(&mut self, id: usize) -> Option<gpu::GpuEntry> {
         let e = self.gpu.remove(&id)?;
+        self.gpu_bytes = self.gpu_bytes.saturating_sub(e.slot.allocation().bytes());
+        self.gpu_owners.remove(&id);
         self.gpu_lru.remove(&(e.last_use, id));
         self.gpu_probation_lru.remove(&(e.last_use, id));
         if let Some(content) = e.slot.content()
@@ -231,6 +284,7 @@ impl Inner {
                 self.gpu_content.remove(&content);
             }
         }
+        self.report_share();
         Some(e)
     }
 
@@ -242,13 +296,18 @@ impl Inner {
         self.gpu_lru.remove(&(old, id));
         self.gpu_probation_lru.remove(&(old, id));
         self.gpu_lru.insert((now, id));
+        self.report_share();
     }
 
     fn gpu_take_all(&mut self) -> HashMap<usize, gpu::GpuEntry> {
         self.gpu_lru.clear();
         self.gpu_probation_lru.clear();
         self.gpu_content.clear();
-        std::mem::take(&mut self.gpu)
+        self.gpu_owners.clear();
+        self.gpu_bytes = 0;
+        let all = std::mem::take(&mut self.gpu);
+        self.report_share();
+        all
     }
 
     /// Entries used after this clock belong to the frames being rendered or the frame before
@@ -351,7 +410,9 @@ impl LayerCache {
     /// A cache retaining at most `budget` CPU and GPU pixel bytes. Existing callers may
     /// pin retired storage above a subsequently reduced budget; new admission stops.
     pub fn new(budget: usize) -> LayerCache {
+        let meter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         LayerCache {
+            meter: meter.clone(),
             storage_epoch: Arc::new(Mutex::new(Arc::new(()))),
             resident_lifetime: Mutex::new(Arc::new(())),
             inner: Arc::new(Mutex::new(Inner {
@@ -376,6 +437,10 @@ impl LayerCache {
                 gpu_probation_lru: BTreeSet::new(),
                 gpu_lru: BTreeSet::new(),
                 gpu_content: HashMap::new(),
+                meter,
+                gpu_owners: HashMap::new(),
+                gpu_bytes: 0,
+                share: None,
             })),
             disk: Mutex::new(None),
             store: Mutex::new(None),
@@ -582,8 +647,7 @@ impl LayerCache {
     /// miss is not counted (the caller falls back to a path that looks it up properly).
     pub(crate) fn peek(&self, key: u64) -> Option<Arc<Buf>> {
         let mut g = self.inner.lock().ok()?;
-        g.clock += 1;
-        let now = g.clock;
+        let now = g.tick();
         let e = g.map.get_mut(&key)?;
         let old = std::mem::replace(&mut e.last_use, now);
         let stored = match &e.buf {
@@ -679,11 +743,10 @@ impl LayerCache {
         if g.map.try_reserve(1).is_err() || g.physical.track_cpu(&buf).is_err() {
             return;
         }
-        g.clock = g.clock.saturating_add(1);
+        let now = g.tick();
         g.inserts = g.inserts.saturating_add(1);
-        let now = g.clock;
         let probation = !admit && g.map.get(&key).is_none_or(|e| e.probation);
-        if let Some(old) = g.map.insert(key, Entry { buf: Stored::Full(buf), bytes, last_use: now, unpackable: false, probation }) {
+        if let Some(old) = g.map.insert(key, Entry { buf: Stored::Full(buf), bytes, last_use: now, unpackable: false, probation, owner: owner::current() }) {
             g.bytes = g.bytes.saturating_sub(old.bytes);
             if old.probation {
                 g.probation_bytes = g.probation_bytes.saturating_sub(old.bytes);
@@ -696,6 +759,7 @@ impl LayerCache {
             g.probation_bytes = g.probation_bytes.saturating_add(bytes);
             trim_probation(&mut g, Some(key));
         }
+        g.sync_meter();
     }
 
     /// Bytes of first renders kept on probation, at most (the newest is kept whatever its size,
@@ -747,6 +811,7 @@ impl LayerCache {
         let old = std::mem::replace(&mut e.bytes, bytes);
         e.buf = Stored::Full(buf.clone());
         g.bytes = g.bytes.saturating_sub(old).saturating_add(bytes);
+        g.sync_meter();
         buf
     }
 
@@ -808,6 +873,7 @@ impl LayerCache {
         e.buf = Stored::Packed(packed);
         e.unpackable = false;
         g.bytes = g.bytes.saturating_sub(old).saturating_add(bytes);
+        g.sync_meter();
     }
 
     /// Physical retained CPU/GPU accounting, including caller pins and pending reservations.
@@ -841,6 +907,33 @@ impl LayerCache {
         gpu::relieve(&self.inner, None, 0, None, false);
     }
 
+    /// Take part in the shared cache budget (`Some`, see [`shared`]) or keep to this cache's
+    /// own budget (`None`). The budget asks this cache to evict its least recently used entry
+    /// by the same rules as its own eviction: entries on probation first, and the working set
+    /// of the frames being rendered stays.
+    pub fn share(&self, budget: Option<&Arc<SharedBudget>>) {
+        let link = budget.and_then(|b| b.join(ShareKind::Layer, Arc::new(LayerMember(Arc::downgrade(&self.inner)))));
+        let old = match self.inner.lock() {
+            Ok(mut g) => {
+                let old = std::mem::replace(&mut g.share, link);
+                g.report_share();
+                old
+            }
+            Err(_) => return,
+        };
+        if let Some(old) = old {
+            old.leave();
+        }
+    }
+
+    /// The budget plans such as how many frames render at once go by: this cache's own budget
+    /// when the caches share one (its fair share, so the plans don't change with the setting),
+    /// else [`Self::budget`].
+    pub fn planning_budget(&self) -> usize {
+        let Ok(g) = self.inner.lock() else { return 0 };
+        g.share.as_ref().and_then(ShareLink::share).map_or(g.budget, |s| usize::try_from(s).unwrap_or(usize::MAX).min(g.budget))
+    }
+
     pub fn clear(&self) {
         let mut epoch = self.storage_epoch.lock().unwrap_or_else(PoisonError::into_inner);
         *epoch = Arc::new(());
@@ -853,6 +946,7 @@ impl LayerCache {
             g.physical.retire();
             g.bytes = 0;
             g.probation_bytes = 0;
+            g.sync_meter();
             g.seen.clear();
             Some(retired)
         } else {
@@ -871,6 +965,55 @@ impl LayerCache {
             .lock()
             .map(|g| CacheStats { entries: g.map.len(), bytes: g.bytes, hits: g.hits, misses: g.misses, gpu_entries: g.gpu.len() })
             .unwrap_or_default()
+    }
+
+    /// Bytes of the CPU buffers held now (`CacheStats::bytes`), without taking the lock: one
+    /// atomic load (the status bar's memory chip reads it twice a second).
+    pub fn bytes_now(&self) -> u64 {
+        self.meter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Every buffer held now with its owner and bytes (the Memory panel, `memory.stats`). The
+    /// lock is held only to copy the entries out (no allocation per entry beyond the result);
+    /// callers aggregate outside it. A GPU slot belongs to the scope it was published in, else
+    /// to the CPU entry of its content key, else it is unattributed.
+    pub fn usage(&self) -> Vec<EntryUsage> {
+        let Ok(g) = self.inner.lock() else { return vec![] };
+        let mut out = Vec::with_capacity(g.map.len().saturating_add(g.gpu.len()));
+        out.extend(g.map.values().map(|e| EntryUsage { owner: e.owner, bytes: e.bytes, kind: UsageKind::Cpu, probation: e.probation }));
+        out.extend(g.gpu.iter().map(|(id, e)| EntryUsage {
+            owner: g.gpu_owners.get(id).copied().or_else(|| e.slot.content().and_then(|k| g.map.get(&k)).map(|c| c.owner)).unwrap_or_default(),
+            bytes: e.slot.allocation().bytes(),
+            kind: UsageKind::Gpu,
+            probation: e.probation,
+        }));
+        out
+    }
+
+    /// Drop the buffers whose owner `purge` picks (the Memory panel's per-row Purge,
+    /// `memory.purge {comp, layer}`), with the GPU slots of their content keys. Buffers being
+    /// used right now stay alive with their users and are simply no longer cached; the GPU
+    /// payloads are released after the lock.
+    pub fn purge_owned(&self, purge: impl Fn(&Owner) -> bool) -> Purged {
+        let retired: Vec<gpu::GpuEntry>;
+        let mut done = Purged::default();
+        {
+            let Ok(mut g) = self.inner.lock() else { return done };
+            let keys: Vec<(u64, usize)> = g.map.iter().filter(|(_, e)| purge(&e.owner)).map(|(k, e)| (*k, e.bytes)).collect();
+            let mut ids: Vec<usize> = keys.iter().filter_map(|(k, _)| g.gpu_content.get(k)).flatten().copied().collect();
+            ids.extend(g.gpu_owners.iter().filter(|(_, o)| purge(o)).map(|(id, _)| *id));
+            ids.sort_unstable();
+            ids.dedup();
+            for (k, b) in &keys {
+                remove(&mut g, *k);
+                done.entries += 1;
+                done.bytes = done.bytes.saturating_add(*b);
+            }
+            retired = ids.into_iter().filter_map(|id| g.gpu_remove(id)).collect();
+            done.gpu_slots = retired.len();
+        }
+        drop(retired);
+        done
     }
 
     /// Buffers inserted so far (each a render, or a disk read): tests count renders with it.
@@ -1215,6 +1358,32 @@ fn evict_one(g: &mut Inner, protect: bool) -> (bool, Option<Arc<GpuSlot>>) {
     }
 }
 
+/// The layer cache as a member of the shared budget ([`LayerCache::share`]).
+struct LayerMember(Weak<Mutex<Inner>>);
+
+impl shared::Member for LayerMember {
+    fn evict_oldest(&self) -> u64 {
+        let Some(inner) = self.0.upgrade() else { return 0 };
+        let (freed, retired) = {
+            let Ok(mut g) = inner.lock() else { return 0 };
+            let before = g.bytes.saturating_add(g.gpu_bytes);
+            // `protect`: the frames being rendered keep what they use (see `evict_one`).
+            let (progress, retired) = evict_one(&mut g, true);
+            let after = g.bytes.saturating_add(g.gpu_bytes);
+            g.report_share();
+            // (an entry of no bytes still counts as progress)
+            (if progress { before.saturating_sub(after).max(1) } else { 0 }, retired)
+        };
+        // A GPU payload is released after the lock, as everywhere else.
+        drop(retired);
+        freed as u64
+    }
+
+    fn alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
 fn remove(g: &mut Inner, key: u64) {
     if let Some(e) = g.map.remove(&key) {
         g.bytes = g.bytes.saturating_sub(e.bytes);
@@ -1222,6 +1391,7 @@ fn remove(g: &mut Inner, key: u64) {
             g.probation_bytes = g.probation_bytes.saturating_sub(e.bytes);
         }
         g.unindex_cpu(key, e.last_use);
+        g.sync_meter();
     }
 }
 

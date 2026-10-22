@@ -391,31 +391,79 @@ pub(crate) fn box_passes(e: &mut Enc, img: &GpuImage, rx: &[usize], ry: &[usize]
 
 /// [`box_passes`] with the horizontal passes run by kernel `h` (the tests' reference kernel).
 pub(crate) fn box_passes_with(e: &mut Enc, h: &str, img: &GpuImage, rx: &[usize], ry: &[usize], repeat: bool) -> GpuImage {
-    let mut cur = img.clone();
-    let passes = rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0);
-    for (vertical, r) in passes {
+    box_passes_owned(e, h, img.clone(), rx, ry, repeat, Precision::F32)
+}
+
+/// What a blur writes: RGBA f32 throughout, or RGBA16F intermediates (see [`crate::half`]) with
+/// an f32 result (`HalfPasses`, for a result that leaves the effect) or a half one too
+/// (`Half`, for a result only the effect's own half-capable kernels read).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Precision {
+    F32,
+    HalfPasses,
+    Half,
+}
+
+impl Precision {
+    /// `Half` / `HalfPasses` when the render allows half images for the blur kernels (and
+    /// `also`), else `F32`.
+    pub(crate) fn pick(e: &Enc, also: &[&str], result_half: bool) -> Precision {
+        let kernels: &[&str] = &["box_h", "box_v", "fill"];
+        if !e.half_for(kernels) || !e.half_for(also) {
+            Precision::F32
+        } else if result_half {
+            Precision::Half
+        } else {
+            Precision::HalfPasses
+        }
+    }
+}
+
+/// [`box_passes_with`] taking the input by value: each pass's input goes back to the texture
+/// pool as soon as the pass is recorded (the encoder keeps it alive for the GPU), so a blur
+/// holds at most two working images however many passes it runs (the caller's input too only
+/// while someone else still holds it). `precision` picks the passes' and the result's format.
+pub(crate) fn box_passes_owned(e: &mut Enc, h: &str, img: GpuImage, rx: &[usize], ry: &[usize], repeat: bool, precision: Precision) -> GpuImage {
+    let mut cur = img;
+    let passes: Vec<(bool, usize)> = rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0).collect();
+    let last = passes.len().saturating_sub(1);
+    for (i, (vertical, r)) in passes.into_iter().enumerate() {
         let block = if vertical { (4 * r).clamp(32, 256) } else { 256 } as u32;
         let (lines, n) = if vertical { (cur.width, cur.height) } else { (cur.height, cur.width) };
         let mut p = Params::default();
         p.u[0] = [r as u32, repeat as u32, block, 0];
-        let out = e.scratch(cur.width, cur.height);
+        let half = match precision {
+            Precision::F32 => false,
+            Precision::HalfPasses => i < last,
+            Precision::Half => true,
+        };
+        let out = e.scratch_as(cur.width, cur.height, half);
         e.dispatch(if vertical { "box_v" } else { h }, &p, &cur, None, &out, None, (lines.div_ceil(64), n.div_ceil(block)));
         cur = out;
     }
     cur
 }
 
+/// [`gaussian_blur`] taking the input by value, in `precision` (see [`box_passes_owned`]).
+pub(crate) fn gaussian_blur_owned(e: &mut Enc, img: GpuImage, sx: f64, sy: f64, repeat: bool, precision: Precision) -> GpuImage {
+    let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
+    let ry = if sy > 0.05 { box_radii(sy, 3) } else { vec![] };
+    box_passes_owned(e, "box_h", img, &rx, &ry, repeat, precision)
+}
+
 /// [`box_passes`] from an image that may be 8 bpc codes: the first pass reads the codes, the
-/// rest run as [`box_passes`] (no passes: the image as it is).
-pub(crate) fn box_passes_px(e: &mut Enc, img: &Pixels, rx: &[usize], ry: &[usize], repeat: bool) -> Pixels {
-    if let Pixels::Float(f) = img {
-        return box_passes(e, f, rx, ry, repeat).into();
-    }
+/// rest run as [`box_passes_owned`] in `precision` (no passes: the image as it is). Takes the
+/// image by value, so it goes back to the pool once the first pass has read it.
+pub(crate) fn box_passes_px(e: &mut Enc, img: Pixels, rx: &[usize], ry: &[usize], repeat: bool, precision: Precision) -> Pixels {
+    let img = match img {
+        Pixels::Float(f) => return box_passes_owned(e, "box_h", f, rx, ry, repeat, precision).into(),
+        codes => codes,
+    };
     let first = match rx.iter().position(|&r| r > 0) {
         Some(i) => rx.get(i).zip(rx.get(i + 1..)).map(|(&r, rest)| (false, r, rest, ry)),
         None => ry.iter().position(|&r| r > 0).and_then(|j| ry.get(j).zip(ry.get(j + 1..))).map(|(&r, rest)| (true, r, &[][..], rest)),
     };
-    let Some((vertical, r, rx, ry)) = first else { return img.clone() };
+    let Some((vertical, r, rx, ry)) = first else { return img };
     // The pass as `box_passes_with` runs it.
     let (w, h) = img.size();
     let block = if vertical { (4 * r).clamp(32, 256) } else { 256 } as u32;
@@ -423,8 +471,10 @@ pub(crate) fn box_passes_px(e: &mut Enc, img: &Pixels, rx: &[usize], ry: &[usize
     let mut p = Params::default();
     p.u[0] = [r as u32, repeat as u32, block, 0];
     let out = e.scratch(w, h);
-    codes::dispatch(e, if vertical { "box_v" } else { "box_h" }, &p, img, None, &out.clone().into(), None, (lines.div_ceil(64), n.div_ceil(block)));
-    box_passes(e, &out, rx, ry, repeat).into()
+    codes::dispatch(e, if vertical { "box_v" } else { "box_h" }, &p, &img, None, &out.clone().into(), None, (lines.div_ceil(64), n.div_ceil(block)));
+    drop(img);
+    // `out` by value: it goes back to the pool once the next pass has read it.
+    box_passes_owned(e, "box_h", out, rx, ry, repeat, precision).into()
 }
 
 /// raster::gaussian_blur (3 box passes per axis).
@@ -435,10 +485,17 @@ pub(crate) fn gaussian_blur(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repea
 }
 
 /// [`gaussian_blur`] from an image that may be codes ([`box_passes_px`]).
-fn gaussian_blur_px(e: &mut Enc, img: &Pixels, sx: f64, sy: f64, repeat: bool) -> Pixels {
+fn gaussian_blur_px(e: &mut Enc, img: Pixels, sx: f64, sy: f64, repeat: bool, precision: Precision) -> Pixels {
     let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
     let ry = if sy > 0.05 { box_radii(sy, 3) } else { vec![] };
-    box_passes_px(e, img, &rx, &ry, repeat)
+    box_passes_px(e, img, &rx, &ry, repeat, precision)
+}
+
+/// `b`'s image, taken out for a step that consumes it (a shared transparent 1 × 1 stands in
+/// until the result goes back): the step can then return it to the pool as soon as it has
+/// read it, instead of the buffer holding it to the end.
+fn take_img(e: &Enc, b: &mut PBuf) -> Pixels {
+    std::mem::replace(&mut b.img, Pixels::Float(e.zeros(1, 1)))
 }
 
 fn dims_xy(dim: u32) -> (f64, f64) {
@@ -463,7 +520,12 @@ fn gaussian_px(e: &mut Enc, ctx: &EffectCtx, mut b: PBuf) -> Option<PBuf> {
     if !repeat && !ctx.adjustment {
         b.pad(e, (sx.max(sy) * 3.0).ceil().min(1.0e5) as u32)?;
     }
-    b.img = gaussian_blur_px(e, &b.img, sx, sy, repeat || ctx.adjustment);
+    // The blur owns its input (the padded copy goes back to the pool after the first pass):
+    // one full-size image fewer at its peak. The passes may be half floats on a display
+    // render (see `crate::half`); the result is f32.
+    let precision = Precision::pick(e, &[], false);
+    let img = take_img(e, &mut b);
+    b.img = gaussian_blur_px(e, img, sx, sy, repeat || ctx.adjustment, precision);
     Some(b)
 }
 
@@ -481,7 +543,11 @@ fn box_blur_px(e: &mut Enc, ctx: &EffectCtx, mut b: PBuf) -> Option<PBuf> {
     if !repeat && !ctx.adjustment {
         b.pad(e, (rx.max(ry) * it) as u32 + 1)?;
     }
-    b.img = box_passes_px(e, &b.img, &vec![rx; it], &vec![ry; it], repeat || ctx.adjustment);
+    // Half-float passes round once each: past 3 iterations (6+ passes per axis) the rounding
+    // could add up to a visible step, so long chains keep f32.
+    let precision = if it <= 3 { Precision::pick(e, &[], false) } else { Precision::F32 };
+    let img = take_img(e, &mut b);
+    b.img = box_passes_px(e, img, &vec![rx; it], &vec![ry; it], repeat || ctx.adjustment, precision);
     Some(b)
 }
 
@@ -519,11 +585,15 @@ fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         b.pad(e, (sx.max(sy) * 3.0).ceil() as u32 + 2)?;
     }
     let p = glow_params(ctx);
-    let bright = e.image(b.img.width, b.img.height);
+    // The bright pass, its blur and colouring are read only here: half floats on a display
+    // render (see `crate::half`); `glow_combine` writes the f32 result.
+    let half = Precision::pick(e, &["glow_bright", "glow_ab"], true) == Precision::Half;
+    let bright = e.image_as(b.img.width, b.img.height, half);
     e.pixels("glow_bright", &p, &b.img, None, &bright, None);
-    let mut blurred = gaussian_blur(e, &bright, sx * kx, sy * ky, false);
+    // The blur owns `bright`: it goes back to the pool after the first pass.
+    let mut blurred = gaussian_blur_owned(e, bright, sx * kx, sy * ky, false, if half { Precision::Half } else { Precision::F32 });
     if use_colors {
-        let coloured = e.image(b.img.width, b.img.height);
+        let coloured = e.image_as(b.img.width, b.img.height, half);
         e.pixels("glow_ab", &p, &blurred, None, &coloured, None);
         blurred = coloured;
     }

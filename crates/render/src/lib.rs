@@ -35,8 +35,8 @@ pub use clip::{set_precomp_clip, set_shape_clip};
 pub use effectcraft_raster::Image;
 pub use eval::{EvalCtx, ExprHost, effect_bounds, source_size};
 pub use footage::{
-    CancellableFootage, FloatCurve, FootageFrame, FootageSource, FramePixels, NoFootage, SharedFrame, blend_frames, exact_footage, field_frame, frame_position,
-    interpret_pixels, is_vector_footage, preview_size,
+    CancellableFootage, FloatCurve, FootageCacheUsage, FootageFrame, FootageSource, FramePixels, NoFootage, SharedFrame, blend_frames, exact_footage,
+    field_frame, frame_position, interpret_pixels, is_vector_footage, preview_size,
 };
 pub(crate) use fx::comp_scene;
 pub use fx::{effect_canvas_extent, effect_canvas_extent_in, effect_points_in_comp_space, effect_space_follows_comp_size};

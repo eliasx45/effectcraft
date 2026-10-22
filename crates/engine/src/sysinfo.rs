@@ -7,7 +7,7 @@
 //! configured budgets. The periodic reading behind the cache budgets runs on a background
 //! thread ([`MemoryWatch`]): on Windows it starts PowerShell, which takes about a second.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
@@ -100,6 +100,93 @@ impl MemoryWatch {
     pub fn pressure(&self) -> Option<MemoryPressure> {
         *self.pressure.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// This process's resident memory and the system's memory pressure, read in the background
+/// for the status bar's memory chip and the Memory panel. [`ProcessWatch::poll`] starts a
+/// reading unless one is running (the chip asks at most every 2 s); [`ProcessWatch::resident`]
+/// is an atomic load. On macOS a reading runs `ps` and `sysctl` (a few ms, off the UI thread);
+/// on Linux it reads `/proc/self/status`; elsewhere it is unknown and the chip shows the bytes
+/// the caches track instead.
+#[derive(Clone, Default)]
+pub struct ProcessWatch {
+    /// Resident bytes at the last reading (0 = unknown).
+    resident: Arc<AtomicU64>,
+    /// [`MemoryPressure`] at the last reading: 0 unknown, 1 normal, 2 warning, 3 critical.
+    pressure: Arc<std::sync::atomic::AtomicU8>,
+    busy: Arc<AtomicBool>,
+}
+
+impl ProcessWatch {
+    /// Start a reading in the background (inline on the web, where it is unknown anyway).
+    pub fn poll(&self) {
+        if self.busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (resident, pressure, busy) = (self.resident.clone(), self.pressure.clone(), self.busy.clone());
+        let read = move || {
+            resident.store(process_resident().unwrap_or(0), Ordering::Relaxed);
+            let level = match memory_pressure() {
+                None => 0,
+                Some(MemoryPressure::Normal) => 1,
+                Some(MemoryPressure::Warning) => 2,
+                Some(MemoryPressure::Critical) => 3,
+            };
+            pressure.store(level, Ordering::Relaxed);
+            busy.store(false, Ordering::Release);
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::thread::Builder::new().name("ec-process-memory".into()).spawn(read).is_err() {
+            self.busy.store(false, Ordering::Release);
+        }
+        #[cfg(target_arch = "wasm32")]
+        read();
+    }
+
+    /// The process's resident bytes at the last reading (`None`: unknown, or none yet).
+    pub fn resident(&self) -> Option<u64> {
+        Some(self.resident.load(Ordering::Relaxed)).filter(|b| *b > 0)
+    }
+
+    /// The memory pressure at the last reading (`None`: unknown).
+    pub fn pressure(&self) -> Option<MemoryPressure> {
+        match self.pressure.load(Ordering::Relaxed) {
+            1 => Some(MemoryPressure::Normal),
+            2 => Some(MemoryPressure::Warning),
+            3 => Some(MemoryPressure::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// Parse the resident set (`VmRSS:`) of Linux `/proc/<pid>/status`, in bytes.
+pub fn parse_proc_status_rss(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kb.checked_mul(1024)
+}
+
+/// Parse `ps -o rss=` output (kilobytes), in bytes.
+pub fn parse_ps_rss(text: &str) -> Option<u64> {
+    text.trim().parse::<u64>().ok()?.checked_mul(1024).filter(|b| *b > 0)
+}
+
+/// This process's resident memory in bytes, when the system reports it. (macOS's Activity
+/// Monitor shows the physical footprint, which also counts compressed memory; reading it needs
+/// `task_info`, i.e. `unsafe`, so the resident size stands in: it is lower while the system
+/// compresses.)
+pub fn process_resident() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        return parse_proc_status_rss(&std::fs::read_to_string("/proc/self/status").ok()?);
+    }
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    {
+        let pid = std::process::id().to_string();
+        return parse_ps_rss(&run("ps", &["-o", "rss=", "-p", &pid])?);
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -273,6 +360,18 @@ mod tests {
         let m = parse_vm_stat(vm, 8 << 30).unwrap();
         assert_eq!(m.available, 4100 * 16384);
         assert!(m.is_low());
+    }
+
+    #[test]
+    fn parses_process_resident_size() {
+        assert_eq!(parse_proc_status_rss("Name:\tx\nVmRSS:\t  2048 kB\nVmSwap: 0 kB\n"), Some(2048 * 1024));
+        assert_eq!(parse_proc_status_rss("Name: x\n"), None);
+        assert_eq!(parse_ps_rss(" 8059600\n"), Some(8_059_600 * 1024));
+        assert_eq!(parse_ps_rss(""), None);
+        assert_eq!(parse_ps_rss("0"), None);
+        let w = ProcessWatch::default();
+        assert_eq!(w.resident(), None);
+        assert_eq!(w.pressure(), None);
     }
 
     #[test]

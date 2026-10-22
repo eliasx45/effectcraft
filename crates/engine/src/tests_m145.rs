@@ -203,21 +203,28 @@ fn cache_budgets_leave_reserved_ram_and_shrink_when_low() {
 }
 
 /// On a large-memory machine the layer and preview caches at their defaults grow with the RAM
-/// (64 GB: 8 and 16 GB); configured sizes and smaller machines keep theirs.
+/// (64 GB: 8 GB of layers, and 8 GB of compressed preview frames or 16 GB uncompressed);
+/// configured sizes and smaller machines keep theirs.
 #[test]
 fn default_cache_budgets_grow_with_a_large_memory() {
     use crate::sysinfo::SysMemory;
     let mut p = crate::prefs::Prefs::default();
     let big = SysMemory { total: 64 << 30, available: 40 << 30 };
     let b = p.cache_budgets(Some(big));
-    assert_eq!((b.layer >> 30, b.media >> 20, b.preview >> 30, b.capped), (8, 1024, 16, false));
+    // Compressed RAM preview frames (the default): 8 GB hold what 16 GB did and more.
+    assert_eq!((b.layer >> 30, b.media >> 20, b.preview >> 30, b.capped), (8, 1024, 8, false));
+    p.memory.preview_compress = false;
+    assert_eq!(p.cache_budgets(Some(big)).preview >> 30, 16, "uncompressed: a quarter of the memory");
+    p.memory.preview_compress = true;
     let small = SysMemory { total: 16 << 30, available: 12 << 30 };
     let b = p.cache_budgets(Some(small));
     assert_eq!((b.layer >> 20, b.preview >> 20), (1024, 3072));
     assert_eq!(p.cache_budgets(None).layer >> 20, 1024, "unknown memory: as configured");
     p.memory.layer_cache_mb = 2048;
     let b = p.cache_budgets(Some(big));
-    assert_eq!((b.layer >> 20, b.preview >> 30), (2048, 16), "a configured size is kept");
+    assert_eq!((b.layer >> 20, b.preview >> 30), (2048, 8), "a configured size is kept");
+    p.memory.preview_cache_mb = 32288;
+    assert_eq!(p.cache_budgets(Some(big)).preview >> 20, 32288, "a configured preview size is kept, compressed or not");
     // Low on memory: halved as before.
     let low = SysMemory { total: 64 << 30, available: 1 << 30 };
     assert!(p.cache_budgets(Some(low)).reduced);

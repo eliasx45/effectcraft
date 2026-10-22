@@ -57,10 +57,13 @@ pub enum PanelKind {
     MotionLibrary,
     /// Window ▸ Script (batch 1, SX5): the voice-over's script lined up with its words.
     Script,
+    /// Window ▸ Memory (our own panel): what the app's memory holds, by cache and by
+    /// comp → layer → effect (`panels::memory_panel`).
+    Memory,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 37] = [
+    pub const ALL: [PanelKind; 38] = [
         PanelKind::Project,
         PanelKind::EffectControls,
         PanelKind::Composition,
@@ -98,6 +101,7 @@ impl PanelKind {
         PanelKind::VrCompEditor,
         PanelKind::MotionLibrary,
         PanelKind::Script,
+        PanelKind::Memory,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -140,6 +144,7 @@ impl PanelKind {
             PanelKind::VrCompEditor => "VR Comp Editor",
             PanelKind::MotionLibrary => "Motion Library",
             PanelKind::Script => "Script",
+            PanelKind::Memory => "Memory",
         }
     }
     pub fn id(self) -> String {

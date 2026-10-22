@@ -165,6 +165,22 @@ Commands (CLI, MCP, control channel):
 - `memory.ramReservedGb`: the cache budgets together leave this much physical memory free
 - `memory.reduceCacheWhenLow`: cache budgets halve while the system is low on memory (checked
   every 30 s by the desktop app, on a background thread)
+- `memory.previewCompress`: Compress RAM Preview Frames (on): frames away from the playhead are
+  kept LZ4-compressed in 16 strips (lossless, about 2.4× the frames per GB; the Preview (RAM)
+  Cache budget counts compressed bytes, and a default budget on a large-memory machine grows to
+  8 GB instead of a quarter of the RAM). A frame worth caching that leaves RAM is written to the
+  disk cache first, and playback reads queued frames from the disk cache ahead of the playhead
+  (`plan/memory/compressed-cache.md`)
+- `memory.previewRawWindow`: Uncompressed Frames Around the Playhead (8): frames the preview
+  reaches next that keep their pixels, so they show without a decode
+- `memory.sharedCacheBudget`: Share One Budget Between the Caches (on): the layer, footage and
+  RAM preview caches share one budget, what their three budgets add up to (still within RAM
+  Reserved for Other Applications). Each keeps a floor (an eighth of the total; the footage
+  cache at least 512 MB, never more than its own budget) and can grow into the rest; past the
+  total the least recently used entry of any cache goes, by that cache's own rules (the layer
+  cache's probation and current frames, the RAM preview's playback range and protected window).
+  Off: each cache keeps to its own budget. `memory.stats` → `sharedBudget` shows the split
+  live (`plan/memory/shared-budget.md`)
 - `memory.idleCacheCores`: CPU Cores for Cache Frames When Idle (0 = automatic: a quarter of the
   cores, 1 to 4; otherwise that many, up to the cores there are). The viewer and playback keep
   every core

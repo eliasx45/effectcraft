@@ -7,6 +7,7 @@ use std::thread::ThreadId;
 
 use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
+use effectcraft_render::cache::shared::{Member, ShareKind, ShareLink, SharedBudget};
 use effectcraft_render::{FloatCurve, FootageFrame, FootageSource, SharedFrame, preview_size};
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
@@ -137,35 +138,54 @@ fn sample_time(at: usize, rate: u32) -> Tick {
 struct Lru {
     map: HashMap<Key, Entry>,
     order: BTreeMap<u64, Key>,
+    /// The latest use stamp, from the process-wide clock the caches share
+    /// ([`effectcraft_render::cache::shared::stamp`]).
     clock: u64,
     bytes: usize,
+    /// The shared cache budget, when the caches share one ([`MediaPool::share`]): told the
+    /// bytes and the oldest use after every change.
+    share: Option<ShareLink>,
 }
 
 impl Lru {
+    fn tick(&mut self) -> u64 {
+        self.clock = effectcraft_render::cache::shared::stamp_after(self.clock);
+        self.clock
+    }
+    /// Tell the shared budget the bytes held and the oldest use (two atomic stores).
+    fn report(&self) {
+        if let Some(l) = &self.share {
+            l.report(self.bytes as u64, self.order.first_key_value().map(|(s, _)| *s));
+        }
+    }
     fn get(&mut self, k: &Key) -> Option<Pixels> {
+        let now = self.tick();
         let e = self.map.get_mut(k)?;
         self.order.remove(&e.stamp);
-        self.clock += 1;
-        e.stamp = self.clock;
-        self.order.insert(e.stamp, k.clone());
-        Some(e.px.clone())
+        e.stamp = now;
+        let px = e.px.clone();
+        self.order.insert(now, k.clone());
+        self.report();
+        Some(px)
     }
     fn insert(&mut self, k: Key, px: Pixels, budget: usize) {
         let bytes = px.bytes();
-        self.clock += 1;
-        if let Some(old) = self.map.insert(k.clone(), Entry { px, stamp: self.clock, bytes }) {
+        let now = self.tick();
+        if let Some(old) = self.map.insert(k.clone(), Entry { px, stamp: now, bytes }) {
             self.order.remove(&old.stamp);
             self.bytes -= old.bytes;
         }
-        self.order.insert(self.clock, k);
+        self.order.insert(now, k);
         self.bytes += bytes;
         self.evict(budget);
+        self.report();
     }
     fn remove(&mut self, k: &Key) {
         if let Some(e) = self.map.remove(k) {
             self.order.remove(&e.stamp);
             self.bytes -= e.bytes;
         }
+        self.report();
     }
     /// Evict least-recently-used frames until within `budget` (the newest frame always stays).
     fn evict(&mut self, budget: usize) {
@@ -175,6 +195,33 @@ impl Lru {
                 self.bytes -= e.bytes;
             }
         }
+        self.report();
+    }
+    /// The least recently used frame, for the shared budget (the newest frame always stays):
+    /// the bytes freed.
+    fn evict_oldest(&mut self) -> usize {
+        if self.map.len() <= 1 {
+            return 0;
+        }
+        let Some((_, k)) = self.order.pop_first() else { return 0 };
+        let freed = self.map.remove(&k).map_or(0, |e| e.bytes);
+        self.bytes = self.bytes.saturating_sub(freed);
+        self.report();
+        freed
+    }
+}
+
+/// The footage frame cache as a member of the shared budget ([`MediaPool::share`]).
+struct MediaMember(std::sync::Weak<Inner>);
+
+impl Member for MediaMember {
+    fn evict_oldest(&self) -> u64 {
+        let Some(inner) = self.0.upgrade() else { return 0 };
+        let freed = lock(&inner.cache).lru.evict_oldest();
+        u64::try_from(freed).unwrap_or(u64::MAX)
+    }
+    fn alive(&self) -> bool {
+        self.0.strong_count() > 0
     }
 }
 
@@ -624,6 +671,23 @@ impl MediaPool {
         lock(&self.inner.cache).lru.evict(bytes);
     }
 
+    /// Take part in the shared cache budget (`Some`, see
+    /// [`effectcraft_render::cache::shared`]) or keep to this cache's own budget (`None`). The
+    /// budget asks it to evict its least recently used frame (the newest always stays). Both
+    /// views of the pool ([`MediaPool::exact`]) share the one cache.
+    pub fn share(&self, budget: Option<&Arc<SharedBudget>>) {
+        let link = budget.and_then(|b| b.join(ShareKind::Media, Arc::new(MediaMember(Arc::downgrade(&self.inner)))));
+        let old = {
+            let mut c = lock(&self.inner.cache);
+            let old = std::mem::replace(&mut c.lru.share, link);
+            c.lru.report();
+            old
+        };
+        if let Some(old) = old {
+            old.leave();
+        }
+    }
+
     /// Enable or disable decoding ahead of sequential reads (on by default on native builds;
     /// ignored on wasm32).
     pub fn set_read_ahead(&self, on: bool) {
@@ -643,10 +707,27 @@ impl MediaPool {
         }
     }
 
+    /// The frame cache by file (the Memory panel): the lock is held to copy (path, bytes) out,
+    /// the totals are made after it.
+    pub fn cache_usage(&self) -> effectcraft_render::FootageCacheUsage {
+        let entries: Vec<(Arc<str>, usize)> = lock(&self.inner.cache).lru.map.iter().map(|(k, e)| (k.path.clone(), e.bytes)).collect();
+        let mut by: HashMap<Arc<str>, (usize, usize)> = HashMap::new();
+        for (path, bytes) in &entries {
+            let e = by.entry(path.clone()).or_default();
+            e.0 = e.0.saturating_add(*bytes);
+            e.1 += 1;
+        }
+        let mut by_file: Vec<(String, usize, usize)> = by.into_iter().map(|(p, (b, n))| (p.to_string(), b, n)).collect();
+        by_file.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        effectcraft_render::FootageCacheUsage { bytes: entries.iter().map(|e| e.1).fold(0usize, usize::saturating_add), frames: entries.len(), by_file }
+    }
+
     /// Drop every cached frame (decoders stay open).
     pub fn clear_frames(&self) {
         let mut c = lock(&self.inner.cache);
-        c.lru = Lru::default();
+        // (the shared budget's link stays)
+        c.lru = Lru { share: c.lru.share.take(), ..Lru::default() };
+        c.lru.report();
         c.last.clear();
         // Running decode-aheads stop.
         c.ahead.clear();
@@ -1494,6 +1575,9 @@ impl FootageSource for MediaPool {
     fn set_cache_budget(&self, bytes: usize) {
         self.set_budget(bytes);
     }
+    fn share_cache_budget(&self, budget: Option<&Arc<SharedBudget>>) {
+        self.share(budget);
+    }
     fn purge(&self) {
         self.clear_frames();
         lock(&self.inner.sources).close_idle();
@@ -1512,6 +1596,9 @@ impl FootageSource for MediaPool {
     }
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
+    }
+    fn cache_usage(&self) -> Option<effectcraft_render::FootageCacheUsage> {
+        Some(MediaPool::cache_usage(self))
     }
     fn set_hardware_decoding(&self, on: bool) {
         MediaPool::set_hardware_decoding(self, on);

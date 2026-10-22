@@ -75,10 +75,19 @@ impl Session {
 
     /// Apply the Memory & CPU cache budgets, limited by RAM Reserved for Other Applications and
     /// reduced while the system is low on memory (see [`crate::prefs::Prefs::cache_budgets`]).
+    /// With Share One Budget Between the Caches on, each cache is set to its limit in the shared
+    /// budget and joins it ([`effectcraft_render::cache::shared`]); the frontend joins its RAM
+    /// preview when it applies the preview budget.
     pub fn apply_cache_budgets(&mut self) {
+        use effectcraft_render::cache::shared::ShareKind;
         let b = self.prefs.cache_budgets(self.sys_memory);
-        self.layer_cache.set_budget(b.layer);
-        self.footage.set_cache_budget(b.media);
+        self.layer_cache.set_budget(b.limit(ShareKind::Layer));
+        self.footage.set_cache_budget(b.limit(ShareKind::Media));
+        let share = b.shared.is_some().then_some(&self.cache_share);
+        self.layer_cache.share(share);
+        self.footage.share_cache_budget(share);
+        // Last: a smaller total evicts across the caches right away (no cache lock is held here).
+        self.cache_share.configure(b.shared);
         // Roto Brush segmentations (process-wide): half the layer cache's budget, at most 768 MB.
         effectcraft_effects::roto::set_cache_budget(b.layer / 2);
     }

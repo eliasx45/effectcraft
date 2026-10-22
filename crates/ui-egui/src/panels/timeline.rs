@@ -3401,13 +3401,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let ms = shown_times.as_ref().map(|s| s.frame.frame_ms).unwrap_or_else(|| app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0));
     // A cloud frame (CR5) shows the server's time, and says so.
     let cloud = shown_times.as_ref().is_some_and(|s| s.frame.remote);
-    p.text(
+    let frt = p.text(
         pos2(graph_x0 - 12.0, footer.center().y),
         Align2::RIGHT_CENTER,
         crate::i18n::tr_args(if cloud { "Frame Render Time  {}ms (cloud)" } else { "Frame Render Time  {}ms" }, &[&format!("{ms:.0}")]),
         Tokens::ui(11.0),
         t.text_faint,
     );
+    // The RAM chip (Window ▸ Memory): atomics only, see `memory_panel::chip`.
+    super::memory_panel::chip(app, ui, &p, pos2(frt.min.x - 10.0, footer.center().y), tgl.max.x + 8.0);
     {
         let comp = inline_graph.as_ref().map(|graph| graph.comp.clone()).unwrap_or_else(|| comp.clone());
         let time = inline_graph.as_ref().map(|graph| graph.time).unwrap_or(time);

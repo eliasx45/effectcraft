@@ -10,7 +10,7 @@ use effectcraft_color::BlendMode;
 use effectcraft_render::styles::{GpuBevel, GpuGlow, GpuShadow, GpuStyles};
 
 use crate::context::{Enc, GpuImage, Params};
-use crate::effects::gaussian_blur;
+use crate::effects::{Precision, gaussian_blur_owned};
 
 /// Compute entry points in `fx_styles.wgsl`.
 pub(crate) const KERNELS: &[&str] = &[
@@ -38,11 +38,14 @@ pub(crate) struct GpuStyled {
 }
 
 /// The planes [`render`] blurs: `(alpha, 1 − alpha, 0, alpha)` of the content, blurred by
-/// `sigma` (edges repeated, as `effects::util::gauss_plane`), memoised per sigma.
+/// `sigma` (edges repeated, as `effects::util::gauss_plane`), memoised per sigma. Only the style
+/// kernels read them, so on a display render with half working images they are RGBA16F
+/// (`half`, see [`crate::half`]): alpha planes need no more than 8-bit-visible precision.
 struct Planes<'a> {
     content: &'a GpuImage,
     base: Option<GpuImage>,
     blurred: Vec<(u64, GpuImage)>,
+    half: bool,
 }
 
 impl Planes<'_> {
@@ -50,7 +53,7 @@ impl Planes<'_> {
         if let Some(b) = &self.base {
             return b.clone();
         }
-        let out = e.scratch(self.content.width, self.content.height);
+        let out = e.scratch_as(self.content.width, self.content.height, self.half);
         e.pixels("sty_alpha", &Params::default(), self.content, None, &out, None);
         self.base = Some(out.clone());
         out
@@ -65,7 +68,7 @@ impl Planes<'_> {
         if let Some((_, b)) = self.blurred.iter().find(|(k, _)| *k == key) {
             return b.clone();
         }
-        let b = gaussian_blur(e, &base, sigma, sigma, true);
+        let b = gaussian_blur_owned(e, base, sigma, sigma, true, if self.half { Precision::Half } else { Precision::F32 });
         self.blurred.push((key, b.clone()));
         b
     }
@@ -75,7 +78,7 @@ impl Planes<'_> {
         let b = self.blurred(e, sigma);
         let mut p = Params::default();
         p.u[0] = [inverse as u32, 0, 0, 0];
-        let out = e.scratch(self.content.width, self.content.height);
+        let out = e.scratch_as(self.content.width, self.content.height, self.half);
         e.pixels("sty_pack", &p, &b, Some(self.content), &out, None);
         out
     }
@@ -120,7 +123,8 @@ pub(crate) fn render(e: &mut Enc, content: &GpuImage, plan: &GpuStyles) -> Optio
         return None;
     }
     e.take_missing();
-    let mut planes = Planes { content, base: None, blurred: vec![] };
+    let half = Precision::pick(e, &["sty_alpha", "sty_pack"], true) == Precision::Half;
+    let mut planes = Planes { content, base: None, blurred: vec![], half };
     let mut passes = vec![];
     for d in &plan.drops {
         let shape = planes.blurred(e, d.sigma);
@@ -200,6 +204,8 @@ pub(crate) fn render(e: &mut Enc, content: &GpuImage, plan: &GpuStyles) -> Optio
     if plan.interior_group && plan.fill < 1.0 {
         body = scale(e, &body, plan.fill);
     }
+    // The memoised planes are done with: back to the pool before the bevel's working images.
+    drop(planes);
     if let Some(bv) = &plan.bevel {
         body = bevel(e, content, &body, plan, bv);
     }
@@ -212,23 +218,36 @@ pub(crate) fn render(e: &mut Enc, content: &GpuImage, plan: &GpuStyles) -> Optio
 /// Bevel and Emboss (`styles::bevel`) over `body`: the content's distance field (exact within
 /// `bv.reach` pixels of its edge, see `fx_styles.wgsl`), the smoothed height profile, then the
 /// shadow and highlight blended by the light.
+///
+/// Each working image goes back to the texture pool as soon as the last pass reading it is
+/// recorded (the next one of its size reuses it within the same encoder), so the bevel holds at
+/// most three canvas-size images of its own (field + two blur buffers) next to `content` and
+/// `body`, where it used to hold all seven to the end. On a display render with half working
+/// images, everything after the distance field (height profile, blur passes, packed height and
+/// region) is RGBA16F; the distance field keeps f32 (squared distances overflow half floats).
 fn bevel(e: &mut Enc, content: &GpuImage, body: &GpuImage, plan: &GpuStyles, bv: &GpuBevel) -> GpuImage {
     let (w, h) = (content.width, content.height);
     let mut p = Params::default();
     p.u[0] = [bv.reach, BEV_TILE, bv.style, 0];
     p.f[0] = [bv.size, 0.0, 0.0, 0.0];
+    let half = Precision::pick(e, &["sty_bev_height", "sty_bev_pack"], true) == Precision::Half;
+    let precision = if half { Precision::Half } else { Precision::F32 };
     let rows = e.scratch(w, h);
     e.dispatch("sty_edt_rows", &p, content, None, &rows, None, (h.div_ceil(64), w.div_ceil(BEV_TILE)));
     let field = e.scratch(w, h);
     e.dispatch("sty_edt_cols", &p, &rows, None, &field, None, (w.div_ceil(64), h.div_ceil(BEV_TILE)));
-    let height = e.scratch(w, h);
+    drop(rows);
+    let height = e.scratch_as(w, h, half);
     e.pixels("sty_bev_height", &p, &field, None, &height, None);
-    let mut smooth = gaussian_blur(e, &height, bv.sigma, bv.sigma, true);
+    // The blurs own their inputs: `height` (and the first smoothing) go back after one pass.
+    let mut smooth = gaussian_blur_owned(e, height, bv.sigma, bv.sigma, true, precision);
     if bv.soften > 0.0 {
-        smooth = gaussian_blur(e, &smooth, bv.soften, bv.soften, true);
+        smooth = gaussian_blur_owned(e, smooth, bv.soften, bv.soften, true, precision);
     }
-    let packed = e.scratch(w, h);
+    let packed = e.scratch_as(w, h, half);
     e.pixels("sty_bev_pack", &p, &smooth, Some(&field), &packed, None);
+    drop(smooth);
+    drop(field);
     let (sh_mode, sh_color, sh_opacity) = bv.shadow;
     let (hl_mode, hl_color, hl_opacity) = bv.highlight;
     let mut q = Params::default();

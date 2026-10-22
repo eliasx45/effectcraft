@@ -82,6 +82,7 @@ impl Cache {
         let Some(img) = self.map.remove(&from) else { return };
         self.map.insert(to, img);
         self.move_draft(&from, to);
+        self.moved(&from, to);
         self.order.rename(&from, to);
         if let Some(rank) = self.protected.remove(&from) {
             self.protected.insert(to, rank);
@@ -298,7 +299,7 @@ mod tests {
     }
 
     fn pixels(f: &Frames, k: &FrameKey) -> Vec<egui::Color32> {
-        match f.cache.lock().unwrap().map.get(k).unwrap() {
+        match f.cache.lock().unwrap().map.get(k).unwrap().image().unwrap() {
             FrameImage::Cpu(c) => c.pixels.clone(),
             FrameImage::Gpu(_) => panic!("CPU frames"),
         }

@@ -28,7 +28,9 @@
 //!   entry; a missing or damaged file is just a miss. Writes run on a background thread with a
 //!   bounded queue (a full queue drops the write rather than stalling rendering). Frames are
 //!   queued uncompressed (shared with the caller, no copy) and compressed on that thread, so a
-//!   frame worker spends no time on them.
+//!   frame worker spends no time on them. Frames are stored in strips ([`crate::frame_pack`]):
+//!   the RAM preview keeps the same bytes when it compresses its frames and writes them as they
+//!   are ([`DiskCache::put_packed_frame`]); frames in the older single-block layout still read.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -287,6 +289,8 @@ enum Job {
     GuardedLayer(u128, Vec<u8>, WriteGuard),
     /// A frame to encode on the writer thread (key, width, height, 8-bit premultiplied RGBA).
     Frame(u128, u32, u32, FrameBytes),
+    /// A frame compressed already (the RAM preview's bytes, shared: written as they are).
+    Packed(u128, Arc<crate::frame_pack::PackedFrame>),
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -297,6 +301,7 @@ impl Job {
             Job::Write(_, _, p) => p.len(),
             Job::GuardedLayer(_, p, _) => p.capacity(),
             Job::Frame(_, _, _, rgba) => (**rgba).as_ref().len(),
+            Job::Packed(_, p) => p.payload().len(),
         }
     }
 }
@@ -663,24 +668,27 @@ impl DiskCache {
         self.changed();
     }
 
-    fn enqueue(&self, job: Job) {
+    /// Queue a write; `false` when it was dropped (the queue is full).
+    fn enqueue(&self, job: Job) -> bool {
         #[cfg(target_arch = "wasm32")]
         {
             self.run(job);
+            true
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (m, cv) = &*self.queue;
-            let Ok(mut q) = m.lock() else { return };
+            let Ok(mut q) = m.lock() else { return false };
             let bytes = job.bytes();
             if q.full(bytes) || (matches!(&job, Job::GuardedLayer(..)) && bytes > QUEUE_BYTES) || q.jobs.try_reserve(1).is_err() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
-                return;
+                return false;
             }
-            let Some(total) = q.bytes.checked_add(bytes) else { return };
+            let Some(total) = q.bytes.checked_add(bytes) else { return false };
             q.bytes = total;
             q.jobs.push_back(job);
             cv.notify_all();
+            true
         }
     }
 
@@ -695,6 +703,7 @@ impl DiskCache {
                     self.write_now(Kind::Frame, key, &encode_frame(w, h, (*rgba).as_ref()));
                 }
             }
+            Job::Packed(key, packed) => self.write_now(Kind::Frame, key, packed.payload()),
         }
     }
 
@@ -795,6 +804,27 @@ impl DiskCache {
     pub fn get_frame(&self, key: u128) -> Option<Frame8> {
         let p = self.read(Kind::Frame, key)?;
         decode_frame(&p)
+    }
+
+    /// A frame as it is stored (compressed, not decoded): what the RAM preview keeps. A frame
+    /// written in the older single-block layout is decoded and compressed into strips.
+    pub fn get_packed_frame(&self, key: u128) -> Option<crate::frame_pack::PackedFrame> {
+        let p = self.read(Kind::Frame, key)?;
+        if crate::frame_pack::is_packed_payload(&p) {
+            return crate::frame_pack::PackedFrame::from_payload(p);
+        }
+        let f = decode_frame(&p)?;
+        crate::frame_pack::PackedFrame::encode(f.width, f.height, &f.rgba)
+    }
+
+    /// Queue a compressed frame for writing (shared, not copied: the same bytes the RAM preview
+    /// keeps). `false` when it was not queued: on disk already, or the write queue is full
+    /// (the frame is then simply not on disk; nothing waits for room).
+    pub fn put_packed_frame(&self, key: u128, packed: Arc<crate::frame_pack::PackedFrame>) -> bool {
+        if self.contains(Kind::Frame, key) {
+            return false;
+        }
+        self.enqueue(Job::Packed(key, packed))
     }
 
     /// Queue a frame for writing (8-bit premultiplied RGBA, `width * height * 4` bytes). The
@@ -1044,7 +1074,12 @@ fn verify(d: &[u8], kind: Kind) -> Option<&[u8]> {
     (checksum(body) == u64::from_le_bytes(s)).then_some(&body[8..])
 }
 
+/// A frame payload: strips ([`crate::frame_pack`], decoded in parallel and shared with the RAM
+/// preview), or for a frame that can't be cut (empty) the older single LZ4 block.
 fn encode_frame(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    if let Some(p) = crate::frame_pack::PackedFrame::encode(w, h, rgba) {
+        return p.into_payload();
+    }
     let mut out = Vec::with_capacity(rgba.len() / 2 + 16);
     out.extend_from_slice(&w.to_le_bytes());
     out.extend_from_slice(&h.to_le_bytes());
@@ -1053,6 +1088,11 @@ fn encode_frame(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 }
 
 fn decode_frame(p: &[u8]) -> Option<Frame8> {
+    if crate::frame_pack::is_packed_payload(p) {
+        let packed = crate::frame_pack::PackedFrame::from_payload(p.to_vec())?;
+        let rgba = packed.decode(1)?;
+        return Some(Frame8 { width: packed.width(), height: packed.height(), rgba });
+    }
     if p.len() < 8 {
         return None;
     }

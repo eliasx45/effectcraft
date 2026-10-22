@@ -1213,6 +1213,7 @@ Window
   Lumetri Scopes | window.panel {"panel":"lumetriScopes"}
   Mask Interpolation | window.panel {"panel":"maskInterpolation"}
   Media Browser | window.panel {"panel":"mediaBrowser"}
+  Memory | window.panel {"panel":"memory"}
   Metadata | window.panel {"panel":"metadata"}
   Motion Library | window.panel {"panel":"motionLibrary"}
   Motion Sketch | window.panel {"panel":"motionSketch"}

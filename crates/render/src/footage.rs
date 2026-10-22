@@ -143,6 +143,15 @@ pub enum FloatCurve {
 }
 
 /// Supplies decoded footage frames (implemented by the media layer).
+/// A footage source's decoded-frame cache ([`FootageSource::cache_usage`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FootageCacheUsage {
+    pub bytes: usize,
+    pub frames: usize,
+    /// Per file: (path, bytes, frames), most bytes first.
+    pub by_file: Vec<(String, usize, usize)>,
+}
+
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
     fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>>;
@@ -200,6 +209,9 @@ pub trait FootageSource: Send + Sync {
     /// Set the decoded-frame cache budget in bytes (Settings ▸ Memory & CPU); sources without
     /// a cache ignore it.
     fn set_cache_budget(&self, _bytes: usize) {}
+    /// Take part in the shared cache budget (`Some`, see [`crate::cache::shared`]) or keep to
+    /// the budget [`Self::set_cache_budget`] gives (`None`). Sources without a cache ignore it.
+    fn share_cache_budget(&self, _budget: Option<&Arc<crate::cache::shared::SharedBudget>>) {}
     /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory) and close
     /// the files nobody is reading: the next reads decode again. Sources without a cache ignore it.
     fn purge(&self) {}
@@ -240,6 +252,11 @@ pub trait FootageSource: Send + Sync {
     }
     /// The decoded-frame cache budget in bytes, if the source has a cache.
     fn cache_budget(&self) -> Option<usize> {
+        None
+    }
+    /// What the decoded-frame cache holds now, by file (the Memory panel, `memory.stats`): `None`
+    /// for sources without a cache. Called only while the panel is open or an agent asks.
+    fn cache_usage(&self) -> Option<FootageCacheUsage> {
         None
     }
     /// Vector footage (SVG) rasterised at `scale` × its pixel size, for Continuously Rasterize.
@@ -319,6 +336,9 @@ impl FootageSource for CancellableFootage<'_> {
     fn set_cache_budget(&self, bytes: usize) {
         self.inner.set_cache_budget(bytes)
     }
+    fn share_cache_budget(&self, budget: Option<&Arc<crate::cache::shared::SharedBudget>>) {
+        self.inner.share_cache_budget(budget)
+    }
     fn purge(&self) {
         self.inner.purge()
     }
@@ -346,6 +366,9 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn cache_budget(&self) -> Option<usize> {
         self.inner.cache_budget()
+    }
+    fn cache_usage(&self) -> Option<FootageCacheUsage> {
+        self.inner.cache_usage()
     }
     fn vector_frame(&self, item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
         self.inner.vector_frame(item, footage, scale)

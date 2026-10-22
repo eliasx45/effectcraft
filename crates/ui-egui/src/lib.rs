@@ -728,6 +728,13 @@ impl EffectcraftApp {
         }
         .with_ui_commands()
         .with_timeline_layout()
+        .with_memory_map()
+    }
+
+    /// Lend the RAM preview to the engine's memory map (Window ▸ Memory, `memory.stats`).
+    fn with_memory_map(mut self) -> Self {
+        panels::memory_panel::install(&mut self);
+        self
     }
 
     /// The Timeline column layout (columns shown, order, widths, splitter) of the last session.
@@ -793,12 +800,18 @@ impl EffectcraftApp {
         self.frames.set_idle_threads(frames::idle_threads(effectcraft_engine::sysinfo::cpu_cores(), p.memory.idle_cache_cores));
         self.ui.viewer.fast_preview = p.previews.fast_previews;
         let budgets = p.cache_budgets(self.session.sys_memory);
-        self.frames.set_budget(budgets.preview);
+        // Compress first: the budget then counts compressed bytes (`frames::codec`).
+        self.frames.set_compress(p.memory.preview_compress, p.memory.preview_raw_window);
+        // Share One Budget Between the Caches: the RAM preview may grow to its limit in the
+        // shared budget and joins it beside the engine's layer and footage caches.
+        self.frames.set_budget(budgets.limit(effectcraft_render::cache::shared::ShareKind::Preview));
+        self.frames.share(budgets.shared.is_some().then_some(&self.session.cache_share));
         if self.zero_copy.active && self.zero_copy.unified {
             self.frames.set_gpu_budget(budgets.preview);
         }
         if let Some(g) = &self.gpu {
             g.context().set_cache_budget(budgets.layer);
+            g.context().set_half_intermediates(p.previews.half_float_effects);
         }
     }
 
@@ -1276,6 +1289,7 @@ impl EffectcraftApp {
                 }
                 log::info!("GPU compositor: {}", effectcraft_engine::render::Accelerator::name(&g));
                 g.context().set_cache_budget(self.session.prefs.cache_budgets(self.session.sys_memory).layer);
+                g.context().set_half_intermediates(self.session.prefs.previews.half_float_effects);
                 self.session.accel = Some(Arc::new(g.clone()));
                 self.gpu = Some(g);
                 #[cfg(not(target_arch = "wasm32"))]
@@ -2431,8 +2445,9 @@ impl EffectcraftApp {
 
     fn frames_that_fit(&self, comp: &effectcraft_engine::project::Comp, scale: f64) -> i64 {
         let side = |n: u32| (n as f64 * scale).ceil().max(1.0);
-        let frame = side(comp.width) * side(comp.height) * 4.0;
-        ((self.frames.budget() as f64 * 0.9 / frame) as i64).max(1)
+        // Compressed frames take less (the ratio measured on the cached ones).
+        let frame = self.frames.frame_bytes(side(comp.width) * side(comp.height) * 4.0).max(1.0);
+        ((self.frames.plan_budget() as f64 * 0.9 / frame) as i64).max(1)
     }
 
     fn frames_parallelism(&self) -> usize {
