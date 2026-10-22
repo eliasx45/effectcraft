@@ -33,6 +33,12 @@ fn image(w: usize, h: usize, seed: u32) -> Arc<egui::ColorImage> {
     Arc::new(egui::ColorImage::new([w, h], px))
 }
 
+/// A frame of one colour per `seed`: it compresses to almost nothing.
+fn flat(w: usize, h: usize, seed: u32) -> Arc<egui::ColorImage> {
+    let c = egui::Color32::from_rgba_premultiplied((seed * 20 % 256) as u8, 40, 200, 255);
+    Arc::new(egui::ColorImage::new([w, h], vec![c; w * h]))
+}
+
 /// Wait until the codec has nothing queued or on its way.
 fn settle(f: &Frames) {
     let t0 = std::time::Instant::now();
@@ -74,6 +80,30 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
     d
 }
 
+/// The pixels of one 64×36 frame.
+const SMALL: usize = 64 * 36 * 4;
+
+/// Frames (sorted) holding pixels / compressed bytes.
+fn raw_frames(f: &Frames) -> Vec<i64> {
+    let c = f.cache.lock().unwrap();
+    let mut v: Vec<i64> = c.map.iter().filter(|(_, s)| s.raw.is_some()).map(|(k, _)| k.frame).collect();
+    v.sort_unstable();
+    v
+}
+fn packed_frames(f: &Frames) -> Vec<i64> {
+    let c = f.cache.lock().unwrap();
+    let mut v: Vec<i64> = c.map.iter().filter(|(_, s)| s.packed.is_some()).map(|(k, _)| k.frame).collect();
+    v.sort_unstable();
+    v
+}
+
+/// Set the budget without evicting (the frames stay; only the uncompressed share is trimmed).
+fn squeeze(f: &Frames, budget: usize) {
+    let mut c = f.cache.lock().unwrap();
+    c.budget = budget;
+    c.trim_raw();
+}
+
 /// A frame compressed in RAM decodes to exactly the pixels it was rendered with, at odd sizes
 /// too (fewer rows than strips, widths not a multiple of anything).
 #[test]
@@ -86,11 +116,16 @@ fn compressed_frames_decode_to_the_exact_pixels() {
         f.cache.lock().unwrap().insert(key(i as i64), FrameImage::Cpu(img.clone()));
     }
     settle(&f);
+    assert!(packed_frames(&f).is_empty(), "room to spare: nothing compressed");
+    // The pixels fill the budget exactly: past the headroom, so the oldest are compressed.
+    let total: usize = originals.iter().map(|i| i.pixels.len() * 4).sum();
+    f.set_budget(total);
+    settle(&f);
     {
         let c = f.cache.lock().unwrap();
-        assert_eq!(c.packed_frames, sizes.len(), "every frame compressed");
-        // Away from any playhead: beyond the spare ones, the oldest lost their pixels.
-        assert!(c.map.get(&key(0)).unwrap().raw.is_none(), "the oldest frame keeps only its bytes");
+        assert!(c.packed_frames >= 1);
+        let oldest = c.map.get(&key(0)).unwrap();
+        assert!(oldest.packed.is_some() && oldest.raw.is_none(), "the oldest frame keeps only its bytes");
     }
     assert_counts(&f);
     for (i, img) in originals.iter().enumerate() {
@@ -100,29 +135,84 @@ fn compressed_frames_decode_to_the_exact_pixels() {
     assert_counts(&f);
 }
 
+/// Nothing is compressed while the pixels stay within [`PACK_AT_PERCENT`] of the budget; one
+/// byte of budget less and the least recently shown frame is, ahead of eviction (nothing is
+/// evicted), and it drops its pixels when it lands.
+#[test]
+fn packing_starts_at_the_headroom_threshold() {
+    let f = Frames::default();
+    f.set_compress(true, 0);
+    for i in 0..10 {
+        f.cache.lock().unwrap().insert(key(i), FrameImage::Cpu(image(64, 36, i as u32)));
+    }
+    let raw = 10 * SMALL;
+    // The smallest budget whose share still holds the pixels.
+    let at = (raw * 100).div_ceil(PACK_AT_PERCENT);
+    assert!(share_of(at, PACK_AT_PERCENT) >= raw && share_of(at - 1, PACK_AT_PERCENT) < raw);
+    f.set_budget(at);
+    settle(&f);
+    assert!(packed_frames(&f).is_empty(), "at the threshold: nothing compressed");
+    assert_eq!(f.cache.lock().unwrap().codec.queued(), (0, 0));
+    f.set_budget(at - 1);
+    settle(&f);
+    assert_eq!(packed_frames(&f), vec![0], "past it: the least recently shown frame only");
+    assert_eq!(raw_frames(&f), (1..10).collect::<Vec<_>>());
+    assert_eq!(f.memory_usage(false).frames, 10, "compressed ahead of eviction: nothing evicted");
+    assert_counts(&f);
+}
+
+/// A playing loop whose frames all fit the budget as pixels is never compressed, however close
+/// to the budget it is; a range that doesn't fit is.
+#[test]
+fn a_loop_that_fits_is_never_compressed() {
+    let f = Frames::default();
+    f.set_compress(true, 0);
+    for i in 0..10 {
+        f.cache.lock().unwrap().insert(key(i), FrameImage::Cpu(image(64, 36, i as u32)));
+    }
+    let play = |end: i64| Playhead { series: key(0), cur: 0, start: 0, end, step: 1, looping: true };
+    f.set_playhead(Some(play(9)));
+    // Exactly the loop's pixels: far past the headroom, and nothing to evict.
+    f.set_budget(10 * SMALL);
+    settle(&f);
+    assert!(packed_frames(&f).is_empty(), "the loop fits: no frame of it is compressed");
+    assert_eq!(raw_frames(&f), (0..10).collect::<Vec<_>>());
+    assert_eq!(f.memory_usage(false).frames, 10);
+    // The same frames in a range twice as long (it can't fit): compressed, the frames the
+    // preview reaches last first; the one on screen keeps its pixels.
+    f.set_playhead(Some(play(19)));
+    settle(&f);
+    let packed = packed_frames(&f);
+    assert!(!packed.is_empty() && !packed.contains(&0), "{packed:?}");
+    assert!(packed.iter().all(|p| (*p..10).all(|q| packed.contains(&q))), "farthest first: {packed:?}");
+    assert_counts(&f);
+}
+
 /// The budget counts what each frame holds (pixels, compressed bytes or both), through inserts,
 /// compression, the trim of pixels, eviction, a purge and clearing.
 #[test]
 fn the_budget_counts_compressed_bytes_through_inserts_and_evictions() {
     let f = Frames::default();
     f.set_compress(true, 0);
+    f.set_budget(10 * 128 * 72 * 4);
     for i in 0..10 {
         f.cache.lock().unwrap().insert(key(i), FrameImage::Cpu(image(128, 72, i as u32)));
         assert_counts(&f);
+        settle(&f);
+        assert_counts(&f);
     }
-    settle(&f);
-    assert_counts(&f);
     let u = f.memory_usage(false);
-    assert_eq!(u.frames, 10);
-    assert!(u.compress && u.packed_frames == 10);
+    assert_eq!(u.frames, 10, "compressed ahead of time: nothing evicted");
+    assert!(u.compress && u.packed_frames >= 1);
     assert_eq!(u.raw_bytes + u.packed_bytes, u.bytes);
-    // Pixels: only the spare most recently shown frames still have them.
-    let with_pixels = f.cache.lock().unwrap().map.values().filter(|s| s.raw.is_some()).count();
-    assert_eq!(with_pixels, RAW_SPARE);
+    // A frame compressed because it was leaving the uncompressed share keeps only its bytes.
+    assert!(f.cache.lock().unwrap().map.values().all(|s| s.packed.is_none() || s.raw.is_none()));
     assert!(u.packed_bytes < u.packed_raw_bytes, "compressed bytes are fewer than the pixels");
     // A smaller budget evicts whole frames; the counts follow.
     let keep = u.bytes / 2;
     f.set_budget(keep as usize);
+    assert_counts(&f);
+    settle(&f);
     assert_counts(&f);
     let after = f.memory_usage(false);
     assert!(after.bytes <= keep && after.frames < 10);
@@ -131,33 +221,34 @@ fn the_budget_counts_compressed_bytes_through_inserts_and_evictions() {
     assert_counts(&f);
     f.clear();
     let c = f.cache.lock().unwrap();
-    assert_eq!((c.bytes, c.packed_bytes, c.packed_raw, c.packed_frames, c.rawset.len()), (0, 0, 0, 0, 0));
+    assert_eq!((c.bytes, c.packed_bytes, c.packed_raw, c.packed_frames, c.rawset.len(), c.gpu_wanted.len()), (0, 0, 0, 0, 0, 0));
 }
 
-/// The frames the playing preview reaches next keep (and get back) their pixels.
+/// The frames the playing preview reaches next keep (and get back) their pixels; the others
+/// are compressed when the budget runs short, the ones it doesn't reach first.
 #[test]
 fn the_window_ahead_of_the_playhead_keeps_its_pixels() {
     let f = Frames::default();
     f.set_compress(true, 2);
-    let originals: Vec<_> = (0..10).map(|i| image(64, 36, i)).collect();
+    // Flat frames: their compressed bytes take next to no room, so nothing is evicted.
+    let originals: Vec<_> = (0..10).map(|i| flat(64, 36, i)).collect();
     for (i, img) in originals.iter().enumerate() {
         f.cache.lock().unwrap().insert(key(i as i64), FrameImage::Cpu(img.clone()));
     }
-    let at = |cur: i64| Playhead { series: key(0), cur, start: 0, end: 9, step: 1, looping: false };
+    // A range longer than the cache holds (the loop doesn't fit), not looping.
+    let at = |cur: i64| Playhead { series: key(0), cur, start: 0, end: 19, step: 1, looping: false };
     f.set_playhead(Some(at(3)));
     settle(&f);
-    let raw = |f: &Frames| -> Vec<i64> {
-        let c = f.cache.lock().unwrap();
-        let mut v: Vec<i64> = c.map.iter().filter(|(_, s)| s.raw.is_some()).map(|(k, _)| k.frame).collect();
-        v.sort_unstable();
-        v
-    };
-    // 3, 4, 5 are within the window; of the others the four last shown keep pixels too.
-    assert_eq!(raw(&f), vec![3, 4, 5, 6, 7, 8, 9]);
+    assert!(packed_frames(&f).is_empty(), "room to spare");
+    // Room for six frames' pixels: every frame but the window (3, 4, 5) is compressed.
+    squeeze(&f, 6 * SMALL);
+    settle(&f);
+    assert_eq!(raw_frames(&f), vec![3, 4, 5]);
+    assert_eq!(packed_frames(&f), vec![0, 1, 2, 6, 7, 8, 9]);
     // Moving back: 0, 1, 2 are decoded ahead of it, exactly.
     f.set_playhead(Some(at(0)));
     settle(&f);
-    assert!([0, 1, 2].iter().all(|i| raw(&f).contains(i)), "{:?}", raw(&f));
+    assert!([0, 1, 2].iter().all(|i| raw_frames(&f).contains(i)), "{:?}", raw_frames(&f));
     for i in 0..3 {
         let c = f.cache.lock().unwrap();
         assert_eq!(cpu_pixels(c.map.get(&key(i)).unwrap().raw.as_ref().unwrap()), originals[i as usize].pixels);
@@ -184,8 +275,16 @@ fn evicted_frames_spill_to_disk_and_read_back_identical() {
             c.insert(key(1), FrameImage::Cpu(cheap));
         }
         settle(&f);
+        if compress {
+            // Past the headroom: the least recently shown frame (the one worth keeping) is
+            // compressed ahead of its eviction, and spills as those bytes.
+            f.set_budget(f.memory_usage(false).bytes as usize);
+            settle(&f);
+            assert!(f.cache.lock().unwrap().map.get(&key(0)).unwrap().packed.is_some());
+        }
         dc.flush();
         assert!(!dc.contains(disk_cache::Kind::Frame, 0xfeed), "not written before it leaves RAM");
+        let ram = f.cache.lock().unwrap().map.get(&key(0)).unwrap().packed.clone();
         f.set_budget(0);
         dc.flush();
         assert!(f.cache.lock().unwrap().map.is_empty());
@@ -197,6 +296,9 @@ fn evicted_frames_spill_to_disk_and_read_back_identical() {
         // The RAM preview reads the same bytes back without compressing them again.
         let packed = dc.get_packed_frame(0xfeed).unwrap();
         assert_eq!(packed.decode(3).unwrap(), worth.as_raw());
+        if let Some(ram) = ram {
+            assert_eq!(packed.payload(), ram.payload(), "spilled as the bytes RAM kept");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

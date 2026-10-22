@@ -313,9 +313,20 @@ impl Cached {
     }
 }
 
-/// Compressed frames away from the playhead that keep their pixels too, the most recently shown
-/// first (scrubbing back and forth over a few frames decodes none of them again).
-const RAW_SPARE: usize = 4;
+/// Compression starts ahead of time (MEM2, `plan/memory/compressed-cache.md`): once the frames'
+/// pixels pass this share (percent) of the room the budget leaves them (the budget less the
+/// compressed bytes), or GPU frames pass it of the video memory budget, the frames eviction would
+/// take first are compressed, so eviction never waits for the codec ([`Cache::trim_raw`]).
+const PACK_AT_PERCENT: usize = 85;
+
+/// GPU frames waiting for a worker to start their read-back for compression at most
+/// ([`Cache::gpu_wanted`]).
+const MAX_GPU_WANTED: usize = 16;
+
+/// `percent` % of `n`, without overflow.
+fn share_of(n: usize, percent: usize) -> usize {
+    usize::try_from(n as u128 * percent as u128 / 100).unwrap_or(usize::MAX)
+}
 
 struct Cache {
     map: HashMap<FrameKey, Cached>,
@@ -353,10 +364,13 @@ struct Cache {
     /// Uncompressed Frames Around the Playhead: frames the playing preview reaches within this
     /// many steps (paused: the protected window's first ones) keep their pixels.
     raw_window: i64,
-    /// Frames holding pixels while compression is on: the ones [`Cache::trim_raw`] looks at.
+    /// Frames holding pixels while compression is on.
     rawset: HashSet<FrameKey>,
     /// Frames being compressed / decoded by the codec.
     packing: HashSet<FrameKey>,
+    /// GPU frames [`Cache::trim_raw`] wants compressed: the next worker to publish a frame
+    /// starts their read-back ([`Worker::pack_wanted_gpu`]), since the cache has no GPU of its own.
+    gpu_wanted: Vec<FrameKey>,
     unpacking: HashSet<FrameKey>,
     codec: Arc<codec::Codec>,
     /// Frames written to disk when they left RAM, and the ones that couldn't be (the disk
@@ -393,6 +407,7 @@ impl Cache {
             rawset: HashSet::new(),
             packing: HashSet::new(),
             unpacking: HashSet::new(),
+            gpu_wanted: Vec::new(),
             codec,
             spilled: 0,
             spill_dropped: 0,
@@ -470,28 +485,34 @@ impl Cache {
         }
         if self.compress && holds_pixels {
             self.rawset.insert(k);
-            self.pack(k);
+            // Written to disk now: from the compressed bytes, so compressed now (on the codec's
+            // background threads). Any other frame keeps its pixels until it would leave the
+            // uncompressed share ([`Cache::trim_raw`]).
+            if self.map.get(&k).is_some_and(|s| s.disk.now) {
+                self.pack(k);
+            }
             self.trim_raw();
         }
         self.evict_to_budget();
         self.evict_gpu();
         self.sync_meter();
     }
-    /// Hand a CPU frame's pixels to the codec ([`codec`]). A frame the codec has no room for
-    /// stays uncompressed ([`Cache::trim_raw`] offers it again); if it was to be written to
-    /// disk now, it is written uncompressed (the disk cache's writer compresses it).
-    fn pack(&mut self, k: FrameKey) {
+    /// Hand a CPU frame's pixels to the codec ([`codec`]); whether they are on their way (or
+    /// already were). A frame the codec has no room for stays uncompressed ([`Cache::trim_raw`]
+    /// offers it again); if it was to be written to disk now, it is written uncompressed (the
+    /// disk cache's writer compresses it).
+    fn pack(&mut self, k: FrameKey) -> bool {
         if self.packing.contains(&k) {
-            return;
+            return true;
         }
-        let Some(slot) = self.map.get(&k) else { return };
-        let (Some(FrameImage::Cpu(img)), None) = (&slot.raw, &slot.packed) else { return };
+        let Some(slot) = self.map.get(&k) else { return false };
+        let (Some(FrameImage::Cpu(img)), None) = (&slot.raw, &slot.packed) else { return false };
         let img = img.clone();
         let raw_id = Arc::as_ptr(&img) as usize;
         let write_now = slot.disk.now.then(|| slot.disk.target.clone()).flatten();
         if self.codec.pack(codec::PackJob { key: k, raw_id, pixels: codec::Pixels::Image(img.clone()) }) {
             self.packing.insert(k);
-            return;
+            return true;
         }
         if let Some((dc, dk)) = write_now {
             dc.put_frame(dk, img.size[0] as u32, img.size[1] as u32, ColorBytes(img));
@@ -500,10 +521,12 @@ impl Cache {
                 slot.disk = DiskPlan::default();
             }
         }
+        false
     }
     /// The codec compressed the pixels `raw_id` of frame `key`: keep the bytes (and write them
-    /// to disk if the frame was to go there now), then drop the pixels if the frame is away
-    /// from the playhead. Dropped when the frame was replaced or evicted meanwhile.
+    /// to disk if the frame was to go there now), then drop the pixels if the uncompressed share
+    /// needs the room ([`Cache::trim_raw`]). Dropped when the frame was replaced or evicted
+    /// meanwhile.
     fn attach_packed(&mut self, key: FrameKey, raw_id: usize, packed: Arc<PackedFrame>) {
         self.packing.remove(&key);
         let Some(old) = self.map.get(&key) else { return };
@@ -512,6 +535,13 @@ impl Cache {
         }
         let mut slot = old.clone();
         slot.packed = Some(packed.clone());
+        // Compressed because it was leaving the uncompressed share: its pixels go now (keeping
+        // both would push the budget over and evict another frame), unless the playhead came
+        // near meanwhile. A frame compressed to be written to disk now keeps them while there
+        // is room.
+        if !slot.disk.now && !self.near(&key) {
+            slot.raw = None;
+        }
         if slot.disk.now {
             slot.disk.now = false;
             // Queued: nothing left to spill. Dropped (a full queue): it may still spill later.
@@ -530,7 +560,8 @@ impl Cache {
         self.sync_meter();
     }
     /// The codec (or the viewer) decoded `packed`, the compressed bytes of `key`: keep the pixels
-    /// while the frame stays near the playhead ([`Cache::trim_raw`]).
+    /// while the uncompressed share has room or the frame stays near the playhead
+    /// ([`Cache::trim_raw`]).
     fn attach_raw(&mut self, key: &FrameKey, packed: &Arc<PackedFrame>, img: FrameImage) {
         self.unpacking.remove(key);
         let Some(old) = self.map.get(key) else { return };
@@ -564,43 +595,133 @@ impl Cache {
             None => self.protected.get(k).is_some_and(|r| i64::try_from(*r).is_ok_and(|r| r <= self.raw_window)),
         }
     }
-    /// Drop the pixels of compressed frames away from the playhead, but the [`RAW_SPARE`] most
-    /// recently shown; hand frames still uncompressed to the codec again. A GPU frame that
-    /// could not be read back for compression stays a texture (and leaves the set).
+    /// Keep the uncompressed share of the budget (MEM2, `plan/memory/compressed-cache.md`).
+    /// Frames keep their pixels (a CPU image or a GPU texture) while there is room, and nothing
+    /// is compressed. Once the pixels pass [`PACK_AT_PERCENT`] of the room the budget leaves them
+    /// (the budget less the compressed bytes), or GPU frames pass it of the video memory budget,
+    /// the frames eviction would take first ([`Cache::pack_order`]) are handled until the
+    /// pixels are back under it: a compressed one drops its pixels, a CPU one goes to the codec,
+    /// a GPU one waits for a worker to read it back ([`Cache::gpu_wanted`]). Frames the playing
+    /// preview reaches within the raw window keep their pixels, and a playing loop that fits the
+    /// budget is never compressed ([`Cache::loop_fits`]). Frames already compressed stay so.
     fn trim_raw(&mut self) {
-        if self.rawset.is_empty() {
+        if !self.compress {
+            self.rawset.clear();
+            self.gpu_wanted.clear();
             return;
         }
-        let keys: Vec<FrameKey> = self.rawset.iter().copied().collect();
-        let mut far: Vec<(u64, FrameKey)> = Vec::new();
-        for k in keys {
-            let Some(slot) = self.map.get(&k) else {
-                self.rawset.remove(&k);
-                continue;
-            };
-            if slot.raw.is_none() {
-                self.rawset.remove(&k);
-                continue;
-            }
-            if self.near(&k) {
-                continue;
-            }
-            if slot.packed.is_none() {
-                if !self.compress || (slot.is_gpu() && !self.packing.contains(&k)) {
-                    self.rawset.remove(&k);
-                } else if !slot.is_gpu() {
-                    self.pack(k);
-                }
-                continue;
-            }
-            far.push((self.order.age.get(&k).copied().unwrap_or(0), k));
+        let map = &self.map;
+        self.rawset.retain(|k| map.get(k).is_some_and(|s| s.raw.is_some()));
+        self.gpu_wanted.retain(|k| map.get(k).is_some_and(|s| s.is_gpu() && s.packed.is_none()));
+        let (mut raw, mut gpu) = self.raw_pressure();
+        let raw_limit = share_of(self.budget.saturating_sub(self.packed_bytes), PACK_AT_PERCENT);
+        let gpu_limit = share_of(self.gpu_budget, PACK_AT_PERCENT);
+        if raw <= raw_limit && gpu <= gpu_limit {
+            return;
         }
-        far.sort_unstable_by_key(|e| e.0);
-        let drop = far.len().saturating_sub(RAW_SPARE);
-        for (_, k) in far.into_iter().take(drop) {
-            self.drop_raw(&k);
+        let mut codec_full = false;
+        for k in self.pack_order() {
+            let (over_raw, over_gpu) = (raw > raw_limit, gpu > gpu_limit);
+            if !over_raw && !over_gpu {
+                break;
+            }
+            let Some(slot) = self.map.get(&k) else { continue };
+            let Some(img) = &slot.raw else { continue };
+            let (is_gpu, bytes, packed) = (img.is_gpu(), img.bytes(), slot.packed.is_some());
+            if !over_raw && !is_gpu {
+                // Only video memory is short.
+                continue;
+            }
+            if packed {
+                self.drop_raw(&k);
+                raw = raw.saturating_sub(bytes);
+                if is_gpu {
+                    gpu = gpu.saturating_sub(bytes);
+                }
+            } else if self.packing.contains(&k) || self.gpu_wanted.contains(&k) {
+                // On its way: counted by `raw_pressure`.
+            } else if is_gpu {
+                if self.gpu_wanted.len() < MAX_GPU_WANTED {
+                    self.gpu_wanted.push(k);
+                    raw = raw.saturating_sub(self.saving(bytes));
+                    gpu = gpu.saturating_sub(bytes);
+                }
+            } else if !codec_full {
+                if self.pack(k) {
+                    raw = raw.saturating_sub(self.saving(bytes));
+                } else {
+                    // The codec's queue is full: the rest waits for the next trim.
+                    codec_full = true;
+                }
+            }
         }
         self.sync_meter();
+    }
+    /// The pixels the cache holds (all, GPU ones), less what the compressions on their way will
+    /// free.
+    fn raw_pressure(&self) -> (usize, usize) {
+        let mut raw = self.bytes.saturating_sub(self.packed_bytes);
+        let mut gpu = self.gpu_bytes;
+        for k in self.packing.iter().chain(self.gpu_wanted.iter()) {
+            let Some(Cached { raw: Some(img), packed: None, .. }) = self.map.get(k) else { continue };
+            raw = raw.saturating_sub(self.saving(img.bytes()));
+            if img.is_gpu() {
+                gpu = gpu.saturating_sub(img.bytes());
+            }
+        }
+        (raw, gpu)
+    }
+    /// What compressing a frame of `bytes` pixels frees, at the ratio measured so far (half
+    /// until a frame was compressed).
+    fn saving(&self, bytes: usize) -> usize {
+        let packed = if self.packed_raw > 0 {
+            usize::try_from(bytes as u128 * self.packed_bytes as u128 / self.packed_raw as u128).unwrap_or(usize::MAX)
+        } else {
+            bytes / 2
+        };
+        bytes.saturating_sub(packed)
+    }
+    /// The frames holding pixels that [`Cache::trim_raw`] may compress or take the pixels of, in
+    /// the order eviction would take them ([`Cache::eviction_candidate`]): while a preview plays,
+    /// the least recently shown of the frames it doesn't reach, then the ones it reaches last;
+    /// paused, the least recently shown, the protected window last. Never the frames near the
+    /// playhead ([`Cache::near`]), nor any frame of a playing loop that fits the budget.
+    fn pack_order(&self) -> Vec<FrameKey> {
+        let keep_loop = self.loop_fits();
+        let candidate = |k: &FrameKey| self.map.get(k).is_some_and(|s| s.raw.is_some()) && !self.near(k);
+        let mut first: Vec<FrameKey> = Vec::new();
+        let mut last: Vec<(i64, FrameKey)> = Vec::new();
+        for k in self.order.iter().filter(|k| candidate(k)) {
+            match &self.playhead {
+                Some(p) => match p.ahead(k) {
+                    None => first.push(*k),
+                    Some(d) if !keep_loop => last.push((d, *k)),
+                    Some(_) => {}
+                },
+                None => match self.protected.get(k) {
+                    None => first.push(*k),
+                    Some(r) => last.push((i64::try_from(*r).unwrap_or(i64::MAX), *k)),
+                },
+            }
+        }
+        // Farthest (reached last / furthest in the window) first.
+        last.sort_by_key(|e| std::cmp::Reverse(e.0));
+        first.extend(last.into_iter().map(|(_, k)| k));
+        first
+    }
+    /// Whether the playing preview's whole range fits as pixels: its frame count times the
+    /// average cached frame's pixels fits the budget (and, with GPU frames cached, the video
+    /// memory budget). Such a loop is never compressed: it plays from pixels every time round.
+    fn loop_fits(&self) -> bool {
+        let Some(p) = &self.playhead else { return false };
+        let frames = (p.end.saturating_sub(p.start).max(0) / p.step.max(1)).saturating_add(1);
+        let (n, bytes) =
+            self.map.values().filter_map(|s| s.raw.as_ref()).fold((0usize, 0usize), |(n, b), i| (n.saturating_add(1), b.saturating_add(i.bytes())));
+        if n == 0 {
+            return true;
+        }
+        let need = u128::try_from(frames).unwrap_or(u128::MAX).saturating_mul((bytes / n) as u128);
+        need <= self.budget as u128 && (self.gpu_bytes == 0 || need <= self.gpu_budget as u128)
     }
     /// Decode the compressed frames the preview reaches next (or the paused viewer's window) on
     /// the codec's threads, so they show without a decode.
@@ -647,13 +768,17 @@ impl Cache {
         if self.rawset.remove(from) {
             self.rawset.insert(to);
         }
+        for k in self.gpu_wanted.iter_mut().filter(|k| **k == *from) {
+            *k = to;
+        }
         self.packing.remove(from);
         self.unpacking.remove(from);
     }
     /// Frame `k` leaves RAM to make room: if it was worth keeping and isn't on disk, it goes
     /// there (its compressed bytes as they are, or its pixels, which the disk cache's writer
-    /// compresses). A full write queue drops it rather than wait; a GPU texture without
-    /// compressed bytes isn't read back for it.
+    /// compresses). A full write queue drops it rather than wait. A GPU texture is read back
+    /// and compressed ahead of eviction, while the headroom allows ([`Cache::trim_raw`]); one
+    /// still without compressed bytes when it leaves isn't read back for it (dropped).
     fn spill(&mut self, k: &FrameKey) {
         let Some(slot) = self.map.get(k) else { return };
         let Some((dc, dk)) = slot.disk.target.clone() else { return };
@@ -708,6 +833,7 @@ impl Cache {
         self.rawset.remove(k);
         self.packing.remove(k);
         self.unpacking.remove(k);
+        self.gpu_wanted.retain(|w| w != k);
     }
     /// Shown again: last in line for eviction.
     fn touch(&mut self, k: &FrameKey) {
@@ -1992,6 +2118,9 @@ impl Frames {
     pub fn set_budget(&self, bytes: usize) {
         if let Ok(mut c) = self.cache.lock() {
             c.budget = bytes;
+            // Compressed ahead of what the smaller budget can't hold as pixels; what doesn't fit
+            // before the codec is done leaves now.
+            c.trim_raw();
             c.evict_to_budget();
         }
     }
@@ -2155,6 +2284,7 @@ impl Frames {
             c.rawset.clear();
             c.packing.clear();
             c.unpacking.clear();
+            c.gpu_wanted.clear();
             c.codec.clear();
             c.sync_meter();
         }
@@ -2925,8 +3055,14 @@ impl Worker {
         // compresses and writes the same snapshot.
         self.finish_stored(job.key, job.urgent, ci.clone(), tail.t0, job.print, Some(job.seq), Stored { disk: plan, packed });
         #[cfg(not(target_arch = "wasm32"))]
-        if compress && let FrameImage::Gpu(f) = &ci {
-            self.pack_gpu(job, f);
+        if compress && let Some(gpu) = &job.src.gpu {
+            // A GPU frame written to disk now is compressed now (from a read-back); any other
+            // keeps its texture until it would leave the uncompressed share, when the cache asks
+            // for its read-back ([`Cache::trim_raw`]).
+            if now && let FrameImage::Gpu(f) = &ci {
+                self.pack_gpu(gpu, job.key, f);
+            }
+            self.pack_wanted_gpu(gpu);
         }
         if written_here && let Some((dc, k)) = &tail.disk {
             match &ci {
@@ -2958,13 +3094,32 @@ impl Worker {
         let _ = self.landing.begin(gpu, f, land);
     }
 
-    /// Compress a GPU frame ([`codec`]): read it back on the landing thread and hand the bytes
-    /// to the codec, which keeps them (and drops the texture once the frame is away from the
-    /// playhead). Skipped when too many readbacks are in flight: the frame stays a texture.
+    /// Start the read-backs of the GPU frames the cache wants compressed ([`Cache::gpu_wanted`]).
     #[cfg(not(target_arch = "wasm32"))]
-    fn pack_gpu(&self, job: &Job, f: &Arc<DisplayFrame>) {
-        let Some(gpu) = &job.src.gpu else { return };
-        let (key, raw_id) = (job.key, Arc::as_ptr(f) as usize);
+    fn pack_wanted_gpu(&self, gpu: &Gpu) {
+        let wanted: Vec<(FrameKey, Arc<DisplayFrame>)> = {
+            let Ok(mut c) = self.cache.lock() else { return };
+            let keys = std::mem::take(&mut c.gpu_wanted);
+            keys.into_iter()
+                .filter_map(|k| match c.map.get(&k) {
+                    Some(Cached { raw: Some(FrameImage::Gpu(f)), packed: None, .. }) => Some((k, f.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (k, f) in wanted {
+            self.pack_gpu(gpu, k, &f);
+        }
+    }
+
+    /// Compress a GPU frame ([`codec`]): read it back on the landing thread and hand the bytes
+    /// to the codec (the hand-off only queues them; the codec's threads run at background
+    /// priority), which keeps them; the texture goes when the uncompressed share needs the room.
+    /// Skipped when too many readbacks are in flight: the frame stays a texture (the next trim
+    /// may ask again).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pack_gpu(&self, gpu: &Gpu, key: FrameKey, f: &Arc<DisplayFrame>) {
+        let raw_id = Arc::as_ptr(f) as usize;
         let coder = {
             let Ok(mut c) = self.cache.lock() else { return };
             let mine = c.map.get(&key).is_some_and(|s| s.raw_id() == Some(raw_id) && s.packed.is_none());

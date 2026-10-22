@@ -1,8 +1,14 @@
 //! The RAM preview's compressed frames (`plan/memory/compressed-cache.md`, Memory & CPU ▸
 //! Compress RAM Preview Frames): a frame is compressed once, off the render path, into 16 LZ4
-//! strips ([`PackedFrame`]); the cache then keeps the compressed bytes and drops the pixels of
-//! frames away from the playhead. Its budget counts the compressed bytes, so the same memory
-//! holds about 2.4× the frames (measured on real 1080p frames, `plan/memory/cache-prototypes.md`).
+//! strips ([`PackedFrame`]); the cache then keeps the compressed bytes and drops the frame's
+//! pixels. Its budget counts the compressed bytes, so the same memory holds about 2.4× the
+//! frames (measured on real 1080p frames, `plan/memory/cache-prototypes.md`).
+//!
+//! Compression is lazy (MEM2): frames keep their pixels while the uncompressed share of the
+//! budget has room, and only the frames about to be pushed out of it are compressed, a little
+//! ahead of time (`Cache::trim_raw`). The threads run the app's thread-start hook first
+//! ([`super::idle::set_thread_start`]: background priority), so they never take CPU from the
+//! render workers.
 //!
 //! - **Pack.** A CPU frame is compressed from the pixels the cache shares (no copy); a GPU frame
 //!   is read back first (the landing thread, `Worker::pack_gpu`). The compressed bytes are the
@@ -152,6 +158,9 @@ impl Codec {
         }
         let me = self.clone();
         let spawned = std::thread::Builder::new().name("ec-frame-codec".into()).spawn(move || {
+            // Background priority (the app's hook: macOS utility QoS), so compression never takes
+            // CPU from the render workers, the UI or playback.
+            super::idle::thread_start();
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.run())).is_err() {
                 log::error!("a RAM preview compression thread panicked; its frames stay uncompressed");
                 let mut s = me.lock();

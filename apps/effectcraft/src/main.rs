@@ -169,8 +169,8 @@ fn main() -> eframe::Result {
     };
     // Hardware ProRes decoding for previews; exports keep their exact decoder.
     log::info!("hardware ProRes decoding: {:?}", effectcraft_platform::register());
-    // Cache Frames When Idle renders at background priority (macOS utility QoS), after the UI,
-    // playback and other apps.
+    // Cache Frames When Idle renders, and RAM preview frames are compressed, at background
+    // priority (macOS utility QoS), after the UI, playback, the render workers and other apps.
     effectcraft_ui_egui::frames::set_idle_thread_start(|| {
         effectcraft_platform::background_thread();
     });

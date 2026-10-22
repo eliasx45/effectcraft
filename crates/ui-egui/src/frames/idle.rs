@@ -25,10 +25,17 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 static THREAD_START: OnceLock<fn()> = OnceLock::new();
 
-/// Run `hook` at the start of every idle-cache thread (the desktop app: lower its priority).
-/// The first call wins.
+/// Run `hook` at the start of every idle-cache thread and RAM preview compression thread
+/// ([`super::codec`]; the desktop app: lower its priority). The first call wins.
 pub fn set_thread_start(hook: fn()) {
     let _ = THREAD_START.set(hook);
+}
+
+/// Run the [`set_thread_start`] hook on the calling thread, if one was set.
+pub(crate) fn thread_start() {
+    if let Some(hook) = THREAD_START.get() {
+        hook();
+    }
 }
 
 /// Threads of the idle pool on a machine with `cores` cores: `setting` (Memory & CPU ▸ CPU Cores
@@ -70,9 +77,7 @@ impl IdlePool {
                 .start_handler(|_| {
                     // Nobody else waits for a layer these threads are rendering.
                     effectcraft_engine::render::cache::set_background_thread();
-                    if let Some(hook) = THREAD_START.get() {
-                        hook();
-                    }
+                    thread_start();
                 })
                 .build();
             match built {
