@@ -2227,7 +2227,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         forget_described();
     }
     // Where files dragged in from the Finder would land: a folder row, its icon, a card.
-    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    // Files dragged in from the Finder: the OS cursor (winit sends no pointer motion then).
+    let pointer = if crate::os_drop::files_present(&ctx) { crate::os_drop::drop_pointer(app, &ctx) } else { ctx.input(|i| i.pointer.hover_pos()) };
     let (mut drop_folder, mut drop_icon, mut drop_card): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     let mut group_anchor: Option<Rect> = None;
     let mut folder_pick: Option<(&'static str, Value)> = None;

@@ -3496,6 +3496,33 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
 
+    // Files dragged in from the Finder land as Project items dropped here do (the window's drop
+    // handler places them, `os_drop`; the OS reports no pointer to this panel during the drag).
+    if crate::os_drop::files_present(&ctx) {
+        let layer_rows =
+            hit_rows.iter().filter(|(_, r)| matches!(r.kind, RowKind::Layer)).filter_map(|(rr, r)| comp.index_of(r.layer).map(|ix| (*rr, ix))).collect();
+        crate::os_drop::publish_timeline(
+            &ctx,
+            crate::os_drop::TimelineDropMap {
+                pass: ctx.cumulative_pass_nr(),
+                comp: cid,
+                panel: rect,
+                rows_rect,
+                layer_rows,
+                layer_count: comp.layers.len(),
+                graph_x0,
+                graph_on,
+                x0: tm.x0,
+                start_secs: tm.start,
+                pps: tm.pps,
+                frame_rate: comp.frame_rate,
+                duration: comp.duration,
+                frame: comp.frame_duration(),
+                now: time,
+            },
+        );
+    }
+
     // Drop targets: effects from Effects & Presets go on the layer under the pointer. Footage and
     // comps from the Project panel and files from the Media Browser go where they are dropped: a
     // line shows the place in the stack, and over the time graph a marker shows the In point too

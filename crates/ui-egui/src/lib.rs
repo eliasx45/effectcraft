@@ -311,6 +311,11 @@ pub struct Hooks {
     pub pick_files: Option<Box<dyn Fn(&[&str]) -> Vec<String>>>,
     pub pick_save: Option<Box<dyn Fn(&str) -> Option<String>>>,
     pub pick_open_project: Option<Box<dyn Fn() -> Option<String>>>,
+    /// The OS cursor in physical screen pixels, given the window's native pixels per point
+    /// (macOS reports points and scales them by it). winit reports no pointer while files are
+    /// dragged in from the Finder, so a drop is placed where this says it landed
+    /// ([`os_drop::drop_pointer`]); without it, where egui last saw the pointer in the window.
+    pub cursor_screen_position: Option<Box<dyn Fn(f32) -> Option<(i32, i32)>>>,
     /// Opens the audio output for preview playback (the desktop app uses cpal).
     pub audio_device: Option<audio::AudioDeviceFactory>,
     /// Lists audio output devices (Settings ▸ Audio).

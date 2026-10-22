@@ -27,6 +27,8 @@
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod convert;
+/// The cursor's screen position while the Finder drags files over the window (no `unsafe`).
+pub mod cursor;
 #[cfg(target_os = "macos")]
 pub mod prores;
 #[cfg(target_os = "macos")]

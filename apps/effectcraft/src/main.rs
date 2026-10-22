@@ -346,6 +346,9 @@ fn main() -> eframe::Result {
         app.hooks.pick_open_project = Some(Box::new(|| {
             rfd::FileDialog::new().add_filter("EffectCraft Project", &["ecproj", "ecprojx"]).pick_file().map(|p| p.to_string_lossy().to_string())
         }));
+        // Files dragged in from the Finder land under the cursor: winit sends no pointer motion
+        // during the drag (macOS reads it with CGEvent; elsewhere `None`, egui's pointer).
+        app.hooks.cursor_screen_position = Some(Box::new(effectcraft_platform::cursor::cursor_screen_position));
         app.hooks.system_theme = appearance::service();
         app.hooks.audio_device = Some(Box::new(audio_out::open));
         app.hooks.audio_devices = Some(Box::new(audio_out::devices));

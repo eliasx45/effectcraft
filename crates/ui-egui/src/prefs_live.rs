@@ -25,6 +25,13 @@ pub fn dropped_files(app: &mut EffectcraftApp, ui: &egui::Ui, bounds: Rect) {
     use egui::{Align2, Stroke, StrokeKind, vec2};
 
     let ctx = ui.ctx().clone();
+    if !crate::os_drop::files_present(&ctx) {
+        return;
+    }
+    // Where the files are: the OS cursor (macOS sends no pointer motion during a Finder drag,
+    // so egui's pointer is gone or stale), else egui's pointer.
+    let pointer = crate::os_drop::drop_pointer(app, &ctx);
+    let timeline = pointer.and_then(|p| crate::os_drop::timeline_target(app, &ctx, p));
     let hovered = ctx.input(|i| i.raw.hovered_files.len());
     if hovered != 0 {
         let label =
@@ -35,6 +42,17 @@ pub fn dropped_files(app: &mut EffectcraftApp, ui: &egui::Ui, bounds: Rect) {
         painter.rect_filled(hint, 6.0, app.tokens.panel_bg);
         painter.text(hint.center(), Align2::CENTER_CENTER, &label, crate::theme::Tokens::medium(14.0), app.tokens.text);
         app.auto.add("file.dropTarget", hint, &label);
+        // Over the Timeline: the line (and In point marker) where the layers would go.
+        if let Some(d) = &timeline
+            && let Some(line) = crate::os_drop::paint_timeline_target(&ctx, app.tokens.accent, d)
+        {
+            app.auto.add("timeline.fileDropTarget", line, &format!("Layer {}", d.index));
+        }
+        // No pointer events arrive during an OS drag: keep drawing so the preview follows the
+        // cursor the host reports.
+        if app.hooks.cursor_screen_position.is_some() {
+            ctx.request_repaint();
+        }
     }
 
     let (paths, skipped) = ctx.input(|i| {
@@ -81,11 +99,15 @@ pub fn dropped_files(app: &mut EffectcraftApp, ui: &egui::Ui, bounds: Rect) {
             .filter(|e| e.window.is_none())
             .map(|e| Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3])));
 
+        // On the Composition viewer the layers are centred where they land; on the Timeline they
+        // go where its line shows, starting at the drop time over the time graph (as Project
+        // items dropped there). Elsewhere the files only go into the Project panel.
         let at = if proj.is_empty() {
-            ctx.input(|i| i.pointer.hover_pos()).filter(|p| viewer.is_some_and(|v| v.contains(*p))).and_then(|p| crate::panels::viewer::screen_to_comp(&ctx, p))
+            pointer.filter(|p| viewer.is_some_and(|v| v.contains(*p))).and_then(|p| crate::panels::viewer::screen_to_comp(&ctx, p))
         } else {
             None
         };
+        let timeline = timeline.filter(|_| proj.is_empty() && at.is_none());
 
         // Dropped files import as stills and folders' numbered stills as sequences; Alt-drag
         // imports a folder's files one by one (After Effects).
@@ -96,10 +118,14 @@ pub fn dropped_files(app: &mut EffectcraftApp, ui: &egui::Ui, bounds: Rect) {
         let mut params = json!({
             "paths": rest,
             "drag": true,
-            "addToComp": at.is_some(),
+            "addToComp": at.is_some() || timeline.is_some(),
             "position": at,
             "background": true
         });
+        if let Some(d) = timeline {
+            params["index"] = json!(d.index);
+            params["time"] = json!(d.time.map(|t| t.seconds()));
+        }
         if !layered {
             params["importAs"] = json!(app.session.prefs.drag_import_as());
         }
@@ -110,6 +136,10 @@ pub fn dropped_files(app: &mut EffectcraftApp, ui: &egui::Ui, bounds: Rect) {
         if let Err(e) = crate::menus::invoke(app, &ctx, "file.import", params) {
             errors.push(crate::i18n::tr_args("Cannot import dropped files: {}", &[&e]));
         }
+        // The import runs in the background and is applied by a later frame. After a Finder drop
+        // the window is not key, so macOS sends it no mouse moves that would draw one: ask now
+        // (the job poll then keeps asking until it is done).
+        ctx.request_repaint();
     }
 
     if !errors.is_empty() {

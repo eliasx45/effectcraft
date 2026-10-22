@@ -168,7 +168,12 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, st: &m
         }
     }
     // Script files dropped on the panel (handled here, not imported as footage).
-    let over = ui.rect_contains_pointer(ui.max_rect());
+    // Files dragged in from the Finder: the OS cursor (winit sends no pointer motion then).
+    let over = if crate::os_drop::files_present(&ctx) {
+        crate::os_drop::drop_pointer(app, &ctx).is_some_and(|p| ui.max_rect().contains(p))
+    } else {
+        ui.rect_contains_pointer(ui.max_rect())
+    };
     if over {
         let dropped: Vec<String> = ctx.input(|i| {
             i.raw
