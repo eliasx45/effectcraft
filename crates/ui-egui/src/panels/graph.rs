@@ -72,6 +72,8 @@ struct Curve<'a> {
     keys: Vec<KeyPt>,
     /// Values editable in the value graph (not spatial / combined dimensions).
     editable: bool,
+    /// One speed curve for all dimensions (see [`linked_speed`]).
+    linked: bool,
 }
 
 /// Properties shown: the selected ones, or every animated property of the selected layers.
@@ -151,7 +153,44 @@ fn curve_has_expression(l: &Layer, pr: &Property) -> bool {
 
 fn shown_dims(l: &Layer, pr: &Property) -> usize {
     let n = pr.value.components().len();
-    if pr.shown_dims > 0 && !l.is_3d() { (pr.shown_dims as usize).min(n) } else { n.min(4) }
+    if pr.shown_dims > 0 && !l.is_3d() {
+        (pr.shown_dims as usize).min(n)
+    } else if !l.is_3d() && n == 3 && matches!(pr.match_id.as_str(), "anchor" | "position" | "scale") {
+        // A 2D layer's transform has no Z to show (After Effects), also when the property was
+        // made without its shown dimensions (imported or older projects).
+        2
+    } else {
+        n.min(4)
+    }
+}
+
+/// The speed graph shows a non-spatial property with several dimensions (Scale) as one curve,
+/// as After Effects does: the dimension that moves most leads, and a handle drag eases every
+/// dimension together.
+fn linked_speed(l: &Layer, pr: &Property, speed: bool) -> bool {
+    speed && !pr.spatial && matches!(pr.value, Value::Vec2(_) | Value::Vec3(_)) && shown_dims(l, pr) > 1
+}
+
+/// The dimension of `pr` that moves most across its keys (the one a linked speed curve shows).
+fn lead_dim(l: &Layer, pr: &Property) -> usize {
+    let travel = |d: usize| {
+        pr.keys
+            .windows(2)
+            .map(|w| (w[1].value.components().get(d).copied().unwrap_or(0.0) - w[0].value.components().get(d).copied().unwrap_or(0.0)).abs())
+            .sum::<f64>()
+    };
+    (0..shown_dims(l, pr)).max_by(|a, b| travel(*a).total_cmp(&travel(*b))).unwrap_or(0)
+}
+
+/// For a linked speed curve's handle on key `i` (`out` side): each shown dimension and its
+/// segment's change relative to the lead dimension's, so one drag gives every dimension the same
+/// share of its own speed and the same influence.
+fn linked_ratios(l: &Layer, pr: &Property, i: usize, out: bool, lead: usize) -> Vec<(usize, f64)> {
+    let j = if out { i.checked_add(1) } else { i.checked_sub(1) };
+    let (Some(a), Some(b)) = (pr.keys.get(i), j.and_then(|j| pr.keys.get(j))) else { return vec![] };
+    let delta = |d: usize| b.value.components().get(d).copied().unwrap_or(0.0) - a.value.components().get(d).copied().unwrap_or(0.0);
+    let base = delta(lead);
+    (0..shown_dims(l, pr)).map(|d| (d, if base.abs() > 1e-9 { delta(d) / base } else { 1.0 })).collect()
 }
 
 #[derive(Clone, Default)]
@@ -313,8 +352,10 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
         let l = owner.as_ref();
         let (lid, uid) = (l.id, pr.uid);
         let spatial = pr.spatial && matches!(pr.value, Value::Vec2(_) | Value::Vec3(_));
-        let dims = if speed && spatial { 1 } else { shown_dims(l, pr) };
+        let linked = linked_speed(l, pr, speed);
+        let dims = if (speed && spatial) || linked { 1 } else { shown_dims(l, pr) };
         for d in 0..dims {
+            let d = if linked { lead_dim(l, pr) } else { d };
             let color = if dims > 1 { DIM_COLORS[d % 4] } else { PROP_COLORS[pi % PROP_COLORS.len()] };
             let ci = out.len();
             let mut points = cached.as_ref().and_then(|cache| cache.curves.get(ci)).cloned().unwrap_or_default();
@@ -379,7 +420,7 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
                 };
                 keys.push(KeyPt { idx: i, time: k.time, t: kt, v, sel: ks, handles });
             }
-            out.push(Curve { layer: l, prop: pr, dim: d, color, pts, base_pts, peaks, keys, editable: !spatial });
+            out.push(Curve { layer: l, prop: pr, dim: d, color, pts, base_pts, peaks, keys, editable: !spatial, linked });
         }
     }
     if cached.is_none() {
@@ -1014,6 +1055,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                         negative: h.negative,
                         dur: h.dur,
                         toggle: ui.input(|i| i.modifiers.alt).then_some(!continuous),
+                        linked: if c.linked { linked_ratios(c.layer, c.prop, k.idx, h.out, c.dim) } else { vec![] },
                     };
                     let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(hp);
                     ctx.data_mut(|dd| {
@@ -1046,7 +1088,18 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                         if let Some(join) = g.toggle {
                             params["continuous"] = json!(join);
                         }
-                        actions.push(("keys.setEase".into(), params));
+                        if g.linked.is_empty() {
+                            actions.push(("keys.setEase".into(), params));
+                        } else {
+                            // Every dimension in the same undo step: the same influence, its share of the speed.
+                            let lead_speed = params.get("speed").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                            for &(dd, ratio) in &g.linked {
+                                let mut p = params.clone();
+                                p["dim"] = json!(dd);
+                                p["speed"] = json!(lead_speed * ratio);
+                                actions.push(("keys.setEase".into(), p));
+                            }
+                        }
                     }
                 }
                 if hresp.drag_stopped() {
@@ -1561,6 +1614,8 @@ struct HandleGrab {
     /// Option was held at the press: `Some(true)` joins the key's handles (continuous),
     /// `Some(false)` splits them, for the whole drag.
     toggle: Option<bool>,
+    /// A linked speed curve's dimensions and their speed relative to the lead's (empty: only `dim`).
+    linked: Vec<(usize, f64)>,
 }
 
 impl HandleGrab {

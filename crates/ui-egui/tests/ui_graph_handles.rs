@@ -194,3 +194,55 @@ fn auto_height_keeps_a_peak_out_of_view() {
     let zoomed = h.state().ui.timeline.graph_range.unwrap();
     assert!(zoomed.1 >= whole.1 * 0.99, "the top stays at the peak: {whole:?} → {zoomed:?}");
 }
+
+/// A 2D solid whose Scale goes from 100 % to (120, 150) % over 1 s with Easy Ease, selected, in
+/// graph `mode`. Returns the layer and Scale's uid.
+fn scale_harness(mode: &str) -> (Harness<'static, EffectcraftApp>, LayerId, u64) {
+    let (mut h, _, _) = harness(mode);
+    let s = &mut h.state_mut().session;
+    s.execute("layer.newSolid", json!({"name": "Box", "color": "#e04020", "width": 80, "height": 80})).unwrap();
+    let id = s.active_comp().unwrap().layers.iter().find(|l| l.name == "Box").unwrap().id;
+    for (t, v) in [(0.0, [100.0, 100.0, 100.0]), (1.0, [120.0, 150.0, 100.0])] {
+        s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/scale", "time": t, "value": v})).unwrap();
+    }
+    let sc = s.active_comp().unwrap().layer(id).unwrap().props.prop("transform/scale").unwrap().uid;
+    s.execute("layer.select", json!({"layers": [id.0]})).unwrap();
+    s.execute("prop.select", json!({"layer": id.0, "prop": sc})).unwrap();
+    s.execute("keys.selectAll", json!({})).unwrap();
+    s.execute("keys.easyEase", json!({})).unwrap();
+    let tl = &mut h.state_mut().ui.timeline;
+    tl.pps = Some(600.0);
+    tl.start = 0.0;
+    tl.graph_auto_zoom = true;
+    h.run_steps(4);
+    (h, id, sc)
+}
+
+/// After Effects shows Scale as one speed curve and a handle drag eases X and Y together: the
+/// same influence, and each dimension its own share of the speed. Only X used to change.
+#[test]
+fn scale_is_one_speed_curve_and_a_handle_drag_eases_every_dimension() {
+    let (mut h, id, sc) = scale_harness("speed");
+    // One curve, led by Y (it moves most): no X or Z handles.
+    assert!(h.state().auto.find(&format!("timeline.graph.handle.{sc}.0.1.in")).is_none(), "no separate X curve");
+    assert!(h.state().auto.find(&format!("timeline.graph.handle.{sc}.2.1.in")).is_none(), "no Z curve");
+    let hp = rect(&h, &format!("timeline.graph.handle.{sc}.1.1.in")).center();
+    let plot = rect(&h, "timeline.graph");
+    drag(&mut h, hp, hp - vec2(40.0, plot.height() * 0.2));
+    let l = h.state().session.active_comp().unwrap().layer(id).unwrap().clone();
+    let k = l.props.prop("transform/scale").unwrap().keys[1].clone();
+    let (x, y) = (k.in_ease[0], k.in_ease[1]);
+    assert!(y.influence > 1.0 / 3.0 + 0.01, "the influence followed the handle: {}", y.influence);
+    assert!((x.influence - y.influence).abs() < 1e-9, "X and Y share the influence: {} vs {}", x.influence, y.influence);
+    assert!(y.speed > 0.0, "the speed followed the handle: {}", y.speed);
+    assert!((x.speed / y.speed - 20.0 / 50.0).abs() < 1e-6, "X takes its share of the speed: {} vs {}", x.speed, y.speed);
+}
+
+/// A 2D layer's Scale shows X and Y in the value graph, never a flat Z (After Effects).
+#[test]
+fn a_2d_layers_scale_shows_no_z_in_the_value_graph() {
+    let (h, _, sc) = scale_harness("value");
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{sc}.0.0")).is_some(), "X shows");
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{sc}.1.0")).is_some(), "Y shows");
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{sc}.2.0")).is_none(), "no Z");
+}
