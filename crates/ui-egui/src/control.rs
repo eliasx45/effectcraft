@@ -345,6 +345,9 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 if let Some(v) = tl.get("showModes").and_then(Value::as_bool) {
                     app.ui.timeline.show_modes = v;
                 }
+                if let Some(v) = tl.get("speedRows").and_then(Value::as_bool) {
+                    app.ui.timeline.speed_rows = v;
+                }
                 if let Some(Value::Array(a)) = tl.get("openLayers") {
                     app.ui.timeline.open_layers = a.iter().filter_map(Value::as_u64).collect();
                 }

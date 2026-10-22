@@ -488,6 +488,10 @@ pub struct TimelineState {
     /// Graph Editor ▸ Show Transform Box When Multiple Keys Are Selected.
     #[serde(default = "yes")]
     pub graph_transform_box: bool,
+    /// Speed curves in the property rows (footer ∿ button): eased segments draw their speed
+    /// curve, peak dot and influence handles in the row (`panels::timeline::speed_rows`).
+    #[serde(default = "yes")]
+    pub speed_rows: bool,
     /// Properties whose inline expression editor is collapsed.
     #[serde(default)]
     pub expr_closed: BTreeSet<u64>,
@@ -589,6 +593,7 @@ impl Default for TimelineState {
             graph_reference: false,
             graph_expression_overlay: false,
             graph_transform_box: true,
+            speed_rows: true,
             expr_closed: BTreeSet::new(),
             expr_lines: BTreeMap::new(),
             unlinked: BTreeSet::new(),

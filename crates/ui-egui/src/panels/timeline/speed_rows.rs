@@ -1,0 +1,309 @@
+//! Speed curves in the property rows (Timeline ▸ footer ∿ toggle, on by default): every eased
+//! segment between two keys draws its speed curve inside the row, scaled to that segment's own
+//! peak, with a dot on the peak (hover: speed, time and influences). Linear and hold segments
+//! draw nothing. Editing in place: a yellow influence handle on the baseline at each Bezier side
+//! (drag: `keys.setEase` influence, as the Graph Editor's speed handles), and ⌘-drag anywhere on
+//! the curve sculpts the side nearer the pointer (left of the peak: the first key's out
+//! influence, right of it: the second key's in influence). The speeds at the keys are kept.
+
+use effectcraft_engine::keyframe::{Interp, side_ease, speed};
+use effectcraft_engine::project::{Comp, Layer, ParamUi, Property};
+use effectcraft_engine::time::{TICKS_PER_SECOND, Tick};
+use egui::{Color32, Painter, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
+use serde_json::json;
+
+use super::TMap;
+use crate::EffectcraftApp;
+
+/// The Graph Editor's speed-curve yellow.
+const CURVE: Color32 = Color32::from_rgb(226, 201, 79);
+const HANDLE: Color32 = Color32::from_rgb(255, 227, 106);
+/// 100% influence reaches this fraction of the segment, as the Graph Editor's speed handles.
+const HANDLE_REACH: f64 = 0.5;
+/// Influence is kept in this range (%), as `keys.setEase` and the Graph Editor.
+const MIN_INFLUENCE: f64 = 0.1;
+const MAX_INFLUENCE: f64 = 100.0;
+
+/// One eased segment as drawn: its keys' comp-time x, the sampled curve (x, speed) and its peak.
+struct Segment {
+    i: usize,
+    xa: f32,
+    xb: f32,
+    /// (x, speed) samples, left to right.
+    pts: Vec<(f32, f64)>,
+    peak: f64,
+    peak_x: f32,
+    peak_t: Tick,
+    /// Out influence of key `i`, in influence of key `i + 1` (0..1); `None` for a linear side.
+    out_inf: Option<f64>,
+    in_inf: Option<f64>,
+}
+
+/// A handle or sculpt drag in progress (egui memory, per property).
+#[derive(Clone, Copy)]
+struct Grab {
+    /// Key index whose side moves, and which side.
+    key: usize,
+    out: bool,
+    /// Pointer x and influence (%) at the press; pixels per 100% influence.
+    x0: f32,
+    inf0: f64,
+    reach_px: f32,
+}
+
+fn grab_id(uid: u64) -> egui::Id {
+    egui::Id::new(("tl-speed-grab", uid))
+}
+
+/// Speed units for the readout (as the Graph Editor's speed graph).
+fn units(pr: &Property) -> &'static str {
+    match pr.ui {
+        ParamUi::Angle => "°/s",
+        ParamUi::Percent => "%/s",
+        ParamUi::Pixels => "px/s",
+        _ if pr.spatial => "px/s",
+        _ if pr.match_id == "opacity" => "%/s",
+        _ => "/s",
+    }
+}
+
+/// Whether segment `i` → `i + 1` changes speed: not hold, not linear on both sides, and of a
+/// value that interpolates.
+fn eased(prop: &Property, i: usize) -> bool {
+    let (Some(a), Some(b)) = (prop.keys.get(i), prop.keys.get(i + 1)) else { return false };
+    if a.out_interp == Interp::Hold || b.in_interp == Interp::Hold || !a.value.interpolates() {
+        return false;
+    }
+    !(a.out_interp == Interp::Linear && b.in_interp == Interp::Linear)
+}
+
+fn influence(prop: &Property, i: usize, out: bool) -> Option<f64> {
+    let k = prop.keys.get(i)?;
+    if (if out { k.out_interp } else { k.in_interp }) != Interp::Bezier {
+        return None;
+    }
+    side_ease(&prop.keys, i, 0, prop.spatial, out).map(|e| e.influence.clamp(0.0, 1.0))
+}
+
+/// The visible eased segments of `prop`, sampled at about one point per 2 px.
+fn segments(prop: &Property, to_comp: &dyn Fn(Tick) -> Tick, tm: TMap, x_min: f32, x_max: f32) -> Vec<Segment> {
+    let mut out = vec![];
+    for i in 0..prop.keys.len().saturating_sub(1) {
+        if !eased(prop, i) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (prop.keys.get(i), prop.keys.get(i + 1)) else { continue };
+        let xa = tm.x(to_comp(a.time).seconds());
+        let xb = tm.x(to_comp(b.time).seconds());
+        if xb < x_min || xa > x_max || xb - xa < 6.0 {
+            continue;
+        }
+        let n = (((xb - xa) / 2.0) as usize).clamp(8, 240);
+        // The numeric speed differentiates over ±1 ms: stay that far inside the segment.
+        let h = Tick(TICKS_PER_SECOND / 500);
+        let (t0, t1) = (a.time.0.saturating_add(h.0), b.time.0.saturating_sub(h.0));
+        if t1 <= t0 {
+            continue;
+        }
+        let mut pts = Vec::with_capacity(n + 1);
+        let (mut peak, mut peak_x, mut peak_t) = (0.0f64, xa, a.time);
+        for j in 0..=n {
+            let s = j as f64 / n as f64;
+            let t = Tick(t0 + ((t1 - t0) as f64 * s) as i64);
+            let v = speed(&prop.keys, t, prop.spatial);
+            let x = xa + (xb - xa) * s as f32;
+            if v.is_finite() && v > peak {
+                (peak, peak_x, peak_t) = (v, x, t);
+            }
+            pts.push((x, if v.is_finite() { v } else { 0.0 }));
+        }
+        if peak <= 1e-9 {
+            continue;
+        }
+        out.push(Segment { i, xa, xb, pts, peak, peak_x, peak_t, out_inf: influence(prop, i, true), in_inf: influence(prop, i + 1, false) });
+    }
+    out
+}
+
+/// Draws `prop`'s speed curves and handles in `strip` (the row's time-graph span, one row high)
+/// and handles their drags, pushing `keys.setEase` (merged into one undo step per drag).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn show(
+    app: &mut EffectcraftApp,
+    ui: &egui::Ui,
+    p: &Painter,
+    comp: &Comp,
+    tm: TMap,
+    layer: &Layer,
+    prop: &Property,
+    strip: Rect,
+    actions: &mut Vec<(String, serde_json::Value)>,
+) {
+    if !app.ui.timeline.speed_rows || prop.keys.len() < 2 {
+        return;
+    }
+    let segs = segments(prop, &|t| layer.comp_time(t), tm, strip.min.x, strip.max.x);
+    let uid = prop.uid;
+    let ctx = ui.ctx().clone();
+    let (top, base) = (strip.min.y + 2.0, strip.max.y - 1.5);
+    let amp = (base - top).max(1.0);
+    let mut grab: Option<Grab> = ctx.data(|d| d.get_temp(grab_id(uid)));
+    // A drag released where this row's widgets were not drawn (scrolled away) leaves no grab behind.
+    if grab.is_some() && !ui.input(|i| i.pointer.any_down()) {
+        ctx.data_mut(|d| d.remove::<Grab>(grab_id(uid)));
+        grab = None;
+    }
+    let cmd = ui.input(|i| i.modifiers.command);
+    let unit = units(prop);
+    // Locked layers show their curves but take no edits.
+    let editable = !layer.switches.locked;
+    for s in &segs {
+        let y = |v: f64| base - (v / s.peak) as f32 * amp;
+        let line: Vec<Pos2> = s.pts.iter().map(|(x, v)| pos2(*x, y(*v))).collect();
+        // Faint fill under the curve, then the curve.
+        let fill = Color32::from_rgba_unmultiplied(CURVE.r(), CURVE.g(), CURVE.b(), 34);
+        for w in line.windows(2) {
+            let [a, b] = [w[0], w[1]];
+            p.add(Shape::convex_polygon(vec![a, b, pos2(b.x, base), pos2(a.x, base)], fill, Stroke::NONE));
+        }
+        p.add(Shape::line(line, Stroke::new(1.2, CURVE.gamma_multiply(0.8))));
+        // Peak dot and its readout.
+        let dot = pos2(s.peak_x, top + 0.5);
+        p.circle(dot, 3.2, HANDLE, Stroke::new(1.0, Color32::from_gray(20)));
+        let infl = |v: Option<f64>| v.map_or("linear".to_string(), |v| format!("{:.0}%", v * 100.0));
+        let tip = format!(
+            "{:.1} {unit} @ {}  ·  out {} · in {}",
+            s.peak,
+            crate::panels::timecode(&app.session, comp, layer.comp_time(s.peak_t)),
+            infl(s.out_inf),
+            infl(s.in_inf)
+        );
+        let dr = Rect::from_center_size(dot, vec2(10.0, 10.0));
+        let dresp = ui.interact(dr, egui::Id::new(("tl-speed-peak", uid, s.i)), Sense::hover());
+        app.auto.add(&format!("timeline.speed.{uid}.{}.peak", s.i), dr, &tip);
+        if dresp.hovered() {
+            egui::Tooltip::always_open(ctx.clone(), ui.layer_id(), egui::Id::new("tl-speed-tip"), egui::PopupAnchor::Pointer).show(|ui| ui.label(&tip));
+        }
+        // ⌘-drag on the curve: sculpt the side nearer the pointer.
+        let sculpt_rect = Rect::from_min_max(pos2(s.xa + 7.0, strip.min.y), pos2(s.xb - 7.0, strip.max.y));
+        let sculpt_id = egui::Id::new(("tl-speed-sculpt", uid, s.i));
+        if editable && sculpt_rect.width() > 4.0 && (cmd || grab.is_some_and(|g| g.key == s.i || g.key == s.i + 1)) {
+            let resp = ui.interact(sculpt_rect, sculpt_id, Sense::drag());
+            app.auto.add(&format!("timeline.speed.{uid}.{}.sculpt", s.i), sculpt_rect, "⌘-drag to sculpt the speed curve");
+            if resp.hovered() || resp.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            if resp.drag_started()
+                && let Some(px) = resp.interact_pointer_pos()
+            {
+                let out = px.x < s.peak_x;
+                let (key, inf) = if out { (s.i, s.out_inf) } else { (s.i + 1, s.in_inf) };
+                let reach_px = ((s.xb - s.xa) as f64 * HANDLE_REACH) as f32;
+                let g = Grab { key, out, x0: px.x, inf0: inf.unwrap_or(1.0 / 6.0) * 100.0, reach_px };
+                ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
+                grab = Some(g);
+            }
+            drag(&ctx, &resp, prop, layer, grab, actions, |g, px| g.inf0 + ((px - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 });
+        }
+        // Influence handles on the baseline.
+        let reach = (s.xb - s.xa) * HANDLE_REACH as f32;
+        for (out, key, inf, kx) in [(true, s.i, s.out_inf, s.xa), (false, s.i + 1, s.in_inf, s.xb)] {
+            let Some(inf) = inf else { continue };
+            let hx = if out { kx + reach * inf as f32 } else { kx - reach * inf as f32 };
+            p.line_segment([pos2(kx, base), pos2(hx, base)], Stroke::new(1.5, HANDLE));
+            let hr = Rect::from_center_size(pos2(hx, base), vec2(5.0, 5.0));
+            p.rect(hr, 0.0, HANDLE, Stroke::new(1.0, Color32::from_gray(20)), egui::StrokeKind::Inside);
+            if !editable {
+                continue;
+            }
+            let hit = Rect::from_center_size(pos2(hx, base - 2.0), vec2(12.0, 12.0));
+            let resp = ui.interact(hit, egui::Id::new(("tl-speed-handle", uid, key, out)), Sense::drag());
+            let side = if out { "out" } else { "in" };
+            app.auto.add(&format!("timeline.speed.{uid}.{key}.{side}"), hit, &format!("{} {side} influence {:.0}%", prop.name, inf * 100.0));
+            if resp.hovered() || resp.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                if !resp.dragged() {
+                    let _ = resp.clone().on_hover_text(format!("{side} influence {:.0}%", inf * 100.0));
+                }
+            }
+            if resp.drag_started() {
+                // The handle follows the pointer: influence from the key's x.
+                let g = Grab { key, out, x0: kx, inf0: 0.0, reach_px: reach };
+                ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
+                grab = Some(g);
+            }
+            if grab.is_some_and(|g| g.key == key && g.out == out) {
+                drag(&ctx, &resp, prop, layer, grab, actions, |g, px| ((px - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 });
+            }
+        }
+    }
+}
+
+/// Follows a handle or sculpt drag: `keys.setEase` with the influence `f` gives for the
+/// pointer x; on release ends the undo merge and forgets the grab.
+fn drag(
+    ctx: &egui::Context,
+    resp: &egui::Response,
+    prop: &Property,
+    layer: &Layer,
+    grab: Option<Grab>,
+    actions: &mut Vec<(String, serde_json::Value)>,
+    f: impl Fn(&Grab, f32) -> f64,
+) {
+    let Some(g) = grab else { return };
+    if resp.dragged()
+        && let Some(px) = resp.interact_pointer_pos()
+        && let Some(k) = prop.keys.get(g.key)
+    {
+        let inf = f(&g, px.x).clamp(MIN_INFLUENCE, MAX_INFLUENCE);
+        actions.push((
+            "keys.setEase".into(),
+            json!({"layer": layer.id.0, "prop": prop.uid, "time": k.time.seconds(), "side": if g.out { "out" } else { "in" }, "influence": inf, "merge": "tl-speed-ease"}),
+        ));
+        ctx.request_repaint();
+    }
+    if resp.drag_stopped() {
+        ctx.data_mut(|d| d.remove::<Grab>(grab_id(prop.uid)));
+        actions.push(("__endMerge".into(), json!({})));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use effectcraft_engine::keyframe::{Keyframe, Value};
+
+    fn prop_with(keys: Vec<Keyframe>) -> Property {
+        let mut p = Property::new(1, "opacity", "Opacity", Value::Scalar(0.0));
+        p.keys = keys;
+        p
+    }
+
+    #[test]
+    fn linear_and_hold_segments_draw_no_curve() {
+        let k = |s: f64, v: f64| Keyframe::new(Tick::from_seconds_f64(s), Value::Scalar(v));
+        assert!(!eased(&prop_with(vec![k(0.0, 0.0), k(1.0, 100.0)]), 0));
+        assert!(!eased(&prop_with(vec![k(0.0, 0.0).hold(), k(1.0, 100.0)]), 0));
+        assert!(eased(&prop_with(vec![k(0.0, 0.0).eased(), k(1.0, 100.0).eased()]), 0));
+        // One Bezier side is enough: the speed changes along the segment.
+        let mut a = k(0.0, 0.0);
+        a.out_interp = Interp::Bezier;
+        assert!(eased(&prop_with(vec![a, k(1.0, 100.0)]), 0));
+        // No segment past the last key.
+        assert!(!eased(&prop_with(vec![k(0.0, 0.0).eased()]), 0));
+    }
+
+    #[test]
+    fn easy_ease_peaks_mid_segment_at_one_and_a_half_times_the_average_speed() {
+        let k = |s: f64, v: f64| Keyframe::new(Tick::from_seconds_f64(s), Value::Scalar(v)).eased();
+        let prop = prop_with(vec![k(0.0, 0.0), k(1.0, 100.0)]);
+        let tm = TMap { x0: 0.0, start: 0.0, pps: 400.0 };
+        let segs = segments(&prop, &|t| t, tm, 0.0, 400.0);
+        let s = segs.first().expect("one eased segment");
+        assert!((s.peak_x - 200.0).abs() < 4.0, "peak at {}", s.peak_x);
+        // Easy Ease (33.33% both sides): the bezier peaks at 1.5× the average speed.
+        assert!((s.peak - 150.0).abs() < 3.0, "peak {}", s.peak);
+        assert_eq!(s.out_inf.map(|v| (v * 100.0).round()), Some(33.0));
+        assert_eq!(s.in_inf.map(|v| (v * 100.0).round()), Some(33.0));
+    }
+}

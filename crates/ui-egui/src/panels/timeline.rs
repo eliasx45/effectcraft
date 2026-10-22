@@ -17,6 +17,7 @@ use serde_json::json;
 mod beat;
 mod inline;
 mod snap;
+mod speed_rows;
 pub(crate) mod wheels;
 
 use crate::i18n::tr;
@@ -2898,6 +2899,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if !graph_on {
                     // Batch 1 (AX3): "Fast In · linked" on moves carrying a Library graph.
                     beat::graph_tags(&gp, tm, layer, prop, cy, graph_x0, rect.max.x, t.text_dim);
+                    // Speed curves, peak dots and influence handles (drawn under the keys, which win the clicks).
+                    let strip = Rect::from_min_max(pos2(graph_x0, r.min.y), pos2(rect.max.x, r.min.y + rh));
+                    speed_rows::show(app, ui, &gp, &comp, tm, layer, prop, strip, &mut actions);
                     for k in &prop.keys {
                         let ct = layer.comp_time(k.time);
                         let x = tm.x(ct.seconds());
