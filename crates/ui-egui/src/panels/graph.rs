@@ -1421,6 +1421,9 @@ fn fit_keys(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool,
     let mut t1 = f64::NEG_INFINITY;
     let mut v0 = f64::INFINITY;
     let mut v1 = f64::NEG_INFINITY;
+    // The keys' own time span, without their handles: one selected key is a lone key however far
+    // its handles reach.
+    let (mut k0, mut k1) = (f64::INFINITY, f64::NEG_INFINITY);
     for c in cs {
         if !selected_only && let Some(tr) = separated_position(c.layer, c.prop) {
             for key in POSITION_AXES.iter().filter_map(|axis| tr.get(axis)).flat_map(|prop| &prop.keys) {
@@ -1432,6 +1435,8 @@ fn fit_keys(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool,
             }
         }
         for k in c.keys.iter().filter(|k| !selected_only || k.sel) {
+            k0 = k0.min(k.t);
+            k1 = k1.max(k.t);
             for (t, v) in std::iter::once((k.t, k.v)).chain(k.handles.iter().map(|h| (h.t, h.v))) {
                 t0 = t0.min(t);
                 t1 = t1.max(t);
@@ -1456,7 +1461,7 @@ fn fit_keys(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool,
     }
     // A lone selected key (one point) also frames its neighbouring keys, so its curve shows
     // instead of a flat sliver a fraction of a frame wide.
-    if t1 - t0 < 1e-6 {
+    if !(k1 - k0 >= 1e-6) {
         for c in cs {
             for (i, k) in c.keys.iter().enumerate().filter(|(_, k)| !selected_only || k.sel) {
                 for n in [i.checked_sub(1).and_then(|j| c.keys.get(j)), c.keys.get(i + 1), Some(k)].into_iter().flatten() {

@@ -413,9 +413,12 @@ fn a_zero_speed_handle_dragged_in_the_speed_graph_keeps_its_segments_direction()
     h.state_mut().ui.timeline.graph_editor = true;
     h.state_mut().ui.timeline.graph_mode = "speed".into();
     h.run_steps(4);
-    let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.1.out")).expect("key 1's out handle").clone();
-    let p = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
-    drag(&mut h, p, p - egui::vec2(0.0, 60.0), Default::default());
+    // Each handle drags on its own (#1053): key 1's on the falling segment, then key 0's.
+    for key in [1, 0] {
+        let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.{key}.out")).unwrap_or_else(|| panic!("key {key}'s out handle")).clone();
+        let p = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
+        drag(&mut h, p, p - egui::vec2(0.0, 60.0), Default::default());
+    }
     let keys = h.state().session.active_comp().unwrap().layer(id).unwrap().props.prop("transform/opacity").unwrap().keys.clone();
     let out = |i: usize| keys[i].out_ease.first().map_or(0.0, |e| e.speed);
     assert!(out(1) < 0.0, "100 → 0 falls: {}", out(1));
