@@ -4890,6 +4890,21 @@ mod tests {
     }
 
     #[test]
+    fn shift_reveal_adds_to_what_the_layer_shows_now() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let l = app.session.state.selected_layers[0].0;
+        // Position shown some other way (Alt+Shift+P, another layer's reveal): the last reveal
+        // key was something else.
+        crate::menus::invoke(&mut app, &ctx, "timeline.reveal.opacity", json!({})).unwrap();
+        app.ui.timeline.layer_reveal.insert(l, vec!["position".into()]);
+        crate::menus::invoke(&mut app, &ctx, "timeline.revealAdd.scale", json!({})).unwrap();
+        assert_eq!(app.ui.timeline.layer_reveal.get(&l), Some(&vec!["position".to_string(), "scale".to_string()]));
+        crate::menus::invoke(&mut app, &ctx, "timeline.revealAdd.scale", json!({})).unwrap();
+        assert_eq!(app.ui.timeline.layer_reveal.get(&l), Some(&vec!["position".to_string()]));
+    }
+
+    #[test]
     fn scroll_to_time_centres_the_current_time_inside_the_comp() {
         assert_eq!(centered_on(4.0, 10.0, 5.0), 3.0);
         // Near the ends the view stops at the comp's start and end.

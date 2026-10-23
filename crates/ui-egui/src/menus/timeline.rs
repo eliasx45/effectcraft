@@ -77,16 +77,29 @@ pub fn reveal(app: &mut EffectcraftApp, kind: &str, now: f64, add: bool) {
     };
     let targets = reveal_targets(app);
     let tl = &mut app.ui.timeline;
+    if add {
+        // Shift+key adds to what each layer shows now, however it got there (another reveal
+        // key, U, Alt+Shift+key), as in After Effects; when every layer shows it already, it
+        // is taken away.
+        let on = !targets.iter().all(|id| tl.layer_reveal.get(id).is_some_and(|k| k.iter().any(|k| k == kind)));
+        let mut shown = Vec::with_capacity(targets.len());
+        for id in &targets {
+            let mut kinds = tl.layer_reveal.get(id).cloned().unwrap_or_default();
+            kinds.retain(|k| k != kind && (k != "props" || !tl.reveal_props.is_empty()));
+            if on {
+                kinds.push(kind.to_string());
+            }
+            tl.apply_reveal(&[*id], kinds.clone());
+            shown.push((*id, kinds));
+        }
+        for (id, kinds) in shown {
+            crate::panels::timeline::open_revealed(app, &[id], &kinds);
+        }
+        return;
+    }
     let present = tl.reveal.iter().any(|k| k == kind);
     let mut kinds = tl.reveal.clone();
-    if add {
-        if present {
-            kinds.retain(|k| k != kind);
-        } else {
-            kinds.retain(|k| k != "props" || !tl.reveal_props.is_empty());
-            kinds.push(kind.to_string());
-        }
-    } else if present && kinds.len() == 1 {
+    if present && kinds.len() == 1 {
         kinds.clear();
     } else {
         kinds = vec![kind.to_string()];
