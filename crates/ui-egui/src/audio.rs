@@ -16,6 +16,10 @@
 //!
 //! The feed also tracks per-channel peaks for the Audio panel's VU meters ([`Meter`]).
 //!
+//! **Play Faster** (×2, ×4, ×8): the feeder mixes that many times more of the comp per block and
+//! compresses it in time at the same pitch ([`Stretch`]); the clock counts each device frame as
+//! that many comp samples.
+//!
 //! **Scrubbing:** Ctrl/Cmd-dragging the current-time indicator plays a short snippet of the mix
 //! at each new frame ([`AudioScrub`], `playback.scrubAudio`), as in After Effects.
 //!
@@ -32,6 +36,8 @@ use effectcraft_engine::render::audio::AudioStream;
 use effectcraft_engine::time::{FrameRate, Tick};
 
 use crate::frames::RenderSource;
+
+pub use crate::audio_stretch::Stretch;
 
 /// An audio output (implemented by the native app with cpal).
 pub trait AudioDevice: Send {
@@ -209,7 +215,12 @@ impl PlaySpan {
 /// `latency`, from the span start, wrapped into the work area when looping (clamped at its end
 /// otherwise).
 pub fn clock_sample(span: &PlaySpan, consumed: u64, latency: u64) -> i64 {
-    let s = span.start + consumed.saturating_sub(latency) as i64;
+    clock_sample_at(span, consumed, latency, 1)
+}
+
+/// [`clock_sample`] at Play Faster's `speed`: each device frame is `speed` comp samples.
+pub fn clock_sample_at(span: &PlaySpan, consumed: u64, latency: u64, speed: u32) -> i64 {
+    let s = span.start.saturating_add((consumed.saturating_sub(latency) as i64).saturating_mul(i64::from(speed.max(1))));
     if s < span.wb {
         return s;
     }
@@ -236,7 +247,7 @@ pub struct AudioPlayback {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     /// wasm32 (no threads): what the feeder thread would own, run by [`AudioPlayback::pump`].
-    feeder: Option<(RenderSource, ItemId, i64, u32, AudioStream)>,
+    feeder: Option<(RenderSource, ItemId, i64, u32, AudioStream, Option<Stretch>)>,
     /// Native: where the feeder thread continues after a hold ([`AudioPlayback::resume`]).
     seek: Arc<Mutex<Option<i64>>>,
     pub comp: ItemId,
@@ -245,6 +256,13 @@ pub struct AudioPlayback {
     /// Device frames consumed before the span (re)started at `span.start`: the clock counts
     /// from there.
     base: u64,
+    /// Play Faster: comp samples per device frame (1 = normal speed).
+    pub speed: u32,
+}
+
+/// Play Faster's pitch-keeping time compression at `speed` (none at normal speed).
+fn stretch_for(rate: u32, speed: u32) -> Option<Stretch> {
+    (speed > 1).then(|| Stretch::new(rate, f64::from(speed)))
 }
 
 /// Audio kept queued ahead of the device: ~200 ms (a feeder thread tops it up continuously);
@@ -259,7 +277,7 @@ impl AudioPlayback {
     /// at (resampled to the device's rate when they differ; 0 = the device's rate).
     #[allow(clippy::too_many_arguments)]
     pub fn start(
-        mut device: Box<dyn AudioDevice>,
+        device: Box<dyn AudioDevice>,
         src: RenderSource,
         comp: ItemId,
         start: Tick,
@@ -268,6 +286,23 @@ impl AudioPlayback {
         looping: bool,
         mix_rate: u32,
     ) -> Result<AudioPlayback, String> {
+        Self::start_at_speed(device, src, comp, start, wa, wb, looping, mix_rate, 1)
+    }
+
+    /// [`Self::start`] at Play Faster's `speed` (×2, ×4, ×8): the sound keeps its pitch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_at_speed(
+        mut device: Box<dyn AudioDevice>,
+        src: RenderSource,
+        comp: ItemId,
+        start: Tick,
+        wa: Tick,
+        wb: Tick,
+        looping: bool,
+        mix_rate: u32,
+        speed: u32,
+    ) -> Result<AudioPlayback, String> {
+        let speed = speed.clamp(1, 16);
         let rate = device.sample_rate().max(8000);
         let mix = if mix_rate == 0 { rate } else { mix_rate.clamp(8000, 192_000) };
         let span = PlaySpan::new(start, wa, wb, looping, rate);
@@ -280,12 +315,13 @@ impl AudioPlayback {
                 device,
                 stop,
                 thread: None,
-                feeder: Some((src, comp, span.start, mix, AudioStream::default())),
+                feeder: Some((src, comp, span.start, mix, AudioStream::default(), stretch_for(rate, speed))),
                 seek: Arc::default(),
                 comp,
                 rate,
                 span,
                 base: 0,
+                speed,
             };
             p.device.start(feed)?;
             p.pump();
@@ -305,14 +341,17 @@ impl AudioPlayback {
                     let target = queue_target(rate);
                     // Keeps layer audio effects running from block to block (no pre-roll per block).
                     let mut stream = AudioStream::default();
+                    let mut stretch = stretch_for(rate, speed);
                     while !stop.load(Ordering::Relaxed) {
                         if let Some(to) = seek.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-                            // Resumed elsewhere: effect chains start over there.
+                            // Resumed elsewhere: effect chains (and the time compression) start
+                            // over there.
                             cursor = to;
                             stream = AudioStream::default();
+                            stretch = stretch_for(rate, speed);
                         }
                         if !feed.held.load(Ordering::Acquire) && feed.queued_frames() < target && !feed.finished.load(Ordering::Relaxed) {
-                            cursor = feed_block(&src, comp, &feed, &span, cursor, rate, mix, &stream);
+                            cursor = feed_block(&src, comp, &feed, &span, cursor, rate, mix, &stream, &mut stretch);
                         } else {
                             std::thread::sleep(std::time::Duration::from_millis(4));
                         }
@@ -321,7 +360,7 @@ impl AudioPlayback {
                 .map_err(|e| e.to_string())?
         };
         device.start(feed.clone())?;
-        Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, seek, comp, rate, span, base: 0 })
+        Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, seek, comp, rate, span, base: 0, speed })
     }
 
     /// Rendering fell behind: silence, keeping the device open (reopening it on the UI thread
@@ -341,9 +380,10 @@ impl AudioPlayback {
         // Outside the work area (cannot happen while it plays): from its start.
         let start = if start >= self.span.wb || start < self.span.wa { self.span.wa } else { start };
         self.span.start = start;
-        if let Some((_, _, cursor, _, stream)) = &mut self.feeder {
+        if let Some((_, _, cursor, _, stream, stretch)) = &mut self.feeder {
             *cursor = start;
             *stream = AudioStream::default();
+            *stretch = stretch_for(self.rate, self.speed);
         }
         *self.seek.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(start);
         // Everything handed to the device so far (the last buffers before the hold may still
@@ -355,10 +395,10 @@ impl AudioPlayback {
     /// Every UI frame while playing: on wasm32 mix ahead into the feed (what the feeder thread
     /// does elsewhere), then let the device take what it needs.
     pub fn pump(&mut self) {
-        if let Some((src, comp, cursor, mix, stream)) = &mut self.feeder {
+        if let Some((src, comp, cursor, mix, stream, stretch)) = &mut self.feeder {
             let target = queue_target(self.rate);
             while !self.feed.held.load(Ordering::Acquire) && self.feed.queued_frames() < target && !self.feed.finished.load(Ordering::Relaxed) {
-                *cursor = feed_block(src, *comp, &self.feed, &self.span, *cursor, self.rate, *mix, stream);
+                *cursor = feed_block(src, *comp, &self.feed, &self.span, *cursor, self.rate, *mix, stream, stretch);
             }
         }
         self.device.pump();
@@ -367,8 +407,8 @@ impl AudioPlayback {
     /// The comp sample index audible now.
     pub fn clock(&self) -> i64 {
         match self.device.audible_frames() {
-            Some(played) => clock_sample(&self.span, played.saturating_sub(self.base), 0),
-            None => clock_sample(&self.span, self.feed.consumed().saturating_sub(self.base), self.device.latency_frames()),
+            Some(played) => clock_sample_at(&self.span, played.saturating_sub(self.base), 0, self.speed),
+            None => clock_sample_at(&self.span, self.feed.consumed().saturating_sub(self.base), self.device.latency_frames(), self.speed),
         }
     }
 
@@ -394,9 +434,21 @@ impl Drop for AudioPlayback {
 }
 
 /// Mix one block at `cursor` into the feed; returns the next cursor (wrapping or finishing at
-/// the work-area end).
+/// the work-area end). With `stretch` (Play Faster) the block is that many times longer and
+/// goes in compressed in time: a loop's wrap goes through it too, so the device frames keep
+/// counting comp samples at the speed.
 #[allow(clippy::too_many_arguments)]
-fn feed_block(src: &RenderSource, comp: ItemId, feed: &AudioFeed, span: &PlaySpan, cursor: i64, rate: u32, mix: u32, stream: &AudioStream) -> i64 {
+fn feed_block(
+    src: &RenderSource,
+    comp: ItemId,
+    feed: &AudioFeed,
+    span: &PlaySpan,
+    cursor: i64,
+    rate: u32,
+    mix: u32,
+    stream: &AudioStream,
+    stretch: &mut Option<Stretch>,
+) -> i64 {
     let mut cursor = cursor;
     if cursor >= span.wb {
         if !span.looping {
@@ -405,9 +457,14 @@ fn feed_block(src: &RenderSource, comp: ItemId, feed: &AudioFeed, span: &PlaySpa
         }
         cursor = span.wa;
     }
-    let n = ((span.wb - cursor) as usize).min(BLOCK);
+    let per = stretch.as_ref().map_or(1, |s| s.speed().round() as usize).max(1);
+    let n = ((span.wb - cursor) as usize).min(BLOCK.saturating_mul(per));
     let epoch = feed.epoch.load(Ordering::Acquire);
     let block = mix_block(src, comp, sample_time(cursor, rate), n, rate, mix, Some(stream));
+    let block = match stretch {
+        Some(st) => st.process(&block),
+        None => block,
+    };
     if !feed.push_at(epoch, &block) {
         // Held or moved while mixing: the next block starts where playback resumes.
         return cursor;
@@ -806,6 +863,7 @@ mod tests {
             rate: 48_000,
             span: PlaySpan { start: 96_000, wa: 48_000, wb: 144_000, looping: false },
             base: 0,
+            speed: 1,
         };
         assert_eq!(playback.clock(), 97_600, "submitted samples do not jump the audible cursor");
         assert!(!playback.finished(), "the final hardware buffer is still playing");
@@ -844,6 +902,7 @@ mod tests {
             rate: 48_000,
             span: PlaySpan { start: 0, wa: 0, wb: 480_000, looping: true },
             base: 0,
+            speed: 1,
         };
         p.feed.push(&[0.5; 9600]);
         let mut out = vec![0.0f32; 9600];
@@ -906,6 +965,8 @@ mod tests {
         assert_eq!(clock_sample(&span, 48000 - 4800 + 100, 0), 100);
         let once = PlaySpan { looping: false, ..span };
         assert_eq!(clock_sample(&once, 100_000, 0), 47999);
+        // Play Faster ×4: each device frame is four comp samples.
+        assert_eq!(clock_sample_at(&span, 1000, 0, 4), 4800 + 4000);
     }
 
     #[test]

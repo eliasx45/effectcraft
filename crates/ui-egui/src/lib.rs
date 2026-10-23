@@ -414,8 +414,8 @@ pub struct Playback {
     /// Every frame shown since the preview started (UI seconds, frame), for `ui.inspect`'s
     /// frame-interval percentiles; capped at [`SHOWN_LOG_MAX`].
     pub log: Vec<(f64, i64)>,
-    /// Play Faster (FilmCraft's Shuttle Right): ×2, ×4 or ×8 the preview's rate, silent; 0 =
-    /// normal speed. The plan's rate and frame step are multiplied, so as many frames a second
+    /// Play Faster (FilmCraft's Shuttle Right): ×2, ×4 or ×8 the preview's rate, its sound
+    /// compressed in time at the same pitch (`audio::Stretch`); 0 = normal speed. The plan's rate and frame step are multiplied, so as many frames a second
     /// show as at normal speed.
     pub speed: u32,
 }
@@ -1788,10 +1788,10 @@ impl EffectcraftApp {
         self.playback.start_frame = cur;
         self.playback.waiting = false;
         self.playback.shown_at.clear();
-        // Silent at speed; back at ×1 the sound starts again once the frames ahead are cached.
+        // The sound starts over at the new speed (same pitch) once the frames ahead are cached.
         self.audio = None;
         self.playback.preroll = None;
-        let sound = new == 1 && self.audio_plays();
+        let sound = self.audio_plays();
         self.playback.audio_held = sound && pl.video;
         if sound && !pl.video {
             self.start_audio(self.session.active_comp().map(|c| c.frame_rate.tick_of(cur)).unwrap_or_default());
@@ -1804,8 +1804,10 @@ impl EffectcraftApp {
     fn audio_plays(&self) -> bool {
         let (Some(pl), Some(cid)) = (self.playback.plan, self.session.active_comp_id()) else { return false };
         let Some(c) = self.session.project.comp(cid) else { return false };
-        // A preview at another frame rate plays slower or faster than real time: silent.
-        pl.audio && (pl.fps - c.frame_rate.as_f64()).abs() <= 0.01 && effectcraft_engine::render::audio::comp_has_audio(&self.session.project, cid)
+        // A preview at another frame rate plays slower or faster than real time: silent. Play
+        // Faster's rate is the speed times the preview's (its sound keeps its pitch).
+        let speed = f64::from(self.playback.speed.max(1));
+        pl.audio && (pl.fps / speed - c.frame_rate.as_f64()).abs() <= 0.01 && effectcraft_engine::render::audio::comp_has_audio(&self.session.project, cid)
     }
 
     /// Start audio preview from comp time `t` when [`Self::audio_plays`] and an output device
@@ -1819,7 +1821,7 @@ impl EffectcraftApp {
         // Held while rendering caught up (same preview): play on, without reopening the device.
         if let Some(mut a) = held.filter(|a| {
             let span = audio::PlaySpan::new(t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, a.rate);
-            a.held() && a.comp == cid && (a.span.wa, a.span.wb, a.span.looping) == (span.wa, span.wb, span.looping)
+            a.held() && a.comp == cid && a.speed == self.playback.speed.max(1) && (a.span.wa, a.span.wb, a.span.looping) == (span.wa, span.wb, span.looping)
         }) {
             a.resume(t);
             self.audio = Some(a);
@@ -1828,7 +1830,8 @@ impl EffectcraftApp {
         let out = audio::AudioOutput::from_prefs(&self.session.prefs);
         let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
         let mix = self.session.prefs.audio.preview_sample_rate;
-        match audio::AudioPlayback::start(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix) {
+        let speed = self.playback.speed.max(1);
+        match audio::AudioPlayback::start_at_speed(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix, speed) {
             Ok(a) => self.audio = Some(a),
             Err(e) => log::warn!("audio preview: {e}"),
         }
@@ -2235,9 +2238,10 @@ impl EffectcraftApp {
                 return;
             }
             // Wake when the audible sample reaches the next frame (not at the display's refresh
-            // rate): a 24 fps preview rebuilds the UI 24 times a second, not 120.
+            // rate): a 24 fps preview rebuilds the UI 24 times a second, not 120. Play Faster's
+            // sound covers that much comp time `speed` × sooner.
             let next = fr.tick_of(target.saturating_add(step.max(1))).seconds();
-            ctx.request_repaint_after(until_next_frame(next - audio::sample_time(audible, a.rate).seconds()));
+            ctx.request_repaint_after(until_next_frame((next - audio::sample_time(audible, a.rate).seconds()) / f64::from(a.speed.max(1))));
             return;
         }
         let elapsed = now - self.playback.start_wall;
