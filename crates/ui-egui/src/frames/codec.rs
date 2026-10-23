@@ -284,7 +284,11 @@ mod tests {
         };
         assert!(codec.unpack(key(1), packed.clone()));
         drained(&codec);
-        assert_eq!((codec.lock().running, codec.lock().waiting), (1, 1), "the thread stays");
+        // One guard: two `lock()` calls in one statement would hold the first while taking the
+        // second, and the test would wait on itself forever.
+        let s = codec.lock();
+        assert_eq!((s.running, s.waiting), (1, 1), "the thread stays");
+        drop(s);
         for f in 2..10 {
             assert!(codec.unpack(key(f), packed.clone()));
             drained(&codec);
