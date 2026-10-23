@@ -109,11 +109,20 @@ thread_local! {
     static TOTAL_RUNS: Cell<u64> = const { Cell::new(0) };
     /// Script runs since the outermost evaluation on this thread began (nested ones included).
     pub static RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whether the last run on this thread read the comp time (`time`, or an explicit time
+    /// argument; see the prelude's `__timeRead`).
+    static TIME_READ: Cell<bool> = const { Cell::new(true) };
 }
 
 /// Script runs on this thread so far (each evaluation runs its script one or more times).
 pub fn runs() -> u64 {
     TOTAL_RUNS.with(Cell::get)
+}
+
+/// Whether the last run on this thread read the comp time. Read it right after [`run`]
+/// returns: the next run (a nested evaluation's too) overwrites it. `true` when unknown.
+pub fn time_read() -> bool {
+    TIME_READ.with(Cell::get)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -421,6 +430,7 @@ impl Runtime {
             }
         });
         TOTAL_RUNS.with(|r| r.set(r.get().saturating_add(1)));
+        TIME_READ.with(|r| r.set(true));
         let args = [
             JsValue::from(b.time),
             to_js(b.value, ctx),
@@ -442,6 +452,10 @@ impl Runtime {
             // Abandoned mid-run: the context is unusable now (see `run`).
             None => return Run::Done(Err(TIMED_OUT.into())),
         };
+        // Anything but a plain `false` counts as read (the memo then keys the result by time).
+        let global = ctx.global_object();
+        let read = !global.get(js_string!("__timeRead"), ctx).is_ok_and(|v| v.as_boolean() == Some(false));
+        TIME_READ.with(|r| r.set(read));
         let pending = FRAMES.with(|f| f.borrow().last().is_some_and(|fr| !fr.misses.is_empty()));
         if pending {
             return Run::Pending;
