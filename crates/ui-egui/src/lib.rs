@@ -538,6 +538,8 @@ pub struct EffectcraftApp {
     pub(crate) passive_tex: std::collections::HashMap<u32, (FrameKey, panels::viewers::PassiveTexture)>,
     /// The last GPU frame shown: its egui texture id (registered with egui-wgpu), key and texture.
     pub(crate) viewer_native: Option<(egui::TextureId, FrameKey, Arc<effectcraft_gpu::DisplayFrame>)>,
+    /// UP1: the FSR1 upscale of low-resolution GPU frames shown magnified (`fsr_upscale`).
+    pub(crate) viewer_fsr: fsr_upscale::Upscaler,
     /// The texture the viewer draws and its frame key (CPU or GPU frame).
     pub(crate) viewer_shown: Option<(egui::TextureId, FrameKey)>,
     /// Last displayed image (Info panel colour, eyedroppers, histograms). GPU frames fill it on
@@ -686,6 +688,7 @@ impl EffectcraftApp {
             sharp_zoom: Default::default(),
             passive_tex: std::collections::HashMap::new(),
             viewer_native: None,
+            viewer_fsr: Default::default(),
             viewer_shown: None,
             viewer_image: None,
             viewer_readback: Default::default(),

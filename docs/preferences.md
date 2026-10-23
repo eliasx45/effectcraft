@@ -56,6 +56,13 @@ Commands (CLI, MCP, control channel):
   Previews ▸ Adaptive Resolution does. Also `view.adaptivePlayback {on?}` and the viewer's Fast
   Previews menu. An explicit Resolution (the viewer's or the Preview panel's), a cloud preview
   (its stream has its own levels) and exports never change.
+- `previews.upscaleLowRes`: Sharpen Low-Resolution Previews (FSR) (on; beyond After Effects): a
+  GPU viewer frame rendered below Full (Half, Third, Quarter, or adaptive playback) and shown
+  magnified is upscaled to its size on screen with AMD FidelityFX Super Resolution 1.0 (EASU, then
+  RCAS sharpening at 0.2 stops; about 0.4 ms for 960×540 → 1920×1080) instead of showing its pixels
+  as blocks. Off: blocks, as in After Effects (#882). Frames composited on the CPU, Show Channel /
+  exposure views, renders and exports never change. Also `view.upscaleLowRes {on?}` and the
+  viewer's Fast Previews menu.
 - `previews.adaptiveResolutionLimit`: Adaptive Resolution Limit (the lowest resolution Fast Previews ▸
   Adaptive Resolution drops to while you drag, and adaptive playback while it plays)
 - `previews.cacheFramesWhenIdle`: Cache Frames When Idle (Composition ▸ Preview): after a second
