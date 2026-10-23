@@ -81,8 +81,6 @@ pub struct LayerCache {
     /// Keys being rendered right now, by whom, and owners that stopped making progress (see
     /// [`LayerCache::claim`]).
     inflight: Arc<Mutex<Flights>>,
-    /// Precomp layers' consecutive key misses (see [`LayerCache::precomp_try`]).
-    streaks: Mutex<HashMap<u64, u32>>,
     /// Shape layers' whole raster buffers by content key (see [`LayerCache::shape_rect`]).
     shape_rects: Mutex<HashMap<u64, Option<ShapeRect>>>,
     /// Shape layers' last content key, when it was seen and for how many times since it held
@@ -446,7 +444,6 @@ impl LayerCache {
             store: Mutex::new(None),
             gate: Mutex::new(None),
             inflight: Arc::default(),
-            streaks: Mutex::new(HashMap::new()),
             shape_rects: Mutex::new(HashMap::new()),
             shape_keys: Mutex::new(HashMap::new()),
         }
@@ -1101,23 +1098,6 @@ impl LayerCache {
         }
     }
 
-    /// Whether to key precomp layer `id` (a hash of its comp and layer) this time. A precomp
-    /// whose key missed on several frames in a row is animated: keying it evaluates its nested
-    /// comp's animated properties (expressions included) once more than rendering it does, so
-    /// it is keyed only every eighth frame until a key hits again.
-    pub(crate) fn precomp_try(&self, id: u64) -> bool {
-        let Ok(mut m) = self.streaks.lock() else { return true };
-        let n = m.get(&id).copied().unwrap_or(0);
-        let attempt = n < 2 || n % 8 == 0;
-        if !attempt {
-            if m.len() > 4096 {
-                m.clear();
-            }
-            m.insert(id, n.saturating_add(1));
-        }
-        attempt
-    }
-
     /// The whole raster buffer of the shape layer whose content key is `key` (which fixes it),
     /// measured by `measure` once (a walk of the layer's shapes; see [`crate::clip`]).
     pub(crate) fn shape_rect(&self, key: u64, measure: impl FnOnce() -> Option<ShapeRect>) -> Option<ShapeRect> {
@@ -1152,16 +1132,6 @@ impl LayerCache {
             *e = (key, t, e.2.saturating_add(1));
         }
         e.2 >= 2
-    }
-
-    /// The outcome of keying precomp layer `id` (see [`Self::precomp_try`]).
-    pub(crate) fn precomp_note(&self, id: u64, hit: bool) {
-        let Ok(mut m) = self.streaks.lock() else { return };
-        if m.len() > 4096 {
-            m.clear();
-        }
-        let n = m.entry(id).or_insert(0);
-        *n = if hit { 0 } else { n.saturating_add(1) };
     }
 }
 
