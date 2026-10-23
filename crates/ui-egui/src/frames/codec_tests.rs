@@ -97,13 +97,6 @@ fn packed_frames(f: &Frames) -> Vec<i64> {
     v
 }
 
-/// Set the budget without evicting (the frames stay; only the uncompressed share is trimmed).
-fn squeeze(f: &Frames, budget: usize) {
-    let mut c = f.cache.lock().unwrap();
-    c.budget = budget;
-    c.trim_raw();
-}
-
 /// A frame compressed in RAM decodes to exactly the pixels it was rendered with, at odd sizes
 /// too (fewer rows than strips, widths not a multiple of anything).
 #[test]
@@ -117,9 +110,11 @@ fn compressed_frames_decode_to_the_exact_pixels() {
     }
     settle(&f);
     assert!(packed_frames(&f).is_empty(), "room to spare: nothing compressed");
-    // The pixels fill the budget exactly: past the headroom, so the oldest are compressed.
+    // The pixels fill 95 % of the budget: past the headroom, so the oldest are compressed. Not
+    // 100 %: the tiny frames' compressed bytes are more than their pixels (the strips' headers),
+    // and a cache filled to the byte would evict them as they land.
     let total: usize = originals.iter().map(|i| i.pixels.len() * 4).sum();
-    f.set_budget(total);
+    f.set_budget(total * 21 / 20);
     settle(&f);
     {
         let c = f.cache.lock().unwrap();
@@ -230,21 +225,26 @@ fn the_budget_counts_compressed_bytes_through_inserts_and_evictions() {
 fn the_window_ahead_of_the_playhead_keeps_its_pixels() {
     let f = Frames::default();
     f.set_compress(true, 2);
-    // Flat frames: their compressed bytes take next to no room, so nothing is evicted.
-    let originals: Vec<_> = (0..10).map(|i| flat(64, 36, i)).collect();
-    for (i, img) in originals.iter().enumerate() {
-        f.cache.lock().unwrap().insert(key(i as i64), FrameImage::Cpu(img.clone()));
-    }
     // A range longer than the cache holds (the loop doesn't fit), not looping.
     let at = |cur: i64| Playhead { series: key(0), cur, start: 0, end: 19, step: 1, looping: false };
     f.set_playhead(Some(at(3)));
-    settle(&f);
-    assert!(packed_frames(&f).is_empty(), "room to spare");
-    // Room for six frames' pixels: every frame but the window (3, 4, 5) is compressed.
-    squeeze(&f, 6 * SMALL);
-    settle(&f);
-    assert_eq!(raw_frames(&f), vec![3, 4, 5]);
-    assert_eq!(packed_frames(&f), vec![0, 1, 2, 6, 7, 8, 9]);
+    // Room for six frames' pixels, filled one frame at a time as playback renders them. (Not
+    // squeezed below what the cache holds: a frame landing compressed would then evict the ones
+    // still on their way, as `Frames::set_budget` does at once.) Flat frames: their compressed
+    // bytes take next to no room, so nothing is evicted.
+    f.set_budget(6 * SMALL);
+    let originals: Vec<_> = (0..10).map(|i| flat(64, 36, i)).collect();
+    for (i, img) in originals.iter().enumerate() {
+        f.cache.lock().unwrap().insert(key(i as i64), FrameImage::Cpu(img.clone()));
+        settle(&f);
+    }
+    assert_eq!(f.memory_usage(false).frames, 10, "compressed, not evicted");
+    let (raw, packed) = (raw_frames(&f), packed_frames(&f));
+    assert!([3, 4, 5].iter().all(|i| raw.contains(i)), "the window keeps its pixels: {raw:?}");
+    // The frames it doesn't reach go first, then the ones it reaches last.
+    assert!([0, 1, 2, 9].iter().all(|i| packed.contains(i) && !raw.contains(i)), "{packed:?}");
+    assert!((6..10).all(|i| !packed.contains(&i) || (i..10).all(|j| packed.contains(&j))), "farthest first: {packed:?}");
+    assert_counts(&f);
     // Moving back: 0, 1, 2 are decoded ahead of it, exactly.
     f.set_playhead(Some(at(0)));
     settle(&f);
