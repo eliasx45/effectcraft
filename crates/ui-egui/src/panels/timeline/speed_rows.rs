@@ -306,10 +306,12 @@ pub(crate) fn show(
         let ptr = ui.input(|i| i.pointer.hover_pos()).filter(|p| strip.expand(HANDLE_PICK).contains(*p))?;
         pick(&handles, ptr, ctx.data(|d| d.get_temp(hot_id(uid))))
     });
-    match hot {
-        Some(h) => ctx.data_mut(|d| d.insert_temp(hot_id(uid), h)),
-        None => ctx.data_mut(|d| d.remove::<(usize, bool)>(hot_id(uid))),
-    }
+    ctx.data_mut(|d| match hot {
+        Some(h) => {
+            d.insert_temp(hot_id(uid), h);
+        }
+        None => d.remove::<(usize, bool)>(hot_id(uid)),
+    });
     for h in &handles {
         app.auto.add(
             &format!("timeline.speed.{uid}.{}.{}", h.key, if h.out { "out" } else { "in" }),
