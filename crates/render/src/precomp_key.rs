@@ -19,7 +19,8 @@
 //! at other times, with every keyframe. The time counts when a layer is read at other times, and
 //! such a layer's expressions must read nothing but their own value and the time
 //! ([`crate::cache::free::self_contained`]): one that may read other layers or comps at those
-//! times, out of the key's sight, leaves the comp unkeyed.
+//! times, out of the key's sight, leaves the comp unkeyed. A layer the frame doesn't use (not
+//! active, and nothing used points at it) counts only by its place, expressions included.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -272,15 +273,17 @@ impl<'a> Renderer<'a> {
                 Mode::Window(..) => li.contained_sampled,
                 Mode::Whole => li.contained_inner && (!sampled.get(i).copied().unwrap_or(true) || li.contained_sampled),
             };
-            if li.expressions && !contained {
-                warn_unkeyed(self.project, id, l);
-                return None;
-            }
             if !used(i) {
                 // Unused: its id and switches (solo hides the comp's other layers at every time).
+                // Its expressions don't count either: the frame doesn't draw it, and a used layer
+                // that reads it by an expression is keyed by the value it reads (or isn't keyed).
                 (0xdead_u16, l.id).hash(&mut h);
                 hash_debug(&mut h, &l.switches);
                 continue;
+            }
+            if li.expressions && !contained {
+                warn_unkeyed(self.project, id, l);
+                return None;
             }
             timed |= *mode != Mode::Free;
             hash_debug(&mut h, mode);

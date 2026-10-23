@@ -321,6 +321,29 @@ fn a_motion_blurred_layers_parent_keeps_the_keyframes_its_shutter_reads_in_the_k
     assert!(kept.iter().all(|f| *f < 90 || *f == END), "{kept:?}");
 }
 
+/// A layer the frame doesn't use (outside its in and out points) doesn't leave the comp
+/// unkeyed by its expressions: lab X1 found a text preset's expressions keeping a whole precomp
+/// out of the layer cache at times it wasn't on screen.
+#[test]
+fn an_unused_layers_expressions_dont_block_the_fingerprint() {
+    let (mut p, cid) = scene();
+    let mut l = p.comp(cid).unwrap().layers.get(0).unwrap().clone();
+    effect(&mut p, &mut l, "ec.time.echo");
+    effect(&mut p, &mut l, "ec.blur.gaussian");
+    l.props.prop_mut("effects/#2/blurriness").unwrap().expr = Some(Expression { text: "thisComp.layer(2).transform.opacity * 0.5".into(), enabled: true });
+    l.in_point = s(3.0);
+    l.out_point = s(3.5);
+    *p.comp_mut(cid).unwrap().layers.get_mut(0).unwrap() = l;
+    // On screen, it may read anything at other times: no fingerprint.
+    assert_eq!(print(&p, cid, s(3.2)), None);
+    // Before its in point the frame doesn't draw it.
+    assert!(print(&p, cid, s(1.0)).is_some());
+    // And an edit to the layer still keeps the frames it isn't on.
+    let q = edit(&p, cid, |l| l.props.prop_mut("transform/position").unwrap().keys[3].value = Value::Vec3([0.0, 0.0, 0.0]));
+    let kept = kept(&p, &q, cid);
+    assert!((0..90).step_by(5).all(|f| kept.contains(&f)), "{kept:?}");
+}
+
 #[test]
 fn a_time_reader_meeting_an_expression_has_no_fingerprint() {
     let (mut p, cid) = scene();
