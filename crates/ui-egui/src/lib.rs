@@ -471,6 +471,10 @@ impl Playback {
 pub struct EffectcraftApp {
     pub session: Session,
     pub ui: UiState,
+    /// Read the system's and the process's memory every few seconds (cache budgets, the memory
+    /// chip). Off in the hidden copies `effectcraft-cli mcp --ui` runs (MEM3): they read the
+    /// machine's memory once when they start.
+    pub watch_system: bool,
     workspace_store: workspace_state::WorkspaceStore,
     pub tokens: Tokens,
     pub auto: automation::Registry,
@@ -637,6 +641,7 @@ impl EffectcraftApp {
         ui.timeline.graph_mode = session.prefs.graph_type.clone();
         let workspace_store = workspace_state::WorkspaceStore::load(session.config.as_deref(), &mut ui);
         EffectcraftApp {
+            watch_system: true,
             session,
             ui,
             workspace_store,

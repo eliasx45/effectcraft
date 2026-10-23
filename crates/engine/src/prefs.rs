@@ -853,9 +853,11 @@ impl Prefs {
     /// their defaults grow with its memory: an eighth and a quarter of it, up to 16 and 32 GB, so
     /// the layers and frames an edit doesn't change stay cached across the timeline; the preview
     /// only up to [`COMPRESSED_PREVIEW_CACHE`] with Compress RAM Preview Frames on), scaled
-    /// down so together they leave **RAM Reserved for Other Applications** free,
-    /// and halved while the system is low on memory when **Reduce Cache Size When System Is Low
-    /// on Memory** is on. `mem` = the system's memory (`None` = unknown: configured budgets).
+    /// down so together they leave **RAM Reserved for Other Applications** free (at least
+    /// [`MIN_RESERVED_SHARE`] of the machine's memory: [`Prefs::ram_reserved_bytes`]),
+    /// and with **Reduce Cache Size When System Is Low on Memory** on halved while the system is
+    /// low on memory or under memory pressure, quartered under critical pressure
+    /// ([`crate::sysinfo::SysMemory::cache_divisor`]). `mem` = the system's memory (`None` = unknown: configured budgets).
     /// In the browser the layer and footage caches also stay within [`WEB_LAYER_CACHE`] and
     /// [`WEB_MEDIA_CACHE`].
     pub fn cache_budgets(&self, mem: Option<crate::sysinfo::SysMemory>) -> CacheBudgets {
@@ -882,7 +884,7 @@ impl Prefs {
         let mut capped = false;
         let mut reduced = false;
         if let Some(mem) = mem.filter(|m| m.total > 0) {
-            let reserved = (self.memory.ram_reserved_gb as u64) << 30;
+            let reserved = self.ram_reserved_bytes(mem.total);
             let cap = mem.total.saturating_sub(reserved).max(3 * floor);
             let sum = l + m + p;
             if sum > cap {
@@ -890,8 +892,9 @@ impl Prefs {
                 (l, m, p) = ((l as f64 * k) as u64, (m as f64 * k) as u64, (p as f64 * k) as u64);
                 capped = true;
             }
-            if self.memory.reduce_cache_when_low && mem.is_low() {
-                (l, m, p) = (l / 2, m / 2, p / 2);
+            let k = mem.cache_divisor();
+            if self.memory.reduce_cache_when_low && k > 1 {
+                (l, m, p) = (l / k, m / k, p / k);
                 reduced = true;
             }
         }
@@ -899,6 +902,15 @@ impl Prefs {
         // One budget for the three (never in the browser: its caches keep their own limits).
         let shared = (self.memory.shared_cache_budget && !web).then(|| Split::of(l, m, p));
         CacheBudgets { layer: l as usize, media: m as usize, preview: p as usize, capped, reduced, shared }
+    }
+
+    /// The memory the caches leave free on a machine with `total` bytes: RAM Reserved for Other
+    /// Applications, and at least [`MIN_RESERVED_SHARE`] of the machine. The caches are not all
+    /// the app holds (GPU textures, which are RAM on unified memory, decoders, effect buffers),
+    /// and macOS and the apps beside it need the rest: on 22 Oct 2026 a 64 GB Mac with 10 GB
+    /// reserved let the caches take 40 GB, and it swapped until other apps stopped responding.
+    pub fn ram_reserved_bytes(&self, total: u64) -> u64 {
+        ((self.memory.ram_reserved_gb as u64) << 30).max(total / MIN_RESERVED_SHARE)
     }
 
     /// Composition ▸ Motion Path: the layer-time span of a motion path to draw around `now`
@@ -1040,6 +1052,10 @@ pub const LARGE_MEMORY: u64 = 32 << 30;
 /// Frames on (see [`Prefs::cache_budgets`]): 8 GB of compressed frames hold about what 19 GB of
 /// uncompressed ones did (`plan/memory/compressed-cache.md`).
 pub const COMPRESSED_PREVIEW_CACHE: u64 = 8 << 30;
+
+/// At least 1 / this of the machine's memory stays out of the caches, whatever RAM Reserved for
+/// Other Applications says (see [`Prefs::ram_reserved_bytes`]): half.
+pub const MIN_RESERVED_SHARE: u64 = 2;
 
 /// The most the footage frame cache holds in the browser (see [`WEB_LAYER_CACHE`]).
 pub const WEB_MEDIA_CACHE: u64 = 256 << 20;

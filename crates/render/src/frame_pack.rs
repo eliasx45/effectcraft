@@ -62,6 +62,18 @@ pub fn raw_len(width: u32, height: u32) -> Option<usize> {
     (n > 0 && n <= MAX_RAW_BYTES).then_some(n)
 }
 
+/// Threads of [`decode_pool`]: with the calling thread, the viewer's four.
+#[cfg(not(target_arch = "wasm32"))]
+const DECODE_POOL_THREADS: usize = 3;
+
+/// The threads a frame's strips decode on besides the caller's, made at the first parallel
+/// decode and kept (`None` if the system refused them).
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(DECODE_POOL_THREADS).thread_name(|i| format!("ec-frame-unpack-{i}")).build().ok()).as_ref()
+}
+
 /// Decompress strips into their slices of the frame: whether every one decoded whole.
 fn decode_group(group: Vec<(&[u8], &mut [u8])>) -> bool {
     group.into_iter().all(|(src, dst)| lz4_flex::block::decompress_into(src, dst).is_ok_and(|n| n == dst.len()))
@@ -204,31 +216,25 @@ impl PackedFrame {
         }
         let mut groups = groups.into_iter();
         let mine = groups.next().unwrap_or_default();
-        // Each other group waits in a slot its thread takes it from; a thread the system
-        // refuses leaves its group there, and it decodes on this thread instead.
-        let slots: Vec<std::sync::Mutex<Option<Vec<(&[u8], &mut [u8])>>>> = groups.map(|g| std::sync::Mutex::new(Some(g))).collect();
-        std::thread::scope(|s| {
-            let mut handles = Vec::new();
-            for slot in &slots {
-                let spawned = std::thread::Builder::new()
-                    .name("ec-frame-unpack".into())
-                    .spawn_scoped(s, move || slot.lock().ok().and_then(|mut g| g.take()).is_none_or(decode_group));
-                if let Ok(h) = spawned {
-                    handles.push(h);
+        // The other groups go to the decode pool, made once and kept (MEM3: a new thread per
+        // group per frame used to be started); without it, this thread decodes them all.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(pool) = decode_pool() {
+            let failed = std::sync::atomic::AtomicBool::new(false);
+            let failed_ref = &failed;
+            let ok = pool.in_place_scope(|s| {
+                for g in groups {
+                    s.spawn(move |_| {
+                        if !decode_group(g) {
+                            failed_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    });
                 }
-            }
-            let mut ok = decode_group(mine);
-            for slot in &slots {
-                let left = slot.lock().ok().and_then(|mut g| g.take());
-                if let Some(g) = left {
-                    ok = decode_group(g) && ok;
-                }
-            }
-            for h in handles {
-                ok = h.join().unwrap_or(false) && ok;
-            }
-            ok
-        })
+                decode_group(mine)
+            });
+            return ok && !failed.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        groups.fold(decode_group(mine), |ok, g| decode_group(g) && ok)
     }
 
     /// The frame's RGBA8 pixels (`None` when damaged or memory runs out).

@@ -169,11 +169,19 @@ fn main() -> eframe::Result {
     };
     // Hardware ProRes decoding for previews; exports keep their exact decoder.
     log::info!("hardware ProRes decoding: {:?}", effectcraft_platform::register());
-    // Cache Frames When Idle renders, and RAM preview frames are compressed, at background
-    // priority (macOS utility QoS), after the UI, playback, the render workers and other apps.
-    effectcraft_ui_egui::frames::set_idle_thread_start(|| {
-        effectcraft_platform::background_thread();
-    });
+    // MEM3: Rayon's global pool leaves a core or two to other apps (before anything uses it).
+    effectcraft_engine::render::concurrency::init_global_pool();
+    // Background work (prefetch away from the playhead, footage read-ahead, Cache Frames When
+    // Idle, RAM preview compression) runs at background priority (macOS utility QoS), after the
+    // UI, the frames the viewer and playback wait for (user-initiated) and other apps.
+    effectcraft_engine::render::concurrency::set_thread_priority_hooks(
+        || {
+            effectcraft_platform::background_thread();
+        },
+        || {
+            effectcraft_platform::foreground_thread();
+        },
+    );
     // The session log lives in the settings folder (`Logs/effectcraft.log`, the previous two runs
     // kept): a launch from the Dock or a menu has no terminal. Opened after the arguments, so
     // `--version` leaves no file behind; records logged until now are written to it first.

@@ -31,10 +31,12 @@ pub fn set_thread_start(hook: fn()) {
     let _ = THREAD_START.set(hook);
 }
 
-/// Run the [`set_thread_start`] hook on the calling thread, if one was set.
+/// Run the [`set_thread_start`] hook on the calling thread, else lower it to background
+/// priority the app's way (`effectcraft_render::concurrency::set_thread_priority_hooks`).
 pub(crate) fn thread_start() {
-    if let Some(hook) = THREAD_START.get() {
-        hook();
+    match THREAD_START.get() {
+        Some(hook) => hook(),
+        None => effectcraft_engine::render::concurrency::background_thread(),
     }
 }
 

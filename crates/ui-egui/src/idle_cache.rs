@@ -31,7 +31,7 @@ mod tests {
 
     #[test]
     fn idle_caching_waits_while_memory_is_short() {
-        let mem = |available: u64| Some(SysMemory { total: 64 * GB, available });
+        let mem = |available: u64| Some(SysMemory { total: 64 * GB, available, pressure: None });
         // Plenty free, normal pressure or none reported: go on.
         assert_eq!(memory_wait(mem(30 * GB), Some(MemoryPressure::Normal), 16), None);
         assert_eq!(memory_wait(mem(30 * GB), None, 16), None);
@@ -45,7 +45,7 @@ mod tests {
         assert!(memory_wait(mem(30 * GB), Some(MemoryPressure::Critical), 0).is_some());
         // Nothing known: go on.
         assert_eq!(memory_wait(None, None, 16), None);
-        assert_eq!(memory_wait(Some(SysMemory { total: 0, available: 0 }), None, 16), None);
+        assert_eq!(memory_wait(Some(SysMemory { total: 0, available: 0, pressure: None }), None, 16), None);
         // Pressure alone is enough when the totals are unknown.
         assert!(memory_wait(None, Some(MemoryPressure::Warning), 16).is_some());
     }

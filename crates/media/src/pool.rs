@@ -1307,11 +1307,21 @@ impl Inner {
     /// Start the decode-ahead runner `id` of `path`: a plain thread, not a rayon job (rayon
     /// workers wait for the frames it decodes). It decodes in its own thread pool, so codecs that
     /// parallelise with rayon don't queue their work behind the global pool's waiting workers.
+    /// The runner and the pool run at background priority, on all but a core or two (MEM3:
+    /// `effectcraft_render::concurrency`): a frame playback needs before they reach it is decoded
+    /// by the frame thread asking for it, at its own priority.
     #[cfg(not(target_arch = "wasm32"))]
     fn start_runner(self: &Arc<Self>, path: Arc<str>, id: u64) -> bool {
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let pool =
-            self.ahead_pool.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("ec-media-ahead-{i}")).build().ok());
+        use effectcraft_render::concurrency::{background_thread, interactive_threads};
+        let threads = interactive_threads(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let pool = self.ahead_pool.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("ec-media-ahead-{i}"))
+                .start_handler(|_| background_thread())
+                .build()
+                .ok()
+        });
         if pool.is_none() {
             return false;
         }
@@ -1319,6 +1329,7 @@ impl Inner {
         std::thread::Builder::new()
             .name("ec-media-decode-ahead".into())
             .spawn(move || {
+                background_thread();
                 let _stop = RunnerStop { inner: weak.clone(), path: path.clone(), id };
                 while let Some(inner) = weak.upgrade() {
                     if !inner.run_ahead(&path, id) {

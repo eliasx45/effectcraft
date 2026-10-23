@@ -1413,7 +1413,11 @@ fn purge_comp(cache: &Mutex<Cache>, comp: Option<u64>) -> u64 {
 impl Default for Frames {
     fn default() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let threads = effectcraft_engine::render::concurrency::frame_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        // All but a core or two (MEM3): playback at full speed left other apps no core.
+        let threads = {
+            use effectcraft_engine::render::concurrency::{frame_threads, interactive_threads};
+            frame_threads(interactive_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)))
+        };
         let gpu_gate = Arc::new(vram::Gate::default());
         let codec = Arc::new(codec::Codec::default());
         let cache = Arc::new(Mutex::new(Cache::new(codec.clone())));
@@ -2906,6 +2910,10 @@ impl Worker {
                 q.parked += 1;
                 return false;
             }
+            // What the viewer or playback waits for renders at foreground priority; prefetch away
+            // from the playing playhead, idle and disk-only frames at background priority, after
+            // other apps (MEM3).
+            let foreground = j.urgent || (!j.idle && !j.disk_only && playhead.as_ref().is_some_and(|p| p.ahead(&j.key).is_some()));
             let mut job = q.jobs.swap_remove(i);
             job.epoch = self.epoch.load(Ordering::Acquire);
             q.running.insert(job.key);
@@ -2916,8 +2924,13 @@ impl Worker {
             if job.idle {
                 q.idle.insert(job.key, (job.seq, job.cancel.clone()));
             }
-            job
+            (job, foreground)
         };
+        let (job, foreground) = job;
+        #[cfg(not(target_arch = "wasm32"))]
+        effectcraft_engine::render::concurrency::thread_priority(foreground);
+        #[cfg(target_arch = "wasm32")]
+        let _ = foreground;
         // An idle frame renders inside the idle pool: its parallel loops stay on those few
         // low-priority threads ([`idle`]); this frame thread waits for it.
         #[cfg(not(target_arch = "wasm32"))]

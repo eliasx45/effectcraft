@@ -81,6 +81,20 @@ pub fn background_thread() -> bool {
     }
 }
 
+/// Raise the calling thread back to the priority of work the user waits for (a frame worker
+/// rendering the viewer's frame or playback after prefetch): on macOS user-initiated quality of
+/// service. Elsewhere it does nothing. Whether it was raised.
+pub fn foreground_thread() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        qos::user_initiated()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Hardware decoding counters (process-wide).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {

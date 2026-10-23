@@ -356,7 +356,7 @@ fn shared_budget_limits_and_off_switch() {
     assert!(!s.cache_share.is_on());
     // RAM Reserved for Other Applications still caps the total.
     s.execute("prefs.set", json!({"key": "memory.sharedCacheBudget", "value": true})).unwrap();
-    s.sys_memory = Some(crate::sysinfo::SysMemory { total: 8 << 30, available: 6 << 30 });
+    s.sys_memory = Some(crate::sysinfo::SysMemory { total: 8 << 30, available: 6 << 30, pressure: None });
     s.execute("prefs.set", json!({"key": "memory.ramReservedGb", "value": 6})).unwrap();
     let capped = s.prefs.cache_budgets(s.sys_memory);
     assert!(capped.capped);

@@ -19,13 +19,15 @@
 //!   other compressed frame the viewer asks for decodes on the spot, its strips in parallel
 //!   (about 2 ms for 1080p).
 //!
-//! At most [`THREADS`] threads run, unpacking before packing; they exit while there is nothing
-//! to do. The queues are bounded: a frame that doesn't fit stays uncompressed (and is offered
+//! At most [`THREADS`] threads run, unpacking before packing; they wait for the next job and
+//! exit only after [`IDLE_EXIT`] with nothing to do (MEM3: they used to exit as soon as the
+//! queues were empty, so playback, which queues one frame at a time, started a thread per frame). The queues are bounded: a frame that doesn't fit stays uncompressed (and is offered
 //! again later, `Cache::trim_raw`). Results come back by key and are dropped when the frame was
 //! replaced or evicted meanwhile (`Cache::attach_packed`, `Cache::attach_raw`).
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+use std::time::Duration;
 
 use effectcraft_engine::render::frame_pack::PackedFrame;
 
@@ -33,6 +35,9 @@ use super::{Cache, FrameImage, FrameKey};
 
 /// Codec threads at most.
 pub(super) const THREADS: usize = 2;
+
+/// A codec thread with nothing to do waits this long for a job before it exits.
+const IDLE_EXIT: Duration = Duration::from_secs(10);
 
 /// Threads the viewer's own decode of a compressed frame uses (its strips in parallel).
 pub(super) const VIEWER_DECODE_THREADS: usize = 4;
@@ -86,11 +91,15 @@ struct State {
     held: usize,
     unpack: VecDeque<UnpackJob>,
     running: usize,
+    /// Threads waiting for a job.
+    waiting: usize,
 }
 
 #[derive(Default)]
 pub(super) struct Codec {
     state: Mutex<State>,
+    /// Wakes a waiting thread when a job is queued.
+    work: Condvar,
     /// The cache results go to (set once by `Frames::default`).
     cache: Mutex<Weak<Mutex<Cache>>>,
 }
@@ -151,8 +160,12 @@ impl Codec {
         (s.pack.len(), s.unpack.len())
     }
 
-    /// Start a thread when one more may run.
+    /// Wake a waiting thread for the job just queued, or start one when one more may run.
     fn start(self: &Arc<Self>, s: &mut State) {
+        if s.waiting > 0 {
+            self.work.notify_one();
+            return;
+        }
         if s.running >= THREADS || s.running >= s.pack.len().saturating_add(s.unpack.len()) {
             return;
         }
@@ -172,8 +185,8 @@ impl Codec {
         }
     }
 
-    /// A codec thread: decode ahead of the playhead first, then compress; exits when both
-    /// queues are empty.
+    /// A codec thread: decode ahead of the playhead first, then compress; waits for more, and
+    /// exits after [`IDLE_EXIT`] with both queues empty.
     fn run(&self) {
         loop {
             enum Next {
@@ -182,14 +195,22 @@ impl Codec {
             }
             let next = {
                 let mut s = self.lock();
-                if let Some(j) = s.unpack.pop_front() {
-                    Next::Unpack(j)
-                } else if let Some(j) = s.pack.pop_front() {
-                    s.held = s.held.saturating_sub(j.held());
-                    Next::Pack(j)
-                } else {
-                    s.running = s.running.saturating_sub(1);
-                    return;
+                let mut waited = false;
+                loop {
+                    if let Some(j) = s.unpack.pop_front() {
+                        break Next::Unpack(j);
+                    } else if let Some(j) = s.pack.pop_front() {
+                        s.held = s.held.saturating_sub(j.held());
+                        break Next::Pack(j);
+                    } else if waited {
+                        s.running = s.running.saturating_sub(1);
+                        return;
+                    }
+                    s.waiting += 1;
+                    let (guard, timeout) = self.work.wait_timeout(s, IDLE_EXIT).unwrap_or_else(PoisonError::into_inner);
+                    s = guard;
+                    s.waiting = s.waiting.saturating_sub(1);
+                    waited = timeout.timed_out();
                 }
             };
             let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner).upgrade();
@@ -241,4 +262,33 @@ pub(super) fn unpack_image(p: &PackedFrame, threads: usize) -> Option<egui::Colo
     px.resize(n, egui::Color32::TRANSPARENT);
     let mut img = egui::ColorImage::new([w, h], px);
     p.decode_into(img.as_raw_mut(), threads).then_some(img)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MEM3: a codec thread that ran out of work waits for the next frame instead of exiting,
+    /// so playback (one frame at a time) reuses it rather than starting a thread per frame.
+    #[test]
+    fn codec_threads_wait_for_the_next_frame() {
+        let codec = Arc::new(Codec::default());
+        let packed = Arc::new(PackedFrame::encode(32, 32, &[7u8; 32 * 32 * 4]).expect("packs"));
+        let key = |frame| FrameKey { revision: 1, content: 1, comp: 1, frame, scale: 1000, view: 0, opts: 0 };
+        let drained = |c: &Codec| {
+            let t0 = std::time::Instant::now();
+            while c.queued() != (0, 0) || c.lock().waiting == 0 {
+                assert!(t0.elapsed() < Duration::from_secs(10), "the codec never finished");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        assert!(codec.unpack(key(1), packed.clone()));
+        drained(&codec);
+        assert_eq!((codec.lock().running, codec.lock().waiting), (1, 1), "the thread stays");
+        for f in 2..10 {
+            assert!(codec.unpack(key(f), packed.clone()));
+            drained(&codec);
+        }
+        assert_eq!(codec.lock().running, 1, "the same thread did every frame");
+    }
 }

@@ -50,6 +50,12 @@ ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 # Safe shell API boundary; never use the crate's Unix mount enumeration.
 trash = { version = "5.2.9", default-features = false, features = ["coinit_apartmentthreaded"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# MEM3: the system's memory and this process's resident size from the kernel, without starting
+# `vm_stat`, `sysctl` or `ps` every few seconds. Safe APIs (MIT); no `unsafe` here.
+sysctl = "0.6"
+memory-stats = "1"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 time = { version = "0.3.55", features = ["local-offset"] }
 

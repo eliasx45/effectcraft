@@ -123,7 +123,7 @@ fn tick(app: &mut EffectcraftApp, ctx: &egui::Context, panel_open: bool) {
     let now = ctx.input(|i| i.time);
     let id = egui::Id::new("memory-map-tick");
     let (last_process, last_gpu): (f64, f64) = ctx.data(|d| d.get_temp(id)).unwrap_or((f64::NEG_INFINITY, f64::NEG_INFINITY));
-    let process = app.session.sys_memory.is_some() && now - last_process >= PROCESS_EVERY;
+    let process = app.watch_system && app.session.sys_memory.is_some() && now - last_process >= PROCESS_EVERY;
     if process {
         app.session.memory_map.process.poll();
     }

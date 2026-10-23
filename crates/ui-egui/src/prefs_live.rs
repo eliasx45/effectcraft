@@ -147,14 +147,18 @@ pub fn dropped_files(app: &mut EffectcraftApp, ui: &egui::Ui, bounds: Rect) {
     }
 }
 
-/// Re-read the system's free memory every 30 s (cache budgets follow it; on Windows each
-/// reading starts PowerShell in the background, so it isn't done more often), and every 5 s
-/// while Cache Frames When Idle is on (it waits while memory is short, `idle_cache`).
+/// Re-read the system's free memory and pressure every 5 s (cache budgets follow it, and Cache
+/// Frames When Idle waits while memory is short, `idle_cache`): a few kernel calls on macOS and
+/// Linux (MEM3). On Windows each reading starts PowerShell in the background, so there it is
+/// every 30 s unless Cache Frames When Idle is on.
 fn memory_watch(app: &mut EffectcraftApp, ctx: &egui::Context) {
+    if !app.watch_system {
+        return;
+    }
     let now = ctx.input(|i| i.time);
     let id = egui::Id::new("prefs-memory-watch");
     let last = ctx.data(|d| d.get_temp::<f64>(id));
-    let every = if app.ui.cache_when_idle && !cfg!(target_os = "windows") { 5.0 } else { 30.0 };
+    let every = if !cfg!(target_os = "windows") { 5.0 } else if app.ui.cache_when_idle { 5.0 } else { 30.0 };
     if last.is_some_and(|t| now - t < every) {
         return;
     }
