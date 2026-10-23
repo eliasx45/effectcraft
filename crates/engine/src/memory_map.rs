@@ -110,10 +110,11 @@ pub struct Chip {
     pub level: Level,
 }
 
-/// Physical memory minus RAM Reserved for Other Applications (`None`: memory unknown).
+/// Physical memory minus what the caches leave free (RAM Reserved for Other Applications, Maximum
+/// Share of RAM for Caches: [`crate::prefs::Prefs::ram_reserved_bytes`]; `None`: memory unknown).
 pub fn cap(s: &Session) -> Option<u64> {
     let total = s.sys_memory.map(|m| m.total).filter(|t| *t > 0)?;
-    Some(total.saturating_sub(u64::from(s.prefs.memory.ram_reserved_gb) << 30))
+    Some(total.saturating_sub(s.prefs.ram_reserved_bytes(total)))
 }
 
 /// The chip's level: the system's pressure when it reports one, else how close `used` is to

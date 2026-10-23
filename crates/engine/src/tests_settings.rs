@@ -361,6 +361,13 @@ fn shared_budget_limits_and_off_switch() {
     let capped = s.prefs.cache_budgets(s.sys_memory);
     assert!(capped.capped);
     assert!(capped.shared.is_some_and(|sp| sp.total <= 2 << 30), "{capped:?}");
+    // Maximum Share of RAM for Caches (75 % by default) caps it too, when it leaves more free.
+    assert_eq!(s.prefs.memory.cache_max_percent, 75);
+    s.execute("prefs.set", json!({"key": "memory.ramReservedGb", "value": 0})).unwrap();
+    s.execute("prefs.set", json!({"key": "memory.cacheMaxPercent", "value": 25})).unwrap();
+    assert_eq!(s.prefs.memory.cache_max_percent, 25);
+    let quarter = s.prefs.cache_budgets(s.sys_memory);
+    assert!(quarter.capped && quarter.shared.is_some_and(|sp| sp.total <= 2 << 30), "{quarter:?}");
 }
 
 #[test]

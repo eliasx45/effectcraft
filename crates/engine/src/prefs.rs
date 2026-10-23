@@ -297,6 +297,10 @@ page!(Disk {
 
 page!(Memory {
     ram_reserved_gb: u32 = 6,
+    /// The most of the machine's memory the caches may take together, in percent (10 to 100;
+    /// 75 = 48 GB of 64). Whichever leaves more free wins: this or RAM Reserved for Other
+    /// Applications ([`Prefs::ram_reserved_bytes`]).
+    cache_max_percent: u32 = DEFAULT_CACHE_MAX_PERCENT,
     /// Processed-layer cache budget (MB).
     layer_cache_mb: u32 = 1024,
     /// Decoded footage frame cache budget (MB).
@@ -859,8 +863,8 @@ impl Prefs {
     /// their defaults grow with its memory: an eighth and a quarter of it, up to 16 and 32 GB, so
     /// the layers and frames an edit doesn't change stay cached across the timeline; the preview
     /// only up to [`COMPRESSED_PREVIEW_CACHE`] with Compress RAM Preview Frames on), scaled
-    /// down so together they leave **RAM Reserved for Other Applications** free (at least
-    /// [`MIN_RESERVED_SHARE`] of the machine's memory: [`Prefs::ram_reserved_bytes`]),
+    /// down so together they leave **RAM Reserved for Other Applications** free and stay within
+    /// **Maximum Share of RAM for Caches** ([`Prefs::ram_reserved_bytes`]),
     /// and with **Reduce Cache Size When System Is Low on Memory** on halved while the system is
     /// low on memory or under memory pressure, quartered under critical pressure
     /// ([`crate::sysinfo::SysMemory::cache_divisor`]). `mem` = the system's memory (`None` = unknown: configured budgets).
@@ -911,12 +915,16 @@ impl Prefs {
     }
 
     /// The memory the caches leave free on a machine with `total` bytes: RAM Reserved for Other
-    /// Applications, and at least [`MIN_RESERVED_SHARE`] of the machine. The caches are not all
-    /// the app holds (GPU textures, which are RAM on unified memory, decoders, effect buffers),
-    /// and macOS and the apps beside it need the rest: on 22 Oct 2026 a 64 GB Mac with 10 GB
-    /// reserved let the caches take 40 GB, and it swapped until other apps stopped responding.
+    /// Applications, and at least what Maximum Share of RAM for Caches leaves (10 to 100 %). The
+    /// caches are not all the app holds (GPU textures, which are RAM on unified memory, decoders,
+    /// effect buffers), and macOS and the apps beside it need the rest: on 22 Oct 2026 a 64 GB Mac
+    /// with 10 GB reserved let the caches take 40 GB, and it swapped until other apps stopped
+    /// responding (with nothing shrinking them: MEM3 added the pressure-based shrinking too).
     pub fn ram_reserved_bytes(&self, total: u64) -> u64 {
-        ((self.memory.ram_reserved_gb as u64) << 30).max(total / MIN_RESERVED_SHARE)
+        let percent = u128::from(self.memory.cache_max_percent.clamp(10, 100));
+        let caches = u64::try_from(u128::from(total) * percent / 100).unwrap_or(total);
+        let share = total.saturating_sub(caches);
+        ((self.memory.ram_reserved_gb as u64) << 30).max(share)
     }
 
     /// Composition ▸ Motion Path: the layer-time span of a motion path to draw around `now`
@@ -1059,9 +1067,9 @@ pub const LARGE_MEMORY: u64 = 32 << 30;
 /// uncompressed ones did (`plan/memory/compressed-cache.md`).
 pub const COMPRESSED_PREVIEW_CACHE: u64 = 8 << 30;
 
-/// At least 1 / this of the machine's memory stays out of the caches, whatever RAM Reserved for
-/// Other Applications says (see [`Prefs::ram_reserved_bytes`]): half.
-pub const MIN_RESERVED_SHARE: u64 = 2;
+/// Maximum Share of RAM for Caches by default, in percent (see [`Prefs::ram_reserved_bytes`]):
+/// 48 GB of a 64 GB Mac.
+pub const DEFAULT_CACHE_MAX_PERCENT: u32 = 75;
 
 /// The most the footage frame cache holds in the browser (see [`WEB_LAYER_CACHE`]).
 pub const WEB_MEDIA_CACHE: u64 = 256 << 20;
@@ -1506,6 +1514,7 @@ pub fn pages() -> Vec<Page> {
             title: "Memory & CPU",
             items: vec![
                 s("memory.ramReservedGb", "RAM Reserved for Other Applications", Kind::Int(0, 1024, "GB"), true),
+                s("memory.cacheMaxPercent", "Maximum Share of RAM for Caches", Kind::Int(10, 100, "%"), true),
                 Section("Cache Budgets"),
                 s("memory.layerCacheMb", "Layer Cache", Kind::Int(64, 1 << 20, "MB"), true),
                 s("memory.mediaCacheMb", "Footage Frame Cache", Kind::Int(64, 1 << 20, "MB"), true),
