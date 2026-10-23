@@ -640,13 +640,12 @@ fn draw_cached_precomp(
         return None;
     }
     let cache = r.cache?;
-    let (key, noted, clip) = {
+    let (key, _, clip) = {
         let _profile = effectcraft_render::profile::span("precomp_resident_key");
         r.resident_precomp_key(ctx, layer)?
     };
     if let Some(image) = e.resident(key, GpuStage::Processed) {
         let _profile = effectcraft_render::profile::span("precomp_resident_hit");
-        r.resident_precomp_note(noted, true);
         return composite_processed(e, r, ctx, layer, canvas, opacity, image);
     }
     let intent = cache.disk_intent(key);
@@ -658,15 +657,12 @@ fn draw_cached_precomp(
             Claim::Owner(guard) => flight = Some(guard),
             Claim::Render => {
                 if let Some(image) = e.resident(key, GpuStage::Processed) {
-                    r.resident_precomp_note(noted, true);
                     return composite_processed(e, r, ctx, layer, canvas, opacity, image);
                 }
-                r.resident_precomp_note(noted, false);
                 return None;
             }
         }
     }
-    r.resident_precomp_note(noted, cpu.is_some());
     let image = if let Some(buf) = cpu {
         SourceImage { img: e.upload_pixels(&buf)?, offset: buf.offset, scale: buf.scale }
     } else {
@@ -687,13 +683,9 @@ fn draw_cached_precomp(
     if result == Some(Some(()))
         && let Some(flight) = flight
     {
-        // An animated precomp's key follows its values: kept once they hold (the key repeats),
-        // and tried again next frame (not backed off as a miss).
-        if r.resident_precomp_animated(ctx, layer) {
-            if !cache.admit_repeated_gpu_content(key) {
-                return result;
-            }
-            r.resident_precomp_note(noted, true);
+        // An animated precomp's key follows its values: kept once they hold (the key repeats).
+        if r.resident_precomp_animated(ctx, layer) && !cache.admit_repeated_gpu_content(key) {
+            return result;
         }
         e.keep_resident(key, image, flight, intent);
     }

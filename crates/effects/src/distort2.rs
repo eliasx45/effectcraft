@@ -37,13 +37,22 @@ fn pct(max: f64) -> ParamUi {
 
 // ---------------------------------------------------------------- Turbulent Displace
 
+/// Value noise with a linear (not smoothstepped) blend between whole-revolution slices, so
+/// Evolution changes the pattern at a steady speed: a faded blend barely moves near each
+/// whole revolution (0° included), which made small Evolution changes invisible.
+fn evo_noise(u: f32, v: f32, z: f32, seed: u32) -> f32 {
+    let z0 = z.floor();
+    let t = z - z0;
+    value_noise(u, v, z0, seed) * (1.0 - t) + value_noise(u, v, z0 + 1.0, seed) * t
+}
+
 fn fbm(u: f64, v: f64, z: f64, seed: u32, octaves: f64, falloff: f32) -> f32 {
     let n = octaves.ceil().max(1.0) as usize;
     let frac = (octaves - octaves.floor()) as f32;
     let (mut sum, mut norm, mut amp, mut f) = (0.0f32, 0.0f32, 1.0f32, 1.0f32);
     for o in 0..n {
         let w = if o + 1 == n && frac > 0.0 { frac } else { 1.0 };
-        sum += value_noise(u as f32 * f, v as f32 * f, z as f32 + o as f32 * 5.17, seed.wrapping_add(o as u32 * 101)) * amp * w;
+        sum += evo_noise(u as f32 * f, v as f32 * f, z as f32 + o as f32 * 5.17, seed.wrapping_add(o as u32 * 101)) * amp * w;
         norm += amp * w;
         amp *= falloff;
         f *= 2.0;
@@ -1034,6 +1043,16 @@ mod tests {
         let img = test_img(32, 24);
         assert_eq!(run("ec.distort.turbulentdisplace", &[("amount", num(0.0))], img.clone()).img, img);
         assert!(max_diff(&run("ec.distort.turbulentdisplace", &[], img.clone()).img, &img) > 1e-3);
+    }
+
+    #[test]
+    fn turbulent_displace_evolution_moves_steadily_from_zero() {
+        // A faded z blend left the first degrees of Evolution (and every whole revolution) dead.
+        let img = test_img(32, 24);
+        let at = |deg: f64| run("ec.distort.turbulentdisplace", &[("size", num(10.0)), ("evolution", num(deg))], img.clone()).img;
+        let (d_small, d_mid) = (max_diff(&at(0.0), &at(20.0)), max_diff(&at(180.0), &at(200.0)));
+        assert!(d_small > 1e-3);
+        assert!(d_small > d_mid * 0.25, "20° from 0 moves {d_small}, 20° mid-revolution {d_mid}");
     }
 
     #[test]

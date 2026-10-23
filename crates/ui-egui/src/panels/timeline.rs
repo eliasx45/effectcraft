@@ -2313,14 +2313,18 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     {
                         actions.push(a);
                     }
-                    let shift = ui.input(|i| i.modifiers.shift);
+                    let (shift, cmd) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
                     if let Some(layers) = (body.clicked() && shift).then(|| shift_range(&ctx, cid, &comp, &rows, &selected, layer.id)).flatten() {
                         // Shift-click: the layers from the last one clicked to this one, as in
                         // the layer outline.
                         actions.push(("layer.select".into(), json!({"layers": layers})));
+                    } else if body.clicked() && cmd && is_sel {
+                        // Cmd-click on a selected bar takes it out of the selection.
+                        actions.push(("layer.select".into(), json!({"layers": [layer.id.0], "toggle": true})));
                     } else {
                         if (body.clicked() || body.drag_started()) && !is_sel {
-                            actions.push(("layer.select".into(), json!({"layers": [layer.id.0], "add": shift})));
+                            // Shift/Cmd add the layer to the selection (Cmd-click several layers).
+                            actions.push(("layer.select".into(), json!({"layers": [layer.id.0], "add": shift || cmd})));
                         }
                         if (body.clicked() || body.drag_started()) && !shift {
                             set_anchor(&ctx, cid, layer.id);
@@ -4883,6 +4887,21 @@ mod tests {
         app.session.execute("prop.set", json!({"layer": bx, "path": "effects/#1/blurriness", "value": 12})).unwrap();
         crate::menus::invoke(&mut app, &ctx, "anim.reveal", json!({"kind": "keyframes"})).unwrap();
         assert!(app.ui.timeline.reveal_props.len() > n_keys, "UU reveals modified properties too");
+    }
+
+    #[test]
+    fn shift_reveal_adds_to_what_the_layer_shows_now() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let l = app.session.state.selected_layers[0].0;
+        // Position shown some other way (Alt+Shift+P, another layer's reveal): the last reveal
+        // key was something else.
+        crate::menus::invoke(&mut app, &ctx, "timeline.reveal.opacity", json!({})).unwrap();
+        app.ui.timeline.layer_reveal.insert(l, vec!["position".into()]);
+        crate::menus::invoke(&mut app, &ctx, "timeline.revealAdd.scale", json!({})).unwrap();
+        assert_eq!(app.ui.timeline.layer_reveal.get(&l), Some(&vec!["position".to_string(), "scale".to_string()]));
+        crate::menus::invoke(&mut app, &ctx, "timeline.revealAdd.scale", json!({})).unwrap();
+        assert_eq!(app.ui.timeline.layer_reveal.get(&l), Some(&vec!["position".to_string()]));
     }
 
     #[test]

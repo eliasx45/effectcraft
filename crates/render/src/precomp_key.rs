@@ -19,11 +19,12 @@
 //! at other times, with every keyframe. The time counts when a layer is read at other times, and
 //! such a layer's expressions must read nothing but their own value and the time
 //! ([`crate::cache::free::self_contained`]): one that may read other layers or comps at those
-//! times, out of the key's sight, leaves the comp unkeyed.
+//! times, out of the key's sight, leaves the comp unkeyed. A layer the frame doesn't use (not
+//! active, and nothing used points at it) counts only by its place, expressions included.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use effectcraft_project::essential::{self, EgKind, Override};
 use effectcraft_project::{AutoOrient, Comp, FootageKind, FrameBlend, ItemId, ItemKind, Layer, LayerId, LayerSource, Layers, Project};
@@ -102,6 +103,27 @@ impl CompInfo {
 }
 
 static COMPS: LazyLock<RwLock<Memo<Comp, Arc<CompInfo>>>> = LazyLock::new(|| RwLock::new(Memo::new()));
+
+/// Comp and layer pairs already reported by [`warn_unkeyed`].
+static UNKEYED: LazyLock<Mutex<HashSet<(ItemId, LayerId)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Say once per comp and layer that `layer`'s expressions keep comp `comp` out of the layer
+/// cache (they may read other layers or comps out of the key's sight), so every precomp of it
+/// is drawn again on every frame. Removing those expressions, or baking them, makes it cacheable.
+fn warn_unkeyed(project: &Project, comp: ItemId, layer: &Layer) {
+    let Ok(mut seen) = UNKEYED.lock() else { return };
+    if seen.len() > 4096 {
+        seen.clear();
+    }
+    if seen.insert((comp, layer.id)) {
+        let name = project.item(comp).map_or("?", |i| i.name.as_str());
+        log::warn!(
+            target: "effectcraft_cache",
+            "comp {name:?} can't be cached: the expressions of its layer {:?} may read other layers or comps, so it is drawn again on every frame",
+            layer.name
+        );
+    }
+}
 
 fn comp_info(arc: &Arc<Comp>) -> Arc<CompInfo> {
     if let Some(i) = COMPS.read().ok().and_then(|m| m.get(Arc::as_ptr(arc))) {
@@ -251,14 +273,17 @@ impl<'a> Renderer<'a> {
                 Mode::Window(..) => li.contained_sampled,
                 Mode::Whole => li.contained_inner && (!sampled.get(i).copied().unwrap_or(true) || li.contained_sampled),
             };
-            if li.expressions && !contained {
-                return None;
-            }
             if !used(i) {
                 // Unused: its id and switches (solo hides the comp's other layers at every time).
+                // Its expressions don't count either: the frame doesn't draw it, and a used layer
+                // that reads it by an expression is keyed by the value it reads (or isn't keyed).
                 (0xdead_u16, l.id).hash(&mut h);
                 hash_debug(&mut h, &l.switches);
                 continue;
+            }
+            if li.expressions && !contained {
+                warn_unkeyed(self.project, id, l);
+                return None;
             }
             timed |= *mode != Mode::Free;
             hash_debug(&mut h, mode);

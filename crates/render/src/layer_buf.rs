@@ -164,13 +164,6 @@ impl<'a> Renderer<'a> {
         self.precomp_varies(ctx, layer)
     }
 
-    /// Report a static precomp lookup through the same miss backoff used by CPU content.
-    pub fn resident_precomp_note(&self, id: u64, hit: bool) {
-        if let Some(cache) = self.cache {
-            cache.precomp_note(id, hit);
-        }
-    }
-
     /// [`Self::resident_content_key`] and the window of the layer's buffer that key stands for
     /// (for [`Self::resident_source`]): decided together, once.
     pub fn resident_content(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, ContentClip)> {
@@ -209,23 +202,20 @@ impl<'a> Renderer<'a> {
         Some((key, token))
     }
 
-    /// [`Self::content_cache_key`], and for a precomp layer that was keyed, its id for
-    /// [`cache::LayerCache::precomp_note`] (an animated precomp is keyed only now and then, see
-    /// [`cache::LayerCache::precomp_try`]).
+    /// [`Self::content_cache_key`], and for a precomp layer, its id (a hash of its comp, layer
+    /// and depth). Precomps are keyed on every render: keying one costs far less than drawing
+    /// it again after its key stopped being tried (lab X1, 23 Oct 2026).
     ///
     /// A shape layer drawn clipped (see [`Self::shape_clip`]) or a precomp layer drawn windowed
     /// (see [`Self::precomp_clip`]) has the window in its key, and the window is returned too.
     fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> ContentKey {
-        let Some(c) = self.cache else {
+        if self.cache.is_none() {
             let win = self.shape_clip(ctx, layer, None).or_else(|| self.precomp_clip(ctx, layer, None));
             return (None, None, ContentClip { win, view: self.fx_view(ctx, layer, None) });
-        };
+        }
         let (src, noted) = match layer.source {
             LayerSource::Comp { .. } => {
                 let id = cache::derive(cache::derive(ctx.comp_id.0, layer.id.0), self.depth as u64);
-                if !c.precomp_try(id) {
-                    return (None, None, ContentClip { win: self.precomp_clip(ctx, layer, None), view: None });
-                }
                 (self.precomp_key(ctx, layer), Some(id))
             }
             // Which proxy the footage shows.
@@ -248,7 +238,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// `keyed`: [`Self::content_cache_key_noted`] when the caller has it already (a key is
-    /// computed once per layer and frame: keying a precomp counts towards its miss streak).
+    /// computed once per layer and frame).
     fn content_buf_timed(
         &self,
         ctx: &EvalCtx,
@@ -275,9 +265,6 @@ impl<'a> Renderer<'a> {
                 }),
                 None => None,
             };
-            if let Some(id) = noted {
-                c.precomp_note(id, hit.is_some());
-            }
             if let Some(b) = hit {
                 if let Some(t) = timing.as_deref_mut() {
                     t.cached = true;
@@ -452,7 +439,7 @@ impl<'a> Renderer<'a> {
     /// and cached in the blending space alone (no working-space copy cloned and kept next to
     /// it). The same pixels as [`Self::content_buf_timed`] then [`Self::to_blend`].
     fn plain_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>, keyed: Option<ContentKey>) -> Option<StyledLayer> {
-        let (ckey, noted, clip) = keyed.unwrap_or_else(|| self.content_cache_key_noted(ctx, layer));
+        let (ckey, _, clip) = keyed.unwrap_or_else(|| self.content_cache_key_noted(ctx, layer));
         let key = ckey.map(|k| cache::derive(k, 0x1ea7));
         // A resident Processed result is an actual CPU demand here. Reuse it in
         // working space, then convert forward; a Blend texture is never inverted.
@@ -496,9 +483,6 @@ impl<'a> Renderer<'a> {
                 }),
                 None => None,
             };
-            if let Some(id) = noted {
-                c.precomp_note(id, hit.is_some());
-            }
             if let Some(b) = hit {
                 if let Some(t) = timing.as_deref_mut() {
                     t.cached = true;
