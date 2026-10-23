@@ -49,7 +49,7 @@ fn shadows_deep_glow_and_bevel_on_a_trimmed_canvas_match_the_cpu() {
     let glow = ("ec.stylize.deepglow", vec![("PEDG-0001", n(24.0))]);
     let bevel = ("ec.perspective.bevelalpha", vec![("edgeThickness", n(3.0))]);
     let fill = ("ec.generate.fill", vec![("color", Value::Color([0.2, 0.9, 0.4, 1.0]))]);
-    let stacks = vec![vec![shadow(12.0, 20.0)], vec![glow.clone()], vec![bevel.clone(), fill], vec![glow, shadow(4.0, 9.0), shadow(0.0, 30.0), bevel]];
+    let stacks = [vec![shadow(12.0, 20.0)], vec![glow.clone()], vec![bevel.clone(), fill], vec![glow, shadow(4.0, 9.0), shadow(0.0, 30.0), bevel]];
     for (k, stack) in stacks.iter().enumerate() {
         for (text, three_d) in [(true, false), (true, true), (false, false), (false, true)] {
             let s = scene(text, three_d, stack);

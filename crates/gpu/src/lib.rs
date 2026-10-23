@@ -676,9 +676,11 @@ mod tests_fx_vr;
 mod tests_fx_warp;
 #[cfg(test)]
 mod tests_glow_reach;
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests_half;
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests_init;
 #[cfg(test)]
 mod tests_inplace;

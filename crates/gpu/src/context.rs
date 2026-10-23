@@ -305,7 +305,12 @@ impl ScratchMeter {
     }
     pub(crate) fn sub(&self, bytes: u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        let _ = self.live.fetch_update(Relaxed, Relaxed, |c| Some(c.saturating_sub(bytes)));
+        // A compare-exchange loop: `fetch_update` is deprecated (Rust 1.99) and its replacement,
+        // `try_update`, is newer than the workspace's rust-version.
+        let mut c = self.live.load(Relaxed);
+        while let Err(now) = self.live.compare_exchange_weak(c, c.saturating_sub(bytes), Relaxed, Relaxed) {
+            c = now;
+        }
     }
     /// (bytes now, most since [`ScratchMeter::reset_peak`]).
     pub fn bytes(&self) -> (u64, u64) {

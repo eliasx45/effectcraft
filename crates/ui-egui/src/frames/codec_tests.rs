@@ -17,7 +17,7 @@ fn image(w: usize, h: usize, seed: u32) -> Arc<egui::ColorImage> {
         .map(|i| {
             let (x, y) = ((i % w) as u32, (i / w) as u32);
             let noise = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(97)) >> 24;
-            let a: u8 = if (x / 7 + y / 5 + seed) % 4 == 0 {
+            let a: u8 = if (x / 7 + y / 5 + seed).is_multiple_of(4) {
                 0
             } else if y % 9 == 0 {
                 128

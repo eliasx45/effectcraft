@@ -158,7 +158,7 @@ fn memory_watch(app: &mut EffectcraftApp, ctx: &egui::Context) {
     let now = ctx.input(|i| i.time);
     let id = egui::Id::new("prefs-memory-watch");
     let last = ctx.data(|d| d.get_temp::<f64>(id));
-    let every = if !cfg!(target_os = "windows") { 5.0 } else if app.ui.cache_when_idle { 5.0 } else { 30.0 };
+    let every = if !cfg!(target_os = "windows") || app.ui.cache_when_idle { 5.0 } else { 30.0 };
     if last.is_some_and(|t| now - t < every) {
         return;
     }

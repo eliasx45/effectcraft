@@ -206,7 +206,7 @@ fn segment_peaks(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool
         let [a, b] = w else { continue };
         let (ta, tb) = (l.comp_time(a.time).seconds(), l.comp_time(b.time).seconds());
         let (t0, t1) = (ta.min(tb), ta.max(tb));
-        if !(t1 > t0) || !t0.is_finite() || !t1.is_finite() {
+        if !t0.is_finite() || !t1.is_finite() || t1 <= t0 {
             continue;
         }
         let step = (t1 - t0) / per as f64;
@@ -1497,7 +1497,7 @@ fn fit_keys(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool,
     }
     // A lone selected key (one point) also frames its neighbouring keys, so its curve shows
     // instead of a flat sliver a fraction of a frame wide.
-    if !(k1 - k0 >= 1e-6) {
+    if (k1 - k0).is_nan() || k1 - k0 < 1e-6 {
         for c in cs {
             for (i, k) in c.keys.iter().enumerate().filter(|(_, k)| !selected_only || k.sel) {
                 for n in [i.checked_sub(1).and_then(|j| c.keys.get(j)), c.keys.get(i + 1), Some(k)].into_iter().flatten() {

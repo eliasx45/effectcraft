@@ -65,10 +65,7 @@ impl Stretch {
     /// Input frame `f` as (left, right); silence outside what is held.
     fn at(&self, f: i64) -> (f32, f32) {
         let i = usize::try_from(f - self.offset).ok().and_then(|i| i.checked_mul(2));
-        match i.and_then(|i| Some((*self.input.get(i)?, *self.input.get(i + 1)?))) {
-            Some(lr) => lr,
-            None => (0.0, 0.0),
-        }
+        i.and_then(|i| Some((*self.input.get(i)?, *self.input.get(i + 1)?))).unwrap_or((0.0, 0.0))
     }
 
     /// Feed `samples` (interleaved stereo) and take the output they complete.
