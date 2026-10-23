@@ -80,4 +80,10 @@ elif [ "$main" = "$root" ] && stale; then
     fi
 fi
 
+# Run a frozen copy: the background rebuild above (or the app's) must never replace a running
+# server's image (scripts/frozen-exe.sh says why).
+if [ -f "$root/scripts/frozen-exe.sh" ]; then
+    . "$root/scripts/frozen-exe.sh"
+    serve=$(frozen_exe "$serve" "$target/run")
+fi
 exec "$serve" mcp "$@"
