@@ -932,7 +932,7 @@ impl EffectcraftApp {
     /// Show panel `p` (opening it in its usual place if it is closed), bring it to the front and
     /// give it the focus: Window ▸ <panel>.
     pub fn show_panel(&mut self, p: PanelKind) {
-        if !self.ui.floating.iter().any(|f| f.panels.contains(&p)) && self.ui.maximized.is_some_and(|m| m != p) {
+        if !self.ui.floating.iter().any(|f| f.panels.contains(&p)) && self.ui.maximized.is_some_and(|m| m != p) && !self.group_maximized(p) {
             self.ui.maximized = None;
         }
         if let Some(f) = self.ui.floating.iter().find(|f| f.panels.contains(&p)) {
@@ -1695,6 +1695,7 @@ impl EffectcraftApp {
         let viewer = panels::viewers::active_panel(self);
         if preset.full_screen && self.ui.dock.contains(viewer) {
             self.ui.maximized = Some(viewer);
+            self.ui.maximized_solo = true;
         }
         self.playback = Playback {
             playing: true,
@@ -1843,6 +1844,7 @@ impl EffectcraftApp {
         log::info!("preview stopped at {:.3} s after {} frames (from {})", self.session.time().seconds(), self.playback.shown, std::panic::Location::caller());
         if let Some(m) = self.playback.restore_max.take() {
             self.ui.maximized = m;
+            self.ui.maximized_solo = false;
         }
         let Some(pl) = self.playback.plan else { return };
         let move_time = self.session.prefs.preview.get(self.playback.shortcut).move_time_to_preview_time;

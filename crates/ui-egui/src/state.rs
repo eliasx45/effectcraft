@@ -724,6 +724,9 @@ pub struct UiState {
     /// The panel maximized to fill the dock area (`~`), if any.
     #[serde(default)]
     pub maximized: Option<PanelKind>,
+    /// The maximized panel fills the area alone, without its group's tabs (full-screen playback).
+    #[serde(skip)]
+    pub maximized_solo: bool,
     /// Locked Composition / Timeline tabs (panel ids): opening another composition does not
     /// bring a locked panel forward (the tab's lock icon, as After Effects' viewer lock).
     #[serde(default)]
@@ -857,6 +860,7 @@ impl Default for UiState {
             saved_floating: Default::default(),
             panel_windows: vec![],
             maximized: None,
+            maximized_solo: false,
             locked_tabs: BTreeSet::new(),
             viewers: Default::default(),
             active_viewer: 0,
