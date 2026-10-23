@@ -2313,14 +2313,18 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     {
                         actions.push(a);
                     }
-                    let shift = ui.input(|i| i.modifiers.shift);
+                    let (shift, cmd) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
                     if let Some(layers) = (body.clicked() && shift).then(|| shift_range(&ctx, cid, &comp, &rows, &selected, layer.id)).flatten() {
                         // Shift-click: the layers from the last one clicked to this one, as in
                         // the layer outline.
                         actions.push(("layer.select".into(), json!({"layers": layers})));
+                    } else if body.clicked() && cmd && is_sel {
+                        // Cmd-click on a selected bar takes it out of the selection.
+                        actions.push(("layer.select".into(), json!({"layers": [layer.id.0], "toggle": true})));
                     } else {
                         if (body.clicked() || body.drag_started()) && !is_sel {
-                            actions.push(("layer.select".into(), json!({"layers": [layer.id.0], "add": shift})));
+                            // Shift/Cmd add the layer to the selection (Cmd-click several layers).
+                            actions.push(("layer.select".into(), json!({"layers": [layer.id.0], "add": shift || cmd})));
                         }
                         if (body.clicked() || body.drag_started()) && !shift {
                             set_anchor(&ctx, cid, layer.id);
