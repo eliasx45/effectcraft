@@ -63,7 +63,7 @@ fn synthetic(seed: u32) -> Frame8 {
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for y in 0..h {
         for x in 0..w {
-            let card = (x / 240 + y / 180 + seed) % 5 == 0;
+            let card = (x / 240 + y / 180 + seed).is_multiple_of(5);
             let grain = (x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663) ^ seed.wrapping_mul(83_492_791)) >> 29;
             let (r, g, b) = if card { (236, 240, 248) } else { ((x / 8) as u8, (y / 5) as u8, (60 + grain) as u8) };
             rgba.extend_from_slice(&[r, g, b, 255]);

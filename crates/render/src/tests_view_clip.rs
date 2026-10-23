@@ -149,7 +149,7 @@ fn top_level_text_and_shapes_draw_only_what_shows_with_the_same_frames() {
             // The layer drifts left (content still or animated).
             let l = p.comp_mut(cid).unwrap().layers.iter_mut().next().unwrap();
             let pos = l.props.prop_mut("transform/position").unwrap();
-            let Value::Vec3(at) = pos.value.clone() else { unreachable!() };
+            let Value::Vec3(at) = pos.value.clone() else { panic!("a layer's position is a Vec3") };
             pos.keys = vec![Keyframe::new(Tick::ZERO, Value::Vec3(at)), Keyframe::new(s(1.0), Value::Vec3([at[0] - 120.0, at[1], 0.0]))];
             // (At Half the buffers are under `clip::MIN_PIXELS`: drawn whole.)
             let (part, whole) = (content_px(&p, cid, 1.0, true), content_px(&p, cid, 1.0, false));

@@ -10,7 +10,7 @@ fn frame(w: u32, h: u32, seed: u32) -> Vec<u8> {
     let mut v = Vec::with_capacity((w * h * 4) as usize);
     for i in 0..w * h {
         let (x, y) = (i % w, i / w);
-        let a: u8 = if (x / 5 + y / 3 + seed) % 4 == 0 { 0 } else { 255 };
+        let a: u8 = if (x / 5 + y / 3 + seed).is_multiple_of(4) { 0 } else { 255 };
         let noise = (i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 24) as u8;
         let flat = ((x / 8 + seed) * 31 % 256) as u8;
         let g = if i % 3 == 0 { noise } else { flat };

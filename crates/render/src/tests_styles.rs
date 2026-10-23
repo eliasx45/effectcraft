@@ -834,7 +834,7 @@ fn shadows_deep_glow_and_bevel_run_on_the_reachable_part_of_the_canvas() {
     let glow = ("ec.stylize.deepglow", vec![("PEDG-0001", Value::Scalar(24.0))]);
     let bevel = ("ec.perspective.bevelalpha", vec![("edgeThickness", Value::Scalar(3.0))]);
     let fill = ("ec.generate.fill", vec![("color", Value::Color([0.2, 0.9, 0.4, 1.0]))]);
-    let stacks = vec![vec![shadow(12.0, 20.0)], vec![glow.clone()], vec![bevel.clone(), fill.clone()], vec![glow, shadow(4.0, 9.0), shadow(0.0, 30.0), bevel]];
+    let stacks = [vec![shadow(12.0, 20.0)], vec![glow.clone()], vec![bevel.clone(), fill.clone()], vec![glow, shadow(4.0, 9.0), shadow(0.0, 30.0), bevel]];
     for (n, stack) in stacks.iter().enumerate() {
         for (text, three_d) in [(true, false), (true, true), (false, false), (false, true)] {
             let mut p = Project::default();
