@@ -26,6 +26,9 @@ pub(crate) fn render<'g>(e: &mut Enc<'g>, r: &Renderer, comp_id: ItemId, t: Tick
     if r.opts.roi.is_some() {
         return None;
     }
+    // Effects the renderer runs on its own encoders during this frame (a static layer's cached
+    // result, `Gpu::effects_kept_owned`) take this encoder's half working images too.
+    let _half = crate::half::Scope::enter(e.half);
     let ctx = r.eval_ctx(comp_id, t)?;
     let s = r.opts.scale;
     // A nested comp drawn only where its precomp layer shows covers that window of its frame.

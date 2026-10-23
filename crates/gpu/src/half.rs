@@ -9,6 +9,12 @@
 //! output, the layer buffers, caches) stays RGBA f32, and so does every render that is not a
 //! viewer display render (exports, readbacks, tests): those keep their exact results.
 //!
+//! A frame's static layers run their effects through the renderer's layer cache, on encoders of
+//! their own ([`crate::Gpu::effects_kept_owned`]); they follow the frame's encoder through
+//! [`Scope`] (thread-local, set for the length of `walk::render`). Their cached results are f32
+//! like any effect output, but a later render of the same viewer cache may reuse one computed
+//! from half intermediates (within the same 8-bit step); exports have caches of their own.
+//!
 //! A kernel writes its `out` through a storage texture of one format, so the kernels that may
 //! write a half image are built a second time with `out` declared `rgba16float` (on first use:
 //! the bank costs nothing until a display render asks for it). Reading needs no variant
@@ -16,6 +22,7 @@
 //! half `out` marks the effect missing ([`crate::context::Enc::take_missing`]) and it renders on
 //! the CPU: never a wrong image.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use crate::context::{init_resource, storage_tex_entry, tex_entry};
@@ -139,4 +146,31 @@ impl Bank {
     pub(crate) fn has_all(&self, entries: &[&str]) -> bool {
         entries.iter().all(|e| self.pipelines.contains_key(e))
     }
+}
+
+thread_local! {
+    /// Whether the frame this thread is rendering keeps half working images ([`Scope`]).
+    static FRAME_HALF: Cell<bool> = const { Cell::new(false) };
+}
+
+/// For as long as it lives, encoders this thread makes for the frame's own effects
+/// ([`crate::Gpu::effects_kept_owned`]) take half working images when `on`; the previous value
+/// comes back on drop (nested comps).
+pub(crate) struct Scope(bool);
+
+impl Scope {
+    pub(crate) fn enter(on: bool) -> Scope {
+        Scope(FRAME_HALF.with(|h| h.replace(on)))
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        FRAME_HALF.with(|h| h.set(self.0));
+    }
+}
+
+/// Whether the frame this thread is rendering keeps half working images (see [`Scope`]).
+pub(crate) fn in_frame() -> bool {
+    FRAME_HALF.with(Cell::get)
 }

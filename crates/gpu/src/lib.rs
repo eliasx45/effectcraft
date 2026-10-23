@@ -524,7 +524,9 @@ impl Accelerator for Gpu {
 
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
         self.ctx.check_health().ok()?;
-        effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels).map(|(b, _)| b)
+        let mut e = Enc::new(&self.ctx);
+        e.half = half::in_frame();
+        effects::run_chain(&mut e, chain, buf, levels).map(|(b, _)| b)
     }
 
     fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
@@ -539,6 +541,8 @@ impl Accelerator for Gpu {
     ) -> Option<(Buf, Option<u64>)> {
         self.ctx.check_health().ok()?;
         let mut e = Enc::with_owner(&self.ctx, owner.cloned());
+        // A static layer of a viewer frame: half working images like the frame's own effects.
+        e.half = half::in_frame();
         let (b, img) = effects::run_chain(&mut e, chain, buf, levels)?;
         Some((b, img.and_then(|img| e.keep(img))))
     }

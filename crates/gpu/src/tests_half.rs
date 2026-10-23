@@ -25,13 +25,27 @@ fn style(s: &mut Scene, l: &mut Layer, id: &str, vals: &[(&str, Value)]) {
     }
 }
 
-/// One frame through a fresh layer cache with half working images on or off: the pixels and
-/// the most working-image bytes handed out at once during it.
-fn render(g: &Gpu, s: &Scene, half: bool) -> (Image, usize) {
+/// How a frame meets its layers.
+#[derive(Clone, Copy)]
+enum Layers {
+    /// Through a fresh layer cache, as the viewer renders: unchanging layers run their effects
+    /// once, on encoders of the renderer's own (`Gpu::effects_kept_owned`), and their styles on
+    /// the CPU.
+    Cached,
+    /// Without a layer cache: every layer counts as changing, so its styles run on the GPU
+    /// (`fx_styles`), as an animated layer's do in the viewer.
+    Changing,
+}
+
+/// One frame with half working images on or off: the pixels and the most working-image bytes
+/// handed out at once during it.
+fn render(g: &Gpu, s: &Scene, half: bool, layers: Layers) -> (Image, usize) {
     let cache = LayerCache::default();
     let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..Default::default() });
     r.accel = Some(g);
-    r.cache = Some(&cache);
+    if let Layers::Cached = layers {
+        r.cache = Some(&cache);
+    }
     g.within_memory(|| {
         let mut enc = Enc::with_owner(&g.ctx, cache.gpu_owner());
         enc.half = half;
@@ -61,14 +75,14 @@ fn diff(a: &Image, b: &Image) -> (f32, f64) {
     (max, over as f64 / total.max(1) as f64)
 }
 
-fn case(label: &str, s: &Scene, steps: f32) {
+fn case(label: &str, s: &Scene, steps: f32, layers: Layers) {
     let Some(g) = crate::tests::gpu() else { return };
     if g.ctx.half_bank().is_none() {
         eprintln!("{label}: no half kernels on {}, skipped", g.ctx.name);
         return;
     }
-    let (full, full_peak) = render(g, s, false);
-    let (half, half_peak) = render(g, s, true);
+    let (full, full_peak) = render(g, s, false, layers);
+    let (half, half_peak) = render(g, s, true, layers);
     let (max, share) = diff(&half, &full);
     eprintln!("{label}: max {max:.3} / 255, {:.4} % over 1/255, peak working bytes f32 {full_peak} → half {half_peak}", share * 100.0);
     assert!(max <= steps, "{label}: half floats differ by {max:.3}/255 (allowed {steps}/255)");
@@ -81,7 +95,7 @@ fn half_gaussian_blur_matches_f32() {
     let mut l = s.footage(97, 61);
     s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(12.0))]);
     s.push(l);
-    case("gaussian blur", &s, 1.0);
+    case("gaussian blur", &s, 1.0, Layers::Cached);
 }
 
 #[test]
@@ -92,7 +106,8 @@ fn half_glow_matches_f32() {
     let mut l = s.solid([0.9, 0.4, 0.1], 40, 24);
     s.effect(&mut l, "ec.stylize.glow", &[("threshold", n(20.0)), ("radius", n(14.0)), ("intensity", n(1.5))]);
     s.push(l);
-    case("glow", &s, 1.0);
+    // A static solid: its glow runs through the layer cache, on the renderer's own encoder.
+    case("glow", &s, 1.0, Layers::Cached);
 }
 
 #[test]
@@ -101,7 +116,7 @@ fn half_deep_glow_matches_f32() {
     let mut l = s.footage(60, 40);
     s.effect(&mut l, "ec.stylize.deepglow", &[("PEDG-0001", n(24.0)), ("PEDG-0004", n(30.0))]);
     s.push(l);
-    case("deep glow", &s, 1.0);
+    case("deep glow", &s, 1.0, Layers::Cached);
 }
 
 #[test]
@@ -114,7 +129,7 @@ fn half_bevel_matches_f32() {
     s.push(l);
     // The lighting takes the height profile's slope: half floats' rounding of the profile shows
     // as at most a step or two of shading, never more.
-    case("bevel and emboss", &s, 2.0);
+    case("bevel and emboss", &s, 2.0, Layers::Changing);
 }
 
 #[test]
@@ -127,5 +142,5 @@ fn half_layer_styles_match_f32() {
     style(&mut s, &mut l, "outerGlow", &[("size", Value::Scalar(10.0))]);
     style(&mut s, &mut l, "innerGlow", &[("size", Value::Scalar(6.0))]);
     s.push(l);
-    case("layer styles", &s, 1.0);
+    case("layer styles", &s, 1.0, Layers::Changing);
 }
