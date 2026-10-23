@@ -23,7 +23,7 @@
 //! effect's exact steps (padding, box-blur radii, parameter conversions); chains of them are
 //! uploaded and read back once. Each family lives in its own module with its own WGSL file
 //! (`fx_color`, `fx_deepglow`, `fx_depth`, `fx_distort`, `fx_extra`, `fx_gen2`, `fx_generate`, `fx_key`,
-//! `fx_light`, `fx_lut`, `fx_noise`, `fx_particles`, `fx_pixel2`, `fx_sim`, `fx_stylize`,
+//! `fx_light`, `fx_lut`, `fx_noise`, `fx_particles`, `fx_pixel2`, `fx_shadowstudio`, `fx_sim`, `fx_stylize`,
 //! `fx_text`, `fx_time`, `fx_tone`, `fx_transition`, `fx_vr`, `fx_warp`); settings a kernel
 //! cannot match fall back to the CPU (`catalog::gpu_supported`, or `None` from the family's
 //! `apply`).
@@ -85,6 +85,7 @@ mod fx_lut;
 mod fx_noise;
 mod fx_particles;
 mod fx_pixel2;
+mod fx_shadowstudio;
 mod fx_sim;
 mod fx_styles;
 mod fx_stylize;
@@ -653,6 +654,8 @@ mod tests_fx_noise;
 mod tests_fx_particles;
 #[cfg(test)]
 mod tests_fx_pixel2;
+#[cfg(test)]
+mod tests_fx_shadowstudio;
 #[cfg(test)]
 mod tests_fx_sim;
 #[cfg(test)]
