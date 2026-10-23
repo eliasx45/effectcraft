@@ -410,11 +410,11 @@ fn a_graph_handle_drag_moves_the_handles_of_every_selected_key() {
 }
 
 /// The Timeline's speed rows (Elias, 22 Oct 2026): a handle drags up for speed (velocity) and
-/// sideways for influence, right next to the keys. Only the grabbed handle moves, even with both
-/// keys selected (Elias, 23 Oct 2026: the other key's handle moved with it, symmetrically); with
-/// ⇧ every selected key's handle follows.
+/// sideways for influence, right next to the keys. The segment's other key stays, even with both
+/// keys selected (Elias, 23 Oct 2026: its handle moved with it, mirrored); other properties'
+/// selected keys follow (engine test `a_handle_drag_eases_every_selected_key`), and with ⇧ none do.
 #[test]
-fn a_speed_row_handle_drags_only_itself_and_every_selected_key_with_shift() {
+fn a_speed_row_handle_drag_leaves_the_segments_other_key() {
     let (mut h, id, uid) = harness();
     let s = &mut h.state_mut().session;
     s.execute("keys.selectAll", json!({})).unwrap();
@@ -436,8 +436,9 @@ fn a_speed_row_handle_drags_only_itself_and_every_selected_key_with_shift() {
     let from = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
     drag(&mut h, from, from + egui::vec2(10.0, -4.0), egui::Modifiers::SHIFT);
     let keys = h.state().session.active_comp().unwrap().layer(id).unwrap().props.prop("transform/opacity").unwrap().keys.clone();
-    let in1 = keys[1].in_ease.first().copied().unwrap();
-    assert!(in1.influence > 1.0 / 3.0 + 0.01 && in1.speed > 1e-6, "with ⇧ key 1 follows: {in1:?}");
+    let (out0_after, in1) = (keys[0].out_ease.first().copied().unwrap(), keys[1].in_ease.first().copied().unwrap());
+    assert!(out0_after.influence > out0.influence, "⇧-drag moved key 0's out: {out0:?} → {out0_after:?}");
+    assert!((in1.influence - 1.0 / 3.0).abs() < 1e-6 && in1.speed.abs() < 1e-6, "with ⇧ key 1 stays too: {in1:?}");
 }
 
 /// Elias, 23 Oct 2026: a speed-row drag left its undo merge open on release, so the next

@@ -7,8 +7,8 @@
 //! nearer the pointer (left of the peak: the first key's out influence, right of it: the second
 //! key's in influence), keeping the speeds. The same side of the selected keys of other
 //! properties follows the dragged handle, but not the property's own other keys (no mirrored
-//! handle across the segment); ⇧ at the press makes every selected key follow
-//! (`keys.setEaseSelected`). The handle
+//! handle across the segment) (`keys.setEaseSelected`); ⇧ at the press moves the grabbed handle
+//! alone. The handle
 //! nearest the pointer (within [`HANDLE_PICK`]) is the one that answers, and stays so until
 //! another is clearly nearer, so the cursor doesn't flicker between handles and the curve.
 
@@ -75,8 +75,8 @@ struct Grab {
     reach_px: f32,
     /// A handle drag's speed: `None` for a sculpt (influence only).
     speed: Option<SpeedGrab>,
-    /// ⇧ at the press: every selected key's handle follows.
-    follow: bool,
+    /// ⇧ at the press: the grabbed handle moves alone.
+    alone: bool,
 }
 
 /// What a handle's vertical drag starts from.
@@ -279,7 +279,7 @@ pub(crate) fn show(
                 let out = px.x < s.peak_x;
                 let (key, inf) = if out { (s.i, s.out_inf) } else { (s.i + 1, s.in_inf) };
                 let reach_px = ((s.xb - s.xa) as f64 * HANDLE_REACH) as f32;
-                let g = Grab { key, out, x0: px.x, inf0: inf.unwrap_or(1.0 / 6.0) * 100.0, reach_px, speed: None, follow: shift };
+                let g = Grab { key, out, x0: px.x, inf0: inf.unwrap_or(1.0 / 6.0) * 100.0, reach_px, speed: None, alone: shift };
                 ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
                 grab = Some(g);
             }
@@ -334,7 +334,7 @@ pub(crate) fn show(
     if resp.hovered() || resp.dragged() {
         ctx.set_cursor_icon(egui::CursorIcon::Move);
         if !resp.dragged() {
-            let _ = resp.clone().on_hover_text(format!("{tip}\nDrag sideways: influence · up/down: speed · ⇧: every selected key follows"));
+            let _ = resp.clone().on_hover_text(format!("{tip}\nDrag sideways: influence · up/down: speed · ⇧: only this handle"));
         }
     }
     if resp.drag_started()
@@ -348,7 +348,7 @@ pub(crate) fn show(
         let mean = s.mean();
         let ratio = if mean > 1e-9 && lead.abs() > 1e-9 { lead.abs() / mean } else { 1.0 };
         let sg = SpeedGrab { y0: press.y, peak: s.peak, amp, ease, dir, ratio };
-        let g = Grab { key, out, x0: kx, inf0: 0.0, reach_px: reach, speed: Some(sg), follow: shift };
+        let g = Grab { key, out, x0: kx, inf0: 0.0, reach_px: reach, speed: Some(sg), alone: shift };
         ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
         grab = Some(g);
     }
@@ -384,7 +384,7 @@ fn seg_velocity(prop: &Property, i: usize, out: bool) -> f64 {
 }
 
 /// Follows a handle or sculpt drag: `keys.setEaseSelected` (other properties' selected keys follow,
-/// every selected key with ⇧) with
+/// none with ⇧) with
 /// the influence and speed `f` gives for the pointer; on release ends the undo merge and forgets
 /// the grab.
 fn drag(
@@ -407,9 +407,10 @@ fn drag(
             params["speed"] = json!(v);
         }
         // The selected keys of other properties follow on the same side; with ⇧ at the press
-        // every selected key does (the grabbed segment's other key too, mirrored).
-        if !g.follow {
-            params["respective"] = json!(true);
+        // the grabbed handle moves alone.
+        params["respective"] = json!(true);
+        if g.alone {
+            params["keys"] = json!([]);
         }
         actions.push(("keys.setEaseSelected".into(), params));
         ctx.request_repaint();
