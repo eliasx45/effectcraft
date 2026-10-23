@@ -120,13 +120,13 @@ const KEY_MARK_HALF: egui::Vec2 = egui::vec2(6.0, 7.0);
 /// The keys of unlocked layers whose marks `br` (a key marquee) touches, as in After Effects (not
 /// only those whose centre it covers), for `rows` stacked from `top` (`rh` high each, see
 /// [`row_height`]).
-fn keys_in_box(comp: &Comp, rows: &[Row], top: f32, rh: f32, tm: TMap, br: Rect) -> Vec<effectcraft_engine::KeyRef> {
+fn keys_in_box(comp: &Comp, rows: &[Row], top: f32, rh: f32, heights: &SpeedHeights, tm: TMap, br: Rect) -> Vec<effectcraft_engine::KeyRef> {
     let mut keys = vec![];
     let mut y = top;
     let br = br.expand2(KEY_MARK_HALF);
     for row in rows {
         let cy = y + rh / 2.0;
-        y += row_height(row, rh);
+        y += row_height(row, rh, heights);
         if let RowKind::Prop { uid } = row.kind
             && cy >= br.min.y
             && cy <= br.max.y
@@ -144,11 +144,25 @@ fn keys_in_box(comp: &Comp, rows: &[Row], top: f32, rh: f32, tm: TMap, br: Rect)
     keys
 }
 
-/// Row height (expression editors grow with their text).
-fn row_height(row: &Row, rh: f32) -> f32 {
+/// Property rows given room for their speed curve (points high, [`speed_heights`]).
+type SpeedHeights = std::collections::BTreeMap<u64, f32>;
+
+/// A property row's speed curve is at most this many rows high.
+const SPEED_ROW_MAX_ROWS: f32 = 12.0;
+
+/// The heights of the property rows whose bottom edge was dragged, while their speed curves
+/// show (not with the Graph Editor open).
+fn speed_heights(tl: &crate::state::TimelineState) -> SpeedHeights {
+    if tl.speed_rows && !tl.graph_editor { tl.speed_row_heights.clone() } else { SpeedHeights::new() }
+}
+
+/// Row height (expression editors grow with their text, property rows by their dragged
+/// bottom edge).
+fn row_height(row: &Row, rh: f32, heights: &SpeedHeights) -> f32 {
     match row.kind {
         RowKind::Expr { lines, .. } => rh * lines as f32,
         RowKind::Waveform { .. } => rh * 3.0,
+        RowKind::Prop { uid } => heights.get(&uid).map_or(rh, |h| h.clamp(rh, rh * SPEED_ROW_MAX_ROWS)),
         _ => rh,
     }
 }
@@ -1768,19 +1782,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let rows = with_expr_rows(build_rows(app, &comp), &comp, &app.ui.timeline, &ctx);
     let rows = inline::expand(app, cid, rows);
     let rh = t.row_h;
-    let total_h: f32 = rows.iter().map(|r| row_height(r, rh)).sum();
+    let heights = speed_heights(&app.ui.timeline);
+    let total_h: f32 = rows.iter().map(|r| row_height(r, rh, &heights)).sum();
     let max_scroll = (total_h - rows_rect.height() + rh).max(0.0);
     if scroll_to == Some(crate::state::ScrollTo::Layer) {
         // The topmost selected layer, in stack order.
         let sel = &app.session.state.selected_layers;
         let top = comp.layers.iter().find(|l| sel.contains(&l.id)).map(|l| l.id);
         if let Some(i) = rows.iter().position(|r| matches!(r.kind, RowKind::Layer) && Some(r.layer) == top) {
-            app.ui.timeline.scroll_y = rows.iter().take(i).map(|r| row_height(r, rh)).sum();
+            app.ui.timeline.scroll_y = rows.iter().take(i).map(|r| row_height(r, rh, &heights)).sum();
         }
     } else if let Some(crate::state::ScrollTo::Property(uid)) = scroll_to
         && let Some(i) = rows.iter().position(|r| matches!(r.kind, RowKind::Prop { uid: p } if p == uid))
     {
-        app.ui.timeline.scroll_y = rows.iter().take(i).map(|r| row_height(r, rh)).sum();
+        app.ui.timeline.scroll_y = rows.iter().take(i).map(|r| row_height(r, rh, &heights)).sum();
     }
     if ui.rect_contains_pointer(rows_rect) && !(app.ui.timeline.graph_editor && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x >= graph_x0)) {
         let (dy, dx, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.smooth_scroll_delta.x, i.modifiers.alt));
@@ -1858,7 +1873,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         _ if empty.drag_stopped() => ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("tl-box"))),
         _ => None,
     };
-    let box_keys = key_box.map(|br| keys_in_box(&comp, &rows, rows_rect.min.y - app.ui.timeline.scroll_y, rh, tm, br));
+    let box_keys = key_box.map(|br| keys_in_box(&comp, &rows, rows_rect.min.y - app.ui.timeline.scroll_y, rh, &heights, tm, br));
     let key_preview = box_keys.as_ref().map(|in_box| super::graph_tools::marquee_selection(&sel_keys, in_box, ui.input(|i| i.modifiers)));
     let mut hit_rows: Vec<(Rect, Row)> = vec![];
     // The value fields of multi-dimension properties (per dimension), for the pick whip.
@@ -1876,7 +1891,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         };
         // Outline widgets never spill into the time graph (narrow timelines).
         ui.set_clip_rect(left_clip);
-        let hh = row_height(row, rh);
+        let hh = row_height(row, rh, &heights);
         let r = Rect::from_min_size(pos2(rect.min.x, y), vec2(rect.width(), hh));
         y += hh;
         if r.max.y < rows_rect.min.y || r.min.y > rows_rect.max.y {
@@ -2900,7 +2915,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     // Batch 1 (AX3): "Fast In · linked" on moves carrying a Library graph.
                     beat::graph_tags(&gp, tm, layer, prop, cy, graph_x0, rect.max.x, t.text_dim);
                     // Speed curves, peak dots and influence handles (drawn under the keys, which win the clicks).
-                    let strip = Rect::from_min_max(pos2(graph_x0, r.min.y), pos2(rect.max.x, r.min.y + rh));
+                    let strip = Rect::from_min_max(pos2(graph_x0, r.min.y), pos2(rect.max.x, r.max.y));
                     speed_rows::show(app, ui, &gp, &comp, tm, layer, prop, strip, &mut actions);
                     for k in &prop.keys {
                         let ct = layer.comp_time(k.time);
@@ -3041,6 +3056,31 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             // Ctrl/Cmd+Alt: Quick Offset of the selected keys' layers (#1012).
                             let quick = (mods.command && mods.alt && ks).then(|| quick_offset_layers(&comp, sel_keys.iter().map(|k| k.layer))).flatten();
                             ctx.data_mut(|d| d.insert_temp(key_drag_id(), KeyDrag { origin_x: p.x, anchor: ct.seconds(), applied: 0, quick }));
+                        }
+                    }
+                }
+                // Its bottom edge (in the outline, across into the time graph a little) drags
+                // the row taller to give its speed curve room; a double-click or a drag back to
+                // one row high makes it one row again.
+                if !graph_on && app.ui.timeline.speed_rows && prop.keys.len() >= 2 {
+                    ui.set_clip_rect(left_clip.union(right_clip));
+                    let edge = Rect::from_min_max(pos2(rect.min.x, r.max.y - 5.0), pos2(graph_x0 + 12.0, r.max.y));
+                    let eresp = ui.interact(edge, egui::Id::new(("speed-row-edge", uid)), Sense::click_and_drag());
+                    app.auto.add(&format!("timeline.prop.{uid}.speedHeight"), edge, "Speed curve height");
+                    if eresp.hovered() || eresp.dragged() {
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                        for p in [&lp, &gp] {
+                            p.line_segment([pos2(rect.min.x, r.max.y - 1.0), pos2(rect.max.x, r.max.y - 1.0)], Stroke::new(1.0, t.accent));
+                        }
+                    }
+                    if eresp.double_clicked() {
+                        app.ui.timeline.speed_row_heights.remove(uid);
+                    } else if let Some(py) = eresp.interact_pointer_pos().filter(|_| eresp.dragged()).map(|p| p.y) {
+                        let h = (py - r.min.y).clamp(rh, rh * SPEED_ROW_MAX_ROWS);
+                        if h < rh * 1.25 {
+                            app.ui.timeline.speed_row_heights.remove(uid);
+                        } else {
+                            app.ui.timeline.speed_row_heights.insert(*uid, h);
                         }
                     }
                 }

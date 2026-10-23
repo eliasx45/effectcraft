@@ -492,6 +492,10 @@ pub struct TimelineState {
     /// curve, peak dot and influence handles in the row (`panels::timeline::speed_rows`).
     #[serde(default = "yes")]
     pub speed_rows: bool,
+    /// Property rows whose speed curve was given more room (points high) by dragging the row's
+    /// bottom edge; the others are one row high.
+    #[serde(default)]
+    pub speed_row_heights: BTreeMap<u64, f32>,
     /// Properties whose inline expression editor is collapsed.
     #[serde(default)]
     pub expr_closed: BTreeSet<u64>,
@@ -594,6 +598,7 @@ impl Default for TimelineState {
             graph_expression_overlay: false,
             graph_transform_box: true,
             speed_rows: true,
+            speed_row_heights: BTreeMap::new(),
             expr_closed: BTreeSet::new(),
             expr_lines: BTreeMap::new(),
             unlinked: BTreeSet::new(),
