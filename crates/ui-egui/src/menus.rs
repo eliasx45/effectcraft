@@ -1012,6 +1012,19 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     // The paste event's text: Edit ▸ Paste pastes SVG markup as a shape layer.
     let pasted =
         if clipboard { ctx.input(|i| i.events.iter().rev().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None })) } else { None };
+    // Held, Zoom In / Out Time keep zooming (After Effects): their key repeats run them again.
+    // `true` for a physical-key binding.
+    let zoom_repeats: Vec<(bool, egui::Modifiers, egui::Key)> = app
+        .session
+        .shortcuts()
+        .bindings()
+        .into_iter()
+        .filter(|(_, b)| matches!(b.command.as_str(), "timeline.zoomIn" | "timeline.zoomOut"))
+        .filter_map(|(sc, _)| {
+            let phys = sc.starts_with("Physical+");
+            parse_shortcut(sc.strip_prefix("Physical+").unwrap_or(sc)).map(|(m, k)| (phys, m, k))
+        })
+        .collect();
     let mut events: Vec<(egui::Key, egui::Modifiers, bool, Option<egui::Key>)> = ctx.input(|i| {
         // The windowing layer turns Ctrl+C / Ctrl+X / Ctrl+V into clipboard events instead of
         // key presses: map them back to the keys (with the modifiers held) so Edit ▸ Copy, Cut,
@@ -1033,7 +1046,8 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                         || matches!(
                             key,
                             egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown
-                        ) =>
+                        )
+                        || zoom_repeats.iter().any(|(phys, m, k)| mods_match(*m, *modifiers) && if *phys { *physical_key == Some(*k) } else { key == k }) =>
                 {
                     out.push((*key, *modifiers, true, *physical_key));
                 }
