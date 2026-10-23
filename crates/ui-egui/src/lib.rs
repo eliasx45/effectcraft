@@ -414,7 +414,14 @@ pub struct Playback {
     /// Every frame shown since the preview started (UI seconds, frame), for `ui.inspect`'s
     /// frame-interval percentiles; capped at [`SHOWN_LOG_MAX`].
     pub log: Vec<(f64, i64)>,
+    /// Play Faster (FilmCraft's Shuttle Right): ×2, ×4 or ×8 the preview's rate, its sound
+    /// compressed in time at the same pitch (`audio::Stretch`); 0 = normal speed. The plan's rate and frame step are multiplied, so as many frames a second
+    /// show as at normal speed.
+    pub speed: u32,
 }
+
+/// Play Faster's top speed (×8, as FilmCraft's Shuttle Right).
+const MAX_PLAY_SPEED: u32 = 8;
 
 /// Frames [`Playback::log`] keeps (about 9 minutes at 30 fps).
 const SHOWN_LOG_MAX: usize = 16_384;
@@ -535,6 +542,8 @@ pub struct EffectcraftApp {
     pub(crate) passive_tex: std::collections::HashMap<u32, (FrameKey, panels::viewers::PassiveTexture)>,
     /// The last GPU frame shown: its egui texture id (registered with egui-wgpu), key and texture.
     pub(crate) viewer_native: Option<(egui::TextureId, FrameKey, Arc<effectcraft_gpu::DisplayFrame>)>,
+    /// UP1: the FSR1 upscale of low-resolution GPU frames shown magnified (`fsr_upscale`).
+    pub(crate) viewer_fsr: fsr_upscale::Upscaler,
     /// The texture the viewer draws and its frame key (CPU or GPU frame).
     pub(crate) viewer_shown: Option<(egui::TextureId, FrameKey)>,
     /// Last displayed image (Info panel colour, eyedroppers, histograms). GPU frames fill it on
@@ -684,6 +693,7 @@ impl EffectcraftApp {
             sharp_zoom: Default::default(),
             passive_tex: std::collections::HashMap::new(),
             viewer_native: None,
+            viewer_fsr: Default::default(),
             viewer_shown: None,
             viewer_image: None,
             viewer_readback: Default::default(),
@@ -937,7 +947,7 @@ impl EffectcraftApp {
     /// Show panel `p` (opening it in its usual place if it is closed), bring it to the front and
     /// give it the focus: Window ▸ <panel>.
     pub fn show_panel(&mut self, p: PanelKind) {
-        if !self.ui.floating.iter().any(|f| f.panels.contains(&p)) && self.ui.maximized.is_some_and(|m| m != p) {
+        if !self.ui.floating.iter().any(|f| f.panels.contains(&p)) && self.ui.maximized.is_some_and(|m| m != p) && !self.group_maximized(p) {
             self.ui.maximized = None;
         }
         if let Some(f) = self.ui.floating.iter().find(|f| f.panels.contains(&p)) {
@@ -1700,6 +1710,7 @@ impl EffectcraftApp {
         let viewer = panels::viewers::active_panel(self);
         if preset.full_screen && self.ui.dock.contains(viewer) {
             self.ui.maximized = Some(viewer);
+            self.ui.maximized_solo = true;
         }
         self.playback = Playback {
             playing: true,
@@ -1722,6 +1733,7 @@ impl EffectcraftApp {
             shown_at: Default::default(),
             observed: now,
             log: Vec::new(),
+            speed: 0,
         };
         if !self.playback.caching {
             if plan.video {
@@ -1733,12 +1745,74 @@ impl EffectcraftApp {
         }
     }
 
+    /// Play Faster (FilmCraft's Shuttle Right, Shift+E in the Elias keymap): plays at ×2 (from
+    /// the current time when stopped), each further press doubles the speed up to ×8. Stopping
+    /// or [`Self::play_slower`] back to ×1 returns to normal speed.
+    pub fn play_faster(&mut self, now: f64) {
+        if !self.playback.playing {
+            self.play(now);
+        }
+        if !self.playback.playing {
+            return;
+        }
+        // At speed the preview starts at once: no Cache Before Playback.
+        self.playback.caching = false;
+        let speed = self.playback.speed.max(1).saturating_mul(2).min(MAX_PLAY_SPEED);
+        self.set_play_speed(now, speed);
+    }
+
+    /// Play Slower: halves Play Faster's speed, down to normal speed (with sound again). Whether
+    /// a fast preview was playing.
+    pub fn play_slower(&mut self, now: f64) -> bool {
+        if !self.playback.playing || self.playback.speed < 2 {
+            return false;
+        }
+        self.set_play_speed(now, self.playback.speed / 2);
+        true
+    }
+
+    /// Play on from the current frame at `speed` × the preview's rate (1 = normal).
+    fn set_play_speed(&mut self, now: f64, speed: u32) {
+        let Some(mut pl) = self.playback.plan else { return };
+        let (old, new) = (self.playback.speed.max(1), speed.clamp(1, MAX_PLAY_SPEED));
+        if old == new {
+            return;
+        }
+        // Powers of two: the rate comes back exactly at ×1 (the sound needs the comp's rate).
+        pl.fps = pl.fps / f64::from(old) * f64::from(new);
+        pl.step = (pl.step / i64::from(old)).max(1).saturating_mul(i64::from(new));
+        let cur = if pl.video {
+            self.session.active_comp().map_or(pl.first, |c| c.frame_rate.frame_at(self.session.time()))
+        } else {
+            self.playback.audio_frame.unwrap_or(pl.first)
+        };
+        self.playback.plan = Some(pl);
+        self.playback.fps = pl.fps;
+        self.playback.speed = if new > 1 { new } else { 0 };
+        self.playback.start_wall = now;
+        self.playback.start_frame = cur;
+        self.playback.waiting = false;
+        self.playback.shown_at.clear();
+        // The sound starts over at the new speed (same pitch) once the frames ahead are cached.
+        self.audio = None;
+        self.playback.preroll = None;
+        let sound = self.audio_plays();
+        self.playback.audio_held = sound && pl.video;
+        if sound && !pl.video {
+            self.start_audio(self.session.active_comp().map(|c| c.frame_rate.tick_of(cur)).unwrap_or_default());
+        }
+        let msg = if new > 1 { format!("Playing at {new}×") } else { "Playing at normal speed".to_string() };
+        self.toast = Some((msg, now));
+    }
+
     /// The preview includes audio at the comp's frame rate and the comp has something audible.
     fn audio_plays(&self) -> bool {
         let (Some(pl), Some(cid)) = (self.playback.plan, self.session.active_comp_id()) else { return false };
         let Some(c) = self.session.project.comp(cid) else { return false };
-        // A preview at another frame rate plays slower or faster than real time: silent.
-        pl.audio && (pl.fps - c.frame_rate.as_f64()).abs() <= 0.01 && effectcraft_engine::render::audio::comp_has_audio(&self.session.project, cid)
+        // A preview at another frame rate plays slower or faster than real time: silent. Play
+        // Faster's rate is the speed times the preview's (its sound keeps its pitch).
+        let speed = f64::from(self.playback.speed.max(1));
+        pl.audio && (pl.fps / speed - c.frame_rate.as_f64()).abs() <= 0.01 && effectcraft_engine::render::audio::comp_has_audio(&self.session.project, cid)
     }
 
     /// Start audio preview from comp time `t` when [`Self::audio_plays`] and an output device
@@ -1752,7 +1826,7 @@ impl EffectcraftApp {
         // Held while rendering caught up (same preview): play on, without reopening the device.
         if let Some(mut a) = held.filter(|a| {
             let span = audio::PlaySpan::new(t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, a.rate);
-            a.held() && a.comp == cid && (a.span.wa, a.span.wb, a.span.looping) == (span.wa, span.wb, span.looping)
+            a.held() && a.comp == cid && a.speed == self.playback.speed.max(1) && (a.span.wa, a.span.wb, a.span.looping) == (span.wa, span.wb, span.looping)
         }) {
             a.resume(t);
             self.audio = Some(a);
@@ -1761,7 +1835,8 @@ impl EffectcraftApp {
         let out = audio::AudioOutput::from_prefs(&self.session.prefs);
         let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
         let mix = self.session.prefs.audio.preview_sample_rate;
-        match audio::AudioPlayback::start(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix) {
+        let speed = self.playback.speed.max(1);
+        match audio::AudioPlayback::start_at_speed(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix, speed) {
             Ok(a) => self.audio = Some(a),
             Err(e) => log::warn!("audio preview: {e}"),
         }
@@ -1848,6 +1923,7 @@ impl EffectcraftApp {
         log::info!("preview stopped at {:.3} s after {} frames (from {})", self.session.time().seconds(), self.playback.shown, std::panic::Location::caller());
         if let Some(m) = self.playback.restore_max.take() {
             self.ui.maximized = m;
+            self.ui.maximized_solo = false;
         }
         let Some(pl) = self.playback.plan else { return };
         let move_time = self.session.prefs.preview.get(self.playback.shortcut).move_time_to_preview_time;
@@ -2167,9 +2243,10 @@ impl EffectcraftApp {
                 return;
             }
             // Wake when the audible sample reaches the next frame (not at the display's refresh
-            // rate): a 24 fps preview rebuilds the UI 24 times a second, not 120.
+            // rate): a 24 fps preview rebuilds the UI 24 times a second, not 120. Play Faster's
+            // sound covers that much comp time `speed` × sooner.
             let next = fr.tick_of(target.saturating_add(step.max(1))).seconds();
-            ctx.request_repaint_after(until_next_frame(next - audio::sample_time(audible, a.rate).seconds()));
+            ctx.request_repaint_after(until_next_frame((next - audio::sample_time(audible, a.rate).seconds()) / f64::from(a.speed.max(1))));
             return;
         }
         let elapsed = now - self.playback.start_wall;

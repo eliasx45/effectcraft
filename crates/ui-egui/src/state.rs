@@ -492,6 +492,10 @@ pub struct TimelineState {
     /// curve, peak dot and influence handles in the row (`panels::timeline::speed_rows`).
     #[serde(default = "yes")]
     pub speed_rows: bool,
+    /// Property rows whose speed curve was given more room (points high) by dragging the row's
+    /// bottom edge; the others are one row high.
+    #[serde(default)]
+    pub speed_row_heights: BTreeMap<u64, f32>,
     /// Properties whose inline expression editor is collapsed.
     #[serde(default)]
     pub expr_closed: BTreeSet<u64>,
@@ -499,7 +503,7 @@ pub struct TimelineState {
     /// the others grow with their text, up to 8 lines.
     #[serde(default)]
     pub expr_lines: BTreeMap<u64, usize>,
-    /// Scale and Mask Feather properties whose chain link (Constrain Proportions, on by default)
+    /// Scale, Mask Feather and Audio Levels properties whose chain link (on by default)
     /// was turned off.
     #[serde(default)]
     pub unlinked: BTreeSet<u64>,
@@ -594,6 +598,7 @@ impl Default for TimelineState {
             graph_expression_overlay: false,
             graph_transform_box: true,
             speed_rows: true,
+            speed_row_heights: BTreeMap::new(),
             expr_closed: BTreeSet::new(),
             expr_lines: BTreeMap::new(),
             unlinked: BTreeSet::new(),
@@ -724,6 +729,9 @@ pub struct UiState {
     /// The panel maximized to fill the dock area (`~`), if any.
     #[serde(default)]
     pub maximized: Option<PanelKind>,
+    /// The maximized panel fills the area alone, without its group's tabs (full-screen playback).
+    #[serde(skip)]
+    pub maximized_solo: bool,
     /// Locked Composition / Timeline tabs (panel ids): opening another composition does not
     /// bring a locked panel forward (the tab's lock icon, as After Effects' viewer lock).
     #[serde(default)]
@@ -857,6 +865,7 @@ impl Default for UiState {
             saved_floating: Default::default(),
             panel_windows: vec![],
             maximized: None,
+            maximized_solo: false,
             locked_tabs: BTreeSet::new(),
             viewers: Default::default(),
             active_viewer: 0,

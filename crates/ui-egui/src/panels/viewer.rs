@@ -1072,8 +1072,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         // A CPU frame goes up again when the magnification calls for another factor.
         let minify = minify_factor(app.session.prefs.viewer_zoom_smooth(), scale, (zoom * ppp) as f64);
         let refit = !app.viewer_on_gpu() && app.viewer_tex.as_ref().is_some_and(|(_, _, m)| *m != minify);
-        if stale || refit {
-            show_frame(app, &ctx, k, img, minify);
+        // A GPU frame goes up again when the zoom (or the pref) asks for another FSR size (UP1).
+        let screen = f64::from(zoom * ppp);
+        let resize = app.viewer_on_gpu() && matches!(img, crate::frames::FrameImage::Gpu(_)) && app.viewer_fsr.asked != fsr_target(app, &k, &img, screen);
+        if stale || refit || resize {
+            show_frame(app, &ctx, k, img, minify, screen);
         } else if let Some((_, s)) = app.viewer_shown.as_mut() {
             // The same frame at a later revision (an edit elsewhere, an undo): it shows that one.
             // A GPU frame's texture key follows, or the viewer stops counting it as shown.
@@ -3034,14 +3037,26 @@ fn rect_of(map: &ViewerMap, r: Option<[f64; 4]>) -> Rect {
     Rect::from_min_max(map.to_screen([x, y]), map.to_screen([x + w, y + h]))
 }
 
+/// UP1: the size the FSR1 pass upscales GPU frame `img` (key `key`) to at `screen` physical pixels
+/// per comp pixel (`None`: drawn as it is; see [`crate::fsr_upscale::target_size`]).
+fn fsr_target(app: &EffectcraftApp, key: &crate::frames::FrameKey, img: &crate::frames::FrameImage, screen: f64) -> Option<[u32; 2]> {
+    let crate::frames::FrameImage::Gpu(f) = img else { return None };
+    let rs = app.wgpu.as_ref()?;
+    let on = app.session.prefs.previews.upscale_low_res;
+    crate::fsr_upscale::target_size(on, [f.width, f.height], f64::from(key.scale) / 1000.0, screen, rs.device.limits().max_texture_dimension_2d)
+}
+
 /// Put a rendered frame on screen: CPU pixels go into an egui texture, averaged down by `minify`
 /// (see [`minify_factor`]); GPU frames are drawn straight from their wgpu texture (registered with
-/// egui-wgpu, no readback).
-fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames::FrameKey, img: crate::frames::FrameImage, minify: usize) {
+/// egui-wgpu, no readback), through the FSR1 upscale when they are below Full and magnified
+/// (`screen`: physical pixels per comp pixel, UP1).
+fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames::FrameKey, img: crate::frames::FrameImage, minify: usize, screen: f64) {
     use crate::frames::FrameImage;
     // Settings ▸ Previews ▸ Viewer Zoom Quality.
     let smooth = app.session.prefs.viewer_zoom_smooth();
     let opts = zoom_texture_options(smooth);
+    let asked = fsr_target(app, &key, &img, screen);
+    app.viewer_fsr.asked = asked;
     match img {
         FrameImage::Cpu(img) => {
             // Frames wider or taller than the GPU's texture limit go up averaged down too (#201).
@@ -3060,14 +3075,20 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
         }
         FrameImage::Gpu(f) => {
             let Some(rs) = &app.wgpu else { return };
-            let view = f.texture.create_view(&Default::default());
+            // UP1: below Full and magnified, the FSR1 upscale at the size on screen; else the
+            // frame itself, magnified as blocks (#882).
+            let upscaled = asked.and_then(|size| app.viewer_fsr.run(&rs.adapter, &rs.device, &rs.queue, &f.texture, size));
+            let (view, sampler) = match upscaled {
+                Some(view) => (view, crate::fsr_upscale::sampler()),
+                None => (f.texture.create_view(&Default::default()), zoom_sampler(smooth)),
+            };
             let mut ren = rs.renderer.write();
             let id = match &app.viewer_native {
                 Some((id, _, _)) => {
-                    ren.update_egui_texture_from_wgpu_texture_with_sampler_options(&rs.device, &view, zoom_sampler(smooth), *id);
+                    ren.update_egui_texture_from_wgpu_texture_with_sampler_options(&rs.device, &view, sampler, *id);
                     *id
                 }
-                None => ren.register_native_texture_with_sampler_options(&rs.device, &view, zoom_sampler(smooth)),
+                None => ren.register_native_texture_with_sampler_options(&rs.device, &view, sampler),
             };
             drop(ren);
             app.viewer_native = Some((id, key, f));

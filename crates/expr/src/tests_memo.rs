@@ -193,3 +193,104 @@ fn impure_scripts_are_not_remembered() {
     assert!(!memo::cacheable("new Date().getSeconds()"));
     assert!(memo::cacheable("random(10)"));
 }
+
+/// The rig with a static controller: the slider has no expression or keyframes and the readers
+/// don't read `time` (`L0`'s rotation reads `extra` on top).
+fn static_rig(n: usize, extra: &str) -> (Project, ItemId) {
+    let (mut p, cid) = rig(n);
+    let ctrl = layer(&mut p, cid, "Ctrl");
+    let fx = ctrl.props.sub_mut("effects").unwrap().children.first_mut().unwrap().as_group_mut().unwrap();
+    fx.prop_mut("slider").unwrap().expr = None;
+    for i in 0..n {
+        let text = format!("thisComp.layer(\"Ctrl\").effect(\"Slider Control\")(\"Slider\") * index{}", if i == 0 { extra } else { "" });
+        layer(&mut p, cid, &format!("L{i}")).props.prop_mut(ROT).unwrap().expr = Some(Expression { text, enabled: true });
+    }
+    (p, cid)
+}
+
+/// Script runs of [`frame`] at `t` on this thread, checked bit for bit against fresh runs.
+fn frame_runs(p: &Project, cid: ItemId, t: f64, what: &str) -> u64 {
+    let before = script_runs();
+    let got = frame(p, cid, t);
+    let n = script_runs() - before;
+    let want = fresh(|| frame(p, cid, t));
+    assert_eq!(bits(&got), bits(&want), "{what} at {t}: {got:?} vs {want:?}");
+    n
+}
+
+/// EXPR-PERF9: expressions whose inputs don't change over time (a control without keyframes,
+/// constants) ran once per frame and per motion-blur sample, because the result memo was keyed
+/// by time. They now run once; an edit of what they read runs them again; reading `time` (or
+/// an explicit time) still runs at every new time. Results equal fresh runs bit for bit.
+#[test]
+fn expressions_that_never_read_the_time_run_once_across_frames() {
+    let (mut p, cid) = static_rig(4, "");
+    let first = frame_runs(&p, cid, 0.0, "first frame");
+    assert!(first >= 5, "the first frame runs every expression: {first}");
+    // Frames and motion-blur samples (sub-frame times): no runs, the same results.
+    for f in 1..=12 {
+        for s in 0..4 {
+            let t = f as f64 / 30.0 + s as f64 / 120.0;
+            assert_eq!(frame_runs(&p, cid, t, "static rig"), 0, "at {t}");
+        }
+    }
+    // An edit of the control: every reader and the sum run once more, then not again.
+    let ctrl = layer(&mut p, cid, "Ctrl");
+    ctrl.props.sub_mut("effects").unwrap().children.first_mut().unwrap().as_group_mut().unwrap().prop_mut("slider").unwrap().value = Value::Scalar(11.0);
+    assert_eq!(frame_runs(&p, cid, 0.5, "after the edit"), 4 + 1);
+    assert_eq!(frame_runs(&p, cid, 0.6, "after the edit"), 0);
+}
+
+/// Reading `time` still runs at every new time: the reader and the sum (its input changed);
+/// the other readers don't. A time seen before is answered from its own key.
+#[test]
+fn a_reader_of_the_time_still_runs_at_every_new_time() {
+    let (p, cid) = static_rig(4, " + time");
+    let _ = frame_runs(&p, cid, 0.0, "time reader");
+    for t in [0.1, 0.2, 0.2 + 1.0 / 120.0] {
+        assert_eq!(frame_runs(&p, cid, t, "time reader"), 2, "at {t}");
+    }
+    assert_eq!(frame_runs(&p, cid, 0.2, "time reader, same time"), 0);
+}
+
+/// An explicit time argument counts as reading the time, even when it equals the evaluation's
+/// own time: otherwise the memo would ask that read again at a later time, and after an edit
+/// an answer there that happens to equal the old one would reuse a stale result.
+#[test]
+fn an_explicit_time_equal_to_the_evaluation_time_is_not_moved() {
+    let (mut p, cid) = static_rig(2, " + thisComp.layer(\"Ctrl\").transform.rotation.valueAtTime(0.5)");
+    let key = |t: f64, v: f64| effectcraft_keyframe::Keyframe::new(Tick::from_seconds_f64(t), Value::Scalar(v));
+    layer(&mut p, cid, "Ctrl").props.prop_mut(ROT).unwrap().keys = vec![key(0.0, 45.0), key(1.0, 45.0)];
+    let _ = frame_runs(&p, cid, 0.5, "valueAtTime(0.5)");
+    // 45 at 0.7 as before, but no longer at 0.5.
+    layer(&mut p, cid, "Ctrl").props.prop_mut(ROT).unwrap().keys = vec![key(0.0, 0.0), key(0.6, 45.0), key(1.0, 45.0)];
+    let _ = frame_runs(&p, cid, 0.7, "valueAtTime(0.5) after the edit");
+}
+
+/// Results are shared between threads: the pre-pass plans layers on every core and the walk
+/// renders on its own thread, and each used to run the same scripts at the same time again.
+#[test]
+fn another_thread_reuses_the_results() {
+    // Text no other test uses (the shared memo is per process).
+    let (mut p, cid) = rig(3);
+    layer(&mut p, cid, "L1").props.prop_mut(ROT).unwrap().expr =
+        Some(Expression { text: "thisComp.layer(\"Ctrl\").effect(\"Slider Control\")(\"Slider\") * index + time // shared".into(), enabled: true });
+    let on_thread = |p: &Project| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                memo::set_shared(true);
+                let before = script_runs();
+                let v = frame(p, cid, 1.25);
+                (script_runs() - before, v)
+            })
+            .join()
+            .unwrap()
+        })
+    };
+    let (first, a) = on_thread(&p);
+    assert!(first >= 5, "the first thread runs every expression: {first}");
+    let (second, b) = on_thread(&p);
+    assert_eq!(second, 0, "the second thread reuses the first one's results");
+    assert_eq!(bits(&a), bits(&b));
+    assert_eq!(bits(&b), bits(&fresh(|| frame(&p, cid, 1.25))));
+}

@@ -16,10 +16,22 @@
 //! Scripts that read something besides their answers (`Math.random`, `Date`) are never stored.
 //! The memo is per thread (frames render in parallel without sharing it), bounded, and clears
 //! recorded results when full while reusing bounded table storage.
+//!
+//! EXPR-PERF9: two more places a result is found when the evaluation's own key misses.
+//! * **Timeless results.** A run that never read the comp time (see the prelude's `__timeRead`)
+//!   and asked for nothing at another time than its own is a function of its other inputs and
+//!   its answers only. It is stored with the time left out of the key; at any other time its
+//!   requests are asked again at the new time and, when every answer is bit-for-bit the one
+//!   recorded, the result is reused. An expression reading a control without keyframes (or a
+//!   constant) runs once, not once per frame and motion-blur sample.
+//! * **Other threads.** The layer pre-pass plans layers on every core and the walk renders on
+//!   its own thread, so each thread used to run the same scripts at the same time again. Results
+//!   are also kept in a bounded memo shared by all threads, checked the same way.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use crate::host::{Req, Resp, Secs};
 use crate::runtime::{Begin, Out};
@@ -31,6 +43,13 @@ const MAX_BYTES: usize = 32 << 20;
 /// Most answers, and approximate bytes of answers, worth recording for one result.
 const MAX_DEPS: usize = 4096;
 const MAX_ENTRY_BYTES: usize = 1 << 20;
+/// The memo shared by all threads: shards (locked one at a time), and the results and estimated
+/// bytes each shard keeps before it is cleared.
+const SHARDS: usize = 16;
+const SHARD_ENTRIES: usize = 8192;
+const SHARD_BYTES: usize = 4 << 20;
+/// The time of a [`Key::timeless`] key: NaN bits, which no evaluation's time has.
+const TIMELESS: Secs = u64::MAX;
 
 /// The inputs of one evaluation that hash cheaply (the script text is hashed; the entry keeps
 /// the full text and the rest of [`Begin`] to compare).
@@ -64,6 +83,10 @@ impl Key {
             selector: b.selector.map(bits),
         }
     }
+    /// This key without the time, for a result that holds at every time (see the module docs).
+    pub fn timeless(&self) -> Key {
+        Key { time: TIMELESS, ..*self }
+    }
 }
 
 struct Entry {
@@ -75,6 +98,13 @@ struct Entry {
     resps: Vec<Resp>,
     out: Out,
     bytes: usize,
+}
+
+impl Entry {
+    /// Remembered for the same script, property and keyframed value.
+    fn matches(&self, text: &str, b: &Begin) -> bool {
+        *self.text == *text && *self.path == *b.path && same(&self.value, b.value)
+    }
 }
 
 #[derive(Default)]
@@ -156,6 +186,25 @@ thread_local! {
     /// Tests turn the memo off to compute the oracle.
     #[cfg(test)]
     static OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests use the shared memo only where they turn it on (tests on other threads would
+    /// otherwise answer each other's evaluations and change their run counts).
+    #[cfg(test)]
+    static SHARED_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn shared_on() -> bool {
+    SHARED_ON.with(std::cell::Cell::get)
+}
+#[cfg(not(test))]
+fn shared_on() -> bool {
+    true
+}
+
+/// Use the memo shared by all threads (or not) on this thread.
+#[cfg(test)]
+pub fn set_shared(v: bool) {
+    SHARED_ON.with(|o| o.set(v));
 }
 
 #[cfg(test)]
@@ -213,8 +262,21 @@ pub fn check(key: &Key, answered: impl Fn(&Req, &Resp) -> bool) -> Option<Out> {
     })
 }
 
-/// Remember a successful evaluation and what its final run read.
+/// Remember a successful evaluation and what its final run read (here and in the memo shared
+/// by all threads). `key` is the evaluation's own key, or its [`Key::timeless`] one when the run
+/// never read the time and asked for nothing at another time (then it is stored under both).
 pub fn store(key: Key, text: &str, b: &Begin, reqs: Vec<Req>, resps: Vec<Resp>, out: Out) {
+    if reqs.len() != resps.len() || reqs.len() > MAX_DEPS || !cacheable(text) {
+        return;
+    }
+    if shared_on() {
+        share(key, text, b, &reqs, &resps, &out);
+    }
+    store_local(key, text, b, reqs, resps, out);
+}
+
+/// [`store`] in this thread's memo only.
+fn store_local(key: Key, text: &str, b: &Begin, reqs: Vec<Req>, resps: Vec<Resp>, out: Out) {
     if reqs.len() != resps.len() || reqs.len() > MAX_DEPS || !cacheable(text) {
         return;
     }
@@ -254,6 +316,102 @@ pub fn store(key: Key, text: &str, b: &Begin, reqs: Vec<Req>, resps: Vec<Resp>, 
             *m = Memo::default();
         }
     });
+}
+
+/// The memo shared by all threads (see the module docs).
+#[derive(Default)]
+struct Shard {
+    entries: HashMap<Key, Arc<Entry>>,
+    bytes: usize,
+}
+
+static SHARED: LazyLock<Vec<Mutex<Shard>>> = LazyLock::new(|| (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect());
+
+/// Run `f` on the shard of `key` (a poisoned lock is used as it is: entries are replaced whole).
+fn with_shard<T>(key: &Key, f: impl FnOnce(&mut Shard) -> T) -> Option<T> {
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    let i = usize::try_from(h.finish() % SHARDS as u64).unwrap_or(0);
+    let shard = SHARED.get(i)?;
+    let mut guard = shard.lock().unwrap_or_else(PoisonError::into_inner);
+    Some(f(&mut guard))
+}
+
+fn share(key: Key, text: &str, b: &Begin, reqs: &[Req], resps: &[Resp], out: &Out) {
+    let (reqs, resps) = (reqs.to_vec(), resps.to_vec());
+    let bytes = entry_heap(text, b, &reqs, &resps, out).saturating_add(std::mem::size_of::<(Key, Arc<Entry>)>());
+    if bytes > MAX_ENTRY_BYTES {
+        return;
+    }
+    let entry = Arc::new(Entry { text: text.into(), path: b.path.into(), value: b.value.clone(), reqs, resps, out: out.clone(), bytes });
+    with_shard(&key, |s| {
+        if let Some(old) = s.entries.remove(&key) {
+            s.bytes = s.bytes.saturating_sub(old.bytes);
+        }
+        if s.entries.len() >= SHARD_ENTRIES || s.bytes.saturating_add(bytes) > SHARD_BYTES {
+            s.entries.clear();
+            s.bytes = 0;
+        }
+        s.bytes = s.bytes.saturating_add(bytes);
+        s.entries.insert(key, entry);
+    });
+}
+
+/// A remembered evaluation found under another key than this evaluation's own (a timeless
+/// result, or another thread's): answer [`Candidate::reqs`], then [`Candidate::matches`].
+pub struct Candidate {
+    /// What its final run read, at this evaluation's time for a timeless result.
+    pub reqs: Vec<Req>,
+    resps: Vec<Resp>,
+    out: Out,
+    /// The key it is kept under (this evaluation's own or its timeless one).
+    key: Key,
+    /// Found in the shared memo (so not in this thread's yet).
+    shared: bool,
+}
+
+impl Candidate {
+    /// Whether `answered(req, resp)` holds for every request and its recorded answer.
+    pub fn matches(&self, answered: impl Fn(&Req, &Resp) -> bool) -> bool {
+        self.reqs.len() == self.resps.len() && self.reqs.iter().zip(&self.resps).all(|(q, r)| answered(q, r))
+    }
+    /// The result of a candidate that [`Self::matches`] (kept in this thread's memo too, when it
+    /// came from another thread), and the requests it read.
+    pub fn take(self, text: &str, b: &Begin) -> (Vec<Req>, Out) {
+        if self.shared {
+            store_local(self.key, text, b, self.reqs.clone(), self.resps, self.out.clone());
+        }
+        (self.reqs, self.out)
+    }
+}
+
+/// The remembered evaluation that may answer the one with `key` when its own key misses in this
+/// thread's memo: this thread's timeless result, then the shared memo's result for `key`, then
+/// its timeless one.
+pub fn candidate(key: &Key, text: &str, b: &Begin) -> Option<Candidate> {
+    if off() {
+        return None;
+    }
+    let now = f64::to_bits(b.time);
+    // A timeless result read only at its own time (see `store`): ask the same at this time.
+    let at_now = |reqs: &[Req]| reqs.iter().map(|q| if q.time().is_some() { q.at(now) } else { q.clone() }).collect::<Vec<_>>();
+    let timeless = key.timeless();
+    let local = MEMO.with(|m| {
+        let m = m.borrow();
+        let e = m.entries.get(&timeless).filter(|e| e.matches(text, b))?;
+        Some(Candidate { reqs: at_now(&e.reqs), resps: e.resps.clone(), out: e.out.clone(), key: timeless, shared: false })
+    });
+    if local.is_some() || !shared_on() {
+        return local;
+    }
+    for k in [*key, timeless] {
+        let Some(e) = with_shard(&k, |s| s.entries.get(&k).cloned()).flatten() else { continue };
+        if e.matches(text, b) {
+            let reqs = if k.time == TIMELESS { at_now(&e.reqs) } else { e.reqs.clone() };
+            return Some(Candidate { reqs, resps: e.resps.clone(), out: e.out.clone(), key: k, shared: true });
+        }
+    }
+    None
 }
 
 #[cfg(test)]

@@ -5,7 +5,25 @@
 // __rnd(...) seeded random. This file is evaluated once per runtime and is NOT passed through
 // the array-maths rewriter, so it uses plain JS operators.
 
-var time = 0;
+// The comp time. Reading it marks the run as time-dependent (`__timeRead`); a run that never
+// reads it gives the same result at another time whenever its host answers there are the same,
+// so the result memo reuses it across frames (see memo.rs). Object-model code that only passes
+// the evaluation's own time on to a host request uses `__now`: the memo asks that request
+// again at the new time. An explicit time argument counts as reading the time (`__at`), as it
+// could equal the evaluation's own time by chance.
+var __now = 0;
+var __timeRead = false;
+Object.defineProperty(globalThis, 'time', {
+  configurable: true,
+  get: function () { __timeRead = true; return __now; },
+  set: function (v) { __timeRead = true; __now = v; },
+});
+
+function __at(t) {
+  if (t === undefined) return __now;
+  __timeRead = true;
+  return t;
+}
 var value = 0;
 var __S = null;
 var __rc = 0;
@@ -21,7 +39,8 @@ var __COMP = 0, __COMPNAME = 1, __LAYER = 2, __LINFO = 3, __CHILD = 4, __PINFO =
 var __FOOT = 11, __FDATA = 12, __SAMPLE = 13, __PROJ = 14, __KEYS = 15, __SOURCE = 16;
 
 function __begin(t, v, c, l, path, uid, idx, fd, ti, tt, sv) {
-  time = t;
+  __now = t;
+  __timeRead = false;
   value = v;
   textIndex = ti;
   textTotal = tt;
@@ -621,7 +640,7 @@ Layer.prototype = {
   },
   mask: function (k) { return this.__group('masks').__get(k); },
   content: function (k) { return this.__group('contents').__get(k); },
-  __x: function (t) { return __h(__XFORM, this.__c, this.__l, t === undefined ? time : t); },
+  __x: function (t) { return __h(__XFORM, this.__c, this.__l, __at(t)); },
   toComp: function (p, t) { return __m3(this.__x(t)[0], __v(p)); },
   fromComp: function (p, t) { return __m3(this.__x(t)[1], __v(p)); },
   toWorld: function (p, t) { return __m4(this.__x(t)[2], __v(p), false); },
@@ -631,7 +650,7 @@ Layer.prototype = {
   toWorldVec: function (p, t) { return __m4(this.__x(t)[2], __v(p), true); },
   fromWorldVec: function (p, t) { return __m4(this.__x(t)[3], __v(p), true); },
   sourceRectAtTime: function (t, includeExtents) {
-    var r = __h(__RECT, this.__c, this.__l, t === undefined ? time : t, !!includeExtents);
+    var r = __h(__RECT, this.__c, this.__l, __at(t), !!includeExtents);
     return { top: r[0], left: r[1], width: r[2], height: r[3] };
   },
   // Average straight RGBA of the layer's pixels in `point ± radius` (layer space).
@@ -640,7 +659,7 @@ Layer.prototype = {
     radius = radius === undefined ? [0.5, 0.5] : __v(radius);
     if (!Array.isArray(radius)) radius = [radius, radius];
     return __h(__SAMPLE, this.__c, this.__l, point[0], point[1], radius[0], radius.length > 1 ? radius[1] : radius[0],
-      postEffect === undefined ? true : !!__v(postEffect), t === undefined ? time : __v(t));
+      postEffect === undefined ? true : !!__v(postEffect), t === undefined ? __now : __at(__v(t)));
   },
   toString: function () { return '[object Layer]'; },
 };
@@ -766,12 +785,14 @@ Prop.prototype = {
     if (kind === 'path' && v !== null) return new __Path(v[0], v[1], v[2], v[3]);
     return v;
   },
-  get value() { return this.__self ? value : this.valueAtTime(time); },
+  get value() { return this.__self ? value : this.__t.__valueAt(__now); },
   valueAtTime: function (t) {
-    var s = this.__t;
-    t = __v(t);
-    if (s.__self && t === time) return value;
-    return s.__wrap(__h(__VALUE, s.__c, s.__l, s.__p, t, s.__self));
+    __timeRead = true;
+    return this.__t.__valueAt(__v(t));
+  },
+  __valueAt: function (t) {
+    if (this.__self && t === __now) return value;
+    return this.__wrap(__h(__VALUE, this.__c, this.__l, this.__p, t, this.__self));
   },
   velocityAtTime: function (t) {
     var h = 1e-3;
@@ -829,13 +850,13 @@ Prop.prototype = {
   loopIn: function (type, n) { return __loop(this, false, type, n || 0); },
   loopOutDuration: function (type, d) { return __loop(this, true, type, 0, d === undefined ? 0 : d); },
   loopInDuration: function (type, d) { return __loop(this, false, type, 0, d === undefined ? 0 : d); },
-  points: function (t) { return this.valueAtTime(t === undefined ? time : t).points(); },
-  inTangents: function (t) { return this.valueAtTime(t === undefined ? time : t).inTangents(); },
-  outTangents: function (t) { return this.valueAtTime(t === undefined ? time : t).outTangents(); },
+  points: function (t) { return (t === undefined ? this.value : this.valueAtTime(t)).points(); },
+  inTangents: function (t) { return (t === undefined ? this.value : this.valueAtTime(t)).inTangents(); },
+  outTangents: function (t) { return (t === undefined ? this.value : this.valueAtTime(t)).outTangents(); },
   isClosed: function () { return this.value.isClosed(); },
-  pointOnPath: function (pct, t) { return this.valueAtTime(t === undefined ? time : t).pointOnPath(pct); },
-  tangentOnPath: function (pct, t) { return this.valueAtTime(t === undefined ? time : t).tangentOnPath(pct); },
-  normalOnPath: function (pct, t) { return this.valueAtTime(t === undefined ? time : t).normalOnPath(pct); },
+  pointOnPath: function (pct, t) { return (t === undefined ? this.value : this.valueAtTime(t)).pointOnPath(pct); },
+  tangentOnPath: function (pct, t) { return (t === undefined ? this.value : this.valueAtTime(t)).tangentOnPath(pct); },
+  normalOnPath: function (pct, t) { return (t === undefined ? this.value : this.valueAtTime(t)).normalOnPath(pct); },
   // Source Text style API.
   __docAt: function (t) {
     var d = __h(__DOC, this.__c, this.__l, this.__p, t, this.__self);
@@ -845,10 +866,9 @@ Prop.prototype = {
   },
   get style() { return this.getStyleAt(0); },
   getStyleAt: function (i, t) {
-    if (t === undefined) t = time;
-    return new __TextStyle(this.__docAt(__v(t)), i === undefined ? 0 : Math.floor(__v(i)), [], false);
+    return new __TextStyle(this.__docAt(t === undefined ? __now : __at(__v(t))), i === undefined ? 0 : Math.floor(__v(i)), [], false);
   },
-  createStyle: function () { return new __TextStyle(this.__docAt(time), 0, [], true); },
+  createStyle: function () { return new __TextStyle(this.__docAt(__now), 0, [], true); },
   valueOf: function () { return this.value; },
   toString: function () { return String(this.value); },
 };

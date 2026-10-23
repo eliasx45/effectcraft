@@ -1,10 +1,16 @@
 //! Speed curves in the property rows (Timeline ▸ footer ∿ toggle, on by default): every eased
 //! segment between two keys draws its speed curve inside the row, scaled to that segment's own
 //! peak, with a dot on the peak (hover: speed, time and influences). Linear and hold segments
-//! draw nothing. Editing in place: a yellow influence handle on the baseline at each Bezier side
-//! (drag: `keys.setEase` influence, as the Graph Editor's speed handles), and ⌘-drag anywhere on
-//! the curve sculpts the side nearer the pointer (left of the peak: the first key's out
-//! influence, right of it: the second key's in influence). The speeds at the keys are kept.
+//! draw nothing. Editing in place: a yellow handle at each Bezier side, at the height of the
+//! speed there, as the Graph Editor's speed handles: dragging it sideways changes the influence,
+//! up or down the speed (velocity) at the key. ⌘-drag anywhere on the curve sculpts the side
+//! nearer the pointer (left of the peak: the first key's out influence, right of it: the second
+//! key's in influence), keeping the speeds. The same side of the selected keys of other
+//! properties follows the dragged handle, but not the property's own other keys (no mirrored
+//! handle across the segment) (`keys.setEaseSelected`); ⇧ at the press moves the grabbed handle
+//! alone. The handle
+//! nearest the pointer (within [`HANDLE_PICK`]) is the one that answers, and stays so until
+//! another is clearly nearer, so the cursor doesn't flicker between handles and the curve.
 
 use effectcraft_engine::keyframe::{Interp, side_ease, speed};
 use effectcraft_engine::project::{Comp, Layer, ParamUi, Property};
@@ -23,6 +29,11 @@ const HANDLE_REACH: f64 = 0.5;
 /// Influence is kept in this range (%), as `keys.setEase` and the Graph Editor.
 const MIN_INFLUENCE: f64 = 0.1;
 const MAX_INFLUENCE: f64 = 100.0;
+/// A handle answers the pointer within this distance (points) when it is the nearest...
+const HANDLE_PICK: f32 = 9.0;
+/// ...and the one answering keeps answering until the pointer is this much farther from it
+/// than from another (or leaves its reach).
+const HANDLE_HYSTERESIS: f32 = 4.0;
 
 /// One eased segment as drawn: its keys' comp-time x, the sampled curve (x, speed) and its peak.
 struct Segment {
@@ -39,6 +50,19 @@ struct Segment {
     in_inf: Option<f64>,
 }
 
+impl Segment {
+    /// The speed shown at the key on one side (the curve's end there).
+    fn speed_at(&self, out: bool) -> f64 {
+        let end = if out { self.pts.first() } else { self.pts.last() };
+        end.map_or(0.0, |(_, v)| *v)
+    }
+
+    /// The average of the speed shown (its units per second).
+    fn mean(&self) -> f64 {
+        if self.pts.is_empty() { 0.0 } else { self.pts.iter().map(|(_, v)| v).sum::<f64>() / self.pts.len() as f64 }
+    }
+}
+
 /// A handle or sculpt drag in progress (egui memory, per property).
 #[derive(Clone, Copy)]
 struct Grab {
@@ -49,10 +73,60 @@ struct Grab {
     x0: f32,
     inf0: f64,
     reach_px: f32,
+    /// A handle drag's speed: `None` for a sculpt (influence only).
+    speed: Option<SpeedGrab>,
+    /// ⇧ at the press: the grabbed handle moves alone.
+    alone: bool,
+}
+
+/// What a handle's vertical drag starts from.
+#[derive(Clone, Copy)]
+struct SpeedGrab {
+    /// Pointer y at the press; the segment's peak and the row's height then, which keep the
+    /// vertical scale for the whole drag.
+    y0: f32,
+    peak: f64,
+    amp: f32,
+    /// The side's stored speed (first dimension) at the press.
+    ease: f64,
+    /// +1 or -1: the way the value moves on that side, so up always means faster.
+    dir: f64,
+    /// Stored speed units per shown speed unit (1 for one-dimensional values).
+    ratio: f64,
 }
 
 fn grab_id(uid: u64) -> egui::Id {
     egui::Id::new(("tl-speed-grab", uid))
+}
+
+/// The handle (key, out) answering the pointer in a property's row.
+fn hot_id(uid: u64) -> egui::Id {
+    egui::Id::new(("tl-speed-hot", uid))
+}
+
+/// One handle as drawn: its segment (index into the drawn segments), key and side, the key's x,
+/// where it is and its influence (0..1).
+struct HandleAt {
+    seg: usize,
+    key: usize,
+    out: bool,
+    kx: f32,
+    pos: Pos2,
+    inf: f64,
+}
+
+/// The handle that answers a pointer at `ptr`: the nearest within [`HANDLE_PICK`], except that
+/// `hot` (the one answering until now) keeps answering while it is within reach and no other
+/// is [`HANDLE_HYSTERESIS`] nearer.
+fn pick(handles: &[HandleAt], ptr: Pos2, hot: Option<(usize, bool)>) -> Option<(usize, bool)> {
+    let dist = |h: &HandleAt| h.pos.distance(ptr);
+    let nearest = handles.iter().filter(|h| dist(h) <= HANDLE_PICK).min_by(|a, b| dist(a).total_cmp(&dist(b)));
+    let kept = hot.and_then(|(k, o)| handles.iter().find(|h| h.key == k && h.out == o)).filter(|h| dist(h) <= HANDLE_PICK + HANDLE_HYSTERESIS);
+    match (kept, nearest) {
+        (Some(k), Some(n)) if dist(n) + HANDLE_HYSTERESIS < dist(k) => Some((n.key, n.out)),
+        (Some(k), _) => Some((k.key, k.out)),
+        (None, n) => n.map(|n| (n.key, n.out)),
+    }
 }
 
 /// Speed units for the readout (as the Graph Editor's speed graph).
@@ -148,17 +222,23 @@ pub(crate) fn show(
     let (top, base) = (strip.min.y + 2.0, strip.max.y - 1.5);
     let amp = (base - top).max(1.0);
     let mut grab: Option<Grab> = ctx.data(|d| d.get_temp(grab_id(uid)));
-    // A drag released where this row's widgets were not drawn (scrolled away) leaves no grab behind.
+    // A released drag (this runs before the handle sees its release, and also catches one
+    // released where this row wasn't drawn) leaves no grab and no open undo merge behind: an
+    // open merge made the next handle drag start from before this one, undoing it (23 Oct 2026).
     if grab.is_some() && !ui.input(|i| i.pointer.any_down()) {
         ctx.data_mut(|d| d.remove::<Grab>(grab_id(uid)));
         grab = None;
+        actions.push(("__endMerge".into(), json!({})));
     }
-    let cmd = ui.input(|i| i.modifiers.command);
+    let (cmd, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
     let unit = units(prop);
     // Locked layers show their curves but take no edits.
     let editable = !layer.switches.locked;
-    for s in &segs {
-        let y = |v: f64| base - (v / s.peak) as f32 * amp;
+    let mut handles: Vec<HandleAt> = vec![];
+    for (si, s) in segs.iter().enumerate() {
+        // A handle being dragged keeps its segment's scale from the press.
+        let peak = grab.filter(|g| if g.out { g.key == s.i } else { g.key == s.i + 1 }).and_then(|g| g.speed).map_or(s.peak, |sg| sg.peak);
+        let y = |v: f64| base - (v / peak.max(1e-9)).clamp(0.0, 1.0) as f32 * amp;
         let line: Vec<Pos2> = s.pts.iter().map(|(x, v)| pos2(*x, y(*v))).collect();
         // Faint fill under the curve, then the curve.
         let fill = Color32::from_rgba_unmultiplied(CURVE.r(), CURVE.g(), CURVE.b(), 34);
@@ -199,48 +279,114 @@ pub(crate) fn show(
                 let out = px.x < s.peak_x;
                 let (key, inf) = if out { (s.i, s.out_inf) } else { (s.i + 1, s.in_inf) };
                 let reach_px = ((s.xb - s.xa) as f64 * HANDLE_REACH) as f32;
-                let g = Grab { key, out, x0: px.x, inf0: inf.unwrap_or(1.0 / 6.0) * 100.0, reach_px };
+                let g = Grab { key, out, x0: px.x, inf0: inf.unwrap_or(1.0 / 6.0) * 100.0, reach_px, speed: None, alone: shift };
                 ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
                 grab = Some(g);
             }
-            drag(&ctx, &resp, prop, layer, grab, actions, |g, px| g.inf0 + ((px - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 });
+            drag(&ctx, &resp, prop, layer, grab, actions, |g, px| {
+                (g.inf0 + ((px.x - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 }, None)
+            });
         }
-        // Influence handles on the baseline.
+        // Handles at the speed of each Bezier side: sideways influence, up and down speed.
         let reach = (s.xb - s.xa) * HANDLE_REACH as f32;
         for (out, key, inf, kx) in [(true, s.i, s.out_inf, s.xa), (false, s.i + 1, s.in_inf, s.xb)] {
             let Some(inf) = inf else { continue };
             let hx = if out { kx + reach * inf as f32 } else { kx - reach * inf as f32 };
-            p.line_segment([pos2(kx, base), pos2(hx, base)], Stroke::new(1.5, HANDLE));
-            let hr = Rect::from_center_size(pos2(hx, base), vec2(5.0, 5.0));
+            let hy = y(s.speed_at(out));
+            p.line_segment([pos2(kx, hy), pos2(hx, hy)], Stroke::new(1.5, HANDLE));
+            let hr = Rect::from_center_size(pos2(hx, hy), vec2(5.0, 5.0));
             p.rect(hr, 0.0, HANDLE, Stroke::new(1.0, Color32::from_gray(20)), egui::StrokeKind::Inside);
-            if !editable {
-                continue;
-            }
-            let hit = Rect::from_center_size(pos2(hx, base - 2.0), vec2(12.0, 12.0));
-            let resp = ui.interact(hit, egui::Id::new(("tl-speed-handle", uid, key, out)), Sense::drag());
-            let side = if out { "out" } else { "in" };
-            app.auto.add(&format!("timeline.speed.{uid}.{key}.{side}"), hit, &format!("{} {side} influence {:.0}%", prop.name, inf * 100.0));
-            if resp.hovered() || resp.dragged() {
-                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                if !resp.dragged() {
-                    let _ = resp.clone().on_hover_text(format!("{side} influence {:.0}%", inf * 100.0));
-                }
-            }
-            if resp.drag_started() {
-                // The handle follows the pointer: influence from the key's x.
-                let g = Grab { key, out, x0: kx, inf0: 0.0, reach_px: reach };
-                ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
-                grab = Some(g);
-            }
-            if grab.is_some_and(|g| g.key == key && g.out == out) {
-                drag(&ctx, &resp, prop, layer, grab, actions, |g, px| ((px - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 });
-            }
+            handles.push(HandleAt { seg: si, key, out, kx, pos: pos2(hx, hy.min(base - 2.0)), inf });
         }
+    }
+    if !editable {
+        return;
+    }
+    // One handle answers at a time: the one being dragged, else the one the pointer is nearest.
+    let dragged = grab.filter(|g| g.speed.is_some()).map(|g| (g.key, g.out));
+    let hot = dragged.or_else(|| {
+        let ptr = ui.input(|i| i.pointer.hover_pos()).filter(|p| strip.expand(HANDLE_PICK).contains(*p))?;
+        pick(&handles, ptr, ctx.data(|d| d.get_temp(hot_id(uid))))
+    });
+    ctx.data_mut(|d| match hot {
+        Some(h) => {
+            d.insert_temp(hot_id(uid), h);
+        }
+        None => d.remove::<(usize, bool)>(hot_id(uid)),
+    });
+    for h in &handles {
+        app.auto.add(
+            &format!("timeline.speed.{uid}.{}.{}", h.key, if h.out { "out" } else { "in" }),
+            Rect::from_center_size(h.pos, vec2(12.0, 12.0)),
+            &prop.name,
+        );
+    }
+    let Some(h) = hot.and_then(|(k, o)| handles.iter().find(|h| h.key == k && h.out == o)) else { return };
+    let Some(s) = segs.get(h.seg) else { return };
+    let (key, out, kx, inf) = (h.key, h.out, h.kx, h.inf);
+    let reach = (s.xb - s.xa) * HANDLE_REACH as f32;
+    // Big enough for the pick distance; only this handle has one, so they never overlap.
+    let hit = Rect::from_center_size(h.pos, vec2(2.0 * HANDLE_PICK, 2.0 * HANDLE_PICK));
+    let resp = ui.interact(hit, egui::Id::new(("tl-speed-handle", uid, key, out)), Sense::drag());
+    let side = if out { "out" } else { "in" };
+    let shown = s.speed_at(out);
+    let tip = format!("{side} influence {:.0}% · speed {shown:.1} {unit}", inf * 100.0);
+    if resp.hovered() || resp.dragged() {
+        ctx.set_cursor_icon(egui::CursorIcon::Move);
+        if !resp.dragged() {
+            let _ = resp.clone().on_hover_text(format!("{tip}\nDrag sideways: influence · up/down: speed · ⇧: only this handle"));
+        }
+    }
+    if resp.drag_started()
+        && let Some(press) = resp.interact_pointer_pos()
+    {
+        // The handle follows the pointer: influence from the key's x, speed from how far
+        // the pointer moved up or down at the press's scale.
+        let ease = side_ease(&prop.keys, key, 0, prop.spatial, out).map_or(0.0, |e| e.speed);
+        let lead = seg_velocity(prop, key, out);
+        let dir = if lead < 0.0 { -1.0 } else { 1.0 };
+        let mean = s.mean();
+        let ratio = if mean > 1e-9 && lead.abs() > 1e-9 { lead.abs() / mean } else { 1.0 };
+        let sg = SpeedGrab { y0: press.y, peak: s.peak, amp, ease, dir, ratio };
+        let g = Grab { key, out, x0: kx, inf0: 0.0, reach_px: reach, speed: Some(sg), alone: shift };
+        ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
+        grab = Some(g);
+    }
+    if grab.is_some_and(|g| g.key == key && g.out == out) {
+        drag(&ctx, &resp, prop, layer, grab, actions, |g, px| {
+            let inf = ((px.x - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 };
+            let speed = g.speed.map(|sg| {
+                let more = f64::from(sg.y0 - px.y) / f64::from(sg.amp.max(1.0)) * sg.peak;
+                let v = sg.ease + sg.dir * more * sg.ratio;
+                // Down to a stop, never backwards.
+                if v * sg.dir < 0.0 { 0.0 } else { v }
+            });
+            (inf, speed)
+        });
     }
 }
 
-/// Follows a handle or sculpt drag: `keys.setEase` with the influence `f` gives for the
-/// pointer x; on release ends the undo merge and forgets the grab.
+/// Average velocity of the first dimension (path speed for a spatial value) on one side of key
+/// `i`, signed the way the value moves.
+fn seg_velocity(prop: &Property, i: usize, out: bool) -> f64 {
+    let j = if out { i.checked_add(1) } else { i.checked_sub(1) };
+    let (Some(k), Some(n)) = (prop.keys.get(i), j.and_then(|j| prop.keys.get(j))) else { return 0.0 };
+    let dur = (n.time.seconds() - k.time.seconds()).abs();
+    if dur <= 0.0 {
+        return 0.0;
+    }
+    let (a, b) = (k.value.components(), n.value.components());
+    if prop.spatial && a.len() > 1 {
+        return a.iter().zip(&b).map(|(x, y)| (y - x).powi(2)).sum::<f64>().sqrt() / dur;
+    }
+    let dv = b.first().copied().unwrap_or(0.0) - a.first().copied().unwrap_or(0.0);
+    if out { dv / dur } else { -dv / dur }
+}
+
+/// Follows a handle or sculpt drag: `keys.setEaseSelected` (other properties' selected keys follow,
+/// none with ⇧) with
+/// the influence and speed `f` gives for the pointer; on release ends the undo merge and forgets
+/// the grab.
 fn drag(
     ctx: &egui::Context,
     resp: &egui::Response,
@@ -248,18 +394,25 @@ fn drag(
     layer: &Layer,
     grab: Option<Grab>,
     actions: &mut Vec<(String, serde_json::Value)>,
-    f: impl Fn(&Grab, f32) -> f64,
+    f: impl Fn(&Grab, Pos2) -> (f64, Option<f64>),
 ) {
     let Some(g) = grab else { return };
     if resp.dragged()
         && let Some(px) = resp.interact_pointer_pos()
         && let Some(k) = prop.keys.get(g.key)
     {
-        let inf = f(&g, px.x).clamp(MIN_INFLUENCE, MAX_INFLUENCE);
-        actions.push((
-            "keys.setEase".into(),
-            json!({"layer": layer.id.0, "prop": prop.uid, "time": k.time.seconds(), "side": if g.out { "out" } else { "in" }, "influence": inf, "merge": "tl-speed-ease"}),
-        ));
+        let (inf, speed) = f(&g, px);
+        let mut params = json!({"layer": layer.id.0, "prop": prop.uid, "time": k.time.seconds(), "side": if g.out { "out" } else { "in" }, "influence": inf.clamp(MIN_INFLUENCE, MAX_INFLUENCE), "merge": "tl-speed-ease"});
+        if let Some(v) = speed.filter(|v| v.is_finite()) {
+            params["speed"] = json!(v);
+        }
+        // The selected keys of other properties follow on the same side; with ⇧ at the press
+        // the grabbed handle moves alone.
+        params["respective"] = json!(true);
+        if g.alone {
+            params["keys"] = json!([]);
+        }
+        actions.push(("keys.setEaseSelected".into(), params));
         ctx.request_repaint();
     }
     if resp.drag_stopped() {

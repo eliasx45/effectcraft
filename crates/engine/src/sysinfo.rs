@@ -275,7 +275,7 @@ pub fn process_resident() -> Option<u64> {
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
-    let mut c = std::process::Command::new(cmd);
+    let mut c = crate::system_tool::command(cmd);
     c.args(args);
     // A console program started from the windowed app would flash a console window.
     #[cfg(target_os = "windows")]

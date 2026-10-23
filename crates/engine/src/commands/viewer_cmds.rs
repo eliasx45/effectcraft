@@ -209,6 +209,19 @@ fn adaptive_playback(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"on": on}))
 }
 
+/// Settings ▸ Previews ▸ Sharpen Low-Resolution Previews (FSR, UP1): set (`on`) or toggle it,
+/// and save.
+fn upscale_low_res(s: &mut Session, p: &Value) -> Result<Value> {
+    let on = match p.get("on") {
+        None | Some(Value::Null) => !s.prefs.previews.upscale_low_res,
+        Some(v) => v.as_bool().ok_or_else(|| bad("view.upscaleLowRes", "`on` must be true or false"))?,
+    };
+    s.prefs.previews.upscale_low_res = on;
+    s.prefs_changed();
+    s.save_prefs();
+    Ok(json!({"on": on}))
+}
+
 fn guide_index(s: &Session, p: &Value, cmd: &str) -> Result<(effectcraft_project::ItemId, usize)> {
     let cid = comp_id(s, p)?;
     let n = s.project.comp(cid).ok_or(EngineError::NoComp)?.guides.len();
@@ -537,6 +550,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("view.showSnapshot", "Show Snapshot", [], None, "{value?}", has_snapshot, show_snapshot),
         cmd!("view.fastPreviewMode", "Fast Previews", [], None, "{mode: off|adaptive|draft|fastDraft|wireframe}", always, fast_previews),
         cmd!("view.adaptivePlayback", "Adaptive Resolution While Playing", [], None, "{on?: bool (default: toggle)}", always, adaptive_playback),
+        cmd!("view.upscaleLowRes", "Sharpen Low-Resolution Previews (FSR)", [], None, "{on?: bool (default: toggle)}", always, upscale_low_res),
         fast!("view.fastPreviews.off", "Fast Previews: Off (Final Quality)", "Cmd+Alt+1", "off"),
         fast!("view.fastPreviews.adaptive", "Fast Previews: Adaptive Resolution", "Cmd+Alt+2", "adaptive"),
         fast!("view.fastPreviews.draft", "Fast Previews: Draft", "Cmd+Alt+3", "draft"),

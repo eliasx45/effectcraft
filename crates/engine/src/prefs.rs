@@ -168,6 +168,12 @@ page!(Previews {
     /// quality again once it stops or you scrub. Off: only Fast Previews ▸ Adaptive Resolution
     /// does. Exports never change.
     adaptive_playback: bool = true,
+    /// UP1 (beyond After Effects): Sharpen Low-Resolution Previews (FSR). A GPU viewer frame
+    /// rendered below Full (Half, Third, Quarter, adaptive playback) and shown magnified is
+    /// upscaled to its size on screen with AMD FidelityFX Super Resolution 1.0 (EASU + RCAS)
+    /// instead of showing its pixels as blocks. Off: blocks, as in After Effects (#882).
+    /// Renders and exports never change.
+    upscale_low_res: bool = true,
     show_internal_wireframes: bool = false,
     cache_frames_when_idle: bool = false,
     fast_previews: bool = false,

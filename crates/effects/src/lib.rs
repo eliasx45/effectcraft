@@ -56,6 +56,7 @@ pub use misc::{
     GLOW_KNEE, GLOW_OPERATIONS, GLOW_SIGMA_PER_RADIUS, INVERT_ALPHA, INVERT_CHANNELS, exposure_gain, glow_ab_position, glow_ab_t, glow_bright, glow_composite,
     glow_operation, glow_sigmas,
 };
+pub use shadow_studio::{ShadowStudioPlan, shadow_studio_plan};
 pub use sim::particle_state;
 pub use sim3::{PgBlit, PgPlan, playground_plan, playground_state};
 pub use stylize2::strobe_on;
@@ -1161,6 +1162,9 @@ pub const GPU_EFFECTS: &[&str] = &[
     "ec.obsolete.pathtext",
     // effectcraft-gpu fx_deepglow
     "ec.stylize.deepglow",
+    // effectcraft-gpu fx_shadowstudio
+    "ec.perspective.shadowstudio2",
+    "ec.perspective.shadowstudio3",
 ];
 
 /// Effects that can read [`EffectHost::comp_scene`] (the comp camera or the first comp light):

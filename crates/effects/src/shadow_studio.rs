@@ -5,14 +5,36 @@ use effectcraft_raster::{Image, gaussian_blur};
 
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, slider};
 
-fn shadow(ctx: &EffectCtx, mut b: Buf, v3: bool) -> Buf {
+/// Shadow Studio's steps for one buffer, from its controls (shared by the CPU render below and
+/// the GPU kernels, `effectcraft-gpu` `fx_shadowstudio`, so both convert them the same way).
+pub struct ShadowStudioPlan {
+    /// Transparent pixels added on the left, top, right and bottom (0 on an adjustment layer).
+    pub pad: [u32; 4],
+    /// The padded buffer's size.
+    pub size: [u32; 2],
+    /// The shadow colour (straight, its alpha already in the steps' opacities).
+    pub color: [f32; 4],
+    pub source_opacity: f32,
+    /// Source pixels at or below this alpha cast nothing.
+    pub alpha_threshold: f32,
+    /// The cast's Gaussian σ is half of this (0: no blur).
+    pub softness: f64,
+    /// The cast's steps, nearest first: (x, y shift in pixels, opacity), only those with
+    /// opacity above 0. Each pixel keeps the most opaque step that reaches it.
+    pub steps: Vec<(i64, i64, f32)>,
+}
+
+/// The plan for a `width` × `height` buffer at `scale` (Shadow Studio 3 when `v3`, else 2);
+/// `None` when the effect leaves the buffer as it is (non-finite controls, an empty buffer, or
+/// a padded raster past 32 Mpx).
+pub fn shadow_studio_plan(ctx: &EffectCtx, width: u32, height: u32, scale: f64, v3: bool) -> Option<ShadowStudioPlan> {
     let id = |v2, v3_id| if v3 { v3_id } else { v2 };
     let angle = ctx.params.f(id("PESS2-0002", "PESS3-0002"));
-    let distance = (ctx.params.f(id("PESS2-0004", "PESS3-0004")) * b.scale).clamp(0.0, 2048.0);
+    let distance = (ctx.params.f(id("PESS2-0004", "PESS3-0004")) * scale).clamp(0.0, 2048.0);
     let softness = if v3 { ctx.params.f("PESS3-0076") * ctx.params.f("PESS3-0075") / 100.0 } else { ctx.params.f("PESS2-0005") };
-    let softness = (softness * b.scale).clamp(0.0, 512.0);
-    if !angle.is_finite() || !distance.is_finite() || !softness.is_finite() || b.img.is_empty() {
-        return b;
+    let softness = (softness * scale).clamp(0.0, 512.0);
+    if !angle.is_finite() || !distance.is_finite() || !softness.is_finite() || width == 0 || height == 0 {
+        return None;
     }
     let color = ctx.params.color(id("PESS2-0006", "PESS3-0006"));
     let start = (ctx.params.f(id("PESS2-0008", "PESS3-0086")) / 100.0).clamp(0.0, 1.0) as f32;
@@ -26,27 +48,42 @@ fn shadow(ctx: &EffectCtx, mut b: Buf, v3: bool) -> Buf {
         || ![start, end, ease, strength, source_opacity, alpha_threshold].iter().all(|v| v.is_finite())
         || !offset.is_finite()
     {
-        return b;
+        return None;
     }
     let (sin, cos) = angle.to_radians().sin_cos();
     let (dx, dy) = (sin * distance * offset, -cos * distance * offset);
     let feather = (softness * 1.5).ceil() as u32 + 1;
-    let (left, top, right, bottom) = if ctx.adjustment {
-        (0, 0, 0, 0)
+    let pad = if ctx.adjustment {
+        [0, 0, 0, 0]
     } else {
-        (
+        [
             (-dx).max(0.0).ceil() as u32 + feather,
             (-dy).max(0.0).ceil() as u32 + feather,
             dx.max(0.0).ceil() as u32 + feather,
             dy.max(0.0).ceil() as u32 + feather,
-        )
+        ]
     };
-    let Some(w) = b.img.width.checked_add(left).and_then(|n| n.checked_add(right)) else { return b };
-    let Some(h) = b.img.height.checked_add(top).and_then(|n| n.checked_add(bottom)) else { return b };
+    let w = width.checked_add(pad[0])?.checked_add(pad[2])?;
+    let h = height.checked_add(pad[1])?.checked_add(pad[3])?;
     // ponytail: one bounded raster per effect; tile the long-shadow pass if larger frames matter.
     if u64::from(w) * u64::from(h) > 32_000_000 {
-        return b;
+        return None;
     }
+    let samples = ctx.params.f(id("PESS2-0022", "PESS3-0022"));
+    let count = distance.ceil().min(if samples.is_finite() && samples > 0.0 { samples } else { 36.0 }).clamp(1.0, 512.0) as usize;
+    let steps = (1..=count)
+        .filter_map(|step| {
+            let t = step as f64 / count as f64;
+            let opacity = (start + (end - start) * (t as f32).powf(ease)) * strength * color[3];
+            (opacity > 0.0).then(|| ((dx * t).round() as i64, (dy * t).round() as i64, opacity))
+        })
+        .collect();
+    Some(ShadowStudioPlan { pad, size: [w, h], color, source_opacity, alpha_threshold, softness, steps })
+}
+
+fn shadow(ctx: &EffectCtx, mut b: Buf, v3: bool) -> Buf {
+    let Some(plan) = shadow_studio_plan(ctx, b.img.width, b.img.height, b.scale, v3) else { return b };
+    let ShadowStudioPlan { pad: [left, top, _, _], size: [w, h], color, source_opacity, alpha_threshold, softness, steps } = plan;
     let src = b.img;
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (src.width, src.height, 0, 0);
     for y in 0..src.height {
@@ -60,15 +97,7 @@ fn shadow(ctx: &EffectCtx, mut b: Buf, v3: bool) -> Buf {
         }
     }
     let mut cast = Image::new(w, h);
-    let samples = ctx.params.f(id("PESS2-0022", "PESS3-0022"));
-    let count = distance.ceil().min(if samples.is_finite() && samples > 0.0 { samples } else { 36.0 }).clamp(1.0, 512.0) as usize;
-    for step in 1..=count {
-        let t = step as f64 / count as f64;
-        let (sx, sy) = ((dx * t).round() as i64, (dy * t).round() as i64);
-        let opacity = (start + (end - start) * (t as f32).powf(ease)) * strength * color[3];
-        if opacity <= 0.0 {
-            continue;
-        }
+    for (sx, sy, opacity) in steps {
         for y in min_y..=max_y {
             for x in min_x..=max_x {
                 let source_alpha = src.get(i64::from(x), i64::from(y))[3];

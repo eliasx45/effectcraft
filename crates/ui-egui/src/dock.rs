@@ -1743,12 +1743,21 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
                 icons::paint(&painter, r.shrink(4.0).translate(vec2(-2.0, 0.0)), Icon::ChevronRight, t.tab_text);
                 icons::paint(&painter, r.shrink(4.0).translate(vec2(2.0, 0.0)), Icon::ChevronRight, t.tab_text);
                 crate::widgets::focus_outline(ui, &resp, t);
-                reg.add_response(&format!("panel.tabs.{}.next", p.id()), &resp, "Show next tab");
+                reg.add_response(&format!("panel.tabs.{}.next", p.id()), &resp, "More tabs");
                 reg.add_response(&format!("panel.overflow.{}", g.path), &resp, "More tabs");
-                if resp.clicked()
-                    && let Some(next) = entries.get((ai + 1) % entries.len())
-                {
-                    out.actions.push(activate(next));
+                // The » list (After Effects): every tab that doesn't fit, in order; picking one
+                // shows it (the strip then scrolls it into view). It used to step to the next tab
+                // only, so a tab further on (Motion Library) was never in sight (23 Oct 2026).
+                let pop = egui::Id::new(("tab-overflow-pop", g.path.clone()));
+                if resp.clicked() {
+                    crate::widgets::open_popup(ui, pop);
+                }
+                if crate::widgets::popup_is_open(ui, pop) {
+                    let hidden: Vec<&Entry> = entries.iter().enumerate().filter(|(j, _)| *j < start || *j >= k).map(|(_, e)| e).collect();
+                    let labels: Vec<String> = hidden.iter().map(|e| e.label.clone()).collect();
+                    if let Some(e) = crate::widgets::popup_menu(ui, pop, pos2(r.max.x - 160.0, r.max.y), &labels, None).and_then(|i| hidden.get(i)) {
+                        out.actions.push(activate(e));
+                    }
                 }
                 break;
             }

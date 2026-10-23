@@ -72,6 +72,7 @@ pub fn supported(command: &str) -> bool {
             | "edit.deselectAll"
             | "keys.copy"
             | "keys.paste"
+            | "keys.pasteGraph"
             | "keys.selectAll"
             | "keys.set"
             | "keys.setEase"

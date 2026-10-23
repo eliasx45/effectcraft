@@ -25,7 +25,9 @@ lock="$target/build.lock"
 log="$target/build.log"
 mkdir -p "$target"
 
-running() { pgrep -f "^$bin( |$)" >/dev/null 2>&1; }
+# The app runs from a frozen copy in $target/run (scripts/frozen-exe.sh), or from $bin when the
+# Dock launcher started it.
+running() { pgrep -f "^($bin|$target/run/effectcraft-[0-9]+-[0-9]+)( |\$)" >/dev/null 2>&1; }
 
 # Sources newer than the last successful build (any file: a change that doesn't affect the app
 # costs one no-op cargo run, then the stamp moves on).
@@ -98,6 +100,12 @@ esac
 
 if [ "${1:-}" = "--build-only" ]; then
     shift
+    # Never replace a running app's binary: its image would no longer match its file, and macOS
+    # blocks and rescans every process it starts (scripts/frozen-exe.sh).
+    if running; then
+        echo "EffectCraft is running: not rebuilding under it" >&2
+        exit 0
+    fi
     if stale; then build || exit 1; fi
     exit 0
 fi
@@ -111,5 +119,6 @@ if stale; then
     build || { echo "build failed, see $log" >&2; exit 1; }
 fi
 cd "$root" || exit 1
-nohup "$bin" "$@" >"$target/app.log" 2>&1 &
+. "$root/scripts/frozen-exe.sh"
+nohup "$(frozen_exe "$bin" "$target/run")" "$@" >"$target/app.log" 2>&1 &
 exit 0

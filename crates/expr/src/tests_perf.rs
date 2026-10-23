@@ -182,7 +182,8 @@ fn a_loop_over_layers_runs_a_constant_number_of_times() {
         assert_eq!(v, expected);
         let (second, v) = ev(0.5);
         assert_eq!(v, expected);
-        assert_eq!(second, 1, "{n} layers: later frames run once");
+        // The loop never reads the time and the positions don't move: reused (EXPR-PERF9).
+        assert_eq!(second, 0, "{n} layers: later frames reuse the result");
         counts.push(first);
     }
     // Every layer's lookups are collected in the same runs: the count doesn't grow with the

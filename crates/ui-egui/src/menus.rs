@@ -45,6 +45,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("playback.preview.shiftNumpad0", "Preview (Shift+Numpad 0)", [], Some("Shift+Num0")),
     uic!("playback.preview.altNumpad0", "Preview (Alt+Numpad 0)", [], Some("Alt+Num0")),
     uic!("playback.stop", "Stop", [], None),
+    uic!("playback.faster", "Play Faster", [], None),
+    uic!("playback.slower", "Play Slower", [], None),
     uic!("view.fit", "Fit", [], Some("Shift+/")),
     uic!("view.actualSize", "100%", [], Some("/")),
     uic!("view.fitUpTo100", "Fit up to 100%", [], Some("Alt+/")),
@@ -310,6 +312,10 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     // Layer ▸ Layer Styles ▸ <style> from the menu adds the style and opens the dialog on it.
     if crate::panels::layer_styles_dialog::route(app, id, &params)? {
         return Ok(Value::Null);
+    }
+    // While Play Faster plays, Go Back 10 Frames (Shift+Q in the Elias keymap) slows it down a step.
+    if id == "time.back10" && no_params(&params) && app.playback.playing && app.playback.speed > 0 {
+        return invoke(app, ctx, "playback.slower", params);
     }
     // The UI commands of the area files (`menus/*.rs`): exact ids, then the longest prefix.
     if let Some(h) = dispatch::find(Stage::Invoke, id) {
@@ -1006,6 +1012,19 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     // The paste event's text: Edit ▸ Paste pastes SVG markup as a shape layer.
     let pasted =
         if clipboard { ctx.input(|i| i.events.iter().rev().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None })) } else { None };
+    // Held, Zoom In / Out Time keep zooming (After Effects): their key repeats run them again.
+    // `true` for a physical-key binding.
+    let zoom_repeats: Vec<(bool, egui::Modifiers, egui::Key)> = app
+        .session
+        .shortcuts()
+        .bindings()
+        .into_iter()
+        .filter(|(_, b)| matches!(b.command.as_str(), "timeline.zoomIn" | "timeline.zoomOut"))
+        .filter_map(|(sc, _)| {
+            let phys = sc.starts_with("Physical+");
+            parse_shortcut(sc.strip_prefix("Physical+").unwrap_or(sc)).map(|(m, k)| (phys, m, k))
+        })
+        .collect();
     let mut events: Vec<(egui::Key, egui::Modifiers, bool, Option<egui::Key>)> = ctx.input(|i| {
         // The windowing layer turns Ctrl+C / Ctrl+X / Ctrl+V into clipboard events instead of
         // key presses: map them back to the keys (with the modifiers held) so Edit ▸ Copy, Cut,
@@ -1027,7 +1046,8 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                         || matches!(
                             key,
                             egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown
-                        ) =>
+                        )
+                        || zoom_repeats.iter().any(|(phys, m, k)| mods_match(*m, *modifiers) && if *phys { *physical_key == Some(*k) } else { key == k }) =>
                 {
                     out.push((*key, *modifiers, true, *physical_key));
                 }

@@ -129,7 +129,7 @@ fn alive(pid: u32) -> Option<bool> {
     }
     #[cfg(unix)]
     {
-        std::process::Command::new("kill")
+        crate::system_tool::command("kill")
             .args(["-0", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

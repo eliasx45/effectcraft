@@ -1087,6 +1087,7 @@ pub(crate) fn kernel_source() -> String {
         include_str!("shaders/fx_pixel2.wgsl"),
         include_str!("shaders/fx_gen2.wgsl"),
         include_str!("shaders/fx_deepglow.wgsl"),
+        include_str!("shaders/fx_shadowstudio.wgsl"),
         include_str!("shaders/fx_styles.wgsl"),
         include_str!("shaders/sky.wgsl"),
     ]
@@ -1335,6 +1336,7 @@ impl GpuContext {
             .chain(crate::fx_pixel2::KERNELS)
             .chain(crate::fx_gen2::KERNELS)
             .chain(crate::fx_deepglow::KERNELS)
+            .chain(crate::fx_shadowstudio::KERNELS)
             .chain(crate::fx_styles::KERNELS)
         {
             match build(e, &layout) {

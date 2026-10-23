@@ -413,14 +413,17 @@ fn transform_row(
             let mut x = vx;
             // Scale: the chain link (Constrain Proportions, on by default), sharing the
             // Timeline's per-property state so both panels agree (#956).
-            let linkable = pr.match_id == "scale";
+            // Audio Levels too: left and right move by the same dB.
+            let levels = pr.match_id == "levels" && layer.props.parent_of(uid).is_some_and(|g| g.match_id == "audio");
+            let linkable = levels || pr.match_id == "scale";
             let linked = linkable && !app.ui.timeline.unlinked.contains(&uid);
             if linkable {
                 // Constrain Proportions toggle, left of the values.
+                let tip = if levels { "Link Left and Right" } else { "Constrain Proportions" };
                 let lr = Rect::from_center_size(pos2(x - 12.0, cy), vec2(12.0, 12.0));
-                let resp = ui.interact(lr, egui::Id::new(("props-link", uid)), Sense::click()).on_hover_text(tr("Constrain Proportions"));
+                let resp = ui.interact(lr, egui::Id::new(("props-link", uid)), Sense::click()).on_hover_text(tr(tip));
                 icons::paint(p, lr, Icon::Link, if linked { t.accent } else { t.text_faint });
-                app.auto.add(&format!("{base}.constrain"), lr, "Constrain Proportions");
+                app.auto.add(&format!("{base}.constrain"), lr, tip);
                 if resp.clicked() && !app.ui.timeline.unlinked.remove(&uid) {
                     app.ui.timeline.unlinked.insert(uid);
                 }
@@ -434,7 +437,8 @@ fn transform_row(
                     // Alt edits one value of a linked pair, as in the Timeline.
                     let shown = if linked && !ui.input(|i| i.modifiers.alt && !widgets::proportional_scrub(i.modifiers)) { n.min(c.len()) } else { 1 };
                     let from = if shown == 1 { d } else { 0 };
-                    for (e, v) in widgets::constrained(c.get(from..from + shown).unwrap_or_default(), d - from, nv).into_iter().enumerate() {
+                    let link = if levels { widgets::offset_linked } else { widgets::constrained };
+                    for (e, v) in link(c.get(from..from + shown).unwrap_or_default(), d - from, nv).into_iter().enumerate() {
                         if let Some(slot) = nc.get_mut(from + e) {
                             *slot = v;
                         }

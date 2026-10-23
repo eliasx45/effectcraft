@@ -362,6 +362,7 @@ fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         _ if crate::fx_pixel2::IDS.contains(&id) => crate::fx_pixel2::apply(e, id, ctx, b),
         _ if crate::fx_gen2::IDS.contains(&id) => crate::fx_gen2::apply(e, id, ctx, b),
         _ if crate::fx_deepglow::IDS.contains(&id) => crate::fx_deepglow::apply(e, id, ctx, b),
+        _ if crate::fx_shadowstudio::IDS.contains(&id) => crate::fx_shadowstudio::apply(e, id, ctx, b),
         _ => pointwise_px(e, id, ctx, b.into()),
     }
 }

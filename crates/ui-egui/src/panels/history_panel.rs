@@ -193,7 +193,7 @@ pub(crate) fn local_offset_secs() -> Option<i64> {
 
 #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
 fn os_offset() -> Option<i64> {
-    let out = std::process::Command::new("date").arg("+%z").output().ok()?;
+    let out = effectcraft_engine::system_tool::command("date").arg("+%z").output().ok()?;
     parse_z(&String::from_utf8_lossy(&out.stdout))
 }
 
