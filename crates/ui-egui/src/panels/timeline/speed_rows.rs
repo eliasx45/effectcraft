@@ -5,8 +5,10 @@
 //! speed there, as the Graph Editor's speed handles: dragging it sideways changes the influence,
 //! up or down the speed (velocity) at the key. ⌘-drag anywhere on the curve sculpts the side
 //! nearer the pointer (left of the peak: the first key's out influence, right of it: the second
-//! key's in influence), keeping the speeds. A drag moves only the handle it grabbed; ⇧ at the
-//! press makes every selected key's handle follow it (`keys.setEaseSelected`). The handle
+//! key's in influence), keeping the speeds. The same side of the selected keys of other
+//! properties follows the dragged handle, but not the property's own other keys (no mirrored
+//! handle across the segment); ⇧ at the press makes every selected key follow
+//! (`keys.setEaseSelected`). The handle
 //! nearest the pointer (within [`HANDLE_PICK`]) is the one that answers, and stays so until
 //! another is clearly nearer, so the cursor doesn't flicker between handles and the curve.
 
@@ -381,7 +383,8 @@ fn seg_velocity(prop: &Property, i: usize, out: bool) -> f64 {
     if out { dv / dur } else { -dv / dur }
 }
 
-/// Follows a handle or sculpt drag: `keys.setEaseSelected` (every selected key follows with ⇧) with
+/// Follows a handle or sculpt drag: `keys.setEaseSelected` (other properties' selected keys follow,
+/// every selected key with ⇧) with
 /// the influence and speed `f` gives for the pointer; on release ends the undo merge and forgets
 /// the grab.
 fn drag(
@@ -403,9 +406,10 @@ fn drag(
         if let Some(v) = speed.filter(|v| v.is_finite()) {
             params["speed"] = json!(v);
         }
-        // Only the grabbed handle moves unless ⇧ was down at the press.
+        // The selected keys of other properties follow on the same side; with ⇧ at the press
+        // every selected key does (the grabbed segment's other key too, mirrored).
         if !g.follow {
-            params["keys"] = json!([]);
+            params["respective"] = json!(true);
         }
         actions.push(("keys.setEaseSelected".into(), params));
         ctx.request_repaint();

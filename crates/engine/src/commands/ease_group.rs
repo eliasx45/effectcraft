@@ -92,7 +92,16 @@ enum SpeedChange {
 
 /// The new eases of one side of key `i` of `pr`'s keys (`dims`: the dimensions that change; the
 /// others keep theirs). `lead` (the grabbed dimension, its speed and influence) is set exactly.
-fn eases_for(keys: &[Keyframe], i: usize, spatial: bool, out: bool, uid: Uid, dims: Option<&[usize]>, ch: Change, lead: Option<(usize, Option<f64>, Option<f64>)>) -> Option<Vec<Ease>> {
+fn eases_for(
+    keys: &[Keyframe],
+    i: usize,
+    spatial: bool,
+    out: bool,
+    uid: Uid,
+    dims: Option<&[usize]>,
+    ch: Change,
+    lead: Option<(usize, Option<f64>, Option<f64>)>,
+) -> Option<Vec<Ease>> {
     let k = keys.get(i)?;
     let n = if one_curve(k, spatial) { 1 } else { k.value.dims().max(1) };
     // Hold sides and keys of values that don't interpolate have no handle.
@@ -141,6 +150,9 @@ fn set_ease_selected(s: &mut Session, p: &Value) -> Result<Value> {
     let speed = f_p(p, "speed").filter(|v| v.is_finite());
     let influence = f_p(p, "influence").filter(|v| v.is_finite()).map(|v| (v / 100.0).clamp(0.001, 1.0));
     let continuous = p.get("continuous").and_then(Value::as_bool);
+    // Only the selected keys of other properties follow, on the same side (the Timeline's speed
+    // rows: the other key of the grabbed segment must not mirror the drag).
+    let respective = p.get("respective").and_then(Value::as_bool).unwrap_or(false);
     let merge = merge_p(p);
     let keys: Vec<KeyRef> = match p.get("keys").and_then(Value::as_array) {
         Some(list) => list
@@ -175,7 +187,8 @@ fn set_ease_selected(s: &mut Session, p: &Value) -> Result<Value> {
     let ch = Change { influence: influence.map_or(0.0, |i| i - e0.influence), speed: speed_change };
     let grabbed = KeyRef { layer: lid, prop: uid, time: gk.time };
     // The grabbed key's handle drags the others only when it is part of the selection.
-    let others: Vec<KeyRef> = if keys.contains(&grabbed) { keys.into_iter().filter(|k| *k != grabbed).collect() } else { vec![] };
+    let others: Vec<KeyRef> =
+        if keys.contains(&grabbed) { keys.into_iter().filter(|k| *k != grabbed && !(respective && k.layer == lid && k.prop == uid)).collect() } else { vec![] };
     let mut moved = 1usize;
     let result = s.edit("Keyframe Velocity", merge, |proj, _| {
         if let Some(b) = &base {
@@ -197,7 +210,7 @@ fn set_ease_selected(s: &mut Session, p: &Value) -> Result<Value> {
             let Some(l) = comp.layer_mut(kr.layer) else { continue };
             let Some(pr) = l.props.find_mut(kr.prop) else { continue };
             let Some(i) = key_at(&pr.keys, kr.time) else { continue };
-            let Some(side) = follow_side(&pr.keys, i, out) else { continue };
+            let Some(side) = follow_side(&pr.keys, i, out).filter(|side| !respective || *side == out) else { continue };
             // On the grabbed property the same dimensions move; other properties move whole.
             let d = if kr.prop == uid && kr.layer == lid { dims.as_deref() } else { None };
             let Some(eases) = eases_for(&pr.keys, i, pr.spatial, side, kr.prop, d, ch, None) else { continue };
@@ -216,7 +229,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Set Ease of Selected Keyframes",
         [],
         None,
-        "{layer?, path|prop, time (layer s), side: in|out, dim?, dims?: [d…] (the grabbed property's dimensions that move), speed?, influence? %, continuous?: bool, keys?: [{layer, prop, time}] (default: the selection), merge?} — the grabbed side gets speed/influence; the matching side of every other selected key moves by as much (same influence change, same share of its segment's speed); one undo step",
+        "{layer?, path|prop, time (layer s), side: in|out, dim?, dims?: [d…] (the grabbed property's dimensions that move), speed?, influence? %, continuous?: bool, keys?: [{layer, prop, time}] (default: the selection), respective?: bool (only other properties' keys follow, never flipping side), merge?} — the grabbed side gets speed/influence; the matching side of every other selected key moves by as much (same influence change, same share of its segment's speed); one undo step",
         has_comp,
         set_ease_selected
     )]
@@ -253,8 +266,11 @@ mod tests {
         let undo_before = s.history.undo.len();
         // Two drag steps of one gesture on Opacity's first key, out handle: 33 % → 80 %, speed up.
         for (inf, sp) in [(60.0, 20.0), (80.0, 50.0)] {
-            s.execute("keys.setEaseSelected", json!({"layer": l, "path": "transform/opacity", "time": 0.0, "side": "out", "influence": inf, "speed": sp, "merge": "drag"}))
-                .unwrap();
+            s.execute(
+                "keys.setEaseSelected",
+                json!({"layer": l, "path": "transform/opacity", "time": 0.0, "side": "out", "influence": inf, "speed": sp, "merge": "drag"}),
+            )
+            .unwrap();
         }
         s.history.merge_key = None;
         assert_eq!(s.history.undo.len(), undo_before + 1, "one undo step");
@@ -273,6 +289,15 @@ mod tests {
         }
         assert!(s.undo());
         assert!((ease(&s, l, "transform/rotation", 0, true).influence - 1.0 / 3.0).abs() < 1e-3);
+        // `respective` (the Timeline's speed rows, Elias 23 Oct 2026): Opacity's second key's in
+        // handle; Rotation's second key follows on its in side, Opacity's first key doesn't
+        // mirror it and Rotation's first key (no in side) stays.
+        s.execute("keys.setEaseSelected", json!({"layer": l, "path": "transform/opacity", "time": 1.0, "side": "in", "influence": 70.0, "respective": true}))
+            .unwrap();
+        assert!((ease(&s, l, "transform/opacity", 1, false).influence - 0.7).abs() < 1e-6);
+        assert!((ease(&s, l, "transform/rotation", 1, false).influence - 0.7).abs() < 1e-6, "Rotation's respective key follows");
+        assert!((ease(&s, l, "transform/opacity", 0, true).influence - 1.0 / 3.0).abs() < 1e-3, "the segment's other key stays");
+        assert!((ease(&s, l, "transform/rotation", 0, true).influence - 1.0 / 3.0).abs() < 1e-3, "no side flips");
     }
 
     /// With only the grabbed key selected (or none), the other keys stay.
