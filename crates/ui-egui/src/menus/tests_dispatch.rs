@@ -35,6 +35,8 @@ const PINNED_INVOKE: &[&str] = &[
     "playback.preview.shiftNumpad0",
     "playback.preview.altNumpad0",
     "playback.stop",
+    "playback.faster",
+    "playback.slower",
     "view.fit",
     "view.fitUpTo100",
     "view.nextItem",

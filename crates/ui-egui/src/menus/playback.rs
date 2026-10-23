@@ -13,6 +13,8 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("playback.preview.shiftNumpad0", preview),
         Handler::ui("playback.preview.altNumpad0", preview),
         Handler::ui("playback.stop", stop),
+        Handler::ui("playback.faster", faster),
+        Handler::ui("playback.slower", slower),
         // Audio scrubbing: one frame of audio at `time` (default the current time).
         Handler::frontend("playback.scrubAudio", scrub_audio),
         Handler::frontend("playback.toggle", play_toggle),
@@ -38,6 +40,20 @@ fn preview(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _params: Val
 fn stop(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
     app.stop();
     Ok(Value::Null)
+}
+
+/// Play Faster: ×2, then ×4, ×8 with each press (FilmCraft's Shuttle Right).
+fn faster(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    let now = ctx.input(|i| i.time);
+    app.play_faster(now);
+    Ok(json!({"playing": app.playback.playing, "speed": app.playback.speed.max(1)}))
+}
+
+/// Play Slower: halves Play Faster's speed, down to normal speed.
+fn slower(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    let now = ctx.input(|i| i.time);
+    app.play_slower(now);
+    Ok(json!({"playing": app.playback.playing, "speed": app.playback.speed.max(1)}))
 }
 
 fn scrub_audio(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, p: Value) -> Result<Value, String> {

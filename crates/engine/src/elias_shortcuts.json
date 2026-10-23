@@ -118,6 +118,9 @@
     "path.convertToBezier": [
       "Cmd+B"
     ],
+    "playback.faster": [
+      "Shift+E"
+    ],
     "render.preRender": [
       "Cmd+Alt+Shift+R"
     ],
@@ -150,6 +153,7 @@
       "Shift+F3"
     ],
     "timeline.keyAt.rotation": [],
+    "timeline.revealAdd.effects": [],
     "timeline.revealAdd.feather": [],
     "timeline.trimInToTime": [
       "W",

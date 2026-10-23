@@ -45,6 +45,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("playback.preview.shiftNumpad0", "Preview (Shift+Numpad 0)", [], Some("Shift+Num0")),
     uic!("playback.preview.altNumpad0", "Preview (Alt+Numpad 0)", [], Some("Alt+Num0")),
     uic!("playback.stop", "Stop", [], None),
+    uic!("playback.faster", "Play Faster", [], None),
+    uic!("playback.slower", "Play Slower", [], None),
     uic!("view.fit", "Fit", [], Some("Shift+/")),
     uic!("view.actualSize", "100%", [], Some("/")),
     uic!("view.fitUpTo100", "Fit up to 100%", [], Some("Alt+/")),
@@ -310,6 +312,10 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     // Layer ▸ Layer Styles ▸ <style> from the menu adds the style and opens the dialog on it.
     if crate::panels::layer_styles_dialog::route(app, id, &params)? {
         return Ok(Value::Null);
+    }
+    // While Play Faster plays, Go Back 10 Frames (Shift+Q in the Elias keymap) slows it down a step.
+    if id == "time.back10" && no_params(&params) && app.playback.playing && app.playback.speed > 0 {
+        return invoke(app, ctx, "playback.slower", params);
     }
     // The UI commands of the area files (`menus/*.rs`): exact ids, then the longest prefix.
     if let Some(h) = dispatch::find(Stage::Invoke, id) {

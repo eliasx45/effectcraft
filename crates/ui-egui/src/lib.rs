@@ -414,7 +414,14 @@ pub struct Playback {
     /// Every frame shown since the preview started (UI seconds, frame), for `ui.inspect`'s
     /// frame-interval percentiles; capped at [`SHOWN_LOG_MAX`].
     pub log: Vec<(f64, i64)>,
+    /// Play Faster (FilmCraft's Shuttle Right): ×2, ×4 or ×8 the preview's rate, silent; 0 =
+    /// normal speed. The plan's rate and frame step are multiplied, so as many frames a second
+    /// show as at normal speed.
+    pub speed: u32,
 }
+
+/// Play Faster's top speed (×8, as FilmCraft's Shuttle Right).
+const MAX_PLAY_SPEED: u32 = 8;
 
 /// Frames [`Playback::log`] keeps (about 9 minutes at 30 fps).
 const SHOWN_LOG_MAX: usize = 16_384;
@@ -1718,6 +1725,7 @@ impl EffectcraftApp {
             shown_at: Default::default(),
             observed: now,
             log: Vec::new(),
+            speed: 0,
         };
         if !self.playback.caching {
             if plan.video {
@@ -1727,6 +1735,66 @@ impl EffectcraftApp {
                 self.start_audio(fr.tick_of(plan.first));
             }
         }
+    }
+
+    /// Play Faster (FilmCraft's Shuttle Right, Shift+E in the Elias keymap): plays at ×2 (from
+    /// the current time when stopped), each further press doubles the speed up to ×8. Stopping
+    /// or [`Self::play_slower`] back to ×1 returns to normal speed.
+    pub fn play_faster(&mut self, now: f64) {
+        if !self.playback.playing {
+            self.play(now);
+        }
+        if !self.playback.playing {
+            return;
+        }
+        // At speed the preview starts at once: no Cache Before Playback.
+        self.playback.caching = false;
+        let speed = self.playback.speed.max(1).saturating_mul(2).min(MAX_PLAY_SPEED);
+        self.set_play_speed(now, speed);
+    }
+
+    /// Play Slower: halves Play Faster's speed, down to normal speed (with sound again). Whether
+    /// a fast preview was playing.
+    pub fn play_slower(&mut self, now: f64) -> bool {
+        if !self.playback.playing || self.playback.speed < 2 {
+            return false;
+        }
+        self.set_play_speed(now, self.playback.speed / 2);
+        true
+    }
+
+    /// Play on from the current frame at `speed` × the preview's rate (1 = normal).
+    fn set_play_speed(&mut self, now: f64, speed: u32) {
+        let Some(mut pl) = self.playback.plan else { return };
+        let (old, new) = (self.playback.speed.max(1), speed.clamp(1, MAX_PLAY_SPEED));
+        if old == new {
+            return;
+        }
+        // Powers of two: the rate comes back exactly at ×1 (the sound needs the comp's rate).
+        pl.fps = pl.fps / f64::from(old) * f64::from(new);
+        pl.step = (pl.step / i64::from(old)).max(1).saturating_mul(i64::from(new));
+        let cur = if pl.video {
+            self.session.active_comp().map_or(pl.first, |c| c.frame_rate.frame_at(self.session.time()))
+        } else {
+            self.playback.audio_frame.unwrap_or(pl.first)
+        };
+        self.playback.plan = Some(pl);
+        self.playback.fps = pl.fps;
+        self.playback.speed = if new > 1 { new } else { 0 };
+        self.playback.start_wall = now;
+        self.playback.start_frame = cur;
+        self.playback.waiting = false;
+        self.playback.shown_at.clear();
+        // Silent at speed; back at ×1 the sound starts again once the frames ahead are cached.
+        self.audio = None;
+        self.playback.preroll = None;
+        let sound = new == 1 && self.audio_plays();
+        self.playback.audio_held = sound && pl.video;
+        if sound && !pl.video {
+            self.start_audio(self.session.active_comp().map(|c| c.frame_rate.tick_of(cur)).unwrap_or_default());
+        }
+        let msg = if new > 1 { format!("Playing at {new}×") } else { "Playing at normal speed".to_string() };
+        self.toast = Some((msg, now));
     }
 
     /// The preview includes audio at the comp's frame rate and the comp has something audible.
