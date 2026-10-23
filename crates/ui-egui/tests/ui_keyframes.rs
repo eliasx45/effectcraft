@@ -431,6 +431,40 @@ fn a_speed_row_handle_drags_speed_and_influence_of_every_selected_key() {
     assert_eq!(h.state().session.history.undo.len(), undo + 1, "one undo step");
 }
 
+/// Elias, 23 Oct 2026: a speed-row drag left its undo merge open on release, so the next
+/// handle drag started from before it and put the first handle back (his 98 % in handle fell to
+/// 16.67 % the moment he touched the other key's out handle). Each drag is its own step now.
+#[test]
+fn a_second_speed_row_drag_keeps_the_first_one() {
+    let (mut h, id, uid) = harness();
+    let s = &mut h.state_mut().session;
+    s.execute("keys.selectAll", json!({})).unwrap();
+    s.execute("keys.easyEase", json!({})).unwrap();
+    s.execute("keys.select", json!({"keys": [{"layer": id.0, "prop": uid, "time": 1.0}]})).unwrap();
+    h.run_steps(4);
+    let centre = |h: &Harness<'_, EffectcraftApp>, name: &str| {
+        let e = h.state().auto.find(&format!("timeline.speed.{uid}.{name}")).unwrap_or_else(|| panic!("{name} handle in the row")).clone();
+        pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0)
+    };
+    let eases = |h: &Harness<'_, EffectcraftApp>| {
+        let keys = h.state().session.active_comp().unwrap().layer(id).unwrap().props.prop("transform/opacity").unwrap().keys.clone();
+        (keys[0].out_ease.first().copied().unwrap(), keys[1].in_ease.first().copied().unwrap())
+    };
+    let undo = h.state().session.history.undo.len();
+    // Key 1's in handle out to the left (more influence), then key 0's out handle a little.
+    let from = centre(&h, "1.in");
+    drag(&mut h, from, from - egui::vec2(40.0, 0.0), Default::default());
+    let (_, in1) = eases(&h);
+    assert!(in1.influence > 1.0 / 3.0 + 0.02, "key 1 in grew: {in1:?}");
+    h.run_steps(3);
+    let from = centre(&h, "0.out");
+    drag(&mut h, from, from + egui::vec2(10.0, 0.0), Default::default());
+    let (out0, in1_after) = eases(&h);
+    assert!(out0.influence > 1.0 / 3.0, "key 0 out moved: {out0:?}");
+    assert!((in1_after.influence - in1.influence).abs() < 1e-9, "key 1 in kept: {in1:?} → {in1_after:?}");
+    assert_eq!(h.state().session.history.undo.len(), undo + 2, "two drags, two undo steps");
+}
+
 /// A handle at speed 0 (Easy Ease) dragged up in the speed graph speeds the value the way its
 /// segment goes: on a falling segment the speed is negative. It came out positive, so the value
 /// overshot, stopped and turned back just before the key.

@@ -181,10 +181,13 @@ pub(crate) fn show(
     let (top, base) = (strip.min.y + 2.0, strip.max.y - 1.5);
     let amp = (base - top).max(1.0);
     let mut grab: Option<Grab> = ctx.data(|d| d.get_temp(grab_id(uid)));
-    // A drag released where this row's widgets were not drawn (scrolled away) leaves no grab behind.
+    // A released drag (this runs before the handle sees its release, and also catches one
+    // released where this row wasn't drawn) leaves no grab and no open undo merge behind: an
+    // open merge made the next handle drag start from before this one, undoing it (23 Oct 2026).
     if grab.is_some() && !ui.input(|i| i.pointer.any_down()) {
         ctx.data_mut(|d| d.remove::<Grab>(grab_id(uid)));
         grab = None;
+        actions.push(("__endMerge".into(), json!({})));
     }
     let cmd = ui.input(|i| i.modifiers.command);
     let unit = units(prop);
@@ -238,7 +241,9 @@ pub(crate) fn show(
                 ctx.data_mut(|d| d.insert_temp(grab_id(uid), g));
                 grab = Some(g);
             }
-            drag(&ctx, &resp, prop, layer, grab, actions, |g, px| (g.inf0 + ((px.x - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 }, None));
+            drag(&ctx, &resp, prop, layer, grab, actions, |g, px| {
+                (g.inf0 + ((px.x - g.x0) / g.reach_px.max(1.0)) as f64 * 100.0 * if g.out { 1.0 } else { -1.0 }, None)
+            });
         }
         // Handles at the speed of each Bezier side: sideways influence, up and down speed.
         let reach = (s.xb - s.xa) * HANDLE_REACH as f32;
