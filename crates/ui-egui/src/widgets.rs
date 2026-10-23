@@ -767,9 +767,23 @@ pub(crate) fn constrained(c: &[f64], d: usize, v: f64) -> Vec<f64> {
         .collect()
 }
 
+/// Linked values after component `d` of `c` became `v`: the others move by the same amount.
+/// Audio Levels' left and right (dB) stay linked this way, as in After Effects: the balance
+/// between the channels is kept, and 0 dB on both sides is no special case.
+pub(crate) fn offset_linked(c: &[f64], d: usize, v: f64) -> Vec<f64> {
+    let Some(&old) = c.get(d) else { return c.to_vec() };
+    c.iter().enumerate().map(|(e, &x)| if e == d { v } else { x + (v - old) }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_levels_move_together_by_the_same_amount() {
+        assert_eq!(offset_linked(&[0.0, 0.0], 0, -6.0), vec![-6.0, -6.0]);
+        assert_eq!(offset_linked(&[-3.0, 0.0], 1, 2.0), vec![-1.0, 2.0]);
+    }
 
     /// #488: an inline editor selects its whole text only as it opens. Should it be without the
     /// keyboard for a frame later (an input method, another handler), it takes the keyboard back

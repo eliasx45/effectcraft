@@ -503,7 +503,7 @@ pub struct TimelineState {
     /// the others grow with their text, up to 8 lines.
     #[serde(default)]
     pub expr_lines: BTreeMap<u64, usize>,
-    /// Scale and Mask Feather properties whose chain link (Constrain Proportions, on by default)
+    /// Scale, Mask Feather and Audio Levels properties whose chain link (on by default)
     /// was turned off.
     #[serde(default)]
     pub unlinked: BTreeSet<u64>,

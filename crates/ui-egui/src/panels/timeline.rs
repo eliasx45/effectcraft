@@ -4516,14 +4516,17 @@ fn value_editor(
             // Mask Feather: two linked values, never negative (as in After Effects, #203).
             let feather = prop.match_id == "feather" && layer.props.parent_of(uid).is_some_and(|g| matches!(g.kind, GroupKind::Mask { .. }));
             let range = if feather { (0.0, 1e9) } else { (-1e9, 1e9) };
+            // Audio Levels: left and right linked by default, moving by the same dB.
+            let levels = prop.match_id == "levels" && layer.props.parent_of(uid).is_some_and(|g| g.match_id == "audio");
             // Scale and Mask Feather: the chain link (Constrain Proportions, on by default).
-            let linkable = feather || (pct && prop.match_id == "scale");
+            let linkable = feather || levels || (pct && prop.match_id == "scale");
             let linked = linkable && !app.ui.timeline.unlinked.contains(&uid);
             if linkable {
+                let tip = if levels { "Link Left and Right" } else { "Constrain Proportions" };
                 let lr = Rect::from_center_size(pos2(x + 7.0, at.y), vec2(14.0, 14.0));
-                let resp = ui.interact(lr, egui::Id::new((instance, "tl-link", uid)), Sense::click()).on_hover_text(crate::i18n::tr("Constrain Proportions"));
+                let resp = ui.interact(lr, egui::Id::new((instance, "tl-link", uid)), Sense::click()).on_hover_text(crate::i18n::tr(tip));
                 icons::paint(p, lr, Icon::Link, if linked { t.accent } else { t.text_faint });
-                app.auto.add(&format!("{prefix}.link"), lr, "Constrain Proportions");
+                app.auto.add(&format!("{prefix}.link"), lr, tip);
                 if resp.clicked() && !app.ui.timeline.unlinked.remove(&uid) {
                     app.ui.timeline.unlinked.insert(uid);
                 }
@@ -4540,7 +4543,8 @@ fn value_editor(
                     // Alt edits one value of a linked pair (Ctrl+Alt is a proportional scrub).
                     let shown = if linked && !ui.input(|i| i.modifiers.alt && !widgets::proportional_scrub(i.modifiers)) { n.min(c.len()) } else { 1 };
                     let from = if shown == 1 { d } else { 0 };
-                    for (e, v) in widgets::constrained(c.get(from..from + shown).unwrap_or_default(), d - from, nv).into_iter().enumerate() {
+                    let link = if levels { widgets::offset_linked } else { widgets::constrained };
+                    for (e, v) in link(c.get(from..from + shown).unwrap_or_default(), d - from, nv).into_iter().enumerate() {
                         if let Some(slot) = nc.get_mut(from + e) {
                             *slot = v;
                         }
