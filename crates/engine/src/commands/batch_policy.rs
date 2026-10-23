@@ -68,6 +68,7 @@ pub fn atomic_supported(id: &str) -> bool {
         "keys.velocity",
         "keys.copy",
         "keys.paste",
+        "keys.pasteGraph",
         "keys.selectAll",
         "keys.nudge",
         "keys.nudgeForward",

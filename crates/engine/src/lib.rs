@@ -210,6 +210,27 @@ pub struct KeyClip {
     pub keys: Vec<effectcraft_keyframe::Keyframe>,
 }
 
+/// The temporal graph of one keyframe: how it eases in and out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyGraph {
+    pub in_interp: effectcraft_keyframe::Interp,
+    pub out_interp: effectcraft_keyframe::Interp,
+    pub in_ease: effectcraft_keyframe::Eases,
+    pub out_ease: effectcraft_keyframe::Eases,
+    pub continuous: bool,
+    pub auto_bezier: bool,
+}
+
+/// The graph Edit ▸ Paste puts on the selected keyframes: one key's graph for all of them (the
+/// copied keys all had the same graph), else the graphs of the last selected property's keys
+/// in time order, repeated segment by segment over any number of keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GraphClip {
+    pub keys: Vec<KeyGraph>,
+    /// The keys that were copied: pasting with exactly these selected pastes the keys themselves.
+    pub source: Vec<KeyRef>,
+}
+
 /// A selected mask vertex: layer, mask group uid, vertex index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VertexRef {
@@ -261,6 +282,9 @@ pub struct EditorState {
     /// Copied keyframes (times relative to the earliest copied key).
     #[serde(skip)]
     pub key_clipboard: Vec<KeyClip>,
+    /// The graph of the copied keyframes (Paste onto other selected keyframes pastes it).
+    #[serde(skip)]
+    pub graph_clipboard: GraphClip,
     /// The last copy was keyframes (Paste pastes keys at the CTI).
     #[serde(skip)]
     pub clip_is_keys: bool,
