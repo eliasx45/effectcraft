@@ -211,6 +211,17 @@ fn evaluate_out(
             return Ok(out);
         }
     }
+    // The same inputs at another time, from a run that never read the time (a control without
+    // keyframes, a constant), or evaluated on another thread: the same check (EXPR-PERF9).
+    if let Some(c) = memo::candidate(&memo_key, text, &begin) {
+        answer(&resolver, depth, c.reqs.clone());
+        let hit = FRAMES.with(|f| f.borrow().get(depth).is_some_and(|fr| c.matches(|q, r| fr.answer(q).is_some_and(|a| memo::same(a, r)))));
+        if hit {
+            let (reqs, out) = c.take(text, &begin);
+            prefetch::store(key, now, reqs);
+            return Ok(out);
+        }
+    }
     // Cached results already validated every answer they read. Only a miss needs this setup.
     answer(
         &resolver,
@@ -225,6 +236,8 @@ fn evaluate_out(
         RUNS.with(|r| r.set(r.get().saturating_add(1)));
         match runtime::run(text, &begin) {
             Run::Done(r) => {
+                // Read before anything else runs a script (see `runtime::time_read`).
+                let time_read = runtime::time_read();
                 let (used, resps) = FRAMES.with(|f| {
                     let mut f = f.borrow_mut();
                     let Some(fr) = f.get_mut(depth) else { return (vec![], None) };
@@ -233,6 +246,14 @@ fn evaluate_out(
                     (used, resps)
                 });
                 if let (Ok(out), Some(resps)) = (&r, resps) {
+                    // Holds at every time where its answers are the same: it never read the
+                    // time, and asked for nothing at another time than its own.
+                    // It is kept under its own key too: a revisit of this time (the walk after
+                    // the pre-pass, scrubbing back) still hits when its inputs changed since.
+                    let timeless = !time_read && used.iter().all(|q| q.time().is_none_or(|t| t == now));
+                    if timeless {
+                        memo::store(memo_key.timeless(), text, &begin, used.clone(), resps.clone(), out.clone());
+                    }
                     memo::store(memo_key, text, &begin, used.clone(), resps, out.clone());
                 }
                 prefetch::store(key, now, used);
