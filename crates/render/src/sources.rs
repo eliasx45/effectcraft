@@ -38,6 +38,14 @@ impl<'a> Renderer<'a> {
         now.is_some() && now == crate::cache::layer_key(&ctx.at(prev), layer, scale, draft, blur)
     }
 
+    /// Whether `layer`'s styles are the same as one frame earlier ([`Self::layer_is_static`]
+    /// covers its content only): a card whose drop shadow moves has static content and styles
+    /// that change every frame.
+    pub fn styles_are_static(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        let prev = ctx.time - ctx.comp.frame_rate.frame_duration();
+        crate::cache::styles_key(ctx, layer, 0) == crate::cache::styles_key(&ctx.at(prev), layer, 0)
+    }
+
     /// Rasterisation scale of a layer's source: the output scale, or — for text and shape layers,
     /// which are always continuously rasterised (#390, #751), and Continuously Rasterize vector
     /// footage — the output scale times the layer's on-screen scale (quarter-octave steps, rounded

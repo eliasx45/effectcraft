@@ -701,6 +701,9 @@ mod tests_precomp_resident;
 #[cfg(test)]
 mod tests_shape_clip;
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests_styles_static;
+#[cfg(test)]
 mod tests_traffic_light;
 #[cfg(test)]
 mod tests_view_clip;

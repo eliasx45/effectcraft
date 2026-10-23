@@ -342,12 +342,14 @@ impl<'a> Renderer<'a> {
 
     /// A styled layer for an accelerator that renders its styles itself: the content cropped
     /// and padded for them, and the styles ([`crate::styles::gpu_prepare`]). `None` leaves the
-    /// layer to [`Self::styled`]: styles the accelerator can't render, a static layer (its
-    /// styles are cached and uploaded once), or a frame seen before. The first visit of a frame
+    /// layer to [`Self::styled`]: styles the accelerator can't render, a static layer with
+    /// static styles (they are cached and uploaded once), or a frame seen before. Static content
+    /// with animated styles styles here: on the CPU it took about 57 ms a frame for a 1200 × 700
+    /// card in a 1080p comp (`tests_styles_static` in the GPU crate). The first visit of a frame
     /// leaves a mark in the layer cache; the next one styles it on the CPU and caches the
     /// result, so scrubbing back over it costs no styling at all.
     pub fn gpu_styles(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, crate::styles::GpuStyles)> {
-        if self.layer_is_static(ctx, layer) {
+        if self.layer_is_static(ctx, layer) && self.styles_are_static(ctx, layer) {
             return None;
         }
         let (content, ckey) = self.content_buf_timed(ctx, layer, None, None)?;
