@@ -1069,8 +1069,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                     let merge = format!("ghandle-{uid}-{}", k.idx);
                     for g in &grabs {
                         let raw_t = g.end.0 + dt;
-                        let snapped =
-                            (snapping && time_ok).then(|| super::graph_tools::snap_target(raw_t, &candidates, 6.0 / pixels_per_second.max(1e-6))).flatten();
+                        let snapped = (snapping && time_ok).then(|| g.snap_end(raw_t, &candidates, 6.0 / pixels_per_second.max(1e-6))).flatten();
                         if let Some(at) = snapped {
                             pc.line_segment([pos2(tm.x(at), plot.min.y), pos2(tm.x(at), plot.max.y)], Stroke::new(1.0, Color32::from_rgb(255, 153, 51)));
                         }
@@ -1625,6 +1624,20 @@ impl HandleGrab {
     }
 }
 
+impl HandleGrab {
+    /// Where Snap puts the handle's end dragged to `raw_t` (comp seconds), if anywhere: the
+    /// nearest candidate within `tol` seconds that lies ahead of the key on the handle's side by
+    /// more than `tol`. A candidate at the key itself (comp start, the layer's in point, the work
+    /// area, the current time, often all on the first key) would pull the end onto the key and
+    /// collapse the influence to its 0.1% minimum on the first pixel of a drag; After Effects
+    /// changes the influence in proportion to the handle's travel instead.
+    fn snap_end(&self, raw_t: f64, candidates: &[f64], tol: f64) -> Option<f64> {
+        let dir = if self.out { 1.0 } else { -1.0 };
+        let ahead: Vec<f64> = candidates.iter().copied().filter(|c| (c - self.key.0) * dir > tol).collect();
+        super::graph_tools::snap_target(raw_t, &ahead, tol)
+    }
+}
+
 /// A handle drag: where the button went down, and the handles that move.
 type HandleDrag = (Pos2, Vec<HandleGrab>, f64, f64);
 
@@ -2123,6 +2136,42 @@ mod tests {
         assert_eq!(shift_axes(true, 10.0, -3.0), (true, false));
         assert_eq!(shift_axes(true, 2.0, -9.0), (false, true));
         assert_eq!(shift_axes(true, 5.0, 5.0), (true, false));
+    }
+
+    /// GE-HANDLE1: a 2-point drag of the first key's out handle in the speed graph (key at comp 0,
+    /// where comp start, the in point, the work area and the playhead all snap) changed the
+    /// influence from 30% to the 0.1% minimum: Snap pulled the handle's end onto its own key.
+    #[test]
+    fn small_handle_drag_changes_influence_a_little() {
+        let grab = super::HandleGrab {
+            layer: super::LayerId(1),
+            prop: 7,
+            dim: None,
+            time: super::Tick::ZERO,
+            out: true,
+            key: (0.0, 0.0),
+            // 30% influence of a 1 s segment (100% reaches halfway).
+            end: (0.15, 0.0),
+            negative: false,
+            dur: 1.0,
+            toggle: None,
+            linked: vec![],
+        };
+        let pixels_per_second = 100.0;
+        let tol = 6.0 / pixels_per_second;
+        // The pointer moves 2 points left: 0.02 s at 100 points per second.
+        let raw_t = grab.end.0 + -2.0 / pixels_per_second;
+        let candidates = [0.0, 0.0, 0.0, 5.0];
+        let snapped = grab.snap_end(raw_t, &candidates, tol);
+        assert_eq!(snapped, None, "the key's own time is no snap target for its handle");
+        let ease = grab.ease(snapped.unwrap_or(raw_t), 0.0, true, "m");
+        let influence = ease["influence"].as_f64().unwrap_or(0.0);
+        assert!((influence - 26.0).abs() < 1e-6, "2 points of travel move the influence 4 points, got {influence}");
+        // A candidate ahead of the key still snaps, and so does one behind on the in side.
+        assert_eq!(grab.snap_end(0.31, &[0.0, 0.3], tol), Some(0.3));
+        let in_grab = super::HandleGrab { out: false, key: (1.0, 0.0), end: (0.85, 0.0), ..grab };
+        assert_eq!(in_grab.snap_end(0.99, &[1.0], tol), None);
+        assert_eq!(in_grab.snap_end(0.81, &[0.8, 1.0], tol), Some(0.8));
     }
 }
 
