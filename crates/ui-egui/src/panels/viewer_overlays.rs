@@ -660,12 +660,18 @@ pub(crate) enum FtPart {
 
 impl FtBox {
     pub fn part_at(&self, p: Pos2) -> Option<FtPart> {
+        // The nearest handle square (corner or edge midpoint) wins over the anchor point when
+        // the pointer is nearer to it: on a thin box the edge handles sit close to the anchor.
+        let handle = (0..8).min_by(|a, b| self.handles[*a].distance(p).total_cmp(&self.handles[*b].distance(p))).filter(|i| self.handles[*i].distance(p) < 7.0);
+        if let Some(i) = handle
+            && self.handles[i].distance(p) <= self.anchor.distance(p)
+        {
+            return Some(FtPart::Handle(i));
+        }
         if self.anchor.distance(p) < 8.0 {
             return Some(FtPart::Anchor);
         }
-        if let Some(i) =
-            (0..8).min_by(|a, b| self.handles[*a].distance(p).total_cmp(&self.handles[*b].distance(p))).filter(|i| self.handles[*i].distance(p) < 7.0)
-        {
+        if let Some(i) = handle {
             return Some(FtPart::Handle(i));
         }
         if point_in_quad(p, &self.quad) {
@@ -726,7 +732,14 @@ pub(crate) fn draw_free_transform(app: &mut EffectcraftApp, painter: &egui::Pain
         let r = Rect::from_center_size(*h, vec2(7.0, 7.0));
         painter.rect_filled(r, 0.0, Color32::WHITE);
         painter.rect_stroke(r, 0.0, outline, StrokeKind::Outside);
-        app.auto.add(&format!("viewer.freeTransform.handle.{i}"), r.expand(2.0), "Free transform handle");
+        let label = match i {
+            4 => "Free transform handle (top edge: scale vertically)",
+            5 => "Free transform handle (right edge: scale horizontally)",
+            6 => "Free transform handle (bottom edge: scale vertically)",
+            7 => "Free transform handle (left edge: scale horizontally)",
+            _ => "Free transform handle",
+        };
+        app.auto.add(&format!("viewer.freeTransform.handle.{i}"), r.expand(2.0), label);
     }
     // The anchor point: a circle with a crosshair through it.
     let shadow = Stroke::new(3.0, Color32::from_black_alpha(110));
@@ -1296,6 +1309,56 @@ mod tests {
         let (m, _) = ft_total(FtMode::Rotate, &f, [0.0, 1.0], [200.0, 200.0], [100.0, 300.0], false).unwrap();
         assert!(near(af_apply(&m, [100.0, 200.0]), [100.0, 200.0]));
         assert!(near(af_apply(&m, [300.0, 200.0]), [100.0, 400.0]), "{m:?}");
+    }
+
+    /// MF3: the box's edge midpoints are handles like its corners. The pointer on one (also on a
+    /// thin box, where it sits near the anchor point) grabs it before the edge's move / rotate
+    /// zone, and its drag scales on that axis only, from the opposite edge.
+    #[test]
+    fn free_transform_edge_handles_hit_first_and_scale_one_axis() {
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        let ft = |w: f32, h: f32| {
+            let f: Affine = [w as f64, 0.0, 0.0, h as f64, 100.0, 100.0];
+            let mut handles = [Pos2::ZERO; 8];
+            for (hd, uv) in handles.iter_mut().zip(FT_HANDLES) {
+                *hd = Pos2::new(100.0 + uv[0] as f32 * w, 100.0 + uv[1] as f32 * h);
+            }
+            let quad = [handles[0], handles[1], handles[2], handles[3]];
+            let anchor = Pos2::new(100.0 + w / 2.0, 100.0 + h / 2.0);
+            FtBox { layer: LayerId(3), uid: 7, angle: 0.0, anchor_uv: [0.5, 0.5], f, m: Mat3::IDENTITY, handles, quad, anchor }
+        };
+        let b = ft(200.0, 100.0);
+        for (i, p) in [(4, (200.0, 100.0)), (5, (300.0, 150.0)), (6, (200.0, 200.0)), (7, (100.0, 150.0))] {
+            assert_eq!(b.part_at(Pos2::new(p.0, p.1)), Some(FtPart::Handle(i)), "edge handle {i}");
+            // A few points off the square, still on it.
+            assert_eq!(b.part_at(Pos2::new(p.0 + 3.0, p.1 - 3.0)), Some(FtPart::Handle(i)), "edge handle {i}, off centre");
+        }
+        // Along the edge away from the midpoint: not a handle.
+        assert_eq!(b.part_at(Pos2::new(150.0, 98.0)), Some(FtPart::Rotate));
+        assert_eq!(b.part_at(Pos2::new(150.0, 103.0)), Some(FtPart::Inside));
+        // A 10-point-high box: the top and bottom handles lie 5 points from the anchor.
+        let thin = ft(200.0, 10.0);
+        assert_eq!(thin.part_at(Pos2::new(200.0, 100.0)), Some(FtPart::Handle(4)));
+        assert_eq!(thin.part_at(Pos2::new(200.0, 110.0)), Some(FtPart::Handle(6)));
+        assert_eq!(thin.part_at(Pos2::new(200.0, 105.0)), Some(FtPart::Anchor));
+        // Top edge handle dragged up 40 on a 200 × 100 box: y only, about the bottom edge.
+        let f = fit_box(&[[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], 0.0, 1.0).unwrap();
+        let mode = FtMode::Scale { pivot: [0.5, 1.0], axes: [false, true] };
+        let (m, _) = ft_total(mode, &f, [0.5, 0.5], [200.0, 100.0], [230.0, 60.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [100.0, 60.0]) && near(af_apply(&m, [300.0, 200.0]), [300.0, 200.0]), "{m:?}");
+        // Left edge handle dragged left 100: x only, about the right edge.
+        let mode = FtMode::Scale { pivot: [1.0, 0.5], axes: [true, false] };
+        let (m, _) = ft_total(mode, &f, [0.5, 0.5], [100.0, 150.0], [0.0, 190.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [0.0, 100.0]) && near(af_apply(&m, [300.0, 200.0]), [300.0, 200.0]), "{m:?}");
+        // Turned 90°: the box's top edge handle still scales across that (now vertical) edge.
+        let t = fit_box(&[[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], 90.0, 1.0).unwrap();
+        let mode = FtMode::Scale { pivot: [0.5, 1.0], axes: [false, true] };
+        let top = af_apply(&t, [0.5, 0.0]);
+        let (m, _) = ft_total(mode, &t, [0.5, 0.5], top, [top[0] + 50.0, top[1]], false).unwrap();
+        let moved = af_apply(&m, af_apply(&t, [0.0, 0.0]));
+        let fixed = af_apply(&m, af_apply(&t, [0.0, 1.0]));
+        assert!(near(fixed, af_apply(&t, [0.0, 1.0])), "the opposite edge stays: {m:?}");
+        assert!((moved[1] - af_apply(&t, [0.0, 0.0])[1]).abs() < 1e-6, "only across the edge: {m:?}");
     }
 
     /// A double-click inside a closed mask finds it (even-odd), not outside it or on an open path.

@@ -2188,6 +2188,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && let Some(pos) = resp.interact_pointer_pos()
     {
         let cpt = map.to_comp(pos);
+        // MF3: the path under a Selection click, remembered for a double-click there. The first
+        // click of a double-click inside a mask but outside its layer's pixels selects the layer
+        // behind, whose paths are not drawn, so the double-click would no longer find the mask.
+        if app.ui.tool == Tool::Selection
+            && ft.is_none()
+            && let Some((l, m)) =
+                vertex_at(pos, false).map(|h| (h.layer, h.mask)).or_else(|| ov::segment_at(&paths, &map, pos, 6.0).map(|s| (s.0, s.1))).or_else(|| {
+                    ov::closed_path_at(&paths, &map, pos).filter(|(l, _)| !comp.layer(*l).is_some_and(|ly| matches!(ly.source, LayerSource::Comp { .. })))
+                })
+            && let Some(n) = paths.iter().find(|p| p.layer == l && p.uid == m).map(|p| p.sp.vertices.len())
+        {
+            let now = ui.input(|i| i.time);
+            ui.data_mut(|d| d.insert_temp(path_click_id(), PathClick { layer: l, path: m, vertices: n, pos, time: now }));
+        }
         match app.ui.tool {
             Tool::Zoom => {
                 let k = if mods.alt { 0.5 } else { 2.0 };
@@ -2285,6 +2299,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let _ = app.session.execute("mask.selectVertices", json!({"vertices": [me], "add": mods.shift, "toggle": mods.shift}));
                 }
             }
+            // MF3: a click on a mask or shape path's outline keeps its layer selected, also where
+            // the outline lies outside the layer's pixels over another layer (a mask larger than
+            // its solid): picking the layer behind hid the path, so a double-click on the
+            // outline never started Free Transform Points.
+            Tool::Selection if !mods.shift && ov::segment_at(&paths, &map, pos, 6.0).is_some() => {}
             // The Roto Brush paints in the Layer panel only: select as usual and say so.
             rt if rt.roto_kind(false).is_some() => {
                 if pick(app, &ectx, cpt, mods.shift).is_none() {
@@ -2331,6 +2350,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         // a mask can be found by its middle, not only by its outline. A precomp keeps its
         // double-click (open it).
         free_transform_whole_path(app, &paths, l, m);
+    } else if resp.double_clicked()
+        && !text_owns
+        && app.ui.tool == Tool::Selection
+        && let Some(pos) = resp.interact_pointer_pos()
+        && let Some(pc) = recent_path_click(ui, pos)
+    {
+        // MF3: the double-click's first click selected another layer (the point lies outside the
+        // masked layer's pixels), so its paths are gone this frame: select the layer again and
+        // free-transform the path the first click was on.
+        let _ = app.session.execute("layer.select", json!({"layers": [pc.layer.0]}));
+        let all: Vec<serde_json::Value> = (0..pc.vertices).map(|index| json!({"layer": pc.layer.0, "mask": pc.path, "index": index})).collect();
+        let _ = app.session.execute("mask.selectVertices", json!({"vertices": all}));
+        ov::begin_free_transform(app, pc.layer, pc.path);
     } else if resp.double_clicked()
         && !text_owns
         && !app.ui.tool.is_pen()
@@ -2381,6 +2413,32 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if err_h > 0.0 {
         super::expr_bar::draw(app, ui, err_bar, cid);
     }
+}
+
+/// The path a Selection click was on (MF3), for a double-click whose first click changed the
+/// layer selection.
+#[derive(Clone, Copy)]
+struct PathClick {
+    layer: LayerId,
+    path: u64,
+    vertices: usize,
+    pos: Pos2,
+    time: f64,
+}
+
+fn path_click_id() -> egui::Id {
+    egui::Id::new("viewer-path-click")
+}
+
+/// The path clicked just before (within a double-click's time, near `pos`), taken once.
+fn recent_path_click(ui: &egui::Ui, pos: Pos2) -> Option<PathClick> {
+    let now = ui.input(|i| i.time);
+    let pc = ui.data_mut(|d| {
+        let pc = d.get_temp::<PathClick>(path_click_id());
+        d.remove::<PathClick>(path_click_id());
+        pc
+    })?;
+    (pc.pos.distance(pos) < 8.0 && (now - pc.time).abs() < 1.0).then_some(pc)
 }
 
 /// Free Transform Points on a whole path (double-click its outline or inside it): all its points
