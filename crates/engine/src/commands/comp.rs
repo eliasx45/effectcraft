@@ -281,13 +281,16 @@ fn add_marker(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let t = time_p(s, p, s.project.comp(cid));
     let comment = str_p(p, "comment").unwrap_or("").to_string();
-    s.edit("Add Marker", None, |proj, _| {
+    let old = s.edit("Add Marker", None, |proj, _| {
         let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        c.markers.push(Marker { time: t, comment, ..Default::default() });
-        c.markers.sort_by_key(|m| m.time);
-        Ok(())
+        Ok(super::markers::place_marker(&mut c.markers, Marker { time: t, comment, ..Default::default() }))
     })?;
-    Ok(json!({"time": t.seconds()}))
+    let mut out = json!({"time": t.seconds()});
+    if let Some(old) = old {
+        super::markers::replaced_reply(&mut out, &old, t, None);
+        super::markers::toast_warning(s, &out);
+    }
+    Ok(out)
 }
 
 fn poster(s: &mut Session, p: &Value) -> Result<Value> {
@@ -327,6 +330,6 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("comp.moveTab", "Move Timeline Tab", [], None, "{comp, before?: id (end without)}", has_comp, move_tab),
         cmd!("comp.workArea", "Set Work Area", [], None, "{start?, end?, set?: begin|end (at CTI)}", has_comp, work_area),
         cmd!("comp.setSwitch", "Composition Switch", [], None, "{switch: hideShy|motionBlur|frameBlending|draft3d, value?}", has_comp, comp_switch),
-        cmd!("comp.addMarker", "Add Marker", [], Some("Num*"), "{time?, comment?}", has_comp, add_marker),
+        cmd!("comp.addMarker", "Add Marker", [], Some("Num*"), "{time?, comment?} → {time, replaced?: {comment, time}, warning?} (a marker already at that time is replaced)", has_comp, add_marker),
     ]
 }

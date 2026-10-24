@@ -1089,11 +1089,11 @@ MarkerProperty.prototype = {
     if (!(mv instanceof MarkerValue)) throw __err("value must be a MarkerValue");
     var p = this.__p({ time: t, duration: mv.duration || 0, comment: mv.comment, chapter: mv.chapter, url: mv.url, frameTarget: mv.frameTarget, protected: !!mv.protectedRegion, label: mv.label || 0 });
     p.cuePoint = (mv.cuePointName || mv.__params.length) ? { name: mv.cuePointName, navigation: !mv.eventCuePoint, params: mv.__params } : null;
-    var l = this.__list(), at = -1;
-    for (var i = 0; i < l.length; i++) if (Math.abs(l[i].time - t) < 1e-6) at = i;
-    if (at >= 0) p.index = at;
-    else p["new"] = true;
-    __call("markers.set", p);
+    // A marker already at that time is replaced (one marker per time, as in After Effects); the
+    // engine reports it and the script's output gets a warning line, so it is never silent.
+    p["new"] = true;
+    var r = __call("markers.set", p);
+    if (r && r.warning) __print("Warning: " + r.warning);
   },
   setValueAtKey: function (i, mv) { this.setValueAtTime(this.keyTime(i), mv); },
   removeKey: function (i) { this.__at(i); __call("markers.delete", this.__p({ index: i - 1 })); },
