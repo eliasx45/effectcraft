@@ -1187,6 +1187,18 @@ pub(crate) fn buffer_init(device: &wgpu::Device, queue: &wgpu::Queue, label: Opt
     buffer
 }
 
+/// The descriptor for a device the compositor owns: `MemoryUsage` so freed textures give their
+/// allocator blocks back instead of a few long-lived objects pinning large ones.
+pub(crate) fn device_descriptor(required_limits: wgpu::Limits, required_features: wgpu::Features) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
+        label: Some("effectcraft gpu"),
+        required_limits,
+        required_features,
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        ..Default::default()
+    }
+}
+
 impl GpuContext {
     /// [`buffer_init`] on this context's device.
     pub(crate) fn buffer_init(&self, label: Option<&str>, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -1841,15 +1853,8 @@ impl GpuContext {
             max_buffer_size: limits.max_buffer_size,
             ..wgpu::Limits::default()
         };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("effectcraft gpu"),
-                required_limits,
-                required_features: profile_features(adapter.features()),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| format!("no device: {e}"))?;
+        let (device, queue) =
+            adapter.request_device(&device_descriptor(required_limits, profile_features(adapter.features()))).await.map_err(|e| format!("no device: {e}"))?;
         let context = GpuContext::new(adapter, device, queue)?;
         // This path owns the device; install handlers only after construction succeeds.
         crate::readback::install(&context.device, &context.readbacks);
