@@ -275,7 +275,7 @@ fn new_path(s: &mut Session, p: &Value) -> Result<Value> {
     let mut outs = pts(p.get("outTangents"));
     ins.resize(n, [0.0; 2]);
     outs.resize(n, [0.0; 2]);
-    let target = super::shape_tool::draw_target(s, &comp, p, "shape.newPath")?;
+    let target = super::shape_tool::draw_target(s, &comp, p, "shape.newPath", true)?;
     let comp_space = str_p(p, "space").map(|s| s == "comp").unwrap_or(target.is_none());
     if comp_space {
         // Comp → layer space of the target (a new layer sits at the comp centre, unrotated).

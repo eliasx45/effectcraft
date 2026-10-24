@@ -314,7 +314,7 @@ step; `ui.set {viewer: {res}}` sets the active comp's, and `ui.inspect` reports 
 `ui.viewer.res`), `view.setRegionOfInterest {rect}`, `view.addGuide {percent?}`,
 `view.addPercentGuide`, `view.convertGuides {to: percent|pixels, index?}`,
 `view.moveGuide` (comp pixels, whatever the guide's unit), `view.removeGuide`, `effect.setLabel {layer?, effect, label}`; editing: `shape.newPath` (Pen on shape layers),
-`shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer;
+`shape.newShape` (the shape tools: a new shape layer by default; `into: <layer>` draws a new group into that shape layer and `addToSelected: true` into the selected one, as the viewer's tools do;
 `roundness` px rounds a rect's corners), `layer.roundCorners {layer?|layers?, roundness?}` (Layer ›
 Create › Round Corners and the Properties panel's Roundness: sets the Roundness of a shape layer's
 Rectangle Paths; a solid becomes, in one undo step, a shape layer drawing a rectangle of its size
