@@ -17,12 +17,18 @@ fn item_ref(s: &Session, v: &Value, cmd: &str) -> Result<ItemId> {
     .ok_or_else(|| bad(cmd, format!("no project item {v}")))
 }
 
-/// `items` (array) / `item`, else the Project panel selection.
+/// `items` (array, or one id/name) / `ids` (the same) / `item`, else the Project panel selection.
+/// Items given are authoritative (PD1): a key that is present never falls back to the selection,
+/// so a typo'd shape can't delete what someone else has selected.
 fn items_p(s: &Session, p: &Value, cmd: &str) -> Result<Vec<ItemId>> {
-    if let Some(Value::Array(a)) = p.get("items") {
-        return a.iter().map(|v| item_ref(s, v, cmd)).collect();
+    for key in ["items", "ids"] {
+        match p.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(a)) => return a.iter().map(|v| item_ref(s, v, cmd)).collect(),
+            Some(v) => return Ok(vec![item_ref(s, v, cmd)?]),
+        }
     }
-    if let Some(v) = p.get("item") {
+    if let Some(v) = p.get("item").filter(|v| !v.is_null()) {
         return Ok(vec![item_ref(s, v, cmd)?]);
     }
     if s.state.project_selection.is_empty() {
@@ -278,7 +284,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Delete Project Items",
             [],
             None,
-            "{items?: [id|name] (default: selected)} (folders with their contents; layers using the items go too)",
+            "{items?|ids?: [id|name] (default: selected)} (folders with their contents; layers using the items go too)",
             always,
             delete
         ),
