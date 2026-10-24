@@ -1038,6 +1038,88 @@ fn double_click_inside_a_mask_free_transforms_it() {
     assert!(h.state().ui.viewer.free_transform.is_none());
 }
 
+/// MF3 (Elias's report): a mask larger than its layer, so its outline lies over the layer behind.
+/// A double-click on that outline (or inside the mask but outside the layer's pixels) used to
+/// select the layer behind on its first click, hiding the mask, so the Free Transform box never
+/// showed. Now it shows with all eight handles, corners and edge midpoints as in After Effects;
+/// an edge handle scales on its axis only, from the opposite edge (Cmd: about the anchor point),
+/// each drag one undo step. Tests not run when written (Elias runs them).
+#[test]
+fn free_transform_edge_handles_on_a_mask_outside_its_layer() {
+    let mut h = harness();
+    let bx = layer_id(&h, "Box");
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [bx]})).unwrap();
+    s.execute("view.snapping", json!({"value": false})).unwrap();
+    // Box is 80 × 80 at comp (280, 140)–(360, 220); the mask spans comp (240, 100)–(400, 260).
+    s.execute("mask.new", json!({"layer": bx, "vertices": [[-40, -40], [120, -40], [120, 120], [-40, 120]], "closed": true})).unwrap();
+    s.execute("mask.selectVertices", json!({"vertices": []})).unwrap();
+    h.state_mut().ui.tool = Tool::Selection;
+    h.run_steps(2);
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1.0 && (a[1] - b[1]).abs() < 1.0;
+    let near_pt = |a: Pos2, b: Pos2| a.distance(b) < 2.0;
+    let dbl = |h: &mut Harness<'_, EffectcraftApp>, at: Pos2| {
+        h.input_mut().events.push(Event::PointerMoved(at));
+        h.step();
+        for pressed in [true, false, true, false] {
+            h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        }
+        h.run_steps(3);
+    };
+    let undo = |h: &mut Harness<'_, EffectcraftApp>| {
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        h.run_steps(2);
+    };
+    // Double-click the top edge, above the Box's pixels (over Plate).
+    let top = screen(&h, [320.0, 100.0]);
+    dbl(&mut h, top);
+    assert!(h.state().ui.viewer.free_transform.is_some(), "a double-click on the outline outside the layer starts Free Transform");
+    assert!(h.state().session.state.selected_layers.contains(&LayerId(bx)), "the masked layer stays selected");
+    assert_eq!(h.state().session.state.selected_vertices.len(), 4);
+    // Eight handles: corners 0–3, then the top, right, bottom and left edges' midpoints.
+    for (i, p) in
+        [[240.0, 100.0], [400.0, 100.0], [400.0, 260.0], [240.0, 260.0], [320.0, 100.0], [400.0, 180.0], [320.0, 260.0], [240.0, 180.0]].iter().enumerate()
+    {
+        assert!(near_pt(rect(&h, &format!("viewer.freeTransform.handle.{i}")).center(), screen(&h, *p)), "handle {i}");
+    }
+    let start = mask_path(&h, "Box");
+    // Top edge handle up 40: only y changes, the bottom edge stays.
+    drag_comp(&mut h, [320.0, 100.0], [320.0, 60.0]);
+    let tall = mask_path(&h, "Box");
+    assert!(near(tall.vertices[0], [-40.0, -80.0]) && near(tall.vertices[1], [120.0, -80.0]), "{tall:?}");
+    assert!(near(tall.vertices[2], [120.0, 120.0]) && near(tall.vertices[3], [-40.0, 120.0]), "the bottom edge stays: {tall:?}");
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Box"), start, "the edge drag is one undo step");
+    // Right edge handle right 40: only x changes, from the left edge.
+    drag_comp(&mut h, [400.0, 180.0], [440.0, 180.0]);
+    let wide = mask_path(&h, "Box");
+    assert!(near(wide.vertices[0], [-40.0, -40.0]) && near(wide.vertices[1], [160.0, -40.0]) && near(wide.vertices[2], [160.0, 120.0]), "{wide:?}");
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Box"), start);
+    // Cmd-drag the bottom edge handle down 40: vertical scale ×1.5 about the anchor (centre).
+    let cmd = egui::Modifiers::COMMAND;
+    let (from, to) = (screen(&h, [320.0, 260.0]), screen(&h, [320.0, 300.0]));
+    mid_drag(&mut h, from, to, cmd);
+    release(&mut h, to, cmd);
+    h.input_mut().events.push(Event::ModifiersChanged(Default::default()));
+    h.run_steps(2);
+    let both = mask_path(&h, "Box");
+    assert!(near(both.vertices[0], [-40.0, -80.0]) && near(both.vertices[2], [120.0, 160.0]), "{both:?}");
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Box"), start);
+    // Esc ends it; a double-click inside the mask but outside the Box's pixels starts it again.
+    h.input_mut().events.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.run_steps(2);
+    assert!(h.state().ui.viewer.free_transform.is_none());
+    h.state_mut().session.execute("mask.selectVertices", json!({"vertices": []})).unwrap();
+    h.run_steps(2);
+    let inside = screen(&h, [255.0, 120.0]);
+    dbl(&mut h, inside);
+    assert!(h.state().ui.viewer.free_transform.is_some(), "a double-click inside the mask outside the layer starts Free Transform");
+    assert!(h.state().session.state.selected_layers.contains(&LayerId(bx)));
+    assert!(h.state().auto.find_current("viewer.freeTransform.handle.6").is_some(), "the box is drawn with its edge handles");
+}
+
 /// #513: clicking away from a mask's path, even on its own layer, deselects the mask's points;
 /// the layer stays selected.
 #[test]
