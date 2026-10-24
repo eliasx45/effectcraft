@@ -334,6 +334,8 @@ struct Cache {
     protected: HashMap<FrameKey, usize>,
     /// The playing preview, if any: eviction spares the frames it shows next.
     playhead: Option<Playhead>,
+    /// Scale of the frame on screen (the newest urgent request): frames of other scales go first.
+    scale: Option<u32>,
     /// Every frame's [`Cached::bytes`]: what the budget counts.
     bytes: usize,
     /// Bytes of GPU frames (also counted in `bytes`).
@@ -391,6 +393,7 @@ impl Cache {
             order: Order::default(),
             protected: HashMap::new(),
             playhead: None,
+            scale: None,
             bytes: 0,
             gpu_bytes: 0,
             packed_bytes: 0,
@@ -888,6 +891,12 @@ impl Cache {
     /// protected window ([`Frames::protect_frames`]) last.
     fn eviction_candidate(&self, gpu_only: bool) -> Option<FrameKey> {
         let eligible = |k: &FrameKey| !gpu_only || self.map.get(k).is_some_and(Cached::is_gpu);
+        // Frames of another scale than the one on screen go first (a zoom or resolution change).
+        if let Some(s) = self.scale
+            && let Some(k) = self.order.iter().find(|k| eligible(k) && k.scale != s)
+        {
+            return Some(*k);
+        }
         if let Some(p) = &self.playhead {
             let mut farthest: Option<(i64, FrameKey)> = None;
             for k in self.order.iter().filter(|k| eligible(k)) {
@@ -2411,6 +2420,11 @@ impl Frames {
 
     #[allow(clippy::too_many_arguments)]
     fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool, over_draft: bool, idle: bool) {
+        // The frame on screen sets the scale evictions keep: a prefetch or a passive viewer at
+        // another zoom must not evict the active viewer's frames.
+        if urgent && let Ok(mut c) = self.cache.lock() {
+            c.scale = Some(key.scale);
+        }
         let cached = if over_draft { self.is_exact(&key) } else { self.is_cached(&key) };
         if cached || self.failed(&key) {
             return;
