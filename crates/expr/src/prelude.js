@@ -63,7 +63,7 @@ function __finish(r) {
 
 function __result(r) {
   r = __v(r);
-  if (r !== null && typeof r === 'object' && r.__isLayer) return r.index;
+  if (__isObj(r) && r.__isLayer) return r.index;
   if (r !== null && typeof r === 'object' && r.__isTextStyle) return r.__out();
   // `[temp, temp]` where temp is a property (pick-whip 1D → 2D): read the values here, while
   // host requests can still be answered and the script re-run.
@@ -489,7 +489,7 @@ Comp.prototype = {
     __err('Composition "' + this.name + '" has no active camera');
   },
   layer: function (a, rel) {
-    if (a !== null && typeof a === 'object' && a.__isLayer) return this.layer(a.index + (rel || 0));
+    if (__isObj(a) && a.__isLayer) return this.layer(a.index + (rel || 0));
     var id = __h(__LAYER, this.__c, a);
     if (id === null) __err(typeof a === 'string' ? 'Layer named "' + a + '" does not exist' : 'Layer index ' + a + ' out of range');
     return new Layer(this.__c, id);
@@ -567,7 +567,17 @@ var thisProject = {
 
 // Layer -----------------------------------------------------------------------------------------
 
-function Layer(c, l) { this.__c = c; this.__l = l; this.__i = null; }
+// Callable like a property group, as in After Effects: `thisComp.layer("Shape")("ADBE Root
+// Vectors Group")(1)`, `thisLayer("Effects")`.
+function Layer(c, l) {
+  var f = function (k) { return f.__group(k); };
+  delete f.name;
+  delete f.length;
+  Object.setPrototypeOf(f, Layer.prototype);
+  f.__c = c; f.__l = l; f.__i = null;
+  return f;
+}
+function __isObj(x) { return x !== null && (typeof x === 'object' || typeof x === 'function'); }
 
 function __m3(m, p) {
   var x = p[0] || 0, y = p[1] || 0;

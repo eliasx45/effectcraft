@@ -318,7 +318,11 @@ fn alias(key: &str) -> &str {
     }
 }
 
-fn find_child<'g>(g: &'g PropGroup, key: &Key) -> Option<&'g Node> {
+/// The child of `g` that `key` names: by index, `@uid`, our match id, display name, or the After
+/// Effects match name ([`effectcraft_project::matchnames`]: `ADBE Root Vectors Group`, `ADBE
+/// Vector Shape`, `ADBE Slider Control-0001`…). `chain` is the nodes from the layer root down to
+/// `g` (empty for the layer root itself), which the AE match name depends on.
+fn find_child<'g>(g: &'g PropGroup, chain: &[&'g Node], key: &Key) -> Option<&'g Node> {
     match key {
         Key::Index(i) => usize::try_from(*i).ok().filter(|i| *i >= 1).and_then(|i| g.children.get(i - 1)),
         Key::Name(name) => {
@@ -332,8 +336,37 @@ fn find_child<'g>(g: &'g PropGroup, key: &Key) -> Option<&'g Node> {
                 .find(|n| n.match_id() == m)
                 .or_else(|| g.children.iter().find(|n| n.name().eq_ignore_ascii_case(name)))
                 .or_else(|| g.children.iter().find(|n| compact(n.name()) == c || compact(n.match_id()) == c))
+                .or_else(|| {
+                    let mut full: Vec<&Node> = chain.to_vec();
+                    g.children.iter().find(|n| {
+                        full.truncate(chain.len());
+                        full.push(n);
+                        effectcraft_project::matchnames::node(&full).eq_ignore_ascii_case(name)
+                    })
+                })
         }
     }
+}
+
+/// The nodes from the layer root `root` down to the group at `path` (empty for the root).
+fn node_chain<'g>(root: &'g PropGroup, path: &str) -> Option<Vec<&'g Node>> {
+    if path.is_empty() {
+        return Some(vec![]);
+    }
+    let walk = root.resolve_path(path);
+    if !walk.rest.is_empty() {
+        return None;
+    }
+    let mut chain = Vec::with_capacity(walk.indices.len());
+    let mut g = root;
+    for i in &walk.indices {
+        let n = g.children.get(*i)?;
+        chain.push(n);
+        if let Some(sub) = n.as_group() {
+            g = sub;
+        }
+    }
+    Some(chain)
 }
 
 impl<'a> Resolver<'a> {
@@ -430,7 +463,8 @@ impl<'a> Resolver<'a> {
             Req::Child { comp, layer, group, key } => {
                 let l = self.layer(*comp, *layer)?;
                 let g = if group.is_empty() { &l.props } else { l.props.group(group)? };
-                let n = find_child(g, key)?;
+                let chain = node_chain(&l.props, group).unwrap_or_default();
+                let n = find_child(g, &chain, key)?;
                 let path = if group.is_empty() { format!("@{}", n.uid()) } else { format!("{group}/@{}", n.uid()) };
                 let count = n.as_group().map_or(0, |g| g.children.len());
                 let index = g.children.iter().position(|child| child.uid() == n.uid())? + 1;

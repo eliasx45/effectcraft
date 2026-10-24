@@ -791,7 +791,7 @@ Property.prototype.property = function () { return null; };
   });
   def("expressionError", function () {
     var e = this.expression;
-    return e ? __get("exprError", { code: e }) : "";
+    return e ? __get("exprError", this.__ref({ code: e })) : "";
   });
   def("canSetExpression", function () { return !!this.__info().canSetExpression; });
   def("canVaryOverTime", function () { return !!this.__info().canVaryOverTime; });

@@ -1807,3 +1807,40 @@ fn two_values_keep_the_z_of_three_d_properties() {
     );
     assert_eq!(o.result, json!([[50, 50, 100], [10, 20, 0], [60, 70, -50], [20, 30, 100]]));
 }
+
+/// `expressionError` reports what the expression raises when it runs (a missing marker name, an
+/// AE match name that names nothing), not only syntax errors, and `marker.setValueAtTime` onto an
+/// occupied time warns that it replaced the marker (regression, 24 Oct 2026).
+#[test]
+fn expression_errors_and_marker_replacement_are_reported() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("M", 200, 100, 1, 4, 30);
+        c.markerProperty.setValueAtTime(1, new MarkerValue("beat"));
+        var l = c.layers.addSolid([1, 0, 0], "S", 50, 50, 1);
+        var op = l.transform.opacity;
+        op.expression = 'thisComp.marker.key("NOPE").time';
+        var missing = op.expressionError;
+        op.expression = 'thisComp.marker.key("beat").time * 10';
+        var found = op.expressionError;
+        var v = op.value;
+        op.expression = 'thisLayer("ADBE Transform Group")("ADBE Nope")';
+        var badMatch = op.expressionError;
+        op.expression = 'thisLayer("ADBE Transform Group")("ADBE Opacity") / 2';
+        var goodMatch = op.expressionError;
+        c.markerProperty.setValueAtTime(1, new MarkerValue("again"));
+        [missing, found, v, badMatch, goodMatch, c.markerProperty.numKeys, c.markerProperty.keyValue(1).comment]
+        "#,
+    );
+    let r = o.result.as_array().unwrap();
+    assert!(r[0].as_str().unwrap().contains("NOPE"), "{r:?}");
+    assert_eq!(r[1], "");
+    assert_eq!(r[2], 10.0);
+    assert!(r[3].as_str().unwrap().contains("ADBE Nope"), "{r:?}");
+    assert_eq!(r[4], "");
+    assert_eq!(r[5], 1);
+    assert_eq!(r[6], "again");
+    assert!(o.output.iter().any(|l| l.contains("Warning") && l.contains("\"beat\"")), "{:?}", o.output);
+}

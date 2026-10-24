@@ -12,6 +12,7 @@ mod finite;
 pub mod freeze;
 pub mod layers;
 pub mod limits;
+pub mod matchnames;
 pub mod props;
 pub mod render_queue;
 pub mod render_templates;

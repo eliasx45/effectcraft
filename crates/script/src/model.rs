@@ -51,13 +51,7 @@ pub fn query(s: &mut Session, kind: &str, a: &J) -> R {
             let i = u(a, "index").unwrap_or(0) as usize;
             Ok(effectcraft_engine::command_specs().get(i.wrapping_sub(1)).map(|c| json!(c.id)).unwrap_or(J::Null))
         }
-        "exprError" => {
-            let code = a.get("code").and_then(J::as_str).unwrap_or("");
-            Ok(match s.expr_check {
-                Some(check) => json!(check(code).err().unwrap_or_default()),
-                None => json!(""),
-            })
-        }
+        "exprError" => expr_error(s, a),
         "labels" => Ok(json!(Label::ALL.iter().map(|l| l.name()).collect::<Vec<_>>())),
         "effects" => Ok(json!(
             effectcraft_engine::effects::all()
@@ -543,6 +537,28 @@ fn value(s: &Session, a: &J) -> R {
     ctx.footage = Some(s.footage.as_ref());
     let v = ctx.value(l, p);
     Ok(js_value(c, &v))
+}
+
+/// `Property.expressionError`: the error the property's enabled expression raises at the comp's
+/// current time (a missing marker, layer or property is an error, not a silent raw value), else
+/// the syntax error of `code` (a disabled expression), else "".
+fn expr_error(s: &Session, a: &J) -> R {
+    let code = a.get("code").and_then(J::as_str).unwrap_or("");
+    if let Ok((cid, c, l)) = layer_of(s, a)
+        && let Some(p) = u(a, "prop").and_then(|uid| l.props.find(uid))
+        && p.has_expression()
+        && let Some(host) = s.expr.as_deref()
+    {
+        let t = s.time_of(cid);
+        let mut ctx = EvalCtx::new(&s.project, cid, c, t);
+        ctx.expr = Some(host);
+        ctx.footage = Some(s.footage.as_ref());
+        return Ok(json!(host.eval(&ctx, l, p, &p.value_at(l.layer_time(t))).err().unwrap_or_default()));
+    }
+    Ok(match s.expr_check {
+        Some(check) => json!(check(code).err().unwrap_or_default()),
+        None => json!(""),
+    })
 }
 
 fn interp(i: Interp) -> &'static str {
