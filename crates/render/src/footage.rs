@@ -3,6 +3,7 @@
 
 use crate::{EvalCtx, Image, Renderer, color};
 use effectcraft_effects::Buf;
+use effectcraft_project::render_queue::ProxyUse;
 use effectcraft_project::{Footage, FootageKind, FrameBlend, ItemId, ItemKind, Layer};
 use effectcraft_raster::Px;
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
@@ -465,10 +466,26 @@ impl<'a> Renderer<'a> {
     }
 
     /// The proxy footage used for `item` under this render's Proxy Use, if any.
+    ///
+    /// An automatic proxy ([`effectcraft_project::Proxy::auto`]) is preview-only: under Current
+    /// Settings it is used only when this render reads through a preview view of the footage
+    /// (one with an [exact twin](FootageSource::exact): the viewer, RAM preview). Final renders
+    /// (Render Queue, exports, Save Frame As) read the exact view and so use the original; only
+    /// Use All Proxies renders with an automatic proxy.
     pub fn proxy_for(&self, item: ItemId) -> Option<&'a Footage> {
         let it = self.project.item(item)?;
         let px = it.proxy.as_deref()?;
-        (self.opts.proxy.uses(matches!(it.kind, ItemKind::Comp(_)), px.enabled) && px.footage.has_video).then_some(&px.footage)
+        let comp = matches!(it.kind, ItemKind::Comp(_));
+        let used = if px.auto {
+            match self.opts.proxy {
+                ProxyUse::UseAll => true,
+                ProxyUse::CurrentSettings => px.enabled && self.footage.exact().is_some(),
+                _ => false,
+            }
+        } else {
+            self.opts.proxy.uses(comp, px.enabled)
+        };
+        (used && px.footage.has_video).then_some(&px.footage)
     }
 
     /// A decoded frame of `f` as a layer buffer covering `w`×`h` layer pixels (the footage's

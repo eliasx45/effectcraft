@@ -44,7 +44,7 @@ fn collect_package_relocates_sequences_and_both_proxy_kinds_without_changing_sou
     sequence.sequence = vec![sequence.path.clone(), source.join("frame02.png").to_string_lossy().into_owned()];
     let frames = add(&mut s, "Frames", sequence);
     let duplicate = add(&mut s, "Same first frame", media(&source.join("frame01.png")));
-    let proxy = Proxy { footage: media(&source.join("proxy.mov")), enabled: true };
+    let proxy = Proxy { footage: media(&source.join("proxy.mov")), enabled: true, auto: false };
     let project = Arc::make_mut(&mut s.project);
     project.item_mut(frames).unwrap().proxy = Some(Box::new(proxy.clone()));
     project.item_mut(comp).unwrap().proxy = Some(Box::new(proxy));

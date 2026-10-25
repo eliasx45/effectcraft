@@ -179,6 +179,18 @@ pub trait Importer: Send + Sync {
     /// An image sequence's other frames (its first was probed) are footage now: hosts whose
     /// media layer reads from memory (the browser) register them; file-based ones need nothing.
     fn add_frames(&self, _paths: &[String]) {}
+    /// Whether previews of `footage` decode in software although this host has a hardware video
+    /// decoder (it refused the stream, or cannot take one like it): the automatic proxy
+    /// suggestion's "hardware can't take it" rule.
+    fn hardware_refuses(&self, _footage: &effectcraft_project::Footage) -> bool {
+        false
+    }
+    /// Build a preview proxy of the movie at `src`: `width`×`height` (even, aspect kept),
+    /// hardware-friendly H.264 in an MP4 at `out`, written whole or not at all; the source is
+    /// never written to. `progress(done, total)` returns `false` to stop (an error then).
+    fn build_proxy(&self, _src: &str, _out: &str, _width: u32, _height: u32, _progress: &mut dyn FnMut(u64, u64) -> bool) -> std::result::Result<(), String> {
+        Err("making proxies is not available in this build".into())
+    }
 }
 
 /// A keyframe reference: layer, property uid, key time (layer time).

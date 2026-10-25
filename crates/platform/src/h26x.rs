@@ -64,6 +64,7 @@ pub fn factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
         Err(why) => {
             log::info!("VideoToolbox {} {}x{}: decoding in software: {why}", e.codec.name(), layout.1.0, layout.1.1);
             REFUSED.lock().unwrap_or_else(PoisonError::into_inner).insert(layout, Instant::now());
+            effectcraft_media::hw::note_refused(layout.1.0, layout.1.1);
             None
         }
     }

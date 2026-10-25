@@ -70,6 +70,36 @@ pub fn takes_codec(codec: &str) -> bool {
     c.is_empty() || ["prores", "h.264", "h264", "avc", "hevc", "h.265", "h265"].iter().any(|k| c.contains(k))
 }
 
+/// Coded sizes of streams the hardware decoder refused or could not take (noted by the
+/// platform layer's factory), for the automatic proxy suggestion.
+static REFUSED: std::sync::Mutex<std::collections::BTreeSet<(u32, u32)>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The platform layer's hardware decoder refused (or does not take) a stream of this coded size.
+pub fn note_refused(coded_w: u32, coded_h: u32) {
+    if let Ok(mut r) = REFUSED.lock()
+        && r.len() < 256
+    {
+        r.insert((coded_w, coded_h));
+    }
+}
+
+/// Whether previews of `codec` footage of `width`×`height` decode in software although a hardware
+/// decoder is registered: a stream of that size was refused ([`note_refused`]; coded sizes are
+/// rounded up to whole macroblocks), or it is H.264 beyond what VideoToolbox's H.264 decoder
+/// takes (4096×2304: the 6K "Smoke" clip, Level 6.0, is refused).
+pub fn refuses(codec: &str, width: u32, height: u32) -> bool {
+    if !available() || width == 0 || height == 0 {
+        return false;
+    }
+    let close = |coded: u32, n: u32| coded >= n && coded - n < 64;
+    if REFUSED.lock().map(|r| r.iter().any(|&(w, h)| close(w, width) && close(h, height))).unwrap_or(false) {
+        return true;
+    }
+    let c = codec.trim().to_ascii_lowercase();
+    let h264 = ["h.264", "h264", "avc"].iter().any(|k| c.contains(k));
+    h264 && (width.max(height) > 4096 || width.min(height) > 2304)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

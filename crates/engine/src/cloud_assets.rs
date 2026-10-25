@@ -1750,6 +1750,7 @@ mod tests {
             item.proxy = Some(Box::new(effectcraft_project::Proxy {
                 footage: effectcraft_project::Footage { path: proxy.clone(), width: 960, height: 540, has_video: true, ..Default::default() },
                 enabled: proxy_on,
+                auto: false,
             }));
         }
         let cid = s.active_comp_id().unwrap();

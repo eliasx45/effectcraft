@@ -375,6 +375,9 @@ pub struct ProjectSettings {
     /// working space (as in After Effects).
     #[serde(default = "gamma_22")]
     pub working_gamma: f64,
+    /// Footage items whose automatic proxy suggestion was turned down ("No"): never asked again.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub proxy_hint_dismissed: std::collections::BTreeSet<ItemId>,
 }
 
 fn gamma_22() -> f64 {
@@ -404,6 +407,7 @@ impl Default for ProjectSettings {
             hdr: HdrMode::Clip,
             output_space: None,
             working_gamma: 2.2,
+            proxy_hint_dismissed: Default::default(),
         }
     }
 }
@@ -1388,6 +1392,11 @@ pub struct Proxy {
     /// Use Proxy (the Project panel's proxy indicator: filled = in use, hollow = set but off).
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Made by EffectCraft's automatic proxy suggestion (`proxy.autoCreate`): a preview-only
+    /// stand-in. Final renders (Render Queue, exports, Save Frame As) use the original under
+    /// Proxy Use ▸ Current Settings; only Use All Proxies renders with it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
 }
 
 /// A layer of a layered still (a Photoshop document, or a PDF / Illustrator / EPS file) used as

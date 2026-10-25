@@ -20,6 +20,19 @@ impl Importer for MediaImporter {
     fn probe(&self, path: &str) -> Result<Footage, String> {
         effectcraft_media::probe(path).map_err(|e| e.to_string())
     }
+    fn hardware_refuses(&self, footage: &Footage) -> bool {
+        effectcraft_media::hw::refuses(&footage.codec, footage.width, footage.height)
+    }
+    fn build_proxy(&self, src: &str, out: &str, width: u32, height: u32, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<(), String> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        effectcraft_media::proxy_h264::build(src, std::path::Path::new(out), width, height, &cancel, &mut |d, t| {
+            if !progress(d, t) {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
 }
 
 /// Render Queue export via `effectcraft-export`: to the file system, or to `sink` (the web app

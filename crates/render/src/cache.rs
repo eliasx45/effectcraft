@@ -1672,8 +1672,8 @@ impl std::fmt::Debug for ProxyKey<'_> {
         match self.0 {
             None => f.write_str("None"),
             Some(p) => {
-                let effectcraft_project::Proxy { footage, enabled } = &**p;
-                f.debug_struct("Proxy").field("footage", &FootageKey(footage)).field("enabled", enabled).finish()
+                let effectcraft_project::Proxy { footage, enabled, auto } = &**p;
+                f.debug_struct("Proxy").field("footage", &FootageKey(footage)).field("enabled", enabled).field("auto", auto).finish()
             }
         }
     }

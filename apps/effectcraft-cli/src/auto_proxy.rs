@@ -290,7 +290,7 @@ impl AutoProxy {
             let mut p = project.clone();
             for (id, footage) in ready {
                 if let Some(it) = p.item_mut(id) {
-                    it.proxy = Some(Box::new(Proxy { footage, enabled: true }));
+                    it.proxy = Some(Box::new(Proxy { footage, enabled: true, auto: false }));
                 }
             }
             Arc::new(p)

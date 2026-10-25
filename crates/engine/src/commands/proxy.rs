@@ -56,7 +56,7 @@ pub(crate) fn set_proxy_footage(s: &mut Session, items: &[ItemId], footage: Foot
     s.edit("Set Proxy", None, |proj, _| {
         for i in items {
             if let Some(it) = proj.item_mut(*i) {
-                it.proxy = Some(Box::new(Proxy { footage: footage.clone(), enabled: true }));
+                it.proxy = Some(Box::new(Proxy { footage: footage.clone(), enabled: true, auto: false }));
             }
         }
         Ok(())
