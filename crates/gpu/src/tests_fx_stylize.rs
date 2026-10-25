@@ -297,20 +297,25 @@ fn transform_motion_blur_perf() {
     let t0 = std::time::Instant::now();
     let _ = Renderer::new(&s.p, &crate::tests::Pattern, effectcraft_render::RenderOpts { backend: Backend::Cpu, ..opts }).comp_frame_cpu(s.cid, t);
     let cpu_ms = t0.elapsed().as_secs_f64() * 1e3;
+    // Consecutive frames with a layer cache (as the viewer renders them): the static Deep Glow
+    // is kept on the first and restored on the next.
+    let cache = effectcraft_render::cache::LayerCache::new(2 << 30);
     let mut gpu_ms = Vec::new();
-    for _ in 0..5 {
+    for k in 0..6 {
         let mut r = Renderer::new(&s.p, &crate::tests::Pattern, effectcraft_render::RenderOpts { backend: Backend::Gpu, ..opts });
         r.accel = Some(g);
+        r.cache = Some(&cache);
         let t0 = std::time::Instant::now();
-        let _ = g.render(&r, s.cid, t).expect("the GPU renders the frame");
+        let _ = g.render(&r, s.cid, t + Tick::from_seconds_f64(k as f64 / 30.0)).expect("the GPU renders the frame");
         gpu_ms.push(t0.elapsed().as_secs_f64() * 1e3);
     }
     #[cfg(feature = "profile")]
     {
         let mut r = Renderer::new(&s.p, &crate::tests::Pattern, effectcraft_render::RenderOpts { backend: Backend::Gpu, ..opts });
         r.accel = Some(g);
+        r.cache = Some(&cache);
         effectcraft_render::profile::start();
-        let _ = g.render(&r, s.cid, t);
+        let _ = g.render(&r, s.cid, t + Tick::from_seconds_f64(0.2));
         let (events, _) = effectcraft_render::profile::finish();
         let mut by: std::collections::BTreeMap<(String, String), (usize, f64)> = Default::default();
         for e in &events {
@@ -322,5 +327,49 @@ fn transform_motion_blur_perf() {
             eprintln!("    {c} {n} x{k} {d:.2} ms");
         }
     }
-    eprintln!("transform motion blur 1920x1080 + deep glow: cpu {cpu_ms:.1} ms, gpu (incl. readback) {gpu_ms:.1?} ms");
+    eprintln!("transform motion blur 1920x1080 + deep glow: cpu {cpu_ms:.1} ms, gpu frames (incl. readback) {gpu_ms:.1?} ms");
+}
+
+/// A static Deep Glow under an animated Transform effect is rendered once and restored on the
+/// next frames (`Renderer::static_prefix`): with a layer cache every frame is the same, bit for
+/// bit, as without one, on the GPU and the CPU, and also when the glow animates (no reuse).
+#[test]
+fn static_first_effects_are_reused_across_frames() {
+    use effectcraft_render::{Backend, Renderer};
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        for animated_glow in [false, true] {
+            let mut s = Scene::new(depth);
+            let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
+            s.push(bg);
+            let mut l = s.footage(40, 24);
+            s.effect(&mut l, "ec.stylize.deepglow", &[("PEDG-0001", n(12.0)), ("glowExposure", n(0.5))]);
+            s.effect(&mut l, "ec.distort.transform", &[("useCompositionShutterAngle", Value::Bool(false)), ("shutterAngle", n(360.0))]);
+            let pos = l.props.prop_mut("effects/#2/position").expect("transform position");
+            pos.keys = vec![Keyframe::new(Tick::ZERO, pt(-10.0, 12.0)), Keyframe::new(Tick::from_seconds_f64(0.5), pt(60.0, 20.0))];
+            if animated_glow {
+                let r = l.props.prop_mut("effects/#1/PEDG-0001").expect("glow radius");
+                r.keys = vec![Keyframe::new(Tick::ZERO, Value::Scalar(6.0)), Keyframe::new(Tick::from_seconds_f64(0.5), Value::Scalar(16.0))];
+            }
+            set(&mut l, "transform/position", v3(48.0, 30.0));
+            s.push(l);
+            let label = format!("static first effects {depth:?} animated glow {animated_glow}");
+            let cache = effectcraft_render::cache::LayerCache::new(256 << 20);
+            let cpu_cache = effectcraft_render::cache::LayerCache::new(256 << 20);
+            for k in 0..4 {
+                let t = Tick::from_seconds_f64(0.1 + k as f64 / 30.0);
+                let mut plain = Renderer::new(&s.p, &crate::tests::Pattern, effectcraft_render::RenderOpts { backend: Backend::Cpu, ..opts() });
+                let cpu = plain.comp_frame_cpu(s.cid, t);
+                plain.cache = Some(&cpu_cache);
+                assert_eq!(plain.comp_frame_cpu(s.cid, t).data, cpu.data, "{label}: CPU frame {k} with a cache");
+                let Some(g) = crate::tests::gpu() else { continue };
+                let mut r = Renderer::new(&s.p, &crate::tests::Pattern, effectcraft_render::RenderOpts { backend: Backend::Gpu, ..opts() });
+                r.accel = Some(g);
+                let uncached = g.render(&r, s.cid, t).expect("the GPU renders the frame");
+                r.cache = Some(&cache);
+                let cached = g.render(&r, s.cid, t).expect("the GPU renders the frame");
+                assert_eq!(cached.data, uncached.data, "{label}: GPU frame {k} with a cache");
+                check(&format!("{label} frame {k}"), compare_at(&s, opts(), t), 0.0);
+            }
+        }
+    }
 }

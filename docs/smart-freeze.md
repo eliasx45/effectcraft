@@ -85,6 +85,23 @@ on: then the slowest heavy layer is frozen the same way once editing and playbac
 idle for eight seconds, one section at a time and each layer once. Only the viewer's own
 (local) frames are measured; frames from a cloud frame server carry another machine's times.
 
+### Heavy footage (automatic proxies)
+
+The same hint place offers a proxy for heavy footage first (`timeline.proxyHint`, buttons
+`.yes` / `.no`): "Smoke is 6K and costs ~46 ms/frame here. Make a 1080p proxy?". A movie used
+by a comp is suggested once when it is at least 1.5× the largest comp using it (either
+dimension), when the hardware decoder refuses it (or it is H.264 beyond 4096×2304), or when its
+layer's measured time stays above the frame budget (8+ frames). Yes (`proxy.autoCreate {item,
+wait?}`) makes an H.264 proxy at that comp's size (aspect kept) in `Proxies/` next to the saved
+project, in the background, and sets it as the item's proxy marked `auto`. No
+(`proxy.dismissSuggestion {item}`) is saved in the project (`proxy_hint_dismissed`).
+`proxy.suggest` lists the candidates.
+
+Automatic proxies are **preview-only**: under Proxy Use ▸ Current Settings they are used only
+by renders through the preview view of the footage (viewer, RAM preview). Render Queue items,
+exports and Save Frame As read the exact view and use the original; only Use All Proxies renders
+with an automatic proxy. Proxies set by hand behave as before.
+
 `wait: true` follows the draft into the full render through the control channel. Jobs
 remain visible through the shared Progress panel and `jobs.list`. Automatic cache
 attachments are derived preview state: they do not add authoring undo steps.

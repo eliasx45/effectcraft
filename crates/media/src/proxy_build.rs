@@ -55,7 +55,7 @@ fn source_bits_per_mb(bytes: Option<u64>, frames: u64, w: u32, h: u32) -> Option
 }
 
 /// Frames of a movie of `duration` at `rate` (rounded to the nearest frame).
-fn frame_count(rate: FrameRate, duration: Tick) -> Option<u64> {
+pub(crate) fn frame_count(rate: FrameRate, duration: Tick) -> Option<u64> {
     if rate.num <= 0 || rate.den <= 0 || duration.0 <= 0 {
         return None;
     }
@@ -65,7 +65,7 @@ fn frame_count(rate: FrameRate, duration: Tick) -> Option<u64> {
 }
 
 /// ISO/IEC 23091-2 codes of FilmCraft's colour description (primaries, transfer, matrix).
-fn color_codes(c: &filmcraft_color::ColorInfo) -> (u8, u8, u8) {
+pub(crate) fn color_codes(c: &filmcraft_color::ColorInfo) -> (u8, u8, u8) {
     use filmcraft_color::{Matrix, Primaries, Transfer};
     let p = match c.primaries {
         Primaries::Bt709 => 1,

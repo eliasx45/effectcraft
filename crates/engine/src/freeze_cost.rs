@@ -72,6 +72,12 @@ impl CostBook {
         *self = Self::default();
     }
 
+    /// Every measured layer: (comp, layer, average ms, frame budget ms, frames measured). The
+    /// automatic proxy suggestion reads footage layers' times from here.
+    pub fn measured(&self) -> impl Iterator<Item = (ItemId, LayerId, f64, f64, u32)> + '_ {
+        self.layers.iter().map(|(&(c, l), cost)| (c, l, cost.ema_ms, cost.budget_ms, cost.samples))
+    }
+
     fn note(&mut self, comp: ItemId, layer: LayerId, ms: f64, budget_ms: f64) {
         if !ms.is_finite() || ms < 0.0 || !budget_ms.is_finite() || budget_ms <= 0.0 {
             return;

@@ -184,6 +184,22 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     fn extent(&self) -> Option<([u32; 2], [f64; 2], f64)> {
         self.b.as_ref().map(|b| ([b.img.width(), b.img.height()], b.offset, b.scale))
     }
+    /// Kept on the device, in the resident layer cache (budgeted like the layers there).
+    fn keep(&mut self, key: u64, cache: &effectcraft_render::cache::LayerCache) {
+        let Some(b) = &self.b else { return };
+        if !self.e.can_retain_resident() {
+            return;
+        }
+        if let effectcraft_render::cache::Claim::Owner(flight) = cache.claim_gpu(key) {
+            let image = crate::context::SourceImage { img: b.img.clone(), offset: b.offset, scale: b.scale };
+            self.e.keep_resident(key, image, flight, None);
+        }
+    }
+    fn restore(&mut self, key: u64, _cache: &effectcraft_render::cache::LayerCache) -> bool {
+        let Some(image) = self.e.resident(key, effectcraft_render::cache::GpuStage::Processed) else { return false };
+        self.b = Some(PBuf { img: image.img, offset: image.offset, scale: image.scale });
+        true
+    }
 
     fn effect_canvas_in(&mut self, from: [f64; 2], to: [f64; 2]) {
         let Some(b) = self.float() else { return };

@@ -568,7 +568,7 @@ fn image_sequence_keys_follow_the_sequence_without_formatting_every_path() {
     // A proxy that is a sequence counts too.
     let mut q = p.clone();
     let proxy = Footage { kind: FootageKind::Sequence, sequence: vec!["/proxy/0.png".into(), "/proxy/1.png".into()], ..Default::default() };
-    q.item_mut(fid).unwrap().proxy = Some(Box::new(effectcraft_project::Proxy { footage: proxy.clone(), enabled: true }));
+    q.item_mut(fid).unwrap().proxy = Some(Box::new(effectcraft_project::Proxy { footage: proxy.clone(), enabled: true, auto: false }));
     let with_proxy = key(&q);
     assert_ne!(with_proxy, base, "a proxy changes the key");
     if let Some(p) = q.item_mut(fid).unwrap().proxy.as_mut() {

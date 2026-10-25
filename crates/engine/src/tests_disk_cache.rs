@@ -131,7 +131,7 @@ fn footage_changes_change_the_salt() {
     // A proxy, and its Use Proxy switch, change the pixels.
     let set_proxy = |s: &mut Session, enabled: bool| {
         let it = std::sync::Arc::make_mut(&mut s.project).items.get_mut(&cid).unwrap();
-        it.proxy = Some(Box::new(effectcraft_project::Proxy { footage: effectcraft_project::Footage::default(), enabled }));
+        it.proxy = Some(Box::new(effectcraft_project::Proxy { footage: effectcraft_project::Footage::default(), enabled, auto: false }));
         effectcraft_render::disk_cache::comp_content_key(&s.project, cid)
     };
     let k3 = set_proxy(&mut s, true);

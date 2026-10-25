@@ -452,13 +452,29 @@ struct Need {
     proxied: bool,
 }
 
-/// Whether frames read `item`'s proxy instead of its source (with `proxy_use`; the viewer's is
+/// Whether preview frames (the viewer, the cloud frame server: renders through a preview view of
+/// the footage) read `item`'s proxy instead of its source (with `proxy_use`; the viewer's is
 /// [`ProxyUse::CurrentSettings`], the item's Use Proxy switch). Audio stays on the Mac.
 pub fn reads_proxy(item: &Item, proxy_use: ProxyUse) -> bool {
+    reads_proxy_in(item, proxy_use, true)
+}
+
+/// [`reads_proxy`] for preview frames (`preview`) or for final renders (Render Queue, exports,
+/// which read the exact view). As `Renderer::proxy_for`: an automatic proxy
+/// ([`effectcraft_project::Proxy::auto`]) is preview-only, so under Current Settings a final
+/// render reads the original; only Use All Proxies reads it in every render.
+pub fn reads_proxy_in(item: &Item, proxy_use: ProxyUse, preview: bool) -> bool {
     item.proxy.as_deref().is_some_and(|p| {
-        proxy_use.uses(matches!(item.kind, ItemKind::Comp(_)), p.enabled)
-            && p.footage.has_video
-            && (!p.footage.path.is_empty() || !p.footage.sequence.is_empty())
+        let used = if p.auto {
+            match proxy_use {
+                ProxyUse::UseAll => true,
+                ProxyUse::CurrentSettings => p.enabled && preview,
+                _ => false,
+            }
+        } else {
+            proxy_use.uses(matches!(item.kind, ItemKind::Comp(_)), p.enabled)
+        };
+        used && p.footage.has_video && (!p.footage.path.is_empty() || !p.footage.sequence.is_empty())
     })
 }
 
@@ -1033,9 +1049,19 @@ pub fn blockers(project: &Project) -> Vec<Missing> {
     blockers_cached(project, ProxyUse::CurrentSettings, &mut BlockerCache::default())
 }
 
-/// [`blockers`] for frames rendered with `proxy_use`, recomputing only comps that changed since
-/// the last call with `cache`.
+/// [`blockers`] for preview frames rendered with `proxy_use` (the frame server), recomputing only
+/// comps that changed since the last call with `cache`.
 pub fn blockers_cached(project: &Project, proxy_use: ProxyUse, cache: &mut BlockerCache) -> Vec<Missing> {
+    blockers_in(project, proxy_use, true, cache)
+}
+
+/// [`blockers`] for a final render (Render Queue, export) with `proxy_use`: an item with an
+/// automatic proxy needs its original under Current Settings (see [`reads_proxy_in`]).
+pub fn final_blockers(project: &Project, proxy_use: ProxyUse) -> Vec<Missing> {
+    blockers_in(project, proxy_use, false, &mut BlockerCache::default())
+}
+
+fn blockers_in(project: &Project, proxy_use: ProxyUse, preview: bool, cache: &mut BlockerCache) -> Vec<Missing> {
     let mut comps = Vec::new();
     for item in project.items.values() {
         if let ItemKind::Comp(c) = &item.kind {
@@ -1061,7 +1087,7 @@ pub fn blockers_cached(project: &Project, proxy_use: ProxyUse, cache: &mut Block
     };
     for item in project.items.values().filter(|i| used.contains(&i.id)) {
         // Frames read the proxy instead (with this render's Proxy Use): only it must be here.
-        let via_proxy = reads_proxy(item, proxy_use);
+        let via_proxy = reads_proxy_in(item, proxy_use, preview);
         let main = match &item.kind {
             ItemKind::Footage(f) if !via_proxy => Some((f, if f.sequence.is_empty() { "footage" } else { "sequence" })),
             _ => None,
@@ -1733,6 +1759,10 @@ mod tests {
 
     /// A saved project with one used clip (`clip.mov`, 1920 wide) and a 50% proxy of it.
     fn proxied_project(dir: &std::path::Path, proxy_on: bool) -> (Session, String, String) {
+        proxied_project_as(dir, proxy_on, false)
+    }
+
+    fn proxied_project_as(dir: &std::path::Path, proxy_on: bool, auto: bool) -> (Session, String, String) {
         let clip = dir.join("presenter keyed clean.mov").to_string_lossy().to_string();
         let proxy = dir.join("presenter 50%.mov").to_string_lossy().to_string();
         std::fs::write(&clip, vec![7u8; 4096]).ok();
@@ -1750,6 +1780,7 @@ mod tests {
             item.proxy = Some(Box::new(effectcraft_project::Proxy {
                 footage: effectcraft_project::Footage { path: proxy.clone(), width: 960, height: 540, has_video: true, ..Default::default() },
                 enabled: proxy_on,
+                auto,
             }));
         }
         let cid = s.active_comp_id().unwrap();
@@ -1803,6 +1834,38 @@ mod tests {
         assert!(blockers(&s.project).is_empty());
         // Frames rendered with "Use No Proxies" need the original, which isn't here.
         assert!(!blockers_cached(&s.project, ProxyUse::UseNone, &mut BlockerCache::default()).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// PROXY-AUTO1's automatic proxies are preview-only on the cloud too: the frame server's
+    /// preview frames read the proxy, a final render needs the original (unless Use All Proxies).
+    #[test]
+    fn an_automatic_proxy_serves_previews_and_final_renders_need_the_original() {
+        let d = tmp("auto-proxy");
+        let (s, clip, proxy) = proxied_project_as(&d, true, true);
+        let item = s.project.items.values().find(|i| i.proxy.is_some()).unwrap();
+        assert!(reads_proxy(item, ProxyUse::CurrentSettings));
+        assert!(!reads_proxy_in(item, ProxyUse::CurrentSettings, false));
+        assert!(!reads_proxy_in(item, ProxyUse::UseCompOnly, true) && !reads_proxy_in(item, ProxyUse::UseNone, true));
+        assert!(reads_proxy_in(item, ProxyUse::UseAll, false));
+        // A hand-set proxy is unchanged: Current Settings reads it in final renders too.
+        let mut manual = item.clone();
+        if let Some(p) = manual.proxy.as_mut() {
+            p.auto = false;
+        }
+        assert!(reads_proxy_in(&manual, ProxyUse::CurrentSettings, false));
+        // Only the proxy on this machine: previews render, a final render is refused (never the
+        // proxy in its place), and with Use All Proxies it renders.
+        std::fs::remove_file(&clip).ok();
+        assert!(blockers(&s.project).is_empty());
+        let missing = final_blockers(&s.project, ProxyUse::CurrentSettings);
+        assert_eq!(missing.iter().filter_map(|m| m.path.clone()).collect::<Vec<_>>(), vec![clip.clone()]);
+        assert!(final_blockers(&s.project, ProxyUse::UseAll).is_empty());
+        // Only the original: a final render is fine, previews need the proxy.
+        std::fs::write(&clip, b"x").ok();
+        std::fs::remove_file(&proxy).ok();
+        assert!(final_blockers(&s.project, ProxyUse::CurrentSettings).is_empty());
+        assert!(!blockers(&s.project).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 
