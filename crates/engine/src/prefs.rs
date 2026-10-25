@@ -1370,7 +1370,7 @@ pub fn pages() -> Vec<Page> {
                 s("previews.fastPreviews", "Fast Previews (Draft 3D, Faster Effects)", B, true),
                 s("previews.zoomQuality", "Viewer Zoom Quality", Kind::Choice(&[("Faster", "faster"), ("More Accurate", "moreAccurate")]), true),
                 s("previews.displayProfile", "Display Color Space", Kind::Choice(&[("sRGB", "srgb"), ("Display P3", "p3")]), true),
-                s("previews.hardwareProResDecoding", "Hardware ProRes Decoding", B, true),
+                s("previews.hardwareProResDecoding", "Hardware Video Decoding", B, true),
                 Note("Previews decode ProRes on the Mac's media engines (visually identical, not bit-exact). Renders and exports decode exactly."),
                 s("previews.zeroCopyDisplay", "Show GPU Frames Without Copying", B, true),
                 Note("Off: viewer frames are copied to the CPU and back, and the GPU compositor gets a graphics device of its own at the next launch."),
