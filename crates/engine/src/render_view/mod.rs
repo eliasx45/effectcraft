@@ -403,7 +403,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "render.contactSheet",
             "Render Contact Sheet",
-            "{comp?, item?, layer?, times?: [s], count?, start? (s), end? (s), cols?, max_side?, labels?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, gif?, base64?, wait? (false: a background task)}",
+            "{comp?, item?, layer?, times?: [s], frames?: [comp frame] | {from, to, every?}, count?, start? (s), end? (s), cols?, max_side?, labels?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, gif?, base64?, wait? (false: a background task)}",
             contact_sheet_cmd
         ),
     ]

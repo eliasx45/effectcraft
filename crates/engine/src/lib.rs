@@ -451,6 +451,8 @@ pub struct Session {
     pub claims: agents::Claims,
     /// Bumped whenever another project replaces this one ([`Session::replace_project`]).
     pub epoch: u64,
+    /// Who changed what, revision by revision ([`feed`]): `history.feed`, `agent.notices`.
+    pub feed: feed::Feed,
     /// Identity of this in-memory session, stable across project replacement.
     pub session_id: String,
     /// The highest `next_id` any state has reached: ids stay unique across undo / redo, so an
@@ -678,6 +680,7 @@ impl Default for Session {
             cursors: Default::default(),
             claims: Default::default(),
             epoch: 0,
+            feed: Default::default(),
             session_id: build_info::next_session_id(),
             id_floor: 0,
             saved_revision: 0,
@@ -788,8 +791,10 @@ impl Session {
         }
     }
 
-    fn execute_inner(&mut self, id: &str, params: Value) -> Result<Value> {
+    fn execute_inner(&mut self, id: &str, mut params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        // Times as the Timeline shows them ("6:20", {"frame": 200}) become seconds of the comp.
+        readout::resolve_time_params(self, id, &mut params)?;
         let resolved = commands::validate_target_refs(self, id, &params)?;
         if let Err(why) = (spec.enabled)(self) {
             // Explicit targets (agents, scripts) don't need a UI selection.
@@ -913,6 +918,8 @@ impl Session {
             self.history.abandon_redo(&before);
         }
         self.history.merge_key = merge.map(str::to_string);
+        self.feed.label = Some(label.to_string());
+        self.feed.merge = same;
         self.project = Arc::new(p);
         if removed {
             self.release_unused_footage();
@@ -927,6 +934,7 @@ impl Session {
     pub fn bump(&mut self) {
         self.freeze_runtime.changed();
         self.revision += 1;
+        self.feed.record(self.revision, self.client.clone(), &self.project, self.epoch, &self.history);
         *self.freeze_runtime.latest_source.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (self.epoch, self.project.clone());
         self.id_floor = self.id_floor.max(self.project.next_id);
         // Back at the saved state (undo, redo, a history jump or a rolled-back batch).
@@ -999,6 +1007,7 @@ impl Session {
 
     pub fn undo(&mut self) -> bool {
         let Some((label, p)) = self.history.undo.pop() else { return false };
+        self.feed.label = Some(format!("Undo {label}"));
         let cur = std::mem::replace(&mut self.project, p);
         self.keep_view_settings(&cur);
         self.history.redo.push((label, cur));
@@ -1010,6 +1019,7 @@ impl Session {
 
     pub fn redo(&mut self) -> bool {
         let Some((label, p)) = self.history.redo.pop() else { return false };
+        self.feed.label = Some(format!("Redo {label}"));
         let cur = std::mem::replace(&mut self.project, p);
         let restored_comp = self.project.comps().find(|(id, _)| cur.comp(**id).is_none()).map(|(id, _)| *id);
         self.keep_view_settings(&cur);
