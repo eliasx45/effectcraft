@@ -1411,8 +1411,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     ctx.data_mut(|d| d.insert_temp(tl_map_id(), (tm.x0, tm.start, tm.pps)));
     let top = rect.min.y;
     let rows_top = top + header_h + colhdr_h;
-    let rows_rect = Rect::from_min_max(pos2(rect.min.x, rows_top), pos2(rect.max.x, rect.max.y - footer_h));
-    let graph_rect = Rect::from_min_max(pos2(graph_x0, top + header_h - ruler_h + colhdr_h), pos2(rect.max.x, rect.max.y - footer_h));
+    // The Why? strip (drawn at the end, above the footer) takes its own row: the layer rows and
+    // the track area end above it, so the last layers are never under it (WHY-STRIP1).
+    let rows_bottom = rect.max.y - footer_h - super::why_chip::height(app, ui.ctx());
+    let rows_rect = Rect::from_min_max(pos2(rect.min.x, rows_top), pos2(rect.max.x, rows_bottom));
+    let graph_rect = Rect::from_min_max(pos2(graph_x0, top + header_h - ruler_h + colhdr_h), pos2(rect.max.x, rows_bottom));
     p.rect_filled(Rect::from_min_max(pos2(graph_x0, top), rect.max), 0.0, t.tl_bg);
     p.line_segment([pos2(graph_x0 - 1.0, top), pos2(graph_x0 - 1.0, rect.max.y)], Stroke::new(1.0, t.app_bg));
 
@@ -3707,7 +3710,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     // The outline / time graph splitter, registered last so it wins over the rows beside it.
     ui.set_clip_rect(full_clip);
-    super::timeline_columns::splitter(app, ui, graph_x0 - 1.0, top, rect.max.y - footer_h, left_w, rect.width());
+    super::timeline_columns::splitter(app, ui, graph_x0 - 1.0, top, rows_bottom, left_w, rect.width());
     // Batch 1 lane C (CX4, CX6): Claude's suggestions (badge, pills, dashed layers) and the Why? strip.
     super::suggestions::timeline_overlay(app, ui, rect);
     if ui.input(|i| i.pointer.primary_down()) && actions.iter().any(|(id, _)| id == "prop.set") {

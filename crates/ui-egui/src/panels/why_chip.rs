@@ -72,6 +72,15 @@ fn watch(app: &EffectcraftApp, ctx: &egui::Context) -> Watch {
     w
 }
 
+/// The strip's height.
+const STRIP_H: f32 = 30.0;
+
+/// The height the strip takes this frame (0 when closed), so the Timeline ends its layer rows
+/// above it before drawing them.
+pub fn height(app: &EffectcraftApp, ctx: &egui::Context) -> f32 {
+    if watch(app, ctx).open.is_some() { STRIP_H } else { 0.0 }
+}
+
 /// Draw the Why? strip at the bottom of the Timeline `rect` (above its footer); its height (0 when
 /// closed).
 pub fn strip(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> f32 {
@@ -82,7 +91,7 @@ pub fn strip(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> f32 {
         return 0.0;
     };
     let t = app.tokens;
-    let h = 30.0;
+    let h = STRIP_H;
     let footer_h = 24.0;
     let r = Rect::from_min_max(pos2(rect.min.x, rect.max.y - footer_h - h), pos2(rect.max.x, rect.max.y - footer_h));
     let p = ui.painter().with_clip_rect(rect);
