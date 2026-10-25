@@ -100,6 +100,7 @@ mod ops;
 mod particles;
 mod prepass;
 mod readback;
+mod shapes_gpu;
 #[cfg(feature = "profile")]
 mod timestamps;
 pub mod traffic_light;
@@ -708,6 +709,8 @@ mod tests_precomp_clip;
 mod tests_precomp_resident;
 #[cfg(test)]
 mod tests_shape_clip;
+#[cfg(test)]
+mod tests_shapes_gpu;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests_styles_static;

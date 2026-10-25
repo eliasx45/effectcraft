@@ -700,6 +700,8 @@ pub fn render_window(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64,
     Buf { img, offset, scale: s }
 }
 
+pub mod gpu_plan;
+pub mod skia_scan;
 #[cfg(test)]
 mod tests;
 

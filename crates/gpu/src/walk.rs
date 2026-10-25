@@ -561,9 +561,15 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         SourceImage { img: e.upload_pixels(&buf)?, offset: buf.offset, scale: buf.scale }
     } else {
         let _profile = effectcraft_render::profile::span("ordinary_resident_produce");
-        let buf = crate::prepass::resident_source(r, ctx, layer, key, clip)?;
-        let src = e.g.upload_image(&buf.img)?;
-        let mut fx = crate::effects::GpuFx::new(e, src, buf.offset, buf.scale, r.pipe().levels);
+        // A shape layer rasterises here (`shapes_gpu`), else its source comes from the CPU.
+        let (src, at, bs) = match crate::shapes_gpu::resident_source(e, r, ctx, layer, clip) {
+            Some(made) => made,
+            None => {
+                let buf = crate::prepass::resident_source(r, ctx, layer, key, clip)?;
+                (e.g.upload_image(&buf.img)?, buf.offset, buf.scale)
+            }
+        };
+        let mut fx = crate::effects::GpuFx::new(e, src, at, bs, r.pipe().levels);
         let origin = r.run_layer_effects_in(ctx, layer, &mut fx, clip);
         let (img, offset, scale) = fx.finish()?;
         SourceImage { img: img.into(), offset: [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale], scale }

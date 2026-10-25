@@ -25,3 +25,8 @@ The Composition viewer's low-resolution preview upscale (crates/ui-egui/src/fsr1
 port of the EASU and RCAS passes of AMD FidelityFX Super Resolution 1.0 (ffx_fsr1.h,
 https://github.com/GPUOpen-Effects/FidelityFX-FSR), Copyright (c) 2021 Advanced Micro Devices,
 Inc., MIT License. The licence text is kept at the top of that file.
+
+The GPU shape rasteriser's edge setup (crates/render/src/shapes/skia_scan.rs) is a port of
+tiny-skia 0.12's anti-aliased scan converter edges (https://github.com/linebender/tiny-skia),
+Copyright (c) 2011 Google Inc., (c) 2020 Yevhenii Reizner, (c) 2006, 2009 The Android Open Source
+Project, BSD 3-Clause License. The licence text is kept at the top of that file.
