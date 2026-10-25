@@ -1,8 +1,9 @@
 //! Who may use a hardware video decoder.
 //!
-//! Hardware decoders (registered by a platform layer with FilmCraft's decoder registry) give
-//! pictures that look the same as the pure-Rust decoders' but are not bit-identical, so only
-//! previews may use them: exports, the Render Queue and other final renders decode exactly.
+//! Hardware decoders (registered by a platform layer with FilmCraft's decoder registry: ProRes,
+//! H.264 and HEVC on macOS) give pictures that look the same as the pure-Rust decoders' but are
+//! not guaranteed bit-identical, so only previews may use them: exports, the Render Queue and
+//! other final renders decode exactly.
 //!
 //! FilmCraft creates decoders through one process-wide registry, so the choice is made per
 //! decoding thread: [`MediaPool`](crate::MediaPool) runs every movie decode inside a [`scope`]
@@ -57,9 +58,12 @@ pub fn available() -> bool {
 }
 
 /// Whether footage with this codec description ([`effectcraft_project::Footage::codec`]) is one
-/// a registered hardware decoder takes: Apple ProRes only.
+/// a registered hardware decoder may take: Apple ProRes, H.264 and HEVC (FilmCraft's labels,
+/// e.g. "Apple ProRes 4444", "H.264 (High)", "HEVC"). The decoder factory itself still declines
+/// streams it doesn't take (10-bit H.264, 4:2:2, interlaced, …), which then decode in software.
 pub fn takes_codec(codec: &str) -> bool {
-    codec.to_ascii_lowercase().contains("prores")
+    let c = codec.to_ascii_lowercase();
+    ["prores", "h.264", "h264", "hevc", "h.265", "h265"].iter().any(|k| c.contains(k))
 }
 
 #[cfg(test)]
@@ -79,6 +83,7 @@ mod tests {
             assert!(allowed());
         }
         assert!(!allowed());
-        assert!(takes_codec("Apple ProRes 4444") && !takes_codec("H.264"));
+        assert!(takes_codec("Apple ProRes 4444") && takes_codec("H.264 (High)") && takes_codec("HEVC") && takes_codec("H.265"));
+        assert!(!takes_codec("VP9") && !takes_codec("AV1") && !takes_codec("DNxHD") && !takes_codec(""));
     }
 }

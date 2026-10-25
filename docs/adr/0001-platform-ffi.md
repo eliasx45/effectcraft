@@ -87,3 +87,29 @@ crate may do, under the same containment rules:
 - the public API is `effectcraft_platform::background_thread() -> bool` (safe; `false` and a no-op
   off macOS). The desktop app hands it to the UI crate (`frames::set_idle_thread_start`), which
   calls it at the start of each idle-cache thread; the UI crate itself stays `forbid(unsafe)`.
+
+## Amendment (2026-10-25): hardware H.264 / HEVC decoding for previews
+
+Requested by the owner (session brief HWDEC1): footage decoding was the largest single cost in
+his comps (about 52 ms per frame for an H.264 video inside a precomp: 45 ms of software decoding
+plus the YUV upload). The third job of this crate is hardware **H.264 and HEVC** decoding for
+**previews** on macOS, under the same containment rules and the same previews-only guarantee as
+ProRes (the media pool's exact view, which every export reads, never uses it):
+
+- FFI module `videotoolbox_nal` (`#[allow(unsafe_code)]`, every block with `// SAFETY:`; the
+  output callback runs under `catch_unwind`), adapted from FilmCraft's VideoToolbox decoder: a
+  session per decoder from the `avcC` / `hvcC` parameter sets, hardware required, asynchronous
+  decompression, decoded `420v`/`420f`/`x420`/`xf20` buffers copied into the software decoders'
+  planar `Yuv8` / `Yuv16` pictures (cropped, same colour and pixel aspect).
+- Safe code around it: `nal` (which streams the hardware path takes, decided from the SPS: only
+  progressive 4:2:0 8-bit H.264 and 8/10-bit HEVC that FilmCraft's software decoders also take,
+  so a fallback is always possible), `h26x` (decoder: reorder buffer of the stream's depth for
+  presentation order, RASL pictures left out after a CRA/BLA start as in software, a fresh
+  session per seek) and `hybrid` (a decoder that fails mid-stream or meets new in-band parameter
+  sets switches to the software decoder and replays the samples since the last restart point, so
+  the output is the software decoder's own sequence).
+- Frames still go through a CPU copy into the existing YUV upload; handing the `CVPixelBuffer`'s
+  IOSurface to the GPU without a copy would need Metal interop in the GPU crate and is a separate
+  decision.
+- The switch is the existing Settings ▸ Previews ▸ Hardware ProRes Decoding preference (on by
+  default); it now covers H.264 and HEVC as well.

@@ -128,8 +128,9 @@ pub fn long_call(bridge: bool, msg: &Value) -> Option<LongCall> {
     }
     let p = msg.get("params")?;
     let name = p.get("name")?.as_str()?;
-    let args = p.get("arguments").cloned().unwrap_or(json!({}));
+    let mut args = p.get("arguments").cloned().unwrap_or(json!({}));
     let tool = tools::available(bridge).find(|t| t.name == name)?;
+    tool.normalize_args(&mut args);
     if tool.unknown_arg(&args).is_some() {
         return None; // the normal path reports it
     }

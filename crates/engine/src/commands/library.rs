@@ -292,6 +292,7 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
         }
         return Err(bad(C, format!("no library entry `{id}`")));
     };
+    let snap = s.project.clone();
     let file = resolve(&lib.folder, &e.file);
     if file.is_empty() || !s.services.exists(&file) {
         return Err(bad(C, format!("“{}” has no file EffectCraft can use yet ({})", e.name, if file.is_empty() { "none listed" } else { &file })));
@@ -340,7 +341,30 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
         }
         layer = s.execute("layer.addItem", params)?["layer"].clone();
     }
-    Ok(json!({"entry": entry, "item": item, "layer": layer, "import": imported}))
+    let mut r = json!({"entry": entry, "item": item, "layer": layer, "import": imported});
+    report_problems(s, &snap, &mut r);
+    Ok(r)
+}
+
+/// What went wrong bringing a library entry in, at the top of its reply instead of buried in
+/// `import`: the import's `warnings` and missing media, and expressions that fail in the
+/// compositions it added or changed (`expressionErrors`, e.g. one reading a marker or match name
+/// the entry doesn't have), also toasted.
+pub(crate) fn report_problems(s: &mut Session, before: &effectcraft_project::Project, r: &mut Value) {
+    let mut warnings: Vec<String> = r["import"]["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+    if let Some(missing) = r["import"]["missingMedia"].as_array().filter(|m| !m.is_empty()) {
+        r["missingMedia"] = json!(missing);
+    }
+    if let Some(errors) = super::expr_tools::new_errors(s, before) {
+        let count = errors["count"].as_u64().unwrap_or(0);
+        let first = errors["errors"][0]["message"].as_str().unwrap_or_default().to_string();
+        warnings.push(format!("{count} expression{} fail{} after applying ({first})", if count == 1 { "" } else { "s" }, if count == 1 { "s" } else { "" }));
+        r["expressionErrors"] = errors;
+    }
+    if !warnings.is_empty() {
+        s.toast(format!("Library: {}", warnings.join("; ")));
+        r["warnings"] = json!(warnings);
+    }
 }
 
 fn folders(s: &mut Session, _: &Value) -> Result<Value> {

@@ -85,6 +85,26 @@ impl ToolDef {
         })
     }
 
+    /// Rename argument names agents mix up between tools to the ones this tool takes: `query` ↔
+    /// `filter`, `source` / `script` → `code`, and camelCase ↔ snake_case (`maxSide` →
+    /// `max_side`). Only when this tool doesn't take the given name itself and the call doesn't
+    /// already pass the canonical one, so a real unknown argument is still reported.
+    pub fn normalize_args(&self, args: &mut Value) {
+        let Some(m) = args.as_object_mut() else { return };
+        let schema = self.input_schema();
+        let Some(props) = schema.get("properties").and_then(Value::as_object) else { return };
+        let renames: Vec<(String, String)> = m
+            .keys()
+            .filter(|k| k.as_str() != "client" && !props.contains_key(*k))
+            .filter_map(|k| arg_alias(k, props).filter(|c| !m.contains_key(c)).map(|c| (k.clone(), c)))
+            .collect();
+        for (from, to) in renames {
+            if let Some(v) = m.remove(&from) {
+                m.insert(to, v);
+            }
+        }
+    }
+
     /// The first argument this tool doesn't take, as a message naming the accepted ones.
     pub fn unknown_arg(&self, args: &Value) -> Option<String> {
         let Some(m) = args.as_object() else { return Some("arguments must be an object".into()) };
@@ -101,6 +121,40 @@ impl ToolDef {
         };
         Some(format!("unknown argument \"{bad}\" for {}{hint}; expected: {}", self.name, accepted.join(", ")))
     }
+}
+
+/// Names agents use for the same argument across tools: (given, canonical).
+const ARG_ALIASES: &[(&str, &str)] =
+    &[("query", "filter"), ("search", "filter"), ("filter", "query"), ("search", "query"), ("source", "code"), ("script", "code"), ("js", "code")];
+
+/// The argument of `props` that `key` stands for: a listed synonym, or the same name in the other
+/// case style (`maxSide` ↔ `max_side`).
+fn arg_alias(key: &str, props: &Map<String, Value>) -> Option<String> {
+    if let Some((_, canonical)) = ARG_ALIASES.iter().find(|(given, canonical)| *given == key && props.contains_key(*canonical)) {
+        return Some((*canonical).to_string());
+    }
+    let snake = key.chars().fold(String::new(), |mut s, c| {
+        if c.is_ascii_uppercase() {
+            s.push('_');
+            s.push(c.to_ascii_lowercase());
+        } else {
+            s.push(c);
+        }
+        s
+    });
+    let mut camel = String::new();
+    let mut upper = false;
+    for c in key.chars() {
+        match c {
+            '_' => upper = true,
+            c if upper => {
+                camel.push(c.to_ascii_uppercase());
+                upper = false;
+            }
+            c => camel.push(c),
+        }
+    }
+    [snake, camel].into_iter().find(|k| k != key && props.contains_key(k))
 }
 
 /// Tools that only read.
@@ -249,7 +303,8 @@ pub fn output_schema(name: &str) -> Option<Value> {
         "command_batch" => object(
             json!({
                 "completed": int, "failed": int,
-                "results": {"type": "array", "items": object(json!({"ok": {"type": "boolean"}, "result": {}, "error": {"type": "string"}}), &["ok"])}
+                "results": {"type": "array", "items": object(json!({"ok": {"type": "boolean"}, "result": {}, "error": {"type": "string"}, "omitted": {"type": "boolean"}}), &["ok"])},
+                "failedSteps": {"type": "array", "items": object(json!({"step": int, "id": {"type": "string"}, "error": {"type": "string"}}), &["step", "error"])}
             }),
             &["completed", "failed", "results"],
         ),
@@ -355,8 +410,9 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
     if b.confinement().is_some() && UNCONFINED_ONLY.contains(&name) {
         return Err(Error::BadArgs(format!("`{name}` is not available while file access is confined (--automation-read-root/--automation-write-root)")));
     }
-    let empty = json!({});
-    let args = if args.is_null() { &empty } else { args };
+    let mut normalized = if args.is_null() { json!({}) } else { args.clone() };
+    t.normalize_args(&mut normalized);
+    let args = &normalized;
     // Validate delivery options before a script/edit can run.
     let delivery_budget = crate::compact::budget(args)?;
     let output_page = crate::compact::Page::from_args(args, 100)?;
@@ -402,6 +458,8 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
             .and_then(Value::as_str)
             .and_then(effectcraft_engine::commands::find)
             .is_some_and(|c| c.journal || c.id.starts_with("edit.") || c.id == "engine.batch"),
+        // A script's reply carries its own outcome; the session context only when asked.
+        "run_script" => get(args, "context").and_then(Value::as_bool) == Some(true),
         _ => !READ_ONLY.contains(&name),
     };
     if writes
@@ -631,10 +689,21 @@ fn get_state(b: &mut Backend, _: &Value) -> Result<Reply> {
 }
 
 fn run_script(b: &mut Backend, a: &Value) -> Result<Reply> {
-    let code = get(a, "code").and_then(Value::as_str).ok_or_else(|| Error::BadArgs("missing `code` (JavaScript)".into()))?;
+    // `file`: a script file on this machine. Its code runs (unless `code` is given) under its path,
+    // so `#include "x.jsx"` resolves next to it rather than in the project's folder.
+    let file = get(a, "file").and_then(Value::as_str);
+    let code = match (get(a, "code").and_then(Value::as_str), file) {
+        (Some(code), _) => code.to_string(),
+        (None, Some(_)) if b.confinement().is_some() => return Err(Error::BadArgs("`file` is not available while file access is confined".into())),
+        (None, Some(f)) => std::fs::read_to_string(f).map_err(|e| Error::BadArgs(format!("cannot read script file {f}: {e}")))?,
+        (None, None) => return Err(Error::BadArgs("missing `code` (JavaScript) or `file` (a .jsx path)".into())),
+    };
     let mut p = json!({"code": code});
-    if let Some(n) = get(a, "name") {
+    if let Some(n) = get(a, "name").or(file.map(|_| &a["file"])) {
         p["name"] = n.clone();
+    }
+    if let Some(r) = get(a, "rollback") {
+        p["rollback"] = r.clone();
     }
     // A time limit by default, so a runaway loop can't hold the session forever; 0 = none.
     p["timeout"] = get(a, "timeout").cloned().unwrap_or(json!(SCRIPT_TIMEOUT));
@@ -1392,16 +1461,19 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "run_script",
-        description: "Run JavaScript with an After Effects-style scripting object model (app, app.project, items.addComp, comp.layers.addSolid/addText/addShape/addNull/addCamera/addLight, layer.property(\"ADBE Transform Group\").property(\"ADBE Position\").setValueAtTime(t, v), Effects.addProperty(\"ADBE Gaussian Blur 2\"), expressions, markers, renderQueue…). Every edit is an undoable engine command; app.beginUndoGroup/endUndoGroup make one undo step. Returns {ok, result (last expression value), output (writeLn/$.writeln/alert text), error: {message, line, column} | null}. Stops after `timeout` seconds (default 300, 0 = no limit) or on MCP notifications/cancelled (an open undo group is rolled back; other edits are kept). File access is limited to the project folder unless the user allows scripts to write files.",
+        description: "Run JavaScript with an After Effects-style scripting object model (app, app.project, items.addComp, comp.layers.addSolid/addText/addShape/addNull/addCamera/addLight, layer.property(\"ADBE Transform Group\").property(\"ADBE Position\").setValueAtTime(t, v), Effects.addProperty(\"ADBE Gaussian Blur 2\"), expressions, markers, renderQueue…). Every edit is an undoable engine command; app.beginUndoGroup/endUndoGroup make one undo step. Returns {ok, result (last expression value), output (writeLn/$.writeln/alert text), error: {message, line, column} | null, rolledBack?, expressionErrors? (expressions the script broke: a missing marker, layer or match name)}. A script that fails or stops (after `timeout` seconds, default 300, 0 = no limit, or on MCP notifications/cancelled) undoes all its edits unless rollback: false. `file` runs a .jsx file (#include resolves next to it). File access is limited to the project folder unless the user allows scripts to write files.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "code": {"type": "string", "description": "JavaScript source, e.g. `var c = app.project.items.addComp(\"Main\", 1920, 1080, 1, 5, 30); c.layers.addText(\"Hi\"); c.numLayers`."},
-                    "name": {"type": "string", "description": "Script name used in error messages (default `script`)."},
-                    "timeout": {"type": "number", "minimum": 0, "description": "Stop the script after this many seconds (default 300; 0 = no limit)."}
+                    "file": {"type": "string", "description": "Path of a .jsx file to run instead of `code` (absolute); `#include` resolves next to it. With `code`, only names the script so its includes resolve there."},
+                    "name": {"type": "string", "description": "Script name used in error messages (default `script`, or `file`)."},
+                    "timeout": {"type": "number", "minimum": 0, "description": "Stop the script after this many seconds (default 300; 0 = no limit)."},
+                    "rollback": {"type": "boolean", "description": "Undo every edit of a script that fails (default true: no half-done state; the reply says rolledBack). false keeps the edits made before the error."},
+                    "context": {"type": "boolean", "description": "Add observedContext (build, project, revision, client) to the reply (default false)."}
                 }),
-                &["code"],
+                &[],
             )
         },
         run: run_script,
@@ -1984,11 +2056,11 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "command_batch",
-        description: "Run commands in order, returning each result or error. Stop at the first error by default; stop_on_error: false continues. Each edit has its own undo step; use batch for an atomic undo group.",
+        description: "Run commands in order, returning {completed, failed, results, failedSteps?}: each step's result (big ones shortened to their ids unless verbose) or error. Stop at the first error by default; stop_on_error: false continues. Each edit has its own undo step; use batch for an atomic undo group.",
         bridge_only: false,
         schema: || {
             schema(
-                json!({"steps": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "params": {"type": "object"}}, "required": ["id"], "additionalProperties": false}}, "stop_on_error": {"type": "boolean"}}),
+                json!({"steps": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "params": {"type": "object"}}, "required": ["id"], "additionalProperties": false}}, "stop_on_error": {"type": "boolean"}, "verbose": {"type": "boolean", "description": "Inline every step's full result (default: results over 300 characters keep only their ids, e.g. layer, comp, item)."}}),
                 &["steps"],
             )
         },
@@ -2062,6 +2134,9 @@ fn prefix_field_pointers(value: &mut Value, prefix: &str, depth: usize) {
     }
 }
 
+/// The longest step result `command_batch` inlines without `verbose`.
+const STEP_INLINE_CHARS: usize = 300;
+
 fn command_batch(b: &mut Backend, a: &Value) -> Result<Reply> {
     let input = need(a, "steps")?.as_array().ok_or_else(|| Error::BadArgs("steps must be an array".into()))?;
     if input.len() > 1024 {
@@ -2077,7 +2152,42 @@ fn command_batch(b: &mut Backend, a: &Value) -> Result<Reply> {
         "engine.batch",
         json!({"steps":steps,"atomic":false,"stopOnError":get(a,"stop_on_error").and_then(Value::as_bool).unwrap_or(true),"groupUndo":false}),
     )?;
-    let mut out = json!({"completed":done["completed"],"failed":done["failed"],"results":done["executionResults"]});
+    // Short by default: a step's result is inlined when small; a big one keeps only its ids
+    // (`layer`, `comp`, `item`…) and failed steps are also listed together (`verbose`: all).
+    let verbose = get(a, "verbose").and_then(Value::as_bool) == Some(true);
+    let ids = input.iter().map(|st| get(st, "command").or_else(|| get(st, "id")).cloned().unwrap_or(Value::Null));
+    let mut failed_steps = vec![];
+    let results: Vec<Value> = done["executionResults"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .zip(ids)
+        .enumerate()
+        .map(|(i, (r, id))| {
+            if r["ok"] != true {
+                failed_steps.push(json!({"step": i + 1, "id": id, "error": r["error"]}));
+                return r.clone();
+            }
+            match r.get("result") {
+                Some(v) if !verbose && v.to_string().len() > STEP_INLINE_CHARS => {
+                    let mut short = json!({"ok": true, "omitted": true});
+                    for key in
+                        ["id", "layer", "layers", "comp", "item", "items", "effect", "key", "keys", "path", "name", "index", "time", "warning", "warnings"]
+                    {
+                        if let Some(x) = v.get(key).filter(|x| x.to_string().len() <= STEP_INLINE_CHARS) {
+                            short[key] = x.clone();
+                        }
+                    }
+                    short
+                }
+                _ => r.clone(),
+            }
+        })
+        .collect();
+    let mut out = json!({"completed":done["completed"],"failed":done["failed"],"results":results});
+    if !failed_steps.is_empty() {
+        out["failedSteps"] = json!(failed_steps);
+    }
     for key in ["appliedSteps", "files", "fileCoverage", "untrackedEffectsPossible", "rolledBack", "failedStep"] {
         if let Some(v) = done.get(key) {
             out[key] = v.clone();

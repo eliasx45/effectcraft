@@ -9305,6 +9305,74 @@
       "family": "ae_bundled_plugin",
       "role": "visual_effect"
     },
+    "CC Light Burst 2.5": {
+      "instances": 1,
+      "ae_names": {
+        "CC Light Burst 2.5": 1
+      },
+      "effect_id": "ec.generate.cclightburst",
+      "registry_present": true,
+      "evidence": "reviewed: 20-08 project (Halo Alpha has no native counterpart)",
+      "children": {
+        "CC Light Burst 2.5-0001": {
+          "names": {
+            "Center": 1
+          },
+          "instances": 1,
+          "param_id": "center",
+          "status": "native_parameter"
+        },
+        "CC Light Burst 2.5-0002": {
+          "names": {
+            "Intensity": 1
+          },
+          "instances": 1,
+          "param_id": "intensity",
+          "status": "native_parameter"
+        },
+        "CC Light Burst 2.5-0003": {
+          "names": {
+            "Ray Length": 1
+          },
+          "instances": 1,
+          "param_id": "rayLength",
+          "status": "native_parameter"
+        },
+        "CC Light Burst 2.5-0004": {
+          "names": {
+            "Burst": 1
+          },
+          "instances": 1,
+          "param_id": "burst",
+          "status": "native_parameter"
+        },
+        "CC Light Burst 2.5-0005": {
+          "names": {
+            "Halo Alpha": 1
+          },
+          "instances": 1,
+          "status": "unresolved_raw_property"
+        },
+        "CC Light Burst 2.5-0006": {
+          "names": {
+            "Set Color": 1
+          },
+          "instances": 1,
+          "param_id": "setColor",
+          "status": "native_parameter"
+        },
+        "CC Light Burst 2.5-0007": {
+          "names": {
+            "Color": 1
+          },
+          "instances": 1,
+          "param_id": "color",
+          "status": "native_parameter"
+        }
+      },
+      "family": "ae_bundled_plugin",
+      "role": "visual_effect"
+    },
     "CC Light Rays": {
       "instances": 1,
       "ae_names": {

@@ -259,8 +259,10 @@ headless and bridged (`--bridge`: the app runs the job; the server polls it).
 other requests wait in line (in order) and `ping` is answered. A cancel or the `timeout`
 (seconds, default 300, `0` = no limit; also `script.run {timeout}`) ends the script with an error
 `try`/`catch` cannot intercept: checked every ~100k bytecode steps and in every object-model call.
-An undo group the script left open is rolled back (Edit ▸ Redo restores it); edits outside undo
-groups are kept; the output says which. Code inside a built-in's callback (`Array.forEach`, a
+A script that fails or is stopped undoes all its edits (`rolledBack: true`; `rollback: false`
+keeps the edits made before the error, as After Effects does; the Script Console keeps them too).
+A script that breaks an expression (a missing marker, layer or match name) lists it in
+`expressionErrors`. `file` runs a `.jsx` file, with `#include` resolved next to it. Code inside a built-in's callback (`Array.forEach`, a
 sort comparator) that never calls the object model is only stopped by the loop-iteration limit.
 Bridged scripts honour `timeout` (in the app) but can't be cancelled.
 
@@ -338,12 +340,18 @@ status separately and explicitly warns not to rerun the operation.
 
 JSON resource URIs accept `offset`, `limit`, `max_chars`, `full`, and `expectRevision`.
 `effectcraft://result/{result_id}?pointer=...&mode=page|json&offset=...` reads retained results.
+`get_result` without `client` finds a result by its id alone; a call naming another client is
+refused. Tools take each other's argument names: `query`/`filter`, `source`/`script` for `code`,
+camelCase or snake_case (`maxSide` = `max_side`). `command_batch` inlines step results up to 300
+characters (bigger ones keep their ids) and lists failed steps in `failedSteps`; `verbose: true`
+inlines everything.
 
 `open_project` preserves `repaired`, `savedBy`, `handover`, `openElsewhere`, a media check and
 structured warnings. A clean load, a repaired load and an incomplete media check are distinct.
 `doc_inspect` propagates failed composition reads rather than inventing an empty composition.
 `hosts {join: path}` requires one exact canonical-path match; basename matches return
-candidates. Numeric ports explicitly select a host. Write replies may carry `observedContext`
+candidates. Numeric ports explicitly select a host. Write replies (`run_script` only with
+`context: true`) may carry `observedContext`
 labelled `observedAfter: true`: it describes the session observed after the operation, while
 the edit's own comp/layer/revision fields identify its actual readback snapshot.
 

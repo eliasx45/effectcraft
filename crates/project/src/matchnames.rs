@@ -429,6 +429,7 @@ pub const EFFECTS: &[(&str, &str)] = &[
     ("ec.distort.ccpageturn", "CC Page Turn"),
     ("ec.distort.upscale", "ADBE Upscale"),
     ("ec.distort.warp", "ADBE WRPMESH"),
+    ("ec.generate.cclightburst", "CC Light Burst 2.5"),
     ("ec.generate.cclightrays", "CC Light Rays"),
     ("ec.generate.cclightsweep", "CC Light Sweep"),
     ("ec.keying.keylight", "Keylight 906"),
@@ -512,6 +513,12 @@ const PARAM_NUMBERS: &[(&str, &str, usize)] = &[
     ("ec.generate.fill", "invert", 6),
     ("ec.generate.fill", "allMasks", 7),
 ];
+
+/// The number of `param` in its effect's AE parameter match names (`<effect>-0007`) when it is
+/// not numbered in display order ([`PARAM_NUMBERS`]).
+pub fn param_number(effect_id: &str, param: &str) -> Option<usize> {
+    PARAM_NUMBERS.iter().find(|(fx, p, _)| *fx == effect_id && *p == param).map(|(_, _, n)| *n)
+}
 
 /// Match name of the node at the end of `chain` (layer root's children → … → node). `effect`
 /// params are numbered `<effect match name>-0001…` in parameter order, like After Effects.

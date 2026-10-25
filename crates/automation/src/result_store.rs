@@ -432,13 +432,20 @@ impl ResultStore {
         Ok(path)
     }
 
-    pub(crate) fn fetch(&self, a: &Value, client: Option<&str>) -> Result<Value> {
+    /// A retained result by its id. The id is an unguessable token handed to whoever made the
+    /// result; a call that names a `client` (`named`) only gets that client's results, a call
+    /// without one gets any (a sub-agent that passed `client` to run_script but not to
+    /// get_result).
+    pub(crate) fn fetch(&self, a: &Value, client: Option<&str>, named: bool) -> Result<Value> {
         let id = a.get("result_id").and_then(Value::as_str).ok_or_else(|| Error::BadArgs("missing result_id".into()))?;
-        let entry = self
-            .entries
-            .iter()
-            .find(|e| e.id == id && e.client.as_deref() == client)
-            .ok_or_else(|| Error::BadArgs("result id is unknown, expired, or belongs to another client; fetching never reruns its source".into()))?;
+        let entry =
+            self.entries.iter().find(|e| e.id == id).ok_or_else(|| {
+                Error::BadArgs("result id is unknown or expired (only the last 32 results are kept); fetching never reruns its source".into())
+            })?;
+        if named && entry.client.as_deref() != client {
+            let owner = entry.client.as_deref().map_or("the user (\"client\": \"\")".to_string(), |c| format!("client `{c}`"));
+            return Err(Error::BadArgs(format!("result {id} belongs to {owner}: pass that client, or none")));
+        }
         let cap = compact::budget(a)?;
         let pointer = a.get("pointer").and_then(Value::as_str).unwrap_or("");
         let default_mode =
@@ -540,7 +547,7 @@ mod tests {
         let mut ids: Vec<u64> = first["items"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
         let mut next = first["next_offset"].as_u64();
         while let Some(offset) = next {
-            let reply = store.fetch(&json!({"result_id": id, "mode": "page", "pointer": "/items", "offset": offset}), Some("a")).unwrap();
+            let reply = store.fetch(&json!({"result_id": id, "mode": "page", "pointer": "/items", "offset": offset}), Some("a"), true).unwrap();
             assert!(compact::fits_budget(&reply, 7000));
             let rows = reply["items"].as_array().unwrap();
             assert!(!rows.is_empty());
@@ -567,7 +574,7 @@ mod tests {
         assert_eq!(reply["warnings"]["fetch"], "get_result");
         assert_eq!(reply["warnings"]["pointer"], "/warnings");
         let id = reply["result_id"].as_str().unwrap();
-        let exact = store.fetch(&json!({"result_id": id, "pointer": "/results/0/value", "mode": "json", "max_chars": 1024}), None).unwrap();
+        let exact = store.fetch(&json!({"result_id": id, "pointer": "/results/0/value", "mode": "json", "max_chars": 1024}), None, true).unwrap();
         assert!(compact::fits_budget(&exact, 1024));
         assert_eq!(exact["ok"], false);
         assert_eq!(exact["source_failed"], true);
@@ -580,12 +587,14 @@ mod tests {
         let mut store = ResultStore::default();
         let first = store.finish("command_batch", &json!({"limit": 1}), json!({"results": [1, 2]}), Some("a")).unwrap();
         let id = first["result_id"].as_str().unwrap();
-        assert!(store.fetch(&json!({"result_id": id}), Some("b")).is_err());
+        assert!(store.fetch(&json!({"result_id": id}), Some("b"), true).is_err());
+        // A call that names no client fetches by the id alone.
+        assert!(store.fetch(&json!({"result_id": id}), Some("default"), false).is_ok());
         for _ in 0..MAX_ENTRIES {
             store.finish("command_batch", &json!({"limit": 1}), json!({"results": [1, 2]}), Some("a")).unwrap();
         }
         assert_eq!(store.entries.len(), MAX_ENTRIES);
-        assert!(store.fetch(&json!({"result_id": id}), Some("a")).is_err());
+        assert!(store.fetch(&json!({"result_id": id}), Some("a"), true).is_err());
         assert!(store.memory <= MEMORY_BYTES);
     }
 
@@ -641,7 +650,7 @@ mod tests {
                 }
             }
             let id = preview["result_id"].as_str().unwrap();
-            let chunk = store.fetch(&json!({"result_id": id, "pointer": "/ok", "mode": "json"}), None).unwrap();
+            let chunk = store.fetch(&json!({"result_id": id, "pointer": "/ok", "mode": "json"}), None, true).unwrap();
             assert_eq!(chunk["operation_completed"], false);
             for key in ["waiting", "running"] {
                 if let Some(v) = state.get(key) {
@@ -713,11 +722,11 @@ mod tests {
             Stored::File { path, .. } => path.clone(),
             Stored::Memory(_) => panic!("expected spill"),
         };
-        let first = store.fetch(&json!({"result_id": id, "mode": "json", "pointer": "", "limit": 37, "max_chars": 1024}), Some("a")).unwrap();
+        let first = store.fetch(&json!({"result_id": id, "mode": "json", "pointer": "", "limit": 37, "max_chars": 1024}), Some("a"), true).unwrap();
         assert!(compact::fits_budget(&first, 1024));
         assert_eq!(first["text"], "{\"output\":\"xxxxxxxxxxxxxxxxxxxxxxxxxx");
         assert_eq!(first["returned"], 37);
-        assert!(store.fetch(&json!({"result_id": id, "mode": "json", "pointer": "/output"}), Some("a")).is_err());
+        assert!(store.fetch(&json!({"result_id": id, "mode": "json", "pointer": "/output"}), Some("a"), true).is_err());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
