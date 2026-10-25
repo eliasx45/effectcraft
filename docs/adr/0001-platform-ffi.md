@@ -90,6 +90,8 @@ crate may do, under the same containment rules:
 
 ## Amendment (2026-10-25): hardware H.264 / HEVC decoding for previews
 
+**Status:** accepted (2026-10-25, approved by the project owner, Elias).
+
 Requested by the owner (session brief HWDEC1): footage decoding was the largest single cost in
 his comps (about 52 ms per frame for an H.264 video inside a precomp: 45 ms of software decoding
 plus the YUV upload). The third job of this crate is hardware **H.264 and HEVC** decoding for
@@ -111,10 +113,12 @@ ProRes (the media pool's exact view, which every export reads, never uses it):
 - Frames still go through a CPU copy into the existing YUV upload; handing the `CVPixelBuffer`'s
   IOSurface to the GPU without a copy would need Metal interop in the GPU crate and is a separate
   decision.
-- The switch is the existing Settings ▸ Previews ▸ Hardware ProRes Decoding preference (on by
-  default); it now covers H.264 and HEVC as well.
+- The switch is the existing Settings ▸ Previews ▸ Hardware Video Decoding preference (on by
+  default; formerly "Hardware ProRes Decoding", same setting id); it now covers H.264 and HEVC as well.
 
 ## Amendment (2026-10-25b): decoded surfaces shared with the GPU (HWDEC2)
+
+**Status:** accepted (2026-10-25, approved by the project owner, Elias).
 
 Requested by the owner (session brief HWDEC2). Hardware-decoded H.264 / HEVC pictures no longer
 need an upload to reach the GPU compositor on Metal. The fourth job of this crate:
