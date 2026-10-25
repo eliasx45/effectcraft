@@ -234,7 +234,14 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
                     k = k.hold();
                 }
                 match pr.keys.binary_search_by(|x| x.time.cmp(&k.time)) {
-                    Ok(i) => pr.keys[i] = k,
+                    // Landing on a key: only its value changes; it keeps its own eases, tangents
+                    // and label, so the graph on either side keeps its shape (Paste Keyframe
+                    // Graph is the way to copy eases).
+                    Ok(i) => {
+                        if let Some(old) = pr.keys.get_mut(i) {
+                            old.value = k.value;
+                        }
+                    }
                     Err(i) => pr.keys.insert(i, k),
                 }
                 sel.push(KeyRef { layer: *lid, prop: *uid, time: lt });

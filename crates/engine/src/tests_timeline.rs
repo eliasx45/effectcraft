@@ -1435,3 +1435,28 @@ fn handle_split_and_join_preserve_the_other_influence_and_undo() {
     s.execute("edit.undo", json!({})).unwrap();
     assert!(!prop(&s, layer, "transform/rotation").keys[1].continuous);
 }
+
+#[test]
+fn pasting_a_key_onto_a_key_changes_only_its_value_not_its_eases() {
+    let (mut s, l) = setup();
+    animate(&mut s, l, "transform/opacity", &[(0.5, json!(0)), (1.0, json!(100)), (2.5, json!(85)), (3.0, json!(0))]);
+    let uid = prop(&s, l, "transform/opacity").uid;
+    // Ease only the 1 s key, so it carries different eases from the 2.5 s key it is pasted on.
+    s.execute("keys.select", json!({"keys": [{"layer": l, "prop": uid, "time": 1.0}]})).unwrap();
+    s.execute("keys.easyEase", json!({})).unwrap();
+    s.execute("keys.copy", json!({})).unwrap();
+    let before = prop(&s, l, "transform/opacity").keys[2].clone();
+    assert_ne!(before.out_ease, prop(&s, l, "transform/opacity").keys[1].out_ease);
+    s.execute("time.set", json!({"time": 2.5})).unwrap();
+    s.execute("keys.select", json!({"keys": []})).unwrap();
+    s.execute("keys.paste", json!({"layers": [l]})).unwrap();
+    let after = |s: &Session| {
+        let p = prop(s, l, "transform/opacity");
+        assert_eq!(p.keys.len(), 4);
+        let k = &p.keys[2];
+        assert_eq!(k.value, KV::Scalar(100.0), "the copied value lands");
+        assert_eq!((k.in_interp, k.out_interp), (before.in_interp, before.out_interp));
+        assert_eq!((&k.in_ease, &k.out_ease), (&before.in_ease, &before.out_ease), "the curves on both sides keep their eases");
+    };
+    undo_redo_roundtrip(&mut s, after, |s| assert_eq!(prop(s, l, "transform/opacity").keys[2].value, KV::Scalar(85.0)));
+}
