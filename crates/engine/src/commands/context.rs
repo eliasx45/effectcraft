@@ -439,7 +439,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "history.feed",
             "Change Feed",
-            "{since?: revision (default: what you were last shown; else the latest), limit? (20), lines? (6 per change), others?: bool (leave out your own)} → who changed what: entries {revision, by (`user` or the agent/script client), who (`you` for yours), label, changes: [\"Layer › Position: key @ 6:20 [960, 540] → [900, 540]\"]}, `text`; `gap` when older changes are gone",
+            "{since?: revision (default: what you were last shown; else the latest), limit? (20), lines? (6 per change), others?: bool (leave out your own)} → who changed what: entries {revision, by (`user` or the agent/script client), who (`you` for yours), label, changes: [\"Layer › Position: key @ 6:20 [960, 540] → [900, 540]\"], comps: [ids of the comps it touched]}, `text`; `gap` when older changes are gone",
             history_feed
         ),
         query!(
