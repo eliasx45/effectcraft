@@ -7,21 +7,21 @@
 
 use serde_json::{Value, json};
 
-use crate::EffectcraftApp;
+use crate::panels::timeline::TimelineHost;
 
 /// Most follow-up steps run after one `text.apply`.
 const MAX_FOLLOW_UPS: usize = 8;
 
 /// Runs `text.apply {params}`, then each of its `followUp` steps. The first error is returned
 /// (a follow-up's error after the preset applied says so).
-pub fn run(app: &mut EffectcraftApp, ctx: &egui::Context, params: Value) -> Result<Value, String> {
-    let r = crate::menus::invoke(app, ctx, "text.apply", params)?;
+pub fn run(app: &mut dyn TimelineHost, ctx: &egui::Context, params: Value) -> Result<Value, String> {
+    let r = app.invoke(ctx, "text.apply", params)?;
     run_follow_ups(app, ctx, &r)?;
     Ok(r)
 }
 
 /// Runs the `followUp` steps of a command's result (`[{command, params}]`, or one such object).
-pub fn run_follow_ups(app: &mut EffectcraftApp, ctx: &egui::Context, result: &Value) -> Result<(), String> {
+pub fn run_follow_ups(app: &mut dyn TimelineHost, ctx: &egui::Context, result: &Value) -> Result<(), String> {
     let steps: Vec<Value> = match result.get("followUp") {
         Some(Value::Array(a)) => a.clone(),
         Some(v @ Value::Object(_)) => vec![v.clone()],
@@ -30,7 +30,7 @@ pub fn run_follow_ups(app: &mut EffectcraftApp, ctx: &egui::Context, result: &Va
     for step in steps.iter().take(MAX_FOLLOW_UPS) {
         let Some(id) = step.get("command").and_then(Value::as_str) else { continue };
         let params = step.get("params").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
-        crate::menus::invoke(app, ctx, id, params).map_err(|e| format!("The preset is on; {id} after it failed: {e}"))?;
+        app.invoke(ctx, id, params).map_err(|e| format!("The preset is on; {id} after it failed: {e}"))?;
     }
     Ok(())
 }
@@ -38,8 +38,8 @@ pub fn run_follow_ups(app: &mut EffectcraftApp, ctx: &egui::Context, result: &Va
 /// The text presets as (name, label), from `text.presetFamilies` (`presets[].{name, controls}`):
 /// Elias's preset cards in Motion Library ▸ Elias ▸ Text animations (CX8c). The label names the
 /// preset's controls.
-pub fn preset_list(app: &mut EffectcraftApp) -> Vec<(String, String)> {
-    let Ok(r) = app.session.execute("text.presetFamilies", json!({})) else { return vec![] };
+pub fn preset_list(app: &mut dyn TimelineHost) -> Vec<(String, String)> {
+    let Ok(r) = app.session_mut().execute("text.presetFamilies", json!({})) else { return vec![] };
     parse_presets(&r)
 }
 

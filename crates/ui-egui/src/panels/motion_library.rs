@@ -1260,10 +1260,11 @@ fn wait_for_preview(id: &str) {
 }
 
 /// A card's name as the panel shows it (renamed here, or only on this Mac).
-pub fn card_name(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str) -> Option<String> {
-    let client = app.session.motion_library().ok()?;
-    let local = app.session.motion_library_local();
-    let lib = local_library(ctx, &app.session.prefs.libraries);
+pub fn card_name(app: &mut dyn crate::panels::timeline::TimelineHost, ctx: &egui::Context, id: &str) -> Option<String> {
+    let session = app.session();
+    let client = session.motion_library().ok()?;
+    let local = session.motion_library_local();
+    let lib = local_library(ctx, &session.prefs.libraries);
     find_card(&library_cards(ctx, &client, &local, &lib), id).map(|c| c.name)
 }
 

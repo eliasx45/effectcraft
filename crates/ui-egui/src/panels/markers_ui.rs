@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use super::timeline::TMap;
 use crate::icons::{self, Icon};
+use crate::panels::timeline::{DialogRequest, TimelineHost};
 use crate::theme::Tokens;
 use crate::{Dialog, EffectcraftApp};
 
@@ -248,13 +249,13 @@ fn drag_state_id() -> egui::Id {
 }
 
 /// Snap `t` (comp seconds) to the CTI, the work area and other marker times within 8 px.
-fn snap(app: &EffectcraftApp, comp: &Comp, tm: TMap, t: f64, skip: MarkerRef) -> f64 {
+fn snap(app: &dyn TimelineHost, comp: &Comp, tm: TMap, t: f64, skip: MarkerRef) -> f64 {
     let fr = comp.frame_rate;
     let mut t = fr.snap_nearest(Tick::from_seconds_f64(t.max(0.0))).seconds();
-    if !app.session.state.snapping {
+    if !app.session().state.snapping {
         return t;
     }
-    let mut cands = vec![app.session.time().seconds(), comp.work_area.0.seconds(), comp.work_area.1.seconds()];
+    let mut cands = vec![app.session().time().seconds(), comp.work_area.0.seconds(), comp.work_area.1.seconds()];
     cands.extend(comp.markers.iter().enumerate().filter(|(i, _)| skip != MarkerRef { layer: None, index: *i }).map(|(_, m)| m.time.seconds()));
     let px = |a: f64| (a - t).abs() * tm.pps;
     if let Some(best) = cands.into_iter().filter(|c| px(*c) < 8.0).min_by(|a, b| px(*a).total_cmp(&px(*b))) {
@@ -277,8 +278,8 @@ fn marker_shape(x: f32, y0: f32, h: f32) -> Vec<Pos2> {
 /// Draw one marker (triangle + duration bar + comment) at `x` in a strip `[y0, y1]` and handle
 /// its gestures. `comp_t` is the marker's comp time.
 #[allow(clippy::too_many_arguments)]
-fn marker(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, comp: &Comp, tm: TMap, m: &Marker, comp_t: f64, r: MarkerRef, y0: f32, y1: f32) {
-    let t = app.tokens;
+fn marker(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, comp: &Comp, tm: TMap, m: &Marker, comp_t: f64, r: MarkerRef, y0: f32, y1: f32) {
+    let t = app.tokens();
     let ctx = ui.ctx().clone();
     let x = tm.x(comp_t);
     let col = marker_color(&t, m.label);
@@ -303,18 +304,18 @@ fn marker(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, comp: 
     let hit = Rect::from_min_max(pos2(x - 5.0, y0 - 1.0), pos2(x + 5.0, y1));
     let id = egui::Id::new(("marker", r.layer, r.index));
     let resp = ui.interact(hit, id, Sense::click_and_drag());
-    app.auto.add(&r.auto_id(), hit, if m.comment.is_empty() { "marker" } else { &m.comment });
+    app.auto_mut().add(&r.auto_id(), hit, if m.comment.is_empty() { "marker" } else { &m.comment });
     let tip = if m.comment.is_empty() { "Marker".to_string() } else { m.comment.clone() };
     let resp = resp.on_hover_text(tip);
     let mods = ui.input(|i| i.modifiers);
     if resp.double_clicked() {
-        if let Err(e) = open_dialog(app, r) {
-            app.ui.status = e;
+        if let Err(e) = app.request_dialog(DialogRequest::Marker(r)) {
+            app.ui_mut().status = e;
         }
         return;
     }
     if resp.clicked() && (if cfg!(target_os = "macos") { mods.mac_cmd || mods.command } else { mods.ctrl }) {
-        let _ = app.session.execute("markers.delete", r.params());
+        let _ = app.session_mut().execute("markers.delete", r.params());
         return;
     }
     if resp.drag_started() {
@@ -334,7 +335,7 @@ fn marker(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, comp: 
         } else {
             params["time"] = json!(tt);
         }
-        if let Ok(v) = app.session.execute("markers.set", params)
+        if let Ok(v) = app.session_mut().execute("markers.set", params)
             && let Some(ni) = v["index"].as_u64()
         {
             ctx.data_mut(|d| d.insert_temp(drag_state_id(), (layer, ni as usize, alt)));
@@ -342,15 +343,15 @@ fn marker(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, comp: 
     }
     if resp.drag_stopped() {
         ctx.data_mut(|d| d.remove::<(Option<u64>, usize, bool)>(drag_state_id()));
-        app.session.history.merge_key = None;
+        app.session_mut().history.merge_key = None;
     }
     crate::widgets::context_menu(&resp, |ui| {
-        let run = |ui: &mut egui::Ui, label: &str, cmd: &str, params: Value, app: &mut EffectcraftApp| {
+        let run = |ui: &mut egui::Ui, label: &str, cmd: &str, params: Value, app: &mut dyn TimelineHost| {
             if ui.button(label).clicked() {
                 if cmd == "dialog" {
-                    let _ = open_dialog(app, r);
-                } else if let Err(e) = app.session.execute(cmd, params) {
-                    app.ui.status = e.to_string();
+                    let _ = app.request_dialog(DialogRequest::Marker(r));
+                } else if let Err(e) = app.session_mut().execute(cmd, params) {
+                    app.ui_mut().status = e.to_string();
                 }
                 ui.close();
             }
@@ -371,7 +372,7 @@ fn marker(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, comp: 
 }
 
 /// Composition markers in the ruler strip `[y0, y1]`, protected regions over `rows`.
-pub(crate) fn comp_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, comp: &Comp, tm: TMap, strip: Rect, rows: Rect) {
+pub(crate) fn comp_markers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, comp: &Comp, tm: TMap, strip: Rect, rows: Rect) {
     let p = ui.painter().with_clip_rect(strip);
     let rp = ui.painter().with_clip_rect(rows);
     for m in comp.markers.iter().filter(|m| m.protected && m.duration > Tick(0)) {
@@ -389,10 +390,10 @@ pub(crate) fn comp_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, comp: &C
 /// (#275): drag a marker out of it and it follows the pointer along the marker strip `strip`
 /// (snapping like a dragged marker); dropping it there adds a composition marker at that time,
 /// one undo step. Dropped back on the bin or outside the time graph's width, nothing is added.
-pub(crate) fn marker_bin(app: &mut EffectcraftApp, ui: &mut egui::Ui, comp: &Comp, tm: TMap, bin: Rect, strip: Rect) {
-    let t = app.tokens;
+pub(crate) fn marker_bin(app: &mut dyn TimelineHost, ui: &mut egui::Ui, comp: &Comp, tm: TMap, bin: Rect, strip: Rect) {
+    let t = app.tokens();
     let resp = ui.interact(bin, egui::Id::new("marker-bin"), Sense::drag()).on_hover_text(tr("Composition marker bin: drag a marker to the time ruler"));
-    app.auto.add("timeline.markerBin", bin, "Composition marker bin");
+    app.auto_mut().add("timeline.markerBin", bin, "Composition marker bin");
     let hot = resp.hovered() || resp.dragged();
     if hot {
         ui.ctx().set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
@@ -410,15 +411,15 @@ pub(crate) fn marker_bin(app: &mut EffectcraftApp, ui: &mut egui::Ui, comp: &Com
         p.add(egui::Shape::convex_polygon(marker_shape(tm.x(at), strip.min.y, h), col, Stroke::NONE));
     }
     if resp.drag_stopped()
-        && let Err(e) = app.session.execute("comp.addMarker", json!({"time": at}))
+        && let Err(e) = app.session_mut().execute("comp.addMarker", json!({"time": at}))
     {
-        app.ui.status = e.to_string();
+        app.ui_mut().status = e.to_string();
     }
 }
 
 /// Layer markers on a layer's row `r`; on a precomp layer, its comp's markers too (read-only,
 /// outlined: hover names them, a double-click opens the nested comp at the marker).
-pub(crate) fn layer_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, clip: Rect, comp: &Comp, layer: &Layer, tm: TMap, r: Rect) {
+pub(crate) fn layer_markers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, clip: Rect, comp: &Comp, layer: &Layer, tm: TMap, r: Rect) {
     let p = ui.painter().with_clip_rect(clip);
     nested_markers(app, ui, &p, comp, layer, tm, r);
     for (i, m) in layer.markers.iter().enumerate() {
@@ -427,16 +428,16 @@ pub(crate) fn layer_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, clip: R
 }
 
 /// The nested comp's markers on a precomp layer's bar (`markers.nested`).
-fn nested_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, comp: &Comp, layer: &Layer, tm: TMap, r: Rect) {
+fn nested_markers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, comp: &Comp, layer: &Layer, tm: TMap, r: Rect) {
     let effectcraft_engine::project::LayerSource::Comp { item } = layer.source else { return };
-    let Some(cid) = app.session.active_comp_id() else { return };
-    let project = app.session.project.clone();
+    let Some(cid) = app.session().active_comp_id() else { return };
+    let project = app.session().project.clone();
     let Some(nc) = project.comp(item) else { return };
     if nc.markers.is_empty() {
         return;
     }
     // Where they land, once per revision (with time remapping that samples the layer's frames).
-    let (key, rev) = (egui::Id::new(("nested-markers", cid.0, layer.id.0)), app.session.revision);
+    let (key, rev) = (egui::Id::new(("nested-markers", cid.0, layer.id.0)), app.session().revision);
     let cached = ui.ctx().data(|d| d.get_temp::<(u64, Vec<(Tick, usize)>)>(key)).filter(|(r, _)| *r == rev);
     let at = cached.map(|(_, v)| v).unwrap_or_else(|| {
         let v: Vec<(Tick, usize)> =
@@ -445,7 +446,7 @@ fn nested_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter
         v
     });
     let list: Vec<(Tick, usize, &Marker)> = at.into_iter().filter_map(|(t, i)| Some((t, i, nc.markers.get(i)?))).collect();
-    let t = app.tokens;
+    let t = app.tokens();
     let name = project.item(item).map(|i| i.name.clone()).unwrap_or_default();
     let (y0, h) = (r.min.y + 3.0, (r.height() - 6.0).min(10.0));
     for (ct, i, m) in list {
@@ -458,12 +459,14 @@ fn nested_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter
         let hit = Rect::from_min_max(pos2(x - 5.0, y0 - 1.0), pos2(x + 5.0, r.max.y - 3.0));
         let tip = if m.comment.is_empty() { format!("Marker in {name}") } else { format!("{} (marker in {name})", m.comment) };
         let resp = ui.interact(hit, egui::Id::new(("nested-marker", layer.id.0, i)), Sense::click()).on_hover_text(&tip);
-        app.auto.add(&format!("timeline.layer.{}.nestedMarker.{i}", layer.id.0), hit, &tip);
+        app.auto_mut().add(&format!("timeline.layer.{}.nestedMarker.{i}", layer.id.0), hit, &tip);
         if resp.double_clicked() {
-            let opened =
-                app.session.execute("comp.open", json!({"comp": item.0})).and_then(|_| app.session.execute("time.set", json!({"time": m.time.seconds()})));
+            let opened = app
+                .session_mut()
+                .execute("comp.open", json!({"comp": item.0}))
+                .and_then(|_| app.session_mut().execute("time.set", json!({"time": m.time.seconds()})));
             if let Err(e) = opened {
-                app.ui.status = e.to_string();
+                app.ui_mut().status = e.to_string();
             }
         }
     }

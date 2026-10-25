@@ -17,7 +17,7 @@ use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::EffectcraftApp;
+use crate::panels::timeline::TimelineHost;
 use crate::theme::Tokens;
 
 /// The row's height.
@@ -125,9 +125,9 @@ pub fn default_pins() -> Vec<QuickPin> {
 pub const FAST_IN_PROPS: [(&str, &str); 4] = [("p", "Position"), ("o", "Opacity"), ("s", "Scale"), ("r", "Rotation")];
 
 /// The property of the selected keys as a Fast In pick (`p` without one).
-fn keys_pick(app: &EffectcraftApp) -> &'static str {
-    let Some(comp) = app.session.active_comp() else { return "p" };
-    for k in &app.session.state.selected_keys {
+fn keys_pick(app: &dyn TimelineHost) -> &'static str {
+    let Some(comp) = app.session().active_comp() else { return "p" };
+    for k in &app.session().state.selected_keys {
         let Some(l) = comp.layer(k.layer) else { continue };
         let Some(path) = effectcraft_engine::commands::match_path_of(&l.props, k.prop) else { continue };
         let leaf = path.rsplit('/').next().unwrap_or("");
@@ -144,33 +144,33 @@ fn keys_pick(app: &EffectcraftApp) -> &'static str {
 }
 
 /// The Fast In pick shown on the split button.
-pub fn fast_in_pick(app: &EffectcraftApp) -> String {
-    app.ui.timeline.quick_row.fast_in_pick.clone().unwrap_or_else(|| keys_pick(app).to_string())
+pub fn fast_in_pick(app: &dyn TimelineHost) -> String {
+    app.ui().timeline.quick_row.fast_in_pick.clone().unwrap_or_else(|| keys_pick(app).to_string())
 }
 
 fn prop_name(pick: &str) -> &'static str {
     FAST_IN_PROPS.iter().find(|(l, _)| *l == pick).map_or("Position", |(_, n)| n)
 }
 
-fn toast(app: &mut EffectcraftApp, ctx: &egui::Context, msg: String) {
-    app.toast = Some((msg, ctx.input(|i| i.time)));
+fn toast(app: &mut dyn TimelineHost, ctx: &egui::Context, msg: String) {
+    app.toast(msg, ctx.input(|i| i.time));
 }
 
 /// Fast In on `pick` for the selected layers.
-pub fn run_fast_in(app: &mut EffectcraftApp, ctx: &egui::Context, pick: &str) {
-    if app.session.state.selected_layers.is_empty() {
-        app.ui.status = format!("Picked {}. Select a layer, then click Fast In ↑", prop_name(pick));
+pub fn run_fast_in(app: &mut dyn TimelineHost, ctx: &egui::Context, pick: &str) {
+    if app.session().state.selected_layers.is_empty() {
+        app.ui_mut().status = format!("Picked {}. Select a layer, then click Fast In ↑", prop_name(pick));
         return;
     }
     let property = prop_name(pick).to_ascii_lowercase();
-    match crate::menus::invoke(app, ctx, "layer.fastIn", json!({"property": property})) {
+    match app.invoke(ctx, "layer.fastIn", json!({"property": property})) {
         Ok(_) => toast(app, ctx, format!("Fast In on {}", prop_name(pick))),
-        Err(e) => app.ui.status = e,
+        Err(e) => app.ui_mut().status = e,
     }
 }
 
 /// Runs a pin's command (`at`: the button, where a wheel opens).
-pub fn run_pin(app: &mut EffectcraftApp, ctx: &egui::Context, pin: &QuickPin, at: Pos2) {
+pub fn run_pin(app: &mut dyn TimelineHost, ctx: &egui::Context, pin: &QuickPin, at: Pos2) {
     match pin.command.as_str() {
         FAST_IN => {
             let pick = fast_in_pick(app);
@@ -178,8 +178,8 @@ pub fn run_pin(app: &mut EffectcraftApp, ctx: &egui::Context, pin: &QuickPin, at
         }
         GRAPH_WHEEL => crate::panels::timeline::wheels::open_graph(app, ctx, at + vec2(0.0, 140.0), None),
         CARD_WHEEL => {
-            if app.session.state.selected_layers.is_empty() {
-                app.ui.status = "Select a card or a picture first: click its name.".into();
+            if app.session().state.selected_layers.is_empty() {
+                app.ui_mut().status = "Select a card or a picture first: click its name.".into();
             } else {
                 crate::panels::cards::open_card_wheel(ctx, at + vec2(0.0, 140.0));
             }
@@ -191,8 +191,8 @@ pub fn run_pin(app: &mut EffectcraftApp, ctx: &egui::Context, pin: &QuickPin, at
             }
         }
         id => {
-            if app.session.state.selected_layers.is_empty() {
-                app.ui.status = "Select a layer first: click a layer name.".into();
+            if app.session().state.selected_layers.is_empty() {
+                app.ui_mut().status = "Select a layer first: click a layer name.".into();
                 return;
             }
             let mut params = if pin.params.is_object() { pin.params.clone() } else { json!({}) };
@@ -202,11 +202,11 @@ pub fn run_pin(app: &mut EffectcraftApp, ctx: &egui::Context, pin: &QuickPin, at
                 add_text_options(app, &mut params);
                 super::text_apply::run(app, ctx, params)
             } else {
-                crate::menus::invoke(app, ctx, id, params)
+                app.invoke(ctx, id, params)
             };
             match r {
                 Ok(_) => toast(app, ctx, format!("{} applied", pin.label)),
-                Err(e) => app.ui.status = e,
+                Err(e) => app.ui_mut().status = e,
             }
         }
     }
@@ -215,11 +215,11 @@ pub fn run_pin(app: &mut EffectcraftApp, ctx: &egui::Context, pin: &QuickPin, at
 /// AX9: the Text add-on chips' options on a `text.apply` call (lane D's command). The selected
 /// layers are passed as `layers`: with only `word`, text.apply would make a new layer instead of
 /// animating the selection.
-fn add_text_options(app: &EffectcraftApp, params: &mut Value) {
+fn add_text_options(app: &dyn TimelineHost, params: &mut Value) {
     if params.get("layers").is_none() {
-        params["layers"] = json!(app.session.state.selected_layers.iter().map(|l| l.0).collect::<Vec<_>>());
+        params["layers"] = json!(app.session().state.selected_layers.iter().map(|l| l.0).collect::<Vec<_>>());
     }
-    let q = &app.ui.timeline.quick_row;
+    let q = &app.ui().timeline.quick_row;
     params["sync"] = json!(q.text_sync);
     params["glow"] = json!(q.text_glow);
     params["distance"] = json!(q.text_distance);
@@ -233,10 +233,10 @@ fn add_text_options(app: &EffectcraftApp, params: &mut Value) {
 /// The word of the comp's speech map nearest the playhead (stressed words first), among the words
 /// that can be heard: lane B (SX1) keeps the words in `comp.speech` (comp time, moved with the
 /// voice layer) and hides the ones trimmed off the voice layer (`SpeechMap::audible`).
-pub fn word_at_playhead(app: &EffectcraftApp) -> Option<String> {
-    let comp = app.session.active_comp()?;
+pub fn word_at_playhead(app: &dyn TimelineHost) -> Option<String> {
+    let comp = app.session().active_comp()?;
     let map = comp.speech.as_ref()?;
-    let now = app.session.time().seconds();
+    let now = app.session().time().seconds();
     let dist = |w: &effectcraft_engine::project::speech::SpeechWord| {
         let (a, b) = (w.start.seconds(), w.end.seconds());
         if now < a {
@@ -260,10 +260,10 @@ pub fn word_at_playhead(app: &EffectcraftApp) -> Option<String> {
 
 /// The text preset cards (name, label with their controls), read again when the project changes
 /// and every 10 s (a card saved in the Motion Library shows up).
-pub(crate) fn text_presets(app: &mut EffectcraftApp, ctx: &egui::Context) -> Vec<(String, String)> {
+pub(crate) fn text_presets(app: &mut dyn TimelineHost, ctx: &egui::Context) -> Vec<(String, String)> {
     type Cached = (u64, f64, Vec<(String, String)>);
     let id = egui::Id::new("tl-quick-text-presets");
-    let rev = app.session.revision;
+    let rev = app.session().revision;
     let now = ctx.input(|i| i.time);
     if let Some((r, t, list)) = ctx.data(|d| d.get_temp::<Cached>(id))
         && !presets_stale(r, t, rev, now)
@@ -276,9 +276,9 @@ pub(crate) fn text_presets(app: &mut EffectcraftApp, ctx: &egui::Context) -> Vec
 }
 
 /// A pin for the card selected in the Motion Library.
-fn pin_selected_card(app: &mut EffectcraftApp, ctx: &egui::Context) {
-    let Some(id) = app.ui.motion_library.selected.clone() else {
-        app.ui.status = "Select a card in the Motion Library, then click + pin.".into();
+fn pin_selected_card(app: &mut dyn TimelineHost, ctx: &egui::Context) {
+    let Some(id) = app.ui().motion_library.selected.clone() else {
+        app.ui_mut().status = "Select a card in the Motion Library, then click + pin.".into();
         return;
     };
     let name = crate::panels::motion_library::card_name(app, ctx, &id).unwrap_or_else(|| id.clone());
@@ -296,24 +296,24 @@ fn pin_selected_card(app: &mut EffectcraftApp, ctx: &egui::Context) {
     };
     let label: String = name.chars().take(24).collect();
     let pin = QuickPin::new(group, &label, &format!("Motion Library ▸ {name}"), "motionLibrary.apply", json!({"id": id}));
-    let pins = app.ui.timeline.quick_row.pins.get_or_insert_with(default_pins);
+    let pins = app.ui_mut().timeline.quick_row.pins.get_or_insert_with(default_pins);
     if pins.iter().any(|p| p.command == pin.command && p.params == pin.params) {
-        app.ui.status = format!("“{name}” is already pinned.");
+        app.ui_mut().status = format!("“{name}” is already pinned.");
         return;
     }
     pins.push(pin);
     toast(app, ctx, format!("Pinned “{name}” to the quick row"));
 }
 
-fn button(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, text: &str, auto: &str, tip: &str, on: bool) -> (Rect, egui::Response) {
-    let t = app.tokens;
+fn button(app: &mut dyn TimelineHost, ui: &mut egui::Ui, at: Pos2, text: &str, auto: &str, tip: &str, on: bool) -> (Rect, egui::Response) {
+    let t = app.tokens();
     let g = ui.painter().layout_no_wrap(text.to_string(), Tokens::ui(11.5), t.text);
     let r = Rect::from_min_size(at, vec2(g.size().x + 14.0, ROW_H - 8.0));
     let resp = ui.interact(r, egui::Id::new(("tl-quick", auto)), Sense::click()).on_hover_text(tip);
     let fill = if on || resp.hovered() { t.field_border } else { t.field_bg };
     ui.painter().rect_filled(r, 4.0, fill);
     ui.painter().galley(pos2(r.min.x + 7.0, r.center().y - g.size().y / 2.0), g, t.text);
-    app.auto.add(&format!("timeline.quick.{auto}"), r, text);
+    app.auto_mut().add(&format!("timeline.quick.{auto}"), r, text);
     (r, resp)
 }
 
@@ -343,12 +343,12 @@ fn divider(ui: &egui::Ui, x: f32, r: Rect, c: Color32) {
 /// Draws the row at the top of `rect` and returns the rest of `rect` for the Timeline.
 // The Timeline lays out everything from the returned rect; the empty-comp drop runs before the row
 // (no comp, no row), and the panel clip is restored before returning.
-pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
-    if !app.ui.timeline.quick_row.shown || rect.height() < ROW_H * 3.0 {
+pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) -> Rect {
+    if !app.ui().timeline.quick_row.shown || rect.height() < ROW_H * 3.0 {
         return rect;
     }
     let ctx = ui.ctx().clone();
-    let t = app.tokens;
+    let t = app.tokens();
     let row = Rect::from_min_size(rect.min, vec2(rect.width(), ROW_H));
     let rest = Rect::from_min_max(pos2(rect.min.x, row.max.y), rect.max);
     ui.painter().rect_filled(row, 0.0, t.panel_bg);
@@ -367,7 +367,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
     let y = row.min.y + 4.0;
     ui.painter().text(pos2(x, row.center().y), Align2::LEFT_CENTER, "Quick", Tokens::semibold(11.0), t.text_faint);
     x += 44.0;
-    let pins = app.ui.timeline.quick_row.pins.clone().unwrap_or_else(default_pins);
+    let pins = app.ui().timeline.quick_row.pins.clone().unwrap_or_else(default_pins);
     let mut clicked: Option<(QuickPin, Pos2)> = None;
     let mut unpin: Option<usize> = None;
     for (gi, group) in GROUPS.iter().enumerate() {
@@ -432,7 +432,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
     }
     ui.set_clip_rect(clip);
     if let Some(i) = unpin {
-        let list = app.ui.timeline.quick_row.pins.get_or_insert_with(default_pins);
+        let list = app.ui_mut().timeline.quick_row.pins.get_or_insert_with(default_pins);
         if i < list.len() {
             list.remove(i);
         }
@@ -444,8 +444,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> Rect {
 }
 
 /// One add-on chip: a small toggle; returns (its rect, clicked).
-fn chip(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, text: &str, auto: &str, tip: &str, on: bool) -> (Rect, bool) {
-    let t = app.tokens;
+fn chip(app: &mut dyn TimelineHost, ui: &mut egui::Ui, at: Pos2, text: &str, auto: &str, tip: &str, on: bool) -> (Rect, bool) {
+    let t = app.tokens();
     let g = ui.painter().layout_no_wrap(text.to_string(), Tokens::ui(10.5), if on { Color32::WHITE } else { t.text_dim });
     let r = Rect::from_min_size(pos2(at.x, at.y + 2.0), vec2(g.size().x + 10.0, ROW_H - 12.0));
     let resp = ui.interact(r, egui::Id::new(("tl-quick-chip", auto)), Sense::click()).on_hover_text(tip);
@@ -455,16 +455,16 @@ fn chip(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, text: &str, auto:
         ui.painter().rect_stroke(r, 8.0, Stroke::new(1.0, if resp.hovered() { t.text_dim } else { t.field_border }), StrokeKind::Inside);
     }
     ui.painter().galley(pos2(r.min.x + 5.0, r.center().y - g.size().y / 2.0), g, if on { Color32::WHITE } else { t.text_dim });
-    app.auto.add(&format!("timeline.quick.text.{auto}"), r, &format!("{text}{}", if on { " (on)" } else { "" }));
+    app.auto_mut().add(&format!("timeline.quick.text.{auto}"), r, &format!("{text}{}", if on { " (on)" } else { "" }));
     (r, resp.clicked())
 }
 
 /// AX9: the Text group's add-on chips (`sync`, `+glow`, `near/mid/far`, `on "<word>"`): toggles
 /// for how the Text buttons apply (`text.apply {sync, glow, distance, word}`; `distance` sets the
 /// preset's Travel controls to 40 / 90 / 150 px, CX8b). Returns the x after them.
-fn text_chips(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, limit: f32) -> f32 {
+fn text_chips(app: &mut dyn TimelineHost, ui: &mut egui::Ui, at: Pos2, limit: f32) -> f32 {
     let mut x = at.x;
-    let q = app.ui.timeline.quick_row.clone();
+    let q = app.ui().timeline.quick_row.clone();
     let word = word_at_playhead(app);
     let word_label = format!("on “{}”", word.as_deref().unwrap_or("word"));
     let chips: [(&str, String, &str, bool); 4] = [
@@ -484,7 +484,7 @@ fn text_chips(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, limit: f32)
         }
         let (r, clicked) = chip(app, ui, pos2(x, at.y), &text, id, tip, on);
         if clicked {
-            let st = &mut app.ui.timeline.quick_row;
+            let st = &mut app.ui_mut().timeline.quick_row;
             match id {
                 "sync" => st.text_sync = !st.text_sync,
                 "glow" => st.text_glow = !st.text_glow,
@@ -505,10 +505,10 @@ fn text_chips(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, limit: f32)
 }
 
 /// The Fast In split button; returns its right edge.
-fn fast_in_split(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, at: Pos2, pin: &QuickPin, tip: &str) -> f32 {
-    let t = app.tokens;
+fn fast_in_split(app: &mut dyn TimelineHost, ui: &mut egui::Ui, ctx: &egui::Context, at: Pos2, pin: &QuickPin, tip: &str) -> f32 {
+    let t = app.tokens();
     let pick = fast_in_pick(app);
-    let auto_pick = app.ui.timeline.quick_row.fast_in_pick.is_none();
+    let auto_pick = app.ui().timeline.quick_row.fast_in_pick.is_none();
     let (main_r, main) = button(app, ui, at, &pin.label, "fastIn", tip, false);
     let letter_tip = format!("Fast In goes on {}{} · hover to change", prop_name(&pick), if auto_pick { " (auto: your selected keys' property)" } else { "" });
     let (pick_r, pick_resp) = button(app, ui, pos2(main_r.max.x + 1.0, at.y), &pick.to_ascii_uppercase(), "fastIn.pick", &letter_tip, !auto_pick);
@@ -541,7 +541,7 @@ fn fast_in_split(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
             let on = pick == letter;
             ui.painter().rect_filled(r, 3.0, if on || resp.hovered() { t.accent } else { t.field_bg });
             ui.painter().galley(pos2(r.min.x + 6.0, r.center().y - g.size().y / 2.0), g, t.text);
-            app.auto.add(&format!("timeline.quick.fastIn.{letter}"), r, &text);
+            app.auto_mut().add(&format!("timeline.quick.fastIn.{letter}"), r, &text);
             if resp.clicked() {
                 chosen = Some(letter.to_string());
             }
@@ -549,7 +549,7 @@ fn fast_in_split(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
         }
     });
     if let Some(letter) = chosen {
-        app.ui.timeline.quick_row.fast_in_pick = Some(letter.clone());
+        app.ui_mut().timeline.quick_row.fast_in_pick = Some(letter.clone());
         run_fast_in(app, ctx, &letter);
     }
     split.max.x
@@ -557,40 +557,40 @@ fn fast_in_split(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
 
 /// AX7: the Find word box. Typing jumps to the word; Enter goes to its next occurrence.
 /// Returns the width its note takes left of the box (0 without one).
-fn find_box(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, r: Rect) -> f32 {
-    let t = app.tokens;
-    let mut text = app.ui.timeline.quick_row.find.clone();
+fn find_box(app: &mut dyn TimelineHost, ui: &mut egui::Ui, ctx: &egui::Context, r: Rect) -> f32 {
+    let t = app.tokens();
+    let mut text = app.ui().timeline.quick_row.find.clone();
     let (resp, clear) = crate::widgets::search_field_with_clear(ui, r, &mut text, "Find word", &t, false);
-    app.auto.add_response("timeline.quick.find", &resp, "Find word");
+    app.auto_mut().add_response("timeline.quick.find", &resp, "Find word");
     if let Some(c) = clear {
-        app.auto.add("timeline.quick.find.clear", c.rect, "Clear");
+        app.auto_mut().add("timeline.quick.find.clear", c.rect, "Clear");
         if c.clicked() {
             text.clear();
         }
     }
     let enter = resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
-    let changed = text != app.ui.timeline.quick_row.find;
-    app.ui.timeline.quick_row.find = text.clone();
+    let changed = text != app.ui().timeline.quick_row.find;
+    app.ui_mut().timeline.quick_row.find = text.clone();
     let q = text.trim().to_string();
     if q.is_empty() {
-        app.ui.timeline.quick_row.found = None;
-        app.ui.timeline.quick_row.find_error = None;
+        app.ui_mut().timeline.quick_row.found = None;
+        app.ui_mut().timeline.quick_row.find_error = None;
     } else if changed || enter {
         // Enter: the next time it is said (wrapping); typing: the first.
-        let occurrence = match (&app.ui.timeline.quick_row.found, enter) {
+        let occurrence = match (&app.ui().timeline.quick_row.found, enter) {
             (Some((w, n, of, _)), true) if *w == q => n % (*of).max(1) + 1,
             _ => 1,
         };
-        match crate::menus::invoke(app, ctx, "speech.find", json!({"word": q, "occurrence": occurrence})) {
+        match app.invoke(ctx, "speech.find", json!({"word": q, "occurrence": occurrence})) {
             Ok(v) => {
                 let of = v.get("of").and_then(Value::as_u64).unwrap_or(1);
                 let frame = v.get("frame").and_then(Value::as_i64).unwrap_or(0);
-                app.ui.timeline.quick_row.found = Some((q.clone(), occurrence, of, frame));
-                app.ui.timeline.quick_row.find_error = None;
+                app.ui_mut().timeline.quick_row.found = Some((q.clone(), occurrence, of, frame));
+                app.ui_mut().timeline.quick_row.find_error = None;
             }
             Err(e) => {
-                app.ui.timeline.quick_row.found = None;
-                app.ui.timeline.quick_row.find_error = Some(e);
+                app.ui_mut().timeline.quick_row.found = None;
+                app.ui_mut().timeline.quick_row.find_error = Some(e);
             }
         }
         if enter {
@@ -598,7 +598,7 @@ fn find_box(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, r:
         }
     }
     // Where it was found (or why not), left of the box.
-    let note = match (&app.ui.timeline.quick_row.found, &app.ui.timeline.quick_row.find_error) {
+    let note = match (&app.ui().timeline.quick_row.found, &app.ui().timeline.quick_row.find_error) {
         (Some((w, n, of, f)), _) => Some((format!("“{w}” f{f} · {n}/{of}"), t.cache_green)),
         (None, Some(_)) => Some(("not said".to_string(), t.text_faint)),
         _ => None,

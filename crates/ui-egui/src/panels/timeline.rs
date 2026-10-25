@@ -23,7 +23,7 @@ mod snap;
 mod speed_rows;
 pub(crate) mod wheels;
 
-pub use host::{CacheBar, TimelineHost, TimelineParts};
+pub use host::{CacheBar, DialogRequest, PointerColor, TimelineHost, TimelineParts};
 use ids::tl_id;
 
 use crate::i18n::tr;
@@ -1371,10 +1371,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     };
     let Some(comp) = app.session().project.comp_arc(cid) else { return };
     // Batch 1 (AX5/AX7): the quick-button row and Find word box take a strip at the top.
-    let rect = match app.app() {
-        Some(a) => super::quick_row::show(a, ui, rect),
-        None => rect,
-    };
+    let rect = super::quick_row::show(app, ui, rect);
     let freeze_badges = app.app_ref().map(|a| super::smart_freeze::timeline_badges(a, cid)).unwrap_or_default();
     let p = ui.painter().clone();
     let time = app.session().time();
@@ -2466,9 +2463,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
                     }
                     // Markers on the layer (drag, Alt-drag duration, Cmd-click delete, dialog).
                     let gclip = rows_rect.intersect(Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), rows_rect.max));
-                    if let Some(a) = app.app() {
-                        super::markers_ui::layer_markers(a, ui, gclip, &comp, layer, tm, r);
-                    }
+                    super::markers_ui::layer_markers(app, ui, gclip, &comp, layer, tm, r);
                 }
             }
             RowKind::Group { uid, name, open, has_children, fx, eye } => {
@@ -2628,7 +2623,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
                 let wr = Rect::from_min_max(pos2(graph_x0, r.min.y), r.max);
                 gp.rect_filled(wr, 0.0, t.tl_bg);
                 app.auto_mut().add(&format!("timeline.layer.{}.waveform", layer.id.0), wr, "Waveform");
-                match app.app().and_then(|a| super::waveform::summary(a, &ctx, ItemId(*item))) {
+                match app.waveform(&ctx, ItemId(*item)) {
                     Some(s) => super::waveform::draw(&gp, wr.shrink2(vec2(0.0, 2.0)), &tm, layer, &s, Color32::from_rgb(0x5f, 0xc8, 0x8a)),
                     None => {
                         gp.text(
@@ -3549,10 +3544,8 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     // Composition markers in the ruler; protected regions shade the layer rows.
     let mstrip = Rect::from_min_max(pos2(graph_x0, ruler.max.y - 12.0), pos2(bin.min.x, ruler.max.y));
     let mrows = if source_graph_on { Rect::NOTHING } else { rows_rect.intersect(Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), rows_rect.max)) };
-    if let Some(a) = app.app() {
-        super::markers_ui::comp_markers(a, ui, &comp, tm, mstrip, mrows);
-        super::markers_ui::marker_bin(a, ui, &comp, tm, bin, mstrip);
-    }
+    super::markers_ui::comp_markers(app, ui, &comp, tm, mstrip, mrows);
+    super::markers_ui::marker_bin(app, ui, &comp, tm, bin, mstrip);
 
     // Spacebar held: the Hand tool. Dragging the ruler or the time graph scrolls it in time when
     // zoomed in (registered last, so it takes the drag from the bars, keys and markers there).
@@ -3724,11 +3717,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
             UiAct::SetTime(tt) => app.session_mut().set_time(tt),
             UiAct::EndMerge => app.session_mut().history.merge_key = None,
             UiAct::ChangeRenderer => {
-                if let Some(a) = app.app()
-                    && super::dialogs::open_comp_settings(a).is_ok()
-                {
-                    a.dialog_state.comp.tab = super::comp_settings::Tab::Renderer;
-                }
+                let _ = app.request_dialog(DialogRequest::CompSettings { tab: Some(super::comp_settings::Tab::Renderer) });
             }
         }
     }

@@ -136,6 +136,48 @@ pub trait TimelineHost {
     /// One main-menu command as a context-menu entry (its label, shortcut and enabled state);
     /// sets `clicked` when chosen.
     fn menu_entry(&self, _ui: &mut egui::Ui, _command: &str, _clicked: &mut Option<(String, Value)>) {}
+
+    // ---- EMBED4 (additive; all have defaults).
+
+    /// A dialog the panel asks for (Marker Settings on a double-click, Composition Settings,
+    /// the Gradient editor). EffectCraft opens its own; the default says it isn't available, which
+    /// the panel shows on the status line.
+    fn request_dialog(&mut self, _request: DialogRequest) -> Result<Value, String> {
+        Err(crate::i18n::tr("This dialog is not available here").into())
+    }
+    /// The audio peak summary of footage `item` for the Timeline's waveform rows (`None` while it
+    /// is computed). The default computes and keeps it per egui context, so any host has waveforms.
+    fn waveform(&self, ctx: &egui::Context, item: ItemId) -> Option<std::sync::Arc<crate::panels::waveform::Summary>> {
+        let cache = ctx.data_mut(|d| d.get_temp_mut_or_default::<crate::panels::waveform::Cache>(super::ids::tl_id("hosted-waveforms")).clone());
+        crate::panels::waveform::summary_in(&cache, self.session(), ctx, item)
+    }
+    /// The colour under the pointer in the host's own view of the comp, for an armed eyedropper
+    /// ([`crate::panels::effect_controls::hosted_pick`]); `None` when the pointer isn't over it.
+    fn pointer_color(&mut self, _ctx: &egui::Context) -> Option<PointerColor> {
+        None
+    }
+}
+
+/// A dialog a hosted panel asks its host for ([`TimelineHost::request_dialog`]). New kinds may be
+/// added; a host answers the ones it knows and errors on the rest.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum DialogRequest {
+    /// Composition/Layer Marker settings for a marker.
+    Marker(crate::panels::markers_ui::MarkerRef),
+    /// Composition Settings of the active comp, on `tab` (`None`: the one it was on).
+    CompSettings { tab: Option<crate::panels::comp_settings::Tab> },
+    /// The Gradient editor for `prop.editGradient` params (`{layer, prop, comp?…}`).
+    Gradient(Value),
+}
+
+/// What a host's comp view shows under the pointer ([`TimelineHost::pointer_color`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerColor {
+    /// The displayed colour, 0–1 per channel, as EffectCraft's viewer samples its frame.
+    pub rgb: [f32; 3],
+    /// The primary button was clicked there this frame (the sample is taken).
+    pub clicked: bool,
 }
 
 impl TimelineHost for EffectcraftApp {
@@ -240,6 +282,22 @@ impl TimelineHost for EffectcraftApp {
     fn menu_entry(&self, ui: &mut egui::Ui, command: &str, clicked: &mut Option<(String, Value)>) {
         crate::menus::entry_for(self, ui, command, clicked);
     }
+    fn request_dialog(&mut self, request: DialogRequest) -> Result<Value, String> {
+        match request {
+            DialogRequest::Marker(m) => crate::panels::markers_ui::open_dialog(self, m).map(|()| Value::Null),
+            DialogRequest::CompSettings { tab } => {
+                crate::panels::dialogs::open_comp_settings(self)?;
+                if let Some(tab) = tab {
+                    self.dialog_state.comp.tab = tab;
+                }
+                Ok(Value::Null)
+            }
+            DialogRequest::Gradient(params) => crate::panels::gradient_editor::open(self, &params),
+        }
+    }
+    fn waveform(&self, ctx: &egui::Context, item: ItemId) -> Option<std::sync::Arc<crate::panels::waveform::Summary>> {
+        crate::panels::waveform::summary(self, ctx, item)
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +313,7 @@ mod tests {
         auto: Registry,
         tokens: Tokens,
         commands: Vec<String>,
+        pointer: Option<PointerColor>,
     }
 
     impl TimelineHost for FakeHost {
@@ -286,6 +345,9 @@ mod tests {
             self.commands.push(id.to_string());
             self.session.execute(id, params).map_err(|e| e.to_string())
         }
+        fn pointer_color(&mut self, _ctx: &egui::Context) -> Option<PointerColor> {
+            self.pointer
+        }
     }
 
     fn host() -> FakeHost {
@@ -294,7 +356,7 @@ mod tests {
         session.execute("layer.newSolid", json!({"name": "Plate", "color": "#406080", "width": 320, "height": 180})).unwrap();
         session.execute("layer.newSolid", json!({"name": "Box", "color": "#e04020", "width": 40, "height": 40})).unwrap();
         let ui = UiState { focused: crate::dock::PanelKind::Timeline, ..UiState::default() };
-        FakeHost { session, ui, auto: Registry::default(), tokens: Tokens::for_kind(crate::theme::ThemeKind::Dark), commands: vec![] }
+        FakeHost { session, ui, auto: Registry::default(), tokens: Tokens::for_kind(crate::theme::ThemeKind::Dark), commands: vec![], pointer: None }
     }
 
     fn frame(ctx: &egui::Context, host: &mut FakeHost, input: egui::RawInput) {
@@ -375,5 +437,29 @@ mod tests {
         let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
         assert_eq!(ran, ["keys.easyEase"]);
         assert_eq!(host.commands, ["keys.easyEase"]);
+    }
+
+    /// EMBED4: a hosted eyedropper takes the colour the host reports under the pointer, and the
+    /// panels' dialogs are requests a host may decline.
+    #[test]
+    fn hosted_eyedropper_and_dialog_requests() {
+        let mut host = host();
+        let comp = host.session.active_comp().unwrap().clone();
+        let bx = comp.layers.iter().find(|l| l.name == "Box").unwrap().id.0;
+        host.session.execute("layer.select", json!({"layers": [bx]})).unwrap();
+        host.session.execute("effect.apply", json!({"effect": "ec.generate.fill"})).unwrap();
+        let prop = host.session.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(bx)).unwrap().props.prop("effects/#1/color").unwrap().uid;
+        host.ui.fx_pick = Some(crate::state::FxPick { kind: "color".into(), layer: bx, prop, name: "Color".into() });
+        let ctx = egui::Context::default();
+        let mut armed = vec![];
+        for pointer in [None, Some(PointerColor { rgb: [1.0, 0.0, 0.0], clicked: false }), Some(PointerColor { rgb: [1.0, 0.0, 0.0], clicked: true })] {
+            host.pointer = pointer;
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| armed.push(crate::panels::effect_controls::hosted_pick(&mut host, ui.ctx())));
+        }
+        assert_eq!(armed, [true, true, false], "armed until the click takes the sample");
+        assert_eq!(host.commands, ["prop.set"]);
+        assert!(host.ui.fx_pick.is_none());
+        let marker = crate::panels::markers_ui::MarkerRef { layer: None, index: 0 };
+        assert!(host.request_dialog(DialogRequest::Marker(marker)).is_err(), "a host without dialogs declines");
     }
 }

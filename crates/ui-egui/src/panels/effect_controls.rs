@@ -1504,6 +1504,56 @@ fn visible_points<'a>(g: &'a PropGroup, scope: &FxScope<'_>, layer: &Layer, ectx
 /// - otherwise, the point parameters of the selected effects are drawn as draggable ⊕ controls.
 ///
 /// `l2c` is the viewer's layer→comp matrix (it knows the 3D view).
+/// EMBED4: an armed colour eyedropper (Effect Controls or the Character panel's text colour) in an
+/// app hosting the panels without EffectCraft's viewer. The host calls this once per frame while
+/// it shows the comp; [`TimelineHost::pointer_color`] gives the colour under the pointer and the
+/// click that takes it, which sets the property (`prop.set`) or the text colour (`layer.setText`)
+/// through [`TimelineHost::invoke`]. Escape disarms. Point picks and keyers' input sampling need
+/// EffectCraft's viewer: a keyer takes the displayed colour, a point pick stays armed. True while
+/// a colour pick is armed (the host shows a crosshair).
+pub fn hosted_pick(app: &mut dyn TimelineHost, ctx: &egui::Context) -> bool {
+    let _ids = crate::panels::timeline::ids::IdScope::enter(app.id_scope());
+    let fx = app.ui().fx_pick.clone().filter(|p| p.kind == "color");
+    let text = app.ui().text_color_pick.clone();
+    if fx.is_none() && text.is_none() {
+        return false;
+    }
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let ui = app.ui_mut();
+        if fx.is_some() {
+            ui.fx_pick = None;
+        }
+        ui.text_color_pick = None;
+        ui.status.clear();
+        return false;
+    }
+    let Some(sample) = app.pointer_color(ctx) else { return true };
+    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+    if !sample.clicked {
+        return true;
+    }
+    let [r, g, b] = sample.rgb;
+    let (id, params) = if let Some(pick) = fx {
+        app.ui_mut().fx_pick = None;
+        ("prop.set", json!({"layer": pick.layer, "prop": pick.prop, "value": [r, g, b, 1.0]}))
+    } else if let Some(pick) = text {
+        app.ui_mut().text_color_pick = None;
+        let mut params = json!({"layer": pick.layer});
+        params[&pick.field] = json!([r, g, b]);
+        if let Some(range) = pick.range {
+            params["range"] = json!(range);
+        }
+        ("layer.setText", params)
+    } else {
+        return false;
+    };
+    app.ui_mut().status.clear();
+    if let Err(e) = app.invoke(ctx, id, params) {
+        app.ui_mut().status = e;
+    }
+    false
+}
+
 pub fn viewer_hook(
     app: &mut EffectcraftApp,
     ui: &mut egui::Ui,

@@ -9,6 +9,7 @@
 use egui::{Key, Pos2};
 use serde_json::{Value, json};
 
+use super::TimelineHost;
 use crate::EffectcraftApp;
 use crate::wheel::{self, WheelItem};
 
@@ -50,9 +51,9 @@ pub(crate) fn layer_items() -> Vec<WheelItem> {
 pub(crate) const CAPTION_GLOW: &str = "Caption glow + double shadow";
 
 /// Opens the Layer wheel (a held A, or a button).
-pub(crate) fn open_layer(app: &mut EffectcraftApp, ctx: &egui::Context, center: Pos2, hold: Option<Key>) {
-    if app.session.state.selected_layers.is_empty() {
-        app.ui.status = "Select a layer first: click a layer name.".into();
+pub(crate) fn open_layer(app: &mut dyn TimelineHost, ctx: &egui::Context, center: Pos2, hold: Option<Key>) {
+    if app.session().state.selected_layers.is_empty() {
+        app.ui_mut().status = "Select a layer first: click a layer name.".into();
         return;
     }
     wheel::open(ctx, LAYER, center, "A", layer_items(), hold);
@@ -64,9 +65,9 @@ pub(crate) fn pointer_or_middle(ctx: &egui::Context) -> Pos2 {
 }
 
 /// Opens the Graph wheel (the quick row's button, or a held G).
-pub(crate) fn open_graph(app: &mut EffectcraftApp, ctx: &egui::Context, center: Pos2, hold: Option<Key>) {
-    if app.session.state.selected_keys.is_empty() {
-        app.ui.status = "Select keys first: click a keyframe of a move.".into();
+pub(crate) fn open_graph(app: &mut dyn TimelineHost, ctx: &egui::Context, center: Pos2, hold: Option<Key>) {
+    if app.session().state.selected_keys.is_empty() {
+        app.ui_mut().status = "Select keys first: click a keyframe of a move.".into();
         return;
     }
     wheel::open(ctx, GRAPH, center, "G", graph_items(), hold);
@@ -84,10 +85,10 @@ fn pending_id() -> egui::Id {
 }
 
 /// The wheel a held `key` opens, when it can open now.
-fn wheel_for(app: &EffectcraftApp, key: Key) -> Option<&'static str> {
+fn wheel_for(app: &dyn TimelineHost, key: Key) -> Option<&'static str> {
     match key {
-        Key::G if !app.session.state.selected_keys.is_empty() => Some(GRAPH),
-        Key::A if !app.session.state.selected_layers.is_empty() => Some(LAYER),
+        Key::G if !app.session().state.selected_keys.is_empty() => Some(GRAPH),
+        Key::A if !app.session().state.selected_layers.is_empty() => Some(LAYER),
         _ => None,
     }
 }
@@ -137,7 +138,7 @@ pub fn hold_keys(app: &mut EffectcraftApp, ctx: &egui::Context) {
         return;
     }
     // Typing, a dialog or an open menu keep their keys.
-    if ctx.egui_wants_keyboard_input() || app.dialog.is_some() || crate::widgets::any_menu_open(ctx) {
+    if ctx.egui_wants_keyboard_input() || app.dialog().is_some() || crate::widgets::any_menu_open(ctx) {
         return;
     }
     for key in [Key::G, Key::A] {
@@ -151,18 +152,18 @@ pub fn hold_keys(app: &mut EffectcraftApp, ctx: &egui::Context) {
 }
 
 /// Runs a command through the normal dispatcher; an error goes to the status line.
-fn run(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Option<Value> {
-    match crate::menus::invoke(app, ctx, id, params) {
+fn run(app: &mut dyn TimelineHost, ctx: &egui::Context, id: &str, params: Value) -> Option<Value> {
+    match app.invoke(ctx, id, params) {
         Ok(v) => Some(v),
         Err(e) => {
-            app.ui.status = e;
+            app.ui_mut().status = e;
             None
         }
     }
 }
 
-fn toast(app: &mut EffectcraftApp, ctx: &egui::Context, msg: String) {
-    app.toast = Some((msg, ctx.input(|i| i.time)));
+fn toast(app: &mut dyn TimelineHost, ctx: &egui::Context, msg: String) {
+    app.toast(msg, ctx.input(|i| i.time));
 }
 
 /// A graph reply's name, with "(linked)" for a Library graph.
@@ -173,7 +174,7 @@ fn graph_label(v: &Value) -> String {
 }
 
 /// Runs a Graph wheel slice.
-pub(crate) fn run_graph(app: &mut EffectcraftApp, ctx: &egui::Context, item: &str) {
+pub(crate) fn run_graph(app: &mut dyn TimelineHost, ctx: &egui::Context, item: &str) {
     match item {
         "copy" => {
             if let Some(v) = run(app, ctx, "graph.copy", json!({})) {
@@ -211,13 +212,13 @@ pub(crate) fn run_graph(app: &mut EffectcraftApp, ctx: &egui::Context, item: &st
 }
 
 /// Applies the Motion Library card found by `query` (its name) to the selection.
-pub(crate) fn apply_library_named(app: &mut EffectcraftApp, ctx: &egui::Context, query: &str) -> Option<Value> {
+pub(crate) fn apply_library_named(app: &mut dyn TimelineHost, ctx: &egui::Context, query: &str) -> Option<Value> {
     let found = run(app, ctx, "library.search", json!({"query": query, "source": "motion", "limit": 5}))?;
     let entries = found["entries"].as_array().cloned().unwrap_or_default();
     // The exact name first, else the best hit.
     let hit = entries.iter().find(|e| e["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(query))).or(entries.first());
     let Some(id) = hit.and_then(|e| e["id"].as_str()).map(str::to_string) else {
-        app.ui.status = format!("No Motion Library item “{query}” (is the library synced?)");
+        app.ui_mut().status = format!("No Motion Library item “{query}” (is the library synced?)");
         return None;
     };
     // TODO(batch1-verify): a text-style preset card applies to the selected layers through motionLibrary.apply.
@@ -225,8 +226,8 @@ pub(crate) fn apply_library_named(app: &mut EffectcraftApp, ctx: &egui::Context,
 }
 
 /// Runs a Layer wheel slice (also the quick row's buttons).
-pub(crate) fn run_layer(app: &mut EffectcraftApp, ctx: &egui::Context, item: &str) {
-    let n = app.session.state.selected_layers.len();
+pub(crate) fn run_layer(app: &mut dyn TimelineHost, ctx: &egui::Context, item: &str) {
+    let n = app.session().state.selected_layers.len();
     match item {
         "fade" => {
             if run(app, ctx, "layer.fadeExit", json!({})).is_some() {
@@ -246,7 +247,7 @@ pub(crate) fn run_layer(app: &mut EffectcraftApp, ctx: &egui::Context, item: &st
         }
         "cascade" => {
             if n < 2 {
-                app.ui.status = "Cascade needs two or more layers: Shift-click their names.".into();
+                app.ui_mut().status = "Cascade needs two or more layers: Shift-click their names.".into();
             } else if run(app, ctx, "layer.cascade", json!({"frames": 1})).is_some() {
                 toast(app, ctx, format!("Cascaded {n} layers, 1 f apart"));
             }
@@ -257,15 +258,15 @@ pub(crate) fn run_layer(app: &mut EffectcraftApp, ctx: &egui::Context, item: &st
             }
         }
         "save" => {
-            let first = app.session.state.selected_layers.first().copied();
+            let first = app.session().state.selected_layers.first().copied();
             let name = first
-                .and_then(|id| app.session.active_comp().and_then(|c| c.layer(id)).map(|l| format!("{} moves", l.name)))
+                .and_then(|id| app.session().active_comp().and_then(|c| c.layer(id)).map(|l| format!("{} moves", l.name)))
                 .unwrap_or_else(|| "My moves".into());
             if run(app, ctx, "motionLibrary.saveSelection", json!({"name": name, "category": "Elias", "kind": "layers"})).is_some() {
                 toast(app, ctx, format!("Saving “{name}” to Motion Library ▸ Elias"));
             }
         }
-        other => app.ui.status = format!("Unknown Layer wheel item `{other}`"),
+        other => app.ui_mut().status = format!("Unknown Layer wheel item `{other}`"),
     }
 }
 

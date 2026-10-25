@@ -365,12 +365,7 @@ pub(super) fn show(
         if id == "prop.editGradient" {
             params["comp"] = json!(n.context.comp.0);
             let scope = crate::state::InlineScope { root: n.root.0, path: n.path.clone(), time: Some(n.context.time) };
-            if let Err(error) = with_scope(app, &scope, |app| match app.app() {
-                Some(app) => super::super::gradient_editor::open(app, &params),
-                None => Ok(Default::default()),
-            })
-            .and_then(|result| result)
-            {
+            if let Err(error) = with_scope(app, &scope, |app| app.request_dialog(DialogRequest::Gradient(params.clone()))).and_then(|result| result) {
                 app.ui_mut().status = error;
             }
             continue;

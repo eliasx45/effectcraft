@@ -10,6 +10,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED1 | Timeline | Draws against `TimelineHost`; a fake host without the app draws it (test below) |
 | EMBED2 | Graph Editor (+ id scopes, host fonts) | Draws against `TimelineHost` too; per-instance ids; `theme::install_panel_fonts` |
 | EMBED3 | Effect Controls (+ shortcuts, widget ids) | Draws against `TimelineHost`; `keys::forward_shortcuts` / `menus::shortcut_command`; scroll-bar and Tab-order ids scoped |
+| EMBED4 | Remaining Timeline features | Markers, quick row, waveforms, dialogs (as requests) and the eyedropper through the host; 6 minor sites left |
 
 ## The host interface (EMBED1)
 
@@ -67,26 +68,26 @@ Motion Blur comp switch through to the session.
 | `timeline_layout_saved` | 3 | stays on the app (`load_layout` / `store_layout` run by the app's frame loop) |
 | `last_reveal` | tests only | unchanged |
 
-### Calls that still need the whole app (13 sites, 11 features after EMBED3) — the blockers left
+### Calls that still need the whole app (6 sites, 6 features after EMBED4) — the blockers left
 
 Through `app()/app_ref()`; a foreign host draws the Timeline without them.
 
 | Feature | Call | Plan |
 |---|---|---|
 | ~~Graph Editor in the Timeline's place~~ | `graph::show`, `graph_tools::alt_scale_begin/update`, inline source graph | **Done (EMBED2)**: `graph.rs`/`graph_tools.rs` take `&dyn TimelineHost` |
-| Quick-button row / Find word box | `quick_row::show` | host trait method or move behind `TimelineHost` (it only reads session/ui) |
+| ~~Quick-button row / Find word box~~ | `quick_row::show` | **Done (EMBED4)**: `quick_row.rs`, the Graph/Layer wheel actions (`timeline/wheels.rs`, except the app-level `hold_keys`/`take_picks`), `text_apply.rs` and `motion_library::card_name` take the host; eases, Fast In, Motion Library pins and Find run through `TimelineHost::invoke` |
 | Smart-freeze badges | `smart_freeze::timeline_badges` | takes `&Session` only in practice: change its signature |
 | Why? strip height | `why_chip::height` | ctx-data only: change its signature |
 | ~~Work-area context menu entries~~ | `menus::entry_for` | **Done (EMBED3)**: `TimelineHost::menu_entry` |
-| Layer markers, comp markers, marker bin | `markers_ui::*` | convert `markers_ui.rs` (session/ui/auto + marker dialog) |
+| ~~Layer markers, comp markers, marker bin~~ | `markers_ui::*` | **Done (EMBED4)**: drawing and gestures take the host; Marker Settings is `request_dialog(DialogRequest::Marker)` |
 | "Convert To Bezier Path" label | `i18n::label` | needs only the language: pass it in |
-| Audio waveform row | `waveform::summary` | needs the app's audio analysis cache: trait method |
+| ~~Audio waveform row~~ | `waveform::summary` | **Done (EMBED4)**: `TimelineHost::waveform`; its default keeps a `waveform::Cache` per egui context (`waveform::summary_in`), so any host gets waveforms |
 | Frozen-layer hint | `freeze_hint::show` | trait method (optional) |
 | RAM chip in the footer | `memory_panel::chip` | EffectCraft-only, keep optional |
-| Change Renderer | `dialogs::open_comp_settings` + `dialog_state` | dialogs are app-owned: `TimelineHost::open_dialog(kind)` |
+| ~~Change Renderer~~ | `dialogs::open_comp_settings` + `dialog_state` | **Done (EMBED4)**: `request_dialog(DialogRequest::CompSettings { tab })` |
 | Suggestions overlay | `suggestions::timeline_overlay` | EffectCraft-only, keep optional |
 | ~~Colour eyedropper~~ | `effect_controls::toggle_pick` | **Done (EMBED3)**: takes the host (it only sets `ui.fx_pick`; sampling happens in the app's viewer) |
-| Gradient editor | `gradient_editor::open` (inline rows) | dialog: `open_dialog` |
+| ~~Gradient editor~~ | `gradient_editor::open` (inline rows) | **Done (EMBED4)**: `request_dialog(DialogRequest::Gradient(params))` |
 
 Dispatch glue that stays on `EffectcraftApp` (called by `menus::invoke`, not by the panel's draw):
 `timeline::{invoke_inline, inline_enabled, show_inline_dialog}`, `inline::{invoke, enabled}`.
@@ -184,3 +185,14 @@ All additive; nothing a host implements or calls was renamed or removed.
   (defaulted), `panels::timeline::keys::forward_shortcuts`, `menus::shortcut_command`;
   `effect_controls::show(&mut dyn TimelineHost, ui, rect)` (was `&mut EffectcraftApp`; the app still
   coerces).
+- EMBED4: `TimelineHost::{request_dialog, waveform, pointer_color}` (defaulted: dialogs decline
+  with a status message, waveforms are computed per context, no pointer colour);
+  `panels::timeline::{DialogRequest, PointerColor}` (`DialogRequest` is `#[non_exhaustive]`: new
+  dialog kinds may be added, so a host's `match` needs a `_` arm);
+  `panels::effect_controls::hosted_pick(host, ctx) -> bool` (call once per frame while the host
+  shows the comp: an armed colour eyedropper takes `pointer_color` on its click and sets the
+  property or text colour; point picks need EffectCraft's viewer and stay armed; a keyer takes the
+  displayed colour rather than its input's); `panels::waveform::{summary_in, Cache: Clone}`.
+  Signatures that now take `&mut dyn TimelineHost` (the app still coerces): `quick_row::show`,
+  `markers_ui::{comp_markers, marker_bin, layer_markers}`, `text_apply::{run, run_follow_ups,
+  preset_list}`, `motion_library::card_name`, the wheel actions in `timeline/wheels.rs`.
