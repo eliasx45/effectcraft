@@ -372,11 +372,12 @@ fn snap_candidates(comp: &Comp, rows: &[Row]) -> Vec<f64> {
 
 /// Shift-dragging the work area or one of its ends (#252): the correction (seconds) that puts
 /// the nearest of the `moving` times on the current time, a key, a layer in / out point or a
-/// marker within 8 px (the work area's own ends are no targets).
-fn work_area_snap(app: &EffectcraftApp, comp: &Comp, moving: &[f64], pps: f64) -> f64 {
-    let (a, b) = (comp.work_area.0.seconds(), comp.work_area.1.seconds());
+/// marker within 8 px. `exclude` are the work area's own ends that are no targets: fixed
+/// values (the end that stays, or the ends at drag start), never the live ends, which would
+/// drop the target the drag just snapped to and flicker between snapped and unsnapped.
+fn work_area_snap(app: &EffectcraftApp, comp: &Comp, moving: &[f64], exclude: &[f64], pps: f64) -> f64 {
     let mut cands = snap_candidates(comp, &build_rows(app, comp));
-    cands.retain(|c| (c - a).abs() > 1e-9 && (c - b).abs() > 1e-9);
+    cands.retain(|c| exclude.iter().all(|e| (c - e).abs() > 1e-9));
     cands.push(app.session.time().seconds());
     let tol = 8.0 / pps.max(1e-6);
     moving.iter().map(|t| snap_time(&cands, *t, tol) - t).filter(|d| *d != 0.0).min_by(|x, y| x.abs().total_cmp(&y.abs())).unwrap_or(0.0)
@@ -1590,7 +1591,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let len = wa1 - wa0;
         let mut a = a0 + d.x as f64 / pps.max(1e-6);
         if shift {
-            a += work_area_snap(app, &comp, &[a, a + len], pps);
+            a += work_area_snap(app, &comp, &[a, a + len], &[a0, a0 + len], pps);
         }
         let a = fr.snap_nearest(Tick::from_seconds_f64(a.clamp(0.0, (comp.duration.seconds() - len).max(0.0)))).seconds();
         let _ = app.session.execute("comp.workArea", json!({"start": a, "end": a + len, "merge": "wa-drag"}));
@@ -1610,7 +1611,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         {
             let mut secs = tm.t(pt.x).max(0.0);
             if shift {
-                secs += work_area_snap(app, &comp, &[secs], pps);
+                let other = if set == "begin" { wa1 } else { wa0 };
+                secs += work_area_snap(app, &comp, &[secs], &[other], pps);
             }
             let secs = fr.snap_nearest(Tick::from_seconds_f64(secs)).seconds();
             let key = if set == "begin" { "start" } else { "end" };

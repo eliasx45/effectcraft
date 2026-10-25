@@ -299,6 +299,42 @@ fn shift_dragging_the_work_area_snaps_to_the_current_time() {
     assert!(near(work_area(&h), (3.0, 6.0)), "the bar snaps its end to the CTI: {:?}", work_area(&h));
 }
 
+/// Shift-dragging the work area end onto a layer's out point stays snapped while the pointer
+/// rests: the snapped end used to drop its own target on the next frame and flicker between
+/// the out point and the pointer every frame.
+#[test]
+fn shift_dragged_work_area_end_holds_its_snap_without_flicker() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Short", "width": 320, "height": 180, "frameRate": 30, "duration": 10})).unwrap();
+    let l = s.execute("layer.newSolid", json!({"name": "Plate", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.timing", json!({"layers": [l], "out": 6.0})).unwrap();
+    s.execute("comp.workArea", json!({"start": 1.0, "end": 4.0})).unwrap();
+    let mut app = EffectcraftApp::new(s);
+    app.ui.timeline.pps = Some(100.0);
+    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_eframe(|_| app);
+    h.run_steps(3);
+    let (b, e) = (rect(&h, "timeline.workArea.begin").center(), rect(&h, "timeline.workArea.end").center());
+    let pps = (e.x - b.x) / 3.0;
+    let to = pos2(b.x + 5.0 * pps - 5.0, e.y);
+    h.event(Event::ModifiersChanged(Modifiers::SHIFT));
+    h.event(Event::PointerMoved(e));
+    h.step();
+    h.event(Event::PointerButton { pos: e, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::SHIFT });
+    h.step();
+    for k in 1..=8 {
+        h.event(Event::PointerMoved(e + (to - e) * (k as f32 / 8.0)));
+        h.step();
+    }
+    for frame in 0..6 {
+        h.event(Event::PointerMoved(to));
+        h.step();
+        let end = h.state().session.active_comp().unwrap().work_area.1.seconds();
+        assert!((end - 6.0).abs() < 1e-6, "frame {frame}: the end stays on the out point, got {end}");
+    }
+    h.event(Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::SHIFT });
+    h.run_steps(2);
+}
+
 /// #284: pressing in the time ruler moves the current time there at once, before the pointer
 /// moves or the button comes up (After Effects); dragging on then scrubs.
 #[test]
