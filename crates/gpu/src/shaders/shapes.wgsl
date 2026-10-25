@@ -1,26 +1,38 @@
-// Shape layer rasteriser (`shapes_gpu.rs`): the CPU plans (`effectcraft_render::shapes::gpu_plan`)
-// and builds each fill's scan edges exactly as tiny-skia does (`shapes::skia_scan`); these
-// kernels walk them. Per draw: `sh_accum` (one invocation per edge chunk) adds each edge's
-// winding at its sample column on every sub-scanline it spans (4 sub-scanlines per pixel row, 4
-// sample columns per pixel, packed as four 8-bit lanes per pixel and sub-scanline); `sh_row`
-// (one workgroup per pixel row) prefix-sums the windings along the row, counts the covered
+// Shape and text layer rasteriser (`shapes_gpu.rs`): the CPU plans (`effectcraft_render::shapes::
+// gpu_plan`, `effectcraft_render::text::gpu_plan`) and builds each fill's scan edges exactly as
+// tiny-skia does (`shapes::skia_scan`); these kernels walk them, every draw of a batch at once:
+// `sh_accum` (one invocation per edge chunk) adds each edge's winding at its sample column on
+// every sub-scanline it spans, in its draw's own region of `acc` (4 sub-scanlines per pixel row,
+// 4 sample columns per pixel, packed as four 8-bit lanes per pixel and sub-scanline); `sh_cov`
+// (one workgroup per row of a draw, 64 pixels a step) prefix-sums the windings along the row, counts the covered
 // samples into tiny-skia's coverage (16 per sample, 64 / 63 for a whole sub-scanline, capped at
-// 255), paints the draw's colour or gradient with it onto the layer image (Normal, as
-// `shapes::paint`) and zeroes the accumulation it read for the next draw. `sh_store` writes the
-// layer image into the compositor's texture.
+// 255) and leaves it in the pixel's first word; `sh_compose` (one invocation per layer pixel)
+// paints the draws over it in order, from its 16 × 16 tile's list (Normal, as `shapes::paint` /
+// `text::paint_coverage`). Draws come in groups (motion-blur sub-samples of a text layer): each
+// group is composited on its own and the groups summed with their weights (`accumulate_warp`).
+// A batch too large for one `acc` is split; `state` carries the pixels between batches.
 
-struct Draw {
-    // x0, y0, w, h of the draw's mask rectangle in buffer pixels
-    r: vec4<u32>,
-    // unused, edge count, first edge, flags (1: even-odd, 2: gradient)
-    m: vec4<u32>,
-    // image width, image height, first gradient word, gradient kind
+struct Batch {
+    // image width, image height, tiles across, rows in this batch
     n: vec4<u32>,
+    // first edge, edge count, workgroups across in `sh_cov`, flags (1: groups, 2: last batch)
+    e: vec4<u32>,
+    // where the tile ranges and the tile lists start in `index`, workgroups across in `sh_accum`
+    t: vec4<u32>,
+}
+
+struct DrawRec {
+    // x0, y0, w, h of the draw's mask rectangle in layer pixels
+    r: vec4<u32>,
+    // acc base (words), unused, flags (1: even-odd, 2: gradient), first gradient word
+    m: vec4<u32>,
+    // gradient kind, group
+    k: vec4<u32>,
     // straight RGBA (solid draws)
     color: vec4<f32>,
     // opacity, len2, has affine, has focal
     op: vec4<f32>,
-    // buffer pixel -> paint space: rows (a, c, e) and (b, d, f)
+    // layer pixel -> paint space: rows (a, c, e) and (b, d, f)
     lx: vec4<f32>,
     ly: vec4<f32>,
     // paint -> unit gradient space (affine gradients), same layout
@@ -30,25 +42,33 @@ struct Draw {
     sd: vec4<f32>,
     // focal point (xy)
     fo: vec4<f32>,
+    // group weight
+    w: vec4<f32>,
 }
 
-@group(0) @binding(0) var<uniform> D: Draw;
-// [first sub-scanline, (count << 1) | (winding < 0), x (16.16), dx (16.16)]
+@group(0) @binding(0) var<uniform> B: Batch;
+// [first sub-scanline, (draw << 7) | (count << 1) | (winding < 0), x (16.16), dx (16.16)]
 @group(0) @binding(1) var<storage, read> edges: array<vec4<i32>>;
-// Per mask pixel and sub-scanline: winding deltas of its 4 sample columns, 8-bit lanes.
+// Per draw, per mask pixel and sub-scanline: winding deltas of its 4 sample columns, 8-bit
+// lanes; after `sh_cov` the pixel's first word holds its coverage (0-255).
 @group(0) @binding(2) var<storage, read_write> acc: array<atomic<i32>>;
-@group(0) @binding(3) var<storage, read_write> img: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> draws: array<DrawRec>;
 @group(0) @binding(4) var<storage, read> grad: array<f32>;
-@group(0) @binding(5) var out: texture_storage_2d<rgba32float, write>;
+// Rows of the batch (draw index, row within it), tile ranges, tile lists (draw indices in order).
+@group(0) @binding(5) var<storage, read> index: array<u32>;
+// The layer's pixels between batches: the composite so far (or, with groups, the weighted sum).
+@group(0) @binding(6) var<storage, read_write> state: array<vec4<f32>>;
+@group(0) @binding(7) var out: texture_storage_2d<rgba32float, write>;
 
 @compute @workgroup_size(64, 1, 1)
-fn sh_accum(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= D.m.y) {
+fn sh_accum(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let i = (wid.y * B.t.z + wid.x) * 64u + lid.x;
+    if (i >= B.e.y) {
         return;
     }
-    let e = edges[D.m.z + i];
-    let count = e.y >> 1u;
+    let e = edges[B.e.x + i];
+    let D = draws[u32(e.y) >> 7u];
+    let count = (e.y >> 1u) & 63;
     var wind = 1;
     if ((e.y & 1) != 0) {
         wind = -1;
@@ -66,7 +86,7 @@ fn sh_accum(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (sx >= w * 4) {
             continue;
         }
-        let at = ((u32(sy >> 2u) * D.r.z + u32(sx >> 2u)) << 2u) + u32(sy & 3);
+        let at = D.m.x + ((u32(sy >> 2u) * D.r.z + u32(sx >> 2u)) << 2u) + u32(sy & 3);
         atomicAdd(&acc[at], wind << (8u * u32(sx & 3)));
     }
 }
@@ -87,10 +107,10 @@ fn lanes(v: i32) -> vec4<i32> {
 // ---------------------------------------------------------------- gradients (shapes::GradientRamp)
 
 fn g_at(i: u32) -> f32 {
-    return grad[D.n.z + i];
+    return grad[i];
 }
 
-fn ramp_t(p_in: vec2<f32>) -> f32 {
+fn ramp_t(D: DrawRec, p_in: vec2<f32>) -> f32 {
     var p = p_in;
     if (D.op.z > 0.5) {
         p = vec2<f32>(D.ax.x * p.x + D.ax.y * p.y + D.ax.z, D.ay.x * p.x + D.ay.y * p.y + D.ay.z);
@@ -99,7 +119,7 @@ fn ramp_t(p_in: vec2<f32>) -> f32 {
     let d = D.sd.zw;
     let len2 = D.op.y;
     let v = p - s;
-    let kind = D.n.w;
+    let kind = D.k.x;
     if (kind == 2u) {
         let a = (atan2(v.y, v.x) - atan2(d.y, d.x)) / 6.283185307179586;
         return a - floor(a);
@@ -139,13 +159,13 @@ fn mid_f(f: f32, m: f32) -> f32 {
 }
 
 // Gradient::sample: colour stops (pos, r, g, b, a, mid) then opacity stops (pos, a, mid).
-fn gradient_at(t_in: f32) -> vec4<f32> {
+fn gradient_at(base: u32, t_in: f32) -> vec4<f32> {
     let t = clamp(t_in, 0.0, 1.0);
-    let nc = u32(g_at(0u));
-    let no = u32(g_at(1u));
+    let nc = u32(g_at(base));
+    let no = u32(g_at(base + 1u));
     var col = vec4<f32>(1.0);
     if (nc > 0u) {
-        let c0 = 2u;
+        let c0 = base + 2u;
         col = vec4<f32>(g_at(c0 + 1u), g_at(c0 + 2u), g_at(c0 + 3u), g_at(c0 + 4u));
         if (t > g_at(c0)) {
             var found = false;
@@ -170,7 +190,7 @@ fn gradient_at(t_in: f32) -> vec4<f32> {
     }
     var alpha = 1.0;
     if (no > 0u) {
-        let o0 = 2u + nc * 6u;
+        let o0 = base + 2u + nc * 6u;
         alpha = g_at(o0 + 1u);
         if (t > g_at(o0)) {
             var found = false;
@@ -193,45 +213,50 @@ fn gradient_at(t_in: f32) -> vec4<f32> {
     return vec4<f32>(col.rgb, col.a * alpha);
 }
 
-fn paint_color(bx: u32, by: u32) -> vec4<f32> {
-    if ((D.m.w & 2u) == 0u) {
-        return D.color;
-    }
-    let p = vec2<f32>(f32(bx) + 0.5, f32(by) + 0.5);
-    let q = vec2<f32>(D.lx.x * p.x + D.lx.y * p.y + D.lx.z, D.ly.x * p.x + D.ly.y * p.y + D.ly.z);
-    return gradient_at(ramp_t(q));
-}
 
-// ---------------------------------------------------------------- rows
+// ---------------------------------------------------------------- coverage rows
 
-var<workgroup> sums: array<vec4<i32>, 256>;
+// Rows are mostly glyph-sized: 64 pixels a step keeps the scan short.
+const ROW: u32 = 64u;
+var<workgroup> sums: array<vec4<i32>, 64>;
+var<workgroup> row_at: vec4<u32>;
 
-@compute @workgroup_size(256, 1, 1)
-fn sh_row(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
-    let y = wid.y;
-    if (y >= D.r.w) {
+@compute @workgroup_size(64, 1, 1)
+fn sh_cov(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.y * B.e.z + wid.x;
+    if (row >= B.n.w) {
         return;
     }
-    let w = D.r.z;
-    let tiles = (w + 255u) / 256u;
-    let even_odd = (D.m.w & 1u) != 0u;
+    // The index holds (draw, row within it) per row; the draw's width, acc base and fill rule
+    // are shared through the workgroup so the loop below stays uniform.
+    if (lid.x == 0u) {
+        let d = index[2u * row];
+        let D = draws[d];
+        row_at = vec4<u32>(index[2u * row + 1u], D.r.z, D.m.x, D.m.z);
+    }
+    let r = workgroupUniformLoad(&row_at);
+    let y = r.x;
+    let w = r.y;
+    let base = r.z;
+    let tiles = (w + ROW - 1u) / ROW;
+    let even_odd = (r.w & 1u) != 0u;
     var carry = vec4<i32>(0);
     for (var t = 0u; t < tiles; t++) {
-        let x = t * 256u + lid.x;
+        let x = t * ROW + lid.x;
         // Per sub-scanline j: the winding deltas at this pixel's 4 sample columns.
         var dl: array<vec4<i32>, 4>;
         var total = vec4<i32>(0);
+        let at = base + ((y * w + x) << 2u);
         if (x < w) {
-            let at = (y * w + x) << 2u;
             for (var j = 0u; j < 4u; j++) {
-                let d = lanes(atomicExchange(&acc[at + j], 0));
-                dl[j] = d;
-                total[j] = d.x + d.y + d.z + d.w;
+                let v = lanes(atomicLoad(&acc[at + j]));
+                dl[j] = v;
+                total[j] = v.x + v.y + v.z + v.w;
             }
         }
         sums[lid.x] = total;
         workgroupBarrier();
-        for (var off = 1u; off < 256u; off = off << 1u) {
+        for (var off = 1u; off < ROW; off = off << 1u) {
             var add = vec4<i32>(0);
             if (lid.x >= off) {
                 add = sums[lid.x - off];
@@ -242,7 +267,7 @@ fn sh_row(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) w
         }
         // Winding left of this pixel, per sub-scanline.
         let before = carry + sums[lid.x] - total;
-        carry = carry + sums[255];
+        carry = carry + sums[ROW - 1u];
         workgroupBarrier();
         if (x < w) {
             var alpha = 0u;
@@ -261,30 +286,76 @@ fn sh_row(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) w
                     alpha += 16u * n;
                 }
             }
-            paint_px(D.r.x + x, D.r.y + y, f32(min(alpha, 255u)) / 255.0);
+            atomicStore(&acc[at], i32(min(alpha, 255u)));
         }
     }
 }
 
-// Paint pixel (bx, by) of the layer image with coverage `c` (`shapes::paint`, Normal).
-fn paint_px(bx: u32, by: u32, c: f32) {
-    if (c <= 0.0 || bx >= D.n.x || by >= D.n.y) {
-        return;
+// ---------------------------------------------------------------- compose
+
+fn paint_color(D: DrawRec, bx: u32, by: u32) -> vec4<f32> {
+    if ((D.m.z & 2u) == 0u) {
+        return D.color;
     }
-    let col = paint_color(bx, by);
-    let al = c * D.op.x * col.a;
-    if (al <= 0.0) {
-        return;
-    }
-    let i = by * D.n.x + bx;
-    let px = img[i];
-    img[i] = vec4<f32>(col.rgb * al, al) + px * (1.0 - al);
+    let p = vec2<f32>(f32(bx) + 0.5, f32(by) + 0.5);
+    let q = vec2<f32>(D.lx.x * p.x + D.lx.y * p.y + D.lx.z, D.ly.x * p.x + D.ly.y * p.y + D.ly.z);
+    return gradient_at(D.m.w, ramp_t(D, q));
 }
 
 @compute @workgroup_size(16, 16, 1)
-fn sh_store(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= D.n.x || gid.y >= D.n.y) {
+fn sh_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let bx = gid.x;
+    let by = gid.y;
+    if (bx >= B.n.x || by >= B.n.y) {
         return;
     }
-    textureStore(out, vec2<i32>(gid.xy), img[gid.y * D.n.x + gid.x]);
+    let i = by * B.n.x + bx;
+    let groups = (B.e.w & 1u) != 0u;
+    // Without groups `cur` carries on from the last batch; with groups every batch starts a
+    // group (batches split between groups) and `sum` carries on.
+    var cur = vec4<f32>(0.0);
+    var sum = vec4<f32>(0.0);
+    if (groups) {
+        sum = state[i];
+    } else {
+        cur = state[i];
+    }
+    var g = 0xffffffffu;
+    var wt = 0.0;
+    let tile = (by / 16u) * B.n.z + bx / 16u;
+    let first = index[B.t.x + tile];
+    let last = index[B.t.x + tile + 1u];
+    for (var k = first; k < last; k++) {
+        let D = draws[index[B.t.y + k]];
+        if (groups && D.k.y != g) {
+            sum = sum + cur * wt;
+            cur = vec4<f32>(0.0);
+            g = D.k.y;
+            wt = D.w.x;
+        }
+        if (bx < D.r.x || by < D.r.y || bx - D.r.x >= D.r.z || by - D.r.y >= D.r.w) {
+            continue;
+        }
+        let a = atomicLoad(&acc[D.m.x + (((by - D.r.y) * D.r.z + (bx - D.r.x)) << 2u)]);
+        let c = f32(a) / 255.0;
+        if (c <= 0.0) {
+            continue;
+        }
+        let col = paint_color(D, bx, by);
+        let al = c * D.op.x * col.a;
+        if (al <= 0.0) {
+            continue;
+        }
+        cur = vec4<f32>(col.rgb * al, al) + cur * (1.0 - al);
+    }
+    var px = cur;
+    if (groups) {
+        sum = sum + cur * wt;
+        px = sum;
+    }
+    if ((B.e.w & 2u) != 0u) {
+        textureStore(out, vec2<i32>(i32(bx), i32(by)), px);
+    } else {
+        state[i] = px;
+    }
 }

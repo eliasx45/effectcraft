@@ -208,3 +208,43 @@ fn text_the_gpu_cannot_match_stays_on_the_cpu() {
     let plan = r.text_raster_plan(&ctx, big, clip).expect("plain text plans");
     assert!(!plan.draws.is_empty(), "the big word draws");
 }
+
+/// A motion-blurred title whose characters animate within the shutter (TEXT-GPU2): its source is
+/// the average of the sub-samples (`blurred_source`), one group of draws each, rasterised in one
+/// pass and matching the CPU's.
+#[test]
+fn motion_blurred_text_sources_on_the_gpu_match_the_cpu() {
+    let g = gpu();
+    assert!(g.is_some() || std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "required GPU unavailable");
+    let Some(g) = g else { return };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut sc = scene(depth);
+        let comp = sc.p.comp_mut(sc.cid).unwrap();
+        comp.enable_motion_blur = true;
+        comp.motion_blur_samples = 8;
+        for l in comp.layers.iter_mut().filter(|l| l.name == "Title" || l.name == "Line") {
+            l.switches.motion_blur = true;
+        }
+        for t in [0.3, 0.6] {
+            let cache = LayerCache::default();
+            let mut r = Renderer::new(&sc.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..Default::default() });
+            r.accel = Some(g);
+            r.cache = Some(&cache);
+            let ctx = r.eval_ctx(sc.cid, s(t)).unwrap();
+            for layer in ctx.comp.layers.iter().filter(|l| l.switches.motion_blur) {
+                let label = format!("{} {depth:?} t {t}", layer.name);
+                let (_, clip) = r.resident_content(&ctx, layer).expect("keyed");
+                let cpu = r.resident_source(&ctx, layer, clip).expect("the CPU renders it");
+                let plan = r.text_raster_plan(&ctx, layer, clip).expect("plans");
+                assert!(plan.draws.iter().any(|d| d.group > 0), "{label}: sub-samples");
+                let mut e = Enc::new(&g.ctx);
+                let (img, offset, bs) = crate::shapes_gpu::resident_source(&mut e, &r, &ctx, layer, clip).expect("the GPU rasterises it");
+                let got = e.download(&img).expect("readback");
+                assert_eq!((got.width, got.height, offset, bs), (cpu.img.width, cpu.img.height, cpu.offset, cpu.scale), "{label}");
+                let mut d = diff(&cpu.img, &got, tolerance(depth));
+                d.quantized = depth != BitDepth::Bpc32;
+                check(&label, Some(d), 0.0);
+            }
+        }
+    }
+}

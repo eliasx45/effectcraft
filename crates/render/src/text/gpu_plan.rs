@@ -7,7 +7,7 @@
 //! composited Normal in drawing order. The accelerator walks them with its shape kernels.
 //!
 //! [`Renderer::text_raster_plan`] declines (`None`: the CPU renders the layer) for masks the
-//! GPU can't apply ([`crate::masks::gpu_plan`]), motion-blurred sub-frames, Blur and Gradient Fill animators (per-pixel colour, blurred
+//! GPU can't apply ([`crate::masks::gpu_plan`]), Blur and Gradient Fill animators (per-pixel colour, blurred
 //! patches), Inter-Character Blending other than Normal, masks tiny-skia would tile and runaway
 //! edge counts.
 
@@ -30,7 +30,6 @@ impl Renderer<'_> {
     pub fn text_raster_eligible(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         matches!(layer.source, LayerSource::Text)
             && crate::masks::gpu_plan::gpu_eligible(layer)
-            && self.content_times(ctx, layer).is_none()
             && layer.props.sub("text").is_some_and(|t| plain_paint(ctx, layer, t))
     }
 
@@ -40,15 +39,59 @@ impl Renderer<'_> {
         if !self.text_raster_eligible(ctx, layer) {
             return None;
         }
+        let mut plan = match self.content_times(ctx, layer) {
+            // `masked_source`: content motion blur draws the whole buffer (no window).
+            Some(times) => self.blurred_text_plan(ctx, layer, &times)?,
+            None => self.text_plan_at(ctx, layer, clip.rect())?,
+        };
+        let origin = crate::fx::fx_origin(ctx, layer, false);
+        plan.offset = [plan.offset[0] + origin[0] * plan.scale, plan.offset[1] + origin[1] * plan.scale];
+        Some(plan)
+    }
+}
+
+impl Renderer<'_> {
+    /// [`plan`] of the layer at the context time, at its raster scale.
+    fn text_plan_at(&self, ctx: &EvalCtx, layer: &Layer, window: Option<[u32; 4]>) -> Option<RasterPlan> {
         let s = self.raster_scale(ctx, layer);
         if !s.is_finite() || s <= 0.0 {
             return None;
         }
-        let geom = text_geom(ctx, layer);
-        let mut plan = plan(geom.as_ref(), s, clip.rect())?;
-        let origin = crate::fx::fx_origin(ctx, layer, false);
-        plan.offset = [plan.offset[0] + origin[0] * plan.scale, plan.offset[1] + origin[1] * plan.scale];
-        Some(plan)
+        plan(text_geom(ctx, layer).as_ref(), s, window)
+    }
+
+    /// `blurred_source` as a plan: the text drawn at each of `times` (the content motion blur's
+    /// sub-samples), each sample a group of draws placed on the union of their buffers and
+    /// weighted 1 / n. Samples at different raster scales, or an outsized union, are drawn once
+    /// at the context time, as there.
+    fn blurred_text_plan(&self, ctx: &EvalCtx, layer: &Layer, times: &[effectcraft_time::Tick]) -> Option<RasterPlan> {
+        let subs = times.iter().map(|t| self.text_plan_at(&ctx.at(*t), layer, None)).collect::<Option<Vec<RasterPlan>>>()?;
+        let scale = subs.first()?.scale;
+        let off = [0, 1].map(|i| subs.iter().map(|b| b.offset[i]).fold(f64::MIN, f64::max));
+        let w = subs.iter().map(|b| off[0] - b.offset[0] + f64::from(b.width)).fold(0.0, f64::max).ceil();
+        let h = subs.iter().map(|b| off[1] - b.offset[1] + f64::from(b.height)).fold(0.0, f64::max).ceil();
+        if subs.iter().any(|b| (b.scale - scale).abs() > 1e-9) || !(w * h).is_finite() || w * h > (1u64 << 26) as f64 {
+            return self.text_plan_at(ctx, layer, None);
+        }
+        let k = 1.0 / subs.len() as f32;
+        let mut draws = Vec::new();
+        for (g, b) in subs.into_iter().enumerate() {
+            // Text buffers sit on the layer pixel grid: whole-pixel moves, which the CPU's
+            // bilinear accumulation copies exactly.
+            let d = [off[0] - b.offset[0], off[1] - b.offset[1]];
+            if d.iter().any(|v| v.fract() != 0.0 || *v < 0.0 || *v > f64::from(u32::MAX)) {
+                return None;
+            }
+            let (dx, dy) = (d[0] as u32, d[1] as u32);
+            for mut draw in b.draws {
+                draw.rect[0] = draw.rect[0].checked_add(dx)?;
+                draw.rect[1] = draw.rect[1].checked_add(dy)?;
+                draw.group = g as u32;
+                draw.weight = k;
+                draws.push(draw);
+            }
+        }
+        Some(RasterPlan { width: w as u32, height: h as u32, offset: off, scale, draws })
     }
 }
 
@@ -179,6 +222,8 @@ impl WholeDraw {
             edges: self.edges,
             opacity: 1.0,
             paint: PlanPaint::Solid(self.color),
+            group: 0,
+            weight: 1.0,
         }
     }
 }
@@ -204,6 +249,8 @@ fn clip_draw(d: WholeDraw, at: [i64; 2], size: [u32; 2]) -> Option<PlanDraw> {
         edges,
         opacity: 1.0,
         paint: PlanPaint::Solid(d.color),
+        group: 0,
+        weight: 1.0,
     })
 }
 

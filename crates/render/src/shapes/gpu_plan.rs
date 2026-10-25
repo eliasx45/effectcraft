@@ -64,6 +64,11 @@ pub struct PlanDraw {
     pub edges: Vec<ScanEdge>,
     pub opacity: f32,
     pub paint: PlanPaint,
+    /// The sub-sample this draw belongs to (motion blur: each group is composited on its own,
+    /// then the groups are summed, `accumulate_warp`); 0 for a layer drawn once.
+    pub group: u32,
+    /// The weight of the draw's group in that sum (1 for a layer drawn once).
+    pub weight: f32,
 }
 
 /// A shape layer's buffer as [`Renderer::resident_source`] makes it, before the working-space
@@ -186,7 +191,7 @@ fn plan(ctx: &EvalCtx, layer: &Layer, contents: &effectcraft_project::PropGroup,
                 PlanPaint::Gradient(Box::new(gradient(g, GradientRamp::new(*kind, *start, *end, *width, *highlight), &to_local)?))
             }
         };
-        out.push(PlanDraw { rect: [r.x0, r.y0, r.w, r.h], even_odd: rule == FillRule::EvenOdd, edges, opacity: d.opacity, paint });
+        out.push(PlanDraw { rect: [r.x0, r.y0, r.w, r.h], even_odd: rule == FillRule::EvenOdd, edges, opacity: d.opacity, paint, group: 0, weight: 1.0 });
     }
     Some(RasterPlan { width: w, height: h, offset, scale: s, draws: out })
 }

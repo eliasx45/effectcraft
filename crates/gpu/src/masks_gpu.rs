@@ -225,6 +225,8 @@ pub(crate) fn apply(e: &mut Enc, plan: &GpuMaskPlan, img: crate::context::GpuIma
         edges: edges.to_vec(),
         opacity: 1.0,
         paint: PlanPaint::Solid([1.0; 4]),
+        group: 0,
+        weight: 1.0,
     };
     let mut acc: Option<crate::context::GpuImage> = None;
     for m in &plan.masks {
