@@ -162,7 +162,8 @@ fn frames_with_gpu_rasterised_shapes_match_the_cpu() {
     }
 }
 
-/// What the plan can't reproduce stays on the CPU: masks, non-Normal draws, Taper strokes.
+/// What the plan can't reproduce stays on the CPU: non-Normal draws, Taper strokes (masks no
+/// longer: MASK-GPU2).
 #[test]
 fn shapes_the_gpu_cannot_match_stay_on_the_cpu() {
     let mut sc = scene(BitDepth::Bpc8);
@@ -191,8 +192,9 @@ fn shapes_the_gpu_cannot_match_stay_on_the_cpu() {
         let (_, clip) = r.resident_content(&ctx, l).expect("keyed");
         r.shape_raster_plan(&ctx, l, clip)
     };
-    assert!(!r.shape_raster_eligible(&ctx, shapes[3]), "masked");
-    assert!(plan(3).is_none(), "masked");
+    // A plain mask is drawn on the GPU too (MASK-GPU2, `tests_masks_gpu`).
+    assert!(r.shape_raster_eligible(&ctx, shapes[3]), "masked");
+    assert!(plan(3).is_some(), "masked");
     assert!(plan(2).is_none(), "Multiply fill");
     assert!(plan(1).is_none(), "tapered stroke");
     let repeated = plan(0).expect("plain fills plan");

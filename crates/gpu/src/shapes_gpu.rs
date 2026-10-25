@@ -20,7 +20,10 @@
 //! samples into tiny-skia's 0–255 coverage, paints solid or gradient colour onto the layer image
 //! and clears what it read. `sh_store` writes the image.
 //!
-//! Fallbacks: the plan declines (the CPU renders the layer as before) for masks, motion-blurred
+//! Masks (MASK-GPU2) are drawn and applied here too (`masks_gpu::apply`) when
+//! `effectcraft_render::masks::gpu_plan` can plan them.
+//!
+//! Fallbacks: the plan declines (the CPU renders the layer as before) for masks it can't plan, motion-blurred
 //! shape sub-frames, non-Normal draw blend modes, Taper / Wave strokes, masks tiny-skia would tile
 //! (over 8191 px), runaway edge counts; this module declines for buffers past the device's
 //! storage-buffer limits or when the kernels didn't build. `EFFECTCRAFT_GPU_SHAPES=0` turns it off
@@ -292,6 +295,14 @@ pub(crate) fn resident_source(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &
         let _profile = effectcraft_render::profile::span(if text { "text_raster_plan" } else { "layer_raster_plan" });
         if text { r.text_raster_plan(ctx, layer, clip)? } else { r.shape_raster_plan(ctx, layer, clip)? }
     };
+    // Masks as the CPU's `masked_source` applies them (after the conversion, before quantising),
+    // planned first: a mask the GPU can't draw sends the whole layer to the CPU.
+    let masks = if layer.masks().is_some_and(|m| !m.children.is_empty()) {
+        let _profile = effectcraft_render::profile::span("mask_plan");
+        Some(r.mask_gpu_plan(ctx, layer, plan.width, plan.height, plan.offset, plan.scale)?)
+    } else {
+        None
+    };
     let mut img = raster(e, &plan)?;
     #[cfg(test)]
     if text {
@@ -300,6 +311,11 @@ pub(crate) fn resident_source(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &
     let pipe = r.pipe();
     if let Some(c) = pipe.authored_in() {
         img = crate::ops::convert(e, &img, &c);
+    }
+    if let Some(masks) = &masks {
+        img = crate::masks_gpu::apply(e, masks, img)?;
+        #[cfg(test)]
+        crate::masks_gpu::APPLIED.fetch_add(usize::from(!masks.masks.is_empty()), std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(l) = pipe.levels {
         img = crate::ops::quantize(e, &img, l);

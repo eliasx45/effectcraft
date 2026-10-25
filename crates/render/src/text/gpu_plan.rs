@@ -6,8 +6,8 @@
 //! the scan edges tiny-skia would walk ([`crate::shapes::skia_scan`]) and a solid colour,
 //! composited Normal in drawing order. The accelerator walks them with its shape kernels.
 //!
-//! [`Renderer::text_raster_plan`] declines (`None`: the CPU renders the layer) for masks,
-//! motion-blurred sub-frames, Blur and Gradient Fill animators (per-pixel colour, blurred
+//! [`Renderer::text_raster_plan`] declines (`None`: the CPU renders the layer) for masks the
+//! GPU can't apply ([`crate::masks::gpu_plan`]), motion-blurred sub-frames, Blur and Gradient Fill animators (per-pixel colour, blurred
 //! patches), Inter-Character Blending other than Normal, masks tiny-skia would tile and runaway
 //! edge counts.
 
@@ -29,7 +29,7 @@ impl Renderer<'_> {
     /// properties, without laying it out; [`Self::text_raster_plan`] can still decline).
     pub fn text_raster_eligible(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         matches!(layer.source, LayerSource::Text)
-            && layer.masks().is_none_or(|m| m.children.is_empty())
+            && crate::masks::gpu_plan::gpu_eligible(layer)
             && self.content_times(ctx, layer).is_none()
             && layer.props.sub("text").is_some_and(|t| plain_paint(ctx, layer, t))
     }

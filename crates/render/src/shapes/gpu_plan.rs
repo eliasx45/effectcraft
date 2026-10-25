@@ -11,7 +11,7 @@
 //! [`super::skia_scan::scan_edges`] unchanged.
 //!
 //! [`Renderer::shape_raster_plan`] declines (`None`: the CPU renders the layer) whatever the plan
-//! can't reproduce yet: masks, motion-blurred shape sub-frames, draws in blend modes other than
+//! can't reproduce yet: masks the GPU can't apply ([`crate::masks::gpu_plan`]), motion-blurred shape sub-frames, draws in blend modes other than
 //! Normal, Taper / Wave strokes (supersampled further on the CPU), masks over 8191 px and runaway
 //! edge counts. Paths reaching outside their draw's mask are clipped as tiny-skia clips them.
 
@@ -89,7 +89,7 @@ impl Renderer<'_> {
     /// without evaluating its contents; [`Self::shape_raster_plan`] can still decline).
     pub fn shape_raster_eligible(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         matches!(layer.source, LayerSource::Shape)
-            && layer.masks().is_none_or(|m| m.children.is_empty())
+            && crate::masks::gpu_plan::gpu_eligible(layer)
             && self.content_times(ctx, layer).is_none()
             && layer.props.sub("contents").is_some()
     }

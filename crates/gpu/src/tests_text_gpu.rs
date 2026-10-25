@@ -171,7 +171,7 @@ fn frames_with_gpu_rasterised_text_match_the_cpu() {
 }
 
 /// What the plan can't reproduce stays on the CPU: Blur and Gradient Fill animators, other
-/// Inter-Character Blending modes, masks.
+/// Inter-Character Blending modes (masks no longer: MASK-GPU2).
 #[test]
 fn text_the_gpu_cannot_match_stays_on_the_cpu() {
     let mut sc = scene(BitDepth::Bpc8);
@@ -196,7 +196,9 @@ fn text_the_gpu_cannot_match_stays_on_the_cpu() {
     r.cache = Some(&cache);
     let ctx = r.eval_ctx(sc.cid, s(0.2)).unwrap();
     let layer = |name: &str| ctx.comp.layers.iter().find(|l| l.name == name).unwrap();
-    for name in ["Title", "Line", "Plain"] {
+    // A plain mask is drawn on the GPU too (MASK-GPU2, `tests_masks_gpu`).
+    assert!(r.text_raster_eligible(&ctx, layer("Plain")), "masked Plain");
+    for name in ["Title", "Line"] {
         assert!(!r.text_raster_eligible(&ctx, layer(name)), "{name}");
         let (_, clip) = r.resident_content(&ctx, layer(name)).expect("keyed");
         assert!(r.text_raster_plan(&ctx, layer(name), clip).is_none(), "{name}");

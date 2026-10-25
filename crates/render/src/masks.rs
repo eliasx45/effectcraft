@@ -10,6 +10,8 @@ use rayon::prelude::*;
 
 use crate::eval::EvalCtx;
 
+pub mod gpu_plan;
+
 /// What mask motion blur may do in a render (from the renderer's motion blur gate), and the
 /// accelerator that may run mask feathers.
 #[derive(Clone, Copy, Default)]
@@ -90,17 +92,7 @@ pub struct Geometry {
 /// (Layer ▸ Mask ▸ Motion Blur: On, or Same As Layer with the layer's switch on) an animated
 /// path is averaged over the comp's shutter.
 fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, buf: &Geometry, blur: MaskBlur<'_>) -> Option<Mask> {
-    let mb = blur.allowed
-        && match g.kind {
-            GroupKind::Mask { motion_blur, .. } => match motion_blur {
-                MaskMotionBlur::On => true,
-                MaskMotionBlur::Off => false,
-                MaskMotionBlur::SameAsLayer => blur.layer,
-            },
-            _ => false,
-        };
-    let animated = g.get("path").is_some_and(|p| p.keys.len() > 1 || p.has_expression());
-    if mb && animated {
+    if motion_blurred(g, blur) {
         let fd = ctx.comp.frame_duration().seconds();
         let (angle, phase) = (ctx.comp.shutter_angle / 360.0, ctx.comp.shutter_phase / 360.0);
         let mut acc: Option<Mask> = None;
@@ -124,22 +116,38 @@ fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, bu
     coverage_at(ctx, layer, g, buf, blur.accel)
 }
 
-/// How far past the layer buffer a feather draws the mask, per axis, at most: a bigger feather
-/// still blurs fully, it just sees the mask no further out than this.
-const MAX_FEATHER_PAD: usize = 1024;
+/// Whether mask `g` is averaged over the shutter in this render (mask motion blur on and an
+/// animated path).
+fn motion_blurred(g: &effectcraft_project::PropGroup, blur: MaskBlur<'_>) -> bool {
+    let mb = blur.allowed
+        && match g.kind {
+            GroupKind::Mask { motion_blur, .. } => match motion_blur {
+                MaskMotionBlur::On => true,
+                MaskMotionBlur::Off => false,
+                MaskMotionBlur::SameAsLayer => blur.layer,
+            },
+            _ => false,
+        };
+    mb && g.get("path").is_some_and(|p| p.keys.len() > 1 || p.has_expression())
+}
 
-fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, out: &Geometry, accel: Option<&dyn crate::Accelerator>) -> Option<Mask> {
-    let Value::Path(sp) = ctx.group_value(layer, g, "path")? else { return None };
-    let path = effectcraft_path::to_kurbo(&sp);
-    let exp = ctx.f(layer, g, "expansion", 0.0);
+/// A mask's feather at the context time: the blur (`None`: no feather), the padded plane the
+/// coverage is drawn into (the feather blurs the mask as drawn, not as cut off by the layer's
+/// edges, so a mask running past an edge stays covered up to that edge; an inverted mask showed
+/// a faint band along it, a normal one faded out there) and the layer buffer's position in it.
+struct Padded {
+    blur: Option<FeatherBlur>,
+    plane: Geometry,
+    px: usize,
+    py: usize,
+}
+
+fn padded(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, out: &Geometry) -> Padded {
     let linear = matches!(g.kind, GroupKind::Mask { feather_falloff: FeatherFalloff::Linear, .. });
     let feather = ctx.v2(layer, g, "feather", [0.0; 2]);
     let feather = feather.map(|f| if f.is_finite() { f.max(0.0) } else { 0.0 });
     let box_r = |f: f64| ((f * out.scale / 2.0).round() as usize).max(if f > 0.0 { 1 } else { 0 });
     let sigma = |f: f64| f * out.scale / 2.0;
-    // The feather blurs the mask as drawn, not as cut off by the layer's edges: drawn into a
-    // buffer this much larger, so a mask running past an edge stays covered up to that edge
-    // (an inverted mask showed a faint band along it, a normal one faded out there).
     let pad = |f: f64| {
         let p = if f <= 0.0 {
             0
@@ -151,12 +159,34 @@ fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup,
         p.min(MAX_FEATHER_PAD)
     };
     let (px, py) = (pad(feather[0]), pad(feather[1]));
-    let buf = &Geometry {
+    let plane = Geometry {
         width: out.width.saturating_add(u32::try_from(px.saturating_mul(2)).unwrap_or(u32::MAX)),
         height: out.height.saturating_add(u32::try_from(py.saturating_mul(2)).unwrap_or(u32::MAX)),
         offset: [out.offset[0] + px as f64, out.offset[1] + py as f64],
         scale: out.scale,
     };
+    // Linear: one box pass, a straight ramp `feather` pixels wide across the edge.
+    let blur = (feather[0] > 0.0 || feather[1] > 0.0).then(|| {
+        if linear {
+            FeatherBlur::Box { rx: box_r(feather[0]), ry: box_r(feather[1]) }
+        } else {
+            FeatherBlur::Gaussian { sx: sigma(feather[0]), sy: sigma(feather[1]) }
+        }
+    });
+    Padded { blur, plane, px, py }
+}
+
+/// How far past the layer buffer a feather draws the mask, per axis, at most: a bigger feather
+/// still blurs fully, it just sees the mask no further out than this.
+const MAX_FEATHER_PAD: usize = 1024;
+
+fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, out: &Geometry, accel: Option<&dyn crate::Accelerator>) -> Option<Mask> {
+    let Value::Path(sp) = ctx.group_value(layer, g, "path")? else { return None };
+    let path = effectcraft_path::to_kurbo(&sp);
+    let exp = ctx.f(layer, g, "expansion", 0.0);
+    let linear = matches!(g.kind, GroupKind::Mask { feather_falloff: FeatherFalloff::Linear, .. });
+    let Padded { blur: feather_blur, plane, px, py } = padded(ctx, layer, g, out);
+    let buf = &plane;
     let (w, h) = (buf.width, buf.height);
     let m = Mat3::translate(vec2(buf.offset[0], buf.offset[1])) * Mat3::scale(vec2(buf.scale, buf.scale));
     // Variable-width feather (Mask Feather tool points): expansion and the per-point feather
@@ -187,14 +217,8 @@ fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup,
             *c = if exp > 0.0 { (*c + r - *c * r).min(1.0) } else { (*c * (1.0 - r)).max(0.0) };
         });
     }
-    if feather[0] > 0.0 || feather[1] > 0.0 {
-        // Coverage is one plane: blur just that. Linear: one box pass, a straight ramp
-        // `feather` pixels wide across the edge.
-        let blur = if linear {
-            FeatherBlur::Box { rx: box_r(feather[0]), ry: box_r(feather[1]) }
-        } else {
-            FeatherBlur::Gaussian { sx: sigma(feather[0]), sy: sigma(feather[1]) }
-        };
+    if let Some(blur) = feather_blur {
+        // Coverage is one plane: blur just that.
         let crop = [u32::try_from(px).ok()?, u32::try_from(py).ok()?, out.width, out.height];
         if let Some(m) = feather_on_accel(accel, &cov, blur, crop) {
             return Some(m);
@@ -271,12 +295,17 @@ pub fn shapes(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_effects::MaskShap
 
 /// Combined layer mask coverage in the supplied geometry.
 /// `None` means there is no applicable closed mask or geometry exceeds the cap.
-pub fn combined(ctx: &EvalCtx, layer: &Layer, buf: &Geometry, blur: MaskBlur<'_>) -> Option<Mask> {
-    let masks = layer.masks()?;
-    // An open mask (a path the Pen is still drawing) makes no transparency: the layer shows
-    // whole until the path is closed (After Effects; effects still use it as a path).
+/// The masks that make transparency, in order: enabled, a mode other than None, closed. An
+/// open mask (a path the Pen is still drawing) makes no transparency: the layer shows whole
+/// until the path is closed (After Effects; effects still use it as a path).
+fn applicable<'l>(ctx: &EvalCtx, layer: &'l Layer) -> Vec<&'l effectcraft_project::PropGroup> {
+    let Some(masks) = layer.masks() else { return Vec::new() };
     let closed = |g: &effectcraft_project::PropGroup| matches!(ctx.group_value(layer, g, "path"), Some(Value::Path(sp)) if sp.closed);
-    let list: Vec<_> = masks.groups().filter(|g| g.enabled && matches!(g.kind, GroupKind::Mask { mode, .. } if mode != MaskMode::None) && closed(g)).collect();
+    masks.groups().filter(|g| g.enabled && matches!(g.kind, GroupKind::Mask { mode, .. } if mode != MaskMode::None) && closed(g)).collect()
+}
+
+pub fn combined(ctx: &EvalCtx, layer: &Layer, buf: &Geometry, blur: MaskBlur<'_>) -> Option<Mask> {
+    let list = applicable(ctx, layer);
     if list.is_empty() {
         return None;
     }

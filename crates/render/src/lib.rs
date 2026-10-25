@@ -13,6 +13,7 @@
 include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 pub mod cache;
 mod clip;
+pub mod masks;
 pub mod shapes;
 pub mod text;
 pub mod yuv;
