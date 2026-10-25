@@ -24,6 +24,9 @@ LAB = os.path.expanduser("~/Developer/lab/S1-speech-timing")
 MFA_ENV = os.environ.get("SPEECH_MAP_MFA_ENV", os.path.join(LAB, "envs", "mfa"))
 MFA_ROOT = os.environ.get("SPEECH_MAP_MFA_ROOT", os.path.join(LAB, "envs", "mfa_root"))
 MFA_DICT = os.environ.get("SPEECH_MAP_MFA_DICT", os.path.join(LAB, "mfa", "custom.dict"))
+# Words missing from MFA_DICT: hand-checked pronunciations first, then ones worked out before (SX7).
+MFA_OVERRIDES = os.path.join(LAB, "mfa", "overrides.dict")
+MFA_LEARNED = os.path.join(LAB, "mfa", "learned.dict")
 SCRIBE = os.path.expanduser("~/.local/bin/scribe-words")
 SR = 16000
 # Audio longer than this is aligned in chunks cut in pauses (MFA struggles with long utterances).
@@ -155,6 +158,69 @@ def chunks(words, total):
     return out
 
 
+def read_dict(path):
+    """{word: phones} of an MFA dictionary (plain or with probability columns; the first entry of a word wins)."""
+    d = {}
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        return d
+    with f:
+        for line in f:
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) >= 2 and cols[0] and cols[0] not in d:
+                d[cols[0]] = cols[-1].strip()
+    return d
+
+
+def secondary(phones):
+    """A compound's second part: its primary stress becomes secondary (COPYwriting)."""
+    return " ".join(p[:-1] + "2" if p.endswith("1") else p for p in phones.split())
+
+
+def complete_dict(texts, tmp, env):
+    """An MFA dictionary that knows every word of `texts`. A word MFA_DICT lacks (it would get no syllables, so
+    no accent) takes, in order: MFA_OVERRIDES, two dictionary words it splits into (copy + writing, the most even
+    split), or MFA's G2P guess. Splits and guesses are appended to MFA_LEARNED, so each is worked out once;
+    correct a bad one by putting the word in MFA_OVERRIDES."""
+    base = read_dict(MFA_DICT)
+    known = {**read_dict(MFA_LEARNED), **read_dict(MFA_OVERRIDES)}
+    words = {w.strip("'") for t in texts for w in re.findall(r"[a-z']+", for_aligner(t).lower())}
+    extra, learned, guess = {}, {}, []
+    for w in sorted(x for x in words if x and x not in base):
+        if w in known:
+            extra[w] = known[w]
+            continue
+        splits = [(w[:i], w[i:]) for i in range(2, len(w) - 1) if w[:i] in base and w[i:] in base]
+        if splits:
+            a, b = min(splits, key=lambda s: abs(len(s[0]) - len(s[1])))
+            extra[w] = learned[w] = base[a] + " " + secondary(base[b])
+        else:
+            guess.append(w)
+    if guess:
+        src, dst = os.path.join(tmp, "oov.txt"), os.path.join(tmp, "oov.dict")
+        with open(src, "w") as f:
+            f.write("\n".join(guess) + "\n")
+        r = subprocess.run([os.path.join(MFA_ENV, "bin", "mfa"), "g2p", src, "english_us_arpa", dst, "--num_pronunciations", "1"],
+                           capture_output=True, text=True, env=env)
+        if r.returncode == 0:
+            for w, ph in read_dict(dst).items():
+                extra[w] = learned[w] = ph
+        else:
+            print(f"# G2P failed, these words get no syllables: {' '.join(guess)}", file=sys.stderr)
+    if learned:
+        with open(MFA_LEARNED, "a", encoding="utf-8") as f:
+            f.writelines(f"{w}\t{ph}\n" for w, ph in sorted(learned.items()))
+        print("# new words: " + ", ".join(f"{w} = {ph}" for w, ph in sorted(learned.items())), file=sys.stderr)
+    if not extra:
+        return MFA_DICT
+    path = os.path.join(tmp, "words.dict")
+    with open(MFA_DICT, encoding="utf-8") as src, open(path, "w", encoding="utf-8") as dst:
+        dst.write(src.read().rstrip("\n") + "\n")
+        dst.writelines(f"{w}\t0.99\t0.5\t1.0\t1.0\t{ph}\n" for w, ph in sorted(extra.items()))
+    return path
+
+
 def mfa_align(x, parts, tmp):
     corpus, outdir = os.path.join(tmp, "corpus"), os.path.join(tmp, "aligned")
     os.makedirs(corpus)
@@ -163,8 +229,9 @@ def mfa_align(x, parts, tmp):
         with open(os.path.join(corpus, f"c{i:03d}.txt"), "w") as f:
             f.write(for_aligner(text))
     env = {**os.environ, "MFA_ROOT_DIR": MFA_ROOT, "PATH": os.path.join(MFA_ENV, "bin") + os.pathsep + os.environ.get("PATH", "")}
+    words_dict = complete_dict([t for _, _, t in parts], tmp, env)
     run([os.path.join(MFA_ENV, "bin", "mfa"), "align", "--clean", "--single_speaker", "--output_format", "json",
-         corpus, MFA_DICT, "english_us_arpa", outdir], env=env)
+         corpus, words_dict, "english_us_arpa", outdir], env=env)
     words = []
     for i, (t0, _, _) in enumerate(parts):
         path = os.path.join(outdir, f"c{i:03d}.json")
@@ -228,10 +295,13 @@ def main():
             words = [{"word": text, "start": 0.0, "end": total}]
             parts = [(0.0, total, text)]
         else:
+            # The media itself, not the cut WAV, so scribe-words' cache serves any range it already has.
             sw = os.path.join(tmp, "scribe.json")
-            run([SCRIBE, wav, "--out", sw] + (["--local"] if a.local else []))
+            run([SCRIBE, a.media, "--start", str(a.start), "--out", sw] + (["--dur", str(a.dur)] if a.dur else [])
+                + (["--local"] if a.local else []))
             d = json.load(open(sw))
-            engine, text, words = d.get("engine", "scribe"), d.get("text", ""), d.get("words", [])
+            engine, text = d.get("engine", "scribe"), d.get("text", "")
+            words = [{**w, "start": w["start"] - a.start, "end": w["end"] - a.start} for w in d.get("words", [])]
             parts = chunks(words, total) if words else [(0.0, total, text)]
         t_mfa = time.time()
         aligned = mfa_align(x, parts, tmp)
