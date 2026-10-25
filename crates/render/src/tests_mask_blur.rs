@@ -46,7 +46,7 @@ fn alpha_at_25(p: &Project, cid: ItemId, motion_blur: bool) -> f32 {
 #[test]
 fn mask_motion_blur_keys_the_layer_cache_by_time() {
     let (mut p, cid) = project(true);
-    let rect = |x: f64| Value::Path(ShapePath::rect([x, 50.0], 20.0, 100.0));
+    let rect = |x: f64| Value::Path(Box::new(ShapePath::rect([x, 50.0], 20.0, 100.0)));
     let l = &mut p.comp_mut(cid).unwrap().layers[0];
     let Some(Node::Group(m)) = l.props.sub_mut("masks").unwrap().children.first_mut() else { panic!("mask") };
     m.get_mut("path").unwrap().keys = vec![
