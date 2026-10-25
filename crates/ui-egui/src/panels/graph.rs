@@ -625,6 +625,10 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
             fit_all(app, &cs, ectx, speed, plot);
         }
     }
+    // F (timeline.graph.fit): Fit All Graphs to View, as the Fit button.
+    if take_fit_all_request(&ctx) {
+        fit_all(app, &cs, ectx, speed, plot);
+    }
 
     // Vertical range: auto-zoom to the curves + handles, or the stored manual range.
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -1167,7 +1171,11 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     if text_button(app, ui, p, &mut buttons, y, "Auto-zoom", auto_on, "autoZoom", "Auto-zoom graph height") {
         app.ui.timeline.graph_auto_zoom = !auto_on;
     }
-    if text_button(app, ui, p, &mut buttons, y, "Fit", false, "fit", "Fit all graphs to view") {
+    let fit_tip = match app.session.shortcuts().shortcut_of("timeline.graph.fit", &serde_json::Value::Null) {
+        Some(sc) => format!("Fit all graphs to view ({})", crate::menus::shortcut_text(sc)),
+        None => "Fit all graphs to view".to_string(),
+    };
+    if text_button(app, ui, p, &mut buttons, y, "Fit", false, "fit", &fit_tip) {
         fit_all(app, &cs, ectx, speed, plot);
     }
     if text_button(app, ui, p, &mut buttons, y, "Fit Selection", false, "fitSelection", "Fit selection to view") {
@@ -1403,6 +1411,20 @@ fn fit_all(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool, 
 
 fn fit_pending_id() -> egui::Id {
     egui::Id::new("graph-fit-pending")
+}
+
+fn fit_all_pending_id() -> egui::Id {
+    egui::Id::new("graph-fit-all-pending")
+}
+
+/// Fit All Graphs to View (F, `timeline.graph.fit`) the next time the Graph Editor is drawn.
+pub(crate) fn request_fit_all(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(fit_all_pending_id(), true));
+}
+
+/// Takes a pending [`request_fit_all`].
+pub(crate) fn take_fit_all_request(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| d.remove_temp::<bool>(fit_all_pending_id())).unwrap_or(false)
 }
 
 /// A graph now targets another composition: no gesture may continue editing the previous one.

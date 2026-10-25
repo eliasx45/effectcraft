@@ -60,6 +60,7 @@ const PINNED_INVOKE: &[&str] = &[
     "flowchart.graph",
     "timeline.search",
     "timeline.graphEditor",
+    "timeline.graph.fit",
     "timeline.switchesModes",
     "timeline.collapseAll",
     "timeline.twirlSelected",

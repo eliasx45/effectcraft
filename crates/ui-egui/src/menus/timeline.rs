@@ -26,6 +26,7 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("timeline.sourceName", source_name),
         Handler::ui("timeline.search", search),
         Handler::ui("timeline.graphEditor", graph_editor),
+        Handler::ui("timeline.graph.fit", graph_fit),
         Handler::ui("timeline.switchesModes", switches_modes),
         Handler::ui("timeline.collapseAll", collapse_all),
         Handler::ui("timeline.twirlSelected", twirl_selected),
@@ -263,6 +264,16 @@ fn search(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Val
 fn graph_editor(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
     app.ui.timeline.graph_editor = !app.ui.timeline.graph_editor;
     Ok(Value::Null)
+}
+
+/// F in the Graph Editor (its bottom bar's Fit button): Fit All Graphs to View. The Graph Editor
+/// frames the graphs when it is next drawn, where its plot is known.
+fn graph_fit(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    if !app.ui.timeline.graph_editor {
+        return Err("Fit All Graphs to View needs the Graph Editor: open it first (timeline.graphEditor, Shift+F3)".into());
+    }
+    crate::panels::graph::request_fit_all(ctx);
+    Ok(json!({"fit": "all"}))
 }
 
 fn switches_modes(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {

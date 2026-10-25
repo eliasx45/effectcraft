@@ -90,6 +90,9 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("timeline.parentColumn", "Show/Hide Parent Column", [], Some("Shift+F4")),
     uic!("timeline.zoomFrameToggle", "Zoom In to Frame Level / Out to the Whole Comp", [], Some(";")),
     uic!("timeline.graphEditor", "Graph Editor", [], Some("Shift+F3")),
+    // Graph Editor scope: only while the Timeline shows the Graph Editor, where it wins over
+    // Reveal Mask Feather's F (After Effects).
+    uic!("timeline.graph.fit", "Fit All Graphs to View", [], Some("F")),
     uic!("timeline.switchesModes", "Toggle Switches / Modes", [], Some("F4")),
     uic!("timeline.workAreaBegin", "Set Work Area Begin", [], Some("B")),
     uic!("timeline.workAreaEnd", "Set Work Area End", [], Some("N")),
@@ -1086,6 +1089,9 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
         return;
     }
     let binds = bindings(&app.session);
+    // The Graph Editor's keys work only while the Timeline shows it, and win over the Timeline's.
+    let graph_editor = app.ui.focused == PanelKind::Timeline && app.ui.timeline.graph_editor;
+    let focused_scope = app.ui.focused.id();
     for (key, mods, pressed, physical_key) in events {
         // Plain Spacebar runs its shortcut (Play Current Preview) on the release: held, it is
         // the Hand tool (After Effects), and a drag with it must not start or stop playback.
@@ -1189,14 +1195,31 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                 && matches!(k, egui::Key::Backtick | egui::Key::IntlBackslash)
                 && matches!(physical_key, Some(egui::Key::IntlBackslash | egui::Key::Backtick))
         };
-        if let Some((_, _, id, params)) =
-            binds.iter().filter(|(m, k, id, _)| (*k == key || iso_maximize(*k, id)) && mods_match(*m, mods)).min_by_key(|(m, k, id, params)| {
+        let scope_of = |id: &str, params: &Value| {
+            let key = effectcraft_engine::shortcuts::binding_key(id, params);
+            app.session.shortcuts().find(&key).map(|b| b.scope.clone())
+        };
+        if let Some((_, _, id, params)) = binds
+            .iter()
+            .filter(|(m, k, id, params)| {
+                (*k == key || iso_maximize(*k, id))
+                    && mods_match(*m, mods)
+                    && (graph_editor || scope_of(id, params).as_deref() != Some(effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE))
+            })
+            .min_by_key(|(m, k, id, params)| {
                 // Keys the user gave a command win over a default sharing them, whatever the
                 // panel (Elias AE: X is Split Layer, not the Timeline's Scroll Topmost Selected
-                // Layer to Top). Otherwise the focused panel wins over an application command
-                // sharing its chord.
+                // Layer to Top). Otherwise the open Graph Editor wins over the Timeline (F: Fit
+                // All Graphs to View, not Reveal Mask Feather), and the focused panel over an
+                // application command sharing its chord.
                 let key = effectcraft_engine::shortcuts::binding_key(id, params);
-                (!user_assigned(&app.session, &key, *m, *k), app.session.shortcuts().find(&key).is_none_or(|b| b.scope != app.ui.focused.id()))
+                let scope = scope_of(id, params);
+                let rank = match scope.as_deref() {
+                    Some(effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE) => 0u8,
+                    Some(s) if s == focused_scope => 1,
+                    _ => 2,
+                };
+                (!user_assigned(&app.session, &key, *m, *k), rank)
             })
         {
             let (id, params) = (id.clone(), if params.is_null() { json!({}) } else { params.clone() });
@@ -1473,9 +1496,15 @@ mod tests {
     #[test]
     fn ui_and_menu_shortcuts_do_not_collide() {
         let app = EffectcraftApp::new(effectcraft_engine::Session::default());
-        let mut seen: std::collections::BTreeMap<(String, String), (String, String)> = Default::default();
+        let mut seen: std::collections::BTreeMap<(String, String, bool), (String, String)> = Default::default();
+        // (Keys may be shared by scopes that never apply together: the Graph Editor's F and the
+        // Timeline's Reveal Mask Feather.)
+        let scope = |id: &str, params: &Value| {
+            let key = effectcraft_engine::shortcuts::binding_key(id, params);
+            app.session.shortcuts().find(&key).map(|b| b.scope.clone()).unwrap_or_default()
+        };
         for (m, k, id, params) in bindings(&app.session) {
-            let key = (format!("{m:?}"), format!("{k:?}"));
+            let key = (format!("{m:?}"), format!("{k:?}"), scope(&id, &params) == effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE);
             let target = (id.clone(), params.to_string());
             if let Some(prev) = seen.get(&key) {
                 assert_eq!(prev, &target, "{key:?} bound to {prev:?} and {target:?}");
@@ -1623,6 +1652,41 @@ mod tests {
         app.show_panel(PanelKind::Project);
         run(&mut app, "window.closeAll");
         assert!(!app.ui.dock.contains(PanelKind::Project));
+    }
+
+    /// GE-FIT1: F in the Timeline fits all graphs while it shows the Graph Editor (After
+    /// Effects) and reveals Mask Feather otherwise; in another panel it never fits the graphs.
+    #[test]
+    fn f_fits_the_graphs_only_in_the_graph_editor() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"name": "A", "duration": 4})).unwrap();
+        let ctx = egui::Context::default();
+        let press_f = |app: &mut EffectcraftApp| {
+            app.last_reveal = None;
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key { key: egui::Key::F, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| handle_shortcuts(app, ui.ctx()));
+            out.textures_delta.clear();
+            let fit = crate::panels::graph::take_fit_all_request(&ctx);
+            (fit, app.last_reveal.as_ref().map(|(k, _)| k.clone()))
+        };
+        assert_eq!(app.session.shortcuts().shortcut_of("timeline.graph.fit", &Value::Null), Some("F"));
+        app.ui.focused = PanelKind::Timeline;
+        app.ui.timeline.graph_editor = true;
+        assert_eq!(press_f(&mut app), (true, None));
+        app.ui.timeline.graph_editor = false;
+        assert_eq!(press_f(&mut app), (false, Some("feather".to_string())));
+        app.ui.timeline.graph_editor = true;
+        app.ui.focused = PanelKind::Composition;
+        assert!(!press_f(&mut app).0);
+        // Run by id (control channel, MCP) it needs the Graph Editor open.
+        app.ui.timeline.graph_editor = false;
+        assert!(invoke(&mut app, &ctx, "timeline.graph.fit", json!({})).is_err());
+        app.ui.timeline.graph_editor = true;
+        invoke(&mut app, &ctx, "timeline.graph.fit", json!({})).unwrap();
+        assert!(crate::panels::graph::take_fit_all_request(&ctx));
     }
 
     #[test]
