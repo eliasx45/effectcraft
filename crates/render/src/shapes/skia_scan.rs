@@ -1631,7 +1631,7 @@ fn clip_to_rect(path: &BezPath, w: u32, h: u32) -> BezPath {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use effectcraft_geom::vec2;
     use effectcraft_path::FillRule;

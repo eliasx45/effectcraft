@@ -1582,6 +1582,7 @@ pub fn per_char_planes(ctx: &EvalCtx, layer: &Layer, s: f64) -> Vec<(Buf, Mat4)>
         .collect()
 }
 
+pub mod gpu_plan;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -25,10 +25,14 @@
 //! (over 8191 px), runaway edge counts; this module declines for buffers past the device's
 //! storage-buffer limits or when the kernels didn't build. `EFFECTCRAFT_GPU_SHAPES=0` turns it off
 //! (A/B).
+//!
+//! Text layers (TEXT-GPU1) come the same way: `effectcraft_render::text::gpu_plan` makes the
+//! glyph runs' fills and round-joined strokes into draws of solid colour, Normal in drawing
+//! order, as `text::render` draws them. `EFFECTCRAFT_GPU_TEXT=0` turns that off.
 
 use std::sync::{Arc, Mutex};
 
-use effectcraft_project::Layer;
+use effectcraft_project::{Layer, LayerSource};
 use effectcraft_render::shapes::gpu_plan::{PlanDraw, PlanPaint, RasterPlan};
 use effectcraft_render::{ContentClip, EvalCtx, Renderer};
 
@@ -45,9 +49,28 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("EFFECTCRAFT_GPU_SHAPES").as_deref() != Ok("0"))
 }
 
+/// Whether text layers rasterise here (`EFFECTCRAFT_GPU_TEXT=0`: on the CPU, for A/B).
+pub(crate) fn text_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EFFECTCRAFT_GPU_TEXT").as_deref() != Ok("0"))
+}
+
+/// Whether the walk may rasterise this layer here (then the CPU pre-pass leaves it alone; the
+/// plan can still decline, and the walk then renders it on the CPU).
+pub(crate) fn eligible(r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> bool {
+    match layer.source {
+        LayerSource::Shape => enabled() && r.shape_raster_eligible(ctx, layer),
+        LayerSource::Text => text_enabled() && r.text_raster_eligible(ctx, layer),
+        _ => false,
+    }
+}
+
 /// Shape layers rasterised here (tests check the GPU path ran).
 #[cfg(test)]
 pub(crate) static RASTERISED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Text layers rasterised here.
+#[cfg(test)]
+pub(crate) static RASTERISED_TEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) struct Pipes {
     bgl: wgpu::BindGroupLayout,
@@ -256,19 +279,24 @@ pub(crate) fn raster(e: &mut Enc, plan: &RasterPlan) -> Option<GpuImage> {
     Some(out)
 }
 
-/// [`Renderer::resident_source`] of a shape layer made here: its image, offset and scale (effect
-/// space), converted to the working space and quantised as the CPU's `masked_source`. `None`:
-/// render it on the CPU.
+/// [`Renderer::resident_source`] of a shape or text layer made here: its image, offset and
+/// scale (effect space), converted to the working space and quantised as the CPU's
+/// `masked_source`. `None`: render it on the CPU.
 pub(crate) fn resident_source(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, clip: ContentClip) -> Option<(GpuImage, [f64; 2], f64)> {
-    if !enabled() || !r.shape_raster_eligible(ctx, layer) {
+    if !eligible(r, ctx, layer) {
         return None;
     }
-    let _profile = effectcraft_render::profile::span("layer_raster_gpu");
+    let text = matches!(layer.source, LayerSource::Text);
+    let _profile = effectcraft_render::profile::span(if text { "text_raster_gpu" } else { "layer_raster_gpu" });
     let plan = {
-        let _profile = effectcraft_render::profile::span("layer_raster_plan");
-        r.shape_raster_plan(ctx, layer, clip)?
+        let _profile = effectcraft_render::profile::span(if text { "text_raster_plan" } else { "layer_raster_plan" });
+        if text { r.text_raster_plan(ctx, layer, clip)? } else { r.shape_raster_plan(ctx, layer, clip)? }
     };
     let mut img = raster(e, &plan)?;
+    #[cfg(test)]
+    if text {
+        RASTERISED_TEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let pipe = r.pipe();
     if let Some(c) = pipe.authored_in() {
         img = crate::ops::convert(e, &img, &c);
