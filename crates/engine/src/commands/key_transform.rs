@@ -68,6 +68,18 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
     // `speedOffset` (speed graph): the speed entering and leaving each key changes by this much
     // (units/s, faster away from 0), its influence kept, as dragging a key up or down there.
     let soff = f_p(p, "speedOffset").filter(|v| v.is_finite()).unwrap_or(0.0);
+    // `speedRef` (the dragged key, {layer, prop, time}): the offset is in that key's units, so
+    // every selected side changes by the same share of its own segment's average speed (Position
+    // in px/s and Scale in %/s move together, as in After Effects). Without it, plain units/s.
+    let speed_ref = p.get("speedRef").and_then(|r| {
+        let lid = LayerId(r.get("layer")?.as_u64()?);
+        let uid = r.get("prop")?.as_u64()?;
+        let t = Tick::from_seconds_f64(r.get("time")?.as_f64()?);
+        let pr = comp.layer(lid)?.props.find(uid)?;
+        let i = pr.keys.iter().position(|k| k.time == t)?;
+        let avg = [false, true].iter().filter_map(|&out| seg_speed(&pr.keys, i, 0, pr.spatial, out)).fold(0.0_f64, f64::max);
+        (avg > 1e-9).then_some(avg)
+    });
     s.edit("Transform Keyframes", merge, |proj, st| {
         if let Some(b) = base {
             *proj = (*b).clone();
@@ -88,7 +100,9 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
             };
             let Some(pr) = layer.props.find_mut(uid) else { continue };
             if soff != 0.0 {
-                speed_offset(&mut pr.keys, pr.spatial, &times, soff, dims.as_deref());
+                // Every dimension: linked Scale X/Y stay together (separated dimensions are
+                // properties of their own).
+                speed_offset(&mut pr.keys, pr.spatial, &times, soff, speed_ref, None);
             }
             let (mut moved, mut kept): (Vec<Keyframe>, Vec<Keyframe>) = pr.keys.drain(..).partition(|k| times.contains(&k.time));
             for k in &mut moved {
@@ -123,7 +137,7 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
 /// Add `off` to the speed magnitude of both sides of the keys at `times` (the dimensions `dims`,
 /// or all), keeping each side's influence; the sides become Bezier. A side at speed 0 speeds up
 /// the way its segment moves, so pulling it up never reverses the motion.
-fn speed_offset(keys: &mut [Keyframe], spatial: bool, times: &[Tick], off: f64, dims: Option<&[usize]>) {
+fn speed_offset(keys: &mut [Keyframe], spatial: bool, times: &[Tick], off: f64, reference: Option<f64>, dims: Option<&[usize]>) {
     let n_keys = keys.len();
     let mut updates = vec![];
     for (i, k) in keys.iter().enumerate().filter(|(_, k)| times.contains(&k.time)) {
@@ -146,6 +160,10 @@ fn speed_offset(keys: &mut [Keyframe], spatial: bool, times: &[Tick], off: f64, 
                         let rising = if out { other >= at(k) } else { at(k) >= other };
                         if rising { 1.0 } else { -1.0 }
                     };
+                    let off = match reference {
+                        Some(r) => off / r * seg_speed(keys, i, d, spatial, out).unwrap_or(r),
+                        None => off,
+                    };
                     Ease { speed: dir * (e.speed.abs() + off).max(0.0), influence: e.influence }
                 })
                 .collect();
@@ -163,6 +181,24 @@ fn speed_offset(keys: &mut [Keyframe], spatial: bool, times: &[Tick], off: f64, 
         }
         k.auto_bezier = false;
     }
+}
+
+/// Average speed (units/s) of the segment on one side of key `i`: path distance for spatial
+/// properties, dimension `d` otherwise. `None` at the ends or for a zero-length segment.
+fn seg_speed(keys: &[Keyframe], i: usize, d: usize, spatial: bool, out: bool) -> Option<f64> {
+    let j = if out { i.checked_add(1)? } else { i.checked_sub(1)? };
+    let (a, b) = (keys.get(i)?, keys.get(j)?);
+    let dt = (b.time.seconds() - a.time.seconds()).abs();
+    if dt <= 0.0 {
+        return None;
+    }
+    let (ca, cb) = (a.value.components(), b.value.components());
+    let dv = if spatial {
+        ca.iter().zip(&cb).map(|(x, y)| (y - x).powi(2)).sum::<f64>().sqrt()
+    } else {
+        (cb.get(d).copied().unwrap_or(0.0) - ca.get(d).copied().unwrap_or(0.0)).abs()
+    };
+    (dv > 0.0).then_some(dv / dt)
 }
 
 /// Spatial tangents of one key of a spatial property (motion path handles), relative to the key
@@ -248,7 +284,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Transform Keyframes",
             [],
             None,
-            "{timeScale?, timeAnchor? (comp s), timeOffset? (s), speedOffset? (units/s: the speed graph's vertical drag), valueScale?, valueAnchor?, valueOffset?, dim? | dims?: [d…], merge?, fromStart?: bool (with merge: values are the whole transform since the drag started)}",
+            "{timeScale?, timeAnchor? (comp s), timeOffset? (s), speedOffset? (units/s: the speed graph's vertical drag), speedRef?: {layer, prop, time} (the dragged key: speedOffset is in its units, shared out by speed), valueScale?, valueAnchor?, valueOffset?, dim? | dims?: [d…], merge?, fromStart?: bool (with merge: values are the whole transform since the drag started)}",
             has_keys,
             transform
         ),

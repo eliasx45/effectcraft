@@ -980,10 +980,18 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                     // Value graph: the value. Speed graph (After Effects): up speeds up the motion
                     // entering and leaving the key, down slows it, along with any move in time,
                     // in one edit from where the drag began.
-                    params[if speed { "speedOffset" } else { "valueOffset" }] = json!(value_offset);
-                    params["dim"] = json!(d);
+                    if speed {
+                        // Every dimension and every selected property, each by the same share of
+                        // its own speed as this key (mixed units move together).
+                        params["speedOffset"] = json!(value_offset);
+                        params["speedRef"] = kjson.clone();
+                    } else {
+                        params["valueOffset"] = json!(value_offset);
+                        params["dim"] = json!(d);
+                    }
                 } else if value_ok && speed {
                     params["speedOffset"] = json!(value_offset);
+                    params["speedRef"] = kjson.clone();
                 }
                 actions.push(("keys.transform".into(), params));
             }
