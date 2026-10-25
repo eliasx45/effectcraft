@@ -61,9 +61,13 @@ pub fn available() -> bool {
 /// a registered hardware decoder may take: Apple ProRes, H.264 and HEVC (FilmCraft's labels,
 /// e.g. "Apple ProRes 4444", "H.264 (High)", "HEVC"). The decoder factory itself still declines
 /// streams it doesn't take (10-bit H.264, 4:2:2, interlaced, …), which then decode in software.
+///
+/// An empty description (footage saved by older versions, or never probed) is unknown, not "no":
+/// the factory looks at the stream itself (HWDEC3: a 6K H.264 clip in the owner's project had an
+/// empty codec and always decoded in software).
 pub fn takes_codec(codec: &str) -> bool {
-    let c = codec.to_ascii_lowercase();
-    ["prores", "h.264", "h264", "hevc", "h.265", "h265"].iter().any(|k| c.contains(k))
+    let c = codec.trim().to_ascii_lowercase();
+    c.is_empty() || ["prores", "h.264", "h264", "avc", "hevc", "h.265", "h265"].iter().any(|k| c.contains(k))
 }
 
 #[cfg(test)]
@@ -84,6 +88,7 @@ mod tests {
         }
         assert!(!allowed());
         assert!(takes_codec("Apple ProRes 4444") && takes_codec("H.264 (High)") && takes_codec("HEVC") && takes_codec("H.265"));
-        assert!(!takes_codec("VP9") && !takes_codec("AV1") && !takes_codec("DNxHD") && !takes_codec(""));
+        assert!(!takes_codec("VP9") && !takes_codec("AV1") && !takes_codec("DNxHD") && !takes_codec("mjpeg"));
+        assert!(takes_codec("") && takes_codec("  "), "unknown codecs are left to the decoder factory");
     }
 }

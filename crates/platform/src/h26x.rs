@@ -12,7 +12,10 @@
 //! BLA leaves out its RASL pictures, as the software decoder does. [`VideoDecoder::reset`] (a
 //! seek) starts a fresh session, so no reference picture survives a seek.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::{LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
 use filmcraft_isobmff::SampleEntry;
@@ -24,6 +27,14 @@ use crate::videotoolbox_nal::{self, Session};
 /// Access units decoding at once (asynchronous decompression overlaps decoding a picture with
 /// copying out the previous one).
 const MAX_IN_FLIGHT: usize = 2;
+
+/// A stream layout whose session could not be made is not tried again for this long (HWDEC3: the
+/// M1's H.264 engine refuses 6K, and every decoder FilmCraft makes for such a clip, one per seek
+/// run and per nested request, would otherwise pay a failed session creation first).
+const RETRY: Duration = Duration::from_secs(60);
+
+/// Layouts (codec, coded size, bit depth) VideoToolbox refused, and when.
+static REFUSED: LazyLock<Mutex<HashMap<(NalCodec, (u32, u32), u32), Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Whether this system has a hardware decoder for H.264 or HEVC.
 pub fn hardware_available() -> bool {
@@ -41,13 +52,18 @@ pub fn factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
         }
         Err(_) => return None,
     };
+    let layout = (stream.codec, stream.layout.coded, stream.layout.bits);
+    if REFUSED.lock().unwrap_or_else(PoisonError::into_inner).get(&layout).is_some_and(|at| at.elapsed() < RETRY) {
+        return None;
+    }
     match VtNalDecoder::new(stream.clone()) {
         Ok(hw) => {
             crate::DECODERS.fetch_add(1, Ordering::Relaxed);
             Some(Ok(Box::new(HybridDecoder::new(Box::new(hw), stream))))
         }
         Err(why) => {
-            log::debug!("VideoToolbox {}: not used: {why}", e.codec.name());
+            log::info!("VideoToolbox {} {}x{}: decoding in software: {why}", e.codec.name(), layout.1.0, layout.1.1);
+            REFUSED.lock().unwrap_or_else(PoisonError::into_inner).insert(layout, Instant::now());
             None
         }
     }

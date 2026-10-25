@@ -17,7 +17,7 @@ use filmcraft_isobmff::{CodecConfig, SampleEntry};
 const MAX_SIDE: u32 = 8192;
 
 /// The two NAL-unit codecs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NalCodec {
     H264,
     Hevc,
