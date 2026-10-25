@@ -104,6 +104,12 @@ impl Plane {
 
 /// Box mean of radius `r` along each row (window 2r+1, edge pixels repeated).
 fn box_row(src: &[f32], dst: &mut [f32], r: usize) {
+    box_row_edges(src, dst, r, true);
+}
+
+/// [`box_row`], with `repeat: false` reading zeros outside the row (the GPU's `box_h`
+/// without repeated edges).
+fn box_row_edges(src: &[f32], dst: &mut [f32], r: usize, repeat: bool) {
     let n = src.len();
     if n == 0 {
         return;
@@ -112,7 +118,9 @@ fn box_row(src: &[f32], dst: &mut [f32], r: usize) {
         dst.copy_from_slice(src);
         return;
     }
-    let get = |i: isize| src[i.clamp(0, n as isize - 1) as usize];
+    let get = |i: isize| {
+        if repeat { src[i.clamp(0, n as isize - 1) as usize] } else { usize::try_from(i).ok().and_then(|i| src.get(i)).copied().unwrap_or(0.0) }
+    };
     let norm = 1.0 / (2 * r + 1) as f32;
     let mut acc = 0.0f64;
     for i in -(r as isize)..=(r as isize) {
@@ -151,16 +159,21 @@ pub fn box_radii(sigma: f64, n: usize) -> Vec<usize> {
 
 /// Approximate Gaussian blur of a plane (3 box passes per axis, edges repeated).
 pub fn gauss_plane(p: &Plane, sigma_x: f64, sigma_y: f64) -> Plane {
+    gauss_plane_edges(p, sigma_x, sigma_y, true)
+}
+
+/// [`gauss_plane`]; `repeat: false` treats everything outside the plane as 0.
+pub fn gauss_plane_edges(p: &Plane, sigma_x: f64, sigma_y: f64, repeat: bool) -> Plane {
     let mut cur = p.clone();
     if sigma_x > 0.05 {
         for r in box_radii(sigma_x, 3) {
-            cur = cur.map_rows(|s, d| box_row(s, d, r));
+            cur = cur.map_rows(|s, d| box_row_edges(s, d, r, repeat));
         }
     }
     if sigma_y > 0.05 {
         let mut t = cur.transpose();
         for r in box_radii(sigma_y, 3) {
-            t = t.map_rows(|s, d| box_row(s, d, r));
+            t = t.map_rows(|s, d| box_row_edges(s, d, r, repeat));
         }
         cur = t.transpose();
     }

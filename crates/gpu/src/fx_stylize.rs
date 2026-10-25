@@ -792,8 +792,10 @@ fn roughen_edges(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let ec = ctx.params.color("edgeColor");
     let border = ctx.params.f("border") * b.scale;
     let sharp = ctx.params.f("edgeSharpness").max(0.01) as f32;
-    let infl = ctx.params.f("fractalInfluence") as f32;
-    let scale = (ctx.params.f("scale") * b.scale * 0.1).max(0.5) as f32;
+    // Matched to After Effects 2026 (a masked rectangle, defaults, Border 30, Scale 300, Sharpness 5):
+    // its roughness is ~2.4x finer, pushes ~1.4x further and cuts ~2x harder than our first fit.
+    let infl = ctx.params.f("fractalInfluence") as f32 * 1.4;
+    let scale = (ctx.params.f("scale") * b.scale * 0.042).max(0.5) as f32;
     let (ox, oy) = b.to_px(ctx.params.v2("offset"));
     let oct = ctx.params.f("complexity") as f32;
     let evo = ctx.params.f("evolution") as f32 / 360.0;
@@ -819,8 +821,8 @@ fn roughen_edges(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     };
     let extra = if kind == 4 || kind == 5 { 1.0 } else { 0.0 };
     let seed = ctx.seed ^ 0x40f1 ^ (ctx.params.f("evolutionOptions/randomSeed").round() as i64 as u32).wrapping_mul(0x9e37_79b9);
-    // util::gauss_plane of the alpha (edges repeated); the kernel reads .w.
-    let d = if border > 0.05 { gaussian_blur(e, &b.img, border * 0.5, border * 0.5, true) } else { b.img.clone() };
+    // util::gauss_plane_edges of the alpha (transparent outside); the kernel reads .w.
+    let d = if border > 0.05 { gaussian_blur(e, &b.img, border * 0.5, border * 0.5, false) } else { b.img.clone() };
     let mut p = Params::default();
     p.u[0] = [seed, cycle.is_some() as u32, colored as u32, 0];
     p.f[0] = [ox as f32, oy as f32, scale * sx, scale * sy];
