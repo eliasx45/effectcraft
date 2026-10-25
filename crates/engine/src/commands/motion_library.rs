@@ -277,6 +277,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     r["card"] = card_summary(&card, false);
     r["source"] = json!("remote");
+    super::library::report_problems(s, &snap, &mut r);
     if !needs.is_empty() {
         r["needsFootage"] = json!(needs);
         r["hint"] = json!("Relink each missing item to this video's footage: footage.relink {item, path}");

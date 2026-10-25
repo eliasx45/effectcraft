@@ -22,6 +22,7 @@ mod looks;
 mod markers_essential;
 mod models3d;
 mod orient;
+pub mod plain;
 mod puppet;
 mod roto;
 mod shadow_defaults;
@@ -1245,7 +1246,7 @@ fn import_property(
             }
         }
         if parent.match_id == "effects"
-            && let Some(spec) = effects::effect_id(ae_match).and_then(effectcraft_effects::find)
+            && let Some((spec, _)) = effects::resolve(ae_match)
         {
             let mut group = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), name, size);
             group.enabled = boolean(ir, &["enabled"]).unwrap_or(true);
@@ -1552,6 +1553,10 @@ fn import_native_effect_params(
         losses.push(format!("{context}: effect property depth exceeds 64"));
         return;
     }
+    // Effects known only by their scripting match name map their parameters by AE index.
+    let ae_effect = string(effect_ir, &["match_name"]).unwrap_or("");
+    let spec = effectcraft_effects::find(effect_id);
+    let reviewed = !matches!(effects::resolve(ae_effect), Some((_, false)));
     for child in array(ir, "children") {
         if string(child, &["kind"]) == Some("group") {
             import_native_effect_params(project, group, child, effect_ir, effect_id, layer_time, losses, context, depth + 1);
@@ -1589,7 +1594,11 @@ fn import_native_effect_params(
         ) {
             continue;
         }
-        let Some(path) = effects::param_id(effect_id, raw) else {
+        let mapped = match spec {
+            Some(spec) => effects::native_param(spec, reviewed, ae_effect, raw),
+            None => effects::param_id(effect_id, raw),
+        };
+        let Some(path) = mapped else {
             if !effect_defaults::inert(effect_id, raw, child, effect_ir) {
                 losses.push(format!("{context}: unsupported {effect_id} parameter {raw}"));
             }
@@ -1612,61 +1621,71 @@ fn import_native_effect_params(
         if unauthored_raw_default_point(child, &value) {
             continue; // Keep the native default (the same layer-relative point).
         }
-        // Match each effect's native opacity unit before importing static and keyed values.
-        let scale = if effect_id == "ec.perspective.dropshadow" && path == "opacity" {
-            100.0 / 255.0
-        } else if effect_id == "ec.generate.fill" && path == "opacity" {
-            100.0
-        } else if effect_id == "ec.stylize.glow" {
-            match path {
-                // AE stores Glow Threshold in 0..255 (shown as 60% = 153) and A & B Midpoint as
-                // 0..1; the native controls are percentages.
-                "threshold" => 100.0 / 255.0,
-                "abMidpoint" => 100.0,
-                _ => 1.0,
-            }
-        } else if effect_id == "ec.generate.scribble" {
-            match path {
-                // AE stores Scribble's Opacity, Curviness and Curviness Variation as 0..1
-                // fractions; the native controls are percentages (SceneYard Magnifying Glass:
-                // an untouched 100% Opacity read as 1% hid the scribble).
-                "opacity" | "strokeOptions/curviness" | "strokeOptions/curvinessVariation" => 100.0,
-                _ => 1.0,
-            }
-        } else if effect_id == "ec.stylize.deepglow" && path == "exposure" {
-            // The native Exposure runs at half the plug-in's scale (`exposure_gain`).
-            2.0
-        } else if effect_id == "ec.generate.radiowaves" {
-            match path {
-                // AE's 0..1 Opacity: 1 draws the waves at half strength (measured with aerender).
-                "waveStroke/opacity" => 50.0,
-                // AE's Expansion / Velocity unit is 30 px per second.
-                "waveMotion/expansion" | "waveMotion/velocity" => 30.0,
-                _ => 1.0,
-            }
-        } else {
-            1.0
-        };
-        // Keylight's AE mask selector is already zero-based (0=None, 1=Mask 1) and the generic
-        // AE popup adapter subtracts one; its Source Crops Right / Bottom are edge positions
-        // (100% = uncropped) where the native controls crop that much from the edge.
-        let remap: Option<fn(f64) -> f64> = match (effect_id, path) {
-            ("ec.keying.keylight", "insideMask/insideMask" | "outsideMask/outsideMask") => Some(|v| v + 1.0),
-            ("ec.keying.keylight", "sourceCrops/cropRight" | "sourceCrops/cropBottom") => Some(|v| 100.0 - v),
-            // CC Page Turn's Controls is numeric natively but keeps AE's popup order less one
-            // (SceneYard Patient ID: AE 4 = drag the top-right corner).
-            ("ec.distort.ccpageturn", "controls") => Some(|v| v - 1.0),
-            // Glow Operation: AE lists an option between Normal (1) and Add (3, its default) that
-            // the native list lacks (aerender, SceneYard UI Envelope: 3 adds, 4 multiplies).
-            ("ec.stylize.glow", "glowOperation") => Some(|v| if v >= 3.0 { v - 1.0 } else { 1.0 }),
-            _ => None,
-        };
+        let scale = param_scale(effect_id, path);
+        let remap = param_remap(effect_id, path);
         if let Some(f) = remap {
             let adjusted_value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
             fill_property_mapped(prop, child, adjusted_value, value_type, scale, Some(&f), layer_time, losses, context);
         } else {
             fill_property(prop, child, value, value_type, scale, layer_time, losses, context);
         }
+    }
+}
+
+/// Factor from AE's stored unit to a native effect parameter's unit (applied after
+/// [`param_remap`]): each effect's native opacity unit and percentage controls.
+pub(crate) fn param_scale(effect_id: &str, path: &str) -> f64 {
+    if effect_id == "ec.perspective.dropshadow" && path == "opacity" {
+        100.0 / 255.0
+    } else if effect_id == "ec.generate.fill" && path == "opacity" {
+        100.0
+    } else if effect_id == "ec.stylize.glow" {
+        match path {
+            // AE stores Glow Threshold in 0..255 (shown as 60% = 153) and A & B Midpoint as
+            // 0..1; the native controls are percentages.
+            "threshold" => 100.0 / 255.0,
+            "abMidpoint" => 100.0,
+            _ => 1.0,
+        }
+    } else if effect_id == "ec.generate.scribble" {
+        match path {
+            // AE stores Scribble's Opacity, Curviness and Curviness Variation as 0..1
+            // fractions; the native controls are percentages (SceneYard Magnifying Glass:
+            // an untouched 100% Opacity read as 1% hid the scribble).
+            "opacity" | "strokeOptions/curviness" | "strokeOptions/curvinessVariation" => 100.0,
+            _ => 1.0,
+        }
+    } else if effect_id == "ec.stylize.deepglow" && path == "exposure" {
+        // The native Exposure runs at half the plug-in's scale (`exposure_gain`).
+        2.0
+    } else if effect_id == "ec.generate.radiowaves" {
+        match path {
+            // AE's 0..1 Opacity: 1 draws the waves at half strength (measured with aerender).
+            "waveStroke/opacity" => 50.0,
+            // AE's Expansion / Velocity unit is 30 px per second.
+            "waveMotion/expansion" | "waveMotion/velocity" => 30.0,
+            _ => 1.0,
+        }
+    } else {
+        1.0
+    }
+}
+
+/// Mapping of an AE value before [`param_scale`]. Keylight's AE mask selector is already
+/// zero-based (0=None, 1=Mask 1) and the generic AE popup adapter subtracts one; its Source
+/// Crops Right / Bottom are edge positions (100% = uncropped) where the native controls crop
+/// that much from the edge.
+pub(crate) fn param_remap(effect_id: &str, path: &str) -> Option<fn(f64) -> f64> {
+    match (effect_id, path) {
+        ("ec.keying.keylight", "insideMask/insideMask" | "outsideMask/outsideMask") => Some(|v| v + 1.0),
+        ("ec.keying.keylight", "sourceCrops/cropRight" | "sourceCrops/cropBottom") => Some(|v| 100.0 - v),
+        // CC Page Turn's Controls is numeric natively but keeps AE's popup order less one
+        // (SceneYard Patient ID: AE 4 = drag the top-right corner).
+        ("ec.distort.ccpageturn", "controls") => Some(|v| v - 1.0),
+        // Glow Operation: AE lists an option between Normal (1) and Add (3, its default) that
+        // the native list lacks (aerender, SceneYard UI Envelope: 3 adds, 4 multiplies).
+        ("ec.stylize.glow", "glowOperation") => Some(|v| if v >= 3.0 { v - 1.0 } else { 1.0 }),
+        _ => None,
     }
 }
 
@@ -2283,6 +2302,60 @@ mod tests {
             }
         });
         assert_eq!(selected, Some(Value::Layer(Some(comp.layers[1].id.0))));
+    }
+
+    /// 20-08: Bevel Alpha and Scatter aren't in the reviewed table but have native effects and
+    /// scripting match names, so they import as those effects with their parameters mapped by AE
+    /// index (they were plain groups that rendered nothing); a third-party plug-in stays plain.
+    #[test]
+    fn effects_known_by_match_name_import_as_native_effects() {
+        let ir = serde_json::json!({"schema_version":1,"items":[
+            {"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":2,"frame_rate":30,"layers":[
+                {"id":10,"index":1,"kind":"null","name":"Owner","properties":[
+                    {"kind":"group","match_name":"ADBE Effect Parade","children":[
+                        {"kind":"group","match_name":"ADBE Bevel Alpha","name":"Bevel Alpha","children":[
+                            {"kind":"property","match_name":"ADBE Bevel Alpha-0001","name":"Edge Thickness","value":2.0},
+                            {"kind":"property","match_name":"ADBE Bevel Alpha-0002","name":"Light Angle","value":-35.0,
+                             "keyframes":[{"time":0.0,"value":-35.0},{"time":1.0,"value":45.0}]},
+                            {"kind":"property","match_name":"ADBE Bevel Alpha-0003","name":"Light Color","value_type":"color","value":[1.0,0.5,0.25,1.0]},
+                            {"kind":"property","match_name":"ADBE Bevel Alpha-0004","name":"Light Intensity","value":0.5},
+                            {"kind":"group","match_name":"ADBE Effect Built In Params","name":"Compositing Options","children":[
+                                {"kind":"property","match_name":"ADBE Effect Mask Opacity","value":100.0},
+                                {"kind":"property","match_name":"ADBE Force CPU GPU","value":1.0}
+                            ]}
+                        ]},
+                        {"kind":"group","match_name":"ADBE Scatter","name":"Scatter","children":[
+                            {"kind":"property","match_name":"ADBE Scatter-0001","name":"Scatter Amount","value":5.0},
+                            {"kind":"property","match_name":"ADBE Scatter-0002","name":"Grain","value":2.0},
+                            {"kind":"property","match_name":"ADBE Scatter-0003","name":"Scatter Randomness","value":1.0}
+                        ]},
+                        {"kind":"group","match_name":"PEDG2","name":"Deep Glow 2","children":[
+                            {"kind":"property","match_name":"PEDG2-0001","value":1.0}
+                        ]}
+                    ]}
+                ]}
+            ]}
+        ]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let comp = project.comp(result.item_ids[&1]).unwrap();
+        let fx: Vec<&PropGroup> = comp.layers[0].props.sub("effects").unwrap().groups().collect();
+        assert_eq!(fx[0].kind, GroupKind::Effect { effect: "ec.perspective.bevelalpha".into() });
+        assert_eq!(fx[0].prop("edgeThickness").unwrap().value, Value::Scalar(2.0));
+        let angle = fx[0].prop("lightAngle").unwrap();
+        assert_eq!(angle.keys.iter().map(|k| k.value.clone()).collect::<Vec<_>>(), vec![Value::Scalar(-35.0), Value::Scalar(45.0)]);
+        assert_eq!(fx[0].prop("lightColor").unwrap().value, Value::Color([1.0, 0.5, 0.25, 1.0]));
+        assert_eq!(fx[0].prop("lightIntensity").unwrap().value, Value::Scalar(0.5));
+        assert_eq!(fx[1].kind, GroupKind::Effect { effect: "ec.stylize.scatter".into() });
+        assert_eq!(fx[1].prop("amount").unwrap().value, Value::Scalar(5.0));
+        assert_eq!(fx[1].prop("grain").unwrap().value, Value::Enum(1));
+        assert_eq!(fx[1].prop("randomizeEveryFrame").unwrap().value, Value::Bool(true));
+        assert_eq!(fx[2].kind, GroupKind::Plain);
+        assert!(
+            !result.losses.iter().any(|l| l.contains("Bevel") || l.contains("Scatter") || l.contains("bevelalpha") || l.contains("scatter")),
+            "{:?}",
+            result.losses
+        );
     }
 
     #[test]

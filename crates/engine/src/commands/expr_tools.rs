@@ -81,6 +81,55 @@ pub fn errors_in(ctx: &EvalCtx, check: Option<fn(&str) -> std::result::Result<()
     keep_going().then_some(out)
 }
 
+/// The most expressions [`new_errors`] evaluates (before and after together): a script that
+/// touched a huge project reports nothing rather than stall its reply.
+const NEW_ERRORS_BUDGET: usize = 20_000;
+/// The most errors [`new_errors`] lists.
+const NEW_ERRORS_MAX: usize = 20;
+
+/// Expressions that fail now but didn't in `before`, in the compositions an edit changed (a
+/// script or an applied library card that left an expression reading a missing marker, layer or
+/// match name), each at its comp's current time: `{count, errors: [{comp, compName, layer,
+/// layerName, path, message}]}` (at most [`NEW_ERRORS_MAX`] listed), or `None` when there are
+/// none or the scan would exceed [`NEW_ERRORS_BUDGET`].
+pub(crate) fn new_errors(s: &Session, before: &effectcraft_project::Project) -> Option<Value> {
+    let mut budget = NEW_ERRORS_BUDGET;
+    let mut keep_going = || {
+        budget = budget.checked_sub(1)?;
+        Some(())
+    };
+    let mut found = vec![];
+    for (&cid, comp) in s.project.comps() {
+        let old = before.comp(cid);
+        if old == Some(comp) {
+            continue;
+        }
+        let t = s.time_of(cid);
+        let scan = |project: &effectcraft_project::Project, comp: &effectcraft_project::Comp, keep: &mut dyn FnMut() -> Option<()>| {
+            let ctx = EvalCtx { footage: Some(s.footage.as_ref()), expr: s.expr.as_deref(), ..EvalCtx::new(project, cid, comp, t) };
+            errors_in(&ctx, s.expr_check, || keep().is_some())
+        };
+        let now = scan(&s.project, comp, &mut keep_going)?;
+        if now.is_empty() {
+            continue;
+        }
+        let was = match old {
+            Some(old) => scan(before, old, &mut keep_going)?,
+            None => vec![],
+        };
+        let name = s.project.item(cid).map(|i| i.name.clone()).unwrap_or_default();
+        for e in now.into_iter().filter(|e| !was.iter().any(|w| w.layer == e.layer && w.prop == e.prop && w.message == e.message)) {
+            found.push(json!({"comp": e.comp, "compName": name, "layer": e.layer, "layerName": e.layer_name, "path": e.path, "message": e.message}));
+        }
+    }
+    if found.is_empty() {
+        return None;
+    }
+    let count = found.len();
+    found.truncate(NEW_ERRORS_MAX);
+    Some(json!({"count": count, "errors": found}))
+}
+
 fn error_of(cid: ItemId, i: usize, l: &Layer, p: &Property, message: String, disabled: bool) -> ExprError {
     ExprError {
         comp: cid.0,

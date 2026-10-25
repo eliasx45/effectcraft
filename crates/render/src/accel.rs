@@ -86,6 +86,12 @@ pub trait Accelerator: Send + Sync {
     fn particles(&self) -> Option<&dyn effectcraft_effects::psim::ParticleSim> {
         None
     }
+    /// Blur a mask's `width`×`height` coverage plane for its feather ([`masks::FeatherBlur`],
+    /// with the CPU blur's semantics) and return the `crop` window (x, y, width, height) of the
+    /// result, row-major. `None` = not handled (the CPU blurs it).
+    fn mask_feather(&self, _plane: &[f32], _width: u32, _height: u32, _blur: masks::FeatherBlur, _crop: [u32; 4]) -> Option<Vec<f32>> {
+        None
+    }
     /// Timing history [`Backend::Auto`] uses to send each comp's top-level frames to the
     /// faster compositor. `None` = Auto always tries the accelerator first.
     fn auto_pick(&self) -> Option<&AutoPick> {

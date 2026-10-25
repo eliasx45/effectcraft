@@ -95,6 +95,7 @@ mod fx_tone;
 mod fx_transition;
 mod fx_vr;
 mod fx_warp;
+mod masks_gpu;
 mod ops;
 mod particles;
 mod prepass;
@@ -522,6 +523,11 @@ impl Accelerator for Gpu {
         self.ctx.check_health().is_ok() && self.ctx.can_readback() && effects::supports(id)
     }
 
+    fn mask_feather(&self, plane: &[f32], width: u32, height: u32, blur: effectcraft_render::masks::FeatherBlur, crop: [u32; 4]) -> Option<Vec<f32>> {
+        self.ctx.check_health().ok()?;
+        masks_gpu::feather(&self.ctx, plane, width, height, blur, crop)
+    }
+
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
         self.ctx.check_health().ok()?;
         let mut e = Enc::new(&self.ctx);
@@ -690,6 +696,8 @@ mod tests_init;
 mod tests_inplace;
 #[cfg(test)]
 mod tests_layer_times;
+#[cfg(test)]
+mod tests_masks_gpu;
 #[cfg(test)]
 mod tests_particles;
 #[cfg(test)]

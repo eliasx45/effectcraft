@@ -10,9 +10,10 @@ use rayon::prelude::*;
 
 use crate::eval::EvalCtx;
 
-/// What mask motion blur may do in a render (from the renderer's motion blur gate).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MaskBlur {
+/// What mask motion blur may do in a render (from the renderer's motion blur gate), and the
+/// accelerator that may run mask feathers.
+#[derive(Clone, Copy, Default)]
+pub struct MaskBlur<'a> {
     /// Motion blur is on in this render: the render options, the comp's switch and the Motion
     /// Blur switches of the precomp layers above (when switches affect nested comps).
     pub allowed: bool,
@@ -20,6 +21,60 @@ pub struct MaskBlur {
     pub layer: bool,
     /// Sub-frame samples (the comp's Samples Per Frame; fewer in Draft).
     pub samples: usize,
+    /// The render's active accelerator ([`crate::Renderer::active_accel`]): large feathers blur
+    /// there ([`crate::Accelerator::mask_feather`]); `None` = on the CPU.
+    pub accel: Option<&'a dyn crate::Accelerator>,
+}
+
+impl std::fmt::Debug for MaskBlur<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaskBlur")
+            .field("allowed", &self.allowed)
+            .field("layer", &self.layer)
+            .field("samples", &self.samples)
+            .field("accel", &self.accel.map(|a| a.name()))
+            .finish()
+    }
+}
+
+/// A mask feather's blur of the coverage plane, as the CPU runs it: one box pass of these radii
+/// per axis (Linear falloff, [`box_blur_plane`]) or a Gaussian of these sigmas (3 box passes per
+/// axis, [`gaussian_blur_plane`]), transparent outside the plane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FeatherBlur {
+    Box { rx: usize, ry: usize },
+    Gaussian { sx: f64, sy: f64 },
+}
+
+impl FeatherBlur {
+    /// The CPU blur (the reference [`crate::Accelerator::mask_feather`] matches).
+    pub fn cpu(self, data: &[f32], w: usize, h: usize) -> Vec<f32> {
+        match self {
+            FeatherBlur::Box { rx, ry } => box_blur_plane(data, w, h, rx, ry, 1, false),
+            FeatherBlur::Gaussian { sx, sy } => gaussian_blur_plane(data, w, h, sx, sy, false),
+        }
+    }
+}
+
+/// Coverage planes smaller than this (pixels, padding included) blur on the CPU even with an
+/// accelerator: a round trip costs more than the blur.
+pub const GPU_FEATHER_MIN_PIXELS: usize = 1 << 16;
+
+/// `cov` blurred by `blur` on the accelerator and cropped to the `crop` window (x, y, width,
+/// height); `None` = blur it on the CPU (no accelerator, a small plane, or the accelerator
+/// declined).
+fn feather_on_accel(accel: Option<&dyn crate::Accelerator>, cov: &Mask, blur: FeatherBlur, crop: [u32; 4]) -> Option<Mask> {
+    let accel = accel?;
+    let n = (cov.width as usize).checked_mul(cov.height as usize)?;
+    if n < GPU_FEATHER_MIN_PIXELS || cov.data.len() != n {
+        return None;
+    }
+    let [x, y, w, h] = crop;
+    if x.checked_add(w)? > cov.width || y.checked_add(h)? > cov.height {
+        return None;
+    }
+    let data = accel.mask_feather(&cov.data, cov.width, cov.height, blur, crop)?;
+    (data.len() == (w as usize).checked_mul(h as usize)?).then_some(Mask { width: w, height: h, data })
 }
 
 /// Geometry needed to rasterise masks without allocating RGBA source pixels.
@@ -34,7 +89,7 @@ pub struct Geometry {
 /// Coverage of one mask in buffer pixels (before mode/opacity/invert). With mask motion blur
 /// (Layer ▸ Mask ▸ Motion Blur: On, or Same As Layer with the layer's switch on) an animated
 /// path is averaged over the comp's shutter.
-fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, buf: &Geometry, blur: MaskBlur) -> Option<Mask> {
+fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, buf: &Geometry, blur: MaskBlur<'_>) -> Option<Mask> {
     let mb = blur.allowed
         && match g.kind {
             GroupKind::Mask { motion_blur, .. } => match motion_blur {
@@ -54,7 +109,7 @@ fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, bu
         for i in 0..n {
             let f = phase + angle * i as f64 / (n - 1) as f64;
             let sub = ctx.at(ctx.time + effectcraft_time::Tick::from_seconds_f64(f * fd));
-            let Some(c) = coverage_at(&sub, layer, g, buf) else { continue };
+            let Some(c) = coverage_at(&sub, layer, g, buf, blur.accel) else { continue };
             match &mut acc {
                 None => {
                     let mut c = c;
@@ -66,14 +121,14 @@ fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, bu
         }
         return acc;
     }
-    coverage_at(ctx, layer, g, buf)
+    coverage_at(ctx, layer, g, buf, blur.accel)
 }
 
 /// How far past the layer buffer a feather draws the mask, per axis, at most: a bigger feather
 /// still blurs fully, it just sees the mask no further out than this.
 const MAX_FEATHER_PAD: usize = 1024;
 
-fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, out: &Geometry) -> Option<Mask> {
+fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, out: &Geometry, accel: Option<&dyn crate::Accelerator>) -> Option<Mask> {
     let Value::Path(sp) = ctx.group_value(layer, g, "path")? else { return None };
     let path = effectcraft_path::to_kurbo(&sp);
     let exp = ctx.f(layer, g, "expansion", 0.0);
@@ -133,14 +188,18 @@ fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup,
         });
     }
     if feather[0] > 0.0 || feather[1] > 0.0 {
-        // Coverage is one plane: blur just that.
-        let (w, h) = (cov.width as usize, cov.height as usize);
-        cov.data = if linear {
-            // One box pass: a straight ramp `feather` pixels wide across the edge.
-            box_blur_plane(&cov.data, w, h, box_r(feather[0]), box_r(feather[1]), 1, false)
+        // Coverage is one plane: blur just that. Linear: one box pass, a straight ramp
+        // `feather` pixels wide across the edge.
+        let blur = if linear {
+            FeatherBlur::Box { rx: box_r(feather[0]), ry: box_r(feather[1]) }
         } else {
-            gaussian_blur_plane(&cov.data, w, h, sigma(feather[0]), sigma(feather[1]), false)
+            FeatherBlur::Gaussian { sx: sigma(feather[0]), sy: sigma(feather[1]) }
         };
+        let crop = [u32::try_from(px).ok()?, u32::try_from(py).ok()?, out.width, out.height];
+        if let Some(m) = feather_on_accel(accel, &cov, blur, crop) {
+            return Some(m);
+        }
+        cov.data = blur.cpu(&cov.data, cov.width as usize, cov.height as usize);
     }
     Some(crop(cov, px, py, out.width, out.height))
 }
@@ -212,7 +271,7 @@ pub fn shapes(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_effects::MaskShap
 
 /// Combined layer mask coverage in the supplied geometry.
 /// `None` means there is no applicable closed mask or geometry exceeds the cap.
-pub fn combined(ctx: &EvalCtx, layer: &Layer, buf: &Geometry, blur: MaskBlur) -> Option<Mask> {
+pub fn combined(ctx: &EvalCtx, layer: &Layer, buf: &Geometry, blur: MaskBlur<'_>) -> Option<Mask> {
     let masks = layer.masks()?;
     // An open mask (a path the Pen is still drawing) makes no transparency: the layer shows
     // whole until the path is closed (After Effects; effects still use it as a path).
@@ -260,7 +319,7 @@ pub fn combined(ctx: &EvalCtx, layer: &Layer, buf: &Geometry, blur: MaskBlur) ->
 }
 
 /// Apply the layer's masks to its buffer, sharing coverage with resident sources.
-pub fn apply(ctx: &EvalCtx, layer: &Layer, buf: &mut Buf, blur: MaskBlur) -> bool {
+pub fn apply(ctx: &EvalCtx, layer: &Layer, buf: &mut Buf, blur: MaskBlur<'_>) -> bool {
     let geometry = Geometry { width: buf.img.width, height: buf.img.height, offset: buf.offset, scale: buf.scale };
     let Some(mask) = combined(ctx, layer, &geometry, blur) else { return false };
     buf.img.mul_mask(&mask.data);

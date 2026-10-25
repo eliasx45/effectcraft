@@ -150,11 +150,12 @@ impl<'a> Renderer<'a> {
     }
 
     /// What a layer's mask motion blur may do in this render (see [`masks::MaskBlur`]).
-    pub(crate) fn mask_blur(&self, ctx: &EvalCtx, layer: &Layer) -> masks::MaskBlur {
+    pub(crate) fn mask_blur(&self, ctx: &EvalCtx, layer: &Layer) -> masks::MaskBlur<'a> {
         masks::MaskBlur {
             allowed: self.opts.motion_blur && ctx.comp.enable_motion_blur,
             layer: self.layer_motion_blur(layer),
             samples: if self.opts.draft { 4 } else { ctx.comp.motion_blur_samples as usize },
+            accel: self.active_accel(),
         }
     }
 
