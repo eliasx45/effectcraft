@@ -31,7 +31,12 @@
 //! layer is on. `overlaps` lists pairs of drawn layers whose on-screen boxes overlap by more
 //! than [`OVERLAP_MIN`] of the smaller one, sampled on the grid; layers covering the whole frame
 //! (backgrounds) are left out. Cameras, lights, nulls, hidden (Video off) and content-less layers
-//! are listed with no segments and a summary saying why.
+//! are listed with no segments and a summary saying why, unless other layers are parented to
+//! them: such a rig (a null carrying the keys) is described by what it moves, its segments those
+//! of the child it moves the most (`describedBy`), its children in `moves`.
+//!
+//! A layer whose moves (move / enter / exit) come at least partly from animated parents lists
+//! them in `movedBy` (nearest first), and its summary says which layer to key.
 
 use effectcraft_project::{Layer, LayerId};
 use effectcraft_render::EvalCtx;
@@ -519,6 +524,86 @@ fn val_json(v: Val) -> Value {
     }
 }
 
+/// Most parent links followed, and most descendants a rig is described by.
+const MAX_DEPTH: usize = 64;
+const MAX_RIG_CHILDREN: usize = 64;
+
+/// Whether `l`'s own Transform moves it within `start..=end` (position, anchor, scale or rotation
+/// keys that change, or an expression on one; opacity doesn't move anything).
+fn own_motion(l: &Layer, start: Tick, end: Tick) -> bool {
+    let Some(tr) = l.transform() else { return false };
+    let mut found = false;
+    tr.walk("", &mut |_, p| {
+        if found || p.match_id == "opacity" {
+            return;
+        }
+        if p.has_expression() {
+            found = true;
+            return;
+        }
+        for pair in p.keys.windows(2) {
+            let [a, b] = pair else { continue };
+            let (ta, tb) = (l.comp_time(a.time), l.comp_time(b.time));
+            if a.value != b.value && ta.max(tb) >= start && ta.min(tb) <= end {
+                found = true;
+                return;
+            }
+        }
+    });
+    found
+}
+
+/// The animated layers up `l`'s parent chain, nearest first.
+fn moving_ancestors<'a>(ctx: &EvalCtx<'a>, l: &Layer, start: Tick, end: Tick) -> Vec<&'a Layer> {
+    let mut out = vec![];
+    let mut cur = l.parent.and_then(|p| ctx.comp.layer(p));
+    let mut depth = 0;
+    while let Some(p) = cur {
+        if own_motion(p, start, end) {
+            out.push(p);
+        }
+        depth += 1;
+        cur = if depth < MAX_DEPTH { p.parent.and_then(|q| ctx.comp.layer(q)) } else { None };
+    }
+    out
+}
+
+/// Every layer parented to `id`, directly or further down, with a picture, in stacking order.
+fn drawn_descendants<'a>(ctx: &EvalCtx<'a>, id: LayerId) -> (usize, Vec<&'a Layer>) {
+    let mut all: Vec<&Layer> = vec![];
+    let mut frontier = vec![id];
+    let mut depth = 0;
+    while !frontier.is_empty() && depth < MAX_DEPTH && all.len() < MAX_RIG_CHILDREN {
+        let kids: Vec<&Layer> = ctx.comp.layers.iter().filter(|c| c.parent.is_some_and(|p| frontier.contains(&p))).collect();
+        frontier = kids.iter().map(|c| c.id).collect();
+        all.extend(kids);
+        depth += 1;
+    }
+    all.truncate(MAX_RIG_CHILDREN);
+    let n = all.len();
+    (n, all.into_iter().filter(|c| no_picture(c).is_none()).collect())
+}
+
+fn name_of(l: &Layer) -> &str {
+    if l.name.trim().is_empty() { "The layer" } else { l.name.as_str() }
+}
+
+fn segs_json(s: &[Sample], segs: &[Seg]) -> Value {
+    let tsec = |i: usize| r4(s.get(i).map_or(0.0, |x| x.t.seconds()));
+    segs.iter()
+        .map(|g| {
+            let mut v = json!({"kind": g.kind.name(), "start": tsec(g.a), "end": tsec(g.b), "from": val_json(g.from), "to": val_json(g.to)});
+            if let Some(d) = g.direction {
+                v["direction"] = json!(d);
+            }
+            if let Some(e) = g.edge {
+                v["edge"] = json!(e);
+            }
+            v
+        })
+        .collect()
+}
+
 /// Why a layer has no motion to describe, if it has no picture.
 fn no_picture(l: &Layer) -> Option<String> {
     if !l.source.is_av() {
@@ -572,16 +657,46 @@ pub fn describe(ctx: &EvalCtx, layers: &[LayerId], start: Tick, end: Tick, step:
             "inPoint": r4(l.in_point.seconds()), "outPoint": r4(l.out_point.seconds()),
             "segments": [], "offscreen": [],
         });
+        let measure = |c: &Layer| {
+            let mut times = grid.clone();
+            times.extend(key_times(ctx, c, start, end));
+            times.sort();
+            times.dedup();
+            let s: Vec<Sample> = times.iter().map(|&t| sample(ctx, c, t, w, h)).collect();
+            let segs = segments(&s, step, diag, w, h);
+            (s, segs)
+        };
         if let Some(why) = no_picture(l) {
-            o["summary"] = json!(format!("{} {why}.", if l.name.is_empty() { "The layer" } else { l.name.as_str() }));
+            let (n, kids) = drawn_descendants(ctx, *id);
+            let moving = |g: &&Seg| !matches!(g.kind, Kind::Hold | Kind::FadeIn | Kind::FadeOut);
+            // A rig: described by the child it moves the most.
+            let best = kids.iter().take(MAX_RIG_CHILDREN).map(|c| (*c, measure(c))).max_by_key(|(_, (_, segs))| segs.iter().filter(moving).count());
+            let Some((rep, (s, mut segs))) = best.filter(|_| n > 0 && own_motion(l, start, end)) else {
+                let rig =
+                    if n > 0 { format!(" It parents {n} layer{} but doesn't animate in this range", if n == 1 { "" } else { "s" }) } else { String::new() };
+                o["summary"] = json!(format!("{} {why}.{rig}", name_of(l)));
+                out.push(o);
+                continue;
+            };
+            segs.truncate(MAX_SEGMENTS);
+            let names: Vec<&str> = kids.iter().take(4).map(|c| c.name.as_str()).collect();
+            let more = if kids.len() > names.len() { format!(", +{}", kids.len() - names.len()) } else { String::new() };
+            let lead = format!(
+                "{} is a {} that moves its {} layer{} ({}{more}): it",
+                name_of(l),
+                l.source.type_name().to_lowercase(),
+                kids.len(),
+                if kids.len() == 1 { "" } else { "s" },
+                names.join(", ")
+            );
+            o["segments"] = segs_json(&s, &segs);
+            o["describedBy"] = json!({"layer": rep.id.0, "name": rep.name});
+            o["moves"] = kids.iter().map(|c| json!({"layer": c.id.0, "name": c.name})).collect();
+            o["summary"] = json!(format!("{} (its keys are on this layer).", sentence(&lead, rep, &s, &segs, start, end).trim_end_matches('.')));
             out.push(o);
             continue;
         }
-        let mut times = grid.clone();
-        times.extend(key_times(ctx, l, start, end));
-        times.sort();
-        times.dedup();
-        let s: Vec<Sample> = times.iter().map(|&t| sample(ctx, l, t, w, h)).collect();
+        let (s, segs_all) = measure(l);
         if s.iter().any(|x| x.on) && !s.iter().any(|x| x.geo.is_some()) {
             o["summary"] = json!(format!(
                 "{} has no visible content (an audio-only, empty or behind-the-camera layer), so it has no on-screen motion.",
@@ -590,28 +705,34 @@ pub fn describe(ctx: &EvalCtx, layers: &[LayerId], start: Tick, end: Tick, step:
             out.push(o);
             continue;
         }
-        let mut segs = segments(&s, step, diag, w, h);
+        let mut segs = segs_all;
         if segs.len() > MAX_SEGMENTS {
             segs.truncate(MAX_SEGMENTS);
             truncated = true;
             notes.push(format!("“{}”: only the first {MAX_SEGMENTS} segments are listed", l.name));
         }
-        let tsec = |i: usize| r4(s.get(i).map_or(0.0, |x| x.t.seconds()));
-        o["segments"] = segs
-            .iter()
-            .map(|g| {
-                let mut v = json!({"kind": g.kind.name(), "start": tsec(g.a), "end": tsec(g.b), "from": val_json(g.from), "to": val_json(g.to)});
-                if let Some(d) = g.direction {
-                    v["direction"] = json!(d);
-                }
-                if let Some(e) = g.edge {
-                    v["edge"] = json!(e);
-                }
-                v
-            })
-            .collect();
+        o["segments"] = segs_json(&s, &segs);
         o["offscreen"] = offscreen(&s, l).iter().map(|(a, b)| json!({"start": r4(a.seconds()), "end": r4(b.seconds())})).collect();
-        o["summary"] = json!(sentence(&l.name, l, &s, &segs, start, end));
+        let mut summary = sentence(&l.name, l, &s, &segs, start, end);
+        // Moves that come from animated parents: say which layer carries the keys.
+        let ancestors =
+            if segs.iter().any(|g| matches!(g.kind, Kind::Move | Kind::Enter | Kind::Exit)) { moving_ancestors(ctx, l, start, end) } else { vec![] };
+        if let Some(first) = ancestors.first() {
+            o["movedBy"] = ancestors.iter().map(|a| json!({"layer": a.id.0, "name": a.name})).collect();
+            let who = ancestors.iter().map(|a| format!("“{}”", a.name)).collect::<Vec<_>>().join(", ");
+            let note = if own_motion(l, start, end) {
+                format!(" Its moves combine its own keys with its parent{} {who}.", if ancestors.len() == 1 { "" } else { "s" })
+            } else {
+                format!(
+                    " The moves come from its parent{} {who}: key “{}” (layer {}), not this layer.",
+                    if ancestors.len() == 1 { "" } else { "s" },
+                    first.name,
+                    first.id.0
+                )
+            };
+            summary.push_str(&note);
+        }
+        o["summary"] = json!(summary);
         out.push(o);
         tracked.push((l, s));
     }
