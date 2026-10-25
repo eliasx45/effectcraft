@@ -1,6 +1,6 @@
 [package]
 name = "effectcraft-platform"
-description = "OS media integration (fork-only): hardware ProRes decoding through VideoToolbox for previews, with transparent fallback to FilmCraft's pure-Rust decoder"
+description = "OS media integration (fork-only): hardware ProRes, H.264 and HEVC decoding through VideoToolbox for previews, with transparent fallback to FilmCraft's pure-Rust decoders"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,6 +25,8 @@ effectcraft-media = { workspace = true }
 filmcraft-codecs = { workspace = true }
 filmcraft-color = { workspace = true }
 filmcraft-frame = { workspace = true }
+filmcraft-h264 = { workspace = true }
+filmcraft-hevc = { workspace = true }
 filmcraft-isobmff = { workspace = true }
 filmcraft-prores = { workspace = true }
 filmcraft-time = { workspace = true }
@@ -41,6 +43,8 @@ objc2-core-video = "0.3.2"
 objc2-video-toolbox = "0.3.2"
 
 [dev-dependencies]
+effectcraft-hevcenc = { workspace = true }
+filmcraft-h264enc = { workspace = true }
 effectcraft-project = { workspace = true }
 effectcraft-render = { workspace = true }
 effectcraft-time = { workspace = true }
