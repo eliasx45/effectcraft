@@ -4,7 +4,8 @@
 //! `commands/lint_cmds.rs`; the rules are here.
 //!
 //! The rules ([`RULES`]), checked at each sample time on the comp's own layers (precomps are
-//! one layer each; track-matte sources and adjustment layers are skipped):
+//! one layer each, except for the nested rules; track-matte sources and adjustment layers are
+//! skipped):
 //! - `text-too-small`: the smallest drawn character's font size in comp pixels (the em size
 //!   carried through the character's animator transform, the layer's transform, its parents and
 //!   the camera: what a "72 px" font becomes on screen; cap height is about 70 % of it) is below
@@ -21,6 +22,21 @@
 //!   info for other layers. Layers that cover the whole frame (backgrounds) are skipped.
 //! - `text-overlap`: two visible text layers' boxes overlap by more than 2 % of the smaller one
 //!   (warning; `other` is the second layer).
+//! - `text-off-centre`: a text layer sits in a card (the smallest drawn non-text layer below it
+//!   whose box holds the text's, not a full-frame background) and its glyph box's centre is more
+//!   than 1.5 px off the card's centre, measured along the card's own axes: vertically when the
+//!   card is at most 3 text heights tall (a pill or one-line card), horizontally when the text
+//!   is centre-justified. Warning; `other` is the card.
+//! - `nested-cut-off` ([`lint_nested`]): a layer inside a precomp, measured in this comp's frame
+//!   through the precomp layers' transforms, is partly outside this comp's frame, or partly
+//!   outside its precomp's frame (which clips it unless Collapse Transformations is on).
+//!   Warning for text, info for other layers; the nested layer is [`Finding::inner`]. Text
+//!   inside precomps also gets `text-too-small` and `outside-title-safe`, measured the same way.
+//! - `exposed-edge`: with the comp rendered (only at times its layers' boxes claim 90 % of the
+//!   frame, so overlay comps are skipped), an empty strip of at least 1 px along a frame edge
+//!   while at most a quarter of the frame is empty (a full-screen shot scaled or shaken off the
+//!   frame), or 1 % or more of the frame empty between two fully covered samples (a gap in a
+//!   transition). Warning, on the layer meant to fill the frame.
 //! - `hidden-visible`: a layer with its Video switch on, inside its in/out range, that shows
 //!   nothing: opacity 0, entirely outside the frame, or entirely covered by an opaque layer above
 //!   it (simple cases only: a solid, or footage whose alpha is ignored, at 100 % opacity, Normal
@@ -33,18 +49,30 @@
 //!   ([`accent_time`]: one frame before its vowel, never before its onset) that misses it by
 //!   more than one frame. Warning.
 
-use effectcraft_geom::vec2;
+use effectcraft_geom::{Mat3, vec2};
 use effectcraft_project::{AlphaMode, Comp, ItemId, ItemKind, Layer, LayerId, LayerSource, Project};
 use effectcraft_raster::Image;
-use effectcraft_render::EvalCtx;
+use effectcraft_render::{EvalCtx, Renderer};
 use effectcraft_time::Tick;
 
 use crate::layout;
 use crate::precomp_time::{self, Hop};
 
 /// Every rule id, in report order.
-pub const RULES: [&str; 9] =
-    ["text-too-small", "low-contrast", "outside-title-safe", "outside-action-safe", "cut-off", "text-overlap", "hidden-visible", "off-beat", "off-accent"];
+pub const RULES: [&str; 12] = [
+    "text-too-small",
+    "low-contrast",
+    "outside-title-safe",
+    "outside-action-safe",
+    "cut-off",
+    "nested-cut-off",
+    "text-overlap",
+    "text-off-centre",
+    "hidden-visible",
+    "exposed-edge",
+    "off-beat",
+    "off-accent",
+];
 
 /// Most sample times one lint looks at; longer ranges are thinned evenly (`truncated`).
 pub const MAX_SAMPLES: usize = 120;
@@ -82,9 +110,23 @@ pub struct Finding {
     pub rule: &'static str,
     pub severity: Severity,
     pub layer: LayerId,
-    /// The second layer of a pair rule (`text-overlap`, the cover of `hidden-visible`).
+    /// The second layer of a pair rule (`text-overlap`, the cover of `hidden-visible`, the card of
+    /// `text-off-centre`).
     pub other: Option<LayerId>,
+    /// The layer inside a precomp the finding is about (`layer` is then the precomp layer of
+    /// the linted comp that shows it).
+    pub inner: Option<Inner>,
     pub message: String,
+}
+
+/// A layer inside a precomp, measured in the linted comp's frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Inner {
+    /// The comp the layer is in (the innermost precomp).
+    pub comp: ItemId,
+    pub layer: LayerId,
+    /// "Phone › Screen › Box": the precomp layers down to the layer.
+    pub path: String,
 }
 
 /// What a lint checks and its thresholds.
@@ -212,9 +254,23 @@ struct TextLook {
     color: Option<[f64; 4]>,
 }
 
-fn text_look(ctx: &EvalCtx, l: &Layer) -> Option<TextLook> {
+/// A point of `ctx`'s comp in the linted comp: through `outer`, the precomp layers' layer → comp
+/// matrices from the innermost out (empty when `ctx` is the linted comp itself).
+fn through(outer: &[Mat3], p: [f64; 2]) -> ([f64; 2], bool) {
+    outer.iter().fold((p, true), |(q, ok), m| {
+        let (r, ok2) = layout::to_comp(m, q);
+        (r, ok && ok2)
+    })
+}
+
+fn text_look(ctx: &EvalCtx, l: &Layer, outer: &[Mat3]) -> Option<TextLook> {
     let geom = effectcraft_render::text::text_geom(ctx, l)?;
     let (m, _) = ctx.layer_to_comp(l);
+    let to_linted = |p: [f64; 2]| {
+        let (q, ok) = layout::to_comp(&m, p);
+        let (r, ok2) = through(outer, q);
+        (r, ok && ok2)
+    };
     let (mut px, mut size) = (f64::INFINITY, 0.0);
     let (mut fill, mut nf, mut stroke, mut ns) = ([0.0f64; 4], 0usize, [0.0f64; 4], 0usize);
     for g in &geom.glyphs {
@@ -227,7 +283,7 @@ fn text_look(ctx: &EvalCtx, l: &Layer) -> Option<TextLook> {
         let em = style.size * style.v_scale / 100.0;
         let m2 = g.m2();
         let (a, b) = (m2.apply(vec2(0.0, 0.0)), m2.apply(vec2(0.0, em)));
-        let ((a, oka), (b, okb)) = (layout::to_comp(&m, [a.x, a.y]), layout::to_comp(&m, [b.x, b.y]));
+        let ((a, oka), (b, okb)) = (to_linted([a.x, a.y]), to_linted([b.x, b.y]));
         let d = (b[0] - a[0]).hypot(b[1] - a[1]);
         if oka && okb && d.is_finite() && d < px {
             px = d;
@@ -327,6 +383,61 @@ fn opaque_cover(ctx: &EvalCtx, l: &Layer) -> bool {
         && ctx.opacity(l) >= 1.0 - 1e-6
 }
 
+/// Text off its card's centre by more than this (comp pixels) is flagged.
+const CENTRE_TOL: f64 = 1.5;
+/// Vertical centring is checked when the card is at most this many times the text's height
+/// (a pill or a one-line card; text in a tall card is usually placed on purpose).
+const CENTRE_HEIGHTS: f64 = 3.0;
+
+/// How far the centre of the text's points (the corners of one or more text boxes) is from
+/// the card quad's centre along the card's own axes (`[right, down]` in comp pixels, so rotated
+/// cards work), for each axis that is checked: down when the card is at most
+/// [`CENTRE_HEIGHTS`] times the text's height, right when the text is centre-justified. `None`
+/// when nothing checked is off by more than [`CENTRE_TOL`].
+fn off_centre(text: &[[f64; 2]], card: &[[f64; 2]; 4], check_h: bool) -> Option<[Option<f64>; 2]> {
+    let sub = |a: [f64; 2], b: [f64; 2]| [a[0] - b[0], a[1] - b[1]];
+    let dot = |a: [f64; 2], b: [f64; 2]| a[0] * b[0] + a[1] * b[1];
+    let (u, v) = (sub(card[1], card[0]), sub(card[3], card[0]));
+    let (lu, lv) = (dot(u, u).sqrt(), dot(v, v).sqrt());
+    if lu <= 1e-6 || lv <= 1e-6 || text.is_empty() {
+        return None;
+    }
+    // The text's extent along an axis from the card's first corner: (centre, length).
+    let along = |axis: [f64; 2], len: f64| {
+        let axis = [axis[0] / len, axis[1] / len];
+        let (lo, hi) = text.iter().map(|p| dot(sub(*p, card[0]), axis)).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)));
+        ((lo + hi) / 2.0 - len / 2.0, hi - lo)
+    };
+    let ((dx, _), (dy, h)) = (along(u, lu), along(v, lv));
+    let check_v = lv <= h * CENTRE_HEIGHTS;
+    let pick = |on: bool, x: f64| (on && x.is_finite() && x.abs() > CENTRE_TOL).then_some(x);
+    let off = [pick(check_h, dx), pick(check_v, dy)];
+    (off[0].is_some() || off[1].is_some()).then_some(off)
+}
+
+/// "“Price” is 5.5 px below and 2.0 px right of the centre of its card “Pill”: …".
+fn off_centre_message(text: &str, several: bool, card: &str, off: [Option<f64>; 2]) -> String {
+    let parts: Vec<(String, String)> = [
+        off[1].map(|y| (format!("{:.1} px {}", y.abs(), if y > 0.0 { "below" } else { "above" }), format!("{:.1} px {}", y.abs(), if y > 0.0 { "up" } else { "down" }))),
+        off[0].map(|x| {
+            (format!("{:.1} px {} of", x.abs(), if x > 0.0 { "right" } else { "left" }), format!("{:.1} px {}", x.abs(), if x > 0.0 { "left" } else { "right" }))
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let is: Vec<&str> = parts.iter().map(|p| p.0.as_str()).collect();
+    let fix: Vec<&str> = parts.iter().map(|p| p.1.as_str()).collect();
+    let (verb, them) = if several { ("are", "them") } else { ("is", text) };
+    format!(
+        "{text} {verb} {} the centre of {} card {card} (measured on the drawn glyphs, along the card's own axes): move {them} {} so {} centred in the card.",
+        is.join(" and "),
+        if several { "their" } else { "its" },
+        fix.join(" and "),
+        if several { "they sit" } else { "it sits" }
+    )
+}
+
 /// Every enabled rule (except `off-beat` and `off-accent`, which look at the whole span) at the context time.
 /// `backdrop` (the comp without text) is needed for `low-contrast`.
 pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Vec<Finding> {
@@ -336,7 +447,7 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
     let mattes: Vec<LayerId> = comp.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
     let mut out = vec![];
     let mut push = |rule: &'static str, severity: Severity, l: &Layer, other: Option<LayerId>, message: String| {
-        out.push(Finding { rule, severity, layer: l.id, other, message });
+        out.push(Finding { rule, severity, layer: l.id, other, inner: None, message });
     };
     let mut placed: Vec<Placed> = vec![];
     for l in &comp.layers {
@@ -412,7 +523,7 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
             );
         }
         if p.text {
-            let look = if set.on("text-too-small") || set.on("low-contrast") { text_look(ctx, l) } else { None };
+            let look = if set.on("text-too-small") || set.on("low-contrast") { text_look(ctx, l, &[]) } else { None };
             if set.on("text-too-small")
                 && let Some(t) = &look
                 && t.px < set.min_text_px
@@ -508,6 +619,43 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
             );
         }
     }
+    if set.on("text-off-centre") {
+        let texts: Vec<(usize, &Placed)> = placed.iter().enumerate().filter(|(_, p)| p.text && p.on_screen > EPS).collect();
+        // The card of a text: the smallest drawn layer below it whose box holds the text's.
+        let card_of = |i: usize, p: &Placed| {
+            placed
+                .iter()
+                .enumerate()
+                .skip(i + 1)
+                .filter(|(_, c)| !c.text && !c.full_frame && c.area > p.area && layout::overlap_area(&p.corners, &c.corners) >= p.area * (1.0 - EPS))
+                .min_by(|a, b| a.1.area.total_cmp(&b.1.area))
+                .map(|(j, _)| j)
+        };
+        let cards: Vec<Option<usize>> = texts.iter().map(|(i, p)| card_of(*i, p)).collect();
+        let mut done: Vec<usize> = vec![];
+        for (k, card) in cards.iter().enumerate() {
+            let Some(card) = *card else { continue };
+            if done.contains(&card) {
+                continue;
+            }
+            done.push(card);
+            let Some(c) = placed.get(card) else { continue };
+            // Every text on the card is placed as one block (a name over a role).
+            let group: Vec<&Placed> = texts.iter().zip(&cards).skip(k).filter(|(_, cc)| **cc == Some(card)).map(|(t, _)| t.1).collect();
+            let centred = |p: &Placed| {
+                effectcraft_render::text::text_geom(ctx, p.layer)
+                    .is_some_and(|g| matches!(g.doc.justify, effectcraft_keyframe::Justify::Center | effectcraft_keyframe::Justify::JustifyLastCenter))
+            };
+            let pts: Vec<[f64; 2]> = group.iter().flat_map(|p| p.corners).collect();
+            let Some(off) = off_centre(&pts, &c.corners, group.iter().all(|p| centred(p))) else { continue };
+            let Some(first) = group.first() else { continue };
+            let subject = match group.as_slice() {
+                [one] => name(one.layer),
+                more => format!("{} (together)", more.iter().map(|p| name(p.layer)).collect::<Vec<_>>().join(" and ")),
+            };
+            push("text-off-centre", Severity::Warning, first.layer, Some(c.layer.id), off_centre_message(&subject, group.len() > 1, &name(c.layer), off));
+        }
+    }
     if set.on("text-overlap") {
         let texts: Vec<&Placed> = placed.iter().filter(|p| p.text && p.on_screen > EPS).collect();
         for (i, a) in texts.iter().enumerate() {
@@ -534,6 +682,307 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
     out
 }
 
+/// How many precomps deep [`lint_nested`] looks (a precomp in a precomp in a precomp…).
+pub const MAX_NEST: usize = 4;
+
+/// Layers inside the comp's precomps, measured in the linted comp's frame (agents that look
+/// inside a precomp measure in the precomp's frame and miss what its layer's scale, position
+/// and edge do to it): `nested-cut-off` (part of the layer is outside the linted comp's frame,
+/// or outside the precomp's own frame, which clips it unless Collapse Transformations is on),
+/// and `text-too-small` and `outside-title-safe` for text inside precomps. Up to
+/// [`MAX_NEST`] levels deep. Findings name the precomp layer of the linted comp as `layer` and
+/// the nested layer as [`Finding::inner`].
+pub fn lint_nested(r: &Renderer, ctx: &EvalCtx, set: &Settings) -> Vec<Finding> {
+    let mut out = vec![];
+    if !(set.on("nested-cut-off") || set.on("text-too-small") || set.on("outside-title-safe")) {
+        return out;
+    }
+    let comp = ctx.comp;
+    let mattes: Vec<LayerId> = comp.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
+    for l in &comp.layers {
+        let LayerSource::Comp { item } = l.source else { continue };
+        if mattes.contains(&l.id) || l.switches.adjustment || !layout::visibility(ctx, l).0 {
+            continue;
+        }
+        let (m, _) = ctx.layer_to_comp(l);
+        let walk = Walk { r, set, top: l, w: comp.width as f64, h: comp.height as f64 };
+        walk.precomp(ctx, l, item, &[m], &l.name, 1, &mut out);
+    }
+    out
+}
+
+struct Walk<'a, 'r> {
+    r: &'a Renderer<'r>,
+    set: &'a Settings,
+    /// The precomp layer of the linted comp the walk is under.
+    top: &'a Layer,
+    /// The linted comp's size.
+    w: f64,
+    h: f64,
+}
+
+impl Walk<'_, '_> {
+    /// The layers of `item`, shown by `host` (a layer of `outer_ctx`'s comp); `chain` maps
+    /// `item`'s pixels into the linted comp (innermost first), `path` names the precomp layers.
+    #[allow(clippy::too_many_arguments)]
+    fn precomp(&self, outer_ctx: &EvalCtx, host: &Layer, item: ItemId, chain: &[Mat3], path: &str, depth: usize, out: &mut Vec<Finding>) {
+        let Some(nctx) = self.r.eval_ctx(item, outer_ctx.nested_time(host)) else { return };
+        let nc = nctx.comp;
+        let (nw, nh) = (nc.width as f64, nc.height as f64);
+        let nframe = [[0.0, 0.0], [nw, 0.0], [nw, nh], [0.0, nh]];
+        let mattes: Vec<LayerId> = nc.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
+        let title = safe_rect(self.w, self.h, self.set.title_safe);
+        for il in &nc.layers {
+            if mattes.contains(&il.id) || il.switches.adjustment || !has_picture(nctx.project, il) || !layout::visibility(&nctx, il).0 {
+                continue;
+            }
+            let here = format!("{path} › {}", il.name);
+            if let LayerSource::Comp { item: deeper } = il.source {
+                if depth < MAX_NEST {
+                    let (m, _) = nctx.layer_to_comp(il);
+                    let mut next = Vec::with_capacity(chain.len() + 1);
+                    next.push(m);
+                    next.extend_from_slice(chain);
+                    self.precomp(&nctx, il, deeper, &next, &here, depth + 1, out);
+                }
+                continue;
+            }
+            let Some(g) = layout::layer_geometry(&nctx, il).filter(|g| g.projected) else { continue };
+            let inner_area = layout::polygon_area(&g.corners);
+            // Backgrounds of the precomp (they fill its frame) are its frame, not content.
+            if inner_area <= 1e-9 || layout::overlap_area(&g.corners, &nframe) >= nw * nh * (1.0 - EPS) {
+                continue;
+            }
+            let mut ok = true;
+            let corners = g.corners.map(|p| {
+                let (q, k) = through(chain, p);
+                ok &= k;
+                q
+            });
+            let area = layout::polygon_area(&corners);
+            if !ok || area <= 1e-9 {
+                continue;
+            }
+            let text = matches!(il.source, LayerSource::Text);
+            let inner = Inner { comp: item, layer: il.id, path: here.clone() };
+            let shown = format!("“{here}”");
+            let mut push = |rule: &'static str, severity: Severity, message: String| {
+                out.push(Finding { rule, severity, layer: self.top.id, other: None, inner: Some(inner.clone()), message });
+            };
+            let in_precomp = inside_share(&g.corners, inner_area, [0.0, 0.0, nw, nh]);
+            if in_precomp <= EPS && !host.switches.collapse {
+                continue;
+            }
+            if self.set.on("nested-cut-off") {
+                let on_screen = layout::on_screen_fraction(&corners, self.w, self.h);
+                if !host.switches.collapse && in_precomp < 1.0 - EPS {
+                    push(
+                        "nested-cut-off",
+                        if text { Severity::Warning } else { Severity::Info },
+                        format!(
+                            "{shown} is cut off by the edge of the precomp “{}” ({}×{}): {:.0}% of it is outside that comp's frame, which clips it here. Move it inside the precomp's frame, make the precomp bigger, or switch on Collapse Transformations on “{}”.",
+                            nc_name(nctx.project, item),
+                            nc.width,
+                            nc.height,
+                            (1.0 - in_precomp) * 100.0,
+                            host.name
+                        ),
+                    );
+                } else if on_screen > EPS && on_screen < 1.0 - EPS {
+                    let b = layout::aabb(&corners);
+                    push(
+                        "nested-cut-off",
+                        if text { Severity::Warning } else { Severity::Info },
+                        format!(
+                            "{shown} (inside the precomp “{}”) is cut off by the {} of this comp: {:.0}% of it is outside the frame once the precomp layer's position and scale are applied, though it looks whole inside the precomp. Move or scale it (or the precomp layer) so it is inside the frame{}.",
+                            self.top.name,
+                            edges(b, self.w, self.h),
+                            (1.0 - on_screen) * 100.0,
+                            if text { "" } else { " if it should be seen whole" }
+                        ),
+                    );
+                }
+            }
+            if !text {
+                continue;
+            }
+            if self.set.on("text-too-small")
+                && let Some(t) = text_look(&nctx, il, chain)
+                && t.px < self.set.min_text_px
+            {
+                let severity = if t.px < self.set.min_text_px / 2.0 { Severity::Error } else { Severity::Warning };
+                push(
+                    "text-too-small",
+                    severity,
+                    format!(
+                        "{shown}'s smallest characters are {:.1} px on screen in this comp (font size {:.0} inside the precomp, made smaller by the precomp layers' scale), below the {:.0} px minimum for legible text in a {} px tall frame{}: increase the font size or the precomp layer's scale.",
+                        t.px,
+                        t.size,
+                        self.set.min_text_px,
+                        self.h,
+                        if severity == Severity::Error { " (less than half of it)" } else { "" }
+                    ),
+                );
+            }
+            if self.set.on("outside-title-safe") && layout::on_screen_fraction(&corners, self.w, self.h) > EPS && inside_share(&corners, area, title) < 1.0 - EPS {
+                push(
+                    "outside-title-safe",
+                    Severity::Warning,
+                    format!(
+                        "{shown} (inside the precomp “{}”) reaches {} past this comp's title-safe area ({}% of the frame per side): move it inward or make it smaller.",
+                        self.top.name,
+                        overshoot(layout::aabb(&corners), title),
+                        self.set.title_safe / 2.0
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn nc_name(project: &Project, item: ItemId) -> String {
+    project.item(item).map(|i| i.name.clone()).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------- exposed-edge
+
+/// A pixel with less alpha than this shows what is behind the comp (its background).
+const COVER_ALPHA: f32 = 0.5;
+/// A frame line (row or column) at an edge counts as empty when at least this share of it is.
+const STRIP_SHARE: f64 = 0.5;
+/// A frame counts as covered with at most this share of it empty.
+const COVERED: f64 = 0.001;
+/// An edge strip is only an "exposed edge" when at most this share of the frame is empty (the
+/// rest is covered: a full-screen shot that doesn't quite fill the frame).
+const MOSTLY_COVERED: f64 = 0.25;
+/// A transition gap: at least this share of the frame empty between two covered samples.
+const GAP_SHARE: f64 = 0.01;
+/// Layer boxes must claim this share of the frame before a sample is rendered for
+/// `exposed-edge` (overlay comps that never fill the frame are skipped).
+pub const CLAIM_SHARE: f64 = 0.9;
+
+/// How much of a rendered frame is covered.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Coverage {
+    /// Share (0–1) of the frame's pixels that show the background.
+    pub empty: f64,
+    /// Depth (comp pixels) of the empty strip along the left, right, top and bottom edges.
+    pub strips: [f64; 4],
+}
+
+/// [`Coverage`] of a render (`img`, premultiplied, at `scale` × comp pixels).
+pub fn coverage(img: &Image, scale: f64) -> Coverage {
+    let (w, h) = (img.width as usize, img.height as usize);
+    if w == 0 || h == 0 || scale <= 0.0 {
+        return Coverage::default();
+    }
+    let empty_at = |x: usize, y: usize| img.data.get(y * w + x).is_none_or(|p| p[3] < COVER_ALPHA);
+    let n = img.data.iter().filter(|p| p[3] < COVER_ALPHA).count();
+    let row = |y: usize| (0..w).filter(|&x| empty_at(x, y)).count() as f64 >= w as f64 * STRIP_SHARE;
+    let col = |x: usize| (0..h).filter(|&y| empty_at(x, y)).count() as f64 >= h as f64 * STRIP_SHARE;
+    let depth = |lines: &mut dyn Iterator<Item = bool>| lines.take_while(|e| *e).count() as f64 / scale;
+    Coverage {
+        empty: n as f64 / (w * h) as f64,
+        strips: [
+            depth(&mut (0..w).map(col)),
+            depth(&mut (0..w).rev().map(col)),
+            depth(&mut (0..h).map(row)),
+            depth(&mut (0..h).rev().map(row)),
+        ],
+    }
+}
+
+/// The share (0–1, capped) of the frame the drawn layers' boxes claim at the context time, and
+/// the layer claiming most of it (the shot meant to fill the frame). Whether the frame is
+/// certainly covered (an opaque solid or alpha-less footage over all of it) comes third: no
+/// render is needed then.
+pub fn frame_claim(ctx: &EvalCtx) -> (f64, Option<LayerId>, bool) {
+    let comp = ctx.comp;
+    let (w, h) = (comp.width as f64, comp.height as f64);
+    let frame = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+    let (mut sum, mut best, mut covered) = (0.0, None::<(LayerId, f64)>, false);
+    let mattes: Vec<LayerId> = comp.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
+    for l in &comp.layers {
+        if mattes.contains(&l.id) || l.switches.adjustment || !has_picture(ctx.project, l) || !layout::visibility(ctx, l).0 {
+            continue;
+        }
+        let Some(g) = layout::layer_geometry(ctx, l).filter(|g| g.projected) else { continue };
+        let a = layout::overlap_area(&g.corners, &frame);
+        sum += a;
+        if best.is_none_or(|(_, b)| a > b) {
+            best = Some((l.id, a));
+        }
+        covered |= a >= w * h * (1.0 - EPS) && opaque_cover(ctx, l);
+    }
+    let area = (w * h).max(1e-9);
+    ((sum / area).min(1.0), best.map(|b| b.0), covered)
+}
+
+/// "a 12 px strip along the bottom edge and 3 px along the left edge".
+fn strips_text(s: [f64; 4]) -> String {
+    let parts: Vec<String> = s
+        .iter()
+        .zip(["left", "right", "top", "bottom"])
+        .filter(|(d, _)| **d >= 1.0)
+        .map(|(d, side)| format!("{d:.0} px along the {side} edge"))
+        .collect();
+    parts.join(" and ")
+}
+
+/// `exposed-edge` findings from the coverage of rendered samples (`(time, coverage, the layer
+/// meant to fill the frame)`, in time order): an empty strip along a frame edge while the rest
+/// is covered, and frames with part of the picture empty between two covered samples (a gap in
+/// a transition).
+pub fn exposed_edges(comp: &Comp, samples: &[(Tick, Coverage, LayerId)]) -> Vec<(Tick, Finding)> {
+    let mut out = vec![];
+    let finding = |layer: LayerId, other: Option<LayerId>, message: String| Finding { rule: "exposed-edge", severity: Severity::Warning, layer, other, inner: None, message };
+    for (i, (t, c, lid)) in samples.iter().enumerate() {
+        let Some(l) = comp.layer(*lid) else { continue };
+        if c.strips.iter().any(|d| *d >= 1.0) && c.empty <= MOSTLY_COVERED {
+            out.push((
+                *t,
+                finding(
+                    l.id,
+                    None,
+                    format!(
+                        "The frame is not fully covered: a {} shows the comp's background (nothing is drawn there) while {} fills the rest. Scale or move {} so it covers the whole frame, or put a full-frame layer under it.",
+                        strips_text(c.strips),
+                        name(l),
+                        name(l)
+                    ),
+                ),
+            ));
+            continue;
+        }
+        // A gap between two covered samples: reported on the shot going out, with the one
+        // coming in as `other`, so one transition is one problem.
+        let covered = |s: &&(Tick, Coverage, LayerId)| s.1.empty <= COVERED;
+        let before = samples.get(..i).and_then(|b| b.iter().rev().find(covered));
+        let after = samples.get(i + 1..).and_then(|a| a.iter().find(covered));
+        let (Some(b), Some(a)) = (before, after) else { continue };
+        let (Some(out_l), Some(in_l)) = (comp.layer(b.2), comp.layer(a.2)) else { continue };
+        if c.empty < GAP_SHARE {
+            continue;
+        }
+        let shots = if out_l.id == in_l.id { name(out_l) } else { format!("{} and {}", name(out_l), name(in_l)) };
+        out.push((
+            *t,
+            finding(
+                out_l.id,
+                (in_l.id != out_l.id).then_some(in_l.id),
+                format!(
+                    "{:.0}% of the frame shows the comp's background at {:.3} s, between {:.3} s and {:.3} s where the frame is fully covered: a gap in the transition. Overlap {shots} (or extend one of them) so something covers every frame.",
+                    c.empty * 100.0,
+                    t.seconds(),
+                    b.0.seconds(),
+                    a.0.seconds()
+                ),
+            ),
+        ));
+    }
+    out
+}
+
 /// A finding over a span of sample times.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Problem {
@@ -554,6 +1003,7 @@ pub fn merge(occurrences: Vec<(Tick, Finding)>) -> Vec<Problem> {
             p.finding.rule == f.rule
                 && p.finding.layer == f.layer
                 && p.finding.other == f.other
+                && p.finding.inner.as_ref().map(|i| (i.comp, i.layer)) == f.inner.as_ref().map(|i| (i.comp, i.layer))
                 && (!matches!(f.rule, "off-beat" | "off-accent") || p.time == t)
         };
         match out.iter_mut().find(|p| same(p)) {
@@ -688,6 +1138,7 @@ pub fn off_beat(comp: &Comp, moments: &[KeyMoment], beats: &[f64], fps: f64) -> 
                 severity: Severity::Warning,
                 layer: l.id,
                 other: None,
+                inner: None,
                 message: format!(
                     "{}'s {} at {:.3} s is {frames} frames {} the beat at {:.3} s (beats every {:.3} s, about {:.0} BPM): move it to {:.3} s to land on the beat.",
                     name(l),
@@ -1090,6 +1541,7 @@ pub fn off_accent(
                 severity: Severity::Warning,
                 layer: shown.id,
                 other: None,
+                inner: None,
                 message: format!(
                     "{}'s {} speed peak{where_} at {:.3} s (frame {:.1}) is {frames} frames {} the stressed syllable of \"{}\" (onset {:.3} s, vowel {:.3} s; accent at {:.3} s, frame {:.0}): move the peak by {:+.0} frames, to {:.3} s, to land on the accent (keys.alignPeak {{{call}, frame: {:.0}}}).",
                     name(l),

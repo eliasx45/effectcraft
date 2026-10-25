@@ -1,7 +1,8 @@
 //! `render.lint`: design problems in a comp at a time or over a time range, in plain language an
 //! agent can act on (MCP `lint_frame`). The rules are [`crate::lint`]; this samples the times,
-//! renders the text-free backdrop `low-contrast` measures, mixes the audio `off-beat` needs and
-//! reads the comp's speech map for `off-accent`.
+//! renders the text-free backdrop `low-contrast` measures and the frames `exposed-edge` checks
+//! for empty pixels, walks the precomps for the nested rules, mixes the audio `off-beat` needs
+//! and reads the comp's speech map for `off-accent`.
 
 use effectcraft_project::{ItemId, LayerSource, Project};
 use effectcraft_render::{Backend, RenderOpts, Renderer};
@@ -131,6 +132,7 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
     let text_free = if set.on("low-contrast") && has_text { lint::without_text(&s.project, cid) } else { None };
     let scale = (lint::BACKDROP_SIDE / comp.width.max(comp.height).max(1) as f64).min(1.0);
     let mut occurrences = vec![];
+    let mut coverage = vec![];
     for &t in &times {
         let Some(ctx) = r.eval_ctx(cid, t) else { continue };
         let backdrop = match &text_free {
@@ -138,7 +140,16 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
             _ => None,
         };
         occurrences.extend(lint::lint_at(&ctx, &set, backdrop.as_ref()).into_iter().map(|f| (t, f)));
+        occurrences.extend(lint::lint_nested(&r, &ctx, &set).into_iter().map(|f| (t, f)));
+        if set.on("exposed-edge")
+            && let (claim, Some(main), covered) = lint::frame_claim(&ctx)
+            && claim >= lint::CLAIM_SHARE
+        {
+            let c = if covered { lint::Coverage::default() } else { lint::coverage(&render_backdrop(s, &s.project, cid, t, scale, comp.background).img, scale) };
+            coverage.push((t, c, main));
+        }
     }
+    occurrences.extend(lint::exposed_edges(comp, &coverage));
 
     let mut notes: Vec<String> = vec![];
     if set.on("off-beat") {
@@ -203,6 +214,9 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
                 o["other"] = json!(other.0);
                 o["otherName"] = json!(comp.layer(other).map(|l| l.name.as_str()).unwrap_or(""));
             }
+            if let Some(i) = &f.inner {
+                o["inner"] = json!({"comp": i.comp.0, "layer": i.layer.0, "path": i.path});
+            }
             o
         })
         .collect();
@@ -223,7 +237,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![query!(
         "render.lint",
         "Design Lint",
-        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: [text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|text-overlap|hidden-visible|off-beat|off-accent] (default all), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?}], notes}",
+        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: [text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|nested-cut-off|text-overlap|text-off-centre|hidden-visible|exposed-edge|off-beat|off-accent] (default all), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner? {comp, layer, path} (a layer inside a precomp: `layer` is the precomp layer showing it)}], notes}",
         render_lint
     )]
 }

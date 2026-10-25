@@ -267,7 +267,7 @@
         "size": 56,
         "position": [
           600,
-          850
+          855
         ],
         "fill": "#FFFFFF",
         "name": "Name"
@@ -280,7 +280,7 @@
         "size": 40,
         "position": [
           600,
-          900
+          905
         ],
         "fill": "#DDE6FF",
         "name": "Role"
