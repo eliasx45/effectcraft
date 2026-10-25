@@ -238,7 +238,7 @@ pub trait FootageSource: Send + Sync {
     /// Settings ▸ Disk ▸ Conformed Audio Folder: where decoded audio is kept between reads
     /// (`None` = off); sources that don't decode audio ignore it.
     fn set_conform_folder(&self, _folder: Option<std::path::PathBuf>) {}
-    /// Settings ▸ Previews ▸ Hardware ProRes Decoding: let previews decode footage on a hardware
+    /// Settings ▸ Previews ▸ Hardware Video Decoding: let previews decode footage on a hardware
     /// decoder (visually identical, not bit-exact). Sources without one ignore it.
     fn set_hardware_decoding(&self, _on: bool) {}
     /// Settings ▸ Media & Disk Cache ▸ Disk Cache: where decoded stills that are slow to decode

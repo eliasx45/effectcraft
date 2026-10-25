@@ -30,7 +30,7 @@ impl Session {
         self.apply_cache_budgets();
         self.configure_disk_cache();
         self.footage.set_conform_folder(self.conformed_audio_folder());
-        // Settings ▸ Previews ▸ Hardware ProRes Decoding (previews only: exports read the exact view).
+        // Settings ▸ Previews ▸ Hardware Video Decoding (previews only: exports read the exact view).
         self.footage.set_hardware_decoding(self.prefs.previews.hardware_pro_res_decoding);
         // Switches Affect Nested Comps changes what precomp layers render: drop cached pixels.
         let nested = self.prefs.general.switches_affect_nested_comps;

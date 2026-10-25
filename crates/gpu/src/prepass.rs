@@ -47,9 +47,8 @@ impl Drop for Prefetched {
 pub(crate) fn run<'a>(e: &Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: (u32, u32), resident: bool) -> Prefetched {
     let resident = resident && e.can_retain_resident();
     let held = |slot: u64| READY.try_with(|m| m.try_borrow().map(|m| m.contains_key(&slot)).unwrap_or(true)).unwrap_or(true);
-    // Shape layers the walk rasterises on the GPU (`shapes_gpu`): no CPU raster ahead of it.
-    let gpu_shapes: Vec<&Layer> =
-        if crate::shapes_gpu::enabled() { visible.iter().copied().filter(|l| r.shape_raster_eligible(ctx, l)).collect() } else { Vec::new() };
+    // Shape and text layers the walk rasterises on the GPU (`shapes_gpu`): no CPU raster ahead.
+    let gpu_shapes: Vec<&Layer> = visible.iter().copied().filter(|l| crate::shapes_gpu::eligible(r, ctx, l)).collect();
     let on_gpu = |key: u64, slot: u64| gpu_shapes.iter().any(|l| prefetch_slot(ctx, l, key) == slot);
     let have = |key: u64, slot: u64| held(slot) || e.has_resident(key, GpuStage::Processed) || on_gpu(key, slot);
     let made = r.prefetch(ctx, visible, canvas, resident.then_some(&have as &dyn Fn(u64, u64) -> bool));

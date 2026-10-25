@@ -11,9 +11,9 @@
 //! [`super::skia_scan::scan_edges`] unchanged.
 //!
 //! [`Renderer::shape_raster_plan`] declines (`None`: the CPU renders the layer) whatever the plan
-//! can't reproduce yet: masks, motion-blurred shape sub-frames, draws in blend modes other than
-//! Normal, Taper / Wave strokes (supersampled further on the CPU), paths reaching outside their
-//! draw's mask (tiny-skia clips those edges first), masks over 8191 px and runaway edge counts.
+//! can't reproduce yet: masks the GPU can't apply ([`crate::masks::gpu_plan`]), motion-blurred shape sub-frames, draws in blend modes other than
+//! Normal, Taper / Wave strokes (supersampled further on the CPU), masks over 8191 px and runaway
+//! edge counts. Paths reaching outside their draw's mask are clipped as tiny-skia clips them.
 
 use effectcraft_color::BlendMode;
 use effectcraft_geom::{Mat3, vec2};
@@ -31,7 +31,7 @@ use crate::{ContentClip, Renderer};
 pub enum PlanPaint {
     /// Straight RGBA.
     Solid([f32; 4]),
-    Gradient(PlanGradient),
+    Gradient(Box<PlanGradient>),
 }
 
 /// A gradient fill or stroke: the ramp of [`GradientRamp`] and the stops of
@@ -89,7 +89,7 @@ impl Renderer<'_> {
     /// without evaluating its contents; [`Self::shape_raster_plan`] can still decline).
     pub fn shape_raster_eligible(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         matches!(layer.source, LayerSource::Shape)
-            && layer.masks().is_none_or(|m| m.children.is_empty())
+            && crate::masks::gpu_plan::gpu_eligible(layer)
             && self.content_times(ctx, layer).is_none()
             && layer.props.sub("contents").is_some()
     }
@@ -183,7 +183,7 @@ fn plan(ctx: &EvalCtx, layer: &Layer, contents: &effectcraft_project::PropGroup,
             Paint::Gradient { g, kind, width, start, end, highlight, .. } => {
                 // As `render_window`: identity when the paint space is degenerate.
                 let to_local = (m * d.xf).inverse().unwrap_or(Mat3::IDENTITY);
-                PlanPaint::Gradient(gradient(g, GradientRamp::new(*kind, *start, *end, *width, *highlight), &to_local)?)
+                PlanPaint::Gradient(Box::new(gradient(g, GradientRamp::new(*kind, *start, *end, *width, *highlight), &to_local)?))
             }
         };
         out.push(PlanDraw { rect: [r.x0, r.y0, r.w, r.h], even_odd: rule == FillRule::EvenOdd, edges, opacity: d.opacity, paint });

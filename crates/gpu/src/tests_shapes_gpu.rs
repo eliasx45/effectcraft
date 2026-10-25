@@ -31,7 +31,7 @@ fn scene(depth: BitDepth) -> Scene {
     let mut sc = Scene::new(depth);
     let bg = sc.footage(97, 61);
     sc.push(bg);
-    let mut layers: Vec<_> = (0..4).map(|i| build::layer(&mut sc.p, &sc.comp, &format!("Shape {i}"), LayerSource::Shape, (97, 61), None)).collect();
+    let mut layers: Vec<_> = (0..5).map(|i| build::layer(&mut sc.p, &sc.comp, &format!("Shape {i}"), LayerSource::Shape, (97, 61), None)).collect();
     let mut next = sc.p.next_id;
     let mut ids = Ids(&mut next);
 
@@ -64,7 +64,12 @@ fn scene(depth: BitDepth) -> Scene {
     fill.prop_mut("opacity").unwrap().value = Value::Scalar(60.0);
     let repeated = vec![build::shape_rect(&mut ids, [9.0, 13.0], [0.0, 0.0], 2.0), fill, build::shape_repeater(&mut ids, 4.0, [12.5, 1.5])];
 
-    for (l, items) in layers.iter_mut().zip([card, star, trimmed, repeated]) {
+    // Reaching far past the comp's corner: its edges are clipped to the window first.
+    let mut rim = build::shape_stroke(&mut ids, [0.3, 0.9, 0.4, 1.0], 7.0);
+    rim.prop_mut("cap").unwrap().value = Value::Enum(1);
+    let off = vec![build::shape_ellipse(&mut ids, [90.0, 70.0], [0.0, 0.0]), rim, build::shape_fill(&mut ids, [0.8, 0.5, 0.2, 0.9])];
+
+    for (l, items) in layers.iter_mut().zip([card, star, trimmed, repeated, off]) {
         l.props.sub_mut("contents").unwrap().children.push(build::shape_group(&mut ids, "Group", items).into());
     }
     sc.p.next_id = next;
@@ -77,6 +82,12 @@ fn scene(depth: BitDepth) -> Scene {
     layers[1].props.prop_mut("transform/rotation").unwrap().keys = key(Value::Scalar(0.0), Value::Scalar(40.0));
     set(&mut layers[2], "transform/position", Value::Vec3([28.0, 44.0, 0.0]));
     set(&mut layers[3], "transform/position", Value::Vec3([50.0, 50.0, 0.0]));
+    set(&mut layers[4], "transform/position", Value::Vec3([88.0, 6.0, 0.0]));
+    set(&mut layers[4], "transform/rotation", Value::Scalar(-17.0));
+    set(&mut layers[4], "transform/scale", Value::Vec3([180.0, 150.0, 100.0]));
+    // Below the others, so their indices stay put.
+    let off = layers.pop().unwrap();
+    sc.push(off);
     for l in layers {
         sc.push(l);
     }
@@ -151,14 +162,15 @@ fn frames_with_gpu_rasterised_shapes_match_the_cpu() {
     }
 }
 
-/// What the plan can't reproduce stays on the CPU: masks, non-Normal draws, Taper strokes.
+/// What the plan can't reproduce stays on the CPU: non-Normal draws, Taper strokes (masks no
+/// longer: MASK-GPU2).
 #[test]
 fn shapes_the_gpu_cannot_match_stay_on_the_cpu() {
     let mut sc = scene(BitDepth::Bpc8);
     let mut next = sc.p.next_id;
     let mut ids = Ids(&mut next);
     let comp = sc.p.comp_mut(sc.cid).unwrap();
-    // `Scene::push` puts each layer on top: [repeated, trimmed, star, card, backdrop].
+    // `Scene::push` puts each layer on top: [repeated, trimmed, star, card, off-comp, backdrop].
     // The card gets a mask.
     let m = build::mask(&mut ids, "Mask 1", ShapePath::rect([10.0, 10.0], 40.0, 30.0), MaskMode::Add, [255, 255, 0]);
     comp.layers[3].props.sub_mut("masks").unwrap().children.push(m.into());
@@ -180,8 +192,9 @@ fn shapes_the_gpu_cannot_match_stay_on_the_cpu() {
         let (_, clip) = r.resident_content(&ctx, l).expect("keyed");
         r.shape_raster_plan(&ctx, l, clip)
     };
-    assert!(!r.shape_raster_eligible(&ctx, shapes[3]), "masked");
-    assert!(plan(3).is_none(), "masked");
+    // A plain mask is drawn on the GPU too (MASK-GPU2, `tests_masks_gpu`).
+    assert!(r.shape_raster_eligible(&ctx, shapes[3]), "masked");
+    assert!(plan(3).is_some(), "masked");
     assert!(plan(2).is_none(), "Multiply fill");
     assert!(plan(1).is_none(), "tapered stroke");
     let repeated = plan(0).expect("plain fills plan");

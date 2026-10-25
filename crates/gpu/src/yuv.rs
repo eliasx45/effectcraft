@@ -225,9 +225,13 @@ pub(crate) fn decode(e: &mut Enc, view: View<'_>) -> Option<GpuImage> {
     if !g.fits(view.width, view.height) {
         return None;
     }
-    let y = upload(g, view.planes[0])?;
-    let u = upload(g, view.planes[1])?;
-    let v = upload(g, view.planes[2])?;
+    // HWDEC2: the hardware decoder's own surface when the platform can share it, else an upload.
+    let surface = crate::surface::planes(e, view);
+    let from_surface = surface.is_some();
+    let [y, u, v] = match surface {
+        Some(planes) => planes,
+        None => [upload(g, view.planes[0])?, upload(g, view.planes[1])?, upload(g, view.planes[2])?],
+    };
     let a = match view.alpha {
         Some(a) => Some(upload(g, a)?),
         None => None,
@@ -271,10 +275,13 @@ pub(crate) fn decode(e: &mut Enc, view: View<'_>) -> Option<GpuImage> {
         ],
     });
     e.custom_pixels("yuv_decode", &p.decode, &bg, (view.width, view.height));
-    for t in [Some(y), Some(u), Some(v), a].into_iter().flatten() {
-        e.stage(t);
+    // (surface planes are not upload planes: they don't go back to the upload pool)
+    if !from_surface {
+        for t in [Some(y), Some(u), Some(v), a].into_iter().flatten() {
+            e.stage(t);
+        }
+        g.transfers.count_yuv(input_bytes);
     }
-    g.transfers.count_yuv(input_bytes);
     Some(out)
 }
 

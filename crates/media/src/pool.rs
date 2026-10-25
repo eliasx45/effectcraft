@@ -505,7 +505,7 @@ struct Inner {
     done: Condvar,
     budget: AtomicU64,
     read_ahead: AtomicBool,
-    /// Settings ▸ Previews ▸ Hardware ProRes Decoding: preview reads of ProRes footage may use a
+    /// Settings ▸ Previews ▸ Hardware Video Decoding: preview reads of ProRes footage may use a
     /// registered hardware decoder (off by default; the exact view never does).
     hardware: AtomicBool,
     hits: AtomicU64,
@@ -546,7 +546,7 @@ struct Inner {
 ///   next ones cached.
 /// - Concurrent requests for the same frame decode it once: the others wait for it.
 ///
-/// Hardware decoding (Settings ▸ Previews ▸ Hardware ProRes Decoding, [`crate::hw`]) is for
+/// Hardware decoding (Settings ▸ Previews ▸ Hardware Video Decoding, [`crate::hw`]) is for
 /// previews only: [`MediaPool::exact`] is a view of the same pool that always decodes exactly,
 /// and exports read footage through it ([`FootageSource::exact`]). Frames, open sources and
 /// decode-aheads are kept apart by that choice, so the exact view never sees a hardware frame.
@@ -632,7 +632,7 @@ impl MediaPool {
         Self { inner, exact: false, twin }
     }
 
-    /// Settings ▸ Previews ▸ Hardware ProRes Decoding: let this pool's preview reads of ProRes
+    /// Settings ▸ Previews ▸ Hardware Video Decoding: let this pool's preview reads of ProRes
     /// footage use a registered hardware decoder ([`crate::hw`]). Off by default; the
     /// [`MediaPool::exact`] view never does.
     pub fn set_hardware_decoding(&self, on: bool) {

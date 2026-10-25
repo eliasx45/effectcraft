@@ -25,14 +25,17 @@ use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFStr
 use objc2_core_media::{CMFormatDescription, CMTime, CMVideoFormatDescriptionCreateFromH264ParameterSets, CMVideoFormatDescriptionCreateFromHEVCParameterSets};
 use objc2_core_video::{
     CVImageBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane,
-    CVPixelBufferGetPixelFormatType, CVPixelBufferGetPlaneCount, CVPixelBufferGetWidth, CVPixelBufferGetWidthOfPlane, kCVPixelBufferPixelFormatTypeKey,
+    CVPixelBufferGetPixelFormatType, CVPixelBufferGetPlaneCount, CVPixelBufferGetWidth, CVPixelBufferGetWidthOfPlane, kCVPixelBufferIOSurfacePropertiesKey,
+    kCVPixelBufferMetalCompatibilityKey, kCVPixelBufferPixelFormatTypeKey,
 };
 use objc2_video_toolbox::{
     VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionOutputCallbackRecord, VTDecompressionSession,
     kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
 };
 
+use crate::metal_surface::Surface;
 use crate::nal::{Layout, NalCodec, NalStream};
+use crate::surfaces::{self, Luma};
 use crate::videotoolbox::{Locked, sample_buffer};
 
 /// Biplanar Y + interleaved CbCr 4:2:0 buffers: 8-bit, or 10-bit in the high bits of 16-bit words;
@@ -190,6 +193,7 @@ fn copy_out(pb: &CVImageBuffer, s: &Shared) -> Result<VideoFrame, String> {
     if ys.width < ox + w || ys.height < oy + h || ys.stride < ys.width * bps || cs.width < cox + cw || cs.height < coy + ch || cs.stride < cs.width * 2 * bps {
         return Err("decoded picture planes are smaller than the picture".into());
     }
+    let luma;
     let data = if bps == 1 {
         let mut yp = Vec::with_capacity(w * h);
         for y in 0..h {
@@ -202,7 +206,9 @@ fn copy_out(pb: &CVImageBuffer, s: &Shared) -> Result<VideoFrame, String> {
                 v.push(pair[1]);
             }
         }
-        PixelData::Yuv8 { planes: [Arc::new(yp), Arc::new(u), Arc::new(v)], chroma: Chroma::C420, alpha: None }
+        let yp = Arc::new(yp);
+        luma = Luma::U8(Arc::downgrade(&yp));
+        PixelData::Yuv8 { planes: [yp, Arc::new(u), Arc::new(v)], chroma: Chroma::C420, alpha: None }
     } else {
         let shift = 16u32.saturating_sub(l.bits);
         let mut yp = Vec::with_capacity(w * h);
@@ -216,9 +222,15 @@ fn copy_out(pb: &CVImageBuffer, s: &Shared) -> Result<VideoFrame, String> {
                 v.push(u16::from_ne_bytes([q[2], q[3]]) >> shift);
             }
         }
-        PixelData::Yuv16 { planes: [Arc::new(yp), Arc::new(u), Arc::new(v)], chroma: Chroma::C420, bits: l.bits, alpha: None }
+        let yp = Arc::new(yp);
+        luma = Luma::U16(Arc::downgrade(&yp));
+        PixelData::Yuv16 { planes: [yp, Arc::new(u), Arc::new(v)], chroma: Chroma::C420, bits: l.bits, alpha: None }
     };
     drop(lock);
+    // HWDEC2: the GPU may read this picture from the decoder's surface instead of uploading it.
+    if surfaces::enabled() {
+        surfaces::keep(luma, (w as u32, h as u32), l.bits, (ox as u32, oy as u32), Surface::retain(pb));
+    }
     Ok(VideoFrame { width: w as u32, height: h as u32, data, color: l.color, par: l.par, pts: filmcraft_time::Tick::ZERO })
 }
 
@@ -262,7 +274,12 @@ impl Session {
         let pf = CFNumber::new_i32(pixel_format as i32);
         // SAFETY: reading an immutable framework constant.
         let pf_key: &CFString = unsafe { kCVPixelBufferPixelFormatTypeKey };
-        let attrs = CFDictionary::<CFString, CFType>::from_slices(&[pf_key], &[pf.as_ref()]);
+        // IOSurface-backed, Metal-compatible buffers: the GPU can read them without a copy (HWDEC2)
+        // SAFETY: reading immutable framework constants.
+        let (io_key, metal_key): (&CFString, &CFString) = unsafe { (kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey) };
+        let io_props = CFDictionary::<CFString, CFType>::from_slices(&[], &[]);
+        let yes = CFBoolean::new(true);
+        let attrs = CFDictionary::<CFString, CFType>::from_slices(&[pf_key, io_key, metal_key], &[pf.as_ref(), io_props.as_ref(), yes.as_ref()]);
         let shared = Box::new(Shared { layout: s.layout.clone(), pixel_format, out: Mutex::new(Vec::new()) });
         let record = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(output_callback),

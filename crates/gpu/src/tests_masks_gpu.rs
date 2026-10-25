@@ -3,14 +3,15 @@
 //! feathered masks in every mode, inverted, with opacity and expansion.
 
 use effectcraft_color::Label;
-use effectcraft_keyframe::{ShapePath, Value};
+use effectcraft_keyframe::{Keyframe, ShapePath, TextDoc, Value};
 use effectcraft_project::build::{self, Ids};
-use effectcraft_project::{BitDepth, Comp, FeatherFalloff, GroupKind, ItemKind, Layer, MaskMode, PropGroup};
-use effectcraft_render::Accelerator;
+use effectcraft_project::{BitDepth, Comp, FeatherFalloff, GroupKind, ItemKind, Layer, LayerSource, MaskMode, MaskMotionBlur, PropGroup};
 use effectcraft_render::masks::FeatherBlur;
+use effectcraft_render::{Accelerator, Backend, LayerCache, RenderOpts, Renderer};
 use effectcraft_time::{FrameRate, Tick};
 
-use crate::tests::{self, Scene, check, compare_at, opts};
+use crate::context::Enc;
+use crate::tests::{self, Scene, check, compare_at, opts, set};
 
 /// An anti-aliased disc plus a hard-edged bar: the shapes a mask's coverage has.
 fn plane(w: usize, h: usize) -> Vec<f32> {
@@ -136,4 +137,147 @@ fn feathered_masks_render_like_the_cpu() {
             check(&format!("{mode:?} {depth:?}"), compare_at(&s, opts(), Tick::ZERO), 0.0);
         }
     }
+}
+
+// ---------------------------------------------------------------- MASK-GPU2: masks drawn on the GPU
+
+fn shape_layer(s: &mut Scene, name: &str, size: [f64; 2], color: [f64; 4]) -> Layer {
+    let mut l = build::layer(&mut s.p, &s.comp, name, LayerSource::Shape, (420, 300), None);
+    let mut next = s.p.next_id;
+    let mut ids = Ids(&mut next);
+    let items = vec![build::shape_rect(&mut ids, size, [0.0, 0.0], 12.0), build::shape_fill(&mut ids, color)];
+    l.props.sub_mut("contents").unwrap().children.push(build::shape_group(&mut ids, "Group", items).into());
+    s.p.next_id = next;
+    l
+}
+
+/// Over a footage backdrop: the spotlight (a shape whose ellipse mask has a 177 px Gaussian
+/// feather and a small expansion), a shape with three masks (Linear-feathered Add, inverted
+/// Subtract at 60 %, Intersect), a text layer with a feathered mask, and a shape whose shrinking
+/// mask the GPU can't draw (it renders on the CPU).
+fn masked_scene(depth: BitDepth) -> Scene {
+    let mut s = scene(depth);
+    let bg = s.footage(420, 300);
+    s.push(bg);
+
+    let mut spot = shape_layer(&mut s, "Spotlight", [380.0, 260.0], [1.0, 0.95, 0.8, 1.0]);
+    let m = mask(&mut s, ShapePath::ellipse([10.0, -5.0], 180.0, 120.0), MaskMode::Add, [177.0, 177.0], false, false, 100.0, 3.0);
+    push_masks(&mut spot, vec![m]);
+    s.push(spot);
+
+    let mut multi = shape_layer(&mut s, "Multi", [200.0, 150.0], [0.2, 0.5, 0.9, 0.9]);
+    set(&mut multi, "transform/rotation", Value::Scalar(9.0));
+    let a = mask(&mut s, ShapePath::rect([-20.0, 0.0], 150.0, 130.0), MaskMode::Add, [16.0, 6.0], true, false, 100.0, 0.0);
+    let b = mask(&mut s, ShapePath::ellipse([40.0, 20.0], 90.0, 70.0), MaskMode::Subtract, [10.0, 10.0], false, true, 60.0, 0.0);
+    let c = mask(&mut s, ShapePath::rect([0.0, 0.0], 400.0, 90.0), MaskMode::Intersect, [0.0, 0.0], false, false, 85.0, 0.0);
+    push_masks(&mut multi, vec![a, b, c]);
+    s.push(multi);
+
+    let mut text = build::layer(&mut s.p, &s.comp, "Text", LayerSource::Text, (420, 300), None);
+    let doc = TextDoc { text: "Masked words".into(), size: 40.0, fill: [1.0, 1.0, 1.0, 1.0], ..Default::default() };
+    set(&mut text, "text/sourceText", Value::Text(Box::new(doc)));
+    set(&mut text, "transform/position", Value::Vec3([60.0, 250.0, 0.0]));
+    let m = mask(&mut s, ShapePath::rect([110.0, -14.0], 160.0, 34.0), MaskMode::Add, [12.0, 12.0], false, false, 100.0, 0.0);
+    push_masks(&mut text, vec![m]);
+    s.push(text);
+
+    let mut shrink = shape_layer(&mut s, "Shrink", [120.0, 80.0], [0.9, 0.2, 0.3, 1.0]);
+    set(&mut shrink, "transform/position", Value::Vec3([330.0, 70.0, 0.0]));
+    let m = mask(&mut s, ShapePath::ellipse([0.0, 0.0], 110.0, 70.0), MaskMode::Add, [8.0, 8.0], false, false, 100.0, -6.0);
+    push_masks(&mut shrink, vec![m]);
+    s.push(shrink);
+    s
+}
+
+/// Each masked shape and text layer's resident source made on the GPU (rasterised and masked
+/// there) equals the CPU's; the shrinking mask declines.
+#[test]
+fn masked_layer_sources_on_the_gpu_match_the_cpu() {
+    let Some(g) = tests::gpu() else { return };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+        let sc = masked_scene(depth);
+        for scale in [1.0, 0.5] {
+            let (gc, cc) = (LayerCache::default(), LayerCache::default());
+            let mut r = Renderer::new(&sc.p, &tests::Pattern, RenderOpts { backend: Backend::Gpu, scale, ..Default::default() });
+            r.accel = Some(g);
+            r.cache = Some(&gc);
+            let mut cpu_r = Renderer::new(&sc.p, &tests::Pattern, RenderOpts { backend: Backend::Cpu, scale, ..Default::default() });
+            cpu_r.cache = Some(&cc);
+            let ctx = r.eval_ctx(sc.cid, Tick::ZERO).unwrap();
+            let cpu_ctx = cpu_r.eval_ctx(sc.cid, Tick::ZERO).unwrap();
+            for layer in ctx.comp.layers.iter().filter(|l| matches!(l.source, LayerSource::Shape | LayerSource::Text)) {
+                let label = format!("{} {depth:?} scale {scale}", layer.name);
+                let (_, clip) = r.resident_content(&ctx, layer).expect("keyed");
+                let mut e = Enc::new(&g.ctx);
+                let made = crate::shapes_gpu::resident_source(&mut e, &r, &ctx, layer, clip);
+                if layer.name == "Shrink" {
+                    assert!(made.is_none(), "{label}: a shrinking mask renders on the CPU");
+                    continue;
+                }
+                let (img, offset, bs) = made.expect("the GPU rasterises and masks it");
+                let (_, cpu_clip) = cpu_r.resident_content(&cpu_ctx, layer).expect("keyed");
+                let cpu = cpu_r.resident_source(&cpu_ctx, layer, cpu_clip).expect("the CPU renders it");
+                let got = e.download(&img).expect("readback");
+                assert_eq!((got.width, got.height), (cpu.img.width, cpu.img.height), "{label}: size");
+                assert!((offset[0] - cpu.offset[0]).abs() < 1e-9 && (offset[1] - cpu.offset[1]).abs() < 1e-9, "{label}: offset");
+                assert_eq!(bs, cpu.scale, "{label}: scale");
+                assert!(cpu.img.data.iter().any(|p| p[3] > 0.2), "{label}: something shows");
+                assert!(cpu.img.data.iter().any(|p| p[3] > 0.01 && p[3] < 0.99), "{label}: the masks soften it");
+                let mut d = tests::diff(&cpu.img, &got, tests::tolerance(depth));
+                d.quantized = depth != BitDepth::Bpc32;
+                check(&label, Some(d), 0.0);
+            }
+        }
+    }
+}
+
+/// Whole frames through the GPU walk (layer cache on: the resident path) match the CPU oracle,
+/// and the masks were applied on the GPU.
+#[test]
+fn frames_with_gpu_masks_match_the_cpu() {
+    let Some(g) = tests::gpu() else { return };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let sc = masked_scene(depth);
+        let cache = LayerCache::default();
+        let before = crate::masks_gpu::APPLIED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut r = Renderer::new(&sc.p, &tests::Pattern, RenderOpts { backend: Backend::Gpu, ..Default::default() });
+        r.accel = Some(g);
+        r.cache = Some(&cache);
+        let img = g.render(&r, sc.cid, Tick::ZERO).expect("the GPU renders the frame");
+        let applied = crate::masks_gpu::APPLIED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let cpu = Renderer::new(&sc.p, &tests::Pattern, RenderOpts { backend: Backend::Cpu, ..Default::default() }).comp_frame_cpu(sc.cid, Tick::ZERO);
+        let mut d = tests::diff(&cpu, &img, tests::tolerance(depth));
+        d.quantized = depth != BitDepth::Bpc32;
+        check(&format!("masked frame {depth:?}"), Some(d), 0.0);
+        assert!(applied >= 3, "{depth:?}: {applied} layers masked on the GPU");
+    }
+}
+
+/// The plan declines what the GPU can't draw: a variable-width feather, mask motion blur on an
+/// animated path, a shrinking expansion.
+#[test]
+fn masks_the_gpu_cannot_draw_decline() {
+    let mut s = scene(BitDepth::Bpc8);
+    let mut variable = shape_layer(&mut s, "Variable", [100.0, 100.0], [1.0; 4]);
+    let mut m = mask(&mut s, ShapePath::rect([0.0, 0.0], 80.0, 80.0), MaskMode::Add, [0.0, 0.0], false, false, 100.0, 0.0);
+    if let Value::Path(sp) = &mut m.get_mut("path").unwrap().value {
+        sp.feather.push(Default::default());
+    }
+    push_masks(&mut variable, vec![m]);
+    assert!(!effectcraft_render::masks::gpu_plan::gpu_eligible(&variable), "variable-width feather");
+
+    let mut moving = shape_layer(&mut s, "Moving", [100.0, 100.0], [1.0; 4]);
+    let mut m = mask(&mut s, ShapePath::rect([0.0, 0.0], 80.0, 80.0), MaskMode::Add, [0.0, 0.0], false, false, 100.0, 0.0);
+    if let GroupKind::Mask { motion_blur, .. } = &mut m.kind {
+        *motion_blur = MaskMotionBlur::On;
+    }
+    m.get_mut("path").unwrap().keys = vec![
+        Keyframe::new(Tick::ZERO, Value::path(ShapePath::rect([0.0, 0.0], 80.0, 80.0))),
+        Keyframe::new(Tick::from_seconds_f64(1.0), Value::path(ShapePath::rect([30.0, 0.0], 80.0, 80.0))),
+    ];
+    push_masks(&mut moving, vec![m]);
+    assert!(!effectcraft_render::masks::gpu_plan::gpu_eligible(&moving), "motion-blurred animated mask");
+
+    let plain = shape_layer(&mut s, "Plain", [100.0, 100.0], [1.0; 4]);
+    assert!(effectcraft_render::masks::gpu_plan::gpu_eligible(&plain), "no masks");
 }

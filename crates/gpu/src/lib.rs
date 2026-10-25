@@ -101,6 +101,8 @@ mod particles;
 mod prepass;
 mod readback;
 mod shapes_gpu;
+/// Decoder surfaces read without an upload (HWDEC2; the importer is a platform layer's).
+pub mod surface;
 #[cfg(feature = "profile")]
 mod timestamps;
 pub mod traffic_light;
@@ -714,6 +716,8 @@ mod tests_shapes_gpu;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests_styles_static;
+#[cfg(test)]
+mod tests_text_gpu;
 #[cfg(test)]
 mod tests_traffic_light;
 #[cfg(test)]

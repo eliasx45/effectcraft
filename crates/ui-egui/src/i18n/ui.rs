@@ -676,7 +676,7 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
     ("Clear search and filters", "清除搜索和筛选"),
     ("Agents", "智能体"),
     ("Control Channel Port", "控制通道端口"),
-    ("Hardware ProRes Decoding", "硬件 ProRes 解码"),
+    ("Hardware Video Decoding", "硬件视频解码"),
     ("Let Agents Control EffectCraft (localhost control channel)", "允许智能体控制 EffectCraft（本地主机控制通道）"),
     ("Let Figma Send Layers (EffectCraft Transfer plug-in, localhost:7789)", "允许 Figma 发送图层（EffectCraft Transfer 插件，localhost:7789）"),
     (
@@ -1477,7 +1477,7 @@ const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
     ("Clear search and filters", "清除搜尋與篩選"),
     ("Agents", "智慧代理"),
     ("Control Channel Port", "控制通道連接埠"),
-    ("Hardware ProRes Decoding", "硬體 ProRes 解碼"),
+    ("Hardware Video Decoding", "硬體視訊解碼"),
     ("Let Agents Control EffectCraft (localhost control channel)", "允許代理控制 EffectCraft（本機控制通道）"),
     ("Let Figma Send Layers (EffectCraft Transfer plug-in, localhost:7789)", "允許 Figma 傳送圖層（EffectCraft Transfer 外掛程式，localhost:7789）"),
     (

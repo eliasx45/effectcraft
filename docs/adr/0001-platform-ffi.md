@@ -90,6 +90,8 @@ crate may do, under the same containment rules:
 
 ## Amendment (2026-10-25): hardware H.264 / HEVC decoding for previews
 
+**Status:** accepted (2026-10-25, approved by the project owner, Elias).
+
 Requested by the owner (session brief HWDEC1): footage decoding was the largest single cost in
 his comps (about 52 ms per frame for an H.264 video inside a precomp: 45 ms of software decoding
 plus the YUV upload). The third job of this crate is hardware **H.264 and HEVC** decoding for
@@ -111,5 +113,31 @@ ProRes (the media pool's exact view, which every export reads, never uses it):
 - Frames still go through a CPU copy into the existing YUV upload; handing the `CVPixelBuffer`'s
   IOSurface to the GPU without a copy would need Metal interop in the GPU crate and is a separate
   decision.
-- The switch is the existing Settings ▸ Previews ▸ Hardware ProRes Decoding preference (on by
-  default); it now covers H.264 and HEVC as well.
+- The switch is the existing Settings ▸ Previews ▸ Hardware Video Decoding preference (on by
+  default; formerly "Hardware ProRes Decoding", same setting id); it now covers H.264 and HEVC as well.
+
+## Amendment (2026-10-25b): decoded surfaces shared with the GPU (HWDEC2)
+
+**Status:** accepted (2026-10-25, approved by the project owner, Elias).
+
+Requested by the owner (session brief HWDEC2). Hardware-decoded H.264 / HEVC pictures no longer
+need an upload to reach the GPU compositor on Metal. The fourth job of this crate:
+
+- FFI module `metal_surface` (`#[allow(unsafe_code)]`, every block with `// SAFETY:`): a kept
+  `CVPixelBuffer`'s two IOSurface planes become `MTLTexture`s of wgpu's own `MTLDevice`
+  (`newTextureWithDescriptor:iosurface:plane:`, no copy), wrapped with
+  `wgpu::hal::metal::Device::texture_from_raw` and `wgpu::Device::create_texture_from_hal`. The
+  hal texture's drop callback holds the pixel buffer, so the decoder cannot reuse the surface
+  while wgpu (and the GPU) may still read it. Sessions ask for IOSurface-backed, Metal-compatible
+  buffers.
+- Safe registry `surfaces`: once the GPU asked on a Metal device, the decoder keeps each
+  picture's pixel buffer keyed by its luma plane (weak reference, so a reused address never
+  matches a dead entry), at most 16, oldest out first.
+- The GPU crate stays free of `unsafe`: `effectcraft_gpu::surface` takes an importer function
+  (`set_surface_import`, installed by `register`) and splits the imported Y / CbCr planes into
+  the integer planes its native YUV decode already reads (`surface.wgsl`); everything after is
+  unchanged. No importer, another backend, an unsupported layout or a surface no longer kept
+  means the CPU planes are uploaded as before; CPU renders and exports never see surfaces.
+- The decoder still copies each picture into planar samples (FilmCraft's frame type, its GOP
+  cache and every CPU path need them); dropping that copy would need a surface-carrying variant
+  of `filmcraft_frame::PixelData` upstream.
