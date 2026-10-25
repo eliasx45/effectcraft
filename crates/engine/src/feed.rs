@@ -76,9 +76,7 @@ impl Feed {
             e.revision = revision;
             return;
         }
-        let label = label
-            .or_else(|| history.undo.last().filter(|(_, p)| Arc::ptr_eq(p, &before)).map(|(l, _)| l.clone()))
-            .unwrap_or_else(|| "Change".into());
+        let label = label.or_else(|| history.undo.last().filter(|(_, p)| Arc::ptr_eq(p, &before)).map(|(l, _)| l.clone())).unwrap_or_else(|| "Change".into());
         self.entries.push_back(Entry { revision, client, label, before, after: project.clone() });
         while self.entries.len() > MAX_ENTRIES {
             self.entries.pop_front();
@@ -238,7 +236,10 @@ fn layer_changes(c: &Comp, b: &Layer, a: &Layer, out: &mut Vec<String>) {
     changed.sort();
     out.extend(changed.into_iter().map(|(_, t)| t));
     if added > 0 || removed > 0 {
-        out.push(format!("{n} › properties {}", [(added, "added"), (removed, "removed")].iter().filter(|(k, _)| *k > 0).map(|(k, w)| format!("{k} {w}")).collect::<Vec<_>>().join(", ")));
+        out.push(format!(
+            "{n} › properties {}",
+            [(added, "added"), (removed, "removed")].iter().filter(|(k, _)| *k > 0).map(|(k, w)| format!("{k} {w}")).collect::<Vec<_>>().join(", ")
+        ));
     }
 }
 

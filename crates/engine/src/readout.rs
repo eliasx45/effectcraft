@@ -60,10 +60,8 @@ fn num(x: f64) -> String {
 pub fn side_eases(keys: &[Keyframe], i: usize, spatial: bool, out: bool) -> Option<Vec<(f64, f64)>> {
     let k = keys.get(i)?;
     let dims = if spatial { 1 } else { k.value.dims().max(1) };
-    let v: Vec<(f64, f64)> = (0..dims)
-        .filter_map(|d| effectcraft_keyframe::side_ease(keys, i, d, spatial, out))
-        .map(|e| (e.speed, e.influence * 100.0))
-        .collect();
+    let v: Vec<(f64, f64)> =
+        (0..dims).filter_map(|d| effectcraft_keyframe::side_ease(keys, i, d, spatial, out)).map(|e| (e.speed, e.influence * 100.0)).collect();
     (!v.is_empty()).then_some(v)
 }
 
@@ -117,10 +115,8 @@ pub fn ease_fields(keys: &[Keyframe], i: usize, spatial: bool) -> Value {
 
 /// Names of time parameters that take timecode (`"6:20"`) and frames (`{"frame": 200}`, `"200f"`)
 /// as well as seconds. Applies at the top level and inside lists of objects (`keys: [{time}]`).
-const TIME_KEYS: &[&str] = &[
-    "time", "times", "start", "end", "from", "to", "at", "inPoint", "outPoint", "startTime", "endTime", "compTime", "layerTime", "newTime",
-    "duration",
-];
+const TIME_KEYS: &[&str] =
+    &["time", "times", "start", "end", "from", "to", "at", "inPoint", "outPoint", "startTime", "endTime", "compTime", "layerTime", "newTime", "duration"];
 
 /// Seconds for a timecode or frame form of a time value of comp `c`: `Some(Err)` for a string that
 /// is meant as a time but doesn't parse, `None` when `v` isn't one of those forms (a number of
@@ -190,7 +186,9 @@ pub fn resolve_time_params(s: &Session, id: &str, p: &mut Value) -> Result<()> {
     if !has_time_forms(p) {
         return Ok(());
     }
-    let cid = s.resolve_comp(p.get("comp").filter(|c| !c.is_null())).map_err(|_| crate::commands::bad(id, "a timecode or frame time needs a composition (`comp`, or an open one)"))?;
+    let cid = s
+        .resolve_comp(p.get("comp").filter(|c| !c.is_null()))
+        .map_err(|_| crate::commands::bad(id, "a timecode or frame time needs a composition (`comp`, or an open one)"))?;
     let c = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let Some(o) = p.as_object_mut() else { return Ok(()) };
     for (k, v) in o.iter_mut() {

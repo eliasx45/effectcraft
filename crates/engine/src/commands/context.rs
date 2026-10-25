@@ -125,8 +125,7 @@ fn related(s: &Session, cid: ItemId, lid: LayerId) -> Result<Value> {
         }
         _ => None,
     };
-    let used_in: Vec<Value> =
-        s.project.item_users(cid).into_iter().map(|(u, n)| json!({"comp": u.0, "name": item_name(u), "layers": n})).collect();
+    let used_in: Vec<Value> = s.project.item_users(cid).into_iter().map(|(u, n)| json!({"comp": u.0, "name": item_name(u), "layers": n})).collect();
     Ok(json!({
         "layer": layer_ref(c, lid), "comp": cid.0,
         "parents": parents, "children": children,
@@ -247,7 +246,12 @@ fn packet(s: &mut Session, p: &Value) -> Result<Value> {
         ));
         for sp in &sel_props {
             let keys = sp["keys"].as_array().cloned().unwrap_or_default();
-            text.push(format!("  {}  {} keys{}", sp["path"].as_str().unwrap_or(""), sp["keyCount"], if keys.is_empty() { format!(", value {}", value_text(&sp["value"])) } else { String::new() }));
+            text.push(format!(
+                "  {}  {} keys{}",
+                sp["path"].as_str().unwrap_or(""),
+                sp["keyCount"],
+                if keys.is_empty() { format!(", value {}", value_text(&sp["value"])) } else { String::new() }
+            ));
             for k in &keys {
                 text.push(format!(
                     "    {}{} (f{})  {}  {}{}",
@@ -271,7 +275,12 @@ fn packet(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(m) = rel["trackMatte"].as_object() {
             links.push(format!("matte: #{} {} ({})", m["layer"]["index"], m["layer"]["name"].as_str().unwrap_or(""), m["kind"].as_str().unwrap_or("")));
         }
-        for (key, label) in [("matteFor", "is matte for"), ("children", "children"), ("expressionRefersTo", "expressions use"), ("expressionReferredBy", "used by expressions in")] {
+        for (key, label) in [
+            ("matteFor", "is matte for"),
+            ("children", "children"),
+            ("expressionRefersTo", "expressions use"),
+            ("expressionReferredBy", "used by expressions in"),
+        ] {
             let v = if key == "matteFor" {
                 Value::Array(rel[key].as_array().map(|a| a.iter().map(|x| x["layer"].clone()).collect()).unwrap_or_default())
             } else {
