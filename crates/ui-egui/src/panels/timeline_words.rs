@@ -13,7 +13,7 @@ use effectcraft_engine::project::{Comp, Layer};
 use egui::{Align2, Color32, Pos2, Rect, Stroke, pos2, vec2};
 
 use super::timeline::TMap;
-use crate::EffectcraftApp;
+use crate::panels::timeline::TimelineHost;
 use crate::theme::Tokens;
 
 /// Most words a bar registers for automation.
@@ -41,7 +41,7 @@ fn dot_visible(x: f32, clip: Rect) -> bool {
 }
 
 /// Paint the words of `layer` on its bar `bar` (when it is the comp's voice layer).
-pub(crate) fn paint(app: &mut EffectcraftApp, ui: &egui::Ui, gp: &egui::Painter, bar: Rect, tm: TMap, comp: &Comp, layer: &Layer) {
+pub(crate) fn paint(app: &mut dyn TimelineHost, ui: &egui::Ui, gp: &egui::Painter, bar: Rect, tm: TMap, comp: &Comp, layer: &Layer) {
     let Some(map) = comp.speech.as_ref() else { return };
     if map.layer != Some(layer.id) || map.words.is_empty() || tm.pps <= 0.0 {
         return;
@@ -99,7 +99,7 @@ pub(crate) fn paint(app: &mut EffectcraftApp, ui: &egui::Ui, gp: &egui::Painter,
             Rect::from_center_size(pos2(x, mid), vec2(8.0, h))
         };
         if registered < MAX_AUTOMATION && hit.intersects(clip) {
-            app.auto.add(&format!("timeline.layer.{}.word.{i}", layer.id.0), hit, &w.word);
+            app.auto_mut().add(&format!("timeline.layer.{}.word.{i}", layer.id.0), hit, &w.word);
             registered += 1;
         }
         if hovered.is_none() && hover.is_some_and(|p: Pos2| hit.contains(p)) {

@@ -31,10 +31,10 @@ pub enum DragPayload {
 /// Layers carried by a Project item drag. Dragging a selected item uses the
 /// complete selection, while dragging an unselected item uses only that item.
 /// Folders and data files are not composition layers.
-pub(crate) fn project_drop_items(app: &EffectcraftApp, dragged: u64) -> Vec<u64> {
+pub(crate) fn project_drop_items(app: &dyn timeline::TimelineHost, dragged: u64) -> Vec<u64> {
     use effectcraft_engine::project::{FootageKind, ItemId, ItemKind};
 
-    let selected = &app.session.state.project_selection;
+    let selected = &app.session().state.project_selection;
     let candidates: Vec<u64> = if selected.iter().any(|id| id.0 == dragged) {
         selected.iter().map(|id| id.0).collect()
     } else {
@@ -45,7 +45,7 @@ pub(crate) fn project_drop_items(app: &EffectcraftApp, dragged: u64) -> Vec<u64>
     candidates
         .into_iter()
         .filter(|id| {
-            app.session.project.item(ItemId(*id)).is_some_and(|item| match &item.kind {
+            app.session().project.item(ItemId(*id)).is_some_and(|item| match &item.kind {
                 ItemKind::Comp(_) | ItemKind::Solid(_) => true,
                 ItemKind::Footage(f) => f.kind != FootageKind::Data,
                 ItemKind::Folder => false,
@@ -68,13 +68,13 @@ pub fn timecode(session: &Session, comp: &Comp, t: Tick) -> String {
 
 /// Ctrl/Cmd-click on a current-time display toggles the project's Time Display Style between
 /// Timecode and Frames, as in After Effects (through Project Settings: one undo step).
-pub(crate) fn toggle_time_display(app: &mut EffectcraftApp, resp: &egui::Response) {
+pub(crate) fn toggle_time_display(app: &mut dyn timeline::TimelineHost, resp: &egui::Response) {
     if !(resp.clicked() && resp.ctx.input(|i| i.modifiers.command)) {
         return;
     }
-    let timecode = app.session.project.settings.time_display == effectcraft_engine::project::TimeDisplayStyle::Timecode;
-    if let Err(e) = app.session.execute("file.projectSettings", serde_json::json!({"timeDisplay": if timecode { "frames" } else { "timecode" }})) {
-        app.ui.status = e.to_string();
+    let timecode = app.session().project.settings.time_display == effectcraft_engine::project::TimeDisplayStyle::Timecode;
+    if let Err(e) = app.session_mut().execute("file.projectSettings", serde_json::json!({"timeDisplay": if timecode { "frames" } else { "timecode" }})) {
+        app.ui_mut().status = e.to_string();
     }
 }
 

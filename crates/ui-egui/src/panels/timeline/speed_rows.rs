@@ -19,7 +19,7 @@ use egui::{Color32, Painter, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
 use serde_json::json;
 
 use super::TMap;
-use crate::EffectcraftApp;
+use crate::panels::timeline::TimelineHost;
 
 /// The Graph Editor's speed-curve yellow.
 const CURVE: Color32 = Color32::from_rgb(226, 201, 79);
@@ -203,7 +203,7 @@ fn segments(prop: &Property, to_comp: &dyn Fn(Tick) -> Tick, tm: TMap, x_min: f3
 /// and handles their drags, pushing `keys.setEase` (merged into one undo step per drag).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &egui::Ui,
     p: &Painter,
     comp: &Comp,
@@ -213,7 +213,7 @@ pub(crate) fn show(
     strip: Rect,
     actions: &mut Vec<(String, serde_json::Value)>,
 ) {
-    if !app.ui.timeline.speed_rows || prop.keys.len() < 2 {
+    if !app.ui().timeline.speed_rows || prop.keys.len() < 2 {
         return;
     }
     let segs = segments(prop, &|t| layer.comp_time(t), tm, strip.min.x, strip.max.x);
@@ -254,13 +254,13 @@ pub(crate) fn show(
         let tip = format!(
             "{:.1} {unit} @ {}  ·  out {} · in {}",
             s.peak,
-            crate::panels::timecode(&app.session, comp, layer.comp_time(s.peak_t)),
+            crate::panels::timecode(app.session(), comp, layer.comp_time(s.peak_t)),
             infl(s.out_inf),
             infl(s.in_inf)
         );
         let dr = Rect::from_center_size(dot, vec2(10.0, 10.0));
         let dresp = ui.interact(dr, egui::Id::new(("tl-speed-peak", uid, s.i)), Sense::hover());
-        app.auto.add(&format!("timeline.speed.{uid}.{}.peak", s.i), dr, &tip);
+        app.auto_mut().add(&format!("timeline.speed.{uid}.{}.peak", s.i), dr, &tip);
         if dresp.hovered() {
             egui::Tooltip::always_open(ctx.clone(), ui.layer_id(), egui::Id::new("tl-speed-tip"), egui::PopupAnchor::Pointer).show(|ui| ui.label(&tip));
         }
@@ -269,7 +269,7 @@ pub(crate) fn show(
         let sculpt_id = egui::Id::new(("tl-speed-sculpt", uid, s.i));
         if editable && sculpt_rect.width() > 4.0 && (cmd || grab.is_some_and(|g| g.key == s.i || g.key == s.i + 1)) {
             let resp = ui.interact(sculpt_rect, sculpt_id, Sense::drag());
-            app.auto.add(&format!("timeline.speed.{uid}.{}.sculpt", s.i), sculpt_rect, "⌘-drag to sculpt the speed curve");
+            app.auto_mut().add(&format!("timeline.speed.{uid}.{}.sculpt", s.i), sculpt_rect, "⌘-drag to sculpt the speed curve");
             if resp.hovered() || resp.dragged() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grab);
             }
@@ -315,7 +315,7 @@ pub(crate) fn show(
         None => d.remove::<(usize, bool)>(hot_id(uid)),
     });
     for h in &handles {
-        app.auto.add(
+        app.auto_mut().add(
             &format!("timeline.speed.{uid}.{}.{}", h.key, if h.out { "out" } else { "in" }),
             Rect::from_center_size(h.pos, vec2(12.0, 12.0)),
             &prop.name,

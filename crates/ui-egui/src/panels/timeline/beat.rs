@@ -8,7 +8,7 @@ use effectcraft_engine::time::Tick;
 use egui::{Align2, Color32, Painter, Rect, pos2};
 
 use super::TMap;
-use crate::EffectcraftApp;
+use crate::panels::timeline::TimelineHost;
 use crate::theme::Tokens;
 
 /// Writes "<graph> · linked" right of the first key of every move of `prop` that carries a
@@ -123,9 +123,9 @@ fn cached(ctx: &egui::Context, revision: u64, cid: u64, comp: &Comp, layer: &Lay
 /// The off-beat dot on a keyed layer's bar, at its first key: green when the move's speed peak
 /// is within [`ON_BEAT`] frames of the nearest stressed syllable, red otherwise. Hovering it says
 /// by how much.
-pub(crate) fn beat_dot(app: &mut EffectcraftApp, p: &Painter, tm: TMap, cid: u64, comp: &Comp, layer: &Layer, row: Rect) {
+pub(crate) fn beat_dot(app: &mut dyn TimelineHost, p: &Painter, tm: TMap, cid: u64, comp: &Comp, layer: &Layer, row: Rect) {
     let ctx = p.ctx().clone();
-    let Some(b) = cached(&ctx, app.session.revision, cid, comp, layer) else { return };
+    let Some(b) = cached(&ctx, app.session().revision, cid, comp, layer) else { return };
     let x = tm.x(b.key);
     if x < row.min.x - 4.0 || x > row.max.x + 4.0 {
         return;
@@ -138,9 +138,9 @@ pub(crate) fn beat_dot(app: &mut EffectcraftApp, p: &Painter, tm: TMap, cid: u64
     let fps = comp.frame_rate.as_f64();
     let note = format!("speed peak f{:.1} · {} f{:.0} · {:+.1} f", b.peak * fps, b.word, b.accent * fps, b.off);
     let hit = Rect::from_center_size(c, egui::vec2(10.0, 10.0));
-    app.auto.add(&format!("timeline.layer.{}.beat", layer.id.0), hit, &note);
+    app.auto_mut().add(&format!("timeline.layer.{}.beat", layer.id.0), hit, &note);
     if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()).filter(|q| hit.contains(*q)) {
-        super::drag_tip(&ctx, &app.tokens, ptr, note);
+        super::drag_tip(&ctx, &app.tokens(), ptr, note);
     }
 }
 
@@ -158,13 +158,13 @@ pub(crate) struct Snap {
 /// The move's peak offset from the key is measured on the keys as they are now (the selected
 /// keys move together, so the offset holds).
 // TODO(batch1-verify): with only one key of a move selected, moving it changes the move's shape; the offset is then approximate.
-pub(crate) fn key_snap(app: &EffectcraftApp, comp: &Comp, now: f64, target: f64) -> Option<Snap> {
+pub(crate) fn key_snap(app: &dyn TimelineHost, comp: &Comp, now: f64, target: f64) -> Option<Snap> {
     let acc = accents(comp);
     if acc.is_empty() {
         return None;
     }
     let fps = comp.frame_rate.as_f64().max(1.0);
-    for k in &app.session.state.selected_keys {
+    for k in &app.session().state.selected_keys {
         let Some(l) = comp.layer(k.layer) else { continue };
         if (l.comp_time(k.time).seconds() - now).abs() > 0.5 / fps {
             continue;
