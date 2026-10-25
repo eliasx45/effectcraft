@@ -34,8 +34,6 @@ pub(crate) const KERNELS: &[&str] = &[
     "fxs_texturize",
     "fxs_glow_map",
     "fxs_glow_op",
-    "fxs_add",
-    "fxs_div",
     "fxs_flomotion",
 ];
 
@@ -983,36 +981,33 @@ pub(crate) fn transform(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBu
     let host = ctx.env.host?;
     let sampling = if ctx.params.e("sampling") == 1 { Sampling::Bicubic } else { Sampling::Bilinear };
     let fd = 1.0 / ctx.fps();
-    let (w, h) = (b.img.width, b.img.height);
-    // Content carried past the buffer edges grows the CPU buffer; render that case there.
-    let ms: Vec<Mat3> = (0..n)
+    let samples: Vec<(Mat3, f32)> = (0..n)
         .filter_map(|k| host.params_at(ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd))
-        .map(|pr| transform_matrix(&pr, &b))
+        .map(|pr| (transform_matrix(&pr, &b), pr.f("opacity") as f32 / 100.0))
         .collect();
-    if effectcraft_effects::transform_extent(ctx.adjustment, (w, h), &ms) != (0, 0, w, h) {
-        return None;
-    }
-    let mut acc = e.image(w, h);
-    let mut count = 0u32;
-    for k in 0..n {
-        let t = ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd;
-        let Some(pr) = host.params_at(t) else { continue };
-        let op = pr.f("opacity") as f32 / 100.0;
-        let empty = e.image(w, h);
-        let one = ops::warp(e, &empty, &b.img, &transform_matrix(&pr, &b), sampling, BlendMode::Normal, op, 0, None);
-        let sum = e.image(w, h);
-        e.pixels("fxs_add", &Params::default(), &acc, Some(&one), &sum, None);
-        acc = sum;
-        count += 1;
-    }
-    if count == 0 {
+    if samples.is_empty() {
         // The CPU renders the frame sharp.
         return None;
     }
-    let mut p = Params::default();
-    p.f[0][0] = count as f32;
-    let out = e.scratch(w, h);
-    e.pixels("fxs_div", &p, &acc, None, &out, None);
-    b.img = out;
+    // The buffer grows to hold every sample (the CPU's extent), and each sample adds straight
+    // into it over its own bounds, weighted by its opacity over the sample count.
+    let ms: Vec<Mat3> = samples.iter().map(|s| s.0).collect();
+    let ext = effectcraft_effects::transform_extent(ctx.adjustment, (b.img.width, b.img.height), &ms);
+    if !e.g.fits(ext.2, ext.3) {
+        return None;
+    }
+    let shift = Mat3::translate(vec2(-ext.0 as f64, -ext.1 as f64));
+    let src = crate::codes::Pixels::Float(b.img.clone());
+    let mut acc = e.image(ext.2, ext.3);
+    let k = 1.0 / samples.len() as f32;
+    // Runs of samples with one opacity (usually all of them) sum in one pass.
+    for run in samples.chunk_by(|a, b| a.1 == b.1) {
+        let ms: Vec<Mat3> = run.iter().map(|(m, _)| shift * *m).collect();
+        ops::warp_accumulate_in(e, &mut acc, &src, &ms, sampling, run[0].1 * k);
+    }
+    drop(src);
+    b.img = acc;
+    b.offset[0] -= ext.0 as f64;
+    b.offset[1] -= ext.1 as f64;
     Some(b)
 }

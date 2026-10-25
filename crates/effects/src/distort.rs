@@ -371,19 +371,15 @@ fn transform(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let ms: Vec<Mat3> = samples.iter().map(|s| s.0).collect();
             let ext = transform_extent(ctx.adjustment, (b.img.width, b.img.height), &ms);
             let shift = Mat3::translate(vec2(-ext.0 as f64, -ext.1 as f64));
+            // Each sample adds straight into one buffer, over its own bounds only (one mip chain
+            // for all of them), weighted by its opacity over the sample count.
             let mut acc = Image::new(ext.2, ext.3);
-            for (m, op) in &samples {
-                let mut one = Image::new(ext.2, ext.3);
-                effectcraft_raster::composite_warp(
-                    &mut one,
-                    &b.img,
-                    &(shift * *m),
-                    &effectcraft_raster::WarpOpts { opacity: *op, sampling, ..Default::default() },
-                );
-                acc.data.iter_mut().zip(&one.data).for_each(|(a, o)| (0..4).for_each(|c| a[c] += o[c]));
-            }
+            let mips = effectcraft_raster::MipChain::new(&b.img);
             let k = 1.0 / samples.len() as f32;
-            acc.data.iter_mut().for_each(|p| p.iter_mut().for_each(|v| *v *= k));
+            for (m, op) in &samples {
+                effectcraft_raster::accumulate_warp_mips(&mut acc, &mips, &(shift * *m), sampling, op * k);
+            }
+            drop(mips);
             regrid(&mut b, ext, acc);
             return b;
         }

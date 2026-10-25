@@ -64,11 +64,12 @@ fn glow_reach(passes: &[GlowPass], aspect: f64, downsample: f64) -> u32 {
     let support = |sigma: f64| effectcraft_raster::gaussian_support(sigma) as f64;
     let mut reach = 0.0f64;
     for pass in passes {
+        let f = pass.factor(downsample);
         for s in [pass.sigma * aspect, pass.sigma * (2.0 - aspect)] {
-            let r = if pass.downsample && downsample < 0.999 {
+            let r = if f < 0.999 {
                 // Small-size radii, plus 4 small pixels of bilinear taps, plus the box
-                // halvings' 2^levels ≤ 2 / downsample full pixels, plus slack.
-                (support(s * downsample) + 4.0) / downsample + 2.0 / downsample + 4.0
+                // halvings' 2^levels ≤ 2 / f full pixels, plus slack.
+                (support(s * f) + 4.0) / f + 2.0 / f + 4.0
             } else {
                 support(s) + 2.0
             };
@@ -182,13 +183,14 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let mut acc: Option<GpuImage> = None;
     for (step, pass) in passes.iter().enumerate() {
         let (sx, sy) = (pass.sigma * work_scale * aspect, pass.sigma * work_scale * (2.0 - aspect));
-        let part = if pass.downsample && downsample < 0.999 {
+        let f = pass.factor(downsample);
+        let part = if f < 0.999 {
             // Downsampled from the whole frame (the same samples and pre-filter levels as before),
             // enlarged back onto the working region only.
             let full = if work_scale < 1.0 { &work } else { &source };
-            let (w, h) = ((ww as f64 * downsample).round().max(1.0) as u32, (wh as f64 * downsample).round().max(1.0) as u32);
+            let (w, h) = ((ww as f64 * f).round().max(1.0) as u32, (wh as f64 * f).round().max(1.0) as u32);
             let small = resample(e, full, w, h)?;
-            let blurred = gaussian_blur_owned(e, small, sx * downsample, sy * downsample, false, Precision::F32);
+            let blurred = gaussian_blur_owned(e, small, sx * f, sy * f, false, Precision::F32);
             enlarge(e, &blurred, ww, wh, work.width, work.height, if work_scale < 1.0 { 0 } else { origin })?
         } else {
             gaussian_blur_owned(e, work.clone(), sx, sy, false, precision)

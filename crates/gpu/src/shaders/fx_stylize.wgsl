@@ -945,24 +945,3 @@ fn fxs_glow_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out, p, o);
 }
 
-// ---------------------------------------------------------------- accumulation (Transform motion blur)
-
-// out = src + aux
-@compute @workgroup_size(16, 16)
-fn fxs_add(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = vec2<i32>(gid.xy);
-    if (!fxs_inside(p)) {
-        return;
-    }
-    textureStore(out, p, textureLoad(src, p, 0) + textureLoad(aux, p, 0));
-}
-
-// out = src / f[0].x
-@compute @workgroup_size(16, 16)
-fn fxs_div(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = vec2<i32>(gid.xy);
-    if (!fxs_inside(p)) {
-        return;
-    }
-    textureStore(out, p, textureLoad(src, p, 0) / P.f[0].x);
-}

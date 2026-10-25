@@ -6,7 +6,7 @@ use effectcraft_project::BitDepth;
 use effectcraft_render::RenderOpts;
 use effectcraft_time::Tick;
 
-use crate::tests::{Scene, c, check, compare_at, effect_case, n, opts, set};
+use crate::tests::{Scene, c, check, compare_at, effect_case, n, opts, set, v3};
 
 fn e(v: u32) -> Value {
     Value::Enum(v)
@@ -228,6 +228,28 @@ fn transform_motion_blur() {
     }
 }
 
+/// A fast move that carries the layer past its own buffer (a 720° shutter across the frame):
+/// the buffer grows to hold every sample on the GPU too, as on the CPU.
+#[test]
+fn transform_motion_blur_past_the_buffer() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
+        s.push(bg);
+        let mut l = s.footage(70, 44);
+        s.effect(&mut l, "ec.distort.transform", &[("useCompositionShutterAngle", Value::Bool(false)), ("shutterAngle", n(720.0))]);
+        let pos = l.props.prop_mut("effects/#1/position").expect("transform position");
+        pos.keys = vec![Keyframe::new(Tick::ZERO, pt(-30.0, 22.0)), Keyframe::new(Tick::from_seconds_f64(0.5), pt(120.0, 30.0))];
+        set(&mut l, "transform/position", v3(48.0, 30.0));
+        s.push(l);
+        let label = format!("transform motion blur past the buffer {depth:?}");
+        for t in [0.1, 0.25] {
+            check(&label, compare_at(&s, opts(), Tick::from_seconds_f64(t)), 0.0);
+            check(&format!("{label} half"), compare_at(&s, RenderOpts { scale: 0.5, ..opts() }, Tick::from_seconds_f64(t)), 0.0);
+        }
+    }
+}
+
 #[test]
 fn text_distortions_use_expanded_canvas() {
     use effectcraft_keyframe::TextDoc;
@@ -247,4 +269,58 @@ fn text_distortions_use_expanded_canvas() {
             check(id, compare_at(&s, RenderOpts { scale, ..opts() }, Tick::ZERO), 0.0);
         }
     }
+}
+
+/// A comp-sized layer with Deep Glow (a padded buffer) whose Transform effect flies it across
+/// the frame with a 720° shutter: the frame times on the CPU and the GPU.
+#[test]
+#[ignore = "perf: cargo test -p effectcraft-gpu --lib transform_motion_blur_perf -- --ignored --nocapture"]
+fn transform_motion_blur_perf() {
+    use effectcraft_color::Label;
+    use effectcraft_project::{Comp, ItemKind, Project};
+    use effectcraft_render::{Backend, Renderer};
+    use effectcraft_time::FrameRate;
+    let Some(g) = crate::tests::gpu() else { return };
+    let mut p = Project::default();
+    p.settings.bit_depth = BitDepth::Bpc8;
+    let comp = Comp::new(1920, 1080, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+    let mut s = Scene { p, cid, comp };
+    let mut l = s.solid([0.25, 0.55, 1.0], 1920, 1080);
+    s.effect(&mut l, "ec.stylize.deepglow", &[("PEDG-0001", n(295.0))]);
+    s.effect(&mut l, "ec.distort.transform", &[("useCompositionShutterAngle", Value::Bool(false)), ("shutterAngle", n(720.0))]);
+    let pos = l.props.prop_mut("effects/#2/position").expect("transform position");
+    pos.keys = vec![Keyframe::new(Tick::ZERO, pt(-800.0, 540.0)), Keyframe::new(Tick::from_seconds_f64(0.5), pt(960.0, 540.0))];
+    s.push(l);
+    let t = Tick::from_seconds_f64(0.2);
+    let opts = opts();
+    let t0 = std::time::Instant::now();
+    let _ = Renderer::new(&s.p, &crate::tests::Pattern, effectcraft_render::RenderOpts { backend: Backend::Cpu, ..opts }).comp_frame_cpu(s.cid, t);
+    let cpu_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let mut gpu_ms = Vec::new();
+    for _ in 0..5 {
+        let mut r = Renderer::new(&s.p, &crate::tests::Pattern, effectcraft_render::RenderOpts { backend: Backend::Gpu, ..opts });
+        r.accel = Some(g);
+        let t0 = std::time::Instant::now();
+        let _ = g.render(&r, s.cid, t).expect("the GPU renders the frame");
+        gpu_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    #[cfg(feature = "profile")]
+    {
+        let mut r = Renderer::new(&s.p, &crate::tests::Pattern, effectcraft_render::RenderOpts { backend: Backend::Gpu, ..opts });
+        r.accel = Some(g);
+        effectcraft_render::profile::start();
+        let _ = g.render(&r, s.cid, t);
+        let (events, _) = effectcraft_render::profile::finish();
+        let mut by: std::collections::BTreeMap<(String, String), (usize, f64)> = Default::default();
+        for e in &events {
+            let s = by.entry((e.cat.to_string(), e.name.to_string())).or_default();
+            s.0 += 1;
+            s.1 += e.dur / 1e3;
+        }
+        for ((c, n), (k, d)) in by {
+            eprintln!("    {c} {n} x{k} {d:.2} ms");
+        }
+    }
+    eprintln!("transform motion blur 1920x1080 + deep glow: cpu {cpu_ms:.1} ms, gpu (incl. readback) {gpu_ms:.1?} ms");
 }

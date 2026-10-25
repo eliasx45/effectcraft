@@ -388,12 +388,34 @@ pub const DEEP_GLOW_GAMMA: f32 = 2.865;
 pub const DEEP_GLOW_EXPOSURE_POWER: f32 = 1.218;
 
 /// One of Deep Glow's blur passes: its Gaussian sigma (working pixels, before Aspect Ratio),
-/// weight, and whether it is blurred at the Downsample size.
+/// weight, whether it is blurred at the Downsample size, and the size it is blurred at
+/// otherwise (`shrink` of the working frame; see [`GlowPass::factor`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlowPass {
     pub sigma: f64,
     pub weight: f32,
     pub downsample: bool,
+    pub shrink: f64,
+}
+
+impl GlowPass {
+    /// The fraction of the working frame this pass is blurred at (1 = full size), for the
+    /// effect's Downsample (0.1-1).
+    pub fn factor(&self, downsample: f64) -> f64 {
+        self.shrink * if self.downsample && downsample < 0.999 { downsample } else { 1.0 }
+    }
+}
+
+/// The linear model's size for a pass of `sigma` working pixels: halved until the sigma is under
+/// 8 px there (a soft pass loses nothing visible at the smaller size, and its blur costs a
+/// fraction: Radius 295 on a 1920 × 1080 layer, box passes 26 -> 15 ms on the GPU; within 1.5
+/// levels of the full-size passes on Deep Glow 2's white bar).
+fn glow_shrink(sigma: f64) -> f64 {
+    let mut shrink = 1.0;
+    while sigma * shrink >= 8.0 && shrink > 1.0 / 64.0 {
+        shrink *= 0.5;
+    }
+    shrink
 }
 
 /// Deep Glow's blur passes for a `radius` in working pixels at layer `scale` (shared with the
@@ -402,7 +424,8 @@ pub struct GlowPass {
 /// Linear model (Gamma Correction): fitted to Deep Glow 2 in After Effects 2026 (white bar,
 /// square and 2 px line; Radius 25-1000, Exposure 0.04-2; 2.2 levels RMS, 1.4 at Radius 282 /
 /// Exposure 0.04): a 2.16 px pass plus blurs from 4.19 px growing x1.437 up to 0.1227 x Radius,
-/// the widest fading in as Radius grows (those of 24 px and more at the Downsample size). Radius adds wider levels and leaves the ones by the
+/// the widest fading in as Radius grows (those of 24 px and more at the Downsample size, each
+/// blurred at a size where its sigma is under 8 px: [`GlowPass::shrink`]). Radius adds wider levels and leaves the ones by the
 /// edge alone, so the glow next to a shape is as bright at any Radius, as in Deep Glow 2.
 /// Without it, the older display-space profile.
 pub fn deep_glow_passes(radius: f64, scale: f64, linear_model: bool, spread: f32) -> Vec<GlowPass> {
@@ -410,18 +433,25 @@ pub fn deep_glow_passes(radius: f64, scale: f64, linear_model: bool, spread: f32
         let near = (0.30 - 0.35 * spread).max(0.05);
         let far = 0.30 + 0.44 * spread;
         return [(0.035, near * 13.5, false), (0.14, (1.0 - near - far) * 13.5, false), (0.42, far * 13.5, true)]
-            .map(|(sigma, weight, downsample)| GlowPass { sigma: radius * sigma, weight, downsample })
+            .map(|(sigma, weight, downsample)| GlowPass { sigma: radius * sigma, weight, downsample, shrink: 1.0 })
             .to_vec();
     }
     let (first, ratio) = (4.188 * scale.max(1e-3), 1.437f64);
     let levels = ((0.1227 * radius).max(first) / first).ln() / ratio.ln();
-    let mut passes = vec![GlowPass { sigma: 2.159 * scale.max(1e-3), weight: 1.107, downsample: false }];
+    // The working frame's scale past Radius 512 (see `deep_glow`), for each pass's size there.
+    let work_scale = (512.0 / radius).min(1.0);
+    let mut passes = vec![GlowPass { sigma: 2.159 * scale.max(1e-3), weight: 1.107, downsample: false, shrink: 1.0 }];
     let mut k = 0u32;
     while f64::from(k) < levels + 1.0 && k < 32 {
         let fade = (levels + 1.0 - f64::from(k)).min(1.0) as f32;
         let sigma = first * ratio.powi(k as i32);
         // Downsample applies to the wide passes (it only softens what is already soft).
-        passes.push(GlowPass { sigma, weight: 0.5479 * (-0.0600 * k as f32).exp() * fade, downsample: sigma >= 24.0 * scale });
+        passes.push(GlowPass {
+            sigma,
+            weight: 0.5479 * (-0.0600 * k as f32).exp() * fade,
+            downsample: sigma >= 24.0 * scale,
+            shrink: glow_shrink(sigma * work_scale),
+        });
         k += 1;
     }
     passes
@@ -552,10 +582,11 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         .iter()
         .map(|pass| {
             let (sx, sy) = (pass.sigma * work_scale * aspect, pass.sigma * work_scale * (2.0 - aspect));
-            if pass.downsample && downsample < 0.999 {
-                let (w, h) = ((ww as f64 * downsample).round().max(1.0) as u32, (wh as f64 * downsample).round().max(1.0) as u32);
+            let f = pass.factor(downsample);
+            if f < 0.999 {
+                let (w, h) = ((ww as f64 * f).round().max(1.0) as u32, (wh as f64 * f).round().max(1.0) as u32);
                 let small = resample_sparse(&work_source, w, h);
-                resample_sparse(&gaussian_blur_sparse(&small, sx * downsample, sy * downsample), ww, wh)
+                resample_sparse(&gaussian_blur_sparse(&small, sx * f, sy * f), ww, wh)
             } else {
                 gaussian_blur_sparse(&work_source, sx, sy)
             }
@@ -819,22 +850,17 @@ fn deep_glow_reference(ctx: &EffectCtx, mut b: Buf) -> Buf {
     for (step, pass) in passes.iter().enumerate() {
         let weight = pass.weight;
         let (sx, sy) = (pass.sigma * work_scale * aspect, pass.sigma * work_scale * (2.0 - aspect));
-        let blurred = if pass.downsample && downsample < 0.999 {
-            let (w, h) = ((work_source.width as f64 * downsample).round().max(1.0) as u32, (work_source.height as f64 * downsample).round().max(1.0) as u32);
+        let f = pass.factor(downsample);
+        let blurred = if f < 0.999 {
+            let (w, h) = ((work_source.width as f64 * f).round().max(1.0) as u32, (work_source.height as f64 * f).round().max(1.0) as u32);
             let small = resample(&work_source, w, h);
-            resample(&gaussian_blur(&small, sx * downsample, sy * downsample, false), work_source.width, work_source.height)
+            resample(&gaussian_blur(&small, sx * f, sy * f, false), work_source.width, work_source.height)
         } else {
             gaussian_blur(&work_source, sx, sy, false)
         };
         halo.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(out, px)| {
             for c in 0..4 {
-                let fringe = if c == 0 && step + 1 == passes.len() {
-                    1.0 + chroma
-                } else if c == 2 && step == 0 {
-                    1.0 + chroma
-                } else {
-                    1.0
-                };
+                let fringe = if (c == 0 && step + 1 == passes.len()) || (c == 2 && step == 0) { 1.0 + chroma } else { 1.0 };
                 out[c] += px[c] * weight * fringe;
             }
         });
@@ -1822,6 +1848,7 @@ mod tests {
             let o = run_fx("ec.stylize.deepglow", &set, img.clone(), 0.0, EffectEnv::default());
             for (d, want) in [0, 1, 7, 15, 31, 63].into_iter().zip(ae) {
                 let v = o.img.get(320 + o.offset[0] as i64, 192 + d + o.offset[1] as i64)[0] * 255.0;
+                eprintln!("ZZ r{radius} d{d}: {v:.1} vs {want}");
                 // The old v1 fit put a hot ring at the edge (Radius 282 / Exposure 0.04: 131 vs 78).
                 assert!((v - want).abs() < 24.0, "Radius {radius} Exposure {exposure}, {d} px out: {v} vs AE {want}");
             }
