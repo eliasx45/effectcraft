@@ -162,6 +162,8 @@ pub fn atomic_supported(id: &str) -> bool {
         "comp.info",
         "layer.tree",
         "editor.state",
+        "context.packet",
+        "layer.related",
         "keys.info",
         "effect.list",
         "effect.plugins.list",
