@@ -14,6 +14,7 @@ use egui::{Align2, Color32, Pos2, Rect, Stroke, pos2, vec2};
 
 use super::timeline::TMap;
 use crate::panels::timeline::TimelineHost;
+use crate::panels::timeline::ids::tl_id;
 use crate::theme::Tokens;
 
 /// Most words a bar registers for automation.
@@ -112,8 +113,7 @@ pub(crate) fn paint(app: &mut dyn TimelineHost, ui: &egui::Ui, gp: &egui::Painte
         }
     }
     if let Some((i, tip)) = hovered {
-        egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new(("tl-word-tip", layer.id.0, i)), egui::PopupAnchor::Pointer)
-            .show(|ui| ui.label(tip));
+        egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), tl_id(("tl-word-tip", layer.id.0, i)), egui::PopupAnchor::Pointer).show(|ui| ui.label(tip));
     }
 }
 

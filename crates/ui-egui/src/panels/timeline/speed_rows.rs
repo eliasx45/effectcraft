@@ -20,6 +20,7 @@ use serde_json::json;
 
 use super::TMap;
 use crate::panels::timeline::TimelineHost;
+use crate::panels::timeline::ids::tl_id;
 
 /// The Graph Editor's speed-curve yellow.
 const CURVE: Color32 = Color32::from_rgb(226, 201, 79);
@@ -96,12 +97,12 @@ struct SpeedGrab {
 }
 
 fn grab_id(uid: u64) -> egui::Id {
-    egui::Id::new(("tl-speed-grab", uid))
+    tl_id(("tl-speed-grab", uid))
 }
 
 /// The handle (key, out) answering the pointer in a property's row.
 fn hot_id(uid: u64) -> egui::Id {
-    egui::Id::new(("tl-speed-hot", uid))
+    tl_id(("tl-speed-hot", uid))
 }
 
 /// One handle as drawn: its segment (index into the drawn segments), key and side, the key's x,
@@ -259,14 +260,14 @@ pub(crate) fn show(
             infl(s.in_inf)
         );
         let dr = Rect::from_center_size(dot, vec2(10.0, 10.0));
-        let dresp = ui.interact(dr, egui::Id::new(("tl-speed-peak", uid, s.i)), Sense::hover());
+        let dresp = ui.interact(dr, tl_id(("tl-speed-peak", uid, s.i)), Sense::hover());
         app.auto_mut().add(&format!("timeline.speed.{uid}.{}.peak", s.i), dr, &tip);
         if dresp.hovered() {
-            egui::Tooltip::always_open(ctx.clone(), ui.layer_id(), egui::Id::new("tl-speed-tip"), egui::PopupAnchor::Pointer).show(|ui| ui.label(&tip));
+            egui::Tooltip::always_open(ctx.clone(), ui.layer_id(), tl_id("tl-speed-tip"), egui::PopupAnchor::Pointer).show(|ui| ui.label(&tip));
         }
         // ⌘-drag on the curve: sculpt the side nearer the pointer.
         let sculpt_rect = Rect::from_min_max(pos2(s.xa + 7.0, strip.min.y), pos2(s.xb - 7.0, strip.max.y));
-        let sculpt_id = egui::Id::new(("tl-speed-sculpt", uid, s.i));
+        let sculpt_id = tl_id(("tl-speed-sculpt", uid, s.i));
         if editable && sculpt_rect.width() > 4.0 && (cmd || grab.is_some_and(|g| g.key == s.i || g.key == s.i + 1)) {
             let resp = ui.interact(sculpt_rect, sculpt_id, Sense::drag());
             app.auto_mut().add(&format!("timeline.speed.{uid}.{}.sculpt", s.i), sculpt_rect, "⌘-drag to sculpt the speed curve");
@@ -327,7 +328,7 @@ pub(crate) fn show(
     let reach = (s.xb - s.xa) * HANDLE_REACH as f32;
     // Big enough for the pick distance; only this handle has one, so they never overlap.
     let hit = Rect::from_center_size(h.pos, vec2(2.0 * HANDLE_PICK, 2.0 * HANDLE_PICK));
-    let resp = ui.interact(hit, egui::Id::new(("tl-speed-handle", uid, key, out)), Sense::drag());
+    let resp = ui.interact(hit, tl_id(("tl-speed-handle", uid, key, out)), Sense::drag());
     let side = if out { "out" } else { "in" };
     let shown = s.speed_at(out);
     let tip = format!("{side} influence {:.0}% · speed {shown:.1} {unit}", inf * 100.0);

@@ -9,6 +9,7 @@ use egui::{Align2, Color32, Painter, Rect, pos2};
 
 use super::TMap;
 use crate::panels::timeline::TimelineHost;
+use crate::panels::timeline::ids::tl_id;
 use crate::theme::Tokens;
 
 /// Writes "<graph> · linked" right of the first key of every move of `prop` that carries a
@@ -112,7 +113,7 @@ struct BeatCache {
 
 fn cached(ctx: &egui::Context, revision: u64, cid: u64, comp: &Comp, layer: &Layer) -> Option<Beat> {
     ctx.data_mut(|d| {
-        let c = d.get_temp_mut_or_default::<BeatCache>(egui::Id::new("tl-beat-cache"));
+        let c = d.get_temp_mut_or_default::<BeatCache>(tl_id("tl-beat-cache"));
         if c.revision != revision || c.comp != cid {
             *c = BeatCache { revision, comp: cid, layers: Default::default() };
         }

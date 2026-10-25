@@ -8,7 +8,7 @@ hosting it and how each blocker is (or will be) resolved.
 | Milestone | Panel | State |
 |---|---|---|
 | EMBED1 | Timeline | Draws against `TimelineHost`; a fake host without the app draws it (test below) |
-| EMBED2 | Graph Editor | Not started (blockers below) |
+| EMBED2 | Graph Editor (+ id scopes, host fonts) | Draws against `TimelineHost` too; per-instance ids; `theme::install_panel_fonts` |
 | EMBED3 | Effect Controls | Not started (blockers below) |
 
 ## The host interface (EMBED1)
@@ -67,13 +67,13 @@ Motion Blur comp switch through to the session.
 | `timeline_layout_saved` | 3 | stays on the app (`load_layout` / `store_layout` run by the app's frame loop) |
 | `last_reveal` | tests only | unchanged |
 
-### Calls that still need the whole app (19 sites, 14 features) — the blockers left
+### Calls that still need the whole app (15 sites, 13 features after EMBED2) — the blockers left
 
 Through `app()/app_ref()`; a foreign host draws the Timeline without them.
 
 | Feature | Call | Plan |
 |---|---|---|
-| Graph Editor in the Timeline's place | `graph::show`, `graph_tools::alt_scale_begin/update`, inline source graph (`inline::show_graph`) | EMBED2: convert `graph.rs`/`graph_tools.rs` to the same host |
+| ~~Graph Editor in the Timeline's place~~ | `graph::show`, `graph_tools::alt_scale_begin/update`, inline source graph | **Done (EMBED2)**: `graph.rs`/`graph_tools.rs` take `&dyn TimelineHost` |
 | Quick-button row / Find word box | `quick_row::show` | host trait method or move behind `TimelineHost` (it only reads session/ui) |
 | Smart-freeze badges | `smart_freeze::timeline_badges` | takes `&Session` only in practice: change its signature |
 | Why? strip height | `why_chip::height` | ctx-data only: change its signature |
@@ -98,11 +98,11 @@ No `static`/`thread_local!`/`OnceLock` in the timeline files. Indirect ones:
 
 | Global | Where | Blocks hosting? | Resolution |
 |---|---|---|---|
-| Named font families `semibold`, `medium` | `Tokens::semibold/medium` | **Yes**: egui panics on an unregistered family | Host calls `theme::install` (or registers the two families) once; EMBED4 adds a `theme::install_families` that only adds families |
+| Named font families `semibold`, `medium` | `Tokens::semibold/medium` | **Resolved (EMBED2)** | Host calls `theme::install_panel_fonts(ctx)` once after its own `set_fonts` (adds only the `semibold`/`medium` families via `ctx.add_font`; safe before the first pass, idempotent), or `theme::add_panel_fonts(&mut defs)` on the definitions it sets. The host's `Proportional`/`Monospace` stay (the panel then draws body text in the host's font) |
 | Interface language `OnceLock` | `i18n::tr` | No (one language per process; FigCraft's process gets English unless set) | Leave; later pass the language through the host |
 | Font fallback state `OnceLock<Mutex>` | `theme::install_fonts` | No | Leave |
 | Owner-asset cursors (disk, cached in ctx data) | `local_assets::cursor` | No (falls back to egui cursors) | Leave |
-| egui context temp data: ~126 reads/writes, 43 fixed `Id::new("…")` keys (`timeline-graph-area`, `tl-tc-edit`, `wa-bar-start`, `tl-cache-bar`…) | timeline files | Partly: unscoped keys mean one Timeline per `egui::Context` and possible clashes with host ids | EMBED4: salt every key with a per-instance id (`ui.id()` or the host's panel id) |
+| egui context temp data: ~126 reads/writes, 43 fixed `Id::new("…")` keys (`timeline-graph-area`, `tl-tc-edit`, `wa-bar-start`, `tl-cache-bar`…) | timeline files | **Resolved (EMBED2)** | Every `egui::Id::new` in the Timeline and Graph Editor (≈175 sites) is `ids::tl_id`, salted with `TimelineHost::id_scope()` while `timeline::show` draws (`ids::IdScope`, a frame-scoped thread-local restored on drop). EffectCraft's app returns `None`: its ids are byte-identical to before. Default for other hosts: one fixed scope; give each instance its own for several Timelines. Caveats: widget helpers in `widgets.rs` and egui's auto ids are not salted; ids that other (non-hosted) panels write for the Timeline (pick-whip targets from Effect Controls) or that app-level commands read outside `show` (`timeline::locate`, `begin_rename`) must run inside `IdScope::enter(host.id_scope())` in a foreign host |
 | Drag-and-drop payload `panels::DragPayload` | layer/footage drops | No (foreign payloads are ignored) | A host that wants drops sends `DragPayload::Files` |
 | OS-drop map `os_drop::publish_timeline` (ctx data) | file drops | No | Host reads it if it handles OS drops |
 
@@ -118,15 +118,21 @@ No `static`/`thread_local!`/`OnceLock` in the timeline files. Indirect ones:
   (`hold_keys`, `take_picks` from `lib.rs`): it is app chrome, not part of the hosted panel, and was
   left on `EffectcraftApp`.
 
-## Graph Editor blockers (EMBED2)
+## Graph Editor (EMBED2, done)
 
-`graph.rs` (2.3k lines) + `graph_tools.rs`: ~165 app references, almost all `session` (79),
+Before: `graph.rs` (2.3k lines) + `graph_tools.rs`: ~165 app references, almost all `session` (79),
 `ui` (82), `auto` (10), `tokens` (3), i.e. what `TimelineHost` already provides. Helpers taking the
 app: `curves`, `shown_props`, `fit_all/fit_keys/fit_selection`, `navigation`, `options_menu`,
 `set_graph_type`, `speed_graph`, `expression_legend`, `comparison_samples`, `text_button`, `more`,
 `graph_tools::transform_box/sel_range`. No statics. Plan: same mechanical conversion to
 `&mut dyn TimelineHost` (rename to `PanelHost` then), which also removes the timeline's Graph Editor
 escape-hatch sites.
+
+Now: every non-test function in `graph.rs` and `graph_tools.rs` takes `&dyn`/`&mut dyn
+TimelineHost`; its command dispatch goes through `TimelineHost::invoke`. The 4 escape sites are gone
+(`graph::show`, `alt_scale_begin`, `alt_scale_update`, the inline source graph), so a foreign host
+gets the Graph Editor in the Timeline. `graph::shown_props` is still called with the app from
+`inline::invoke` (dispatch glue). No statics.
 
 ## Effect Controls blockers (EMBED3)
 
@@ -140,8 +146,8 @@ foreign host).
 
 ## Next steps
 
-1. EMBED2: Graph Editor onto the host (removes 4 escape sites).
-2. EMBED4: per-instance egui ids, a font-family installer for hosts, shortcut lookup.
+1. ~~EMBED2: Graph Editor, per-instance ids, host font installer.~~ Done.
+2. EMBED4: shortcut lookup for hosts; salt `widgets.rs` helper ids.
 3. Replace the small escape sites (smart-freeze badges, why-strip height, Bezier label) with
    signatures that take `&Session`/the language.
 4. EMBED3: Effect Controls.

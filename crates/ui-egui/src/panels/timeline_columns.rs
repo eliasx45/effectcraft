@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::icons::{self, Icon};
 use crate::panels::timeline::TimelineHost;
+use crate::panels::timeline::ids::tl_id;
 use crate::state::TimelineState;
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
@@ -371,7 +372,7 @@ fn drop_target(cw: &Cols, dragged: &str, x: f32) -> (Option<&'static str>, f32) 
 }
 
 fn drag_id() -> egui::Id {
-    egui::Id::new("tl-col-drag")
+    tl_id("tl-col-drag")
 }
 
 /// The column headers: labels, dividers to resize, drag to reorder, click the name header for
@@ -439,7 +440,7 @@ pub(super) fn header(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pa
         hp.line_segment([pos2(b - 0.5, hdr.min.y + 5.0), pos2(b - 0.5, hdr.max.y - 5.0)], Stroke::new(1.0, t.separator));
     }
 
-    let hresp = ui.interact(hdr, egui::Id::new("tl-colhdr"), Sense::click_and_drag());
+    let hresp = ui.interact(hdr, tl_id("tl-colhdr"), Sense::click_and_drag());
     app.auto_mut().add("timeline.header", hdr, "Columns (right-click)");
     for (id, a, b) in &cw.spans {
         let label = column_label(&app.ui().timeline, id);
@@ -458,7 +459,7 @@ pub(super) fn header(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pa
         && let Some((a, b)) = cw.span(id)
         && let Some(ptr) = ctx.input(|i| i.pointer.latest_pos())
     {
-        let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tl-col-drag-ghost")));
+        let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, tl_id("tl-col-drag-ghost")));
         let ghost = Rect::from_min_max(pos2(a, hdr.min.y), pos2(b, hdr.max.y)).translate(vec2(ptr.x - origin.x, 0.0));
         fg.rect_filled(ghost, 2.0, t.accent.gamma_multiply(0.25));
         fg.text(ghost.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, crate::i18n::tr(column_label(&app.ui().timeline, id)), Tokens::ui(11.0), t.text);
@@ -483,12 +484,12 @@ pub(super) fn header(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pa
             continue;
         }
         let r = Rect::from_min_max(pos2(b - 3.0, hdr.min.y), pos2(b + 3.0, hdr.max.y));
-        let resp = ui.interact(r, egui::Id::new(("tl-colw", id)), Sense::drag());
+        let resp = ui.interact(r, tl_id(("tl-colw", id)), Sense::drag());
         app.auto_mut().add(&format!("timeline.header.{id}.resize"), r, "Drag to resize the column");
         if resp.hovered() || resp.dragged() {
             ctx.set_cursor_icon(egui::CursorIcon::ResizeColumn);
         }
-        let start_id = egui::Id::new(("tl-colw-start", id));
+        let start_id = tl_id(("tl-colw-start", id));
         if resp.drag_started() {
             ctx.data_mut(|d| d.insert_temp(start_id, column_width(&app.ui().timeline, id)));
         }
@@ -511,10 +512,10 @@ pub(super) fn header(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pa
     }
     if hresp.secondary_clicked() {
         let under = hresp.interact_pointer_pos().and_then(|pt| column_at(cw, pt.x));
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-colhdr-under"), under.unwrap_or("")));
+        ctx.data_mut(|d| d.insert_temp(tl_id("tl-colhdr-under"), under.unwrap_or("")));
     }
     crate::widgets::context_menu(&hresp, |ui| {
-        let under: &str = ctx.data(|d| d.get_temp(egui::Id::new("tl-colhdr-under"))).unwrap_or("");
+        let under: &str = ctx.data(|d| d.get_temp(tl_id("tl-colhdr-under"))).unwrap_or("");
         if !under.is_empty() && under != "name" && ui.button(crate::i18n::tr("Hide This")).clicked() {
             actions.push(("timeline.column".into(), json!({"column": under, "visible": false})));
             ui.close();
@@ -544,12 +545,12 @@ pub(super) fn header(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pa
 pub(super) fn splitter(app: &mut dyn TimelineHost, ui: &mut egui::Ui, x: f32, y0: f32, y1: f32, left_w: f32, panel_w: f32) {
     let ctx = ui.ctx().clone();
     let r = Rect::from_min_max(pos2(x - 3.0, y0), pos2(x + 3.0, y1));
-    let resp = ui.interact(r, egui::Id::new("tl-splitter"), Sense::click_and_drag());
+    let resp = ui.interact(r, tl_id("tl-splitter"), Sense::click_and_drag());
     app.auto_mut().add("timeline.splitter", r, "Drag to resize the layer outline");
     if resp.hovered() || resp.dragged() {
         ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     }
-    let start_id = egui::Id::new("tl-splitter-start");
+    let start_id = tl_id("tl-splitter-start");
     if resp.drag_started() {
         ctx.data_mut(|d| d.insert_temp(start_id, left_w));
     }
@@ -582,7 +583,7 @@ pub(super) fn pane_buttons(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &eg
     ];
     for (id, tip, on) in panes {
         let r = Rect::from_min_size(pos2(x, footer.center().y - 9.0), vec2(18.0, 18.0));
-        let resp = ui.interact(r, egui::Id::new(("tl-pane", id)), Sense::click()).on_hover_text(crate::i18n::tr(tip));
+        let resp = ui.interact(r, tl_id(("tl-pane", id)), Sense::click()).on_hover_text(crate::i18n::tr(tip));
         if on {
             p.rect_filled(r, 2.0, t.hover);
         }

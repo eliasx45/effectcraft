@@ -55,6 +55,12 @@ pub trait TimelineHost {
     fn auto_mut(&mut self) -> &mut Registry;
     fn tokens(&self) -> Tokens;
     fn parts(&mut self) -> TimelineParts<'_>;
+    /// Salts every egui id the panel makes ([`super::ids`]), so its state and widgets never clash
+    /// with the host's or another Timeline's. Give each instance its own; `None` (EffectCraft's one
+    /// Timeline) keeps the plain ids.
+    fn id_scope(&self) -> Option<egui::Id> {
+        Some(egui::Id::new("effectcraft-hosted-timeline"))
+    }
 
     /// Runs a command by id the way a menu item would (UI commands included).
     fn invoke(&mut self, _ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
@@ -135,6 +141,9 @@ impl TimelineHost for EffectcraftApp {
     }
     fn parts(&mut self) -> TimelineParts<'_> {
         TimelineParts { session: &mut self.session, ui: &mut self.ui, auto: &mut self.auto, tokens: self.tokens }
+    }
+    fn id_scope(&self) -> Option<egui::Id> {
+        None
     }
     fn invoke(&mut self, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
         crate::menus::invoke(self, ctx, id, params)
@@ -266,7 +275,8 @@ mod tests {
     fn the_timeline_draws_in_a_host_without_the_app() {
         let mut host = host();
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx, &host.tokens, "en");
+        // A host with egui's own fonts: only the families the panel names are added (EMBED2).
+        crate::theme::install_panel_fonts(&ctx);
         let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 400.0))), ..Default::default() };
         frame(&ctx, &mut host, input());
         frame(&ctx, &mut host, input());

@@ -9,7 +9,8 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::{Value, json};
 
 use super::timeline::TMap;
-use crate::EffectcraftApp;
+use crate::panels::timeline::TimelineHost;
+use crate::panels::timeline::ids::tl_id;
 
 type Actions = Vec<(String, Value)>;
 
@@ -39,7 +40,7 @@ struct BoxDrag {
 }
 
 fn box_id() -> egui::Id {
-    egui::Id::new("graph-transform-box")
+    tl_id("graph-transform-box")
 }
 
 /// Discard drag origins that belong to a different graph/timeline composition.
@@ -158,7 +159,7 @@ fn handle_points(r: Rect) -> [Pos2; 8] {
 /// the inside moves the keys; times land on frames.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn transform_box(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     p: &egui::Painter,
     keys: &[SelKey],
@@ -170,7 +171,7 @@ pub(crate) fn transform_box(
     handles: bool,
     actions: &mut Actions,
 ) {
-    if !app.ui.timeline.graph_transform_box {
+    if !app.ui().timeline.graph_transform_box {
         return;
     }
     let Some(b) = bounds(keys) else { return };
@@ -178,7 +179,7 @@ pub(crate) fn transform_box(
     let value_ok = !speed && keys.iter().all(|k| k.editable);
     let col = Color32::from_rgb(0xd8, 0xd8, 0xd8);
     let ctx = ui.ctx().clone();
-    let drag_id = egui::Id::new("graph-dragging");
+    let drag_id = tl_id("graph-dragging");
     let hp = handle_points(r);
     let data = |q: Pos2| [tm.t(q.x), vmap(q.y)];
     // Which data point each handle sits on, and its opposite.
@@ -198,8 +199,8 @@ pub(crate) fn transform_box(
     let mut resp_any: Option<egui::Response> = None;
     if !handles {
         p.rect_stroke(r, 0.0, Stroke::new(1.0, col.gamma_multiply(0.7)), StrokeKind::Middle);
-        let resp = ui.interact(r, egui::Id::new("graph-box-inside"), Sense::drag());
-        app.auto.add("timeline.graph.transformBox", r, "Transform box");
+        let resp = ui.interact(r, tl_id("graph-box-inside"), Sense::drag());
+        app.auto_mut().add("timeline.graph.transformBox", r, "Transform box");
         if resp.drag_started()
             && let Some(o) = ui.input(|i| i.pointer.press_origin())
         {
@@ -215,8 +216,8 @@ pub(crate) fn transform_box(
             let hr = Rect::from_center_size(*h, vec2(7.0, 7.0));
             p.rect_filled(hr, 0.0, Color32::from_gray(0x20));
             p.rect_stroke(hr, 0.0, Stroke::new(1.0, col), StrokeKind::Middle);
-            let resp = ui.interact(hr.expand(2.0), egui::Id::new(("graph-box-handle", i)), Sense::drag());
-            app.auto.add(&format!("timeline.graph.transformBox.{i}"), hr, "Transform box handle");
+            let resp = ui.interact(hr.expand(2.0), tl_id(("graph-box-handle", i)), Sense::drag());
+            app.auto_mut().add(&format!("timeline.graph.transformBox.{i}"), hr, "Transform box handle");
             if resp.drag_started() {
                 let opp = [2, 3, 0, 1, 6, 7, 4, 5][i];
                 start = Some(BoxDrag { handle: i, anchor: corner(opp), last: corner(i), origin: [b[0], b[1]] });
@@ -241,10 +242,10 @@ pub(crate) fn transform_box(
         && let Some(pt) = resp.interact_pointer_pos()
     {
         let mut cur = data(pt);
-        if app.ui.timeline.graph_snap != ui.input(|i| i.modifiers.command) {
+        if app.ui().timeline.graph_snap != ui.input(|i| i.modifiers.command) {
             let mut times: Vec<f64> = snap_keys.iter().map(|k| k.t).collect();
-            times.push(app.session.time().seconds());
-            if let Some(comp) = app.session.active_comp() {
+            times.push(app.session().time().seconds());
+            if let Some(comp) = app.session().active_comp() {
                 times.extend(comp_snap_times(comp));
             }
             let values: Vec<f64> = snap_keys.iter().map(|k| k.v).collect();
@@ -379,12 +380,12 @@ struct AltScale {
 }
 
 fn alt_id() -> egui::Id {
-    egui::Id::new("timeline-alt-scale")
+    tl_id("timeline-alt-scale")
 }
 
 /// Selected keys' comp-time range.
-fn sel_range(app: &EffectcraftApp, comp: &Comp) -> Option<(f64, f64)> {
-    let ts: Vec<f64> = app.session.state.selected_keys.iter().filter_map(|k| comp.layer(k.layer).map(|l| l.comp_time(k.time).seconds())).collect();
+fn sel_range(app: &dyn TimelineHost, comp: &Comp) -> Option<(f64, f64)> {
+    let ts: Vec<f64> = app.session().state.selected_keys.iter().filter_map(|k| comp.layer(k.layer).map(|l| l.comp_time(k.time).seconds())).collect();
     if ts.len() < 2 {
         return None;
     }
@@ -395,7 +396,7 @@ fn sel_range(app: &EffectcraftApp, comp: &Comp) -> Option<(f64, f64)> {
 
 /// Alt-drag on the first or last key of a selected group starts scaling the group in time
 /// about the other end. Returns true when it took the drag.
-pub(crate) fn alt_scale_begin(app: &EffectcraftApp, ctx: &egui::Context, comp: &Comp, key_ct: f64) -> bool {
+pub(crate) fn alt_scale_begin(app: &dyn TimelineHost, ctx: &egui::Context, comp: &Comp, key_ct: f64) -> bool {
     let Some((lo, hi)) = sel_range(app, comp) else { return false };
     let st = if (key_ct - hi).abs() < 1e-6 {
         AltScale { anchor: lo, end_is_max: true, span: None }
@@ -409,7 +410,7 @@ pub(crate) fn alt_scale_begin(app: &EffectcraftApp, ctx: &egui::Context, comp: &
 }
 
 /// While an Alt-drag scale is active: scale the group so its dragged end follows the pointer.
-pub(crate) fn alt_scale_update(app: &EffectcraftApp, ctx: &egui::Context, comp: &Comp, tm: TMap, actions: &mut Actions) {
+pub(crate) fn alt_scale_update(app: &dyn TimelineHost, ctx: &egui::Context, comp: &Comp, tm: TMap, actions: &mut Actions) {
     let Some(st) = ctx.data(|d| d.get_temp::<AltScale>(alt_id())) else { return };
     if !ctx.input(|i| i.pointer.primary_down()) {
         ctx.data_mut(|d| d.remove::<AltScale>(alt_id()));

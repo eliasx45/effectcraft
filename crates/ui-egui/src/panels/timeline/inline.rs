@@ -24,7 +24,7 @@ pub(super) fn expander(app: &mut dyn TimelineHost, ui: &mut egui::Ui, root: Item
     child_path.push(layer.id.0);
     let key = instance_key(root, &child_path);
     let open = app.ui().timeline.inline_precomps.contains(&key);
-    let resp = widgets::twirl(ui, rect, open, egui::Id::new(("inline-precomp", &key)), &app.tokens())
+    let resp = widgets::twirl(ui, rect, open, tl_id(("inline-precomp", &key)), &app.tokens())
         .on_hover_text(tr("Expand this composition's layers inline (edits affect every instance)"));
     app.auto_mut().add(&format!("timeline.inline.{}.expand", key.iter().map(u64::to_string).collect::<Vec<_>>().join(".")), rect, "Expand nested composition");
     if resp.clicked() {
@@ -138,7 +138,7 @@ pub(super) fn show(
         [pos2(cw.name + 14.0 * n.path.len() as f32, r.min.y), pos2(cw.name + 14.0 * n.path.len() as f32, r.max.y)],
         Stroke::new(1.0, t.accent.gamma_multiply(0.5)),
     );
-    let id = egui::Id::new((
+    let id = tl_id((
         &prefix,
         match n.row.kind {
             RowKind::Prop { uid } | RowKind::Group { uid, .. } => uid,
@@ -405,7 +405,7 @@ fn draw_keys(
         let kr = effectcraft_engine::KeyRef { layer: layer.id, prop: prop.uid, time: k.time };
         let rect = Rect::from_center_size(center, vec2(12.0, 14.0));
         icons::paint(&p, rect, Icon::Keyframe, if selected.contains(&kr) { t.keyframe_selected } else { t.text_dim });
-        let id = egui::Id::new(("inline-key", n.root.0, &n.path, prop.uid, index));
+        let id = tl_id(("inline-key", n.root.0, &n.path, prop.uid, index));
         let resp =
             ui.interact(rect, id, Sense::click_and_drag()).on_hover_text(format!("Source {:.3}s; parent {:.3}s", layer.comp_time(k.time).seconds(), root_time));
         let auto = format!(
@@ -743,7 +743,7 @@ pub(super) fn show_graph(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui
         p.line_segment([pos2(x, ruler.max.y - 5.0), pos2(x, ruler.max.y)], Stroke::new(1.0, app.tokens().text_faint));
         p.text(pos2(x + 3.0, ruler.min.y + 8.0), Align2::LEFT_CENTER, format!("{seconds:.2}s"), Tokens::ui(10.0), app.tokens().text_dim);
     }
-    let response = ui.interact(ruler, egui::Id::new("inline-graph-ruler"), Sense::click_and_drag());
+    let response = ui.interact(ruler, tl_id("inline-graph-ruler"), Sense::click_and_drag());
     app.auto_mut().add("timeline.inlineGraph.ruler", ruler, &format!("{},{}", tm.start, tm.pps));
     if (response.clicked() || response.dragged())
         && let Some(pointer) = response.interact_pointer_pos()
@@ -756,8 +756,6 @@ pub(super) fn show_graph(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui
         }
     }
     let result = with_scope(app, &scope, |app| {
-        // The Graph Editor still needs EffectCraft's app (docs/embedding-panels.md, EMBED2).
-        let Some(app) = app.app() else { return };
         let project = app.session().project.clone();
         let expr = app.session().expr.clone();
         let mut eval = EvalCtx::new(&project, context.comp, &comp, context.time);

@@ -371,6 +371,44 @@ fn bundled_fonts() -> FontDefinitions {
     fonts
 }
 
+/// EMBED2: the named font families EffectCraft's panels draw with ([`Tokens::semibold`],
+/// [`Tokens::medium`]; egui panics on a family that has no font), for an app that hosts a panel
+/// (`panels::timeline::TimelineHost`) with fonts of its own. Adds Inter SemiBold / Medium (with
+/// JetBrains Mono for symbols) as the `semibold` and `medium` families to `fonts` and leaves the
+/// host's other families alone; families that are already set are kept.
+pub fn add_panel_fonts(fonts: &mut FontDefinitions) {
+    let bundled = bundled_fonts();
+    for family in ["semibold", "medium"] {
+        let family = FontFamily::Name(family.into());
+        if fonts.families.get(&family).is_some_and(|stack| !stack.is_empty()) {
+            continue;
+        }
+        let Some(stack) = bundled.families.get(&family) else { continue };
+        for name in stack {
+            if let Some(data) = bundled.font_data.get(name) {
+                fonts.font_data.entry(name.clone()).or_insert_with(|| data.clone());
+            }
+        }
+        fonts.families.insert(family, stack.clone());
+    }
+}
+
+/// The `semibold` and `medium` families on a context, keeping the fonts the host set (any time,
+/// also before the first pass; calling it again does nothing). Call it after the host's own
+/// `set_fonts`, which replaces every family; or use [`add_panel_fonts`] on the definitions the host
+/// sets.
+pub fn install_panel_fonts(ctx: &egui::Context) {
+    use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+    let family = |name: &str, priority| InsertFontFamily { family: FontFamily::Name(name.into()), priority };
+    ctx.add_font(FontInsert::new("effectcraft-inter-semibold", FontData::from_static(INTER_SEMIBOLD), vec![family("semibold", FontPriority::Highest)]));
+    ctx.add_font(FontInsert::new("effectcraft-inter-medium", FontData::from_static(INTER_MEDIUM), vec![family("medium", FontPriority::Highest)]));
+    ctx.add_font(FontInsert::new(
+        "effectcraft-jbmono",
+        FontData::from_static(JETBRAINS_MONO),
+        vec![family("semibold", FontPriority::Lowest), family("medium", FontPriority::Lowest)],
+    ));
+}
+
 /// A system face registered as a fallback: its name, file and index in the file.
 #[derive(Clone)]
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
