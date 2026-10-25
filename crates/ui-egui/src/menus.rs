@@ -1195,33 +1195,7 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                 && matches!(k, egui::Key::Backtick | egui::Key::IntlBackslash)
                 && matches!(physical_key, Some(egui::Key::IntlBackslash | egui::Key::Backtick))
         };
-        let scope_of = |id: &str, params: &Value| {
-            let key = effectcraft_engine::shortcuts::binding_key(id, params);
-            app.session.shortcuts().find(&key).map(|b| b.scope.clone())
-        };
-        if let Some((_, _, id, params)) = binds
-            .iter()
-            .filter(|(m, k, id, params)| {
-                (*k == key || iso_maximize(*k, id))
-                    && mods_match(*m, mods)
-                    && (graph_editor || scope_of(id, params).as_deref() != Some(effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE))
-            })
-            .min_by_key(|(m, k, id, params)| {
-                // Keys the user gave a command win over a default sharing them, whatever the
-                // panel (Elias AE: X is Split Layer, not the Timeline's Scroll Topmost Selected
-                // Layer to Top). Otherwise the open Graph Editor wins over the Timeline (F: Fit
-                // All Graphs to View, not Reveal Mask Feather), and the focused panel over an
-                // application command sharing its chord.
-                let key = effectcraft_engine::shortcuts::binding_key(id, params);
-                let scope = scope_of(id, params);
-                let rank = match scope.as_deref() {
-                    Some(effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE) => 0u8,
-                    Some(s) if s == focused_scope => 1,
-                    _ => 2,
-                };
-                (!user_assigned(&app.session, &key, *m, *k), rank)
-            })
-        {
+        if let Some((_, _, id, params)) = pick_binding(&app.session, &binds, key, mods, &iso_maximize, graph_editor, &focused_scope) {
             let (id, params) = (id.clone(), if params.is_null() { json!({}) } else { params.clone() });
             let params = if id == "window.maximizePanel" && matches!(physical_key, Some(egui::Key::IntlBackslash | egui::Key::Backtick)) {
                 json!({"panel": app.ui.focused.id()})
@@ -1239,6 +1213,64 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
             ctx.data_mut(|d| d.remove_temp::<String>(system_paste_id()));
         }
     }
+}
+
+/// The binding `key` + `mods` runs: of those matching (`also` lets a binding match another key,
+/// see the ISO `<` key), Graph Editor keys only while it shows, and the one the user assigned,
+/// else the Graph Editor's, the focused panel's (`focused_scope`) and then an application one.
+fn pick_binding<'a>(
+    session: &effectcraft_engine::Session,
+    binds: &'a [Binding],
+    key: egui::Key,
+    mods: egui::Modifiers,
+    also: &dyn Fn(egui::Key, &str) -> bool,
+    graph_editor: bool,
+    focused_scope: &str,
+) -> Option<&'a Binding> {
+    let scope_of = |id: &str, params: &Value| {
+        let key = effectcraft_engine::shortcuts::binding_key(id, params);
+        session.shortcuts().find(&key).map(|b| b.scope.clone())
+    };
+    binds
+        .iter()
+        .filter(|(m, k, id, params)| {
+            (*k == key || also(*k, id))
+                && mods_match(*m, mods)
+                && (graph_editor || scope_of(id, params).as_deref() != Some(effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE))
+        })
+        .min_by_key(|(m, k, id, params)| {
+            // Keys the user gave a command win over a default sharing them, whatever the
+            // panel (Elias AE: X is Split Layer, not the Timeline's Scroll Topmost Selected
+            // Layer to Top). Otherwise the open Graph Editor wins over the Timeline (F: Fit
+            // All Graphs to View, not Reveal Mask Feather), and the focused panel over an
+            // application command sharing its chord.
+            let key = effectcraft_engine::shortcuts::binding_key(id, params);
+            let scope = scope_of(id, params);
+            let rank = match scope.as_deref() {
+                Some(effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE) => 0u8,
+                Some(s) if s == focused_scope => 1,
+                _ => 2,
+            };
+            (!user_assigned(session, &key, *m, *k), rank)
+        })
+}
+
+/// EMBED3: the command (id, params) EffectCraft's active keyboard shortcuts run for `key` with
+/// `mods` while `panel` has focus (`graph_editor`: the Timeline shows the Graph Editor), for an
+/// app hosting a panel. The same choice as EffectCraft's own dispatch (user keys, Graph Editor,
+/// panel, application), without its app-level special cases (dialogs, Spacebar hold, clipboard
+/// events, Delete); see `panels::timeline::keys::forward_shortcuts` for those a host needs.
+pub fn shortcut_command(
+    session: &effectcraft_engine::Session,
+    panel: PanelKind,
+    graph_editor: bool,
+    key: egui::Key,
+    mods: egui::Modifiers,
+) -> Option<(String, Value)> {
+    let binds = bindings(session);
+    let graph_editor = panel == PanelKind::Timeline && graph_editor;
+    let (_, _, id, params) = pick_binding(session, &binds, key, mods, &|_, _| false, graph_editor, &panel.id())?;
+    Some((id.clone(), if params.is_null() { json!({}) } else { params.clone() }))
 }
 
 /// Draw the in-window menu bar (the engine's AE menu tree).

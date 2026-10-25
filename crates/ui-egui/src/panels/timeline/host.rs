@@ -115,6 +115,27 @@ pub trait TimelineHost {
     fn app_ref(&self) -> Option<&EffectcraftApp> {
         None
     }
+
+    // ---- EMBED3: Effect Controls (additive; all have defaults).
+
+    /// The frame the Composition viewer shows (Levels/Curves histograms); `None` without a viewer.
+    fn viewer_pixels(&mut self) -> Option<std::sync::Arc<egui::ColorImage>> {
+        None
+    }
+    /// An open-files dialog for `filters` (extensions); `None` when the host has none (the panel
+    /// then says to set the path with `prop.set`).
+    fn pick_files(&self, _filters: &[&str]) -> Option<Vec<String>> {
+        None
+    }
+    /// Brings a panel to the front (Effect Controls after an effect is applied).
+    fn raise_panel(&mut self, _panel: crate::dock::PanelKind) {}
+    /// The entries of a main-menu menu (`"Effect"`) as a context menu; the chosen command.
+    fn menu_contents(&mut self, _ui: &mut egui::Ui, _menu: &str) -> Option<(String, Value)> {
+        None
+    }
+    /// One main-menu command as a context-menu entry (its label, shortcut and enabled state);
+    /// sets `clicked` when chosen.
+    fn menu_entry(&self, _ui: &mut egui::Ui, _command: &str, _clicked: &mut Option<(String, Value)>) {}
 }
 
 impl TimelineHost for EffectcraftApp {
@@ -203,6 +224,21 @@ impl TimelineHost for EffectcraftApp {
     }
     fn app_ref(&self) -> Option<&EffectcraftApp> {
         Some(self)
+    }
+    fn viewer_pixels(&mut self) -> Option<std::sync::Arc<egui::ColorImage>> {
+        EffectcraftApp::viewer_pixels(self)
+    }
+    fn pick_files(&self, filters: &[&str]) -> Option<Vec<String>> {
+        self.hooks.pick_files.as_ref().map(|pick| pick(filters))
+    }
+    fn raise_panel(&mut self, panel: crate::dock::PanelKind) {
+        EffectcraftApp::raise_panel(self, panel);
+    }
+    fn menu_contents(&mut self, ui: &mut egui::Ui, menu: &str) -> Option<(String, Value)> {
+        crate::menus::menu_contents(self, ui, menu)
+    }
+    fn menu_entry(&self, ui: &mut egui::Ui, command: &str, clicked: &mut Option<(String, Value)>) {
+        crate::menus::entry_for(self, ui, command, clicked);
     }
 }
 
@@ -298,5 +334,46 @@ mod tests {
         release.events = vec![egui::Event::PointerButton { pos: mb, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }];
         frame(&ctx, &mut host, release);
         assert_ne!(host.session.active_comp().unwrap().enable_motion_blur, before, "the switch toggled through the host's session");
+    }
+
+    /// EMBED3: Effect Controls draws the selected layer's effect against a host without the app.
+    #[test]
+    fn effect_controls_draw_in_a_host_without_the_app() {
+        let mut host = host();
+        let comp = host.session.active_comp().unwrap().clone();
+        let bx = comp.layers.iter().find(|l| l.name == "Box").unwrap().id.0;
+        host.session.execute("layer.select", json!({"layers": [bx]})).unwrap();
+        host.session.execute("effect.apply", json!({"effect": "ec.blur.gaussian"})).unwrap();
+        host.ui.focused = crate::dock::PanelKind::EffectControls;
+        let ctx = egui::Context::default();
+        crate::theme::install_panel_fonts(&ctx);
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                host.auto.begin_frame();
+                let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 600.0));
+                crate::panels::effect_controls::show(&mut host, ui, rect);
+            });
+        }
+        let props = host.auto.query_current("effectControls.prop.");
+        assert!(!props.is_empty(), "the effect's properties drew");
+    }
+
+    /// EMBED3: a hosted panel's keys run EffectCraft's bindings through the host.
+    #[test]
+    fn hosted_shortcuts_run_effectcrafts_bindings() {
+        let mut host = host();
+        let (id, _) = crate::menus::shortcut_command(&host.session, crate::dock::PanelKind::Timeline, false, egui::Key::F9, egui::Modifiers::NONE).unwrap();
+        assert_eq!(id, "keys.easyEase");
+        assert!(
+            crate::menus::shortcut_command(&host.session, crate::dock::PanelKind::Timeline, false, egui::Key::F9, egui::Modifiers::ALT | egui::Modifiers::CTRL)
+                .is_none()
+        );
+        let ctx = egui::Context::default();
+        let press = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let input = egui::RawInput { events: vec![press(egui::Key::F9)], ..Default::default() };
+        let mut ran = vec![];
+        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        assert_eq!(ran, ["keys.easyEase"]);
+        assert_eq!(host.commands, ["keys.easyEase"]);
     }
 }

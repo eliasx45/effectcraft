@@ -22,7 +22,7 @@ struct TabOrder {
 
 fn tab_order_id(ui: &Ui) -> egui::Id {
     let panel = ui.stack().iter().find(|s| s.tags().contains(PANEL_TAG)).map_or(egui::Id::NULL, |s| s.id);
-    egui::Id::new(("hot-tab-order", panel))
+    crate::panels::timeline::ids::tl_id(("hot-tab-order", panel))
 }
 
 /// Puts hot-text field `id` in its panel's Tab order. True when a Tab in the field before it
@@ -490,7 +490,7 @@ pub fn scroll_bar(ui: &mut Ui, auto: &mut Registry, key: &str, track: Rect, scro
     let thumb_len = (len * len / (len + max.max(0.0)).max(1.0)).max(16.0).min(len).max(0.0);
     let travel = (len - thumb_len).max(1.0);
     let thumb_at = |s: f32| track.min[a] + (len - thumb_len) * if max > 0.0 { (s / max).clamp(0.0, 1.0) } else { 0.0 };
-    let resp = ui.interact(track.expand2(if vertical { vec2(3.0, 0.0) } else { vec2(0.0, 3.0) }), egui::Id::new(key), Sense::drag());
+    let resp = ui.interact(track.expand2(if vertical { vec2(3.0, 0.0) } else { vec2(0.0, 3.0) }), crate::panels::timeline::ids::tl_id(key), Sense::drag());
     let pressed = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.any_pressed());
     let mut s = scroll;
     if let Some(p) = resp.interact_pointer_pos().filter(|p| pressed && !(thumb_at(scroll)..=thumb_at(scroll) + thumb_len).contains(&p[a])) {

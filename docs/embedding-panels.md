@@ -9,7 +9,7 @@ hosting it and how each blocker is (or will be) resolved.
 |---|---|---|
 | EMBED1 | Timeline | Draws against `TimelineHost`; a fake host without the app draws it (test below) |
 | EMBED2 | Graph Editor (+ id scopes, host fonts) | Draws against `TimelineHost` too; per-instance ids; `theme::install_panel_fonts` |
-| EMBED3 | Effect Controls | Not started (blockers below) |
+| EMBED3 | Effect Controls (+ shortcuts, widget ids) | Draws against `TimelineHost`; `keys::forward_shortcuts` / `menus::shortcut_command`; scroll-bar and Tab-order ids scoped |
 
 ## The host interface (EMBED1)
 
@@ -67,7 +67,7 @@ Motion Blur comp switch through to the session.
 | `timeline_layout_saved` | 3 | stays on the app (`load_layout` / `store_layout` run by the app's frame loop) |
 | `last_reveal` | tests only | unchanged |
 
-### Calls that still need the whole app (15 sites, 13 features after EMBED2) — the blockers left
+### Calls that still need the whole app (13 sites, 11 features after EMBED3) — the blockers left
 
 Through `app()/app_ref()`; a foreign host draws the Timeline without them.
 
@@ -77,7 +77,7 @@ Through `app()/app_ref()`; a foreign host draws the Timeline without them.
 | Quick-button row / Find word box | `quick_row::show` | host trait method or move behind `TimelineHost` (it only reads session/ui) |
 | Smart-freeze badges | `smart_freeze::timeline_badges` | takes `&Session` only in practice: change its signature |
 | Why? strip height | `why_chip::height` | ctx-data only: change its signature |
-| Work-area context menu entries | `menus::entry_for` | needs menu enabled-state: add `TimelineHost::menu_entry` |
+| ~~Work-area context menu entries~~ | `menus::entry_for` | **Done (EMBED3)**: `TimelineHost::menu_entry` |
 | Layer markers, comp markers, marker bin | `markers_ui::*` | convert `markers_ui.rs` (session/ui/auto + marker dialog) |
 | "Convert To Bezier Path" label | `i18n::label` | needs only the language: pass it in |
 | Audio waveform row | `waveform::summary` | needs the app's audio analysis cache: trait method |
@@ -85,7 +85,7 @@ Through `app()/app_ref()`; a foreign host draws the Timeline without them.
 | RAM chip in the footer | `memory_panel::chip` | EffectCraft-only, keep optional |
 | Change Renderer | `dialogs::open_comp_settings` + `dialog_state` | dialogs are app-owned: `TimelineHost::open_dialog(kind)` |
 | Suggestions overlay | `suggestions::timeline_overlay` | EffectCraft-only, keep optional |
-| Colour eyedropper | `effect_controls::toggle_pick` | EMBED3 (needs the viewer's pixels) |
+| ~~Colour eyedropper~~ | `effect_controls::toggle_pick` | **Done (EMBED3)**: takes the host (it only sets `ui.fx_pick`; sampling happens in the app's viewer) |
 | Gradient editor | `gradient_editor::open` (inline rows) | dialog: `open_dialog` |
 
 Dispatch glue that stays on `EffectcraftApp` (called by `menus::invoke`, not by the panel's draw):
@@ -102,7 +102,9 @@ No `static`/`thread_local!`/`OnceLock` in the timeline files. Indirect ones:
 | Interface language `OnceLock` | `i18n::tr` | No (one language per process; FigCraft's process gets English unless set) | Leave; later pass the language through the host |
 | Font fallback state `OnceLock<Mutex>` | `theme::install_fonts` | No | Leave |
 | Owner-asset cursors (disk, cached in ctx data) | `local_assets::cursor` | No (falls back to egui cursors) | Leave |
-| egui context temp data: ~126 reads/writes, 43 fixed `Id::new("…")` keys (`timeline-graph-area`, `tl-tc-edit`, `wa-bar-start`, `tl-cache-bar`…) | timeline files | **Resolved (EMBED2)** | Every `egui::Id::new` in the Timeline and Graph Editor (≈175 sites) is `ids::tl_id`, salted with `TimelineHost::id_scope()` while `timeline::show` draws (`ids::IdScope`, a frame-scoped thread-local restored on drop). EffectCraft's app returns `None`: its ids are byte-identical to before. Default for other hosts: one fixed scope; give each instance its own for several Timelines. Caveats: widget helpers in `widgets.rs` and egui's auto ids are not salted; ids that other (non-hosted) panels write for the Timeline (pick-whip targets from Effect Controls) or that app-level commands read outside `show` (`timeline::locate`, `begin_rename`) must run inside `IdScope::enter(host.id_scope())` in a foreign host |
+| egui context temp data: ~126 reads/writes, 43 fixed `Id::new("…")` keys (`timeline-graph-area`, `tl-tc-edit`, `wa-bar-start`, `tl-cache-bar`…) | timeline files | **Resolved (EMBED2)** | Every `egui::Id::new` in the Timeline and Graph Editor (≈175 sites) is `ids::tl_id`, salted with `TimelineHost::id_scope()` while `timeline::show` draws (`ids::IdScope`, a frame-scoped thread-local restored on drop). EffectCraft's app returns `None`: its ids are byte-identical to before. Default for other hosts: one fixed scope; give each instance its own for several Timelines. Caveats: egui's auto ids are not salted; in `widgets.rs` the scroll bar and Tab-order ids are
+(EMBED3), while `popup-list-pass` and `label-swatch` stay global on purpose (an open popup anywhere
+holds shortcuts; one shared swatch); ids that other (non-hosted) panels write for the Timeline (pick-whip targets from Effect Controls) or that app-level commands read outside `show` (`timeline::locate`, `begin_rename`) must run inside `IdScope::enter(host.id_scope())` in a foreign host |
 | Drag-and-drop payload `panels::DragPayload` | layer/footage drops | No (foreign payloads are ignored) | A host that wants drops sends `DragPayload::Files` |
 | OS-drop map `os_drop::publish_timeline` (ctx data) | file drops | No | Host reads it if it handles OS drops |
 
@@ -111,9 +113,15 @@ No `static`/`thread_local!`/`OnceLock` in the timeline files. Indirect ones:
 - The panel itself reads only Escape/Enter in its text fields (6 sites) and Shift/Cmd/Alt modifiers
   for gestures: these work in any host.
 - Timeline shortcuts (U/UU reveal, zoom, J/K, I/O, Cmd+arrows…) are **not** in the panel: the app's
-  `menus::handle_shortcuts` maps keys to command ids. A host forwards them with
-  `TimelineHost::invoke` (EMBED4: expose a `shortcut_command(key, modifiers) -> Option<id>` lookup
-  from the engine's menu catalog so FigCraft can reuse the bindings).
+  `menus::handle_shortcuts` maps keys to command ids. **EMBED3:** a host calls
+  `panels::timeline::keys::forward_shortcuts(host, ctx, panel)` once per frame while an EffectCraft
+  panel has its keyboard focus: the frame's key presses run EffectCraft's active bindings for that
+  panel (Spacebar on tap release, J/K, P/S/R/T/A, Alt+Shift+P, F9, Shift+F3…; Graph Editor keys
+  while it shows; Delete/Backspace = Edit ▸ Clear) through `TimelineHost::invoke`, consume them
+  and return the ids run. Nothing while a text field, menu or dialog has the keyboard. Hosts that
+  route keys themselves call `menus::shortcut_command(session, panel, graph_editor, key, mods)`,
+  the same choice as EffectCraft's dispatch (shared `menus::pick_binding`), minus its app-only
+  cases (dialogs, clipboard events, Free Transform, physical-key bindings).
 - `timeline/wheels.rs` (hold-a-key radial wheels) consumes keys at the app level each frame
   (`hold_keys`, `take_picks` from `lib.rs`): it is app chrome, not part of the hosted panel, and was
   left on `EffectcraftApp`.
@@ -134,9 +142,9 @@ TimelineHost`; its command dispatch goes through `TimelineHost::invoke`. The 4 e
 gets the Graph Editor in the Timeline. `graph::shown_props` is still called with the app from
 `inline::invoke` (dispatch glue). No statics.
 
-## Effect Controls blockers (EMBED3)
+## Effect Controls (EMBED3, done)
 
-`effect_controls.rs` (1.7k lines) + `fx_editors.rs` (1.2k) + `camera_tracker_ui.rs`: ~220 app
+Before: `effect_controls.rs` (1.7k lines) + `fx_editors.rs` (1.2k) + `camera_tracker_ui.rs`: ~220 app
 references: `auto` (77), `ui` (58), `session` (50), `tokens` (24) plus app-only members:
 `viewer_image` / `viewer_pixels()` (histograms, Levels, eyedroppers: needs the viewer's last
 frame), `pointer_comp`, `hooks` (clipboard), `raise_panel()`, `menus::menu_contents` /
@@ -144,12 +152,35 @@ frame), `pointer_comp`, `hooks` (clipboard), `raise_panel()`, `menus::menu_conte
 `clipboard_text()` services with `None` defaults (histogram/eyedropper editors show "no frame" in a
 foreign host).
 
+Now: `effect_controls.rs`, `fx_editors.rs` and `camera_tracker_ui.rs` take `&dyn`/`&mut dyn
+TimelineHost`; `effect_controls::show` enters the host's id scope and its ≈85 ids are `tl_id`.
+New trait services (additive, all defaulted): `viewer_pixels()` (Levels/Curves histograms; `None`
+draws them empty), `pick_files(filters)` (`None`: "no file dialog available"), `raise_panel`,
+`menu_contents(ui, menu)` (the Effect context menu; `None`: empty) and `menu_entry(ui, command,
+clicked)`. Left on `EffectcraftApp` (app-level, not the panel's draw): `effect_controls::viewer_hook`
+and `camera_tracker_ui::viewer_hook` (eyedropper sampling and track points in the Composition
+viewer, which uses `viewer_image`/`pointer_comp`), `choose_files_after_apply` (run by `effect.apply`
+dispatch). A foreign host's colour eyedropper therefore arms but cannot sample until it hosts the
+viewer.
+
 ## Next steps
 
 1. ~~EMBED2: Graph Editor, per-instance ids, host font installer.~~ Done.
-2. EMBED4: shortcut lookup for hosts; salt `widgets.rs` helper ids.
+2. ~~Shortcut lookup/forwarding for hosts; `widgets.rs` ids.~~ Done (EMBED3).
 3. Replace the small escape sites (smart-freeze badges, why-strip height, Bezier label) with
    signatures that take `&Session`/the language.
-4. EMBED3: Effect Controls.
+4. ~~EMBED3: Effect Controls.~~ Done.
 5. FigCraft side: depend on `effectcraft-ui-egui`, implement `TimelineHost` over FigCraft's
    EffectCraft session, and open it on comp-card double-click.
+
+## Public API changes
+
+All additive; nothing a host implements or calls was renamed or removed.
+
+- EMBED1: `TimelineHost`, `TimelineParts`, `CacheBar`.
+- EMBED2: `TimelineHost::id_scope` (default `Some(fixed id)`), `panels::timeline::ids::{tl_id, IdScope}`,
+  `theme::{install_panel_fonts, add_panel_fonts}`.
+- EMBED3: `TimelineHost::{viewer_pixels, pick_files, raise_panel, menu_contents, menu_entry}`
+  (defaulted), `panels::timeline::keys::forward_shortcuts`, `menus::shortcut_command`;
+  `effect_controls::show(&mut dyn TimelineHost, ui, rect)` (was `&mut EffectcraftApp`; the app still
+  coerces).

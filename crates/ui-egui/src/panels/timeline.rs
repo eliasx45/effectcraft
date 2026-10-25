@@ -18,6 +18,7 @@ mod beat;
 pub mod host;
 pub mod ids;
 mod inline;
+pub mod keys;
 mod snap;
 mod speed_rows;
 pub(crate) mod wheels;
@@ -1594,9 +1595,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     crate::widgets::context_menu(&bresp, |ui| {
         let mut chosen = None;
         for id in ["comp.trimToWorkArea", "edit.liftWorkArea", "edit.extractWorkArea"] {
-            if let Some(a) = app.app_ref() {
-                crate::menus::entry_for(a, ui, id, &mut chosen);
-            }
+            app.menu_entry(ui, id, &mut chosen);
         }
         actions.extend(chosen);
     });
@@ -4604,9 +4603,7 @@ fn value_editor(
                     .on_hover_text(crate::i18n::tr("Eyedropper: click, then click in the Composition panel"))
                     .clicked()
             {
-                if let Some(a) = app.app() {
-                    super::effect_controls::toggle_pick(a, "color", layer, prop);
-                }
+                super::effect_controls::toggle_pick(app, "color", layer, prop);
             }
             if instance.is_none() {
                 app.auto_mut().add(&format!("{prefix}.eyedropper"), er, &prop.name);
