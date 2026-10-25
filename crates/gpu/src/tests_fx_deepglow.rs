@@ -30,7 +30,7 @@ fn deep_glow_matches_cpu() {
             ("PEDG-0001", n(14.0)),
             ("PEDG-0043", b(false)),
             ("PEDG-0008", e(1)),
-            ("exposure", n(5.0)),
+            ("glowExposure", n(5.0)),
             ("PEDG-0037", b(true)),
             ("PEDG-0039", e(1)),
             ("PEDG-0041", n(70.0)),

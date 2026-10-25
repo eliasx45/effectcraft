@@ -183,7 +183,7 @@ mod tests {
         s.execute_checked("prop.get", json!({"layer": l, "path": "effects/ec.blur.gaussian/blurriness"})).unwrap();
         s.execute_checked("effect.apply", json!({"layers": [l], "effect": "ec.stylize.deepglow"})).unwrap();
         let mut keys = vec![];
-        for param in ["PEDG-0001", "exposure"] {
+        for param in ["PEDG-0001", "glowExposure"] {
             for (t, v) in [(0.0, 1.0), (1.0, 2.0)] {
                 s.execute_checked("prop.addKey", json!({"layer": l, "path": format!("effects/#2/{param}"), "time": t, "value": v})).unwrap();
             }

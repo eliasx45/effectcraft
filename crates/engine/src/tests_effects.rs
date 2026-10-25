@@ -565,7 +565,8 @@ fn opening_an_old_project_upgrades_effect_instances() {
             }
             for (e, old_id, new_id) in PARAM_ID_ALIASES {
                 if g.match_id == *e {
-                    let mut p = take(g, new_id).unwrap_or_else(|| panic!("{e}: no {new_id}"));
+                    // A parameter with several old ids is saved under the first.
+                    let Some(mut p) = take(g, new_id) else { continue };
                     // Put it back at its old path (which may be inside a group).
                     let (path, leaf) = old_id.rsplit_once('/').map(|(p, l)| (Some(p), l)).unwrap_or((None, old_id));
                     p.match_id = leaf.to_string();
@@ -619,6 +620,48 @@ fn opening_an_old_project_upgrades_effect_instances() {
     }
     // The upgraded project renders.
     let _ = s2.render(cid, s2.time(), Default::default());
+}
+
+/// Deep Glow's Exposure keeps its strength through both renames: `exposure` (half-strength,
+/// 18-25 Oct 2026) is halved onto Deep Glow 2's scale, the plug-in's `PEDG-0002` carries over.
+#[test]
+fn opening_an_old_project_keeps_deep_glow_exposure() {
+    use effectcraft_project::{Node, PropGroup};
+    for (old_id, saved, want) in [("exposure", 0.08, 0.04), ("PEDG-0002", 0.3, 0.3)] {
+        let (mut s, a, _) = comp_with_two_solids();
+        apply(&mut s, a, "ec.stylize.deepglow");
+        let mut old = (*s.project).clone();
+        let cid = s.active_comp_id().unwrap();
+        {
+            let comp = std::sync::Arc::make_mut(match &mut old.items.get_mut(&cid).unwrap().kind {
+                effectcraft_project::ItemKind::Comp(c) => c,
+                _ => panic!("not a composition"),
+            });
+            let l = comp.layers.iter_mut().find(|l| l.id == LayerId(a)).unwrap();
+            for n in &mut l.props.sub_mut("effects").unwrap().children {
+                let Node::Group(g) = n else { continue };
+                let g: &mut PropGroup = g;
+                if g.match_id == "ec.stylize.deepglow" {
+                    let p = g.get_mut("glowExposure").unwrap();
+                    p.match_id = old_id.to_string();
+                    p.value = KV::Scalar(saved);
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ec-dg-exposure-{}-{old_id}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.ecproj").to_string_lossy().to_string();
+        std::fs::write(&path, old.to_json()).unwrap();
+        let mut s2 = Session::default();
+        s2.execute("file.open", json!({"path": path})).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        let l = s2.project.comp(cid).unwrap().layer(LayerId(a)).unwrap().clone();
+        let fx = l.effects().unwrap();
+        let g = fx.groups().find(|g| g.match_id == "ec.stylize.deepglow").unwrap();
+        assert!(g.get(old_id).is_none(), "{old_id} still present");
+        let KV::Scalar(v) = g.get("glowExposure").unwrap().value else { panic!("not a scalar") };
+        assert!((v - want).abs() < 1e-9, "{old_id} {saved} opened as {v}, want {want}");
+    }
 }
 
 /// A project saved before schema 2 (#227): effect points on a shape layer were measured from

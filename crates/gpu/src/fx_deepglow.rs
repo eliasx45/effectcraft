@@ -9,7 +9,7 @@
 //! layer is fitted on the CPU (`util::fit_layer`) and uploaded.
 
 use effectcraft_color::BlendMode;
-use effectcraft_effects::{Buf, EffectCtx};
+use effectcraft_effects::{Buf, EffectCtx, GlowPass};
 use effectcraft_geom::{Mat3, vec2};
 use effectcraft_raster::{Image, Sampling};
 
@@ -56,16 +56,16 @@ fn enlarge(e: &mut Enc, src: &GpuImage, fw: u32, fh: u32, gw: u32, gh: u32, orig
     Some(ops::warp(e, &empty, src, &m, Sampling::Bilinear, BlendMode::Normal, 1.0, 0, None))
 }
 
-/// How far (full-resolution pixels) past the glow input's non-zero pixels the three weighted
-/// passes can be non-zero: the box radii of the two full-resolution blurs, and for the
-/// downsampled one its radii at the small size plus the resamples' pre-filter and bilinear
-/// taps, rounded up generously (past it every pass is exactly transparent).
-fn glow_reach(radius: f64, sigmas: [f64; 3], aspect: f64, downsample: f64) -> u32 {
+/// How far (full-resolution pixels) past the glow input's non-zero pixels the weighted passes
+/// can be non-zero: the box radii of the full-resolution blurs, and for downsampled ones their
+/// radii at the small size plus the resamples' pre-filter and bilinear taps, rounded up
+/// generously (past it every pass is exactly transparent).
+fn glow_reach(passes: &[GlowPass], aspect: f64, downsample: f64) -> u32 {
     let support = |sigma: f64| effectcraft_raster::gaussian_support(sigma) as f64;
     let mut reach = 0.0f64;
-    for (step, sigma) in sigmas.into_iter().enumerate() {
-        for s in [radius * sigma * aspect, radius * sigma * (2.0 - aspect)] {
-            let r = if step == 2 && downsample < 0.999 {
+    for pass in passes {
+        for s in [pass.sigma * aspect, pass.sigma * (2.0 - aspect)] {
+            let r = if pass.downsample && downsample < 0.999 {
                 // Small-size radii, plus 4 small pixels of bilinear taps, plus the box
                 // halvings' 2^levels ≤ 2 / downsample full pixels, plus slack.
                 (support(s * downsample) + 4.0) / downsample + 2.0 / downsample + 4.0
@@ -149,11 +149,7 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         return Some(b);
     }
     let spread = (pr.f("PEDG-0011") / 100.0).clamp(0.0, 1.0) as f32;
-    let near = (0.30 - 0.35 * spread).max(0.05);
-    let far = 0.30 + 0.44 * spread;
-    let core = if pr.e("PEDG-0008") == 0 { 3.0 } else { 6.6 };
-    let weights = if linear_model { [core, 2.54, 1.30] } else { [near * 13.5, (1.0 - near - far) * 13.5, far * 13.5] };
-    let sigmas = if linear_model { [0.003, 0.03, 0.12] } else { [0.035, 0.14, 0.42] };
+    let passes = effectcraft_effects::deep_glow_passes(radius, b.scale, linear_model, spread);
     let aspect = pr.f("PEDG-0010").clamp(0.0, 2.0);
     let chroma = if pr.b("PEDG-0013") { pr.f("PEDG-0015").clamp(0.0, 2.0) as f32 } else { 0.0 };
     let downsample = (pr.f("PEDG-0019") / 100.0).clamp(0.1, 1.0);
@@ -161,7 +157,7 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     // The glow is transparent past the layer's rectangle grown by the blurs' reach, so at the
     // full working resolution the blurs and sums run on that region of the frame only (a glow
     // much narrower than its Radius pad: the blob's 300 px pad glows ~110 px).
-    let reach = if work_scale < 1.0 { pad } else { glow_reach(radius, sigmas, aspect, downsample).min(pad) };
+    let reach = if work_scale < 1.0 { pad } else { glow_reach(&passes, aspect, downsample).min(pad) };
     let origin = pad - reach;
     let (gw, gh) = (w0 + 2 * reach, h0 + 2 * reach);
     let mut work = if work_scale < 1.0 {
@@ -175,17 +171,18 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     };
     // The frame the working images stand for (their own size, or the region's whole frame).
     let (ww, wh) = if work_scale < 1.0 { (work.width, work.height) } else { (fw, fh) };
-    // The three parts and their sums are read only here: half floats on a display render
-    // (see `crate::half`; `fdg_finish` writes the f32 result). Each part is summed as soon as
-    // the next one is made, so at most two parts and a sum are held at once (they used to be
-    // three parts, the sum and the halo to the end).
+    // The parts and their sums are read only here: half floats on a display render (see
+    // `crate::half`; `fdg_finish` writes the f32 result). Each part is summed as soon as it is
+    // made, so at most a part and a sum are held at once.
     let half = Precision::pick(e, &["fdg_sum"], true) == Precision::Half;
     let precision = if half { Precision::Half } else { Precision::F32 };
-    let fringe = |step: usize| [[1.0, 1.0, 1.0 + chroma][step], 1.0, [1.0 + chroma, 1.0, 1.0][step], 1.0];
+    // Chromatic Aberration: the widest pass redder, the narrowest bluer (as the CPU).
+    let last = passes.len().saturating_sub(1);
+    let fringe = |step: usize| [if step == last { 1.0 + chroma } else { 1.0 }, 1.0, if step == 0 { 1.0 + chroma } else { 1.0 }, 1.0];
     let mut acc: Option<GpuImage> = None;
-    for (step, sigma) in sigmas.into_iter().enumerate() {
-        let (sx, sy) = (radius * work_scale * sigma * aspect, radius * work_scale * sigma * (2.0 - aspect));
-        let part = if step == 2 && downsample < 0.999 {
+    for (step, pass) in passes.iter().enumerate() {
+        let (sx, sy) = (pass.sigma * work_scale * aspect, pass.sigma * work_scale * (2.0 - aspect));
+        let part = if pass.downsample && downsample < 0.999 {
             // Downsampled from the whole frame (the same samples and pre-filter levels as before),
             // enlarged back onto the working region only.
             let full = if work_scale < 1.0 { &work } else { &source };
@@ -196,16 +193,18 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         } else {
             gaussian_blur_owned(e, work.clone(), sx, sy, false, precision)
         };
-        if step == 2 {
+        if step == last {
             // The last part: the sources are done with before the last sum.
             drop(std::mem::replace(&mut work, e.zeros(1, 1)));
             drop(std::mem::replace(&mut source, e.zeros(1, 1)));
         }
         acc = Some(match (acc.take(), step) {
-            // The first part waits for the second (the CPU sums the first two, then the third).
+            // The first part waits for the second (the CPU adds the parts in order); a lone part
+            // is weighted on its own.
+            (None, _) if last == 0 => weighted_sum(e, &part, pass.weight, fringe(0), &part, 0.0, [0.0; 4], half),
             (None, _) => part,
-            (Some(p0), 1) => weighted_sum(e, &p0, weights[0], fringe(0), &part, weights[1], fringe(1), half),
-            (Some(first), _) => weighted_sum(e, &first, 1.0, [1.0; 4], &part, weights[2], fringe(2), half),
+            (Some(p0), 1) => weighted_sum(e, &p0, passes[0].weight, fringe(0), &part, pass.weight, fringe(1), half),
+            (Some(sum), _) => weighted_sum(e, &sum, 1.0, [1.0; 4], &part, pass.weight, fringe(step), half),
         });
     }
     drop(work);
@@ -214,8 +213,8 @@ fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if work_scale < 1.0 {
         halo = resample(e, &halo, fw, fh)?;
     }
-    let exposure = effectcraft_effects::exposure_gain(pr.f("exposure"));
-    let exposure = if linear_model { exposure.powf(0.75) } else { exposure };
+    let exposure = effectcraft_effects::exposure_gain(pr.f("glowExposure"));
+    let exposure = if linear_model { exposure.powf(effectcraft_effects::DEEP_GLOW_EXPOSURE_POWER) } else { exposure };
     let tint = pr.color("PEDG-0038");
     let mut p = Params::default();
     p.u[0] = [convert as u32, unmult as u32, (pr.e("PEDG-0008") == 0) as u32, pr.b("PEDG-0037") as u32];

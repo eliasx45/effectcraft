@@ -6,15 +6,36 @@ fn fdg_inside(p: vec2<i32>) -> bool {
     return p.x < d.x && p.y < d.y;
 }
 
+// misc::DEEP_GLOW_GAMMA: the linear model's plain power, both ways (misc::dg_decode / dg_encode).
+// With misc::DEEP_GLOW_TOE's straight line to black below linear 1e-5.
+const FDG_GAMMA: f32 = 2.865;
+const FDG_TOE: f32 = 1e-5;
+fn fdg_decode(v0: f32) -> f32 {
+    let knee = pow(FDG_TOE, 1.0 / FDG_GAMMA);
+    let v = max(v0, 0.0);
+    if (v < knee) {
+        return v * FDG_TOE / knee;
+    }
+    return pow(v, FDG_GAMMA);
+}
+fn fdg_encode(v0: f32) -> f32 {
+    let knee = pow(FDG_TOE, 1.0 / FDG_GAMMA);
+    let v = max(v0, 0.0);
+    if (v < FDG_TOE) {
+        return v * knee / FDG_TOE;
+    }
+    return pow(v, 1.0 / FDG_GAMMA);
+}
+
 // misc::deep_glow_to_linear (Unmult: of the values as seen over black).
 fn fdg_to_linear(px: vec4<f32>, unmult: bool) -> vec4<f32> {
     let a = px.w;
     if (unmult) {
-        return vec4<f32>(srgb_to_linear(clamp(px.x, 0.0, 1.0)), srgb_to_linear(clamp(px.y, 0.0, 1.0)), srgb_to_linear(clamp(px.z, 0.0, 1.0)), a);
+        return vec4<f32>(fdg_decode(clamp(px.x, 0.0, 1.0)), fdg_decode(clamp(px.y, 0.0, 1.0)), fdg_decode(clamp(px.z, 0.0, 1.0)), a);
     }
     if (a > 0.0) {
         let c = clamp(px.xyz / a, vec3<f32>(0.0), vec3<f32>(1.0));
-        return vec4<f32>(srgb_to_linear(c.x) * a, srgb_to_linear(c.y) * a, srgb_to_linear(c.z) * a, a);
+        return vec4<f32>(fdg_decode(c.x) * a, fdg_decode(c.y) * a, fdg_decode(c.z) * a, a);
     }
     return px;
 }
@@ -137,10 +158,10 @@ fn fdg_finish(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (convert) {
         let a = o.w;
         if (unmult) {
-            o = vec4<f32>(linear_to_srgb(clamp(o.x, 0.0, 1.0)), linear_to_srgb(clamp(o.y, 0.0, 1.0)), linear_to_srgb(clamp(o.z, 0.0, 1.0)), a);
+            o = vec4<f32>(fdg_encode(clamp(o.x, 0.0, 1.0)), fdg_encode(clamp(o.y, 0.0, 1.0)), fdg_encode(clamp(o.z, 0.0, 1.0)), a);
         } else if (a > 0.0) {
             for (var c = 0; c < 3; c++) {
-                o[c] = min(linear_to_srgb(max(o[c] / a, 0.0)), 1.0) * a;
+                o[c] = min(fdg_encode(max(o[c] / a, 0.0)), 1.0) * a;
             }
         }
     }

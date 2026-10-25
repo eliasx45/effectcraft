@@ -1655,9 +1655,6 @@ pub(crate) fn param_scale(effect_id: &str, path: &str) -> f64 {
             "opacity" | "strokeOptions/curviness" | "strokeOptions/curvinessVariation" => 100.0,
             _ => 1.0,
         }
-    } else if effect_id == "ec.stylize.deepglow" && path == "exposure" {
-        // The native Exposure runs at half the plug-in's scale (`exposure_gain`).
-        2.0
     } else if effect_id == "ec.generate.radiowaves" {
         match path {
             // AE's 0..1 Opacity: 1 draws the waves at half strength (measured with aerender).
@@ -2329,8 +2326,8 @@ mod tests {
                             {"kind":"property","match_name":"ADBE Scatter-0002","name":"Grain","value":2.0},
                             {"kind":"property","match_name":"ADBE Scatter-0003","name":"Scatter Randomness","value":1.0}
                         ]},
-                        {"kind":"group","match_name":"PEDG2","name":"Deep Glow 2","children":[
-                            {"kind":"property","match_name":"PEDG2-0001","value":1.0}
+                        {"kind":"group","match_name":"ZZ Unknown Plugin","name":"Unknown Plugin","children":[
+                            {"kind":"property","match_name":"ZZ Unknown Plugin-0001","value":1.0}
                         ]}
                     ]}
                 ]}
