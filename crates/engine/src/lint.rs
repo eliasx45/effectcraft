@@ -48,6 +48,11 @@
 //!   ([`speed_peaks_deep`]: also inside precomps) within a few frames (default 4) of a stressed syllable's accent
 //!   ([`accent_time`]: one frame before its vowel, never before its onset) that misses it by
 //!   more than one frame. Warning.
+//! - `off-taste`: a keyframed move of this comp's layers whose ease is off Elias's profile
+//!   ([`crate::taste`]: linear, Easy Ease, a speed jump, baked keys, or outside his learned
+//!   ranges). Error when its move type has enough approved curves to block a handover, else
+//!   warning; a move in his range that isn't one of his approved curves is info. Precomps are
+//!   not searched (check them with `taste.check` on the precomp).
 
 use effectcraft_geom::{Mat3, vec2};
 use effectcraft_project::{AlphaMode, Comp, ItemId, ItemKind, Layer, LayerId, LayerSource, Project};
@@ -59,7 +64,7 @@ use crate::layout;
 use crate::precomp_time::{self, Hop};
 
 /// Every rule id, in report order.
-pub const RULES: [&str; 12] = [
+pub const RULES: [&str; 13] = [
     "text-too-small",
     "low-contrast",
     "outside-title-safe",
@@ -72,6 +77,7 @@ pub const RULES: [&str; 12] = [
     "exposed-edge",
     "off-beat",
     "off-accent",
+    "off-taste",
 ];
 
 /// Most sample times one lint looks at; longer ranges are thinned evenly (`truncated`).
@@ -1010,7 +1016,7 @@ pub fn merge(occurrences: Vec<(Tick, Finding)>) -> Vec<Problem> {
                 && p.finding.layer == f.layer
                 && p.finding.other == f.other
                 && p.finding.inner.as_ref().map(|i| (i.comp, i.layer)) == f.inner.as_ref().map(|i| (i.comp, i.layer))
-                && (!matches!(f.rule, "off-beat" | "off-accent") || p.time == t)
+                && (!matches!(f.rule, "off-beat" | "off-accent" | "off-taste") || p.time == t)
         };
         match out.iter_mut().find(|p| same(p)) {
             Some(p) => {

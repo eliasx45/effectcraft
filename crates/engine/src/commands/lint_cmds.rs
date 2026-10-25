@@ -195,6 +195,33 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
 
+    if set.on("off-taste") {
+        let (prof, _) = crate::taste::Profile::load(s.config.as_deref());
+        let (moves, truncated) = crate::taste::check(&prof, comp, None, span.0, span.1, false);
+        let (ok, close, off, blocking) = crate::taste::summary(&moves);
+        notes.push(format!(
+            "off-taste: {} moves judged against Elias's ease profile: ✅ {ok} · 🟡 {close} · ❌ {off} ({blocking} blocking){}; taste.check lists them with fixes",
+            moves.len(),
+            if truncated { ", list truncated" } else { "" }
+        ));
+        for m in moves.into_iter().filter(|m| m.verdict != crate::taste::Verdict::Approved) {
+            let severity = match (m.verdict, m.blocking) {
+                (crate::taste::Verdict::Off, true) => lint::Severity::Error,
+                (crate::taste::Verdict::Off, false) => lint::Severity::Warning,
+                _ => lint::Severity::Info,
+            };
+            let fix = m
+                .nearest
+                .as_ref()
+                .map(|(id, _, _)| format!(" Fix: taste.apply {{layer: {}, path: \"{}\", key: {}, curve: \"{id}\"}}.", m.at.layer.0, m.path, m.at.key))
+                .unwrap_or_default();
+            occurrences.push((
+                Tick::from_seconds_f64(m.t0),
+                lint::Finding { rule: "off-taste", severity, layer: m.at.layer, other: None, inner: None, message: format!("{}{fix}", m.message) },
+            ));
+        }
+    }
+
     let problems = lint::merge(occurrences);
     let count = |sev: lint::Severity| problems.iter().filter(|p| p.finding.severity == sev).count();
     let (errors, warnings, infos) = (count(lint::Severity::Error), count(lint::Severity::Warning), count(lint::Severity::Info));
@@ -238,7 +265,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![query!(
         "render.lint",
         "Design Lint",
-        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: [text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|nested-cut-off|text-overlap|text-off-centre|hidden-visible|exposed-edge|off-beat|off-accent] (default all), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner? {comp, layer, path} (a layer inside a precomp: `layer` is the precomp layer showing it)}], notes}",
+        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: [text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|nested-cut-off|text-overlap|text-off-centre|hidden-visible|exposed-edge|off-beat|off-accent|off-taste] (default all), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner? {comp, layer, path} (a layer inside a precomp: `layer` is the precomp layer showing it)}], notes}",
         render_lint
     )]
 }
