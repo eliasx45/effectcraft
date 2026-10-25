@@ -21,8 +21,8 @@
 //! and clears what it read. `sh_store` writes the image.
 //!
 //! Fallbacks: the plan declines (the CPU renders the layer as before) for masks, motion-blurred
-//! shape sub-frames, non-Normal draw blend modes, Taper / Wave strokes, paths tiny-skia would clip
-//! or tile, runaway edge counts; this module declines for buffers past the device's
+//! shape sub-frames, non-Normal draw blend modes, Taper / Wave strokes, masks tiny-skia would tile
+//! (over 8191 px), runaway edge counts; this module declines for buffers past the device's
 //! storage-buffer limits or when the kernels didn't build. `EFFECTCRAFT_GPU_SHAPES=0` turns it off
 //! (A/B).
 
@@ -157,7 +157,7 @@ fn uniform(plan: &RasterPlan, draw: Option<&PlanDraw>, edge_at: u32, grad_at: u3
     }
     let mut out = [0u8; DRAW_BYTES];
     let words = u.iter().flatten().copied().chain(f.iter().flatten().map(|x| x.to_bits()));
-    for (dst, x) in out.chunks_exact_mut(4).zip(words) {
+    for (dst, x) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
         dst.copy_from_slice(&x.to_le_bytes());
     }
     out

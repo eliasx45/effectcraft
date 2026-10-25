@@ -12,8 +12,8 @@
 //!
 //! [`Renderer::shape_raster_plan`] declines (`None`: the CPU renders the layer) whatever the plan
 //! can't reproduce yet: masks, motion-blurred shape sub-frames, draws in blend modes other than
-//! Normal, Taper / Wave strokes (supersampled further on the CPU), paths reaching outside their
-//! draw's mask (tiny-skia clips those edges first), masks over 8191 px and runaway edge counts.
+//! Normal, Taper / Wave strokes (supersampled further on the CPU), masks over 8191 px and runaway
+//! edge counts. Paths reaching outside their draw's mask are clipped as tiny-skia clips them.
 
 use effectcraft_color::BlendMode;
 use effectcraft_geom::{Mat3, vec2};
@@ -31,7 +31,7 @@ use crate::{ContentClip, Renderer};
 pub enum PlanPaint {
     /// Straight RGBA.
     Solid([f32; 4]),
-    Gradient(PlanGradient),
+    Gradient(Box<PlanGradient>),
 }
 
 /// A gradient fill or stroke: the ramp of [`GradientRamp`] and the stops of
@@ -183,7 +183,7 @@ fn plan(ctx: &EvalCtx, layer: &Layer, contents: &effectcraft_project::PropGroup,
             Paint::Gradient { g, kind, width, start, end, highlight, .. } => {
                 // As `render_window`: identity when the paint space is degenerate.
                 let to_local = (m * d.xf).inverse().unwrap_or(Mat3::IDENTITY);
-                PlanPaint::Gradient(gradient(g, GradientRamp::new(*kind, *start, *end, *width, *highlight), &to_local)?)
+                PlanPaint::Gradient(Box::new(gradient(g, GradientRamp::new(*kind, *start, *end, *width, *highlight), &to_local)?))
             }
         };
         out.push(PlanDraw { rect: [r.x0, r.y0, r.w, r.h], even_odd: rule == FillRule::EvenOdd, edges, opacity: d.opacity, paint });

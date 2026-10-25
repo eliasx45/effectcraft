@@ -5,6 +5,10 @@
 //! curves turned into lines by its fixed-point forward differencing, every line as a 16.16
 //! fixed-point x stepped per sub-scanline (4 per pixel row, 4 sample columns per pixel).
 //!
+//! Paths reaching outside the mask go through tiny-skia's edge clipper first (curves chopped
+//! at its sides, what lies left or right as vertical lines there), and paths reaching far
+//! outside are flattened and clipped as `fill_coverage` does, so every path is covered.
+//!
 //! Each [`ScanEdge`] covers up to [`CHUNK`] consecutive sub-scanlines; on sub-scanline `y` its
 //! sample column is `(x + k·dx + 0x8000) >> 16` (`k = y − first`), and every sample at or right
 //! of it gets the edge's winding. A pixel's coverage is then tiny-skia's `SuperBlitter` sum: per
@@ -12,7 +16,7 @@
 //! covered, capped at 255.
 //!
 //! Ported from tiny-skia 0.12 (`edge.rs`, `edge_builder.rs`, `path_geometry.rs`,
-//! `fixed_point.rs`, `scan/path_aa.rs`, and `tiny-skia-path`'s `path_builder.rs`,
+//! `edge_clipper.rs`, `line_clipper.rs`, `fixed_point.rs`, `scan/path_aa.rs`, and `tiny-skia-path`'s `path_builder.rs`,
 //! `path_geometry.rs`, `transform.rs`), itself a port of Skia, under this licence:
 //!
 //! Copyright (c) 2011 Google Inc. All rights reserved.
@@ -69,8 +73,8 @@ pub enum Scan {
     Empty,
     /// The edges to walk.
     Edges(Vec<ScanEdge>),
-    /// Not reproduced here (a path tiny-skia clips or tiles first, or too many edges): the CPU
-    /// must rasterise this one.
+    /// Not reproduced here (a mask tiny-skia tiles, over 8191 px a side; a projective matrix;
+    /// too many edges): the CPU must rasterise this one.
     Decline,
 }
 
@@ -155,6 +159,7 @@ pub fn scan_edges(paths: &[BezPath], m: &Mat3, w: u32, h: u32) -> Scan {
     let a = &m.0;
     // `fill_coverage`'s extent test, in f64.
     let (wf, hf) = (f64::from(w), f64::from(h));
+    let mut huge = false;
     for p in paths {
         for el in p.elements() {
             let pts: &[kurbo::Point] = match el {
@@ -169,12 +174,26 @@ pub fn scan_edges(paths: &[BezPath], m: &Mat3, w: u32, h: u32) -> Scan {
                 if !(x.is_finite() && y.is_finite()) {
                     return Scan::Empty;
                 }
-                if x < -SAFE_REACH || y < -SAFE_REACH || x > wf + SAFE_REACH || y > hf + SAFE_REACH {
-                    return Scan::Decline;
-                }
+                huge |= x < -SAFE_REACH || y < -SAFE_REACH || x > wf + SAFE_REACH || y > hf + SAFE_REACH;
             }
         }
     }
+    if huge {
+        // As `fill_coverage`: flattened and clipped in device space first, filled untransformed.
+        let to_device = kurbo::Affine::new([a[0][0], a[1][0], a[0][1], a[1][1], a[0][2], a[1][2]]);
+        let mut all = BezPath::new();
+        for p in paths {
+            all.extend(p.elements().iter().copied());
+        }
+        let clipped = clip_to_rect(&(to_device * all), w, h);
+        return scan_device(std::slice::from_ref(&clipped), &Mat3::IDENTITY, w, h);
+    }
+    scan_device(paths, m, w, h)
+}
+
+/// [`scan_edges`] of paths near the mask (tiny-skia's part of `fill_coverage`).
+fn scan_device(paths: &[BezPath], m: &Mat3, w: u32, h: u32) -> Scan {
+    let a = &m.0;
     // `to_skia`: the path in f32 through tiny-skia's builder.
     let mut b = Builder::new();
     let f = |p: kurbo::Point| [p.x as f32, p.y as f32];
@@ -220,26 +239,49 @@ pub fn scan_edges(paths: &[BezPath], m: &Mat3, w: u32, h: u32) -> Scan {
     if ir[2] <= 0 || ir[3] <= 0 || ir[0] >= wi || ir[1] >= hi {
         return Scan::Empty;
     }
-    // Paths that reach outside the mask go through tiny-skia's edge clipper: not ported yet.
-    if ir[0] < 0 || ir[1] < 0 || ir[2] > wi || ir[3] > hi {
-        return Scan::Decline;
-    }
+    // `fill_path_impl`: a path reaching outside the mask has its edges clipped to it first
+    // (`EdgeClipper`: curves chopped there, what lies left or right becomes vertical lines on
+    // the mask's sides); the clipped curves are already monotonic.
+    let contained = ir[0] >= 0 && ir[1] >= 0 && ir[2] <= wi && ir[3] <= hi;
+    let edges = if contained {
+        path_edges(&b.verbs, &pts)
+    } else {
+        let mut clipped = Vec::new();
+        let c = [0.0, 0.0, w as f32, h as f32];
+        for e in path_edges(&b.verbs, &pts) {
+            clip_edge(e, c, &mut clipped);
+            if clipped.len() > MAX_EDGES {
+                return Scan::Decline;
+            }
+        }
+        // `BasicEdgeBuilder::build`: a non-finite clipped point fails the whole path.
+        let finite = |p: &Pt| p[0].is_finite() && p[1].is_finite();
+        if !clipped.iter().all(|e| match e {
+            PathEdge::Line(a, b) => finite(a) && finite(b),
+            PathEdge::Quad(a, b, c) => finite(a) && finite(b) && finite(c),
+            PathEdge::Cubic(a, b, c, d) => finite(a) && finite(b) && finite(c) && finite(d),
+        }) {
+            return Scan::Empty;
+        }
+        clipped
+    };
+    // `BasicEdgeBuilder`'s edge list: lines kept (a vertical one merges with a vertical line
+    // before it, as `combine_vertical` does), curves walked into chunks straight away.
     let mut out = Vec::new();
-    let mut objects = 0usize;
-    for e in path_edges(&b.verbs, &pts) {
+    let mut list: Vec<Option<LineEdge>> = Vec::new();
+    for e in edges {
         match e {
             PathEdge::Line(p0, p1) => {
                 if let Some(line) = LineEdge::new(p0, p1, SHIFT) {
-                    objects += 1;
-                    emit(&line, &mut out);
+                    push_line(line, &mut list);
                 }
             }
             PathEdge::Quad(p0, p1, p2) => {
-                let (n, mono) = chop_quad_at_y_extrema(&[p0, p1, p2]);
+                let (n, mono) = if contained { chop_quad_at_extrema(&[p0, p1, p2], 1) } else { (0, [p0, p1, p2, [0.0; 2], [0.0; 2]]) };
                 for i in 0..=n {
                     let Some(q) = mono.get(i * 2..i * 2 + 3) else { continue };
                     let Some(mut quad) = QuadEdge::new([q[0], q[1], q[2]], SHIFT) else { continue };
-                    objects += 1;
+                    list.push(None);
                     emit(&quad.line, &mut out);
                     while quad.count > 0 && quad.update() {
                         emit(&quad.line, &mut out);
@@ -247,11 +289,17 @@ pub fn scan_edges(paths: &[BezPath], m: &Mat3, w: u32, h: u32) -> Scan {
                 }
             }
             PathEdge::Cubic(p0, p1, p2, p3) => {
-                let (n, mono) = chop_cubic_at_y_extrema(&[p0, p1, p2, p3]);
+                let (n, mono) = if contained {
+                    chop_cubic_at_extrema(&[p0, p1, p2, p3], 1)
+                } else {
+                    let mut d = [[0.0f32; 2]; 10];
+                    d[..4].copy_from_slice(&[p0, p1, p2, p3]);
+                    (0, d)
+                };
                 for i in 0..=n {
                     let Some(c) = mono.get(i * 3..i * 3 + 4) else { continue };
                     let Some(mut cubic) = CubicEdge::new([c[0], c[1], c[2], c[3]], SHIFT) else { continue };
-                    objects += 1;
+                    list.push(None);
                     emit(&cubic.line, &mut out);
                     while cubic.count < 0 && cubic.update() {
                         emit(&cubic.line, &mut out);
@@ -259,12 +307,86 @@ pub fn scan_edges(paths: &[BezPath], m: &Mat3, w: u32, h: u32) -> Scan {
                 }
             }
         }
-        if out.len() > MAX_EDGES {
+        if out.len().saturating_add(list.len()) > MAX_EDGES {
             return Scan::Decline;
         }
     }
     // `BasicEdgeBuilder::build_edges`: fewer than two edges draw nothing.
-    if objects < 2 || out.is_empty() { Scan::Empty } else { Scan::Edges(out) }
+    if list.len() < 2 {
+        return Scan::Empty;
+    }
+    for line in list.iter().flatten() {
+        emit(line, &mut out);
+        if out.len() > MAX_EDGES {
+            return Scan::Decline;
+        }
+    }
+    if out.is_empty() { Scan::Empty } else { Scan::Edges(out) }
+}
+
+/// `BasicEdgeBuilder::push_line` (`None` in `list` is a curve).
+fn push_line(edge: LineEdge, list: &mut Vec<Option<LineEdge>>) {
+    if edge.dx == 0
+        && let Some(Some(last)) = list.last_mut()
+    {
+        match combine_vertical(&edge, last) {
+            Combine::Total => {
+                list.pop();
+                return;
+            }
+            Combine::Partial => return,
+            Combine::No => {}
+        }
+    }
+    list.push(Some(edge));
+}
+
+enum Combine {
+    No,
+    Partial,
+    Total,
+}
+
+/// `combine_vertical`.
+fn combine_vertical(edge: &LineEdge, last: &mut LineEdge) -> Combine {
+    if last.dx != 0 || edge.x != last.x {
+        return Combine::No;
+    }
+    if edge.winding == last.winding {
+        return if edge.last_y.wrapping_add(1) == last.first_y {
+            last.first_y = edge.first_y;
+            Combine::Partial
+        } else if edge.first_y == last.last_y.wrapping_add(1) {
+            last.last_y = edge.last_y;
+            Combine::Partial
+        } else {
+            Combine::No
+        };
+    }
+    if edge.first_y == last.first_y {
+        return if edge.last_y == last.last_y {
+            Combine::Total
+        } else if edge.last_y < last.last_y {
+            last.first_y = edge.last_y.wrapping_add(1);
+            Combine::Partial
+        } else {
+            last.first_y = last.last_y.wrapping_add(1);
+            last.last_y = edge.last_y;
+            last.winding = edge.winding;
+            Combine::Partial
+        };
+    }
+    if edge.last_y == last.last_y {
+        if edge.first_y > last.first_y {
+            last.last_y = edge.first_y.wrapping_sub(1);
+        } else {
+            last.last_y = last.first_y.wrapping_sub(1);
+            last.first_y = edge.first_y;
+            last.winding = edge.winding;
+        }
+        return Combine::Partial;
+    }
+    Combine::No
 }
 
 /// Add a line edge, cut into [`CHUNK`]s of sub-scanlines (`x` stepped as the walk steps it).
@@ -678,18 +800,24 @@ fn is_not_monotonic(a: f32, b: f32, c: f32) -> bool {
     ab == 0.0 || bc < 0.0
 }
 
-fn chop_quad_at_y_extrema(src: &[Pt; 3]) -> (usize, [Pt; 5]) {
-    let (a, mut b, c) = (src[0][1], src[1][1], src[2][1]);
+/// `chop_quad_at_x_extrema` (`axis` 0) / `chop_quad_at_y_extrema` (1).
+fn chop_quad_at_extrema(src: &[Pt; 3], axis: usize) -> (usize, [Pt; 5]) {
+    let k = axis.min(1);
+    let (a, mut b, c) = (src[0][k], src[1][k], src[2][k]);
     if is_not_monotonic(a, b, c) {
         if let Some(t) = unit_divide(a - b, a - b - b + c) {
             let mut dst = chop_quad_at(src, t);
-            dst[1][1] = dst[2][1];
-            dst[3][1] = dst[2][1];
+            dst[1][k] = dst[2][k];
+            dst[3][k] = dst[2][k];
             return (1, dst);
         }
         b = if (a - b).abs() < (b - c).abs() { a } else { c };
     }
-    (0, [[src[0][0], a], [src[1][0], b], [src[2][0], c], [0.0; 2], [0.0; 2]])
+    let mut dst = [src[0], src[1], src[2], [0.0; 2], [0.0; 2]];
+    dst[0][k] = a;
+    dst[1][k] = b;
+    dst[2][k] = c;
+    (0, dst)
 }
 
 /// `find_unit_quad_roots`: roots of `a t² + b t + c` strictly inside (0, 1), ascending.
@@ -727,8 +855,10 @@ fn chop_cubic_at2(src: &[Pt; 4], t: f32) -> [Pt; 7] {
     [src[0], ab, abc, interp(abc, bcd, t), bcd, cd, src[3]]
 }
 
-fn chop_cubic_at_y_extrema(src: &[Pt; 4]) -> (usize, [Pt; 10]) {
-    let (a, b, c, d) = (src[0][1], src[1][1], src[2][1], src[3][1]);
+/// `chop_cubic_at_x_extrema` (`axis` 0) / `chop_cubic_at_y_extrema` (1).
+fn chop_cubic_at_extrema(src: &[Pt; 4], axis: usize) -> (usize, [Pt; 10]) {
+    let k = axis.min(1);
+    let (a, b, c, d) = (src[0][k], src[1][k], src[2][k], src[3][k]);
     let ts = unit_quad_roots(d - a + 3.0 * (b - c), 2.0 * (a - b - b + c), b - a);
     let mut dst = [[0.0f32; 2]; 10];
     if ts.is_empty() {
@@ -761,13 +891,743 @@ fn chop_cubic_at_y_extrema(src: &[Pt; 4]) -> (usize, [Pt; 10]) {
             }
         }
     }
-    dst[2][1] = dst[3][1];
-    dst[4][1] = dst[3][1];
+    dst[2][k] = dst[3][k];
+    dst[4][k] = dst[3][k];
     if ts.len() == 2 {
-        dst[5][1] = dst[6][1];
-        dst[7][1] = dst[6][1];
+        dst[5][k] = dst[6][k];
+        dst[7][k] = dst[6][k];
     }
     (ts.len(), dst)
+}
+
+// ---------------------------------------------------------------- clipping (edge_clipper.rs, line_clipper.rs)
+
+/// `[left, top, right, bottom]`.
+type Clip = [f32; 4];
+
+fn ave(a: f32, b: f32) -> f32 {
+    (a + b) * 0.5
+}
+
+fn pin(v: f64, a: f64, b: f64) -> f64 {
+    let (lo, hi) = if b < a { (b, a) } else { (a, b) };
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+fn sect_with_horizontal(src: &[Pt; 2], y: f32) -> f32 {
+    let dy = src[1][1] - src[0][1];
+    if dy.abs() <= NEARLY_ZERO {
+        return ave(src[0][0], src[1][0]);
+    }
+    let (x0, y0, x1, y1) = (f64::from(src[0][0]), f64::from(src[0][1]), f64::from(src[1][0]), f64::from(src[1][1]));
+    pin(x0 + (f64::from(y) - y0) * (x1 - x0) / (y1 - y0), x0, x1) as f32
+}
+
+fn sect_clamp_with_vertical(src: &[Pt; 2], x: f32) -> f32 {
+    let dx = src[1][0] - src[0][0];
+    let y = if dx.abs() <= NEARLY_ZERO {
+        ave(src[0][1], src[1][1])
+    } else {
+        let (x0, y0, x1, y1) = (f64::from(src[0][0]), f64::from(src[0][1]), f64::from(src[1][0]), f64::from(src[1][1]));
+        (y0 + (f64::from(x) - x0) * (y1 - y0) / (x1 - x0)) as f32
+    };
+    let (lo, hi) = if src[1][1] < src[0][1] { (src[1][1], src[0][1]) } else { (src[0][1], src[1][1]) };
+    if y < lo {
+        lo
+    } else if y > hi {
+        hi
+    } else {
+        y
+    }
+}
+
+/// `line_clipper::clip` (nothing culled to the right) as lines.
+fn clip_line(src: [Pt; 2], c: Clip, out: &mut Vec<PathEdge>) {
+    let (i0, i1) = if src[0][1] < src[1][1] { (0, 1) } else { (1, 0) };
+    if src[i1][1] <= c[1] || src[i0][1] >= c[3] {
+        return;
+    }
+    let mut tmp = src;
+    if src[i0][1] < c[1] {
+        tmp[i0] = [sect_with_horizontal(&src, c[1]), c[1]];
+    }
+    if tmp[i1][1] > c[3] {
+        tmp[i1] = [sect_with_horizontal(&src, c[3]), c[3]];
+    }
+    let (i0, i1, mut reverse) = if src[0][0] < src[1][0] { (0, 1, false) } else { (1, 0, true) };
+    let mut res = [[0.0f32; 2]; 4];
+    let count = if tmp[i1][0] <= c[0] || tmp[i0][0] >= c[2] {
+        let x = if tmp[i1][0] <= c[0] { c[0] } else { c[2] };
+        tmp[0][0] = x;
+        tmp[1][0] = x;
+        reverse = false;
+        res[0] = tmp[0];
+        res[1] = tmp[1];
+        1
+    } else {
+        let mut at = 0;
+        if tmp[i0][0] < c[0] {
+            res[0] = [c[0], tmp[i0][1]];
+            at = 1;
+            res[1] = [c[0], sect_clamp_with_vertical(&tmp, c[0])];
+        } else {
+            res[0] = tmp[i0];
+        }
+        at += 1;
+        if tmp[i1][0] > c[2] {
+            res[at] = [c[2], sect_clamp_with_vertical(&tmp, c[2])];
+            at += 1;
+            res[at] = [c[2], tmp[i1][1]];
+        } else {
+            res[at] = tmp[i1];
+        }
+        at
+    };
+    let pts: Vec<Pt> = if reverse { res[..=count].iter().rev().copied().collect() } else { res[..=count].to_vec() };
+    for w in pts.windows(2) {
+        out.push(PathEdge::Line(w[0], w[1]));
+    }
+}
+
+fn push_vline(x: f32, mut y0: f32, mut y1: f32, reverse: bool, out: &mut Vec<PathEdge>) {
+    if reverse {
+        std::mem::swap(&mut y0, &mut y1);
+    }
+    out.push(PathEdge::Line([x, y0], [x, y1]));
+}
+
+/// The first root of the monotonic quadratic `c0, c1, c2` at `target` (`chop_mono_quad_at`).
+fn chop_mono_quad_at(c0: f32, c1: f32, c2: f32, target: f32) -> Option<f32> {
+    unit_quad_roots(c0 - c1 - c1 + c2, 2.0 * (c1 - c0), c0 - target).first().copied()
+}
+
+/// `EdgeClipper`: one path edge clipped to `c`.
+fn clip_edge(e: PathEdge, c: Clip, out: &mut Vec<PathEdge>) {
+    match e {
+        PathEdge::Line(p0, p1) => clip_line([p0, p1], c, out),
+        PathEdge::Quad(p0, p1, p2) => {
+            let pts = [p0, p1, p2];
+            let Some(b) = bounds(&pts) else { return };
+            if b[1] >= c[3] || b[3] <= c[1] {
+                return;
+            }
+            let (ny, mono_y) = chop_quad_at_extrema(&pts, 1);
+            for y in 0..=ny {
+                let Some(q) = mono_y.get(y * 2..y * 2 + 3) else { continue };
+                let (nx, mono_x) = chop_quad_at_extrema(&[q[0], q[1], q[2]], 0);
+                for x in 0..=nx {
+                    let Some(q) = mono_x.get(x * 2..x * 2 + 3) else { continue };
+                    clip_mono_quad([q[0], q[1], q[2]], c, out);
+                }
+            }
+        }
+        PathEdge::Cubic(p0, p1, p2, p3) => {
+            let pts = [p0, p1, p2, p3];
+            let Some(b) = bounds(&pts) else { return };
+            if !(b[3] > c[1] && b[1] < c[3]) {
+                return;
+            }
+            let limit = (1 << 22) as f32;
+            if b[0] < -limit || b[1] < -limit || b[2] > limit || b[3] > limit {
+                clip_line([p0, p3], c, out);
+                return;
+            }
+            let (ny, mono_y) = chop_cubic_at_extrema(&pts, 1);
+            for y in 0..=ny {
+                let Some(q) = mono_y.get(y * 3..y * 3 + 4) else { continue };
+                let (nx, mono_x) = chop_cubic_at_extrema(&[q[0], q[1], q[2], q[3]], 0);
+                for x in 0..=nx {
+                    let Some(q) = mono_x.get(x * 3..x * 3 + 4) else { continue };
+                    clip_mono_cubic([q[0], q[1], q[2], q[3]], c, out);
+                }
+            }
+        }
+    }
+}
+
+/// `src` monotonic in x and y.
+fn clip_mono_quad(src: [Pt; 3], c: Clip, out: &mut Vec<PathEdge>) {
+    let mut reverse = src[0][1] > src[2][1];
+    let mut pts = if reverse { [src[2], src[1], src[0]] } else { src };
+    if pts[2][1] <= c[1] || pts[0][1] >= c[3] {
+        return;
+    }
+    // `chop_quad_in_y`.
+    if pts[0][1] < c[1] {
+        if let Some(t) = chop_mono_quad_at(pts[0][1], pts[1][1], pts[2][1], c[1]) {
+            let mut tmp = chop_quad_at(&pts, t);
+            tmp[2][1] = c[1];
+            tmp[3][1] = tmp[3][1].max(c[1]);
+            pts[0] = tmp[2];
+            pts[1] = tmp[3];
+        } else {
+            for p in &mut pts {
+                if p[1] < c[1] {
+                    p[1] = c[1];
+                }
+            }
+        }
+    }
+    if pts[2][1] > c[3] {
+        if let Some(t) = chop_mono_quad_at(pts[0][1], pts[1][1], pts[2][1], c[3]) {
+            let mut tmp = chop_quad_at(&pts, t);
+            tmp[1][1] = tmp[1][1].min(c[3]);
+            tmp[2][1] = c[3];
+            pts[1] = tmp[1];
+            pts[2] = tmp[2];
+        } else {
+            for p in &mut pts {
+                if p[1] > c[3] {
+                    p[1] = c[3];
+                }
+            }
+        }
+    }
+    if pts[0][0] > pts[2][0] {
+        pts.swap(0, 2);
+        reverse = !reverse;
+    }
+    if pts[2][0] <= c[0] {
+        push_vline(c[0], pts[0][1], pts[2][1], reverse, out);
+        return;
+    }
+    if pts[0][0] >= c[2] {
+        push_vline(c[2], pts[0][1], pts[2][1], reverse, out);
+        return;
+    }
+    let push = |p: [Pt; 3], out: &mut Vec<PathEdge>| out.push(if reverse { PathEdge::Quad(p[2], p[1], p[0]) } else { PathEdge::Quad(p[0], p[1], p[2]) });
+    if pts[0][0] < c[0] {
+        match chop_mono_quad_at(pts[0][0], pts[1][0], pts[2][0], c[0]) {
+            Some(t) => {
+                let mut tmp = chop_quad_at(&pts, t);
+                push_vline(c[0], tmp[0][1], tmp[2][1], reverse, out);
+                tmp[2][0] = c[0];
+                tmp[3][0] = tmp[3][0].max(c[0]);
+                pts[0] = tmp[2];
+                pts[1] = tmp[3];
+            }
+            None => {
+                push_vline(c[0], pts[0][1], pts[2][1], reverse, out);
+                return;
+            }
+        }
+    }
+    if pts[2][0] > c[2] {
+        match chop_mono_quad_at(pts[0][0], pts[1][0], pts[2][0], c[2]) {
+            Some(t) => {
+                let mut tmp = chop_quad_at(&pts, t);
+                tmp[1][0] = tmp[1][0].min(c[2]);
+                tmp[2][0] = c[2];
+                push([tmp[0], tmp[1], tmp[2]], out);
+                push_vline(c[2], tmp[2][1], tmp[4][1], reverse, out);
+            }
+            None => {
+                pts[1][0] = pts[1][0].min(c[2]);
+                pts[2][0] = pts[2][0].min(c[2]);
+                push(pts, out);
+            }
+        }
+    } else {
+        push(pts, out);
+    }
+}
+
+/// `src` monotonic in x and y.
+fn clip_mono_cubic(src: [Pt; 4], c: Clip, out: &mut Vec<PathEdge>) {
+    let mut reverse = src[0][1] > src[3][1];
+    let mut pts = if reverse { [src[3], src[2], src[1], src[0]] } else { src };
+    if pts[3][1] <= c[1] || pts[0][1] >= c[3] {
+        return;
+    }
+    // `chop_cubic_in_y`.
+    if pts[0][1] < c[1] {
+        let mut tmp = chop_mono_cubic_at(&pts, c[1], 1);
+        if tmp[3][1] < c[1] && tmp[4][1] < c[1] && tmp[5][1] < c[1] {
+            tmp = chop_mono_cubic_at(&[tmp[3], tmp[4], tmp[5], tmp[6]], c[1], 1);
+        }
+        tmp[3][1] = c[1];
+        tmp[4][1] = tmp[4][1].max(c[1]);
+        pts[0] = tmp[3];
+        pts[1] = tmp[4];
+        pts[2] = tmp[5];
+    }
+    if pts[3][1] > c[3] {
+        let mut tmp = chop_mono_cubic_at(&pts, c[3], 1);
+        tmp[3][1] = c[3];
+        tmp[2][1] = tmp[2][1].min(c[3]);
+        pts[1] = tmp[1];
+        pts[2] = tmp[2];
+        pts[3] = tmp[3];
+    }
+    if pts[0][0] > pts[3][0] {
+        pts.swap(0, 3);
+        pts.swap(1, 2);
+        reverse = !reverse;
+    }
+    if pts[3][0] <= c[0] {
+        push_vline(c[0], pts[0][1], pts[3][1], reverse, out);
+        return;
+    }
+    if pts[0][0] >= c[2] {
+        push_vline(c[2], pts[0][1], pts[3][1], reverse, out);
+        return;
+    }
+    if pts[0][0] < c[0] {
+        let mut tmp = chop_mono_cubic_at(&pts, c[0], 0);
+        push_vline(c[0], tmp[0][1], tmp[3][1], reverse, out);
+        tmp[3][0] = c[0];
+        tmp[4][0] = tmp[4][0].max(c[0]);
+        pts[0] = tmp[3];
+        pts[1] = tmp[4];
+        pts[2] = tmp[5];
+    }
+    let push =
+        |p: [Pt; 4], out: &mut Vec<PathEdge>| out.push(if reverse { PathEdge::Cubic(p[3], p[2], p[1], p[0]) } else { PathEdge::Cubic(p[0], p[1], p[2], p[3]) });
+    if pts[3][0] > c[2] {
+        let mut tmp = chop_mono_cubic_at(&pts, c[2], 0);
+        tmp[3][0] = c[2];
+        tmp[2][0] = tmp[2][0].min(c[2]);
+        push([tmp[0], tmp[1], tmp[2], tmp[3]], out);
+        push_vline(c[2], tmp[3][1], tmp[6][1], reverse, out);
+    } else {
+        push(pts, out);
+    }
+}
+
+/// `chop_mono_cubic_at_x/y` of the edge clipper: at the first intercept `path64` finds
+/// (`cubic_dchop_at_intercept`), else at `mono_cubic_closest_t`.
+fn chop_mono_cubic_at(src: &[Pt; 4], v: f32, axis: usize) -> [Pt; 7] {
+    let k = axis.min(1);
+    let p: [[f64; 2]; 4] = src.map(|q| [f64::from(q[0]), f64::from(q[1])]);
+    if let Some(t) = c64::intercept(&p, f64::from(v), k) {
+        return chop_cubic64(&p, t);
+    }
+    chop_cubic_at2(src, mono_cubic_closest_t([src[0][k], src[1][k], src[2][k], src[3][k]], v))
+}
+
+/// tiny-skia's `path64`: Skia's double-precision cubic intercepts.
+mod c64 {
+    const FLT_EPSILON_HALF: f64 = (f32::EPSILON / 2.0) as f64;
+    const FLT_EPSILON_CUBED: f64 = (f32::EPSILON * f32::EPSILON * f32::EPSILON) as f64;
+    const FLT_EPSILON_INVERSE: f64 = 1.0 / f32::EPSILON as f64;
+    use std::f64::consts::PI;
+
+    type P = [[f64; 2]; 4];
+
+    fn bound(v: f64, min: f64, max: f64) -> f64 {
+        max.min(v).max(min)
+    }
+    fn between(v: f64, a: f64, b: f64) -> bool {
+        (a - v) * (b - v) <= 0.0
+    }
+    fn approximately_zero(v: f64) -> bool {
+        v.abs() < f64::EPSILON
+    }
+    fn approximately_zero_or_more(v: f64) -> bool {
+        v > -f64::EPSILON
+    }
+    fn approximately_one_or_less(v: f64) -> bool {
+        v < 1.0 + f64::EPSILON
+    }
+    fn approximately_zero_inverse(v: f64) -> bool {
+        v.abs() > FLT_EPSILON_INVERSE
+    }
+    fn approximately_zero_when_compared_to(v: f64, other: f64) -> bool {
+        v == 0.0 || v.abs() < (other * f64::from(f32::EPSILON)).abs()
+    }
+    fn approximately_equal(a: f64, b: f64) -> bool {
+        approximately_zero(a - b)
+    }
+    fn approximately_equal_half(a: f64, b: f64) -> bool {
+        a - b < FLT_EPSILON_HALF
+    }
+    fn twos(x: f32) -> i32 {
+        let b = x.to_bits() as i32;
+        if b < 0 { (b & 0x7FFF_FFFF).wrapping_neg() } else { b }
+    }
+    fn almost_dequal_ulps(a: f64, b: f64) -> bool {
+        if a.abs() < f64::from(f32::MAX) && b.abs() < f64::from(f32::MAX) {
+            let (x, y) = (twos(a as f32), twos(b as f32));
+            x < y.wrapping_add(16) && y < x.wrapping_add(16)
+        } else {
+            (a - b).abs() / a.abs().max(b.abs()) < f64::from(f32::EPSILON * 16.0)
+        }
+    }
+    fn cube_root(x: f64) -> f64 {
+        if x.abs() < FLT_EPSILON_CUBED {
+            return 0.0;
+        }
+        let d = x.abs();
+        let hi = (d.to_bits() >> 32) as u32;
+        let mut a = f64::from_bits(u64::from((hi / 3).wrapping_add(715_094_163)) << 32);
+        for _ in 0..3 {
+            let a3 = a * a * a;
+            a = a * (a3 + d + d) / (a3 + a3 + d);
+        }
+        if x < 0.0 { -a } else { a }
+    }
+
+    fn push_valid_ts(s: &[f64], t: &mut Vec<f64>) {
+        'outer: for &v in s {
+            if approximately_zero_or_more(v) && approximately_one_or_less(v) {
+                let v = bound(v, 0.0, 1.0);
+                for &u in t.iter() {
+                    if approximately_equal(u, v) {
+                        continue 'outer;
+                    }
+                }
+                t.push(v);
+            }
+        }
+    }
+
+    fn quad_handle_zero(b: f64, c: f64) -> Vec<f64> {
+        if approximately_zero(b) { if c == 0.0 { vec![0.0] } else { vec![] } } else { vec![-c / b] }
+    }
+
+    fn quad_roots_real(a: f64, b: f64, c: f64) -> Vec<f64> {
+        if a == 0.0 {
+            return quad_handle_zero(b, c);
+        }
+        let p = b / (2.0 * a);
+        let q = c / a;
+        if approximately_zero(a) && (approximately_zero_inverse(p) || approximately_zero_inverse(q)) {
+            return quad_handle_zero(b, c);
+        }
+        let p2 = p * p;
+        if !almost_dequal_ulps(p2, q) && p2 < q {
+            return vec![];
+        }
+        let sqrt_d = if p2 > q { (p2 - q).sqrt() } else { 0.0 };
+        let (s0, s1) = (sqrt_d - p, -sqrt_d - p);
+        if almost_dequal_ulps(s0, s1) { vec![s0] } else { vec![s0, s1] }
+    }
+
+    fn quad_roots_valid_t(a: f64, b: f64, c: f64) -> Vec<f64> {
+        let mut t = Vec::new();
+        push_valid_ts(&quad_roots_real(a, b, c), &mut t);
+        t
+    }
+
+    fn roots_real(a: f64, b: f64, c: f64, d: f64) -> Vec<f64> {
+        if approximately_zero(a)
+            && approximately_zero_when_compared_to(a, b)
+            && approximately_zero_when_compared_to(a, c)
+            && approximately_zero_when_compared_to(a, d)
+        {
+            return quad_roots_real(b, c, d);
+        }
+        if approximately_zero_when_compared_to(d, a) && approximately_zero_when_compared_to(d, b) && approximately_zero_when_compared_to(d, c) {
+            let mut s = quad_roots_real(a, b, c);
+            if s.iter().any(|&v| approximately_zero(v)) {
+                return s;
+            }
+            s.push(0.0);
+            return s;
+        }
+        if approximately_zero(a + b + c + d) {
+            let mut s = quad_roots_real(a, a + b, -d);
+            if s.iter().any(|&v| almost_dequal_ulps(v, 1.0)) {
+                return s;
+            }
+            s.push(1.0);
+            return s;
+        }
+        let inv_a = 1.0 / a;
+        let (a, b, c) = (b * inv_a, c * inv_a, d * inv_a);
+        let a2 = a * a;
+        let q = (a2 - b * 3.0) / 9.0;
+        let r = (2.0 * a2 * a - 9.0 * a * b + 27.0 * c) / 54.0;
+        let r2 = r * r;
+        let q3 = q * q * q;
+        let r2_minus_q3 = r2 - q3;
+        let adiv3 = a / 3.0;
+        let mut s = Vec::with_capacity(3);
+        if r2_minus_q3 < 0.0 {
+            let theta = bound(r / q3.sqrt(), -1.0, 1.0).acos();
+            let neg2_root_q = -2.0 * q.sqrt();
+            s.push(neg2_root_q * (theta / 3.0).cos() - adiv3);
+            let rr = neg2_root_q * ((theta + 2.0 * PI) / 3.0).cos() - adiv3;
+            if !almost_dequal_ulps(s[0], rr) {
+                s.push(rr);
+            }
+            let rr = neg2_root_q * ((theta - 2.0 * PI) / 3.0).cos() - adiv3;
+            if !almost_dequal_ulps(s[0], rr) && (s.len() == 1 || !almost_dequal_ulps(s[1], rr)) {
+                s.push(rr);
+            }
+        } else {
+            let mut a = cube_root(r.abs() + r2_minus_q3.sqrt());
+            if r > 0.0 {
+                a = -a;
+            }
+            if a != 0.0 {
+                a += q / a;
+            }
+            let r2 = a - adiv3;
+            s.push(r2);
+            if almost_dequal_ulps(r2, q3) {
+                let r2 = -a / 2.0 - adiv3;
+                if !almost_dequal_ulps(s[0], r2) {
+                    s.push(r2);
+                }
+            }
+        }
+        s
+    }
+
+    fn roots_valid_t(a: f64, b: f64, c: f64, d: f64) -> Vec<f64> {
+        let s = roots_real(a, b, c, d);
+        let mut t = Vec::with_capacity(3);
+        push_valid_ts(&s, &mut t);
+        'outer: for &v in &s {
+            if !approximately_one_or_less(v) && between(v, 1.0, 1.00005) {
+                if t.iter().any(|&u| approximately_equal(u, 1.0)) {
+                    continue 'outer;
+                }
+                t.push(1.0);
+            } else if !approximately_zero_or_more(v) && between(v, -0.00005, 0.0) {
+                if t.iter().any(|&u| approximately_equal(u, 0.0)) {
+                    continue 'outer;
+                }
+                t.push(0.0);
+            }
+        }
+        t
+    }
+
+    fn point_at_t(p: &P, t: f64) -> [f64; 2] {
+        if t == 0.0 {
+            return p[0];
+        }
+        if t == 1.0 {
+            return p[3];
+        }
+        let one_t = 1.0 - t;
+        let one_t2 = one_t * one_t;
+        let a = one_t2 * one_t;
+        let b = 3.0 * one_t2 * t;
+        let t2 = t * t;
+        let c = 3.0 * one_t * t2;
+        let d = t2 * t;
+        [a * p[0][0] + b * p[1][0] + c * p[2][0] + d * p[3][0], a * p[0][1] + b * p[1][1] + c * p[2][1] + d * p[3][1]]
+    }
+
+    fn find_extrema(p: &P, k: usize) -> Vec<f64> {
+        let (a, b, c, d) = (p[0][k], p[1][k], p[2][k], p[3][k]);
+        quad_roots_valid_t(d - a + 3.0 * (b - c), 2.0 * (a - b - b + c), b - a)
+    }
+
+    fn find_inflections(p: &P) -> Vec<f64> {
+        let ax = p[1][0] - p[0][0];
+        let ay = p[1][1] - p[0][1];
+        let bx = p[2][0] - 2.0 * p[1][0] + p[0][0];
+        let by = p[2][1] - 2.0 * p[1][1] + p[0][1];
+        let cx = p[3][0] + 3.0 * (p[1][0] - p[2][0]) - p[0][0];
+        let cy = p[3][1] + 3.0 * (p[1][1] - p[2][1]) - p[0][1];
+        quad_roots_valid_t(bx * cy - by * cx, ax * cy - ay * cx, ax * by - ay * bx)
+    }
+
+    fn binary_search(p: &P, min: f64, max: f64, v: f64, k: usize) -> f64 {
+        let mut t = (min + max) / 2.0;
+        let mut step = (t - min) / 2.0;
+        let mut at = point_at_t(p, t);
+        let mut dist = at[k] - v;
+        // Halving steps reach the f64 resolution long before this.
+        for _ in 0..4096 {
+            let prior_t = min.max(t - step);
+            let less = point_at_t(p, prior_t);
+            if approximately_equal_half(less[0], at[0]) && approximately_equal_half(less[1], at[1]) {
+                return -1.0;
+            }
+            let less_dist = less[k] - v;
+            let last_step = step;
+            step /= 2.0;
+            let ok = if dist > 0.0 { dist > less_dist } else { dist < less_dist };
+            if ok {
+                t = prior_t;
+            } else {
+                let next_t = t + last_step;
+                if next_t > max {
+                    return -1.0;
+                }
+                let more = point_at_t(p, next_t);
+                if approximately_equal_half(more[0], at[0]) && approximately_equal_half(more[1], at[1]) {
+                    return -1.0;
+                }
+                let more_dist = more[k] - v;
+                let ok = if dist > 0.0 { dist <= more_dist } else { dist >= more_dist };
+                if ok {
+                    continue;
+                }
+                t = next_t;
+            }
+            at = point_at_t(p, t);
+            dist = at[k] - v;
+            if approximately_equal(at[k], v) {
+                return t;
+            }
+        }
+        -1.0
+    }
+
+    fn search_roots(p: &P, mut ts: Vec<f64>, v: f64, k: usize) -> Vec<f64> {
+        ts.extend(find_inflections(p));
+        ts.push(0.0);
+        ts.push(1.0);
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut roots = Vec::new();
+        for w in ts.windows(2) {
+            let (min, max) = (w[0], w[1]);
+            if min == max {
+                continue;
+            }
+            let t = binary_search(p, min, max, v, k);
+            if t >= 0.0 {
+                if roots.len() >= 3 {
+                    return Vec::new();
+                }
+                roots.push(t);
+            }
+        }
+        roots
+    }
+
+    /// `horizontal_intersect` (`k` 1) / `vertical_intersect` (`k` 0): the first root.
+    pub(super) fn intercept(p: &P, v: f64, k: usize) -> Option<f64> {
+        // `coefficients`.
+        let (pa, pb, pc, pd) = (p[0][k], p[1][k], p[2][k], p[3][k]);
+        let mut a = pd;
+        let mut b = pc * 3.0;
+        let mut c = pb * 3.0;
+        let d = pa;
+        a -= d - c + b;
+        b += 3.0 * d - 2.0 * c;
+        c -= 3.0 * d;
+        let mut roots = roots_valid_t(a, b, c, d - v);
+        for &t in &roots {
+            if !approximately_equal(point_at_t(p, t)[k], v) {
+                roots = search_roots(p, find_extrema(p, k), v, k);
+                break;
+            }
+        }
+        roots.first().copied()
+    }
+}
+
+/// `Cubic64::chop_at`, back in f32.
+fn chop_cubic64(p: &[[f64; 2]; 4], t: f64) -> [Pt; 7] {
+    let mut dst = [[0.0f32; 2]; 7];
+    for k in 0..2 {
+        let (a, b, c, d) = (p[0][k], p[1][k], p[2][k], p[3][k]);
+        let v = if t == 0.5 {
+            [a, (a + b) / 2.0, (a + 2.0 * b + c) / 4.0, (a + 3.0 * (b + c) + d) / 8.0, (b + 2.0 * c + d) / 4.0, (c + d) / 2.0, d]
+        } else {
+            let i = |x: f64, y: f64| x + (y - x) * t;
+            let (ab, bc, cd) = (i(a, b), i(b, c), i(c, d));
+            let (abc, bcd) = (i(ab, bc), i(bc, cd));
+            [a, ab, abc, i(abc, bcd), bcd, cd, d]
+        };
+        for (o, x) in dst.iter_mut().zip(v) {
+            o[k] = x as f32;
+        }
+    }
+    dst
+}
+
+fn mono_cubic_closest_t(src: [f32; 4], x: f32) -> f32 {
+    let mut t = 0.5f32;
+    let mut best_t = t;
+    let mut step = 0.25f32;
+    let d = src[0];
+    let a = src[3] + 3.0 * (src[1] - src[2]) - d;
+    let b = 3.0 * (src[2] - src[1] - src[1] + d);
+    let c = 3.0 * (src[1] - d);
+    let x = x - d;
+    let mut closest = f32::MAX;
+    loop {
+        let loc = ((a * t + b) * t + c) * t;
+        let dist = (loc - x).abs();
+        if closest > dist {
+            closest = dist;
+            best_t = t;
+        }
+        let last_t = t;
+        t += if loc < x { step } else { -step };
+        step *= 0.5;
+        if !(closest > 0.25 && last_t != t) {
+            break;
+        }
+    }
+    best_t
+}
+
+// ---------------------------------------------------------------- `fill_coverage`'s huge paths
+
+/// `effectcraft_path::clip_to_rect`: `path` (device space) flattened and clipped to a little more
+/// than the `w × h` mask, one closed polygon per subpath.
+fn clip_to_rect(path: &BezPath, w: u32, h: u32) -> BezPath {
+    let (x0, y0, x1, y1) = (-2.0, -2.0, f64::from(w) + 2.0, f64::from(h) + 2.0);
+    let mut polys: Vec<Vec<kurbo::Point>> = vec![];
+    kurbo::flatten(path, 0.05, |el| match el {
+        PathEl::MoveTo(p) => polys.push(vec![p]),
+        PathEl::LineTo(p) => match polys.last_mut() {
+            Some(poly) => poly.push(p),
+            None => polys.push(vec![p]),
+        },
+        _ => {}
+    });
+    // Left, right, top, bottom: (axis, limit, keep >= limit).
+    let sides = [(0usize, x0, true), (0, x1, false), (1, y0, true), (1, y1, false)];
+    let mut out = BezPath::new();
+    for poly in polys {
+        let mut pts = poly;
+        for (axis, lim, ge) in sides {
+            let Some(&last) = pts.last() else { break };
+            let inside = |p: kurbo::Point| {
+                let v = if axis == 0 { p.x } else { p.y };
+                if ge { v >= lim } else { v <= lim }
+            };
+            let cross = |a: kurbo::Point, b: kurbo::Point| {
+                if axis == 0 {
+                    let t = if b.x == a.x { 0.0 } else { (lim - a.x) / (b.x - a.x) };
+                    kurbo::Point::new(lim, a.y + (b.y - a.y) * t)
+                } else {
+                    let t = if b.y == a.y { 0.0 } else { (lim - a.y) / (b.y - a.y) };
+                    kurbo::Point::new(a.x + (b.x - a.x) * t, lim)
+                }
+            };
+            let mut next = Vec::with_capacity(pts.len() + 2);
+            let mut a = last;
+            for &b in &pts {
+                match (inside(a), inside(b)) {
+                    (true, true) => next.push(b),
+                    (true, false) => next.push(cross(a, b)),
+                    (false, true) => {
+                        next.push(cross(a, b));
+                        next.push(b);
+                    }
+                    (false, false) => {}
+                }
+                a = b;
+            }
+            pts = next;
+        }
+        let mut it = pts.into_iter();
+        if let Some(first) = it.next() {
+            out.move_to(first);
+            for p in it {
+                out.line_to(p);
+            }
+            out.close_path();
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -863,9 +1723,40 @@ mod tests {
     }
 
     #[test]
-    fn paths_reaching_out_of_the_mask_are_declined_and_junk_is_empty() {
-        let r = kurbo::Rect::new(-3.0, 2.0, 20.0, 10.0).to_path(0.1);
-        assert_eq!(scan_edges(&[r], &Mat3::IDENTITY, 30, 20), Scan::Decline);
+    fn paths_reaching_out_of_the_mask_are_clipped_as_tiny_skia_clips_them() {
+        // Every side, lines, quads and cubics, both rules; then far out (`fill_coverage`'s
+        // flatten-and-clip path) and rotated past the corners.
+        let mut quad = BezPath::new();
+        quad.move_to((-12.0, 5.0));
+        quad.quad_to((30.0, -25.0), (62.0, 20.0));
+        quad.quad_to((20.0, 50.0), (-12.0, 5.0));
+        let shapes = [
+            kurbo::Rect::new(-3.0, 2.0, 20.0, 10.0).to_path(0.1),
+            kurbo::Rect::new(10.3, -4.6, 61.2, 40.7).to_path(0.1),
+            kurbo::Ellipse::new((25.0, 16.0), (31.3, 9.7), 0.4).to_path(0.1),
+            kurbo::Ellipse::new((2.0, 30.0), (12.5, 8.2), 1.1).to_path(0.1),
+            kurbo::RoundedRect::new(-8.2, -6.4, 45.9, 38.1, 9.5).to_path(0.1),
+            quad,
+        ];
+        let ms = [
+            Mat3::IDENTITY,
+            Mat3::translate(vec2(25.0, 16.0)) * Mat3::rotate_deg(33.0) * Mat3::scale(vec2(1.4, 1.2)) * Mat3::translate(vec2(-25.0, -16.0)),
+            Mat3::translate(vec2(25.0, 16.0)) * Mat3::rotate_deg(-71.0) * Mat3::scale(vec2(300.0, 250.0)) * Mat3::translate(vec2(-25.0, -16.0)),
+        ];
+        for m in &ms {
+            for p in &shapes {
+                for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+                    check(std::slice::from_ref(p), m, 50, 32, rule);
+                }
+            }
+        }
+        // Wholly outside: nothing.
+        let r = kurbo::Rect::new(-30.0, 2.0, -20.0, 10.0).to_path(0.1);
+        assert_eq!(scan_edges(&[r], &Mat3::IDENTITY, 30, 20), Scan::Empty);
+    }
+
+    #[test]
+    fn junk_and_degenerate_paths_are_empty() {
         let mut nan = BezPath::new();
         nan.move_to((f64::NAN, 1.0));
         nan.line_to((3.0, 3.0));
