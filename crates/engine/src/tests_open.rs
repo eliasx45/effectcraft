@@ -123,6 +123,56 @@ fn opening_upgrades_only_the_stale_layers() {
     assert_converged(&q);
 }
 
+/// 20-08: Bevel Alpha and Scatter imported from After Effects before EffectCraft knew them were
+/// saved as plain groups that rendered nothing. Opening the project makes them native effects
+/// with their values and keys; a third-party plug-in's group stays as it was.
+#[test]
+fn opening_turns_plain_ae_effects_into_native_effects() {
+    let mut p = large(1);
+    let cid = p.comps().next().map(|(id, _)| *id).unwrap();
+    let fx = p.comp_mut(cid).unwrap().layers.get_mut(0).unwrap().props.sub_mut("effects").unwrap();
+    let group = |m: &str, uid: u64, params: &[(&str, effectcraft_keyframe::Value)]| {
+        let mut g = PropGroup::new(uid, m, m);
+        for (i, (pm, v)) in params.iter().enumerate() {
+            g.children.push(Node::Prop(effectcraft_project::Property::new(uid + 1 + i as u64, pm, pm, v.clone())));
+        }
+        g
+    };
+    use effectcraft_keyframe::Value::Scalar;
+    let mut bevel = group("ADBE Bevel Alpha", 900_000, &[("ADBE Bevel Alpha-0001", Scalar(4.0)), ("ADBE Bevel Alpha-0002", Scalar(-35.0))]);
+    if let Some(Node::Prop(angle)) = bevel.children.get_mut(1) {
+        angle.keys = vec![
+            effectcraft_keyframe::Keyframe::new(effectcraft_time::Tick::ZERO, Scalar(-35.0)),
+            effectcraft_keyframe::Keyframe::new(effectcraft_time::Tick::from_seconds_f64(1.0), Scalar(10.0)),
+        ];
+    }
+    fx.children.push(bevel.into());
+    fx.children.push(group("ADBE Scatter", 900_100, &[("ADBE Scatter-0001", Scalar(5.0)), ("ADBE Scatter-0002", Scalar(1.0))]).into());
+    fx.children.push(group("PEDG2", 900_200, &[("PEDG2-0001", Scalar(1.0))]).into());
+    let mut q = Project::from_json(&p.to_json_compact()).unwrap();
+    q.fix_next_id();
+    upgrade_effects(&mut q);
+    let fx: Vec<&PropGroup> = q.comp(cid).unwrap().layers[0].props.sub("effects").unwrap().groups().collect();
+    let bevel = fx.iter().find(|g| g.uid == 900_000).unwrap();
+    assert_eq!(bevel.kind, GroupKind::Effect { effect: "ec.perspective.bevelalpha".into() });
+    assert_eq!(bevel.prop("edgeThickness").unwrap().value, Scalar(4.0));
+    assert_eq!(bevel.prop("lightAngle").unwrap().keys.iter().map(|k| k.value.clone()).collect::<Vec<_>>(), vec![Scalar(-35.0), Scalar(10.0)]);
+    // Untouched parameters take their defaults.
+    assert_eq!(bevel.prop("lightIntensity").unwrap().value, Scalar(0.4));
+    let scatter = fx.iter().find(|g| g.uid == 900_100).unwrap();
+    assert_eq!(scatter.kind, GroupKind::Effect { effect: "ec.stylize.scatter".into() });
+    assert_eq!(scatter.prop("grain").unwrap().value, effectcraft_keyframe::Value::Enum(0));
+    let glow = fx.iter().find(|g| g.uid == 900_200).unwrap();
+    assert_eq!(glow.kind, GroupKind::Plain);
+    assert_eq!(glow.children.len(), 1);
+    // Unique uids after the rebuild, and a second open changes nothing.
+    let mut uids = std::collections::HashSet::new();
+    q.comp(cid).unwrap().layers[0].props.walk("", &mut |_, pr| assert!(uids.insert(pr.uid), "duplicate uid {}", pr.uid));
+    let mut again = q.clone();
+    upgrade_effects(&mut again);
+    assert!(again.same_content(&q));
+}
+
 /// Writes the opened projects' JSON to `$EC_OPEN_DUMP` when set (compared byte for byte with
 /// the code before the speed-up).
 #[test]

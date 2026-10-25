@@ -91,6 +91,7 @@ pub(crate) fn effect_id(ae_match: &str) -> Option<&'static str> {
         "CC Glass" => "ec.stylize.ccglass",
         "CC Griddler" => "ec.distort.ccgriddler",
         "CC Lens" => "ec.distort.cclens",
+        "CC Light Burst 2.5" => "ec.generate.cclightburst",
         "CC Light Rays" => "ec.generate.cclightrays",
         "CC Light Sweep" => "ec.generate.cclightsweep",
         "CC Mr. Mercury" => "ec.sim.ccmrmercury",
@@ -782,6 +783,13 @@ pub(crate) fn param_id(effect_id: &str, ae_param_match: &str) -> Option<&'static
         ("ec.distort.cclens", "CC Lens-0001") => "center",
         ("ec.distort.cclens", "CC Lens-0002") => "size",
         ("ec.distort.cclens", "CC Lens-0003") => "convergence",
+        // CC Light Burst 2.5's Halo Alpha (-0005) has no native counterpart.
+        ("ec.generate.cclightburst", "CC Light Burst 2.5-0001") => "center",
+        ("ec.generate.cclightburst", "CC Light Burst 2.5-0002") => "intensity",
+        ("ec.generate.cclightburst", "CC Light Burst 2.5-0003") => "rayLength",
+        ("ec.generate.cclightburst", "CC Light Burst 2.5-0004") => "burst",
+        ("ec.generate.cclightburst", "CC Light Burst 2.5-0006") => "setColor",
+        ("ec.generate.cclightburst", "CC Light Burst 2.5-0007") => "color",
         ("ec.generate.cclightrays", "CC Light Rays-0001") => "intensity",
         ("ec.generate.cclightrays", "CC Light Rays-0002") => "center",
         ("ec.generate.cclightrays", "CC Light Rays-0003") => "radius",
@@ -1270,6 +1278,43 @@ pub(crate) fn control_only(ae_match: &str) -> bool {
             | "Pseudo/MDS Elastic Controller"
             | "Pseudo/MHAC PrCtrl J95 4"
     )
+}
+
+/// The native effect for an AE effect match name: from the reviewed table above ([`effect_id`],
+/// whose parameters map through [`param_id`]), or else from the scripting match names
+/// ([`effectcraft_project::matchnames::effect_from_match`]), whose parameters map by their AE
+/// index ([`indexed_param`]). The flag says which: `true` for the reviewed table.
+pub(crate) fn resolve(ae_match: &str) -> Option<(&'static effectcraft_effects::EffectSpec, bool)> {
+    if let Some(id) = effect_id(ae_match) {
+        return effectcraft_effects::find(id).map(|spec| (spec, true));
+    }
+    effectcraft_project::matchnames::effect_from_match(ae_match).and_then(effectcraft_effects::find).map(|spec| (spec, false))
+}
+
+/// The native parameter of AE parameter `raw` (`<ae_effect>-0003`) by its index: the n-th
+/// visible parameter in spec order (or the number [`effectcraft_project::matchnames::param_number`]
+/// gives it). Only for effects without twirl-down groups, whose AE indices also count the
+/// group start and end markers.
+pub(crate) fn indexed_param(spec: &effectcraft_effects::EffectSpec, ae_effect: &str, raw: &str) -> Option<&'static str> {
+    let (prefix, digits) = raw.rsplit_once('-')?;
+    if !prefix.eq_ignore_ascii_case(ae_effect) || digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: usize = digits.parse().ok()?;
+    if spec.params.iter().any(|p| p.id.contains('/')) {
+        return None;
+    }
+    spec.params
+        .iter()
+        .filter(|p| !matches!(p.ui, effectcraft_project::ParamUi::Hidden))
+        .enumerate()
+        .find(|(i, p)| effectcraft_project::matchnames::param_number(spec.id, p.id).unwrap_or(i + 1) == n)
+        .map(|(_, p)| p.id)
+}
+
+/// [`param_id`] for a reviewed effect, [`indexed_param`] for one resolved by match name.
+pub(crate) fn native_param(spec: &effectcraft_effects::EffectSpec, reviewed: bool, ae_effect: &str, raw: &str) -> Option<&'static str> {
+    if reviewed { param_id(spec.id, raw) } else { indexed_param(spec, ae_effect, raw) }
 }
 
 #[cfg(test)]

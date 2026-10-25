@@ -1518,7 +1518,9 @@ impl Session {
 /// (renamed / regrouped / added parameters, reordered popups; see
 /// [`effectcraft_effects::migrate`]), and a project from before
 /// [`effectcraft_project::SCHEMA_EFFECT_SPACE`] into effect space
-/// ([`effectcraft_effects::migrate::to_effect_space`]). Stamps the current schema.
+/// ([`effectcraft_effects::migrate::to_effect_space`]). Effects imported from After Effects as
+/// plain groups before EffectCraft knew them become native effects
+/// ([`effectcraft_aep::plain::native_effect`]). Stamps the current schema.
 pub fn upgrade_effects(p: &mut Project) {
     let to_effect_space = p.schema < effectcraft_project::SCHEMA_EFFECT_SPACE;
     // The layers with an instance to change (any registered effect when moving into effect
@@ -1531,6 +1533,7 @@ pub fn upgrade_effects(p: &mut Project) {
                 effectcraft_project::GroupKind::Effect { effect } => {
                     effectcraft_effects::find(effect).is_some_and(|spec| to_effect_space || !effectcraft_effects::migrate::is_current(spec, g))
                 }
+                effectcraft_project::GroupKind::Plain => effectcraft_aep::plain::is_convertible(g),
                 _ => false,
             });
             if stale {
@@ -1572,6 +1575,9 @@ pub fn upgrade_effects(p: &mut Project) {
             let Some(fx) = l.props.sub_mut("effects") else { continue };
             for n in &mut fx.children {
                 let effectcraft_project::Node::Group(g) = n else { continue };
+                if let Some(native) = effectcraft_aep::plain::native_effect(g, &mut effectcraft_project::build::Ids(&mut next), size) {
+                    *g = native;
+                }
                 let effectcraft_project::GroupKind::Effect { effect } = &g.kind else { continue };
                 if let Some(spec) = effectcraft_effects::find(effect) {
                     effectcraft_effects::migrate::upgrade_instance(spec, g, &mut effectcraft_project::build::Ids(&mut next), size);
