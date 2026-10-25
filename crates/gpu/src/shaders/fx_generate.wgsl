@@ -221,8 +221,18 @@ fn gen_lens_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ---------------------------------------------------------------- wipes
 
-// Linear Wipe. data = per column ((x + 0.5)·dx − edge) (hi, lo), then per row ((y + 0.5)·dy)
-// (hi, lo); u[0].x = row table offset; f[0].x = feather.
+// Standard normal CDF (Abramowitz & Stegun 7.1.26), as misc::wipe_phi.
+fn gen_phi(z: f32) -> f32 {
+    let x = abs(z) * 0.70710678118654752;
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    let ef = 1.0 - poly * exp(-x * x);
+    return select(0.5 * (1.0 + ef), 0.5 * (1.0 - ef), z < 0.0);
+}
+
+// Linear Wipe (misc::LinearWipe::factor). data = per column ((x + 0.5)·dx − edge) (hi, lo),
+// then per row ((y + 0.5)·dy) (hi, lo); u[0].x = row table offset;
+// f[0] = (σ, reach, s_lo, s_hi) (σ = 0: hard edge); f[1].x = Φ(−reach/σ).
 @compute @workgroup_size(16, 16)
 fn gen_linear_wipe(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -230,8 +240,21 @@ fn gen_linear_wipe(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x >= dims.x || p.y >= dims.y) {
         return;
     }
-    let d = gen_sum(gen_hl(2u * u32(p.x)), gen_hl(P.u[0].x + 2u * u32(p.y)));
-    let k = clamp(d / P.f[0].x + 0.5, 0.0, 1.0);
+    let t = gen_sum(gen_hl(2u * u32(p.x)), gen_hl(P.u[0].x + 2u * u32(p.y)));
+    let sigma = P.f[0].x;
+    let reach = P.f[0].y;
+    let tail = P.f[1].x;
+    var g: f32;
+    if (sigma <= 0.0) {
+        g = clamp(t + 0.5, 0.0, 1.0);
+    } else if (t <= -reach) {
+        g = 0.0;
+    } else if (t >= reach) {
+        g = 1.0;
+    } else {
+        g = clamp((gen_phi(t / sigma) - tail) / max(1.0 - 2.0 * tail, 1e-9), 0.0, 1.0);
+    }
+    let k = clamp(1.0 - P.f[0].z * (1.0 - P.f[0].w * g), 0.0, 1.0);
     textureStore(out, p, textureLoad(src, p, 0) * k);
 }
 
