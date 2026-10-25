@@ -243,6 +243,14 @@ fn layer_changes(c: &Comp, b: &Layer, a: &Layer, out: &mut Vec<String>) {
     }
 }
 
+/// The ids of the comps that differ from `b` to `a` (new, changed or deleted), in id order.
+pub fn changed_comps(b: &Project, a: &Project) -> Vec<u64> {
+    let mut ids: Vec<u64> = a.comps().filter(|(id, c)| b.comp(**id) != Some(*c)).map(|(id, _)| id.0).collect();
+    ids.extend(b.comps().filter(|(id, _)| a.comp(**id).is_none()).map(|(id, _)| id.0));
+    ids.sort_unstable();
+    ids
+}
+
 /// What changed from `b` to `a`, one line per change.
 pub fn describe(b: &Project, a: &Project) -> Vec<String> {
     let mut out = Vec::new();
@@ -291,6 +299,7 @@ pub fn entry_json(e: &Entry, me: Option<&str>, max_lines: usize) -> Value {
     let mut o = json!({
         "revision": e.revision, "by": e.client.as_deref().unwrap_or(USER), "who": who(e, me), "label": e.label,
         "changes": lines.into_iter().take(max_lines).collect::<Vec<_>>(),
+        "comps": changed_comps(&e.before, &e.after),
     });
     if more > 0 {
         o["more"] = json!(more);

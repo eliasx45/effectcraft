@@ -119,7 +119,7 @@ panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_age
 
 ### Clients: cursors and claims
 
-A request whose params carry `client` runs on that client's own cursor: active comp, current times,
+A request whose params carry `client` (in the command's `params`; one written next to `command` or `method` is moved there) runs on that client's own cursor: active comp, current times,
 selected layers / properties / keys / mask vertices / Project items, the current track and on-canvas
 text editing (`Session::execute` swaps it in for the command and the user's back afterwards; batch and
 script steps inherit it). A new client starts from a copy of the user's cursor; at most 64 are kept

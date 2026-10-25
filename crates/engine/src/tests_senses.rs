@@ -89,6 +89,8 @@ fn feed_says_who_changed_what_in_words() {
     assert!(e[0]["changes"][0].as_str().unwrap().contains("Card › Opacity: animated"), "{f}");
     assert_eq!(e[1]["by"], "user");
     assert_eq!(e[1]["changes"][0], "Card › Rotation: 0 → 15");
+    // Which comps each change touched (the handover snapshot hook snaps those).
+    assert_eq!((&e[0]["comps"], &e[1]["comps"]), (&json!([c.0]), &json!([c.0])), "{f}");
     // Without `since`: only what came after the last read.
     s.execute("prop.set", json!({"comp": c.0, "layer": l.0, "path": "transform/opacity", "time": "6:20", "value": 60})).unwrap();
     let f = s.execute("history.feed", json!({"client": "bot"})).unwrap();
