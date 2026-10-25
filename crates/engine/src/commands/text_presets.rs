@@ -220,7 +220,7 @@ fn names_of(list: &[CardRef], category: &str) -> String {
 }
 
 /// The preset `query` names: a `.ecpreset` path (with a `/` or `\`), else a card of the text
-/// animations category by id or name (case-insensitive).
+/// animations category by id or name (case-insensitive, then ignoring spaces and punctuation).
 pub fn find_preset(s: &Session, p: &Value, query: &str, cmd: &str) -> Result<TextPreset> {
     let q = query.trim();
     if q.contains('/') || q.contains('\\') {
@@ -232,7 +232,13 @@ pub fn find_preset(s: &Session, p: &Value, query: &str, cmd: &str) -> Result<Tex
     let all = all_cards(s, &category);
     let list = one_per_name(all.clone());
     // By id any card (an older one with a repeated name too); by name the newest.
-    let hit = all.iter().find(|c| c.id == q).or_else(|| list.iter().find(|c| c.name.trim().eq_ignore_ascii_case(q)));
+    // Loosely, "slide-in" / "slidein" / "Slide in" all name “Slide In”.
+    let loose = |n: &str| n.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect::<String>();
+    let hit = all
+        .iter()
+        .find(|c| c.id == q)
+        .or_else(|| list.iter().find(|c| c.name.trim().eq_ignore_ascii_case(q)))
+        .or_else(|| list.iter().find(|c| !loose(q).is_empty() && loose(&c.name) == loose(q)));
     match hit {
         Some(c) => load_card(s, c, cmd),
         None => Err(bad(cmd, format!("no text preset “{q}” in Motion Library ▸ {category}; there are: {}", names_of(&list, &category)))),

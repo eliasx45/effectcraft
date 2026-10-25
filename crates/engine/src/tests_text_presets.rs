@@ -475,3 +475,15 @@ fn a_made_layer_keeps_the_out_marker_before_its_new_out_point() {
     assert!(at >= l.in_point.seconds() && at + dur < out, "the exit shows while the layer does: {marks:?}");
     assert_eq!(marks.len(), 2, "{marks:?}");
 }
+
+#[test]
+fn preset_names_match_loosely() {
+    let (mut s, _, cap) = studio();
+    // "slide-in" / "SlideIn" name “Slide In”: agents guessed hyphens and lost a turn.
+    for q in ["slide-in", "SlideIn", " Slide_in "] {
+        let r = s.execute_checked("text.apply", json!({"preset": q, "layers": [cap]})).unwrap();
+        assert_eq!(r["preset"]["name"], "Slide In", "{q}");
+    }
+    let e = s.execute_checked("text.apply", json!({"preset": "pop-in", "layers": [cap]})).unwrap_err().to_string();
+    assert!(e.contains("no text preset “pop-in”") && e.contains("Slide In"), "{e}");
+}
