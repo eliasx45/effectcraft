@@ -72,7 +72,7 @@ printf '{"id":1,"method":"engine.execute","params":{"command":"comp.new","params
 | `engine.execute` | `{command, params?}` | The command's result. Every engine command (`effectcraft-cli commands`) runs exactly as it does headless, so it never opens a dialog: `comp.new {}` creates a default comp. UI-only ids (`tool.*`, `view.*`, `window.*`, `playback.*`, `timeline.*`, `app.*`) fall through to the menu dispatcher. Unknown top-level params are rejected, and the error lists the accepted keys. |
 | `ui.menu.invoke` | `{id, params?}` | Like a menu click: commands with empty params may open their dialog (New Composition, Solid Settings, file pickers). |
 | Copy a Media Browser source path | `ui.menu.invoke {id: "mediaBrowser.copySourcePath", params: {path}}` | Copies the exact non-empty path string to the clipboard and returns `{path}`. Supports file/folder paths and virtual source identifiers. Missing, empty or non-string paths return an error. |
-| UI commands (via either) | | `timeline.column {column, visible?, width?, before?}` (av, keys, label, num, name, comment, switches, modes, parent, in, out, duration, stretch: shows/hides (toggles when nothing else is given), resizes the name, comment, parent, in, out, duration and stretch columns, or moves the column before another, `before: null` to the right end; returns `{columns, order, widths, outlineWidth, sourceName}`), `timeline.columnLayout {reset?, outlineWidth?}` (the layout; `reset` restores After Effects' defaults; `outlineWidth` places the outline / time graph splitter, `null` fits the columns; the layout is kept in `timeline_columns.json` in the settings store), `timeline.sourceName {value?}`, `timeline.search {query}`, `timeline.reveal.<kind>` / `timeline.revealAdd.<kind>` (the property shortcuts and Shift+shortcut: position, scale, rotation, opacity, anchor, effects, masks, feather, levels, animated, and the double-press sets maskPath, maskOpacity, timeRemap, expressions, material, paint, selected, missingEffects, waveform), `timeline.keyAt.<anchor\|position\|scale\|rotation\|opacity>` (Alt+Shift+A/P/S/R/T), `timeline.twirlSelected` (Ctrl/Cmd+`), `viewer.freeTransform {layer?, path?, end?, angle?, anchor?: [u, v]}` (Free Transform Points in the viewer, as a double-click on a path or Cmd+T with its points selected: no params starts it on the selected points' path; returns `{freeTransform: {layer, path, angle, anchor}}`; widgets `viewer.freeTransform.box`, `.anchor`, `.handle.0`–`.handle.7`), `timeline.collapseAll`, `flowchart.options {layers?, effects?, solids?, direction?: lr\|tb, comp?}`, `flowchart.graph {comp?}` → `{nodes, edges}`, `window.workspace {name}` (all After Effects workspaces), `app.fxConsole {query?}` (Edit ▸ Effect Console, Ctrl+Space: a search bar at the pointer, `fxConsole.search`, results `fxConsole.result.<i>`; Enter applies the effect or preset to the selected layers). |
+| UI commands (via either) | | `timeline.column {column, visible?, width?, before?}` (av, keys, label, num, name, comment, switches, modes, parent, in, out, duration, stretch: shows/hides (toggles when nothing else is given), resizes the name, comment, parent, in, out, duration and stretch columns, or moves the column before another, `before: null` to the right end; returns `{columns, order, widths, outlineWidth, sourceName}`), `timeline.columnLayout {reset?, outlineWidth?}` (the layout; `reset` restores After Effects' defaults; `outlineWidth` places the outline / time graph splitter, `null` fits the columns; the layout is kept in `timeline_columns.json` in the settings store), `timeline.sourceName {value?}`, `timeline.search {query}`, `timeline.reveal.<kind>` / `timeline.revealAdd.<kind>` (the property shortcuts and Shift+shortcut: position, scale, rotation, opacity, anchor, effects, masks, feather, levels, animated, and the double-press sets maskPath, maskOpacity, timeRemap, expressions, material, paint, selected, missingEffects, waveform), `timeline.keyAt.<anchor\|position\|scale\|rotation\|opacity>` (Alt+Shift+A/P/S/R/T), `timeline.twirlSelected` (Ctrl/Cmd+`), `viewer.freeTransform {layer?, path?, end?, angle?, anchor?: [u, v]}` (Free Transform Points in the viewer, as a double-click on a path or inside a closed one, or Cmd+T with its points or the mask / shape path selected; Enter or Esc ends it: no params starts it on the selected points' (or selected mask's) path, `{layer, path}` also selects that layer so the box shows; returns `{freeTransform: {layer, path, angle, anchor}}`; widgets `viewer.freeTransform.box`, `.anchor`, `.handle.0`–`.handle.7`), `timeline.collapseAll`, `flowchart.options {layers?, effects?, solids?, direction?: lr\|tb, comp?}`, `flowchart.graph {comp?}` → `{nodes, edges}`, `window.workspace {name}` (all After Effects workspaces), `app.fxConsole {query?}` (Edit ▸ Effect Console, Ctrl+Space: a search bar at the pointer, `fxConsole.search`, results `fxConsole.result.<i>`; Enter applies the effect or preset to the selected layers). |
 | `engine.commands` | `{filter?, enabledOnly?}` | `[{id, label, menu, shortcut, params, enabled, why}]` |
 | `ui.menu.list` | `{}` | The menu tree with enablement. |
 | `render.frame` | `{comp? \| item?, layer?, time? \| frame?, max_side?, transparent?, region?, overlays?, path?, base64?}` | Renders a frame through the session, independent of the viewer zoom or resolution; the same code as the engine command `render.frame`. `comp` is an id or name (default: the active comp), `time` is in comp seconds (default: the CTI), `max_side` caps the longest side (0 = full size). `item` renders a footage or solid item on its own (source time), `layer` one layer solo, `region: [x, y, w, h]` one comp rectangle at full resolution (clipped to the frame; `max_side` applies to it), and `overlays` (`true` = bounds + anchor, or a list of `bounds`, `anchor`, `motionPath`, `safeMargins`, `grid`, `all`) draws the viewer's overlays and adds `layers: [{id, index, name, bounds: [x, y, w, h], anchor, keyPositions?}]` (comp space, as `layer.bounds` measures them). Writes a PNG to `path` (default: a temp file) and returns `{comp \| item, time, frame, width, height, scale, region?, path}`. With `base64: true` it returns `{…, png: "<base64>"}` (and still writes `path` when one is given). Several frames on one labelled sheet: `engine.execute` `render.contactSheet {times? \| count?, start?, end?, cols?, max_side?, labels?, gif?, …}`. |
@@ -99,6 +99,9 @@ Motion summaries: `comp.motion {comp?, layers?, start?, end?, step?}` /
 `layer.motion {comp?, layer, start?, end?, step?}` → per layer `segments` (enter, exit, move,
 hold, scale, rotate, fade-in, fade-out), `offscreen` intervals and a `summary` sentence, plus
 `overlaps` ([agents.md](agents.md#motion-summary)).
+Recipes: `comp.recipe {comp?, layers?, path?, includeDefaults?}` → a compact JSON recipe of what
+was authored (layers, structure, changed values and keyframes); `comp.fromRecipe {recipe | path,
+name?, open?}` builds a new comp from one in one undo step ([agents.md](agents.md#reuse-a-library-comp-recipes)).
 Agent exam: `exam.check {task? | checks?, base?}` scores the
 project against an exam task's checks (each runs one read-only query and tests its result) →
 `{passed, score, total, passedCount, results: [{id, desc, pass, reason, actual}]}`
@@ -159,7 +162,7 @@ unsubscribes.
 |---|---|---|
 | `ui.inspect` | `{}` | Window size, pixels per point, UI fps, serialized `UiState`, playback (`achievedFps`, `targetFps`, `realTime`, `shown`, `caching`, `waiting`), time, active comp, selection, open dialog, last render ms, `keyboardFocus`, `windowFocused`, `workspaceStorageError`. Read-only `preview` diagnostics are described below. |
 | `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h], window?}]`: the widgets from the most recently completed paint pass, in points. ID-based input uses that same snapshot, without falling back to widgets removed since an older frame. On the desktop an undocked panel group is an OS window of its own: its widgets carry `window` (the group's id) and their rect is in that window's coordinates. |
-| `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, graphMode: auto|value|speed, graphShowSet, graphAutoZoom, showModes, openLayers: [ids], openGroups: [uids]}`. |
+| `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?, renderQueueColumns?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, graphMode: auto|value|speed, graphShowSet, graphAutoZoom, showModes, openLayers: [ids], openGroups: [uids]}`; `renderQueueColumns: {render\|label\|num\|name\|status\|started\|time: points (null = default; without `name`, Comp Name fills)}`, read back as `ui.render_queue_columns` in `ui.inspect`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
 | `engine.execute` `window.*` (panel menu) | `{panel, comp?, rect?, stacked?, solo?, small?, anchor?, zone?}` | The panel menu's items (≡ beside a tab name, or right-click a tab; automation ids `panelMenu.<key>`): `window.closePanel` (on a Timeline comp tab, `comp` closes that comp's Timeline), `window.floatPanel` (Undock Panel), `window.dockPanel` (with `anchor`/`zone`, or back to its usual place), `window.closeOtherPanels`, `window.closePanelGroup`, `window.floatPanelGroup`, `window.maximizePanel` (Maximize Panel Group, as `` ` ``), `window.stackPanelGroup`, `window.soloPanels` (Solo Panels in Stack: one expanded panel at a time; `solo`, or toggle), `window.smallTabs` (Small Tabs: a shorter tab strip, for a docked or undocked group; `small`, or toggle), and `window.panelMenu {panel, x?, y?}` to open the menu. |
 | `ui.playback` | `{action: play\|stop\|toggle\|status}` | `{playing, time, audio, levelsDb, peaksDb}` (audio: an audio preview is running; L/R meter levels and held peaks in dBFS) |
@@ -237,7 +240,7 @@ Points are logical window coordinates. A target is `{id}` (the element's centre;
 | `ui.move` | `{id \| x,y, down?, up?, button?, modifiers?}`: `down` presses and holds the button there, later moves drag, `up` releases |
 | `ui.drag` | `{from: target, to: target, steps? (12), modifiers?}`: press, move, release |
 | `ui.scroll` | `{id \| x,y, dx?, dy?, unit?: point\|line, pinch?, modifiers?}`: `line` is a mouse wheel (zooms the viewers); `point` (default) is a pixel-precise scroll, which the viewers take as a wheel until one moves on both axes (a trackpad: from then on it pans); `pinch` is a trackpad pinch's zoom factor |
-| `ui.key` | `{key}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape` |
+| `ui.key` | `{key}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape`; `down: true` presses and holds it, a later `up: true` releases it (key holds: G / A wheels, `\` Claude's version) |
 | `ui.type` | `{text}`: text input into the focused field |
 
 Input on an element in an undocked panel group's OS window (one with `window` in `ui.elements`)
@@ -301,7 +304,9 @@ Viewer state that agents drive headless too: `view.snapping`, `view.snappingOpti
 `header.snappingOptions`: After Effects' Snap Edges Extended and Snap to Features in Collapsed
 Compositions and Text Layers), `view.channel {channel, colorized?}`,
 `view.exposure {stops | delta}`, `view.resetExposure`, `view.takeSnapshot`, `view.showSnapshot`,
-`view.fastPreviewMode {mode}` (one mode each, for shortcuts:
+`view.adaptivePlayback {on?}` (Settings ▸ Previews ▸ Adaptive Resolution While Playing; no `on`
+toggles), `view.upscaleLowRes {on?}` (Settings ▸ Previews ▸ Sharpen Low-Resolution Previews (FSR);
+no `on` toggles), `view.fastPreviewMode {mode}` (one mode each, for shortcuts:
 `view.fastPreviews.off|adaptive|draft|fastDraft|wireframe`, and for the channels
 `view.channel.red|green|blue|alpha|redColorized|greenColorized|blueColorized|rgbStraight`), `view.res.full|half|third|quarter|auto {comp?}` and
 `view.res.custom {factor, comp?}` (the comp's Resolution, saved with the project but no undo
@@ -309,7 +314,7 @@ step; `ui.set {viewer: {res}}` sets the active comp's, and `ui.inspect` reports 
 `ui.viewer.res`), `view.setRegionOfInterest {rect}`, `view.addGuide {percent?}`,
 `view.addPercentGuide`, `view.convertGuides {to: percent|pixels, index?}`,
 `view.moveGuide` (comp pixels, whatever the guide's unit), `view.removeGuide`, `effect.setLabel {layer?, effect, label}`; editing: `shape.newPath` (Pen on shape layers),
-`shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer;
+`shape.newShape` (the shape tools: a new shape layer by default; `into: <layer>` draws a new group into that shape layer and `addToSelected: true` into the selected one, as the viewer's tools do;
 `roundness` px rounds a rect's corners), `layer.roundCorners {layer?|layers?, roundness?}` (Layer ›
 Create › Round Corners and the Properties panel's Roundness: sets the Roundness of a shape layer's
 Rectangle Paths; a solid becomes, in one undo step, a shape layer drawing a rectangle of its size
@@ -487,3 +492,65 @@ answers an error), keeps no checkpoints, is not in the host list, and `host.rele
   `render.contactSheet`, `render.lint`, `render.snapshot` and `render.compare` to the box and
   everything else to the app. Replies carry `renderedOn: render-box | app`. While the box is
   unreachable or out of sync, renders run in the app (retried on the box after 10 s).
+
+## FigCraft link
+
+FigCraft (the sibling design app) shows and plays EffectCraft comps on its canvas, like Dynamic
+Link: a card on FigCraft's canvas is a live view of a comp range. FigCraft calls these methods on
+the desktop app's control channel; they never open dialogs. `comp` is a composition id or name
+everywhere. Junk parameters are an error (`{"ok": false, "error": "figcraft.<method>: …"}`).
+
+- **`figcraft.frames {comp, frames: [int], maxSide: int, quality?: int}`** → `{comp: id, revision,
+  width, height (the comp's size), frameRate, frames: [{frame, w, h, jpeg: "<base64>"} | {frame,
+  pending: true} | {frame, failed: true}]}`.
+  - `frames` are comp frame numbers at the comp's frame rate, at most 64 per request; duplicates,
+    non-integers and frames outside the comp are dropped. `maxSide` (clamped to 32–1920) is the
+    longest side FigCraft wants; `quality` is the JPEG quality (30–95, default 80).
+  - The reply comes at once with what EffectCraft has **now** (no waiting for renders): a frame is
+    taken from the RAM preview of the comp's viewer at ¼, ⅓, ½ or full resolution (and the scale
+    the viewer shows now) — the smallest cached one whose longest side reaches `maxSide`, else the
+    largest — scaled down to fit `maxSide` and encoded as a JPEG over black (GPU frames are read
+    back first). Reading back, scaling and encoding run on a thread, not the UI thread.
+  - A frame that isn't cached is queued as a **prefetch** render (never urgent, so the viewer's
+    own frames keep their priority) at the smallest of ¼, ⅓, ½, full whose longest side reaches
+    `maxSide`, with the viewer's render options, so the viewer reuses it (and a frame in the disk
+    cache is just read back); it is reported `pending: true`. Ask again a little later: frames
+    appear as soon as EffectCraft has them. A frame already queued isn't queued twice.
+  - `failed: true`: the frame's render failed at this project revision (or couldn't be encoded).
+    `revision` changes with every edit: re-ask for frames after it changes.
+  - While four encoders are busy, cached frames are reported pending too.
+- **`figcraft.audio {comp, start, end, rate?}`** → `{rate, channels: 2, start, end, wav:
+  "<base64>"}` or `{silent: true}`. `start`/`end` are comp seconds (`end - start` ≤ 300; `start`
+  below 0 counts from 0); `rate` is 8000–96000 Hz (default 48000). The WAV is 16-bit PCM stereo
+  of the comp's mix (what previews play), mixed on a thread. `silent: true` when the comp has no
+  audible layers, or the range is all silence.
+- **`figcraft.tree {comp, start?, end?, depth?}`** → `{comp: {id, name, width, height, frameRate,
+  duration}, children: [{layer: {id, name}, comp: {…}, start, stretch, in, out, timeRemap,
+  children: […]}]}`: the precomp layers that show between `start` and `end` (comp seconds,
+  default the whole comp), top layer first, `depth` levels deep (1–4, default 3). A child's
+  `start` (where its time 0 sits), `in` and `out` are seconds in its parent comp and `stretch` is
+  in percent; its own `children` are those that show in the part of it its layer shows (the
+  whole comp when `timeRemap` is true).
+- **`figcraft.reveal {comp, time}`** → `{comp, time}`: opens the comp (its viewer and Timeline tab,
+  as double-clicking it in the Project panel does), moves the current time to `time` (comp
+  seconds, kept inside the comp) and brings the window to the front. FigCraft calls it when a card
+  is double-clicked.
+
+**Composition ▸ Send to FigCraft** (`comp.sendToFigCraft {comp?, start?, end?}`, also in the
+Timeline layer context menu and the Project panel's context menu of a comp) places a comp range on
+FigCraft's canvas. The comp is the active one (the right-clicked one in the Project panel); the
+range is the selected layers' span (earliest In point to latest Out point, clipped to the comp)
+when that comp's layers are selected, else its work area, else (a work area that is empty or the
+whole comp says nothing) the span of its graphics layers: text, shapes, solids, precomps and nulls,
+leaving out footage, cameras, lights and layers that run nearly the whole comp
+(`start`/`end` override it). The engine
+returns the place params; the desktop app connects to FigCraft (127.0.0.1, port
+`FIGCRAFT_CONTROL_PORT`, default 7979) on a thread and sends one line:
+
+```json
+{"id":1,"method":"engine.execute","params":{"command":"effectcraft.place","params":{"comp":"Promo","compId":12,"project":"/path/Promo.ecproj","start":1,"end":3,"fps":25,"width":1920,"height":1080,"name":"Promo · 0:01–0:03"}}}
+```
+
+`project` is the saved project's path (empty for an unsaved one). The toast says "Sent to
+FigCraft" when FigCraft answers `ok`, "FigCraft isn't open" when nothing listens on the port, else
+FigCraft's error. A headless session (CLI, MCP without the app) only returns the params.

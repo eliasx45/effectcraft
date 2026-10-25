@@ -22,6 +22,21 @@ pub struct FaceNames {
     /// A variable font: it has an `fvar` table with at least one axis (the font menu's
     /// Variable Fonts filter).
     pub variable: bool,
+    /// A variable font's named instances (`fvar`): the styles it offers beyond its default
+    /// (SF Pro's Thin … Black), each with its axis coordinates.
+    pub instances: Vec<NamedInstance>,
+}
+
+/// One named instance of a variable font (`fvar` InstanceRecord): a style name such as `Bold`
+/// and the design-space position it stands for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NamedInstance {
+    /// The subfamily name (`Bold`, `Condensed Light`, `Bold Italic`).
+    pub name: String,
+    /// The instance's PostScript name (`SFPro-Bold`), when the font gives one.
+    pub postscript: Option<String>,
+    /// Axis values in user units (tag as in the font, e.g. `wght`), one per axis.
+    pub coords: Vec<(String, f32)>,
 }
 
 fn be16(b: &[u8], o: usize) -> Option<u16> {
@@ -98,8 +113,59 @@ fn read_face<R: Read + Seek>(r: &mut R, off: u64, index: u32) -> Option<FaceName
     let sl = style.to_ascii_lowercase();
     italic |= sl.contains("italic") || sl.contains("oblique");
     // fvar header: version (4), axesArrayOffset (2), reserved (2), axisCount (2).
-    let variable = fvar.filter(|(_, l)| *l >= 10).and_then(|(fo, _)| read_at(r, fo, 10)).and_then(|fb| be16(&fb, 8)).is_some_and(|axes| axes > 0);
-    Some(FaceNames { index, family, style, full_name, weight, italic, native_family, postscript, variable })
+    // The whole table (named instances follow the axes); just the header when the table is too
+    // large or runs past the end of the file.
+    let fvar_bytes = fvar.filter(|(_, l)| *l >= 10).and_then(|(fo, fl)| read_at(r, fo, fl).or_else(|| read_at(r, fo, 10)));
+    let variable = fvar_bytes.as_deref().and_then(|fb| be16(fb, 8)).is_some_and(|axes| axes > 0);
+    let instances = if variable { fvar_bytes.as_deref().map(|fb| read_instances(fb, &nb)).unwrap_or_default() } else { Vec::new() };
+    Some(FaceNames { index, family, style, full_name, weight, italic, native_family, postscript, variable, instances })
+}
+
+/// The named instances of an `fvar` table (`fb`), named through the face's `name` table (`nb`).
+/// Every offset comes from the file, so all arithmetic is checked and the count is capped.
+fn read_instances(fb: &[u8], nb: &[u8]) -> Vec<NamedInstance> {
+    let field = |o: usize| be16(fb, o).map(usize::from);
+    let (Some(axes_off), Some(axis_count), Some(axis_size), Some(inst_count), Some(inst_size)) = (field(4), field(8), field(10), field(12), field(14)) else {
+        return Vec::new();
+    };
+    // An instance record holds subfamilyNameID, flags and one Fixed per axis (then an optional
+    // postScriptNameID).
+    let Some(coords_len) = axis_count.checked_mul(4) else { return Vec::new() };
+    if axis_count == 0 || axis_size < 20 || inst_size < coords_len.saturating_add(4) {
+        return Vec::new();
+    }
+    let mut tags = Vec::with_capacity(axis_count.min(64));
+    for i in 0..axis_count {
+        let Some(t) = i.checked_mul(axis_size).and_then(|o| o.checked_add(axes_off)).and_then(|o| fb.get(o..o.checked_add(4)?)) else {
+            return Vec::new();
+        };
+        tags.push(String::from_utf8_lossy(t).to_string());
+    }
+    let Some(start) = axis_count.checked_mul(axis_size).and_then(|n| n.checked_add(axes_off)) else { return Vec::new() };
+    let has_ps = inst_size >= coords_len.saturating_add(6);
+    let mut out = Vec::new();
+    for i in 0..inst_count.min(1024) {
+        let Some(o) = i.checked_mul(inst_size).and_then(|n| n.checked_add(start)) else { break };
+        let Some(name_id) = be16(fb, o) else { break };
+        let mut coords = Vec::with_capacity(tags.len());
+        for (k, t) in tags.iter().enumerate() {
+            let Some(v) = o.checked_add(4 + 4 * k).and_then(|p| be32(fb, p)) else { break };
+            coords.push((t.clone(), v as i32 as f32 / 65536.0));
+        }
+        if coords.len() != tags.len() {
+            break;
+        }
+        let Some(name) = name_string(nb, name_id).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else { continue };
+        let postscript = if has_ps { o.checked_add(4 + coords_len).and_then(|p| be16(fb, p)) } else { None }
+            .filter(|&id| id != 0xFFFF)
+            .and_then(|id| name_string(nb, id))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if !out.iter().any(|n: &NamedInstance| n.name.eq_ignore_ascii_case(&name)) {
+            out.push(NamedInstance { name, postscript, coords });
+        }
+    }
+    out
 }
 
 /// A Windows Unicode name-table string by id in a language other than US English.
@@ -155,9 +221,80 @@ fn name_string(b: &[u8], id: u16) -> Option<String> {
     best.map(|(_, s)| s).filter(|s| !s.trim().is_empty())
 }
 
+/// A font of just `name` and `fvar` (one `wght` axis 100–900, default 400) with named instances
+/// Regular (400), Bold (700, PostScript `<ps>-Bold`) and Light (300, no PostScript name), for
+/// tests of named-instance styles that don't depend on what is installed.
+#[cfg(test)]
+pub(crate) fn test_instances_font(family: &str, ps: &str) -> Vec<u8> {
+    let u16s = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_be_bytes()).collect() };
+    let names: Vec<(u16, String)> =
+        vec![(1, family.into()), (2, "Regular".into()), (6, format!("{ps}-Regular")), (256, "Bold".into()), (257, format!("{ps}-Bold")), (258, "Light".into())];
+    let strings: Vec<Vec<u8>> = names.iter().map(|(_, s)| s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()).collect();
+    let mut name = u16s(&[0, names.len() as u16, 6 + 12 * names.len() as u16]);
+    let mut off = 0;
+    for ((id, _), st) in names.iter().zip(&strings) {
+        name.extend(u16s(&[3, 1, 0x409, *id, st.len() as u16, off]));
+        off += st.len() as u16;
+    }
+    strings.iter().for_each(|st| name.extend(st));
+    // Header: version 1.0, axes at 16, 1 axis of 20 bytes, 3 instances of 10 bytes.
+    let mut fvar = u16s(&[1, 0, 16, 2, 1, 20, 3, 10]);
+    fvar.extend(b"wght".iter().copied().chain(u16s(&[100, 0, 400, 0, 900, 0, 0, 256])));
+    for (name_id, wght, ps_id) in [(2u16, 400u16, 6u16), (256, 700, 257), (258, 300, 0xFFFF)] {
+        fvar.extend(u16s(&[name_id, 0, wght, 0, ps_id]));
+    }
+    let tables: [(&[u8; 4], Vec<u8>); 2] = [(b"fvar", fvar), (b"name", name)];
+    let mut out = u16s(&[1, 0, tables.len() as u16, 0, 0, 0]);
+    let mut body: Vec<u8> = vec![];
+    for (tag, data) in &tables {
+        out.extend(*tag);
+        out.extend([0u8; 4]);
+        out.extend(((12 + 16 * tables.len() + body.len()) as u32).to_be_bytes());
+        out.extend((data.len() as u32).to_be_bytes());
+        body.extend(data);
+    }
+    out.extend(body);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A variable font's named instances come from `fvar`, named through `name`; a damaged
+    /// instance array yields what can be read and never panics.
+    #[test]
+    fn reads_named_instances_from_fvar() {
+        let font = test_instances_font("Instance Test", "InstanceTest");
+        let f = read_faces_bytes(&font);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].variable);
+        let names: Vec<&str> = f[0].instances.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["Regular", "Bold", "Light"]);
+        let bold = &f[0].instances[1];
+        assert_eq!(bold.coords, vec![("wght".to_string(), 700.0)]);
+        assert_eq!(bold.postscript.as_deref(), Some("InstanceTest-Bold"));
+        assert_eq!(f[0].instances[2].postscript, None, "0xFFFF means no PostScript name");
+        // Every truncation of the fvar table reads without panicking.
+        let fvar_at = font.windows(4).position(|w| w == b"fvar").unwrap();
+        let off = u32::from_be_bytes(font[fvar_at + 8..fvar_at + 12].try_into().unwrap()) as usize;
+        let len = u32::from_be_bytes(font[fvar_at + 12..fvar_at + 16].try_into().unwrap()) as usize;
+        let name_at = font.windows(4).position(|w| w == b"name").unwrap();
+        let noff = u32::from_be_bytes(font[name_at + 8..name_at + 12].try_into().unwrap()) as usize;
+        let nlen = u32::from_be_bytes(font[name_at + 12..name_at + 16].try_into().unwrap()) as usize;
+        let nb = &font[noff..noff + nlen];
+        for cut in 0..len {
+            let _ = read_instances(&font[off..off + cut], nb);
+        }
+        // Hostile counts and sizes.
+        let mut bad = font[off..off + len].to_vec();
+        bad[12..14].copy_from_slice(&u16::MAX.to_be_bytes());
+        bad[14..16].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(read_instances(&bad, nb).len() <= 3);
+        bad[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
+        bad[10..12].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(read_instances(&bad, nb).is_empty());
+    }
 
     #[test]
     fn reads_bundled_names() {

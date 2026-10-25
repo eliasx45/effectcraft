@@ -79,6 +79,7 @@ fn scene(depth: BitDepth, outer_blur: bool) -> (Project, ItemId) {
 /// precomp, and upload a fraction of the bytes.
 #[test]
 fn clipped_shapes_on_the_gpu_match_the_whole_cpu_raster() {
+    let _serial = crate::tests_view_clip::CLIP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let g = gpu();
     assert!(g.is_some() || std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "required GPU unavailable");
     let Some(g) = g else { return };

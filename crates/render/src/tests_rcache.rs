@@ -229,7 +229,7 @@ fn concurrent_misses_render_once() {
 }
 
 #[test]
-fn an_animated_precomp_is_keyed_only_now_and_then() {
+fn an_animated_precomp_is_keyed_on_every_render() {
     let (mut p, oid, iid) = precomp_scene();
     moving(&mut p.comp_mut(iid).unwrap().layers[0]);
     let cache = LayerCache::default();
@@ -240,10 +240,10 @@ fn an_animated_precomp_is_keyed_only_now_and_then() {
         let after = cache.stats();
         lookups.push(after.hits + after.misses - before.hits - before.misses);
     }
-    // Every frame looks up the nested solid (its content is static); the precomp is looked up
-    // on the first two frames (both miss), then only every eighth frame.
-    assert_eq!(lookups[..2], [2, 2], "{lookups:?}");
-    assert_eq!(lookups[2..].iter().filter(|n| **n == 2).count(), 1, "{lookups:?}");
+    // Every frame looks up the nested solid (its content is static) and the precomp: PC1 keys a
+    // precomp on every render, missed or not (keying costs far less than drawing an unchanged
+    // precomp again because its key was no longer tried; lab X1, 23 Oct 2026).
+    assert_eq!(lookups, [2; 12], "{lookups:?}");
 }
 
 /// The blended layer (a cached solid) follows the layer its Blend effect reads (before, its

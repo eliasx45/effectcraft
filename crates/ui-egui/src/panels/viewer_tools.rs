@@ -878,9 +878,18 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
     if clicked {
         toggle_popup(ui, "vw-fast-pop");
     }
-    let items: Vec<(String, bool)> = FastPreviews::ALL.iter().map(|m| (m.label().to_string(), fp == *m)).collect();
+    let mut items: Vec<(String, bool)> = FastPreviews::ALL.iter().map(|m| (m.label().to_string(), fp == *m)).collect();
+    // Settings ▸ Previews: drafts while playing in any mode.
+    items.push(("Adaptive Resolution While Playing".to_string(), app.session.prefs.previews.adaptive_playback));
+    // UP1: Half / Third / Quarter frames upscaled with FSR1 instead of shown as blocks.
+    items.push(("Sharpen Low-Resolution Previews (FSR)".to_string(), app.session.prefs.previews.upscale_low_res));
     if let Some(i) = popup(app, ui, "vw-fast-pop", fr, &items, "fastPreviewsItem") {
-        let _ = app.session.execute("view.fastPreviewMode", json!({"mode": FastPreviews::ALL[i].id()}));
+        let n = FastPreviews::ALL.len();
+        let _ = match FastPreviews::ALL.get(i) {
+            Some(m) => app.session.execute("view.fastPreviewMode", json!({"mode": m.id()})),
+            None if i == n => app.session.execute("view.adaptivePlayback", json!({})),
+            None => app.session.execute("view.upscaleLowRes", json!({})),
+        };
     }
     x += 4.0;
     #[cfg(not(target_arch = "wasm32"))]

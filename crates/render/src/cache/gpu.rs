@@ -175,8 +175,7 @@ impl GpuOwner {
         if !g.gpu.get(&id).is_some_and(|e| Arc::ptr_eq(&e.slot, &slot)) {
             return None;
         }
-        g.clock = g.clock.saturating_add(1);
-        let now = g.clock;
+        let now = g.tick();
         g.gpu_touch(id, now);
         Some(slot)
     }
@@ -253,8 +252,7 @@ impl GpuPending {
         g.gpu.try_reserve(1).map_err(|_| AdmissionError::Allocation)?;
         self.device.commit(self.reservation)?;
         self.claim.commit();
-        g.clock = g.clock.saturating_add(1);
-        let now = g.clock;
+        let now = g.tick();
         let weak = Arc::downgrade(&self.slot);
         let old = g.gpu_insert(Arc::as_ptr(&self.slot) as usize, GpuEntry { slot: self.slot, last_use: now, probation: true });
         drop(g);

@@ -613,7 +613,10 @@ fn fxs_motiontile(@builtin(global_invocation_id) gid: vec3<u32>) {
             fy = 1.0 - fy;
         }
     }
-    textureStore(out, p, sample_bilinear(src, fx * P.f[0].y + P.f[1].x, fy * P.f[0].z + P.f[1].y));
+    // stylize2::motion_tile_sample: clamped to the layer's edge pixel centres.
+    let sx = clamp(fx * P.f[0].y, 0.5, max(P.f[0].y - 0.5, 0.5)) + P.f[1].x;
+    let sy = clamp(fy * P.f[0].z, 0.5, max(P.f[0].z - 0.5, 0.5)) + P.f[1].y;
+    textureStore(out, p, sample_bilinear(src, sx, sy));
 }
 
 // CC RepeTile (stylize2::repetile) into a new output size. data: per output column (tile index,

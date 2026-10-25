@@ -29,6 +29,7 @@ our own scripts; no real-world script library has been run against both apps.
 | Keyboard shortcuts for scripts | yes | no | missing | plugins.md |
 | Command-line rendering `aerender` | yes | `effectcraft-cli render`, `script`, `exec` | same purpose | `apps/effectcraft-cli` |
 | Essential Graphics scripting hooks | `addToMotionGraphicsTemplate…` | yes (M13.7) | good | — |
+| Text Gradient Fill (EffectCraft extension) | none (no gradient text animator) | Match name `EC Text Gradient Fill` adds Gradient Type / Start / End / Fill Colors to an animator's Properties. Gradient Fill Colors reads as `{colors: [[position, [r, g, b, a]], …], opacities: [[position, alpha], …]}` (0..1) and `setValue` / `prop.set` take that, `[[position, colour], …]` or `[colour, …]` (evenly spaced; a colour is `[r, g, b, a?]` or `"#rrggbb"`); an expression may return the same arrays (`[effect("A")("Color"), effect("B")("Color")]`). Gradient Start / End are `[x, y]` in percent of the group's box | beyond | `crates/script` `text_gradient_fill_stops_are_scriptable` |
 | Agent control (MCP, control channel, every command) | none | yes | beyond | [agents.md](agents.md), [control-protocol.md](control-protocol.md); `list_effects` omits parameter types and ranges (#441) |
 | Real-world script corpus | — | none run | gap | Run popular free scripts (the 11 sample scripts After Effects ships are a good start, run as behaviour tests, never copied) |
 

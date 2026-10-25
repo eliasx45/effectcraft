@@ -222,6 +222,14 @@ fn dst_cclens(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ---------------------------------------------------------------- Turbulent Displace (distort2)
 
 // distort2::fbm. u[0].w = octave count; f[1].w = fraction of the last octave; f[3].y = falloff.
+// distort2::evo_noise: a linear blend between whole-revolution slices, so Evolution moves
+// the pattern at a steady speed.
+fn dst_evo_noise(u: f32, v: f32, z: f32, seed: u32) -> f32 {
+    let z0 = floor(z);
+    let t = z - z0;
+    return value_noise(u, v, z0, seed) * (1.0 - t) + value_noise(u, v, z0 + 1.0, seed) * t;
+}
+
 fn dst_fbm(u: f32, v: f32, z: f32, seed: u32) -> f32 {
     let n = P.u[0].w;
     let frac = P.f[1].w;
@@ -235,7 +243,7 @@ fn dst_fbm(u: f32, v: f32, z: f32, seed: u32) -> f32 {
         if (o + 1u == n && frac > 0.0) {
             w = frac;
         }
-        sum += value_noise(u * f, v * f, z + f32(o) * 5.17, seed + o * 101u) * amp * w;
+        sum += dst_evo_noise(u * f, v * f, z + f32(o) * 5.17, seed + o * 101u) * amp * w;
         norm += amp * w;
         amp *= falloff;
         f *= 2.0;

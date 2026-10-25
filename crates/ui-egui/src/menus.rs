@@ -45,6 +45,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("playback.preview.shiftNumpad0", "Preview (Shift+Numpad 0)", [], Some("Shift+Num0")),
     uic!("playback.preview.altNumpad0", "Preview (Alt+Numpad 0)", [], Some("Alt+Num0")),
     uic!("playback.stop", "Stop", [], None),
+    uic!("playback.faster", "Play Faster", [], None),
+    uic!("playback.slower", "Play Slower", [], None),
     uic!("view.fit", "Fit", [], Some("Shift+/")),
     uic!("view.actualSize", "100%", [], Some("/")),
     uic!("view.fitUpTo100", "Fit up to 100%", [], Some("Alt+/")),
@@ -88,6 +90,9 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("timeline.parentColumn", "Show/Hide Parent Column", [], Some("Shift+F4")),
     uic!("timeline.zoomFrameToggle", "Zoom In to Frame Level / Out to the Whole Comp", [], Some(";")),
     uic!("timeline.graphEditor", "Graph Editor", [], Some("Shift+F3")),
+    // Graph Editor scope: only while the Timeline shows the Graph Editor, where it wins over
+    // Reveal Mask Feather's F (After Effects).
+    uic!("timeline.graph.fit", "Fit All Graphs to View", [], Some("F")),
     uic!("timeline.switchesModes", "Toggle Switches / Modes", [], Some("F4")),
     uic!("timeline.workAreaBegin", "Set Work Area Begin", [], Some("B")),
     uic!("timeline.workAreaEnd", "Set Work Area End", [], Some("N")),
@@ -210,13 +215,14 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     if let Some(result) = crate::panels::timeline::invoke_inline(app, ctx, id, &params) {
         return result;
     }
-    // Cmd+T with path points selected, and Layer ▸ Mask and Shape Path ▸ Free Transform Points
-    // with a path to work on, enter Free Transform in the viewer (After Effects); otherwise
-    // Cmd+T is the Type tool and the menu item asks for numbers.
+    // Cmd+T and Layer ▸ Mask and Shape Path ▸ Free Transform Points with a path to work on (its
+    // points selected in the viewer, or the mask / shape path selected in the Timeline) enter
+    // Free Transform in the viewer (After Effects); otherwise Cmd+T is the Type tool and the menu
+    // item asks for numbers.
     if no_params(&params)
         && app.session.state.text_edit.is_none()
-        && ((id == "tool.type" && !app.session.state.selected_vertices.is_empty())
-            || (id == "path.freeTransform" && view::free_transform_target(app).is_some()))
+        && matches!(id, "tool.type" | "path.freeTransform")
+        && view::free_transform_target(app).is_some()
     {
         return invoke(app, ctx, "viewer.freeTransform", json!({}));
     }
@@ -309,6 +315,10 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     // Layer ▸ Layer Styles ▸ <style> from the menu adds the style and opens the dialog on it.
     if crate::panels::layer_styles_dialog::route(app, id, &params)? {
         return Ok(Value::Null);
+    }
+    // While Play Faster plays, Go Back 10 Frames (Shift+Q in the Elias keymap) slows it down a step.
+    if id == "time.back10" && no_params(&params) && app.playback.playing && app.playback.speed > 0 {
+        return invoke(app, ctx, "playback.slower", params);
     }
     // The UI commands of the area files (`menus/*.rs`): exact ids, then the longest prefix.
     if let Some(h) = dispatch::find(Stage::Invoke, id) {
@@ -480,6 +490,8 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         "file.collectFiles" => ("folder", Ask::Save("Collected Files")),
         "file.saveCopyAsXml" => ("path", Ask::Save("Untitled Project.ecprojx")),
         "keys.rpfCameraImport" => ("path", Ask::Open(&["json", "csv", "txt"])),
+        // Batch 1 lane B (SX5): the Script tab's Load script….
+        "script.load" if params.get("text").is_none() => ("path", Ask::Open(&["txt", "md"])),
         "essential.exportTemplate" => ("path", Ask::Save("Template.ectemplate")),
         "essential.importTemplate" => ("path", Ask::Open(&["ectemplate"])),
         "file.setProxy" => ("path", Ask::Open(&["mp4", "mov", "m4v", "mkv", "webm", "mxf", "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "exr"])),
@@ -670,6 +682,7 @@ pub(crate) fn entry_checked(app: &EffectcraftApp, e: &MenuEntry) -> Option<bool>
         "view.grid" => Some(v.grid),
         "view.snapToGrid" => Some(v.snap_grid),
         "view.layerControls" => Some(v.show_layer_controls),
+        "view.sharpZoom" => Some(v.sharp_zoom),
         "playback.cacheWhenIdle" => Some(app.ui.cache_when_idle),
         "playback.audio" => Some(app.session.prefs.preview.active().include_audio),
         "window.workspace" => Some(pstr("name").is_some_and(|n| n == app.ui.workspace)),
@@ -847,6 +860,19 @@ fn shifted_alias(k: egui::Key) -> Option<egui::Key> {
 /// A key binding: modifiers, key, command id and bound params.
 pub type Binding = (egui::Modifiers, egui::Key, String, Value);
 
+/// Whether the active shortcut preset gives the bindable `key` the keys `(m, k)` that aren't
+/// among its defaults: a shortcut the user chose, not a built-in one.
+fn user_assigned(session: &effectcraft_engine::Session, key: &str, m: egui::Modifiers, k: egui::Key) -> bool {
+    use effectcraft_engine::shortcuts::normalize;
+    let Some(keys) = session.keymaps.active_preset().and_then(|p| p.overrides.get(key)) else { return false };
+    let table = session.shortcuts();
+    let defaults: Vec<String> = table.find(key).map(|b| b.defaults.iter().filter_map(|d| normalize(d)).collect()).unwrap_or_default();
+    keys.iter()
+        .filter(|sc| normalize(sc).is_none_or(|n| !defaults.contains(&n)))
+        .filter_map(|sc| parse_shortcut(sc))
+        .any(|(om, ok)| om == m && (ok == k || shifted_alias(ok) == Some(k) || (ok == egui::Key::Backtick && k == egui::Key::IntlBackslash)))
+}
+
 /// All bindings of the active keyboard shortcut preset, most modifiers first.
 pub fn bindings(session: &effectcraft_engine::Session) -> Vec<Binding> {
     let mut v: Vec<Binding> = Vec::new();
@@ -979,7 +1005,8 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     // (Tab only gives way to typing: a focused button or checkbox doesn't keep it from opening
     // the Mini-Flowchart.)
     let keyboard_taken = if tab_only { ctx.text_edit_focused() } else { ctx.egui_wants_keyboard_input() };
-    if keyboard_taken || crate::widgets::any_menu_open(ctx) {
+    // An open colour picker takes Enter (OK) and Escape (Cancel) itself.
+    if keyboard_taken || crate::widgets::any_menu_open(ctx) || crate::color_picker::open_recently(ctx) {
         return;
     }
     // Text editing in the viewer takes the clipboard events itself.
@@ -988,6 +1015,19 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     // The paste event's text: Edit ▸ Paste pastes SVG markup as a shape layer.
     let pasted =
         if clipboard { ctx.input(|i| i.events.iter().rev().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None })) } else { None };
+    // Held, Zoom In / Out Time keep zooming (After Effects): their key repeats run them again.
+    // `true` for a physical-key binding.
+    let zoom_repeats: Vec<(bool, egui::Modifiers, egui::Key)> = app
+        .session
+        .shortcuts()
+        .bindings()
+        .into_iter()
+        .filter(|(_, b)| matches!(b.command.as_str(), "timeline.zoomIn" | "timeline.zoomOut"))
+        .filter_map(|(sc, _)| {
+            let phys = sc.starts_with("Physical+");
+            parse_shortcut(sc.strip_prefix("Physical+").unwrap_or(sc)).map(|(m, k)| (phys, m, k))
+        })
+        .collect();
     let mut events: Vec<(egui::Key, egui::Modifiers, bool, Option<egui::Key>)> = ctx.input(|i| {
         // The windowing layer turns Ctrl+C / Ctrl+X / Ctrl+V into clipboard events instead of
         // key presses: map them back to the keys (with the modifiers held) so Edit ▸ Copy, Cut,
@@ -1009,7 +1049,8 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                         || matches!(
                             key,
                             egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown
-                        ) =>
+                        )
+                        || zoom_repeats.iter().any(|(phys, m, k)| mods_match(*m, *modifiers) && if *phys { *physical_key == Some(*k) } else { key == k }) =>
                 {
                     out.push((*key, *modifiers, true, *physical_key));
                 }
@@ -1048,6 +1089,9 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
         return;
     }
     let binds = bindings(&app.session);
+    // The Graph Editor's keys work only while the Timeline shows it, and win over the Timeline's.
+    let graph_editor = app.ui.focused == PanelKind::Timeline && app.ui.timeline.graph_editor;
+    let focused_scope = app.ui.focused.id();
     for (key, mods, pressed, physical_key) in events {
         // Plain Spacebar runs its shortcut (Play Current Preview) on the release: held, it is
         // the Hand tool (After Effects), and a drag with it must not start or stop playback.
@@ -1084,6 +1128,13 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
             continue;
         }
         if app.dialog.is_some() {
+            continue;
+        }
+        // Enter / Return and Escape end Free Transform Points in the viewer (After Effects);
+        // Enter must not also rename the selected layer.
+        if pressed && !mods.any() && matches!(key, egui::Key::Enter | egui::Key::Escape) && app.ui.viewer.free_transform.is_some() {
+            crate::panels::viewer_overlays::end_free_transform(app);
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
             continue;
         }
         // The Composition panel also accepts the familiar Cmd/Ctrl +/- magnification keys.
@@ -1144,11 +1195,31 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                 && matches!(k, egui::Key::Backtick | egui::Key::IntlBackslash)
                 && matches!(physical_key, Some(egui::Key::IntlBackslash | egui::Key::Backtick))
         };
-        if let Some((_, _, id, params)) =
-            binds.iter().filter(|(m, k, id, _)| (*k == key || iso_maximize(*k, id)) && mods_match(*m, mods)).min_by_key(|(_, _, id, params)| {
-                // The focused panel wins over an application command sharing its chord.
+        let scope_of = |id: &str, params: &Value| {
+            let key = effectcraft_engine::shortcuts::binding_key(id, params);
+            app.session.shortcuts().find(&key).map(|b| b.scope.clone())
+        };
+        if let Some((_, _, id, params)) = binds
+            .iter()
+            .filter(|(m, k, id, params)| {
+                (*k == key || iso_maximize(*k, id))
+                    && mods_match(*m, mods)
+                    && (graph_editor || scope_of(id, params).as_deref() != Some(effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE))
+            })
+            .min_by_key(|(m, k, id, params)| {
+                // Keys the user gave a command win over a default sharing them, whatever the
+                // panel (Elias AE: X is Split Layer, not the Timeline's Scroll Topmost Selected
+                // Layer to Top). Otherwise the open Graph Editor wins over the Timeline (F: Fit
+                // All Graphs to View, not Reveal Mask Feather), and the focused panel over an
+                // application command sharing its chord.
                 let key = effectcraft_engine::shortcuts::binding_key(id, params);
-                app.session.shortcuts().find(&key).is_none_or(|b| b.scope != app.ui.focused.id())
+                let scope = scope_of(id, params);
+                let rank = match scope.as_deref() {
+                    Some(effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE) => 0u8,
+                    Some(s) if s == focused_scope => 1,
+                    _ => 2,
+                };
+                (!user_assigned(&app.session, &key, *m, *k), rank)
             })
         {
             let (id, params) = (id.clone(), if params.is_null() { json!({}) } else { params.clone() });
@@ -1425,9 +1496,15 @@ mod tests {
     #[test]
     fn ui_and_menu_shortcuts_do_not_collide() {
         let app = EffectcraftApp::new(effectcraft_engine::Session::default());
-        let mut seen: std::collections::BTreeMap<(String, String), (String, String)> = Default::default();
+        let mut seen: std::collections::BTreeMap<(String, String, bool), (String, String)> = Default::default();
+        // (Keys may be shared by scopes that never apply together: the Graph Editor's F and the
+        // Timeline's Reveal Mask Feather.)
+        let scope = |id: &str, params: &Value| {
+            let key = effectcraft_engine::shortcuts::binding_key(id, params);
+            app.session.shortcuts().find(&key).map(|b| b.scope.clone()).unwrap_or_default()
+        };
         for (m, k, id, params) in bindings(&app.session) {
-            let key = (format!("{m:?}"), format!("{k:?}"));
+            let key = (format!("{m:?}"), format!("{k:?}"), scope(&id, &params) == effectcraft_engine::shortcuts::GRAPH_EDITOR_SCOPE);
             let target = (id.clone(), params.to_string());
             if let Some(prev) = seen.get(&key) {
                 assert_eq!(prev, &target, "{key:?} bound to {prev:?} and {target:?}");
@@ -1575,6 +1652,41 @@ mod tests {
         app.show_panel(PanelKind::Project);
         run(&mut app, "window.closeAll");
         assert!(!app.ui.dock.contains(PanelKind::Project));
+    }
+
+    /// GE-FIT1: F in the Timeline fits all graphs while it shows the Graph Editor (After
+    /// Effects) and reveals Mask Feather otherwise; in another panel it never fits the graphs.
+    #[test]
+    fn f_fits_the_graphs_only_in_the_graph_editor() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"name": "A", "duration": 4})).unwrap();
+        let ctx = egui::Context::default();
+        let press_f = |app: &mut EffectcraftApp| {
+            app.last_reveal = None;
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key { key: egui::Key::F, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| handle_shortcuts(app, ui.ctx()));
+            out.textures_delta.clear();
+            let fit = crate::panels::graph::take_fit_all_request(&ctx);
+            (fit, app.last_reveal.as_ref().map(|(k, _)| k.clone()))
+        };
+        assert_eq!(app.session.shortcuts().shortcut_of("timeline.graph.fit", &Value::Null), Some("F"));
+        app.ui.focused = PanelKind::Timeline;
+        app.ui.timeline.graph_editor = true;
+        assert_eq!(press_f(&mut app), (true, None));
+        app.ui.timeline.graph_editor = false;
+        assert_eq!(press_f(&mut app), (false, Some("feather".to_string())));
+        app.ui.timeline.graph_editor = true;
+        app.ui.focused = PanelKind::Composition;
+        assert!(!press_f(&mut app).0);
+        // Run by id (control channel, MCP) it needs the Graph Editor open.
+        app.ui.timeline.graph_editor = false;
+        assert!(invoke(&mut app, &ctx, "timeline.graph.fit", json!({})).is_err());
+        app.ui.timeline.graph_editor = true;
+        invoke(&mut app, &ctx, "timeline.graph.fit", json!({})).unwrap();
+        assert!(crate::panels::graph::take_fit_all_request(&ctx));
     }
 
     #[test]

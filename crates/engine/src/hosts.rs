@@ -129,7 +129,7 @@ fn alive(pid: u32) -> Option<bool> {
     }
     #[cfg(unix)]
     {
-        std::process::Command::new("kill")
+        crate::system_tool::command("kill")
             .args(["-0", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -267,7 +267,8 @@ pub(crate) fn check_unchanged(path: &str) -> Result<()> {
 }
 
 /// Forget this process's entry (tests; the save guard's memory stays, other tests rely on it).
-#[cfg(test)]
+/// Unix only, as the test that uses it (dead code on Windows failed clippy there).
+#[cfg(all(test, unix))]
 pub(crate) fn reset() {
     *lock(&ME) = None;
 }

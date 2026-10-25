@@ -197,6 +197,31 @@ fn fast_previews(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!(m.id()))
 }
 
+/// Settings ▸ Previews ▸ Adaptive Resolution While Playing: set (`on`) or toggle it, and save.
+fn adaptive_playback(s: &mut Session, p: &Value) -> Result<Value> {
+    let on = match p.get("on") {
+        None | Some(Value::Null) => !s.prefs.previews.adaptive_playback,
+        Some(v) => v.as_bool().ok_or_else(|| bad("view.adaptivePlayback", "`on` must be true or false"))?,
+    };
+    s.prefs.previews.adaptive_playback = on;
+    s.prefs_changed();
+    s.save_prefs();
+    Ok(json!({"on": on}))
+}
+
+/// Settings ▸ Previews ▸ Sharpen Low-Resolution Previews (FSR, UP1): set (`on`) or toggle it,
+/// and save.
+fn upscale_low_res(s: &mut Session, p: &Value) -> Result<Value> {
+    let on = match p.get("on") {
+        None | Some(Value::Null) => !s.prefs.previews.upscale_low_res,
+        Some(v) => v.as_bool().ok_or_else(|| bad("view.upscaleLowRes", "`on` must be true or false"))?,
+    };
+    s.prefs.previews.upscale_low_res = on;
+    s.prefs_changed();
+    s.save_prefs();
+    Ok(json!({"on": on}))
+}
+
 fn guide_index(s: &Session, p: &Value, cmd: &str) -> Result<(effectcraft_project::ItemId, usize)> {
     let cid = comp_id(s, p)?;
     let n = s.project.comp(cid).ok_or(EngineError::NoComp)?.guides.len();
@@ -250,7 +275,7 @@ fn new_path(s: &mut Session, p: &Value) -> Result<Value> {
     let mut outs = pts(p.get("outTangents"));
     ins.resize(n, [0.0; 2]);
     outs.resize(n, [0.0; 2]);
-    let target = super::shape_tool::draw_target(s, &comp, p, "shape.newPath")?;
+    let target = super::shape_tool::draw_target(s, &comp, p, "shape.newPath", true)?;
     let comp_space = str_p(p, "space").map(|s| s == "comp").unwrap_or(target.is_none());
     if comp_space {
         // Comp → layer space of the target (a new layer sits at the comp centre, unrotated).
@@ -524,6 +549,8 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("view.takeSnapshot", "Take Snapshot", [], Some("Shift+F5"), "{comp?, scale?: 0.05..1}", has_comp, take_snapshot),
         cmd!("view.showSnapshot", "Show Snapshot", [], None, "{value?}", has_snapshot, show_snapshot),
         cmd!("view.fastPreviewMode", "Fast Previews", [], None, "{mode: off|adaptive|draft|fastDraft|wireframe}", always, fast_previews),
+        cmd!("view.adaptivePlayback", "Adaptive Resolution While Playing", [], None, "{on?: bool (default: toggle)}", always, adaptive_playback),
+        cmd!("view.upscaleLowRes", "Sharpen Low-Resolution Previews (FSR)", [], None, "{on?: bool (default: toggle)}", always, upscale_low_res),
         fast!("view.fastPreviews.off", "Fast Previews: Off (Final Quality)", "Cmd+Alt+1", "off"),
         fast!("view.fastPreviews.adaptive", "Fast Previews: Adaptive Resolution", "Cmd+Alt+2", "adaptive"),
         fast!("view.fastPreviews.draft", "Fast Previews: Draft", "Cmd+Alt+3", "draft"),

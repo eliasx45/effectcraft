@@ -737,3 +737,22 @@ fn transition_presets_apply_from_effects_and_presets() {
     assert_eq!(fx.name, "Radial Wipe");
     assert_eq!(fx.prop("completion").unwrap().keys.len(), 2);
 }
+
+/// Maximizing fills the area with the whole panel group, tabs included (Elias, 23 Oct 2026: only
+/// the shown panel was maximized): another tab of the group opens inside the maximized group,
+/// and Maximize on any of its tabs restores the layout.
+#[test]
+fn maximizing_a_panel_keeps_its_groups_tabs_switchable() {
+    let mut h = harness();
+    let (group, _, _) = h.state().panel_group(PanelKind::Project).expect("Project is docked");
+    let other = group.iter().copied().find(|p| *p != PanelKind::Project).expect("Project shares a group");
+    h.state_mut().toggle_maximize(PanelKind::Project);
+    h.run_steps(3);
+    assert_eq!(h.state().ui.maximized, Some(PanelKind::Project));
+    h.state_mut().show_panel(other);
+    h.run_steps(3);
+    assert_eq!(h.state().ui.maximized, Some(other), "still maximized, now on the other tab");
+    assert!(h.state().group_maximized(PanelKind::Project));
+    h.state_mut().toggle_maximize(PanelKind::Project);
+    assert_eq!(h.state().ui.maximized, None, "restored from any tab of the group");
+}

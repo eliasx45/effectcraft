@@ -643,7 +643,7 @@ fn motion_tile(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         let (ex, ey) = (effectcraft_effects::motion_tile_growth(ow - lw, s), effectcraft_effects::motion_tile_growth(oh - lh, s));
         (b.img.width.saturating_add(2 * ex), b.img.height.saturating_add(2 * ey), [b.offset[0] + ex as f64, b.offset[1] + ey as f64])
     } else {
-        ((ow * s).round().max(1.0) as u32, (oh * s).round().max(1.0) as u32, [(ow - lw) * 0.5 * s, (oh - lh) * 0.5 * s])
+        effectcraft_effects::motion_tile_frame(lw, lh, ow, oh, s, b.offset)
     };
     if !e.g.fits(nw, nh) {
         return None;
@@ -912,14 +912,15 @@ pub(crate) fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let intensity = ctx.params.f("intensity") as f32;
     let colors = ctx.params.e("colors");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
-    let s = (radius * effectcraft_effects::GLOW_SIGMA_PER_RADIUS).max(0.5);
+    let [cx, cy] = ctx.env.comp_px();
+    let (sx, sy) = effectcraft_effects::glow_sigmas(radius, cx, cy);
     if !ctx.adjustment {
-        b.pad(e, (s * 3.0).ceil() as u32 + 2)?;
+        b.pad(e, (sx.max(sy) * 3.0).ceil() as u32 + 2)?;
     }
     let mut p = crate::effects::glow_params(ctx);
     let bright = e.image(b.img.width, b.img.height);
     e.pixels("glow_bright", &p, &b.img, None, &bright, None);
-    let mut blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    let mut blurred = gaussian_blur(e, &bright, sx * kx, sy * ky, false);
     if colors == 2 {
         // Arbitrary Map: Curves tables per channel (see effects::curves).
         let mut parts = ctx.params.s("arbitraryMap").split('|');

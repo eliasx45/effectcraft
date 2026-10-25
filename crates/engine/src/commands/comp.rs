@@ -1,7 +1,7 @@
 //! Composition menu.
 
 use effectcraft_color::Label;
-use effectcraft_project::{Comp, ItemKind, Marker, limits};
+use effectcraft_project::{Comp, ItemKind, LayerId, Marker, limits};
 use effectcraft_time::{FrameRate, Tick};
 use serde_json::{Value, json};
 
@@ -20,7 +20,9 @@ fn check_rate(p: &Value, cmd: &str) -> Result<()> {
     }
 }
 
-fn apply_settings(c: &mut Comp, p: &Value) {
+/// `comp_sized`: the layers whose effect space follows the comp's size
+/// ([`super::layer::comp_sized_fx_layers`], read before the change).
+fn apply_settings(c: &mut Comp, p: &Value, comp_sized: &[LayerId]) {
     let (ow, oh) = (c.width, c.height);
     if let Some(w) = p.get("width").and_then(Value::as_u64) {
         c.width = limits::size(w).max(4);
@@ -29,7 +31,9 @@ fn apply_settings(c: &mut Comp, p: &Value) {
         c.height = limits::size(h).max(4);
     }
     // Advanced › Anchor: where the old frame sits in the resized one (0 = top left … 4 = center …
-    // 8 = bottom right). Unparented layers (and all their position keys) move by that offset.
+    // 8 = bottom right). Unparented layers (and all their position keys) move by that offset;
+    // effect point parameters stay where they are on the layers (shape and text layers' effect
+    // space is sized by the comp, whatever the anchor).
     if (c.width, c.height) != (ow, oh) {
         let a = p.get("anchor").and_then(Value::as_u64).unwrap_or(4).min(8);
         let dx = (c.width as f64 - ow as f64) * (a % 3) as f64 / 2.0;
@@ -41,6 +45,8 @@ fn apply_settings(c: &mut Comp, p: &Value) {
                 }
             }
         }
+        let resize = [c.width as f64 - ow as f64, c.height as f64 - oh as f64];
+        super::layer::offset_effect_points(c, comp_sized, resize, [dx, dy]);
     }
     if let Some(t) = f_p(p, "startTime") {
         c.display_start = Tick::from_seconds_f64(t);
@@ -106,7 +112,7 @@ fn new_comp(s: &mut Session, p: &Value) -> Result<Value> {
     if s.prefs.three_d.default_renderer == "advanced" {
         c.renderer = effectcraft_project::Renderer::Advanced3D;
     }
-    apply_settings(&mut c, p);
+    apply_settings(&mut c, p, &[]);
     let id = s.edit("New Composition", None, |proj, st| {
         let name = proj.unique_item_name(&name, |_| false);
         let id = proj.add_item(&name, Label::Sandstone, None, ItemKind::Comp(c.into()));
@@ -128,8 +134,12 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
         {
             it.name = n.to_string();
         }
+        let comp_sized = {
+            let pr: &effectcraft_project::Project = proj;
+            super::layer::comp_sized_fx_layers(pr, pr.comp(cid).ok_or(EngineError::NoComp)?)
+        };
         let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        apply_settings(c, p);
+        apply_settings(c, p, &comp_sized);
         super::model3d::sync_geometry_options(proj, cid);
         Ok(())
     })?;
@@ -271,13 +281,16 @@ fn add_marker(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let t = time_p(s, p, s.project.comp(cid));
     let comment = str_p(p, "comment").unwrap_or("").to_string();
-    s.edit("Add Marker", None, |proj, _| {
+    let old = s.edit("Add Marker", None, |proj, _| {
         let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        c.markers.push(Marker { time: t, comment, ..Default::default() });
-        c.markers.sort_by_key(|m| m.time);
-        Ok(())
+        Ok(super::markers::place_marker(&mut c.markers, Marker { time: t, comment, ..Default::default() }))
     })?;
-    Ok(json!({"time": t.seconds()}))
+    let mut out = json!({"time": t.seconds()});
+    if let Some(old) = old {
+        super::markers::replaced_reply(&mut out, &old, t, None);
+        super::markers::toast_warning(s, &out);
+    }
+    Ok(out)
 }
 
 fn poster(s: &mut Session, p: &Value) -> Result<Value> {
@@ -317,6 +330,6 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("comp.moveTab", "Move Timeline Tab", [], None, "{comp, before?: id (end without)}", has_comp, move_tab),
         cmd!("comp.workArea", "Set Work Area", [], None, "{start?, end?, set?: begin|end (at CTI)}", has_comp, work_area),
         cmd!("comp.setSwitch", "Composition Switch", [], None, "{switch: hideShy|motionBlur|frameBlending|draft3d, value?}", has_comp, comp_switch),
-        cmd!("comp.addMarker", "Add Marker", [], Some("Num*"), "{time?, comment?}", has_comp, add_marker),
+        cmd!("comp.addMarker", "Add Marker", [], Some("Num*"), "{time?, comment?} → {time, replaced?: {comment, time}, warning?} (a marker already at that time is replaced)", has_comp, add_marker),
     ]
 }

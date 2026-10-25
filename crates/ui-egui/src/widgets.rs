@@ -61,10 +61,31 @@ pub fn hot_number_at(
     suffix: &str,
     t: &Tokens,
 ) -> (Rect, Option<f64>, bool) {
+    let edit_text = format!("{value:.decimals$}");
+    let parse = |txt: &str| txt.trim().trim_end_matches(suffix).trim().replace(',', ".").parse::<f64>().ok();
+    hot_number_typed_at(ui, rect_min, id, value, speed, range, decimals, suffix, t, &edit_text, &parse)
+}
+
+/// [`hot_number_at`] whose editor opens with `edit_text` and whose typed text `parse` reads
+/// (a typed value is still kept only when finite and is clamped to `range`). An angle's degrees
+/// show their size but are typed signed, and take a whole `NxD` angle.
+pub fn hot_number_typed_at(
+    ui: &mut Ui,
+    rect_min: egui::Pos2,
+    id: egui::Id,
+    value: f64,
+    speed: f64,
+    range: (f64, f64),
+    decimals: usize,
+    suffix: &str,
+    t: &Tokens,
+    edit_text: &str,
+    parse: &dyn Fn(&str) -> Option<f64>,
+) -> (Rect, Option<f64>, bool) {
     let editing_id = id.with("editing");
     let mut editing: Option<String> = ui.data(|d| d.get_temp(editing_id));
     if tab_stop(ui, id) && editing.is_none() {
-        editing = Some(format!("{value:.decimals$}"));
+        editing = Some(edit_text.to_owned());
     }
     let text = format!("{value:.decimals$}{suffix}");
     let galley = ui.painter().layout_no_wrap(text, Tokens::ui(12.0), t.hot_text);
@@ -84,9 +105,8 @@ pub fn hot_number_at(
         let tab = r.has_focus().then(|| ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab).then_some(i.modifiers.shift))).flatten();
         let mut out = None;
         if r.lost_focus() || tab.is_some() {
-            let txt = buf.trim().trim_end_matches(suffix).trim().replace(',', ".");
             if !ui.input(|i| i.key_pressed(egui::Key::Escape))
-                && let Ok(v) = txt.parse::<f64>()
+                && let Some(v) = parse(&buf)
                 && v.is_finite()
             {
                 out = Some(v.clamp(range.0, range.1));
@@ -133,7 +153,7 @@ pub fn hot_number_at(
         }
     }
     if resp.clicked() {
-        ui.data_mut(|d| d.insert_temp(editing_id, format!("{value:.decimals$}")));
+        ui.data_mut(|d| d.insert_temp(editing_id, edit_text.to_owned()));
     }
     (rect, out, resp.drag_stopped())
 }
@@ -747,9 +767,23 @@ pub(crate) fn constrained(c: &[f64], d: usize, v: f64) -> Vec<f64> {
         .collect()
 }
 
+/// Linked values after component `d` of `c` became `v`: the others move by the same amount.
+/// Audio Levels' left and right (dB) stay linked this way, as in After Effects: the balance
+/// between the channels is kept, and 0 dB on both sides is no special case.
+pub(crate) fn offset_linked(c: &[f64], d: usize, v: f64) -> Vec<f64> {
+    let Some(&old) = c.get(d) else { return c.to_vec() };
+    c.iter().enumerate().map(|(e, &x)| if e == d { v } else { x + (v - old) }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_levels_move_together_by_the_same_amount() {
+        assert_eq!(offset_linked(&[0.0, 0.0], 0, -6.0), vec![-6.0, -6.0]);
+        assert_eq!(offset_linked(&[-3.0, 0.0], 1, 2.0), vec![-1.0, 2.0]);
+    }
 
     /// #488: an inline editor selects its whole text only as it opens. Should it be without the
     /// keyboard for a frame later (an input method, another handler), it takes the keyboard back

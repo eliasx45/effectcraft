@@ -24,6 +24,13 @@
 //! compositor has a device of its own (frame workers must not submit to the window surface's
 //! device, see `compositor_gpu`), so the texture comes back as RGBA8 bytes; a worker does not
 //! wait for them but goes on to its next frame, and the frame lands later (`landing`).
+//!
+//! With Compress RAM Preview Frames on (Settings ▸ Memory & CPU, the default in the app) the
+//! cache keeps frames away from the playhead LZ4-compressed ([`codec`]) and counts their
+//! compressed bytes; a frame evicted from RAM that was worth caching goes to the disk cache
+//! first (spill), and while a preview plays, queued frames found on disk are read ahead of the
+//! playhead instead of waiting for a render (`Worker::read_ahead`). See
+//! `plan/memory/compressed-cache.md`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,12 +38,20 @@ use std::sync::{Arc, Mutex};
 
 use effectcraft_engine::project::{Comp, ItemId, ItemKind, LayerSource, Node, Project, PropGroup};
 use effectcraft_engine::render::disk_cache::{self, DiskCache};
+use effectcraft_engine::render::frame_pack::PackedFrame;
 use effectcraft_engine::render::{CancellableFootage, ExprHost, FootageSource, LayerCache, LayerTimes, RenderOpts, Renderer};
 use effectcraft_engine::time::Tick;
 use effectcraft_gpu::{DisplayFrame, Gpu};
+use effectcraft_render::cache::shared::{Member, ShareKind, ShareLink, SharedBudget};
 use rayon::prelude::*;
 
+mod codec;
+#[cfg(test)]
+mod codec_tests;
 mod fingerprint;
+mod frame_keys;
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+mod idle;
 #[cfg(not(target_arch = "wasm32"))]
 mod landing;
 mod property_reuse;
@@ -48,6 +63,12 @@ pub mod times;
 mod vram;
 #[cfg(not(target_arch = "wasm32"))]
 mod workers;
+
+pub(crate) use idle::idle_threads;
+pub use idle::set_thread_start as set_idle_thread_start;
+
+/// Idle frames (Cache Frames When Idle) that render at once ([`idle`]).
+const IDLE_FRAMES: usize = 1;
 
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
@@ -184,12 +205,18 @@ impl Order {
     fn iter(&self) -> impl DoubleEndedIterator<Item = &FrameKey> {
         self.by_age.values()
     }
-    /// `k` becomes the most recently shown (added if new).
+    /// `k` becomes the most recently shown (added if new). Ages come from the process-wide
+    /// clock the caches share, so the shared budget can compare them with the layer and footage
+    /// caches' ([`effectcraft_render::cache::shared`]).
     fn push_back(&mut self, k: FrameKey) {
         self.remove(&k);
-        self.next = self.next.wrapping_add(1);
+        self.next = effectcraft_render::cache::shared::stamp_after(self.next);
         self.by_age.insert(self.next, k);
         self.age.insert(k, self.next);
+    }
+    /// The age of the least recently shown frame.
+    fn oldest(&self) -> Option<u64> {
+        self.by_age.first_key_value().map(|(a, _)| *a)
     }
     /// Shown again: last in line (no-op when `k` is not cached).
     fn touch(&mut self, k: &FrameKey) {
@@ -228,15 +255,96 @@ impl Order {
     }
 }
 
+/// Where a cached frame goes on disk (see [`Worker::publish`]).
+#[derive(Clone, Default)]
+struct DiskPlan {
+    /// The disk cache and the frame's key there, for a frame worth keeping (it took at least
+    /// [`DISK_MIN_RENDER`] to render and isn't on disk): written when it leaves RAM (spill,
+    /// [`Cache::spill`]) unless it is on disk by then. `None`: on disk already, or cheap.
+    target: Option<(Arc<DiskCache>, u128)>,
+    /// Written as soon as it is compressed ([`Cache::attach_packed`]), not only when it leaves RAM.
+    now: bool,
+}
+
+/// What a finished frame is stored with besides its pixels ([`Worker::finish_stored`]).
+#[derive(Clone, Default)]
+struct Stored {
+    disk: DiskPlan,
+    /// Its compressed bytes when they came with it (a disk cache hit).
+    packed: Option<Arc<PackedFrame>>,
+}
+
+/// A cached frame: its pixels for display, its compressed bytes ([`codec`]), or both.
+#[derive(Clone)]
+struct Cached {
+    raw: Option<FrameImage>,
+    packed: Option<Arc<PackedFrame>>,
+    disk: DiskPlan,
+}
+
+/// The identity of a frame's pixels (the address of their shared allocation): a compression
+/// result is attached only to the pixels it was made from.
+fn image_id(img: &FrameImage) -> usize {
+    match img {
+        FrameImage::Cpu(a) => Arc::as_ptr(a) as usize,
+        FrameImage::Gpu(a) => Arc::as_ptr(a) as usize,
+    }
+}
+
+impl Cached {
+    fn raw(img: FrameImage, stored: Stored) -> Cached {
+        Cached { raw: Some(img), packed: stored.packed, disk: stored.disk }
+    }
+    /// Bytes it takes: the pixels' and the compressed bytes'.
+    fn bytes(&self) -> usize {
+        self.raw.as_ref().map_or(0, FrameImage::bytes).saturating_add(self.packed.as_ref().map_or(0, |p| p.bytes()))
+    }
+    /// Its pixels are a GPU texture.
+    fn is_gpu(&self) -> bool {
+        self.raw.as_ref().is_some_and(FrameImage::is_gpu)
+    }
+    /// Its pixels, when it holds them (a compressed-only frame doesn't: [`Frames::get`] decodes it).
+    #[cfg(test)]
+    fn image(&self) -> Option<&FrameImage> {
+        self.raw.as_ref()
+    }
+    fn raw_id(&self) -> Option<usize> {
+        self.raw.as_ref().map(image_id)
+    }
+}
+
+/// Compression starts ahead of time (MEM2, `plan/memory/compressed-cache.md`): once the frames'
+/// pixels pass this share (percent) of the room the budget leaves them (the budget less the
+/// compressed bytes), or GPU frames pass it of the video memory budget, the frames eviction would
+/// take first are compressed, so eviction never waits for the codec ([`Cache::trim_raw`]).
+const PACK_AT_PERCENT: usize = 85;
+
+/// GPU frames waiting for a worker to start their read-back for compression at most
+/// ([`Cache::gpu_wanted`]).
+const MAX_GPU_WANTED: usize = 16;
+
+/// `percent` % of `n`, without overflow.
+fn share_of(n: usize, percent: usize) -> usize {
+    usize::try_from(n as u128 * percent as u128 / 100).unwrap_or(usize::MAX)
+}
+
 struct Cache {
-    map: HashMap<FrameKey, FrameImage>,
+    map: HashMap<FrameKey, Cached>,
     order: Order,
     protected: HashMap<FrameKey, usize>,
     /// The playing preview, if any: eviction spares the frames it shows next.
     playhead: Option<Playhead>,
+    /// Scale of the frame on screen (the newest urgent request): frames of other scales go first.
+    scale: Option<u32>,
+    /// Every frame's [`Cached::bytes`]: what the budget counts.
     bytes: usize,
     /// Bytes of GPU frames (also counted in `bytes`).
     gpu_bytes: usize,
+    /// Compressed bytes (also counted in `bytes`), the frames that have them, and what those
+    /// frames take uncompressed (the compression ratio, [`Frames::frame_bytes`]).
+    packed_bytes: usize,
+    packed_frames: usize,
+    packed_raw: usize,
     budget: usize,
     /// Bytes of GPU frames to keep at most ([`GPU_BUDGET`]).
     gpu_budget: usize,
@@ -249,30 +357,466 @@ struct Cache {
     /// cached under the viewer's key. Playback shows them; the paused viewer renders the exact
     /// frame over one, and any other frame stored under the key replaces it.
     drafts: HashSet<FrameKey>,
+    /// `bytes`, readable without the lock (the status bar's memory chip, see
+    /// [`Frames::memory_meter`]); every change of `bytes` ends with [`Cache::sync_meter`].
+    meter: Arc<AtomicU64>,
+    /// Compress RAM Preview Frames ([`codec`]; off by default here, the app turns it on from
+    /// its setting).
+    compress: bool,
+    /// Uncompressed Frames Around the Playhead: frames the playing preview reaches within this
+    /// many steps (paused: the protected window's first ones) keep their pixels.
+    raw_window: i64,
+    /// Frames holding pixels while compression is on.
+    rawset: HashSet<FrameKey>,
+    /// Frames being compressed / decoded by the codec.
+    packing: HashSet<FrameKey>,
+    /// GPU frames [`Cache::trim_raw`] wants compressed: the next worker to publish a frame
+    /// starts their read-back ([`Worker::pack_wanted_gpu`]), since the cache has no GPU of its own.
+    gpu_wanted: Vec<FrameKey>,
+    unpacking: HashSet<FrameKey>,
+    codec: Arc<codec::Codec>,
+    /// Frames written to disk when they left RAM, and the ones that couldn't be (the disk
+    /// cache's write queue was full).
+    spilled: u64,
+    spill_dropped: u64,
+    /// Frames the disk read-ahead brought in ahead of the playhead ([`Worker::read_ahead`]).
+    read_ahead: u64,
+    /// The shared cache budget, when the caches share one ([`Frames::share`]): told `bytes` and
+    /// the oldest frame's age with every meter update.
+    share: Option<ShareLink>,
 }
 
 impl Cache {
+    fn new(codec: Arc<codec::Codec>) -> Cache {
+        Cache {
+            map: HashMap::new(),
+            order: Order::default(),
+            protected: HashMap::new(),
+            playhead: None,
+            scale: None,
+            bytes: 0,
+            gpu_bytes: 0,
+            packed_bytes: 0,
+            packed_frames: 0,
+            packed_raw: 0,
+            budget: 3 << 30,
+            gpu_budget: GPU_BUDGET,
+            generation: 0,
+            prints: fingerprint::Prints::default(),
+            drafts: HashSet::new(),
+            meter: Arc::default(),
+            compress: false,
+            raw_window: 8,
+            rawset: HashSet::new(),
+            packing: HashSet::new(),
+            unpacking: HashSet::new(),
+            gpu_wanted: Vec::new(),
+            codec,
+            spilled: 0,
+            spill_dropped: 0,
+            read_ahead: 0,
+            share: None,
+        }
+    }
+    fn sync_meter(&self) {
+        self.meter.store(self.bytes as u64, Ordering::Relaxed);
+        self.report_share();
+    }
+    /// Tell the shared budget the bytes held and the least recently shown frame's age (two
+    /// atomic stores; the arbiter runs on its own thread, never under this lock).
+    fn report_share(&self) {
+        if let Some(l) = &self.share {
+            l.report(self.bytes as u64, self.order.oldest());
+        }
+    }
+    /// Count a frame in.
+    fn add(&mut self, s: &Cached) {
+        self.bytes = self.bytes.saturating_add(s.bytes());
+        if let Some(img) = s.raw.as_ref().filter(|i| i.is_gpu()) {
+            self.gpu_bytes = self.gpu_bytes.saturating_add(img.bytes());
+        }
+        if let Some(p) = &s.packed {
+            self.packed_bytes = self.packed_bytes.saturating_add(p.bytes());
+            self.packed_raw = self.packed_raw.saturating_add(p.raw_len());
+            self.packed_frames = self.packed_frames.saturating_add(1);
+        }
+    }
+    /// Count a frame out.
+    fn sub(&mut self, s: &Cached) {
+        self.bytes = self.bytes.saturating_sub(s.bytes());
+        if let Some(img) = s.raw.as_ref().filter(|i| i.is_gpu()) {
+            self.gpu_bytes = self.gpu_bytes.saturating_sub(img.bytes());
+        }
+        if let Some(p) = &s.packed {
+            self.packed_bytes = self.packed_bytes.saturating_sub(p.bytes());
+            self.packed_raw = self.packed_raw.saturating_sub(p.raw_len());
+            self.packed_frames = self.packed_frames.saturating_sub(1);
+        }
+    }
+    /// Replace the entry of a cached frame (same place in line), keeping the counts right.
+    fn replace(&mut self, k: FrameKey, s: Cached) {
+        if !self.map.contains_key(&k) {
+            return;
+        }
+        self.add(&s);
+        if let Some(old) = self.map.insert(k, s) {
+            self.sub(&old);
+        }
+        self.sync_meter();
+    }
     fn insert(&mut self, k: FrameKey, img: FrameImage) {
+        self.insert_stored(k, img, Stored::default());
+    }
+    /// Store a frame's pixels with what came with them (see [`Stored`]).
+    fn insert_stored(&mut self, k: FrameKey, img: FrameImage, stored: Stored) {
+        self.put(k, Cached::raw(img, stored));
+    }
+    /// Store a frame (replacing the one under `k`), then compress it if it should be and keep
+    /// the budgets.
+    fn put(&mut self, k: FrameKey, slot: Cached) {
         self.generation = self.generation.wrapping_add(1);
-        let (sz, gpu) = (img.bytes(), img.is_gpu());
         self.drafts.remove(&k);
-        if let Some(old) = self.map.insert(k, img) {
-            self.forget(&old);
+        self.packing.remove(&k);
+        self.unpacking.remove(&k);
+        self.rawset.remove(&k);
+        let holds_pixels = slot.raw.is_some();
+        self.add(&slot);
+        if let Some(old) = self.map.insert(k, slot) {
+            self.sub(&old);
         } else {
             self.order.push_back(k);
         }
-        self.bytes += sz;
-        if gpu {
-            self.gpu_bytes += sz;
+        if self.compress && holds_pixels {
+            self.rawset.insert(k);
+            // Written to disk now: from the compressed bytes, so compressed now (on the codec's
+            // background threads). Any other frame keeps its pixels until it would leave the
+            // uncompressed share ([`Cache::trim_raw`]).
+            if self.map.get(&k).is_some_and(|s| s.disk.now) {
+                self.pack(k);
+            }
+            self.trim_raw();
         }
         self.evict_to_budget();
         self.evict_gpu();
+        self.sync_meter();
     }
-    /// Video memory: drop the oldest GPU frames past their own budget.
+    /// Hand a CPU frame's pixels to the codec ([`codec`]); whether they are on their way (or
+    /// already were). A frame the codec has no room for stays uncompressed ([`Cache::trim_raw`]
+    /// offers it again); if it was to be written to disk now, it is written uncompressed (the
+    /// disk cache's writer compresses it).
+    fn pack(&mut self, k: FrameKey) -> bool {
+        if self.packing.contains(&k) {
+            return true;
+        }
+        let Some(slot) = self.map.get(&k) else { return false };
+        let (Some(FrameImage::Cpu(img)), None) = (&slot.raw, &slot.packed) else { return false };
+        let img = img.clone();
+        let raw_id = Arc::as_ptr(&img) as usize;
+        let write_now = slot.disk.now.then(|| slot.disk.target.clone()).flatten();
+        if self.codec.pack(codec::PackJob { key: k, raw_id, pixels: codec::Pixels::Image(img.clone()) }) {
+            self.packing.insert(k);
+            return true;
+        }
+        if let Some((dc, dk)) = write_now {
+            dc.put_frame(dk, img.size[0] as u32, img.size[1] as u32, ColorBytes(img));
+            if let Some(slot) = self.map.get_mut(&k) {
+                // On its way to disk: nothing left to spill.
+                slot.disk = DiskPlan::default();
+            }
+        }
+        false
+    }
+    /// The codec compressed the pixels `raw_id` of frame `key`: keep the bytes (and write them
+    /// to disk if the frame was to go there now), then drop the pixels if the uncompressed share
+    /// needs the room ([`Cache::trim_raw`]). Dropped when the frame was replaced or evicted
+    /// meanwhile.
+    fn attach_packed(&mut self, key: FrameKey, raw_id: usize, packed: Arc<PackedFrame>) {
+        self.packing.remove(&key);
+        let Some(old) = self.map.get(&key) else { return };
+        if old.packed.is_some() || old.raw_id() != Some(raw_id) {
+            return;
+        }
+        let mut slot = old.clone();
+        slot.packed = Some(packed.clone());
+        // Compressed because it was leaving the uncompressed share: its pixels go now (keeping
+        // both would push the budget over and evict another frame), unless the playhead came
+        // near meanwhile. A frame compressed to be written to disk now keeps them while there
+        // is room.
+        if !slot.disk.now && !self.near(&key) {
+            slot.raw = None;
+        }
+        if slot.disk.now {
+            slot.disk.now = false;
+            // Queued: nothing left to spill. Dropped (a full queue): it may still spill later.
+            if slot.disk.target.as_ref().is_some_and(|(dc, dk)| dc.put_packed_frame(*dk, packed.clone())) {
+                slot.disk.target = None;
+            }
+        }
+        let has_pixels = slot.raw.is_some();
+        self.replace(key, slot);
+        if has_pixels {
+            // A GPU frame left the set while its read-back was on its way.
+            self.rawset.insert(key);
+        }
+        self.trim_raw();
+        self.evict_to_budget();
+        self.sync_meter();
+    }
+    /// The codec (or the viewer) decoded `packed`, the compressed bytes of `key`: keep the pixels
+    /// while the uncompressed share has room or the frame stays near the playhead
+    /// ([`Cache::trim_raw`]).
+    fn attach_raw(&mut self, key: &FrameKey, packed: &Arc<PackedFrame>, img: FrameImage) {
+        self.unpacking.remove(key);
+        let Some(old) = self.map.get(key) else { return };
+        if old.raw.is_some() || !old.packed.as_ref().is_some_and(|p| Arc::ptr_eq(p, packed)) {
+            return;
+        }
+        let mut slot = old.clone();
+        slot.raw = Some(img);
+        self.replace(*key, slot);
+        self.rawset.insert(*key);
+        self.trim_raw();
+        self.evict_to_budget();
+        self.sync_meter();
+    }
+    /// Drop a compressed frame's pixels (it keeps its compressed bytes).
+    fn drop_raw(&mut self, key: &FrameKey) {
+        self.rawset.remove(key);
+        let Some(old) = self.map.get(key) else { return };
+        if old.raw.is_none() || old.packed.is_none() {
+            return;
+        }
+        let mut slot = old.clone();
+        slot.raw = None;
+        self.replace(*key, slot);
+    }
+    /// Whether frame `k` keeps its pixels: the playing preview reaches it within the raw window,
+    /// or (paused) it is among the protected window's first frames.
+    fn near(&self, k: &FrameKey) -> bool {
+        match &self.playhead {
+            Some(p) => p.ahead(k).is_some_and(|d| d <= self.raw_window),
+            None => self.protected.get(k).is_some_and(|r| i64::try_from(*r).is_ok_and(|r| r <= self.raw_window)),
+        }
+    }
+    /// Keep the uncompressed share of the budget (MEM2, `plan/memory/compressed-cache.md`).
+    /// Frames keep their pixels (a CPU image or a GPU texture) while there is room, and nothing
+    /// is compressed. Once the pixels pass [`PACK_AT_PERCENT`] of the room the budget leaves them
+    /// (the budget less the compressed bytes), or GPU frames pass it of the video memory budget,
+    /// the frames eviction would take first ([`Cache::pack_order`]) are handled until the
+    /// pixels are back under it: a compressed one drops its pixels, a CPU one goes to the codec,
+    /// a GPU one waits for a worker to read it back ([`Cache::gpu_wanted`]). Frames the playing
+    /// preview reaches within the raw window keep their pixels, and a playing loop that fits the
+    /// budget is never compressed ([`Cache::loop_fits`]). Frames already compressed stay so.
+    fn trim_raw(&mut self) {
+        if !self.compress {
+            self.rawset.clear();
+            self.gpu_wanted.clear();
+            return;
+        }
+        let map = &self.map;
+        self.rawset.retain(|k| map.get(k).is_some_and(|s| s.raw.is_some()));
+        self.gpu_wanted.retain(|k| map.get(k).is_some_and(|s| s.is_gpu() && s.packed.is_none()));
+        let (mut raw, mut gpu) = self.raw_pressure();
+        let raw_limit = share_of(self.budget.saturating_sub(self.packed_bytes), PACK_AT_PERCENT);
+        let gpu_limit = share_of(self.gpu_budget, PACK_AT_PERCENT);
+        if raw <= raw_limit && gpu <= gpu_limit {
+            return;
+        }
+        let mut codec_full = false;
+        for k in self.pack_order() {
+            let (over_raw, over_gpu) = (raw > raw_limit, gpu > gpu_limit);
+            if !over_raw && !over_gpu {
+                break;
+            }
+            let Some(slot) = self.map.get(&k) else { continue };
+            let Some(img) = &slot.raw else { continue };
+            let (is_gpu, bytes, packed) = (img.is_gpu(), img.bytes(), slot.packed.is_some());
+            if !over_raw && !is_gpu {
+                // Only video memory is short.
+                continue;
+            }
+            if packed {
+                self.drop_raw(&k);
+                raw = raw.saturating_sub(bytes);
+                if is_gpu {
+                    gpu = gpu.saturating_sub(bytes);
+                }
+            } else if self.packing.contains(&k) || self.gpu_wanted.contains(&k) {
+                // On its way: counted by `raw_pressure`.
+            } else if is_gpu {
+                if self.gpu_wanted.len() < MAX_GPU_WANTED {
+                    self.gpu_wanted.push(k);
+                    raw = raw.saturating_sub(self.saving(bytes));
+                    gpu = gpu.saturating_sub(bytes);
+                }
+            } else if !codec_full {
+                if self.pack(k) {
+                    raw = raw.saturating_sub(self.saving(bytes));
+                } else {
+                    // The codec's queue is full: the rest waits for the next trim.
+                    codec_full = true;
+                }
+            }
+        }
+        self.sync_meter();
+    }
+    /// The pixels the cache holds (all, GPU ones), less what the compressions on their way will
+    /// free.
+    fn raw_pressure(&self) -> (usize, usize) {
+        let mut raw = self.bytes.saturating_sub(self.packed_bytes);
+        let mut gpu = self.gpu_bytes;
+        for k in self.packing.iter().chain(self.gpu_wanted.iter()) {
+            let Some(Cached { raw: Some(img), packed: None, .. }) = self.map.get(k) else { continue };
+            raw = raw.saturating_sub(self.saving(img.bytes()));
+            if img.is_gpu() {
+                gpu = gpu.saturating_sub(img.bytes());
+            }
+        }
+        (raw, gpu)
+    }
+    /// What compressing a frame of `bytes` pixels frees, at the ratio measured so far (half
+    /// until a frame was compressed).
+    fn saving(&self, bytes: usize) -> usize {
+        let packed = if self.packed_raw > 0 {
+            usize::try_from(bytes as u128 * self.packed_bytes as u128 / self.packed_raw as u128).unwrap_or(usize::MAX)
+        } else {
+            bytes / 2
+        };
+        bytes.saturating_sub(packed)
+    }
+    /// The frames holding pixels that [`Cache::trim_raw`] may compress or take the pixels of, in
+    /// the order eviction would take them ([`Cache::eviction_candidate`]): while a preview plays,
+    /// the least recently shown of the frames it doesn't reach, then the ones it reaches last;
+    /// paused, the least recently shown, the protected window last. Never the frames near the
+    /// playhead ([`Cache::near`]), nor any frame of a playing loop that fits the budget.
+    fn pack_order(&self) -> Vec<FrameKey> {
+        let keep_loop = self.loop_fits();
+        let candidate = |k: &FrameKey| self.map.get(k).is_some_and(|s| s.raw.is_some()) && !self.near(k);
+        let mut first: Vec<FrameKey> = Vec::new();
+        let mut last: Vec<(i64, FrameKey)> = Vec::new();
+        for k in self.order.iter().filter(|k| candidate(k)) {
+            match &self.playhead {
+                Some(p) => match p.ahead(k) {
+                    None => first.push(*k),
+                    Some(d) if !keep_loop => last.push((d, *k)),
+                    Some(_) => {}
+                },
+                None => match self.protected.get(k) {
+                    None => first.push(*k),
+                    Some(r) => last.push((i64::try_from(*r).unwrap_or(i64::MAX), *k)),
+                },
+            }
+        }
+        // Farthest (reached last / furthest in the window) first.
+        last.sort_by_key(|e| std::cmp::Reverse(e.0));
+        first.extend(last.into_iter().map(|(_, k)| k));
+        first
+    }
+    /// Whether the playing preview's whole range fits as pixels: its frame count times the
+    /// average cached frame's pixels fits the budget (and, with GPU frames cached, the video
+    /// memory budget). Such a loop is never compressed: it plays from pixels every time round.
+    fn loop_fits(&self) -> bool {
+        let Some(p) = &self.playhead else { return false };
+        let frames = (p.end.saturating_sub(p.start).max(0) / p.step.max(1)).saturating_add(1);
+        let (n, bytes) =
+            self.map.values().filter_map(|s| s.raw.as_ref()).fold((0usize, 0usize), |(n, b), i| (n.saturating_add(1), b.saturating_add(i.bytes())));
+        if n == 0 {
+            return true;
+        }
+        let need = u128::try_from(frames).unwrap_or(u128::MAX).saturating_mul((bytes / n) as u128);
+        need <= self.budget as u128 && (self.gpu_bytes == 0 || need <= self.gpu_budget as u128)
+    }
+    /// Decode the compressed frames the preview reaches next (or the paused viewer's window) on
+    /// the codec's threads, so they show without a decode.
+    fn unpack_ahead(&mut self) {
+        if !self.compress {
+            return;
+        }
+        let window = self.raw_window.clamp(0, 1024);
+        let targets: Vec<FrameKey> = match &self.playhead {
+            Some(p) => {
+                let step = p.step.max(1);
+                let mut v = Vec::new();
+                let mut f = p.cur;
+                for _ in 0..=window {
+                    if f > p.end {
+                        if !p.looping {
+                            break;
+                        }
+                        f = p.start;
+                    }
+                    v.push(FrameKey { frame: f, ..p.series });
+                    f = f.saturating_add(step);
+                }
+                v
+            }
+            None => self.protected.iter().filter(|(_, r)| i64::try_from(**r).is_ok_and(|r| r <= window)).map(|(k, _)| *k).collect(),
+        };
+        for k in targets {
+            let Some(slot) = self.map.get(&k) else { continue };
+            if slot.raw.is_some() || self.unpacking.contains(&k) {
+                continue;
+            }
+            let Some(p) = slot.packed.clone() else { continue };
+            if !self.codec.unpack(k, p) {
+                break;
+            }
+            self.unpacking.insert(k);
+        }
+    }
+    /// Frame `from` is known as `to` from now on: its pixels stay in the set the trim looks at;
+    /// a compression or decode on its way for it is dropped when it lands (it may be offered
+    /// again).
+    fn moved(&mut self, from: &FrameKey, to: FrameKey) {
+        if self.rawset.remove(from) {
+            self.rawset.insert(to);
+        }
+        for k in self.gpu_wanted.iter_mut().filter(|k| **k == *from) {
+            *k = to;
+        }
+        self.packing.remove(from);
+        self.unpacking.remove(from);
+    }
+    /// Frame `k` leaves RAM to make room: if it was worth keeping and isn't on disk, it goes
+    /// there (its compressed bytes as they are, or its pixels, which the disk cache's writer
+    /// compresses). A full write queue drops it rather than wait. A GPU texture is read back
+    /// and compressed ahead of eviction, while the headroom allows ([`Cache::trim_raw`]); one
+    /// still without compressed bytes when it leaves isn't read back for it (dropped).
+    fn spill(&mut self, k: &FrameKey) {
+        let Some(slot) = self.map.get(k) else { return };
+        let Some((dc, dk)) = slot.disk.target.clone() else { return };
+        if dc.contains(disk_cache::Kind::Frame, dk) {
+            return;
+        }
+        let sent = match (&slot.packed, &slot.raw) {
+            (Some(p), _) => dc.put_packed_frame(dk, p.clone()),
+            (None, Some(FrameImage::Cpu(img))) => {
+                let n = img.size[0].saturating_mul(img.size[1]).saturating_mul(4);
+                let room = dc.has_room(n);
+                if room {
+                    dc.put_frame(dk, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
+                }
+                room
+            }
+            _ => return,
+        };
+        if sent {
+            self.spilled = self.spilled.saturating_add(1);
+        } else {
+            self.spill_dropped = self.spill_dropped.saturating_add(1);
+        }
+    }
+    /// Video memory: past their own budget, the oldest GPU frames drop their textures (a
+    /// compressed frame stays cached as its compressed bytes) or leave the cache.
     fn evict_gpu(&mut self) {
         while self.gpu_bytes > self.gpu_budget {
             let Some(old) = self.eviction_candidate(true) else { break };
+            if self.map.get(&old).is_some_and(|s| s.packed.is_some()) {
+                self.drop_raw(&old);
+                continue;
+            }
             self.order.remove(&old);
+            self.spill(&old);
             self.remove(&old);
         }
     }
@@ -281,23 +825,23 @@ impl Cache {
         self.gpu_budget = (self.gpu_budget / 2).max(MIN_GPU_BUDGET);
         self.evict_gpu();
     }
-    fn forget(&mut self, img: &FrameImage) {
-        self.bytes -= img.bytes();
-        if img.is_gpu() {
-            self.gpu_bytes -= img.bytes();
-        }
-    }
     fn remove(&mut self, k: &FrameKey) {
         if let Some(i) = self.map.remove(k) {
             self.generation = self.generation.wrapping_add(1);
-            self.forget(&i);
+            self.sub(&i);
+            self.sync_meter();
         }
         self.drafts.remove(k);
         self.prints.remove(k);
+        self.rawset.remove(k);
+        self.packing.remove(k);
+        self.unpacking.remove(k);
+        self.gpu_wanted.retain(|w| w != k);
     }
     /// Shown again: last in line for eviction.
     fn touch(&mut self, k: &FrameKey) {
         self.order.touch(k);
+        self.report_share();
     }
     /// The frame of `from` is known as `to` from now on: a draft stays a draft.
     fn move_draft(&mut self, from: &FrameKey, to: FrameKey) {
@@ -321,6 +865,7 @@ impl Cache {
             {
                 self.map.insert(orphan, img);
                 self.move_draft(k, orphan);
+                self.moved(k, orphan);
                 if let Some(rank) = self.protected.remove(k) {
                     self.protected.insert(orphan, rank);
                 }
@@ -345,7 +890,13 @@ impl Cache {
     /// into gaps that prefetch kept refilling (#595). Otherwise the least recently shown, the
     /// protected window ([`Frames::protect_frames`]) last.
     fn eviction_candidate(&self, gpu_only: bool) -> Option<FrameKey> {
-        let eligible = |k: &FrameKey| !gpu_only || self.map.get(k).is_some_and(FrameImage::is_gpu);
+        let eligible = |k: &FrameKey| !gpu_only || self.map.get(k).is_some_and(Cached::is_gpu);
+        // Frames of another scale than the one on screen go first (a zoom or resolution change).
+        if let Some(s) = self.scale
+            && let Some(k) = self.order.iter().find(|k| eligible(k) && k.scale != s)
+        {
+            return Some(*k);
+        }
         if let Some(p) = &self.playhead {
             let mut farthest: Option<(i64, FrameKey)> = None;
             for k in self.order.iter().filter(|k| eligible(k)) {
@@ -363,14 +914,49 @@ impl Cache {
         })
     }
 
+    /// The frame the shared budget may take ([`PreviewMember`]): the least recently shown one
+    /// the playing preview doesn't reach and that isn't in the protected window. Stricter than
+    /// [`Cache::eviction_candidate`], which falls back to protected frames to keep this cache's
+    /// own budget: for the other caches, the playback range and the paused viewer's window stay.
+    fn shared_candidate(&self) -> Option<FrameKey> {
+        self.order.iter().find(|k| !self.protected.contains_key(k) && self.playhead.as_ref().is_none_or(|p| p.ahead(k).is_none())).copied()
+    }
+
+    /// Evict frames until the budget holds them, writing the ones worth keeping to disk first
+    /// ([`Cache::spill`]).
     fn evict_to_budget(&mut self) {
         while self.bytes > self.budget {
             let Some(old) = self.eviction_candidate(false) else { break };
             if !self.order.remove(&old) {
                 break;
             }
+            self.spill(&old);
             self.remove(&old);
         }
+    }
+}
+
+/// The RAM preview as a member of the shared cache budget ([`Frames::share`]).
+struct PreviewMember(std::sync::Weak<Mutex<Cache>>);
+
+impl Member for PreviewMember {
+    fn evict_oldest(&self) -> u64 {
+        let Some(cache) = self.0.upgrade() else { return 0 };
+        let Ok(mut c) = cache.lock() else { return 0 };
+        let Some(k) = c.shared_candidate() else { return 0 };
+        let before = c.bytes;
+        if !c.order.remove(&k) {
+            return 0;
+        }
+        // Worth keeping: written to the disk cache first, as when it leaves for this cache's
+        // own budget.
+        c.spill(&k);
+        c.remove(&k);
+        c.report_share();
+        u64::try_from(before.saturating_sub(c.bytes).max(1)).unwrap_or(u64::MAX)
+    }
+    fn alive(&self) -> bool {
+        self.0.strong_count() > 0
     }
 }
 
@@ -618,6 +1204,8 @@ pub struct RemotePrecache {
     pub opts: RenderOpts,
     /// Inclusive frame ranges, in the order they render.
     pub ranges: Vec<(i64, i64)>,
+    /// The frames' fingerprints, which name them in the server's frame cache.
+    pub prints: Option<Arc<effectcraft_engine::remote::FramePrints>>,
 }
 
 /// Whether a comp (or a comp it nests) has a layer with enabled effects.
@@ -685,6 +1273,9 @@ pub struct Frames {
     pool: Option<Arc<workers::Workers>>,
     #[cfg(not(target_arch = "wasm32"))]
     background_running: Arc<AtomicBool>,
+    /// The threads Cache Frames When Idle renders on ([`idle`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    idle: Arc<idle::IdlePool>,
     ctx: Option<egui::Context>,
     /// Render time of the last viewer (urgent) frame in ms, for the Info panel / perf readout.
     pub last_ms: Arc<Mutex<f64>>,
@@ -692,6 +1283,10 @@ pub struct Frames {
     pub times: Arc<times::RenderTimes>,
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
+    /// Footage salts by revision, for frame disk keys named by fingerprint ([`frame_keys`]).
+    salts: frame_keys::Salts,
+    /// Every frame's fingerprint per series ([`frame_keys::PrintTable`]).
+    tables: Arc<frame_keys::Tables>,
     #[cfg(not(target_arch = "wasm32"))]
     content_key_jobs: Arc<Mutex<ContentKeyJobs>>,
     gpu_retired: Arc<AtomicBool>,
@@ -728,6 +1323,31 @@ pub struct Frames {
     /// Sweeps that take over the frames an edit didn't change ([`fingerprint`]).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     sweeps: fingerprint::Sweeps,
+    /// The threads that read queued frames from the disk cache ahead of the playhead
+    /// ([`Worker::read_ahead`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    read_ahead: Arc<ReadAhead>,
+}
+
+/// Disk read-ahead threads at most ([`Worker::read_ahead`]): a 1080p frame reads and decodes in
+/// about 5 ms, so one keeps up with 1080p60; two with 4K60 (`plan/memory/cache-prototypes.md`).
+#[cfg(not(target_arch = "wasm32"))]
+const READ_AHEAD_THREADS: usize = 2;
+
+/// How long an idle read-ahead thread waits for more frames before it exits.
+#[cfg(not(target_arch = "wasm32"))]
+const READ_AHEAD_LINGER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Looked-up jobs the read-ahead remembers before it forgets the ones no longer queued.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PROBED: usize = 4096;
+
+/// The disk read-ahead threads: (running, wake-ups so far) and their wake-up signal.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct ReadAhead {
+    state: Mutex<(usize, u64)>,
+    cv: std::sync::Condvar,
 }
 
 /// See [`Frames::cached_frames`] and [`Frames::disk_frames`]: (series with frame 0, what else
@@ -748,13 +1368,71 @@ fn remember<K: Copy>(v: &mut Vec<(FrameKey, K, Vec<i64>)>, series: FrameKey, k: 
     v.push((series, k, frames.to_vec()));
 }
 
+/// See [`Frames::memory_usage`].
+fn memory_usage(cache: &Mutex<Cache>, detail: bool) -> effectcraft_engine::memory_map::PreviewUsage {
+    use effectcraft_engine::memory_map::{CompFrames, PreviewUsage};
+    let Ok(c) = cache.lock() else { return PreviewUsage::default() };
+    let mut u = PreviewUsage {
+        bytes: c.bytes as u64,
+        gpu_bytes: c.gpu_bytes as u64,
+        frames: c.map.len() as u64,
+        budget: c.budget as u64,
+        packed_bytes: c.packed_bytes as u64,
+        raw_bytes: c.bytes.saturating_sub(c.packed_bytes) as u64,
+        packed_frames: c.packed_frames as u64,
+        packed_raw_bytes: c.packed_raw as u64,
+        spilled: c.spilled,
+        spill_dropped: c.spill_dropped,
+        read_ahead: c.read_ahead,
+        compress: c.compress,
+        by_comp: vec![],
+    };
+    if !detail {
+        return u;
+    }
+    let keys: Vec<(u64, usize)> = c.map.iter().map(|(k, slot)| (k.comp, slot.bytes())).collect();
+    drop(c);
+    let mut by: HashMap<u64, (u64, u64)> = HashMap::new();
+    for (comp, bytes) in keys {
+        let e = by.entry(comp).or_default();
+        e.0 = e.0.saturating_add(bytes as u64);
+        e.1 += 1;
+    }
+    u.by_comp = by.into_iter().map(|(comp, (bytes, frames))| CompFrames { comp, bytes, frames }).collect();
+    u.by_comp.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.comp.cmp(&b.comp)));
+    u
+}
+
+/// Drop the RAM preview's frames of `comp` (every frame: `None`); the bytes freed. Frames
+/// rendering now land afterwards (a full purge goes through [`Frames::clear`], which also
+/// drops those).
+fn purge_comp(cache: &Mutex<Cache>, comp: Option<u64>) -> u64 {
+    let Ok(mut c) = cache.lock() else { return 0 };
+    let before = c.bytes;
+    let keys: Vec<FrameKey> = c.map.keys().filter(|k| comp.is_none_or(|id| k.comp == id)).copied().collect();
+    for k in &keys {
+        c.order.remove(k);
+        c.remove(k);
+        c.protected.remove(k);
+    }
+    c.sync_meter();
+    before.saturating_sub(c.bytes) as u64
+}
+
 impl Default for Frames {
     fn default() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let threads = effectcraft_engine::render::concurrency::frame_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        // All but a core or two (MEM3): playback at full speed left other apps no core.
+        let threads = {
+            use effectcraft_engine::render::concurrency::{frame_threads, interactive_threads};
+            frame_threads(interactive_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)))
+        };
         let gpu_gate = Arc::new(vram::Gate::default());
+        let codec = Arc::new(codec::Codec::default());
+        let cache = Arc::new(Mutex::new(Cache::new(codec.clone())));
+        codec.bind(&cache);
         Frames {
-            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: Order::default(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0, prints: fingerprint::Prints::default(), drafts: HashSet::new() })),
+            cache,
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -767,11 +1445,15 @@ impl Default for Frames {
             pool: workers::Workers::new(threads).map(Arc::new),
             #[cfg(not(target_arch = "wasm32"))]
             background_running: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            idle: Arc::default(),
             ctx: None,
             last_ms: Arc::new(Mutex::new(0.0)),
             times: Arc::default(),
             playback_budget: Arc::default(),
             content_keys: Arc::default(),
+            salts: Arc::default(),
+            tables: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             content_key_jobs: Arc::default(),
             gpu_retired: Arc::default(),
@@ -790,6 +1472,8 @@ impl Default for Frames {
             resident: Arc::default(),
             bar: Mutex::default(),
             sweeps: fingerprint::Sweeps::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            read_ahead: Arc::default(),
         }
     }
 }
@@ -812,7 +1496,8 @@ fn max_running_gated(job: &Job, threads: usize, gate: &vram::Gate) -> usize {
     let (w, h) = job.src.project.comp(job.comp).map_or((0, 0), |c| (c.width, c.height));
     let s = job.opts.scale.clamp(0.01, 4.0);
     let frame = ((w as f64 * s).ceil() * (h as f64 * s).ceil() * 16.0 * 4.0).max(1.0);
-    let cpu = ((job.src.layer_cache.budget() as f64 / frame) as usize).max(1);
+    // (the layer cache's own budget, also when the caches share one: as many frames at once)
+    let cpu = ((job.src.layer_cache.planning_budget() as f64 / frame) as usize).max(1);
     let on_gpu = |g: &Gpu| job.on_gpu.unwrap_or_else(|| composites_on_gpu(job, g));
     match job.src.gpu.as_ref() {
         Some(g) if on_gpu(g) => {
@@ -1038,12 +1723,18 @@ impl Frames {
         self.resident.set(false);
         self.adapt_playback(None);
         if let Ok(mut cache) = self.cache.lock() {
-            let keys: Vec<_> = cache.map.iter().filter_map(|(key, image)| image.is_gpu().then_some(*key)).collect();
-            for key in keys {
-                cache.remove(&key);
+            // A compressed frame keeps its bytes and loses only the texture.
+            let keys: Vec<_> = cache.map.iter().filter_map(|(key, slot)| slot.is_gpu().then_some((*key, slot.packed.is_some()))).collect();
+            for (key, packed) in keys {
+                if packed {
+                    cache.drop_raw(&key);
+                } else {
+                    cache.remove(&key);
+                }
             }
             let Cache { map, order, .. } = &mut *cache;
             order.retain(|key| map.contains_key(key));
+            cache.sync_meter();
         }
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
@@ -1120,12 +1811,26 @@ impl Frames {
         self.ctx.clone()
     }
 
-    /// The cached frame, which becomes the most recently used.
+    /// The cached frame, which becomes the most recently used. A compressed frame without its
+    /// pixels is decoded here, its strips in parallel (about 2 ms for 1080p), and keeps them
+    /// while it stays near the playhead or among the last ones shown ([`codec`]).
     pub fn get(&self, k: &FrameKey) -> Option<FrameImage> {
-        let mut c = self.cache.lock().ok()?;
-        let img = c.map.get(k).cloned()?;
-        c.touch(k);
-        Some(img)
+        let packed = {
+            let mut c = self.cache.lock().ok()?;
+            let slot = c.map.get(k)?;
+            let (raw, packed) = (slot.raw.clone(), slot.packed.clone());
+            c.touch(k);
+            if let Some(img) = raw {
+                return Some(img);
+            }
+            packed?
+        };
+        // Decoded outside the lock: workers and the codec go on meanwhile.
+        let img = Arc::new(codec::unpack_image(&packed, codec::VIEWER_DECODE_THREADS)?);
+        if let Ok(mut c) = self.cache.lock() {
+            c.attach_raw(k, &packed, FrameImage::Cpu(img.clone()));
+        }
+        Some(FrameImage::Cpu(img))
     }
 
     /// Prefer the exact requested frame. While an edit renders, advance to the newest completed
@@ -1144,7 +1849,7 @@ impl Frames {
         if shown.comp != wanted.comp || shown.frame != wanted.frame || shown.view != wanted.view || shown.revision >= wanted.revision {
             return None;
         }
-        let mut c = self.cache.lock().ok()?;
+        let c = self.cache.lock().ok()?;
         let newest = c
             .map
             .keys()
@@ -1159,9 +1864,8 @@ impl Frames {
             })
             .max_by_key(|k| k.revision)
             .copied()?;
-        let img = c.map.get(&newest).cloned()?;
-        c.touch(&newest);
-        Some((newest, img))
+        drop(c);
+        Some((newest, self.get(&newest)?))
     }
 
     /// The [`comp_content`] identity of `comp` in `project` at `revision` (taken once per
@@ -1265,6 +1969,8 @@ impl Frames {
 
     /// The render queue right now (a diagnostic for previews that stop, see `ui.inspect`).
     pub fn queue_state(&self) -> serde_json::Value {
+        // Taken before the queue's lock (never the cache's inside it).
+        let codec = self.cache.lock().map(|c| c.codec.queued()).map(|(p, u)| [p, u]).unwrap_or_default();
         let q = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut running: Vec<i64> = q.running.iter().map(|k| k.frame).collect();
         running.sort_unstable();
@@ -1281,6 +1987,7 @@ impl Frames {
             "urgentRunning": q.urgent_running,
             "inflight": self.inflight(),
             "layerCacheWaitTimeouts": effectcraft_render::cache::wait_timeouts(),
+            "codecQueued": codec,
         })
     }
 
@@ -1327,7 +2034,8 @@ impl Frames {
             Some(dc) => dc.generation(),
             None => self.cache.lock().map(|c| c.generation).unwrap_or(0),
         } ^ remote.map_or(0, |r| r.disk_generation().rotate_left(32));
-        let k = [base.revision, frames as u64, oh, generation, u64::from(local.is_some())];
+        let table = self.print_table(src, base, opts);
+        let k = [base.revision, frames as u64, oh, generation, u64::from(local.is_some()) | u64::from(table.is_some()) << 1];
         let ram = self.cached_frames(base);
         let in_ram = |f: &i64| ram.binary_search(f).is_ok();
         if let Ok(bar) = self.bar.lock()
@@ -1348,7 +2056,13 @@ impl Frames {
         };
         #[cfg(target_arch = "wasm32")]
         let content = content_key(&self.content_keys, &src.project, base.revision, base.comp);
-        let v: Vec<i64> = (0..frames.clamp(0, 100_000)).filter(|f| contains(disk_cache::frame_key(content, *f, base.scale, base.view ^ oh))).collect();
+        // Frames with a fingerprint are named by it ([`frame_keys`]), the others by the content key.
+        let v: Vec<i64> = (0..frames.clamp(0, 100_000))
+            .filter(|f| {
+                let at = FrameKey { frame: *f, ..*base };
+                contains(table.as_ref().and_then(|t| t.disk_key(&at, oh)).unwrap_or_else(|| disk_cache::frame_key(content, *f, base.scale, base.view ^ oh)))
+            })
+            .collect();
         if let Ok(mut bar) = self.bar.lock() {
             bar.disk.retain(|(s, ..)| *s != series);
             remember(&mut bar.disk, series, k, &v);
@@ -1385,15 +2099,71 @@ impl Frames {
     /// way, or the link isn't ready), try again shortly.
     pub fn precache_remote(&self, src: &RenderSource, base: &FrameKey, comp: ItemId, opts: RenderOpts, ranges: Vec<(i64, i64)>) -> Option<bool> {
         let remote = self.remote.as_ref().filter(|r| r.eager() && r.disk())?;
-        let Some(series) = self.cache_series(&src.project, base, &opts) else { return Some(false) };
-        Some(remote.precache(RemotePrecache { project: src.project.clone(), revision: base.revision, comp, series, opts, ranges }))
+        let Some(mut series) = self.cache_series(&src.project, base, &opts) else { return Some(false) };
+        // The server names the frames by their fingerprints too: an edit re-renders only the
+        // frames it changed.
+        let Some(table) = self.print_table(src, base, &opts) else { return Some(false) };
+        series.prints = table.prints.digest();
+        let prints = Some(Arc::new(table.prints.clone()));
+        Some(remote.precache(RemotePrecache { project: src.project.clone(), revision: base.revision, comp, series, opts, ranges, prints }))
+    }
+
+    /// The fingerprints of every frame of `base`'s series with `opts` ([`frame_keys::PrintTable`]);
+    /// native: computed on the frame pool, `None` until then.
+    fn print_table(&self, src: &RenderSource, base: &FrameKey, opts: &RenderOpts) -> Option<Arc<frame_keys::PrintTable>> {
+        let key = frame_keys::table_key(base, opts_hash(opts));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let pool = self.pool.clone();
+            let spawn = move |job: Box<dyn FnOnce() + Send>| match pool {
+                Some(p) => p.spawn(job),
+                None => rayon::spawn(job),
+            };
+            self.tables.get_or_request(spawn, &self.salts, self.ctx.as_ref(), src, key, ItemId(base.comp), *opts)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = src;
+            self.tables.get(&key)
+        }
     }
 
     pub fn set_budget(&self, bytes: usize) {
         if let Ok(mut c) = self.cache.lock() {
             c.budget = bytes;
+            // Compressed ahead of what the smaller budget can't hold as pixels; what doesn't fit
+            // before the codec is done leaves now.
+            c.trim_raw();
             c.evict_to_budget();
         }
+    }
+
+    /// Take part in the shared cache budget (`Some`; Settings ▸ Memory & CPU ▸ Share One Budget
+    /// Between the Caches, see [`effectcraft_render::cache::shared`]) or keep to this cache's
+    /// own budget (`None`). The budget takes the least recently shown frame outside the playback
+    /// range and the protected window ([`Cache::shared_candidate`]), spilling it to disk first.
+    pub fn share(&self, budget: Option<&Arc<SharedBudget>>) {
+        let link = budget.and_then(|b| b.join(ShareKind::Preview, Arc::new(PreviewMember(Arc::downgrade(&self.cache)))));
+        let old = match self.cache.lock() {
+            Ok(mut c) => {
+                let old = std::mem::replace(&mut c.share, link);
+                c.report_share();
+                old
+            }
+            Err(_) => return,
+        };
+        if let Some(old) = old {
+            old.leave();
+        }
+    }
+
+    /// The bytes the RAM preview may plan to fill now (how many frames Cache Before Playback
+    /// and the playback range count on): with a shared budget, the total less what the layer
+    /// and footage caches hold (at least its own budget, at most its limit), else
+    /// [`Frames::budget`].
+    pub fn plan_budget(&self) -> usize {
+        let Ok(c) = self.cache.lock() else { return 0 };
+        c.share.as_ref().and_then(ShareLink::room).map_or(c.budget, |r| usize::try_from(r).unwrap_or(usize::MAX).min(c.budget))
     }
 
     /// Keep the playhead and its immediate look-ahead ahead of speculative frames for eviction.
@@ -1402,7 +2172,39 @@ impl Frames {
         if let Ok(mut cache) = self.cache.lock() {
             cache.protected.clear();
             cache.protected.extend(frames.into_iter().enumerate().map(|(rank, frame)| (FrameKey { frame, ..base }, rank)));
+            // Compressed frames: the window keeps (and gets back) its pixels.
+            cache.trim_raw();
+            cache.unpack_ahead();
         }
+    }
+
+    /// Compress RAM Preview Frames and Uncompressed Frames Around the Playhead (Settings ▸
+    /// Memory & CPU, see [`codec`]). Off: new frames keep their pixels (compressed ones stay as
+    /// they are and decode when shown). Never in the browser (no threads to compress on).
+    pub fn set_compress(&self, on: bool, raw_window: u32) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.compress = on && cfg!(not(target_arch = "wasm32"));
+            c.raw_window = i64::from(raw_window);
+            if c.compress {
+                // Frames cached before go to the codec as the trim meets them.
+                let keys: Vec<FrameKey> = c.map.iter().filter(|(_, s)| s.raw.is_some()).map(|(k, _)| *k).collect();
+                c.rawset.extend(keys);
+            }
+            c.trim_raw();
+            c.evict_to_budget();
+            c.sync_meter();
+        }
+    }
+
+    /// Bytes a frame of `raw` uncompressed bytes takes in the RAM preview: with compression on,
+    /// scaled by the ratio measured on the cached frames (1 until a frame was compressed), so
+    /// the playback and Cache Before Playback ranges count the frames that really fit.
+    pub fn frame_bytes(&self, raw: f64) -> f64 {
+        let Ok(c) = self.cache.lock() else { return raw };
+        if !c.compress || c.packed_raw == 0 {
+            return raw;
+        }
+        raw * (c.packed_bytes as f64 / c.packed_raw as f64).clamp(0.02, 1.0)
     }
 
     /// The playing preview's position (`None` when no preview plays): eviction spares the
@@ -1411,6 +2213,8 @@ impl Frames {
     pub fn set_playhead(&self, playhead: Option<Playhead>) {
         if let Ok(mut c) = self.cache.lock() {
             c.playhead = playhead;
+            c.trim_raw();
+            c.unpack_ahead();
         }
         let Ok(mut q) = self.queue.lock() else { return };
         q.playhead = playhead;
@@ -1452,6 +2256,24 @@ impl Frames {
         self.cache.lock().map(|c| c.budget).unwrap_or(0)
     }
 
+    /// The RAM preview's bytes as an atomic the memory chip reads without the lock.
+    pub fn memory_meter(&self) -> Arc<AtomicU64> {
+        self.cache.lock().map(|c| c.meter.clone()).unwrap_or_default()
+    }
+
+    /// What the RAM preview holds (Window ▸ Memory, `memory.stats`). `detail`: per comp too
+    /// (the keys are copied out under the lock and counted after it).
+    pub fn memory_usage(&self, detail: bool) -> effectcraft_engine::memory_map::PreviewUsage {
+        memory_usage(&self.cache, detail)
+    }
+
+    /// The memory map's probes over this cache ([`effectcraft_engine::memory_map::Hooks`]):
+    /// closures over the shared cache, so the engine's `memory.stats` / `memory.purge` see it.
+    pub fn memory_hooks(&self) -> (effectcraft_engine::memory_map::PreviewProbe, effectcraft_engine::memory_map::PreviewPurge) {
+        let (a, b) = (self.cache.clone(), self.cache.clone());
+        (Arc::new(move |detail| memory_usage(&a, detail)), Arc::new(move |comp| purge_comp(&b, comp)))
+    }
+
     /// Purge Caches: forget every frame, and the frames rendering or landing now too (they are
     /// dropped when they finish, see [`Job::epoch`]): their pixels may be from before.
     pub fn clear(&self) {
@@ -1469,6 +2291,15 @@ impl Frames {
             c.order.clear();
             c.bytes = 0;
             c.gpu_bytes = 0;
+            c.packed_bytes = 0;
+            c.packed_frames = 0;
+            c.packed_raw = 0;
+            c.rawset.clear();
+            c.packing.clear();
+            c.unpacking.clear();
+            c.gpu_wanted.clear();
+            c.codec.clear();
+            c.sync_meter();
         }
         // Disk keys hash the footage files' size and time, but are remembered per revision; a
         // file reloaded from disk without a new revision (a re-rendered image sequence) must be
@@ -1488,18 +2319,38 @@ impl Frames {
 
     /// Queue a prefetch frame (no-op if cached or already queued/rendering).
     pub fn request(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
-        self.request_with(src, key, comp, t, opts, false, false);
+        self.request_with(src, key, comp, t, opts, false, false, false);
+    }
+
+    /// Queue a frame for Cache Frames When Idle: rendered after every viewer and prefetch frame,
+    /// one at a time, on the idle threads ([`idle`]: a few cores at background priority).
+    pub fn request_idle(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
+        self.request_with(src, key, comp, t, opts, false, false, true);
+    }
+
+    /// How many idle frames Cache Frames When Idle keeps in flight: one rendering and one
+    /// queued behind it, so the idle threads don't wait for the next UI frame.
+    pub fn idle_slots(&self) -> usize {
+        IDLE_FRAMES + 1
+    }
+
+    /// Render idle frames on `threads` threads from the next one on (see [`idle::idle_threads`]).
+    pub fn set_idle_threads(&self, threads: usize) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.idle.set_threads(threads);
+        #[cfg(target_arch = "wasm32")]
+        let _ = threads;
     }
 
     /// Queue the frame the viewer is showing: it jumps ahead of every prefetch job.
     pub fn request_urgent(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
-        self.request_with(src, key, comp, t, opts, true, false);
+        self.request_with(src, key, comp, t, opts, true, false, false);
     }
 
     /// [`Frames::request_urgent`] for the paused viewer: a draft frame of the cloud's stream
     /// ([`streamed`]) under the key is rendered exactly too (and replaced when it lands).
     pub fn request_exact(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
-        self.request_with(src, key, comp, t, opts, true, true);
+        self.request_with(src, key, comp, t, opts, true, true, false);
     }
 
     /// An urgent (viewer) frame is queued or rendering.
@@ -1508,7 +2359,8 @@ impl Frames {
     }
 
     /// Queue a frame for the disk cache only (Cache Frames When Idle once the RAM preview is
-    /// full): rendered after every other frame and written to disk without going through RAM.
+    /// full): rendered after every other frame, on the idle threads like [`Frames::request_idle`],
+    /// and written to disk without going through RAM.
     /// Returns whether it was queued: not without a disk cache, when the frame is in RAM, on
     /// disk, queued or failed, or while the disk cache's writer has no room for it (the
     /// caller tries again later).
@@ -1522,7 +2374,9 @@ impl Frames {
         if self.is_cached(&key) || self.failed(&key) {
             return false;
         }
-        if dc.contains(disk_cache::Kind::Frame, frame_disk_key(&self.content_keys, &src.project, &key, opts_hash(&opts))) {
+        let oh = opts_hash(&opts);
+        let named = self.print_table(src, &key, &opts).and_then(|t| t.disk_key(&key, oh));
+        if dc.contains(disk_cache::Kind::Frame, named.unwrap_or_else(|| frame_disk_key(&self.content_keys, &src.project, &key, oh))) {
             return false;
         }
         let (w, h) = src.project.comp(comp).map_or((0, 0), |c| (c.width, c.height));
@@ -1547,6 +2401,7 @@ impl Frames {
             opts,
             urgent: false,
             disk_only: true,
+            idle: true,
             seq,
             epoch,
             on_gpu: None,
@@ -1563,7 +2418,13 @@ impl Frames {
         true
     }
 
-    fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool, over_draft: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool, over_draft: bool, idle: bool) {
+        // The frame on screen sets the scale evictions keep: a prefetch or a passive viewer at
+        // another zoom must not evict the active viewer's frames.
+        if urgent && let Ok(mut c) = self.cache.lock() {
+            c.scale = Some(key.scale);
+        }
         let cached = if over_draft { self.is_exact(&key) } else { self.is_cached(&key) };
         if cached || self.failed(&key) {
             return;
@@ -1602,6 +2463,8 @@ impl Frames {
             });
             for j in q.jobs.iter_mut() {
                 j.urgent = j.key == key;
+                // Wanted on screen now: no longer an idle frame.
+                j.idle &= !j.urgent;
             }
             // The comp's viewer frames of other times that are rendering are called off too: a
             // movie seeking for each of them held the decoder the frame under the pointer
@@ -1613,10 +2476,22 @@ impl Frames {
                 }
             }
         }
-        if !inf.insert(key) {
-            // Queued for the disk only: now wanted in RAM too.
+        // Rendering as an idle frame (a few low-priority threads): call that render off and render
+        // the frame again at this request's priority, so the viewer and playback never wait for
+        // it. The idle render becomes an orphan: the new job owns the key ([`Worker::release_seq`]).
+        let running_idle = q.idle.get(&key).filter(|(s, _)| !q.orphans.contains(s)).map(|(s, c)| (*s, c.clone()));
+        let promote = !idle && running_idle.is_some() && !q.jobs.iter().any(|j| j.key == key);
+        if promote && let Some((seq, cancel)) = running_idle {
+            cancel.store(true, Ordering::Relaxed);
+            q.orphans.insert(seq);
+            q.running.remove(&key);
+        }
+        if !promote && !inf.insert(key) {
+            // Queued for the disk only: now wanted in RAM too. Queued by Cache Frames When Idle:
+            // now wanted by playback or the viewer, at their priority.
             if let Some(j) = q.jobs.iter_mut().find(|j| j.key == key) {
                 j.disk_only = false;
+                j.idle &= idle;
             }
             return;
         }
@@ -1631,6 +2506,7 @@ impl Frames {
             opts,
             urgent,
             disk_only: false,
+            idle: idle && !urgent,
             seq,
             epoch,
             on_gpu: None,
@@ -1648,6 +2524,10 @@ impl Frames {
                 self.dispatch_remote();
             }
         } else if self.local_workers() {
+            // A frame on disk comes from there, ahead of the renders (not behind them).
+            if !urgent && src.disk.is_some() {
+                self.wake_read_ahead();
+            }
             // One spawn per job; each spawn renders whichever queued jobs matter most right now.
             self.worker().spawn_next();
         }
@@ -1655,6 +2535,30 @@ impl Frames {
         if let Some(ctx) = &self.ctx {
             // rendered by `pump` after this UI frame
             ctx.request_repaint();
+        }
+    }
+
+    /// Start a disk read-ahead thread when fewer than [`READ_AHEAD_THREADS`] run, and wake the
+    /// ones waiting ([`Worker::read_ahead`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wake_read_ahead(&self) {
+        let ra = &self.read_ahead;
+        let mut s = ra.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.1 = s.1.wrapping_add(1);
+        ra.cv.notify_all();
+        if s.0 >= READ_AHEAD_THREADS {
+            return;
+        }
+        let w = self.worker();
+        let spawned = std::thread::Builder::new().name("ec-frame-read-ahead".into()).spawn(move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.read_ahead())).is_err() {
+                log::error!("a disk read-ahead thread panicked; queued frames render instead");
+                let mut s = w.read_ahead.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.0 = s.0.saturating_sub(1);
+            }
+        });
+        if spawned.is_ok() {
+            s.0 += 1;
         }
     }
 
@@ -1669,6 +2573,7 @@ impl Frames {
             times: self.times.clone(),
             playback_budget: self.playback_budget.clone(),
             content_keys: self.content_keys.clone(),
+            salts: self.salts.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             content_key_jobs: self.content_key_jobs.clone(),
             gpu_retired: self.gpu_retired.clone(),
@@ -1677,9 +2582,13 @@ impl Frames {
             #[cfg(not(target_arch = "wasm32"))]
             pool: self.pool.clone(),
             #[cfg(not(target_arch = "wasm32"))]
+            idle: self.idle.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
             landing: self.landing.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             resident: self.resident.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            read_ahead: self.read_ahead.clone(),
         }
     }
 
@@ -1864,6 +2773,8 @@ struct Worker {
     times: Arc<times::RenderTimes>,
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
+    /// Footage salts by revision, for frame disk keys named by fingerprint ([`frame_keys`]).
+    salts: frame_keys::Salts,
     #[cfg(not(target_arch = "wasm32"))]
     content_key_jobs: Arc<Mutex<ContentKeyJobs>>,
     gpu_retired: Arc<AtomicBool>,
@@ -1872,10 +2783,15 @@ struct Worker {
     /// The threads frames render on (`None`: rayon's global pool).
     #[cfg(not(target_arch = "wasm32"))]
     pool: Option<Arc<workers::Workers>>,
+    /// The threads idle frames render on.
+    #[cfg(not(target_arch = "wasm32"))]
+    idle: Arc<idle::IdlePool>,
     #[cfg(not(target_arch = "wasm32"))]
     landing: Arc<landing::Landing>,
     #[cfg(not(target_arch = "wasm32"))]
     resident: Arc<resident::Resident>,
+    #[cfg(not(target_arch = "wasm32"))]
+    read_ahead: Arc<ReadAhead>,
 }
 
 /// What finishing a frame needs besides its pixels (see [`Worker::publish`]).
@@ -1888,6 +2804,13 @@ struct Tail {
     ticket: Option<crate::playback_budget::Ticket>,
     /// The disk cache and the frame's key there.
     disk: Option<(Arc<DiskCache>, u128)>,
+}
+
+/// Where a finished frame's pixels came from ([`Worker::publish`]).
+enum Origin {
+    Rendered,
+    /// The disk cache, with the compressed bytes the RAM preview keeps (compression on).
+    Disk(Option<Arc<PackedFrame>>),
 }
 
 /// What [`Worker::render_job`] did with a frame.
@@ -1982,9 +2905,8 @@ impl Worker {
     /// Render the queued job that matters most right now. `false` when the queue was empty, or
     /// the job has to wait for memory (a finishing frame starts it, see [`Worker::release`]).
     fn run_next(&self) -> bool {
-        let Worker { queue, content_keys, .. } = self;
-        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-        let mut job = {
+        let queue = &self.queue;
+        let job = {
             let Ok(mut q) = queue.lock() else { return false };
             let Some(i) = q.best() else { return false };
             let retired = self.gpu_retired.load(Ordering::Acquire);
@@ -2002,6 +2924,10 @@ impl Worker {
                 q.parked += 1;
                 return false;
             }
+            // What the viewer or playback waits for renders at foreground priority; prefetch away
+            // from the playing playhead, idle and disk-only frames at background priority, after
+            // other apps (MEM3).
+            let foreground = j.urgent || (!j.idle && !j.disk_only && playhead.as_ref().is_some_and(|p| p.ahead(&j.key).is_some()));
             let mut job = q.jobs.swap_remove(i);
             job.epoch = self.epoch.load(Ordering::Acquire);
             q.running.insert(job.key);
@@ -2009,8 +2935,31 @@ impl Worker {
                 q.urgent_running += 1;
                 q.urgent_cancels.push((job.key, job.cancel.clone()));
             }
-            job
+            if job.idle {
+                q.idle.insert(job.key, (job.seq, job.cancel.clone()));
+            }
+            (job, foreground)
         };
+        let (job, foreground) = job;
+        #[cfg(not(target_arch = "wasm32"))]
+        effectcraft_engine::render::concurrency::thread_priority(foreground);
+        #[cfg(target_arch = "wasm32")]
+        let _ = foreground;
+        // An idle frame renders inside the idle pool: its parallel loops stay on those few
+        // low-priority threads ([`idle`]); this frame thread waits for it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if job.idle
+            && let Some(pool) = self.idle.pool()
+        {
+            let w = self.clone();
+            return pool.install(move || w.run_job(job));
+        }
+        self.run_job(job)
+    }
+
+    /// Render `job`, which [`Worker::run_next`] took from the queue.
+    fn run_job(&self, #[cfg_attr(target_arch = "wasm32", allow(unused_mut))] mut job: Job) -> bool {
+        let Worker { content_keys, salts, .. } = self;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(retry) = job.retry.take() {
             self.render_retry(job, *retry);
@@ -2025,48 +2974,71 @@ impl Worker {
                 .lock()
                 .is_ok_and(|mut c| (c.map.contains_key(&job.key) && !c.drafts.contains(&job.key)) || job.print.is_some_and(|p| c.adopt(job.key, p)))
             {
-                self.release(job.key, job.urgent);
+                self.done(&job);
                 return true;
             }
         }
         let t0 = web_time::Instant::now();
-        let disk = job.src.disk.as_ref().map(|dc| (dc.clone(), frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts))));
+        if job.disk_only && job.src.disk.is_some() {
+            job.print = fingerprint::of(&job.src, job.comp, job.t, job.opts);
+        }
+        // Named by its fingerprint when it has one: on disk, an edit elsewhere keeps it.
+        let disk = job.src.disk.as_ref().map(|dc| {
+            let key = match job.print {
+                Some(p) => frame_keys::print_disk_key(salts, &job.src.project, &job.key, p, opts_hash(&job.opts)),
+                None => frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts)),
+            };
+            (dc.clone(), key)
+        });
         if job.disk_only && disk.as_ref().is_none_or(|(dc, k)| dc.contains(disk_cache::Kind::Frame, *k)) {
             // Already on disk (or no disk cache any more): nothing to do.
-            self.release(job.key, false);
+            self.done(&job);
             return true;
         }
-        let from_disk = disk.as_ref().and_then(|(dc, k)| dc.get_frame(*k));
-        let disk_hit = from_disk.is_some();
+        // Compressed in RAM: the disk's bytes are kept as they are (no second compression).
+        let compress = !job.disk_only && self.cache.lock().is_ok_and(|c| c.compress);
+        let from_disk = disk.as_ref().and_then(|(dc, k)| {
+            if compress {
+                let p = Arc::new(dc.get_packed_frame(*k)?);
+                Some((Arc::new(codec::unpack_image(&p, 1)?), Some(p)))
+            } else {
+                let f = dc.get_frame(*k)?;
+                Some((Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba)), None))
+            }
+        });
         let ticket = if job.disk_only { None } else { self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ticket(job.key) };
         let tail = Tail { t0, service_start: web_time::Instant::now(), ticket, disk };
-        let ci = match from_disk {
-            Some(f) => FrameImage::Cpu(Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))),
-            None => match self.render_guarded(&job, &tail) {
-                // On its way back from the GPU: the landing thread publishes it.
-                Some(Rendered::Landing) => return true,
-                // Called off (frames it read may be missing): not cached, and the viewer asks
-                // for it again if it still wants it.
-                _ if job.called_off() => {
-                    self.release(job.key, job.urgent);
-                    return true;
-                }
-                Some(Rendered::Image(ci)) => ci,
-                None => {
-                    // Not "in progress" forever; not asked for again until the project changes.
-                    self.give_up(job.key, job.urgent);
-                    return true;
-                }
-            },
+        let (ci, origin) = match from_disk {
+            Some((img, packed)) => (FrameImage::Cpu(img), Origin::Disk(packed)),
+            None => (
+                match self.render_guarded(&job, &tail) {
+                    // On its way back from the GPU: the landing thread publishes it.
+                    Some(Rendered::Landing) => return true,
+                    // Called off (frames it read may be missing): not cached, and the viewer asks
+                    // for it again if it still wants it.
+                    _ if job.called_off() => {
+                        self.done(&job);
+                        return true;
+                    }
+                    Some(Rendered::Image(ci)) => ci,
+                    None => {
+                        // Not "in progress" forever; not asked for again until the project changes.
+                        self.give_up_job(&job);
+                        return true;
+                    }
+                },
+                Origin::Rendered,
+            ),
         };
-        self.publish(&job, ci, &tail, disk_hit, std::time::Duration::ZERO);
+        self.publish(&job, ci, &tail, origin, std::time::Duration::ZERO);
         true
     }
 
     /// A frame is done: sample its render time for the playback budget, store it (RAM and / or
     /// disk) and release its job. `queued`: time a GPU frame waited behind other frames in
     /// flight on the landing thread, left out of its render time (RT9b).
-    fn publish(&self, job: &Job, ci: FrameImage, tail: &Tail, disk_hit: bool, queued: std::time::Duration) {
+    fn publish(&self, job: &Job, ci: FrameImage, tail: &Tail, origin: Origin, queued: std::time::Duration) {
+        let disk_hit = matches!(origin, Origin::Disk(_));
         if job.epoch != self.epoch.load(Ordering::Acquire) {
             // Started before Purge Caches: its pixels may be from before (a footage file
             // reloaded from disk). Rendered again instead, as the viewer would ask.
@@ -2088,17 +3060,38 @@ impl Worker {
             if let (Some((dc, k)), FrameImage::Cpu(img)) = (&tail.disk, &ci) {
                 dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
             }
-            self.release(job.key, false);
+            self.done(job);
             return;
         }
+        // Where it goes on disk (`plan/memory/compressed-cache.md`): an expensive frame is written
+        // now when nothing else waits ([`keep_on_disk`]); one rendered while playback or prefetch
+        // keeps the workers busy is written when it leaves RAM (spill, [`Cache::spill`]).
+        let backlog = self.queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent && !j.disk_only).count()).unwrap_or(0);
+        let expensive = !disk_hit && render_time >= DISK_MIN_RENDER;
+        let now = !disk_hit && keep_on_disk(render_time, job.urgent, backlog);
+        let compress = self.cache.lock().is_ok_and(|c| c.compress);
+        // Compressed in RAM, the codec writes it from the bytes RAM keeps once it is compressed;
+        // otherwise it is written here.
+        let written_here = now && !compress;
+        let packed = match origin {
+            Origin::Disk(p) => p,
+            Origin::Rendered => None,
+        };
+        let plan = DiskPlan { target: if expensive && !written_here { tail.disk.clone() } else { None }, now: now && compress };
         // Publish the shared frame and wake the viewer first; the disk cache's writer thread
         // compresses and writes the same snapshot.
-        self.finish(job, ci.clone(), tail.t0);
-        let backlog = self.queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent && !j.disk_only).count()).unwrap_or(0);
-        if !disk_hit
-            && keep_on_disk(render_time, job.urgent, backlog)
-            && let Some((dc, k)) = &tail.disk
-        {
+        self.finish_stored(job.key, job.urgent, ci.clone(), tail.t0, job.print, Some(job.seq), Stored { disk: plan, packed });
+        #[cfg(not(target_arch = "wasm32"))]
+        if compress && let Some(gpu) = &job.src.gpu {
+            // A GPU frame written to disk now is compressed now (from a read-back); any other
+            // keeps its texture until it would leave the uncompressed share, when the cache asks
+            // for its read-back ([`Cache::trim_raw`]).
+            if now && let FrameImage::Gpu(f) = &ci {
+                self.pack_gpu(gpu, job.key, f);
+            }
+            self.pack_wanted_gpu(gpu);
+        }
+        if written_here && let Some((dc, k)) = &tail.disk {
             match &ci {
                 // Hands over a reference to the frame (no copy, no compression here).
                 FrameImage::Cpu(img) => dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone())),
@@ -2128,31 +3121,191 @@ impl Worker {
         let _ = self.landing.begin(gpu, f, land);
     }
 
+    /// Start the read-backs of the GPU frames the cache wants compressed ([`Cache::gpu_wanted`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pack_wanted_gpu(&self, gpu: &Gpu) {
+        let wanted: Vec<(FrameKey, Arc<DisplayFrame>)> = {
+            let Ok(mut c) = self.cache.lock() else { return };
+            let keys = std::mem::take(&mut c.gpu_wanted);
+            keys.into_iter()
+                .filter_map(|k| match c.map.get(&k) {
+                    Some(Cached { raw: Some(FrameImage::Gpu(f)), packed: None, .. }) => Some((k, f.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (k, f) in wanted {
+            self.pack_gpu(gpu, k, &f);
+        }
+    }
+
+    /// Compress a GPU frame ([`codec`]): read it back on the landing thread and hand the bytes
+    /// to the codec (the hand-off only queues them; the codec's threads run at background
+    /// priority), which keeps them; the texture goes when the uncompressed share needs the room.
+    /// Skipped when too many readbacks are in flight: the frame stays a texture (the next trim
+    /// may ask again).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pack_gpu(&self, gpu: &Gpu, key: FrameKey, f: &Arc<DisplayFrame>) {
+        let raw_id = Arc::as_ptr(f) as usize;
+        let coder = {
+            let Ok(mut c) = self.cache.lock() else { return };
+            let mine = c.map.get(&key).is_some_and(|s| s.raw_id() == Some(raw_id) && s.packed.is_none());
+            if !c.compress || !mine || c.packing.contains(&key) {
+                return;
+            }
+            c.packing.insert(key);
+            c.codec.clone()
+        };
+        let (w, h) = (f.width, f.height);
+        let cache = self.cache.clone();
+        let land: landing::Land = Box::new(move |bytes, _| {
+            let queued = bytes.is_some_and(|b| coder.pack(codec::PackJob { key, raw_id, pixels: codec::Pixels::Bytes(w, h, b) }));
+            if !queued && let Ok(mut c) = cache.lock() {
+                c.packing.remove(&key);
+            }
+        });
+        if self.landing.begin(gpu, f, land).is_err()
+            && let Ok(mut c) = self.cache.lock()
+        {
+            c.packing.remove(&key);
+        }
+    }
+
+    /// A disk read-ahead thread ([`Frames::wake_read_ahead`]): queued prefetch frames the disk
+    /// cache holds, nearest the playhead first, are read (and, near it, decoded) here and taken
+    /// out of the render queue, so playing over frames on disk never waits behind a render
+    /// (`plan/memory/compressed-cache.md`). Exits after [`READ_AHEAD_LINGER`] without new frames.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_ahead(&self) {
+        let ra = self.read_ahead.clone();
+        loop {
+            let seen = ra.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).1;
+            while let Some(job) = self.next_unprobed() {
+                self.read_ahead_one(job);
+            }
+            let s = ra.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (mut s, _) = ra.cv.wait_timeout_while(s, READ_AHEAD_LINGER, |s| s.1 == seen).unwrap_or_else(std::sync::PoisonError::into_inner);
+            if s.1 == seen {
+                s.0 = s.0.saturating_sub(1);
+                return;
+            }
+        }
+    }
+
+    /// The queued prefetch frame the disk cache wasn't asked about yet that the preview reaches
+    /// first (marked asked).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn next_unprobed(&self) -> Option<Job> {
+        let mut q = self.queue.lock().ok()?;
+        let p = q.playhead;
+        let i = q
+            .jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, j)| !j.urgent && !j.disk_only && j.retry.is_none() && j.src.disk.is_some() && !q.probed.contains(&j.seq))
+            .min_by_key(|(_, j)| (p.as_ref().and_then(|p| p.ahead(&j.key)).unwrap_or(i64::MAX), j.seq))
+            .map(|(i, _)| i)?;
+        let job = q.jobs.get(i)?.clone();
+        if q.probed.len() >= MAX_PROBED {
+            let live: HashSet<u64> = q.jobs.iter().map(|j| j.seq).collect();
+            q.probed.retain(|s| live.contains(s));
+        }
+        q.probed.insert(job.seq);
+        Some(job)
+    }
+
+    /// Look for `job`'s frame in the disk cache; when it is there, cache it (compressed, with its
+    /// pixels too near the playhead) and take the job out of the queue. A worker that took the
+    /// job meanwhile renders it anyway; this copy shows until it lands.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_ahead_one(&self, job: Job) {
+        let Some(dc) = job.src.disk.clone() else { return };
+        // Named as `run_job` names it: by fingerprint when it has one.
+        let print = fingerprint::of(&job.src, job.comp, job.t, job.opts);
+        let oh = opts_hash(&job.opts);
+        let key = match print {
+            Some(p) => frame_keys::print_disk_key(&self.salts, &job.src.project, &job.key, p, oh),
+            None => frame_disk_key(&self.content_keys, &job.src.project, &job.key, oh),
+        };
+        if !dc.contains(disk_cache::Kind::Frame, key) {
+            return;
+        }
+        let (compress, near) = self.cache.lock().map(|c| (c.compress, c.near(&job.key))).unwrap_or((false, false));
+        let slot = if compress {
+            let Some(p) = dc.get_packed_frame(key) else { return };
+            let p = Arc::new(p);
+            let raw = if near { codec::unpack_image(&p, 1).map(|i| FrameImage::Cpu(Arc::new(i))) } else { None };
+            Cached { raw, packed: Some(p), disk: DiskPlan::default() }
+        } else {
+            let Some(f) = dc.get_frame(key) else { return };
+            let Some(img) = display_color_image(f.width, f.height, &f.rgba) else { return };
+            Cached { raw: Some(FrameImage::Cpu(Arc::new(img))), packed: None, disk: DiskPlan::default() }
+        };
+        if job.epoch != self.epoch.load(Ordering::Acquire) {
+            // Purge Caches since it was asked for: rendered again.
+            return;
+        }
+        let taken = match self.queue.lock() {
+            Ok(mut q) => match q.jobs.iter().position(|j| j.seq == job.seq) {
+                Some(i) => {
+                    q.jobs.swap_remove(i);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => return,
+        };
+        if let Ok(mut c) = self.cache.lock()
+            && (!c.map.contains_key(&job.key) || c.drafts.contains(&job.key))
+        {
+            c.put(job.key, slot);
+            if let Some(p) = print
+                && c.map.contains_key(&job.key)
+            {
+                c.prints.stamp(job.key, p);
+            }
+            c.read_ahead = c.read_ahead.saturating_add(1);
+        }
+        if taken && let Ok(mut inf) = self.inflight.lock() {
+            inf.remove(&job.key);
+        }
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+
     /// Store a finished frame and release its job.
     fn finish(&self, job: &Job, img: FrameImage, t0: web_time::Instant) {
-        self.finish_print(job.key, job.urgent, img, t0, job.print);
+        self.finish_print(job.key, job.urgent, img, t0, job.print, Some(job.seq));
     }
 
+    #[cfg(test)]
     fn finish_key(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant) {
-        self.finish_print(key, urgent, img, t0, None);
+        self.finish_print(key, urgent, img, t0, None, None);
     }
 
-    /// [`Self::finish_key`] with the frame's fingerprint, if it has one.
-    fn finish_print(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant, print: Option<u64>) {
+    /// Store a finished frame, stamped with its fingerprint if it has one, and release its job.
+    fn finish_print(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant, print: Option<u64>, seq: Option<u64>) {
+        self.finish_stored(key, urgent, img, t0, print, seq, Stored::default());
+    }
+
+    /// [`Worker::finish_print`] with where the frame goes on disk and its compressed bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_stored(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant, print: Option<u64>, seq: Option<u64>, stored: Stored) {
         if urgent && let Ok(mut l) = self.last.lock() {
             *l = t0.elapsed().as_secs_f64() * 1000.0;
         }
         if let Ok(mut c) = self.cache.lock()
             && (!img.is_gpu() || !self.gpu_retired.load(Ordering::Acquire))
         {
-            c.insert(key, img);
+            c.insert_stored(key, img, stored);
             if let Some(p) = print
                 && c.map.contains_key(&key)
             {
                 c.prints.stamp(key, p);
             }
         }
-        self.release(key, urgent);
+        self.release_seq(key, urgent, seq);
     }
 
     /// Hand queued frames to the remote renderer while it has free slots, most important first
@@ -2203,7 +3356,7 @@ impl Worker {
             };
             if job.disk_only && (!remote.disk() || remote.eager()) {
                 // Queued for this machine's disk cache before the frames went remote.
-                self.release(job.key, job.urgent);
+                self.done(&job);
                 continue;
             }
             // The GPU compositor here keeps the frame on the GPU, but runs layer effects on the
@@ -2222,82 +3375,133 @@ impl Worker {
                 *b += 1;
             }
             started += 1;
-            let (key, urgent, epoch) = (job.key, job.urgent, job.epoch);
-            let t0 = web_time::Instant::now();
-            // The cloud (eager) never hashes the comp here (this may be the UI thread): its key
-            // goes along once a worker has the content key.
+            // The cloud (eager): a pool thread takes the frame's fingerprint first, so a frame the
+            // last edit didn't change is taken over from RAM instead of downloaded again, and the
+            // server names it by what it shows (its frame cache survives edits elsewhere).
+            #[cfg(not(target_arch = "wasm32"))]
+            if remote.eager() && !job.disk_only {
+                let (fw, link) = (self.clone(), link.clone());
+                self.spawn(move || fw.print_and_send(&link, job));
+                continue;
+            }
             let disk_key = if remote.eager() {
-                self.known_disk_key(&job.src.project, &key, &job.opts)
+                self.known_disk_key(&job.src.project, &job.key, &job.opts)
             } else {
-                remote.disk().then(|| frame_disk_key(&self.content_keys, &job.src.project, &key, opts_hash(&job.opts)))
+                remote.disk().then(|| frame_disk_key(&self.content_keys, &job.src.project, &job.key, opts_hash(&job.opts)))
             };
-            let fw = self.clone();
-            let refined = {
-                let fw = self.clone();
-                Box::new(move |f: RemoteFrame| {
-                    if fw.epoch.load(Ordering::Acquire) != epoch {
-                        return;
-                    }
-                    let Some(img) = egui_image(&f) else { return };
-                    if let Ok(mut c) = fw.cache.lock()
-                        && c.map.contains_key(&key)
-                    {
-                        c.insert(key, FrameImage::Cpu(Arc::new(img)));
-                    }
-                    if let Some(ctx) = &fw.ctx {
-                        ctx.request_repaint();
-                    }
-                }) as RemoteRefine
-            };
-            let rj = RemoteJob {
-                project: job.src.project.clone(),
-                revision: key.revision,
-                comp: job.comp,
-                t: job.t,
-                opts: job.opts,
-                disk_key,
-                urgent,
-                cancel: job.cancel.clone(),
-                refined: Some(refined),
-                timed: Some({
-                    let sink = self.times.clone();
-                    Box::new(move |t: times::FrameTimes| sink.put(&key, t)) as RemoteTimes
-                }),
-            };
-            let next = link.clone();
-            remote.start(
-                rj,
-                Box::new(move |r: Result<RemoteFrame, String>| {
-                    if let Ok(mut b) = next.busy.lock() {
-                        *b = b.saturating_sub(1);
-                    }
-                    match r.and_then(|f| egui_image(&f).ok_or_else(|| "the frame's size and pixels disagree".to_string())) {
-                        // Purge Caches since it was asked for: its pixels may be from before.
-                        Ok(_) if fw.epoch.load(Ordering::Acquire) != epoch => fw.release(key, urgent),
-                        Ok(img) => {
-                            fw.finish_key(key, urgent, FrameImage::Cpu(Arc::new(img)), t0);
-                            if urgent && let Ok(mut l) = next.latest.lock() {
-                                // Never move back to an older frame finishing late.
-                                if l.is_none_or(|old| old.comp != key.comp || old.revision <= key.revision) {
-                                    *l = Some(key);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Not rendered (a stale revision, a lost connection, called off): the
-                            // viewer asks again.
-                            log::debug!("remote frame: {e}");
-                            fw.release(key, urgent);
-                        }
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if next.remote.eager() {
-                        fw.dispatch_remote(&next);
-                    }
-                }),
-            );
+            self.send_remote(link, job, disk_key);
         }
         started
+    }
+
+    /// [`Self::dispatch_remote`] for the cloud, on a pool thread: the frame's fingerprint, then
+    /// the cached frame that shows the same (released, no download), else the render request
+    /// with the frame's disk key named by its fingerprint.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn print_and_send(&self, link: &RemoteLink, mut job: Job) {
+        job.print = fingerprint::of(&job.src, job.comp, job.t, job.opts);
+        if let Some(p) = job.print
+            && !job.called_off()
+            && self.cache.lock().is_ok_and(|mut c| c.adopt(job.key, p))
+        {
+            if let Ok(mut b) = link.busy.lock() {
+                *b = b.saturating_sub(1);
+            }
+            self.done(&job);
+            if let Some(ctx) = &self.ctx {
+                ctx.request_repaint();
+            }
+            self.dispatch_remote(link);
+            return;
+        }
+        let disk_key = match job.print {
+            Some(p) => Some(frame_keys::print_disk_key(&self.salts, &job.src.project, &job.key, p, opts_hash(&job.opts))),
+            None => self.known_disk_key(&job.src.project, &job.key, &job.opts),
+        };
+        self.send_remote(link, job, disk_key);
+    }
+
+    /// Send `job` to the remote renderer (its slot is counted in `link.busy`); the frame lands in
+    /// the cache with its fingerprint, if it has one.
+    fn send_remote(&self, link: &RemoteLink, job: Job, disk_key: Option<u128>) {
+        let remote = &link.remote;
+        let (key, urgent, epoch, print) = (job.key, job.urgent, job.epoch, job.print);
+        let t0 = web_time::Instant::now();
+        let fw = self.clone();
+        let refined = {
+            let fw = self.clone();
+            Box::new(move |f: RemoteFrame| {
+                if fw.epoch.load(Ordering::Acquire) != epoch {
+                    return;
+                }
+                let Some(img) = egui_image(&f) else { return };
+                if let Ok(mut c) = fw.cache.lock()
+                    && c.map.contains_key(&key)
+                {
+                    c.insert(key, FrameImage::Cpu(Arc::new(img)));
+                }
+                if let Some(ctx) = &fw.ctx {
+                    ctx.request_repaint();
+                }
+            }) as RemoteRefine
+        };
+        let rj = RemoteJob {
+            project: job.src.project.clone(),
+            revision: key.revision,
+            comp: job.comp,
+            t: job.t,
+            opts: job.opts,
+            disk_key,
+            urgent,
+            cancel: job.cancel.clone(),
+            refined: Some(refined),
+            timed: Some({
+                let sink = self.times.clone();
+                Box::new(move |t: times::FrameTimes| sink.put(&key, t)) as RemoteTimes
+            }),
+        };
+        let next = link.clone();
+        remote.start(
+            rj,
+            Box::new(move |r: Result<RemoteFrame, String>| {
+                if let Ok(mut b) = next.busy.lock() {
+                    *b = b.saturating_sub(1);
+                }
+                match r.and_then(|f| egui_image(&f).ok_or_else(|| "the frame's size and pixels disagree".to_string())) {
+                    // Purge Caches since it was asked for: its pixels may be from before.
+                    Ok(_) if fw.epoch.load(Ordering::Acquire) != epoch => fw.release(key, urgent),
+                    Ok(img) => {
+                        fw.finish_print(key, urgent, FrameImage::Cpu(Arc::new(img)), t0, print, None);
+                        if urgent && let Ok(mut l) = next.latest.lock() {
+                            // Never move back to an older frame finishing late.
+                            if l.is_none_or(|old| old.comp != key.comp || old.revision <= key.revision) {
+                                *l = Some(key);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Not rendered (a stale revision, a lost connection, called off): the
+                        // viewer asks again.
+                        log::debug!("remote frame: {e}");
+                        fw.release(key, urgent);
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if next.remote.eager() {
+                    fw.dispatch_remote(&next);
+                }
+            }),
+        );
+    }
+
+    /// The render of `job` failed: remember it (see [`Frames::failed`]) and release the job.
+    fn give_up_job(&self, job: &Job) {
+        // An orphaned idle frame failed (called off): the job that took its key over decides.
+        if self.queue.lock().is_ok_and(|q| q.orphans.contains(&job.seq)) {
+            self.done(job);
+            return;
+        }
+        self.give_up(job.key, job.urgent);
     }
 
     /// The render of `key` failed: remember it (see [`Frames::failed`]) and release the job.
@@ -2313,21 +3517,37 @@ impl Worker {
 
     /// The job of `key` is no longer queued or running (rendered or dropped).
     fn release(&self, key: FrameKey, urgent: bool) {
-        if let Ok(mut inf) = self.inflight.lock() {
-            inf.remove(&key);
-        }
+        self.release_seq(key, urgent, None);
+    }
+
+    /// [`Worker::release`] for `job` (an idle frame the viewer took over leaves the key alone).
+    fn done(&self, job: &Job) {
+        self.release_seq(job.key, job.urgent, Some(job.seq));
+    }
+
+    /// [`Worker::release`] for the job numbered `seq` (`None`: whichever has the key). An orphaned
+    /// idle frame ([`Queue::orphans`]) only frees its idle slot: the key belongs to the job that
+    /// took it over.
+    fn release_seq(&self, key: FrameKey, urgent: bool, seq: Option<u64>) {
         let mut restart = false;
+        let mut orphan = false;
         if let Ok(mut q) = self.queue.lock() {
-            q.running.remove(&key);
-            q.remote_running.remove(&key);
-            if urgent {
-                q.urgent_running = q.urgent_running.saturating_sub(1);
+            orphan = seq.is_some_and(|s| q.orphans.remove(&s));
+            if q.idle.get(&key).is_some_and(|(s, _)| seq.is_none_or(|seq| *s == seq)) {
+                q.idle.remove(&key);
+            }
+            if !orphan {
+                q.running.remove(&key);
+                q.remote_running.remove(&key);
+                if urgent {
+                    q.urgent_running = q.urgent_running.saturating_sub(1);
+                    if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
+                        q.urgent_cancels.swap_remove(i);
+                    }
+                }
                 if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
                     q.urgent_cancels.swap_remove(i);
                 }
-            }
-            if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
-                q.urgent_cancels.swap_remove(i);
             }
             // A job that waited for memory starts now (one per finished frame).
             if q.parked > 0 && !q.jobs.is_empty() {
@@ -2336,6 +3556,9 @@ impl Worker {
             } else if q.jobs.is_empty() {
                 q.parked = 0;
             }
+        }
+        if !orphan && let Ok(mut inf) = self.inflight.lock() {
+            inf.remove(&key);
         }
         #[cfg(not(target_arch = "wasm32"))]
         if restart {
@@ -2354,12 +3577,15 @@ impl Worker {
     fn requeue(&self, mut job: Job) {
         if job.called_off() {
             // The viewer no longer waits for it (#329).
-            self.release(job.key, job.urgent);
+            self.done(&job);
             return;
         }
         {
             let Ok(mut q) = self.queue.lock() else { return };
             q.running.remove(&job.key);
+            if q.idle.get(&job.key).is_some_and(|(s, _)| *s == job.seq) {
+                q.idle.remove(&job.key);
+            }
             if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == job.key) {
                 q.urgent_cancels.swap_remove(i);
             }
@@ -2383,9 +3609,9 @@ impl Worker {
         let Retry { gpu, auto, tail } = retry;
         let attempt = |f: &dyn Fn() -> Rendered| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
         match attempt(&|| self.display_fallback(&job, &gpu, auto)).or_else(|| attempt(&|| self.render_job(&job, false, None))) {
-            _ if job.called_off() => self.release(job.key, job.urgent),
-            Some(Rendered::Image(ci)) => self.publish(&job, ci, &tail, false, std::time::Duration::ZERO),
-            _ => self.give_up(job.key, job.urgent),
+            _ if job.called_off() => self.done(&job),
+            Some(Rendered::Image(ci)) => self.publish(&job, ci, &tail, Origin::Rendered, std::time::Duration::ZERO),
+            _ => self.give_up_job(&job),
         }
     }
 
@@ -2482,7 +3708,7 @@ impl Worker {
                 // Its readback and CPU image construction included, the queue ahead of it not.
                 p.record(key, true, t0.elapsed().saturating_sub(queued).as_secs_f64() * 1000.0);
             }
-            self.publish(&job, FrameImage::Cpu(Arc::new(image)), &tail, false, queued);
+            self.publish(&job, FrameImage::Cpu(Arc::new(image)), &tail, Origin::Rendered, queued);
             return;
         }
         // Back in the queue, on the CPU: rendered within the CPU's cap (and one per pool thread,
@@ -2732,6 +3958,9 @@ struct Job {
     /// written to disk, never put in RAM (where it would evict the cached frames), and
     /// rendered after every viewer and prefetch frame.
     disk_only: bool,
+    /// Rendered by Cache Frames When Idle: after every viewer and prefetch frame, at most
+    /// [`IDLE_FRAMES`] at once, inside the idle pool ([`idle`]).
+    idle: bool,
     seq: u64,
     /// The [`Frames::clear`] generation it started rendering in: a frame of an older one is not
     /// published but renders again (Purge Caches, A7).
@@ -2773,6 +4002,11 @@ struct Retry {
 struct Queue {
     jobs: Vec<Job>,
     running: HashSet<FrameKey>,
+    /// The running idle frames ([`Job::idle`]): their job's `seq` and how to call them off.
+    idle: HashMap<FrameKey, (u64, Arc<AtomicBool>)>,
+    /// Running idle frames (by `seq`) whose key the viewer or playback took over with a job of
+    /// its own (see [`Frames::request_with`]): they end without touching the key's bookkeeping.
+    orphans: HashSet<u64>,
     urgent_running: usize,
     /// The running viewer (urgent) frames and how to call them off.
     urgent_cancels: Vec<(FrameKey, Arc<AtomicBool>)>,
@@ -2789,6 +4023,9 @@ struct Queue {
     landing: usize,
     /// The playing preview, if any: its prefetch renders nearest first.
     playhead: Option<Playhead>,
+    /// Queued jobs (by `seq`) the disk read-ahead looked up already ([`Worker::read_ahead`]).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    probed: HashSet<u64>,
     /// Threads of the frame pool: GPU frames never run more at once.
     threads: usize,
     /// How many GPU frames render at once (CR1).
@@ -2799,11 +4036,15 @@ impl Queue {
     fn can_start(&self, job: &Job) -> bool {
         let limit = max_running_gated(job, self.threads, &self.gate);
         let rendering = self.running.len().saturating_sub(self.landing);
+        if job.idle && self.idle.len() >= IDLE_FRAMES {
+            return false;
+        }
         if job.urgent { self.urgent_running == 0 && rendering <= limit } else { rendering < limit }
     }
 
     /// The job that matters most: urgent first (newest), then prefetch: while a preview plays,
-    /// the frame it reaches first, then the rest in request order; disk-only frames last. In
+    /// the frame it reaches first, then the rest in request order; idle frames (Cache Frames When
+    /// Idle) after them, disk-only frames last. In
     /// request order alone, a frame asked for again after an eviction (right ahead of the
     /// playhead) waited behind every frame further ahead (#595).
     fn best(&self) -> Option<usize> {
@@ -2813,7 +4054,7 @@ impl Queue {
             .enumerate()
             .max_by_key(|(_, j)| {
                 let near = if j.urgent || j.disk_only { None } else { p.and_then(|p| p.ahead(&j.key)) };
-                (j.urgent, !j.disk_only, near.is_some(), near.map_or(0, |d| d.saturating_neg()), if j.urgent { j.seq as i64 } else { -(j.seq as i64) })
+                (j.urgent, !j.idle, !j.disk_only, near.is_some(), near.map_or(0, |d| d.saturating_neg()), if j.urgent { j.seq as i64 } else { -(j.seq as i64) })
             })
             .map(|(i, _)| i)
     }
@@ -2879,16 +4120,6 @@ mod tests {
         s.execute("comp.new", serde_json::json!({"width":32,"height":18,"duration":1})).unwrap();
         let cid = s.active_comp_id().unwrap();
         let opts = RenderOpts::default();
-        let stored = disk_cache::frame_key(disk_cache::comp_content_key(&s.project, cid), 2, 1000, opts_hash(&opts));
-        let mut frames = Frames { pool: Some(Arc::new(workers::Workers::new(1).unwrap())), ..Default::default() };
-        frames.set_remote(Some(Arc::new(Disk(stored))));
-        let (entered, started) = mpsc::channel();
-        let (release, wait) = mpsc::channel();
-        frames.pool.as_ref().unwrap().spawn(move || {
-            entered.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
-        });
-        started.recv_timeout(Duration::from_secs(3)).unwrap();
         let src = RenderSource {
             freeze_feedback: Default::default(),
             project: s.project.clone(),
@@ -2899,8 +4130,21 @@ mod tests {
             gpu_display: false,
             disk: None,
         };
+        // Frame 2 on the server, named by its fingerprint ([`frame_keys`]).
         let mut base = key(1, 0, 0);
         base.comp = cid.0;
+        let t2 = s.project.comp(cid).unwrap().frame_rate.tick_of(2);
+        let print = fingerprint::of(&src, cid, t2, opts).expect("a fingerprint");
+        let stored = frame_keys::print_disk_key(&Default::default(), &s.project, &FrameKey { frame: 2, ..base }, print, opts_hash(&opts));
+        let mut frames = Frames { pool: Some(Arc::new(workers::Workers::new(1).unwrap())), ..Default::default() };
+        frames.set_remote(Some(Arc::new(Disk(stored))));
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        frames.pool.as_ref().unwrap().spawn(move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
         for revision in 1..50 {
             base.revision = revision;
             assert!(frames.disk_frames(&src, &base, 30, &opts).is_empty());
@@ -2908,12 +4152,12 @@ mod tests {
         assert!(frames.content_keys.lock().unwrap().is_empty(), "painting computed a content hash while the worker was blocked");
         assert_eq!(frames.content_key_jobs.lock().unwrap().pending.len(), 1);
         release.send(()).unwrap();
-        let until = Instant::now() + Duration::from_secs(3);
-        while !frames.content_keys.lock().unwrap().contains_key(&(base.revision, base.comp)) {
-            assert!(Instant::now() < until);
+        // The content key and the fingerprints are computed on the pool, then the bar shows it.
+        let until = Instant::now() + Duration::from_secs(10);
+        while frames.disk_frames(&src, &base, 30, &opts) != vec![2] {
+            assert!(Instant::now() < until, "the blue indicator must return once its keys are ready");
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(frames.disk_frames(&src, &base, 30, &opts), vec![2], "the blue indicator must return once its key is ready");
         assert_eq!(frames.content_keys.lock().unwrap().len(), 1, "superseded revisions were hashed");
     }
 
@@ -3114,6 +4358,7 @@ mod tests {
                 opts,
                 urgent: false,
                 disk_only: false,
+                idle: false,
                 seq: i as u64,
                 epoch: 0,
                 on_gpu: Some(true),
@@ -3181,6 +4426,7 @@ mod tests {
             opts: RenderOpts { backend, ..Default::default() },
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: None,
@@ -3253,6 +4499,7 @@ mod tests {
             opts: RenderOpts { backend: Backend::Gpu, ..Default::default() },
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: Some(true),
@@ -3278,6 +4525,94 @@ mod tests {
         assert!(!f.gpu_retired.load(Ordering::Acquire), "GPU frames are kept again");
         assert!(cap() <= 4, "the replacement keeps the ceiling: {}", cap());
         assert!(cap() >= 1);
+    }
+
+    /// Cache Frames When Idle: its frames go after the viewer's and playback's, one renders at
+    /// a time, and a frame the viewer or playback asks for meanwhile is no longer idle.
+    #[test]
+    fn idle_frames_go_last_and_one_at_a_time() {
+        let project = Arc::new(Project::default());
+        let job = |frame: i64, urgent: bool, idle: bool, seq: u64| Job {
+            key: key(1, frame, 0),
+            src: RenderSource {
+                freeze_feedback: Default::default(),
+                project: project.clone(),
+                footage: Arc::new(effectcraft_engine::render::NoFootage),
+                expr: None,
+                layer_cache: Arc::new(LayerCache::new(1 << 30)),
+                gpu: None,
+                gpu_display: false,
+                disk: None,
+            },
+            comp: ItemId(1),
+            t: Tick::ZERO,
+            opts: RenderOpts::default(),
+            urgent,
+            disk_only: false,
+            idle,
+            seq,
+            epoch: 0,
+            on_gpu: Some(false),
+            retry: None,
+            cancel: Arc::default(),
+            print: None,
+        };
+        let mut q = Queue { threads: 8, gate: Arc::new(vram::Gate::warmed()), ..Queue::default() };
+        // Asked for first, the idle frame still waits for prefetch and the viewer's frame.
+        q.jobs = vec![job(1, false, true, 1), job(2, false, false, 2), job(3, true, false, 3)];
+        assert_eq!(q.best().map(|i| q.jobs[i].key.frame), Some(3));
+        q.jobs.retain(|j| j.key.frame != 3);
+        assert_eq!(q.best().map(|i| q.jobs[i].key.frame), Some(2));
+        q.jobs.retain(|j| j.key.frame != 2);
+        assert_eq!(q.best().map(|i| q.jobs[i].key.frame), Some(1));
+        // One idle frame renders at a time; prefetch and the viewer's frame still start.
+        assert!(q.can_start(&job(1, false, true, 1)));
+        q.running.insert(key(1, 9, 0));
+        q.idle.insert(key(1, 9, 0), (9, Arc::default()));
+        assert!(!q.can_start(&job(1, false, true, 1)), "a second idle frame waits");
+        assert!(q.can_start(&job(2, false, false, 2)));
+        assert!(q.can_start(&job(3, true, false, 3)));
+
+        // Through Frames: an idle frame asked for again by playback (or the viewer) is not idle.
+        let f = Frames::default();
+        let src = job(0, false, false, 0).src;
+        let opts = RenderOpts::default();
+        // Queued as an idle frame (put in the queue directly, so it doesn't start rendering).
+        let k = key(1, 5, 0);
+        f.queue.lock().unwrap().jobs.push(job(5, false, true, 1));
+        f.inflight.lock().unwrap().insert(k);
+        f.request(&src, k, ItemId(1), Tick::ZERO, opts);
+        assert!(f.queue.lock().unwrap().jobs.iter().any(|j| j.key == k && !j.idle), "wanted by playback now");
+        assert_eq!(f.idle_slots(), IDLE_FRAMES + 1);
+
+        // The viewer asks for the frame an idle render is rendering: that render is called off
+        // and the frame renders again at the viewer's priority, without waiting for it.
+        let k = key(1, 6, 0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut q = f.queue.lock().unwrap();
+            q.running.insert(k);
+            q.idle.insert(k, (77, cancel.clone()));
+        }
+        f.inflight.lock().unwrap().insert(k);
+        f.request_urgent(&src, k, ItemId(1), Tick::ZERO, opts);
+        assert!(cancel.load(Ordering::Relaxed), "the idle render is called off");
+        assert!(f.queue.lock().unwrap().orphans.contains(&77));
+        // (The viewer's job is queued, or already rendering: this comp doesn't exist, so it fails.)
+        let w = f.worker();
+        // The orphan ends: it frees its idle slot and leaves the key to the viewer's job.
+        let orphan = Job { key: k, seq: 77, cancel, ..job(6, false, true, 77) };
+        w.give_up_job(&orphan);
+        let q = f.queue.lock().unwrap();
+        assert!(q.orphans.is_empty() && !q.idle.contains_key(&k), "its idle slot is free");
+        drop(q);
+        for _ in 0..2000 {
+            if !f.inflight.lock().unwrap().contains(&k) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!f.inflight.lock().unwrap().contains(&k), "the viewer's job ended and released the key");
     }
 
     fn key(content: u64, frame: i64, opts: u64) -> FrameKey {
@@ -3433,6 +4768,7 @@ mod tests {
             opts: RenderOpts { scale, ..Default::default() },
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: None,
@@ -3480,6 +4816,7 @@ mod tests {
             opts: RenderOpts { backend, ..Default::default() },
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: None,
@@ -3628,6 +4965,7 @@ mod tests {
             opts,
             urgent: false,
             disk_only: false,
+            idle: false,
             seq: 0,
             epoch: 0,
             on_gpu: None,
@@ -3693,6 +5031,7 @@ mod tests {
             opts: RenderOpts::default(),
             urgent: true,
             disk_only: false,
+            idle: false,
             seq: 2,
             epoch: 0,
             on_gpu: None,
@@ -3900,7 +5239,7 @@ mod tests {
             gpu_display: false,
             disk: None,
         };
-        let request = |k: FrameKey, urgent: bool| f.request_with(&src, k, ItemId(k.comp), Tick::ZERO, RenderOpts::default(), urgent, false);
+        let request = |k: FrameKey, urgent: bool| f.request_with(&src, k, ItemId(k.comp), Tick::ZERO, RenderOpts::default(), urgent, false, false);
         let other = FrameKey { comp: 2, ..key(1, 0, 0) };
         request(other, true);
         request(key(1, 20, 0), false);
@@ -3939,6 +5278,52 @@ mod tests {
         insert(&f, key(1, 3, 0));
         assert!(f.is_cached(&key(1, 0, 0)) && !f.is_cached(&key(1, 1, 0)));
         assert!(f.is_cached(&key(1, 2, 0)) && f.is_cached(&key(1, 3, 0)));
+    }
+
+    /// Share One Budget Between the Caches: past the shared total the least recently used entry
+    /// of any cache goes. The RAM preview gives its oldest frame outside the protected window
+    /// (never a protected one), and when every frame is protected the layer cache gives way.
+    #[test]
+    fn shared_budget_takes_the_oldest_unprotected_frame() {
+        use effectcraft_render::cache::shared::{SharedBudget, Split};
+        let one_buf = |l: &LayerCache, k: u64| {
+            l.insert(k, Arc::new(effectcraft_engine::effects::Buf { img: effectcraft_engine::render::Image::new(8, 8), offset: [0.0; 2], scale: 1.0 }))
+        };
+        // How big a layer buffer is.
+        let probe = LayerCache::new(1 << 20);
+        one_buf(&probe, 1);
+        let buf = probe.stats().bytes as u64;
+        let b = SharedBudget::new().without_thread();
+        b.configure(Some(Split { total: 4 * 16 + buf, floors: [0; 3], shares: [buf, 0, 4 * 16] }));
+        let f = Frames::default();
+        f.set_budget(1 << 20);
+        f.share(Some(&b));
+        let layer = LayerCache::new(1 << 20);
+        layer.share(Some(&b));
+        f.protect_frames(key(1, 0, 0), [0]);
+        for i in 0..4 {
+            insert(&f, key(1, i, 0));
+        }
+        one_buf(&layer, 7);
+        assert_eq!(b.usage().preview.bytes, 4 * 16);
+        assert!(!b.over(), "everything fits");
+        // One frame more: frame 0 is the oldest of all but protected, so frame 1 goes.
+        insert(&f, key(1, 4, 0));
+        assert!(b.over());
+        b.settle();
+        assert!(f.is_cached(&key(1, 0, 0)), "the protected frame stays");
+        assert!(!f.is_cached(&key(1, 1, 0)), "the oldest unprotected frame went");
+        assert_eq!(layer.stats().entries, 1, "the newer layer buffer stayed");
+        // Every frame protected: the layer cache gives its buffer instead.
+        f.protect_frames(key(1, 0, 0), 0..100);
+        insert(&f, key(1, 5, 0));
+        b.settle();
+        assert_eq!(layer.stats().entries, 0);
+        assert!((0..6).filter(|i| *i != 1).all(|i| f.is_cached(&key(1, i, 0))));
+        assert!(b.usage().used <= 4 * 16 + buf);
+        // Off the shared budget, the preview no longer reports.
+        f.share(None);
+        assert!(!b.usage().preview.joined);
     }
 
     /// #595: finishing far-ahead jobs must not evict the next frame playback is waiting for.
@@ -4164,7 +5549,8 @@ mod tests {
         let content = f.content_of(&s.project, s.revision, cid);
         let k = |frame: i64| FrameKey { revision: s.revision, content, comp: cid.0, ..key(0, frame, 0) };
         let opts = RenderOpts::default();
-        assert!(f.request_to_disk(&src, k(3), cid, Tick::ZERO, opts));
+        let t3 = s.project.comp(cid).unwrap().frame_rate.tick_of(3);
+        assert!(f.request_to_disk(&src, k(3), cid, t3, opts));
         for _ in 0..500 {
             if f.inflight() == 0 && f.disk_frames(&src, &k(0), 10, &opts) == vec![3] {
                 break;
@@ -4173,7 +5559,7 @@ mod tests {
         }
         assert_eq!(f.disk_frames(&src, &k(0), 10, &opts), vec![3], "written to disk");
         assert!(!f.is_cached(&k(3)), "not put in RAM");
-        assert!(!f.request_to_disk(&src, k(3), cid, Tick::ZERO, opts), "already on disk");
+        assert!(!f.request_to_disk(&src, k(3), cid, t3, opts), "already on disk");
         // A queued disk-only job asked for by the viewer comes to RAM.
         {
             let mut q = f.queue.lock().unwrap();
@@ -4186,6 +5572,7 @@ mod tests {
                 opts,
                 urgent: false,
                 disk_only: true,
+                idle: true,
                 seq: 1,
                 epoch: 0,
                 on_gpu: None,
@@ -4397,5 +5784,32 @@ mod tests {
         let o0 = at(&s);
         s.execute("layer.addMarker", json!({"comp": outer.0, "layers": [solid], "time": 0.5, "comment": "beat"})).unwrap();
         assert_ne!(at(&s), o0, "an expression can read the marker, so the frames change");
+    }
+
+    #[test]
+    fn memory_meter_follows_inserts_evictions_and_purges() {
+        let f = Frames::default();
+        let meter = f.memory_meter();
+        let one = {
+            let mut c = f.cache.lock().unwrap();
+            c.insert(key(1, 0, 0), img());
+            c.insert(key(1, 1, 0), img());
+            c.insert(FrameKey { comp: 2, ..key(1, 0, 0) }, img());
+            c.bytes as u64 / 3
+        };
+        assert_eq!(meter.load(Ordering::Relaxed), 3 * one);
+        let u = f.memory_usage(true);
+        assert_eq!((u.bytes, u.frames), (3 * one, 3));
+        assert_eq!(u.by_comp.iter().map(|c| (c.comp, c.bytes, c.frames)).collect::<Vec<_>>(), vec![(1, 2 * one, 2), (2, one, 1)]);
+        // Per comp.
+        let (_, purge) = f.memory_hooks();
+        assert_eq!(purge(Some(1)), 2 * one);
+        assert_eq!(meter.load(Ordering::Relaxed), one);
+        assert!(f.is_cached(&FrameKey { comp: 2, ..key(1, 0, 0) }));
+        // Eviction to a smaller budget.
+        f.set_budget(0);
+        assert_eq!(meter.load(Ordering::Relaxed), f.memory_usage(false).bytes);
+        f.clear();
+        assert_eq!(meter.load(Ordering::Relaxed), 0);
     }
 }

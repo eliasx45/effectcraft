@@ -74,6 +74,9 @@ pub struct ViewState {
     /// The card whose details are shown.
     #[serde(skip)]
     pub details: Option<String>,
+    /// The details' Variants row is open (its saved variants with their situation cards).
+    #[serde(skip)]
+    pub variants_open: bool,
     /// Where the card being applied goes: comp seconds (a drop on the Timeline), else the playhead.
     #[serde(skip)]
     pub apply_time: Option<f64>,
@@ -138,6 +141,7 @@ impl Default for ViewState {
             sfx_volume: DEFAULT_SFX_VOLUME,
             popover: String::new(),
             details: None,
+            variants_open: false,
             apply_time: None,
             applying: None,
             saving: None,
@@ -203,6 +207,7 @@ impl ViewState {
             "workspace": self.workspace,
             "group": self.group,
             "details": self.details,
+            "variants": self.variants_open,
         })
     }
     /// Open every folder above `folder` so its row shows in the tree.
@@ -1389,7 +1394,7 @@ fn rail(
     let mut y = bar.min.y + 8.0 * s;
     let mut anchors: Vec<(&str, Rect)> = vec![];
     use crate::icons::Icon;
-    let top: [(&str, Icon, &str, bool); 7] = [
+    let top: [(&str, Icon, &str, bool); 10] = [
         (
             "assets",
             Icon::Grid,
@@ -1398,6 +1403,12 @@ fn rail(
         ),
         ("curves", Icon::Graph, "Curves: the graph editor and curve presets", view.workspace == "curves"),
         ("tools", Icon::Sparkle, "Tools: Workflow, Text Split, Bounce, Colour", view.workspace == "tools"),
+        // Batch 1 lane C (CX2): ⌘V link paste's tab.
+        // CX3: style families (change one, all follow).
+        ("families", Icon::TextLayer, "Families: style families and Text animations", view.workspace == "families"),
+        // CX7: what you did (the learning loop reads it too).
+        ("history", Icon::Chat, "History: what you did, for you and for Claude", view.workspace == "history"),
+        ("link", Icon::Link, "Link: paste an Instagram link onto a layer", view.workspace == "link"),
         ("search", Icon::Search, "Search assets", false),
         ("filters", Icon::Hamburger, "Filter cards by kind", view.popover == "filters" || !view.kind_filter.is_empty() || view.here_only),
         ("folders", Icon::Folder, "Show or hide the collections", view.show_folders),
@@ -1416,7 +1427,7 @@ fn rail(
                     view.query.clear();
                     view.scroll = 0.0;
                 }
-                "curves" | "tools" => {
+                "curves" | "tools" | "link" | "families" | "history" => {
                     view.workspace = if view.workspace == name { String::new() } else { name.to_string() };
                     view.popover.clear();
                 }
@@ -1604,6 +1615,13 @@ fn kind_label(c: &Card) -> &str {
     }
 }
 
+/// Whether "Save Selection as Variant" can run: layers selected in the open comp and a library
+/// folder to keep the variant in.
+fn can_variant(app: &EffectcraftApp) -> bool {
+    let s = &app.session;
+    !s.prefs.libraries.is_empty() && s.active_comp().is_some() && !s.state.selected_layers.is_empty()
+}
+
 /// A card's right-click menu: each entry is a command (with an automation id) → the one picked.
 fn card_menu(
     auto: &mut crate::automation::Registry,
@@ -1612,10 +1630,11 @@ fn card_menu(
     local: &LocalIndex,
     lib: &LocalLib,
     can_save: bool,
+    can_variant: bool,
     danger: Color32,
 ) -> Option<(&'static str, Value)> {
     let mut pick = None;
-    crate::widgets::context_menu(resp, |ui| pick = card_menu_entries(ui, auto, card, local, lib, can_save, danger, "menu"));
+    crate::widgets::context_menu(resp, |ui| pick = card_menu_entries(ui, auto, card, local, lib, can_save, can_variant, danger, "menu"));
     pick
 }
 
@@ -1629,6 +1648,7 @@ fn card_menu_entries(
     local: &LocalIndex,
     lib: &LocalLib,
     can_save: bool,
+    can_variant: bool,
     danger: Color32,
     prefix: &str,
 ) -> Option<(&'static str, Value)> {
@@ -1684,6 +1704,9 @@ fn card_menu_entries(
     );
     entry(ui, "reveal", "Reveal in Finder", has_file, "library.reveal", json!({"id": id}), None);
     entry(ui, "copyName", "Copy Name", true, "motionLibrary.copyName", json!({"id": id}), None);
+    // The refined layers (or precomp) selected in the open comp, remembered with their situation.
+    ui.separator();
+    entry(ui, "saveVariant", "Save Selection as Variant", can_variant, "library.saveVariant", json!({"parent": id}), None);
     if let Some(e) = edit {
         ui.separator();
         entry(ui, "rename", "Rename…", true, "motionLibrary.card", json!({"op": "rename", "id": id}), None);
@@ -1744,6 +1767,34 @@ fn drop_place(path: &str, row: Rect, pointer: Option<egui::Pos2>) -> DropPlace {
     } else {
         DropPlace::Inside
     }
+}
+
+/// Where a folder dropped at `place` on `target` lands, given the row shown `above` it. The line
+/// between the last row of a group and the next, shallower row is drawn in one spot for "after the
+/// group's last folder" and "before the next row": for a folder from that group it stays a
+/// reorder among its siblings (it moved the folder out of its parent).
+fn boundary_drop(folder: &str, target: &str, place: DropPlace, above: Option<&str>) -> (String, DropPlace) {
+    let parent = |p: &str| p.rsplit_once('/').map_or(String::new(), |(a, _)| a.to_string());
+    let depth = |p: &str| p.matches('/').count();
+    if let (DropPlace::Before, Some(above)) = (place, above)
+        && parent(target) != parent(folder)
+        && depth(above) > depth(target)
+    {
+        let mut q = above;
+        loop {
+            if parent(q) == parent(folder) {
+                if q != folder {
+                    return (q.to_string(), DropPlace::After);
+                }
+                break;
+            }
+            match q.rsplit_once('/') {
+                Some((up, _)) => q = up,
+                None => break,
+            }
+        }
+    }
+    (target.to_string(), place)
 }
 
 /// The command a folder dropped on `target` (`""`: All motion) runs.
@@ -1919,8 +1970,9 @@ fn details_sheet(
     let mut menu_pick = None;
     let local = app.session.motion_library_local();
     let saving = view.saving.is_none();
+    let can_v = can_variant(app);
     egui::Popup::menu(&mresp).style(widgets::menu_style).show(|ui| {
-        menu_pick = card_menu_entries(ui, &mut app.auto, card, &local, lib, saving, t.danger, "details");
+        menu_pick = card_menu_entries(ui, &mut app.auto, card, &local, lib, saving, can_v, t.danger, "details");
     });
     y += 20.0 * s;
     p.text(pos2(inner.min.x, y), Align2::LEFT_TOP, card.subtitle(), Tokens::ui(11.0 * s), t.text_faint);
@@ -1976,7 +2028,73 @@ fn details_sheet(
         facts.push(format!("needs footage: {}", names.join(", ")));
     }
     let buttons_h = 34.0 * s;
-    let text_rect = Rect::from_min_max(pos2(inner.min.x, y), pos2(inner.max.x, inner.max.y - buttons_h));
+    let mut text_rect = Rect::from_min_max(pos2(inner.min.x, y), pos2(inner.max.x, inner.max.y - buttons_h));
+    // Variants: refined copies saved with the situation each was made for; the row opens a list.
+    let saved = effectcraft_engine::library_variants::index(&app.session).by_parent.get(&card.id).cloned().unwrap_or_default();
+    if !saved.is_empty() {
+        let (head_h, row_h) = (22.0 * s, 36.0 * s);
+        // Room for the rows, keeping a few lines of the description.
+        let room = ((text_rect.height() - head_h - 48.0 * s) / row_h).floor().max(0.0) as usize;
+        let shown = if view.variants_open { saved.len().min(4).min(room) } else { 0 };
+        let more = view.variants_open && saved.len() > shown;
+        let area_h = head_h + shown as f32 * row_h + if more { 16.0 * s } else { 0.0 };
+        let area = Rect::from_min_max(pos2(inner.min.x, (text_rect.max.y - area_h).max(text_rect.min.y)), pos2(inner.max.x, text_rect.max.y));
+        text_rect.max.y = (area.min.y - 6.0 * s).max(text_rect.min.y);
+        let head = Rect::from_min_size(area.min, vec2(area.width(), head_h));
+        let hresp = ui.interact(head, egui::Id::new("ml-details-variants"), Sense::click());
+        p.rect_filled(head, CornerRadius::same(4), if hresp.hovered() { t.hover } else { t.field_bg });
+        let c = pos2(head.min.x + 10.0 * s, head.center().y);
+        let k = 3.5 * s;
+        let tri = if view.variants_open {
+            vec![pos2(c.x - k, c.y - k * 0.6), pos2(c.x + k, c.y - k * 0.6), pos2(c.x, c.y + k * 0.7)]
+        } else {
+            vec![pos2(c.x - k * 0.6, c.y - k), pos2(c.x + k * 0.7, c.y), pos2(c.x - k * 0.6, c.y + k)]
+        };
+        p.add(egui::Shape::convex_polygon(tri, t.text_dim, Stroke::NONE));
+        let title = format!("{} ({})", tr("Variants"), saved.len());
+        p.text(pos2(head.min.x + 20.0 * s, head.center().y), Align2::LEFT_CENTER, &title, Tokens::semibold(11.5 * s), t.text);
+        p.text(
+            pos2(head.max.x - 8.0 * s, head.center().y),
+            Align2::RIGHT_CENTER,
+            tr("refined copies, each with its situation"),
+            Tokens::ui(10.0 * s),
+            t.text_faint,
+        );
+        app.auto.add_response("motionLibrary.details.variants", &hresp, &title);
+        if hresp.clicked() {
+            view.variants_open = !view.variants_open;
+        }
+        for (i, v) in saved.iter().take(shown).enumerate() {
+            let row = Rect::from_min_size(pos2(area.min.x, head.max.y + i as f32 * row_h), vec2(area.width(), row_h));
+            if i % 2 == 1 {
+                p.rect_filled(row, CornerRadius::same(3), t.field_bg.gamma_multiply(0.5));
+            }
+            let bw = 52.0 * s;
+            let apply_v = Rect::from_min_size(pos2(row.max.x - bw - 4.0 * s, row.center().y - 10.0 * s), vec2(bw, 20.0 * s));
+            let tw = (apply_v.min.x - row.min.x - 14.0 * s).max(20.0);
+            let name_font = Tokens::medium(11.0 * s);
+            let sum_font = Tokens::ui(10.0 * s);
+            let summary = v.card.summary();
+            p.text(pos2(row.min.x + 8.0 * s, row.min.y + 10.0 * s), Align2::LEFT_CENTER, elide(&p, &v.name, &name_font, tw), name_font, t.text);
+            let line = if summary.is_empty() { tr("no situation recorded yet").to_string() } else { summary.clone() };
+            p.text(pos2(row.min.x + 8.0 * s, row.min.y + 25.0 * s), Align2::LEFT_CENTER, elide(&p, &line, &sum_font, tw), sum_font, t.text_faint);
+            app.auto.add(&format!("motionLibrary.details.variant.{}", v.id), row, &format!("{}: {line}", v.name));
+            if kit::button(app, ui, apply_v, &format!("motionLibrary.details.variant.{}.apply", v.id), "Apply", false) {
+                menu_pick = Some(("library.applyVariant", json!({"id": v.id})));
+                view.details = None;
+            }
+        }
+        if more {
+            let r = Rect::from_min_size(pos2(area.min.x, head.max.y + shown as f32 * row_h), vec2(area.width(), 16.0 * s));
+            p.text(
+                pos2(r.min.x + 8.0 * s, r.center().y),
+                Align2::LEFT_CENTER,
+                format!("+{} more (library.variants lists them all)", saved.len() - shown),
+                Tokens::ui(10.0 * s),
+                t.text_faint,
+            );
+        }
+    }
     let mut body = facts.join("  ·  ");
     // Its description (editable on the Mac with the library), else the catalog's.
     let own = edit.map(|e| folder_ops().card_descriptions.get(&card.id).cloned().unwrap_or_else(|| e.description.clone()));
@@ -2109,7 +2227,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         forget_described();
     }
     // Where files dragged in from the Finder would land: a folder row, its icon, a card.
-    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    // Files dragged in from the Finder: the OS cursor (winit sends no pointer motion then).
+    let pointer = if crate::os_drop::files_present(&ctx) { crate::os_drop::drop_pointer(app, &ctx) } else { ctx.input(|i| i.pointer.hover_pos()) };
     let (mut drop_folder, mut drop_icon, mut drop_card): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     let mut group_anchor: Option<Rect> = None;
     let mut folder_pick: Option<(&'static str, Value)> = None;
@@ -2131,6 +2250,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         match view.workspace.as_str() {
             "curves" => super::motion_library_curves::workspace(app, ui, &ctx, area, &mut view, s),
             "tools" => super::motion_library_tools::workspace(app, ui, &ctx, area, &mut view, s),
+            "link" => super::cards::link_tab(app, ui, area, s),
+            "families" => super::motion_library_tools::families_tab(app, ui, area, s),
+            "history" => super::history_panel::history_tab(app, ui, area, s),
             _ => view.workspace.clear(),
         }
         rail(app, ui, &ctx, &client, &status, rail_r, &mut view, s);
@@ -2224,6 +2346,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 Some(row) => (row.path.as_str(), row.name.as_str(), row.cards, row.depth),
                 None => ("", tr("All motion"), total, 0),
             };
+            let above = i.checked_sub(2).and_then(|k| rows.get(k)).map(|r| r.path.as_str());
             let auto_id = format!("motionLibrary.folder.{}", if path.is_empty() { "all" } else { path });
             let resp = ui.interact(r.intersect(list), egui::Id::new(("ml-folder", path)), Sense::click_and_drag());
             let active = view.folder == path;
@@ -2239,9 +2362,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 && fd.0 != path
                 && !under(path, &fd.0)
             {
-                let place = drop_place(path, r, pointer);
+                let (to, place) = boundary_drop(&fd.0, path, drop_place(path, r, pointer), above);
+                // Indented to the level the folder lands at.
+                let x = r.min.x + to.matches('/').count() as f32 * 12.0 * s;
                 let line = |y: f32| {
-                    sp.line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], Stroke::new(2.0, t.accent));
+                    sp.line_segment([pos2(x, y), pos2(r.max.x, y)], Stroke::new(2.0, t.accent));
                 };
                 match place {
                     DropPlace::Before => line(r.min.y),
@@ -2255,7 +2380,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 && fd.0 != path
                 && !under(path, &fd.0)
             {
-                folder_pick = Some(folder_drop(&fd.0, path, drop_place(path, r, pointer)));
+                let (to, place) = boundary_drop(&fd.0, path, drop_place(path, r, pointer), above);
+                folder_pick = Some(folder_drop(&fd.0, &to, place));
             }
             // Drop a card on a folder: move it there.
             if !path.is_empty()
@@ -2521,6 +2647,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut apply_now: Option<String> = None;
     // A card's right-click menu entry: a command and its params, run after the cards.
     let mut menu_pick: Option<(&'static str, Value)> = None;
+    let variants = effectcraft_engine::library_variants::index(&app.session);
+    let can_v = can_variant(app);
     for item in &lay.items {
         match item {
             Placed::Header { folder, count, rect: hr } => {
@@ -2614,6 +2742,30 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         gp.text(badge.center(), Align2::CENTER_CENTER, label, font, color);
                     }
                 }
+                // Saved variants (refined copies with their situation cards): the count, which
+                // opens the details' Variants row.
+                let n_variants = variants.count(&card.id);
+                if n_variants > 0 {
+                    let font = Tokens::medium(9.5 * s);
+                    let label = if thumb_r.width() > 110.0 * s {
+                        format!("{n_variants} variant{}", if n_variants == 1 { "" } else { "s" })
+                    } else {
+                        format!("◆ {n_variants}")
+                    };
+                    let vw = gp.layout_no_wrap(label.clone(), font.clone(), Color32::WHITE).size().x + 12.0 * s;
+                    let vr = Rect::from_min_size(pos2(thumb_r.max.x - vw - 5.0 * s, thumb_r.max.y - 20.0 * s), vec2(vw, 15.0 * s));
+                    if grid.contains_rect(vr) {
+                        let vresp = ui.interact(vr, egui::Id::new(("ml-card-variants", &card.id)), Sense::click());
+                        gp.rect_filled(vr, CornerRadius::same((7.0 * s) as u8), if vresp.hovered() { t.accent } else { t.accent.gamma_multiply(0.75) });
+                        gp.text(vr.center(), Align2::CENTER_CENTER, &label, font, Color32::WHITE);
+                        app.auto.add(&format!("motionLibrary.variantCount.{}", card.id), vr, &format!("{n_variants} saved variants"));
+                        if vresp.on_hover_text(tr("Saved variants, each with the situation it was made for: click to see them")).clicked() {
+                            view.details = Some(card.id.clone());
+                            view.selected = Some(card.id.clone());
+                            view.variants_open = true;
+                        }
+                    }
+                }
                 if view.applying.as_deref() == Some(card.id.as_str()) {
                     gp.rect_filled(thumb_r, tr_radius, Color32::from_black_alpha(140));
                     gp.text(thumb_r.center(), Align2::CENTER_CENTER, tr("Downloading…"), Tokens::medium(11.5 * s), Color32::WHITE);
@@ -2694,7 +2846,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if resp.clicked() || resp.secondary_clicked() {
                     view.selected = Some(card.id.clone());
                 }
-                if let Some(pick) = card_menu(&mut app.auto, &resp, card, &local, &lib, view.saving.is_none(), t.danger) {
+                if let Some(pick) = card_menu(&mut app.auto, &resp, card, &local, &lib, view.saving.is_none(), can_v, t.danger) {
                     menu_pick = Some(pick);
                 }
                 if resp.double_clicked() {
@@ -2955,7 +3107,7 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
         view.scroll = 0.0;
     }
     if let Some(sc) = p.get("scale") {
-        let sc = sc.as_f64().filter(|v| v.is_finite()).ok_or("`scale` is a percentage (80–140)")?;
+        let sc = sc.as_f64().filter(|v| v.is_finite()).ok_or("`scale` is a percentage (80–200)")?;
         view.scale = ((sc / 10.0).round() * 10.0).clamp(SCALE_RANGE.0 as f64, SCALE_RANGE.1 as f64) as u32;
     }
     if let Some(c) = p.get("cardSize") {
@@ -2992,8 +3144,8 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
     }
     if let Some(w) = p.get("workspace") {
         let w = w.as_str().unwrap_or("");
-        if !["", "assets", "curves", "tools"].contains(&w) {
-            return Err(format!("unknown workspace `{w}` (assets, curves, tools)"));
+        if !["", "assets", "curves", "tools", "link", "families", "history"].contains(&w) {
+            return Err(format!("unknown workspace `{w}` (assets, curves, tools, link, families, history)"));
         }
         view.workspace = if w == "assets" { String::new() } else { w.to_string() };
     }
@@ -3011,6 +3163,9 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
     }
     if let Some(d) = p.get("details") {
         view.details = d.as_str().map(str::to_string);
+    }
+    if let Some(v) = p.get("variants") {
+        view.variants_open = v.as_bool().ok_or("`variants` is true or false (the details' Variants row open)")?;
     }
     if let Some(sel) = p.get("select") {
         view.selected = sel.as_str().map(str::to_string);
@@ -3116,8 +3271,8 @@ mod tests {
     #[test]
     fn view_command_clamps_and_reveals() {
         let mut v = ViewState::default();
-        let r = set_view(&mut v, &json!({"scale": 175, "cardSize": 20, "folder": "Devin Jatho/Instagram/Reels"})).unwrap();
-        assert_eq!((v.scale, v.card_size), (140, 88.0));
+        let r = set_view(&mut v, &json!({"scale": 275, "cardSize": 20, "folder": "Devin Jatho/Instagram/Reels"})).unwrap();
+        assert_eq!((v.scale, v.card_size), (200, 88.0));
         assert!(v.expanded.contains("Devin Jatho") && v.expanded.contains("Devin Jatho/Instagram"));
         assert_eq!(r["folder"], "Devin Jatho/Instagram/Reels");
         set_view(&mut v, &json!({"scale": 84, "collapse": "Devin Jatho", "cardSize": 400.4})).unwrap();
@@ -3903,7 +4058,8 @@ fn folder_ask_sheet(app: &mut EffectcraftApp, ui: &mut egui::Ui, grid: Rect, ask
         p.with_clip_rect(body_r.intersect(grid)).galley(body_r.min, galley, t.text_dim);
     } else {
         let field = Rect::from_min_size(body_r.min, vec2(body_r.width(), 24.0 * s));
-        let resp = ui.put(field, egui::TextEdit::singleline(&mut ask.text).hint_text(tr("Folder name")));
+        let resp = ui
+            .put(field, egui::TextEdit::singleline(&mut ask.text).hint_text(tr("Folder name")).vertical_align(egui::Align::Center).font(Tokens::ui(12.0 * s)));
         app.auto.add_response("motionLibrary.folderAsk.name", &resp, "Folder name");
         if !resp.has_focus() && !resp.lost_focus() {
             resp.request_focus();
@@ -4743,6 +4899,23 @@ mod library_tests {
     use super::*;
 
     #[test]
+    fn drop_between_a_group_and_the_next_row_stays_a_sibling() {
+        // Refs dragged to the line under Backgrounds (the top of Graphs): after Backgrounds, not out.
+        let (to, place) = boundary_drop("Devin Jatho/Refs", "Graphs", DropPlace::Before, Some("Devin Jatho/Backgrounds"));
+        assert_eq!((to.as_str(), place), ("Devin Jatho/Backgrounds", DropPlace::After));
+        assert_eq!(folder_drop("Devin Jatho/Refs", &to, place).1["op"], "reorder");
+        // Under an open subfolder: after its sibling ancestor.
+        let (to, _) = boundary_drop("Devin Jatho/Refs", "Graphs", DropPlace::Before, Some("Devin Jatho/Icons/Instagram"));
+        assert_eq!(to, "Devin Jatho/Icons");
+        // A top folder dropped at the top of a group's first child still moves in.
+        let (to, place) = boundary_drop("Graphs", "Devin Jatho/Elements", DropPlace::Before, Some("Devin Jatho"));
+        assert_eq!((to.as_str(), place), ("Devin Jatho/Elements", DropPlace::Before));
+        // Its own row above: unchanged.
+        let (to, _) = boundary_drop("Devin Jatho/Refs", "Graphs", DropPlace::Before, Some("Devin Jatho/Refs"));
+        assert_eq!(to, "Graphs");
+    }
+
+    #[test]
     fn reorder_moves_before_and_after() {
         let s: Vec<String> = ["A", "B", "C", "D"].iter().map(|x| x.to_string()).collect();
         assert_eq!(reordered(&s, "D", "B", false).unwrap(), ["A", "D", "B", "C"]);
@@ -4970,4 +5143,48 @@ pub(crate) fn store_display(app: &mut EffectcraftApp, ctx: &egui::Context) {
         }
     }
     app.motion_library_saved = Some(now);
+}
+
+// ── Text animation presets (batch 1b, CX8, CX8c) ──────────────────────────────────────────────
+
+/// The frontend half of `ml.saveTextPreset`: save the workshop layer's effects and text animators
+/// (the engine selected them) as a preset card (the plug's `save_asset` kind `preset`, which runs
+/// anim.savePreset on the selection and renders the layer as the preview; CX8c); cards of the same
+/// name in that folder are deleted once the new one is saved, so saving again updates the preset.
+pub fn save_text_preset(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+    let name = params.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()).ok_or("ml.saveTextPreset: no name")?.to_string();
+    let category = params.get("category").and_then(Value::as_str).unwrap_or("Elias/Text animations").trim_matches('/').to_string();
+    // The cards it replaces: the same name in the same folder.
+    let old: Vec<(String, String)> = match app.session.motion_library() {
+        Ok(client) => {
+            let local = app.session.motion_library_local();
+            let lib = local_library(ctx, &app.session.prefs.libraries);
+            library_cards(ctx, &client, &local, &lib)
+                .iter()
+                .filter(|c| c.category == category && c.name.trim().eq_ignore_ascii_case(&name))
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect()
+        }
+        Err(_) => vec![],
+    };
+    let port = control_port(app)?;
+    let args = json!({"kind": "preset", "name": name, "category": category, "description": "Text animation preset (from the Creating Text Presets comp)"});
+    app.ui.status = format!("Saving text preset “{name}” to {category}…");
+    let replaced = old.len();
+    let done = if replaced > 0 { format!("Updated text preset “{name}” in {category}") } else { format!("Saved text preset “{name}” to {category}") };
+    let cat2 = category.clone();
+    let save = move || {
+        let r = ml_rpc("effectcraft_plug.py", &[], Some(port), "save_asset", args)?;
+        let new_id = r.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        wait_for_preview(&new_id);
+        // delete_entry with the arguments the card menu's Delete sends.
+        for (id, old_name) in old {
+            if id != new_id {
+                backend_rpc("delete_entry", json!({"id": id, "confirm_delete": true, "expected_name": old_name, "expected_category": cat2}))?;
+            }
+        }
+        Ok(r)
+    };
+    spawn_ml_op(ctx, save, FolderChange::Created(category.clone()), done);
+    Ok(json!({"saving": name, "category": category, "replaces": replaced}))
 }

@@ -565,16 +565,17 @@ pub(super) fn splitter(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, y0: 
 }
 
 /// The footer's pane buttons (After Effects' lower-left corner): Layer Switches, Transfer
-/// Controls (Modes), In/Out/Duration/Stretch and Render Time. Returns where the next footer item
-/// goes.
+/// Controls (Modes), In/Out/Duration/Stretch and Render Time, then the speed curves in the rows
+/// (EffectCraft). Returns where the next footer item goes.
 pub(super) fn pane_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, footer: Rect) -> f32 {
     let t = app.tokens;
     let mut x = footer.min.x + 6.0;
-    let panes: [(&str, &str, bool); 4] = [
+    let panes: [(&str, &str, bool); 5] = [
         ("switches", "Expand or Collapse the Layer Switches pane", column_visible(&app.ui.timeline, "switches")),
         ("modes", "Expand or Collapse the Transfer Controls pane", app.ui.timeline.show_modes),
         ("inOut", "Expand or Collapse the In/Out/Duration/Stretch panes", IN_OUT_PANE.iter().any(|c| column_visible(&app.ui.timeline, c))),
         ("renderTime", "Expand or Collapse the Render Time pane", column_visible(&app.ui.timeline, "renderTime")),
+        ("speedRows", "Show or Hide Speed Curves in the Property Rows (⌘-drag a curve to sculpt it)", app.ui.timeline.speed_rows),
     ];
     for (id, tip, on) in panes {
         let r = Rect::from_min_size(pos2(x, footer.center().y - 9.0), vec2(18.0, 18.0));
@@ -592,6 +593,7 @@ pub(super) fn pane_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui
                     let _ = set_column(tl, "switches", !on);
                 }
                 "modes" => tl.show_modes = !on,
+                "speedRows" => tl.speed_rows = !on,
                 "renderTime" => {
                     let _ = set_column(tl, "renderTime", !on);
                 }
@@ -617,6 +619,18 @@ fn pane_glyph(p: &egui::Painter, r: Rect, id: &str, col: Color32) {
         "modes" => {
             p.circle_stroke(pos2(r.center().x - 2.0, r.center().y), 3.5, s);
             p.circle_stroke(pos2(r.center().x + 2.0, r.center().y), 3.5, s);
+        }
+        "speedRows" => {
+            // A small eased speed curve over its baseline.
+            let pts: Vec<egui::Pos2> = (0..=12)
+                .map(|i| {
+                    let s = i as f32 / 12.0;
+                    let bump = (std::f32::consts::PI * s).sin().powi(3);
+                    pos2(r.min.x + s * r.width(), r.max.y - 1.0 - bump * (r.height() - 2.0))
+                })
+                .collect();
+            p.add(egui::Shape::line(pts, s));
+            p.line_segment([pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)], s);
         }
         "renderTime" => {
             let c = pos2(r.center().x, r.center().y + 1.0);

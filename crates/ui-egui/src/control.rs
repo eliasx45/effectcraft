@@ -11,7 +11,7 @@
 //! - `ui.panel.show {panel}` / `ui.panel.close {panel}`
 //! - `ui.click {id | x,y, button?, count?, modifiers?}` / `ui.move {x,y}` / `ui.scroll {x,y,dx,dy,unit?,pinch?}`
 //! - `ui.drag {from:{id|x,y}, to:{id|x,y}, steps?, modifiers?}`: synthetic press-move-release
-//! - `ui.key {key, command?, shift?, alt?, ctrl?}` / `ui.type {text}`
+//! - `ui.key {key, command?, shift?, alt?, ctrl?, down?, up?}` (`down`/`up`: hold, then release) / `ui.type {text}`
 //! - `ui.viewer.locate {x, y}`: screen point of a comp pixel; `ui.viewer.hit {x, y}`: comp pixel at a screen point
 //! - `ui.timeline.locate {layer, time?}`: screen point of a layer bar (at a comp time)
 //! - `ui.playback {action: play|stop|toggle}`
@@ -22,6 +22,9 @@
 //!   the app revision `have`, or the whole project) and the cursors ([`effectcraft_engine::remote_follow`])
 //! - `render.frame {comp?, item?, layer?, time?, max_side?, transparent?, region?, overlays?, path?, base64?}`: PNG of a frame rendered by the session
 //! - `ui.figmaPair {client}`: the one-time Figma pairing prompt; replies `{allowed}` once answered
+//! - `figcraft.frames {comp, frames, maxSide, quality?}` / `figcraft.audio {comp, start, end, rate?}` /
+//!   `figcraft.tree {comp, start?, end?, depth?}` / `figcraft.reveal {comp, time}`: the FigCraft link
+//!   ([`crate::figcraft_link`])
 //! - `ui.resize {width, height}` / `ui.focus` / `app.quit {force?}` (a modified project asks to save first unless `force`)
 //!
 //! The full reference with examples is `docs/control-protocol.md`.
@@ -181,6 +184,11 @@ pub fn fair_order<T>(reqs: Vec<(ControlRequest, T)>) -> Vec<(ControlRequest, T)>
 /// Run an engine command. A waiting command (`wait: true`) runs with `wait: false` instead, and
 /// the reply waits for the job it started ([`Outcome::AwaitJobs`]), so the UI keeps drawing and
 /// other clients' requests run while it works. `jobs.wait` likewise waits for the running tasks.
+/// An engine command that only reads (not journaled, e.g. `speech.get`, `comp.info`).
+fn is_query(id: &str) -> bool {
+    effectcraft_engine::find_command(id).is_some_and(|c| !c.journal)
+}
+
 fn execute_engine(app: &mut EffectcraftApp, id: &str, params: Value) -> Result<Outcome, String> {
     Ok(match effectcraft_engine::job_waiter::start(&mut app.session, id, params)? {
         effectcraft_engine::job_waiter::Started::Done(v) => ok(v),
@@ -241,7 +249,12 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             match r {
                 Ok(o) => o,
                 Err(e) => {
-                    app.ui.status = e.clone();
+                    // A failed query (a read: `speech.get`, `comp.info`, …) changed nothing; only its
+                    // caller hears about it. Background readers (the learning loop asks `speech.get`
+                    // on every comp, and most comps have no speech map) must not toast the user.
+                    if !is_query(id) {
+                        app.ui.status = e.clone();
+                    }
                     err(e)
                 }
             }
@@ -332,6 +345,9 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 if let Some(v) = tl.get("showModes").and_then(Value::as_bool) {
                     app.ui.timeline.show_modes = v;
                 }
+                if let Some(v) = tl.get("speedRows").and_then(Value::as_bool) {
+                    app.ui.timeline.speed_rows = v;
+                }
                 if let Some(Value::Array(a)) = tl.get("openLayers") {
                     app.ui.timeline.open_layers = a.iter().filter_map(Value::as_u64).collect();
                 }
@@ -349,6 +365,17 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                     crate::panels::project::set_column(&mut cols, k, true);
                 }
                 app.ui.project_columns = cols;
+            }
+            // Render Queue column widths, e.g. {"status": 140, "name": 300}; null resets a column
+            // to its default (and Comp Name to filling the panel).
+            if let Some(Value::Object(m)) = p.get("renderQueueColumns") {
+                for (k, v) in m {
+                    if v.is_null() {
+                        app.ui.render_queue_columns.remove(k);
+                    } else if !v.as_f64().is_some_and(|w| crate::panels::render_queue::set_column_width(&mut app.ui.render_queue_columns, k, w as f32)) {
+                        return err(format!("renderQueueColumns: `{k}` needs a width in points (columns: render, label, num, name, status, started, time)"));
+                    }
+                }
             }
             // Wiggler / Smoother / Motion Sketch settings (fields of `AnimToolsState`).
             if let Some(Value::Object(m)) = p.get("animTools") {
@@ -472,10 +499,16 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             // As a US keyboard sends it: the key is also the physical key, so by-position
             // shortcuts (`Physical+=`, Zoom In Time) answer `=` too.
             let physical_key = Some(key);
-            let events = vec![
-                egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m },
-                egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m },
-            ];
+            // `down: true` presses and holds the key, `up: true` releases it (a hold in steps: the
+            // Graph / Layer wheels on G / A, Claude's version on `\`); neither = a tap.
+            let (down, up) = (p.get("down").and_then(Value::as_bool) == Some(true), p.get("up").and_then(Value::as_bool) == Some(true));
+            let mut events = vec![];
+            if down || !up {
+                events.push(egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m });
+            }
+            if up || !down {
+                events.push(egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m });
+            }
             // (To the window the last pointer input went to: an undocked one, or the main window.)
             crate::float_windows::send_keys(app, ctx, events);
             Outcome::AfterInput
@@ -572,6 +605,8 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             Err(e) => err(e),
         },
         "render.frame" => render_frame(app, p),
+        // The FigCraft link (crate::figcraft_link): frames, audio, the precomp tree, reveal.
+        "figcraft.frames" | "figcraft.audio" | "figcraft.tree" | "figcraft.reveal" => crate::figcraft_link::handle(app, ctx, req),
         "ui.resize" => {
             let w = p.get("width").and_then(Value::as_f64).unwrap_or(1600.0) as f32;
             let h = p.get("height").and_then(Value::as_f64).unwrap_or(1000.0) as f32;
@@ -918,5 +953,24 @@ mod tests {
         for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
             assert_eq!(super::base64(i.as_bytes()), o);
         }
+    }
+
+    #[test]
+    fn ui_key_holds_with_down_then_up() {
+        // BUILD2: the G / A wheels and `\` (Claude's version) open on a hold; agents test them
+        // with `down` and a later `up`.
+        use super::*;
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        let request = |method, params| ControlRequest::new(method, params).0;
+        let keys = |app: &mut EffectcraftApp| -> Vec<bool> {
+            app.take_synthetic_input().into_iter().filter_map(|e| if let egui::Event::Key { pressed, .. } = e { Some(pressed) } else { None }).collect()
+        };
+        assert!(matches!(handle(&mut app, &ctx, &request("ui.key", json!({"key": "G"}))), Outcome::AfterInput));
+        assert_eq!(keys(&mut app), [true, false], "a tap");
+        assert!(matches!(handle(&mut app, &ctx, &request("ui.key", json!({"key": "G", "down": true}))), Outcome::AfterInput));
+        assert_eq!(keys(&mut app), [true], "held down");
+        assert!(matches!(handle(&mut app, &ctx, &request("ui.key", json!({"key": "G", "up": true}))), Outcome::AfterInput));
+        assert_eq!(keys(&mut app), [false], "released");
     }
 }

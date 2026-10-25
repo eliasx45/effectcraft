@@ -15,7 +15,10 @@
 //! - **Text** (text layers): font family/style, size, leading, tracking, stroke width, fill and
 //!   stroke with enable checkboxes; "More" opens the Character panel.
 //! - **Paragraph** (text layers): the seven alignment buttons; "More" opens the Paragraph panel.
-//! - **Text Animation** (text layers): Add Animator menu.
+//! - **Text Animation** (text layers): Add Animator menu; under it, each Gradient Fill animator
+//!   (an EffectCraft extension) with its Linear / Radial type and the colour stops bar
+//!   ([`super::gradient_stops`]). Automation ids `properties.gradientFill.<animator uid>.type`
+//!   and `properties.gradientFill.<animator uid>.stops.*`.
 
 use effectcraft_engine::keyframe::{Justify, TextDoc, Value};
 use effectcraft_engine::project::{Layer, LayerSource, PropGroup, Property};
@@ -174,6 +177,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             actions.push(("layer.applyTextPreset".into(), json!({"layer": layer.id.0, "preset": presets[i].0})));
         }
         y += 24.0;
+        y = gradient_fill_section(app, ui, &p, &layer, &ectx, x0, w, y + 10.0, &mut actions);
     }
 
     y += 40.0;
@@ -193,6 +197,51 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.status = e;
         }
     }
+}
+
+/// The text layer's Gradient Fill animators: name, Linear / Radial, and the stops bar of its
+/// Gradient Fill Colors (at the current time). Returns the y below them.
+#[allow(clippy::too_many_arguments)]
+fn gradient_fill_section(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    layer: &Layer,
+    ectx: &EvalCtx,
+    x0: f32,
+    w: f32,
+    mut y: f32,
+    actions: &mut Actions,
+) -> f32 {
+    let t = app.tokens;
+    let Some(anims) = layer.props.group("text/animators") else { return y };
+    for anim in anims.groups().filter(|a| a.enabled) {
+        let Some(props) = anim.sub("properties") else { continue };
+        let Some(colors) = props.get("gradientFillColors") else { continue };
+        let Value::Gradient(g) = ectx.value(layer, colors) else { continue };
+        let label = format!("{} › {}", anim.name, tr("Gradient Fill"));
+        p.text(pos2(x0, y + ROW_H / 2.0), Align2::LEFT_CENTER, &label, Tokens::ui(12.0), t.text);
+        // Linear / Radial.
+        if let Some(ty) = props.get("gradientType") {
+            let radial = ectx.value(layer, ty).as_enum() == 1;
+            let mut bx = x0 + w;
+            for (i, name) in [(1u32, "Radial"), (0u32, "Linear")] {
+                let tw = 52.0;
+                bx -= tw + 4.0;
+                let r = Rect::from_min_size(pos2(bx, y + 2.0), vec2(tw, ROW_H - 4.0));
+                let on = (i == 1) == radial;
+                if widgets::text_button(ui, r, tr(name), on, &t, egui::Id::new(("props-gradient-type", anim.uid, i))).clicked() && !on {
+                    actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": ty.uid, "value": i})));
+                }
+                app.auto.add(&format!("properties.gradientFill.{}.type.{}", anim.uid, name.to_ascii_lowercase()), r, name);
+            }
+        }
+        y += ROW_H + 4.0;
+        let r = Rect::from_min_size(pos2(x0, y), vec2(w.clamp(120.0, 420.0), super::gradient_stops::HEIGHT));
+        super::gradient_stops::show(app, ui, p, layer.id.0, colors.uid, &g, r, &format!("properties.gradientFill.{}.stops", anim.uid), actions);
+        y += super::gradient_stops::HEIGHT + 8.0;
+    }
+    y
 }
 
 fn section_header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x0: f32, w: f32, y: f32, title: &str, auto: &str) {
@@ -364,14 +413,17 @@ fn transform_row(
             let mut x = vx;
             // Scale: the chain link (Constrain Proportions, on by default), sharing the
             // Timeline's per-property state so both panels agree (#956).
-            let linkable = pr.match_id == "scale";
+            // Audio Levels too: left and right move by the same dB.
+            let levels = pr.match_id == "levels" && layer.props.parent_of(uid).is_some_and(|g| g.match_id == "audio");
+            let linkable = levels || pr.match_id == "scale";
             let linked = linkable && !app.ui.timeline.unlinked.contains(&uid);
             if linkable {
                 // Constrain Proportions toggle, left of the values.
+                let tip = if levels { "Link Left and Right" } else { "Constrain Proportions" };
                 let lr = Rect::from_center_size(pos2(x - 12.0, cy), vec2(12.0, 12.0));
-                let resp = ui.interact(lr, egui::Id::new(("props-link", uid)), Sense::click()).on_hover_text(tr("Constrain Proportions"));
+                let resp = ui.interact(lr, egui::Id::new(("props-link", uid)), Sense::click()).on_hover_text(tr(tip));
                 icons::paint(p, lr, Icon::Link, if linked { t.accent } else { t.text_faint });
-                app.auto.add(&format!("{base}.constrain"), lr, "Constrain Proportions");
+                app.auto.add(&format!("{base}.constrain"), lr, tip);
                 if resp.clicked() && !app.ui.timeline.unlinked.remove(&uid) {
                     app.ui.timeline.unlinked.insert(uid);
                 }
@@ -385,7 +437,8 @@ fn transform_row(
                     // Alt edits one value of a linked pair, as in the Timeline.
                     let shown = if linked && !ui.input(|i| i.modifiers.alt && !widgets::proportional_scrub(i.modifiers)) { n.min(c.len()) } else { 1 };
                     let from = if shown == 1 { d } else { 0 };
-                    for (e, v) in widgets::constrained(c.get(from..from + shown).unwrap_or_default(), d - from, nv).into_iter().enumerate() {
+                    let link = if levels { widgets::offset_linked } else { widgets::constrained };
+                    for (e, v) in link(c.get(from..from + shown).unwrap_or_default(), d - from, nv).into_iter().enumerate() {
                         if let Some(slot) = nc.get_mut(from + e) {
                             *slot = v;
                         }

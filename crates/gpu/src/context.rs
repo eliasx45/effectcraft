@@ -116,12 +116,27 @@ fn private_reuse() -> bool {
     *ON.get_or_init(|| std::env::var("EFFECTCRAFT_PRIVATE_REUSE").as_deref() != Ok("0"))
 }
 
+/// `EFFECTCRAFT_HALF_FX=1` / `=0` forces half-float effect intermediates on or off for display
+/// renders (benches, A/B), whatever [`GpuContext::set_half_intermediates`] is given.
+fn half_env() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("EFFECTCRAFT_HALF_FX").as_deref() {
+        Ok("1") | Ok("on") => Some(true),
+        Ok("0") | Ok("off") => Some(false),
+        _ => None,
+    })
+}
+
 impl GpuImage {
     /// Mark the image as readable by other encoders (it is going into a cache): once dropped,
     /// its texture waits for every encoder open then before it is reused.
     pub(crate) fn share(&self) {
         if let Some(l) = &self._lease {
-            l.shared.store(true, std::sync::atomic::Ordering::Release);
+            let was_shared = l.shared.swap(true, std::sync::atomic::Ordering::AcqRel);
+            // Handed to a cache: no longer scratch (the cache's GPU slots count it from now on).
+            if !was_shared && let Some(m) = l.scratch {
+                m.sub(l.pooled.bytes() as u64);
+            }
         }
     }
 
@@ -153,6 +168,8 @@ struct Lease {
     shared: std::sync::atomic::AtomicBool,
     /// Where it was taken (see [`VramReport::peak_sites`]).
     site: &'static std::panic::Location<'static>,
+    /// Counted as effect scratch ([`effect_scratch`]) while not shared: working images only.
+    scratch: Option<&'static ScratchMeter>,
 }
 
 /// A pooled working texture with its default view, made once with the texture and reused with
@@ -190,6 +207,11 @@ impl Drop for Lease {
     fn drop(&mut self) {
         self.meter.sub(self.pooled.bytes(), self.site);
         use std::sync::atomic::Ordering::Acquire;
+        if let Some(m) = self.scratch
+            && !self.shared.load(Acquire)
+        {
+            m.sub(self.pooled.bytes() as u64);
+        }
         // A working image only its own `Enc` ever recorded (never cached) waits for that `Enc`'s
         // open encoder alone, not for every encoder open anywhere (other frames in flight).
         let private = self.cell.as_ref().filter(|_| !self.shared.load(Acquire) && private_reuse()).map(|c| c.load(Acquire));
@@ -261,6 +283,59 @@ impl Meter {
         }
         let _ = site;
     }
+}
+
+/// Bytes of GPU working images (effect intermediates: blur passes, glow parts, style planes,
+/// per-frame scratch) handed out and not yet given back or handed to a cache, for every
+/// [`GpuContext`] in the process, with the high-water mark since [`ScratchMeter::reset_peak`].
+/// Two relaxed atomics, updated when a working image is taken, shared or dropped: the memory
+/// map (Window ▸ Memory, `memory.stats`) reads them through [`ScratchMeter::live_counter`] /
+/// [`ScratchMeter::peak_counter`] without walking anything. A subset of [`VramReport::leased`].
+#[derive(Debug, Default)]
+pub struct ScratchMeter {
+    live: Arc<std::sync::atomic::AtomicU64>,
+    peak: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ScratchMeter {
+    pub(crate) fn add(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = self.live.fetch_add(bytes, Relaxed).saturating_add(bytes);
+        self.peak.fetch_max(now, Relaxed);
+    }
+    pub(crate) fn sub(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // A compare-exchange loop: `fetch_update` is deprecated (Rust 1.99) and its replacement,
+        // `try_update`, is newer than the workspace's rust-version.
+        let mut c = self.live.load(Relaxed);
+        while let Err(now) = self.live.compare_exchange_weak(c, c.saturating_sub(bytes), Relaxed, Relaxed) {
+            c = now;
+        }
+    }
+    /// (bytes now, most since [`ScratchMeter::reset_peak`]).
+    pub fn bytes(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.live.load(Relaxed), self.peak.load(Relaxed))
+    }
+    /// Start a new high-water mark from what is handed out now.
+    pub fn reset_peak(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.peak.store(self.live.load(Relaxed), Relaxed);
+    }
+    /// The live byte counter itself (read it with a relaxed load; never store into it).
+    pub fn live_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.live.clone()
+    }
+    /// The high-water mark counter itself (see [`ScratchMeter::live_counter`]).
+    pub fn peak_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.peak.clone()
+    }
+}
+
+/// The process's effect scratch meter (see [`ScratchMeter`]).
+pub fn effect_scratch() -> &'static ScratchMeter {
+    static METER: std::sync::OnceLock<ScratchMeter> = std::sync::OnceLock::new();
+    METER.get_or_init(ScratchMeter::default)
 }
 
 /// Where the device's memory is, by what holds it (see [`GpuContext::vram_report`]).
@@ -949,6 +1024,12 @@ pub struct GpuContext {
     unpack8: std::sync::OnceLock<wgpu::Buffer>,
     /// Advanced 3D render pipelines (built on first use).
     pub(crate) adv3d: std::sync::OnceLock<Result<crate::adv3d::Pipes, String>>,
+    /// Half-float effect kernels (built on first use, see [`crate::half`]).
+    half: std::sync::OnceLock<Result<crate::half::Bank, String>>,
+    /// Viewer display renders keep effect intermediates as RGBA16F ([`GpuContext::set_half_intermediates`]).
+    half_on: std::sync::atomic::AtomicBool,
+    /// The device is Metal (kernels built for its fast math, see `box_h_serial`).
+    metal: bool,
     pub(crate) static_pipeline_count: std::sync::atomic::AtomicU64,
     /// The adapter can run the Advanced 3D rasteriser (`adv3d::raster_unsupported`); without
     /// it Advanced 3D scenes render on the CPU.
@@ -961,7 +1042,7 @@ pub struct GpuContext {
     readbacks: Arc<crate::readback::Readbacks>,
 }
 
-fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -974,13 +1055,48 @@ fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format, view_dimension: wgpu::TextureViewDimension::D2 },
         count: None,
     }
+}
+
+/// The compositor's kernel source: every `shaders/*.wgsl` the kernels' module is built from
+/// (also the half kernels' source, see [`crate::half`]).
+pub(crate) fn kernel_source() -> String {
+    [
+        include_str!("shaders/common.wgsl"),
+        include_str!("shaders/kernels.wgsl"),
+        include_str!("shaders/classic3d.wgsl"),
+        include_str!("shaders/fx_color.wgsl"),
+        include_str!("shaders/fx_distort.wgsl"),
+        include_str!("shaders/fx_generate.wgsl"),
+        include_str!("shaders/fx_key.wgsl"),
+        include_str!("shaders/fx_stylize.wgsl"),
+        include_str!("shaders/fx_noise.wgsl"),
+        include_str!("shaders/fx_tone.wgsl"),
+        include_str!("shaders/fx_warp.wgsl"),
+        include_str!("shaders/fx_extra.wgsl"),
+        include_str!("shaders/fx_depth.wgsl"),
+        include_str!("shaders/fx_lut.wgsl"),
+        include_str!("shaders/fx_sim.wgsl"),
+        include_str!("shaders/fx_particles.wgsl"),
+        include_str!("shaders/fx_vr.wgsl"),
+        include_str!("shaders/fx_light.wgsl"),
+        include_str!("shaders/fx_transition.wgsl"),
+        include_str!("shaders/fx_text.wgsl"),
+        include_str!("shaders/fx_time.wgsl"),
+        include_str!("shaders/fx_pixel2.wgsl"),
+        include_str!("shaders/fx_gen2.wgsl"),
+        include_str!("shaders/fx_deepglow.wgsl"),
+        include_str!("shaders/fx_shadowstudio.wgsl"),
+        include_str!("shaders/fx_styles.wgsl"),
+        include_str!("shaders/sky.wgsl"),
+    ]
+    .concat()
 }
 
 /// Counts a render out of [`GpuContext::enter_render`]'s in-flight count.
@@ -1071,6 +1187,18 @@ pub(crate) fn buffer_init(device: &wgpu::Device, queue: &wgpu::Queue, label: Opt
     buffer
 }
 
+/// The descriptor for a device the compositor owns: `MemoryUsage` so freed textures give their
+/// allocator blocks back instead of a few long-lived objects pinning large ones.
+pub(crate) fn device_descriptor(required_limits: wgpu::Limits, required_features: wgpu::Features) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
+        label: Some("effectcraft gpu"),
+        required_limits,
+        required_features,
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        ..Default::default()
+    }
+}
+
 impl GpuContext {
     /// [`buffer_init`] on this context's device.
     pub(crate) fn buffer_init(&self, label: Option<&str>, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -1118,34 +1246,7 @@ impl GpuContext {
         if let Some(why) = &adv3d_unsupported {
             log::info!("gpu {name}: Advanced 3D renders on the CPU ({why})");
         }
-        let src = [
-            include_str!("shaders/common.wgsl"),
-            include_str!("shaders/kernels.wgsl"),
-            include_str!("shaders/classic3d.wgsl"),
-            include_str!("shaders/fx_color.wgsl"),
-            include_str!("shaders/fx_distort.wgsl"),
-            include_str!("shaders/fx_generate.wgsl"),
-            include_str!("shaders/fx_key.wgsl"),
-            include_str!("shaders/fx_stylize.wgsl"),
-            include_str!("shaders/fx_noise.wgsl"),
-            include_str!("shaders/fx_tone.wgsl"),
-            include_str!("shaders/fx_warp.wgsl"),
-            include_str!("shaders/fx_extra.wgsl"),
-            include_str!("shaders/fx_depth.wgsl"),
-            include_str!("shaders/fx_lut.wgsl"),
-            include_str!("shaders/fx_sim.wgsl"),
-            include_str!("shaders/fx_particles.wgsl"),
-            include_str!("shaders/fx_vr.wgsl"),
-            include_str!("shaders/fx_light.wgsl"),
-            include_str!("shaders/fx_transition.wgsl"),
-            include_str!("shaders/fx_text.wgsl"),
-            include_str!("shaders/fx_time.wgsl"),
-            include_str!("shaders/fx_pixel2.wgsl"),
-            include_str!("shaders/fx_gen2.wgsl"),
-            include_str!("shaders/fx_deepglow.wgsl"),
-            include_str!("shaders/sky.wgsl"),
-        ]
-        .concat();
+        let src = kernel_source();
         let compile_start = web_time::Instant::now();
         let module = init_resource(&device, "kernels shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("effectcraft kernels"), source: wgpu::ShaderSource::Wgsl(src.into()) })
@@ -1252,6 +1353,8 @@ impl GpuContext {
             .chain(crate::fx_pixel2::KERNELS)
             .chain(crate::fx_gen2::KERNELS)
             .chain(crate::fx_deepglow::KERNELS)
+            .chain(crate::fx_shadowstudio::KERNELS)
+            .chain(crate::fx_styles::KERNELS)
         {
             match build(e, &layout) {
                 Ok(p) => {
@@ -1383,6 +1486,9 @@ impl GpuContext {
             zeros: Default::default(),
             unpack8: Default::default(),
             adv3d: std::sync::OnceLock::new(),
+            half: std::sync::OnceLock::new(),
+            half_on: std::sync::atomic::AtomicBool::new(half_env().unwrap_or(false)),
+            metal,
             static_pipeline_count,
             adv3d_raster: adv3d_unsupported.is_none(),
             particles: Default::default(),
@@ -1747,15 +1853,8 @@ impl GpuContext {
             max_buffer_size: limits.max_buffer_size,
             ..wgpu::Limits::default()
         };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("effectcraft gpu"),
-                required_limits,
-                required_features: profile_features(adapter.features()),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| format!("no device: {e}"))?;
+        let (device, queue) =
+            adapter.request_device(&device_descriptor(required_limits, profile_features(adapter.features()))).await.map_err(|e| format!("no device: {e}"))?;
         let context = GpuContext::new(adapter, device, queue)?;
         // This path owns the device; install handlers only after construction succeeds.
         crate::readback::install(&context.device, &context.readbacks);
@@ -1817,7 +1916,13 @@ impl GpuContext {
         let px = u64::from(format.block_copy_size(None).unwrap_or(16));
         self.transfers.count_made(u64::from(w.max(1)).saturating_mul(u64::from(h.max(1))).saturating_mul(px));
         self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(if format == FORMAT { "working image" } else { "working 8 bpc codes" }),
+            label: Some(if format == FORMAT {
+                "working image"
+            } else if format == crate::half::FORMAT {
+                "working half image"
+            } else {
+                "working 8 bpc codes"
+            }),
             size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
@@ -1866,8 +1971,21 @@ impl GpuContext {
         let (texture, view) = (pooled.texture.clone(), pooled.view.clone());
         let site = std::panic::Location::caller();
         self.leased.add(pooled.bytes(), site);
-        let lease =
-            Arc::new(Lease { pooled, pool: Arc::downgrade(&self.pool), encoder: made_for, meter: self.leased.clone(), site, cell, shared: Default::default() });
+        // Working images (taken by an `Enc`) are effect scratch until shared or dropped.
+        let scratch = cell.is_some().then(effect_scratch);
+        if let Some(m) = scratch {
+            m.add(pooled.bytes() as u64);
+        }
+        let lease = Arc::new(Lease {
+            pooled,
+            pool: Arc::downgrade(&self.pool),
+            encoder: made_for,
+            meter: self.leased.clone(),
+            site,
+            cell,
+            shared: Default::default(),
+            scratch,
+        });
         let allocation = if format == FORMAT {
             effectcraft_render::allocation::GpuAllocation::rgba_f32(w, h, self.generation.clone())
         } else {
@@ -1962,6 +2080,39 @@ impl GpuContext {
         if let Ok(mut s) = self.leased.sites.lock() {
             s.at_peak = s.live.clone();
         }
+    }
+
+    /// Bytes of pooled textures handed out now and the most since [`GpuContext::reset_vram_peak`]
+    /// (working images, uploads, retained results): the scratch high-water mark the effect
+    /// bench reports (`examples/effect_buffers.rs`). Cheaper than [`GpuContext::vram_report`].
+    pub fn leased_bytes(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.leased.live.load(Relaxed), self.leased.peak.load(Relaxed))
+    }
+
+    /// Viewer display renders ([`crate::Gpu::render_display`]) keep effect intermediates (blur
+    /// passes, glow parts, layer style planes, the bevel height profile) as RGBA16F, half the
+    /// bytes (Settings ▸ Previews ▸ Half-float effect buffers). Effect outputs, exports and
+    /// every other render stay RGBA f32. `EFFECTCRAFT_HALF_FX=0/1` overrides it.
+    pub fn set_half_intermediates(&self, on: bool) {
+        let on = half_env().unwrap_or(on);
+        self.half_on.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// See [`GpuContext::set_half_intermediates`].
+    pub fn half_intermediates(&self) -> bool {
+        self.half_on.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The half kernels, built on first use (`None`: they could not be built; f32 it is).
+    pub(crate) fn half_bank(&self) -> Option<&crate::half::Bank> {
+        self.half
+            .get_or_init(|| {
+                crate::half::Bank::new(&self.device, &kernel_source(), self.metal)
+                    .inspect_err(|why| log::info!("gpu {}: effect buffers stay f32 ({why})", self.name))
+            })
+            .as_ref()
+            .ok()
     }
 
     /// A `COPY_DST | TEXTURE_BINDING` texture for uploaded samples: a free one of this size and
@@ -2606,6 +2757,9 @@ pub(crate) struct Enc<'g> {
     /// The pool id of the open command encoder (0: none), shared with the leases of the
     /// working images this `Enc` takes (see [`Pool::release`]).
     cell: Arc<std::sync::atomic::AtomicU64>,
+    /// Effects may keep their intermediates as RGBA16F ([`Enc::half_for`]): a viewer display
+    /// render with [`GpuContext::set_half_intermediates`] on. Off everywhere else.
+    pub(crate) half: bool,
 }
 
 /// Submitted encoder ids an [`Enc`] remembers for [`Enc::owns`] (older ones lose in-place).
@@ -2823,6 +2977,7 @@ impl<'g> Enc<'g> {
             submitted_ids: Vec::new(),
             opened: None,
             cell: Default::default(),
+            half: false,
             #[cfg(feature = "profile")]
             timestamps: None,
         }
@@ -2910,6 +3065,45 @@ impl<'g> Enc<'g> {
         img
     }
 
+    /// Whether this render's effect intermediates written by `kernels` may be RGBA16F: half
+    /// working images are on for this `Enc` ([`Enc::half`]) and every one of `kernels` has a
+    /// half variant ([`crate::half::KERNELS`]). An effect asks once, then passes the answer to
+    /// [`Enc::scratch_as`] / [`Enc::image_as`] for the images only its own kernels read.
+    pub(crate) fn half_for(&self, kernels: &[&str]) -> bool {
+        self.half && self.g.half_bank().is_some_and(|b| b.has_all(kernels))
+    }
+
+    /// [`Enc::scratch`] as RGBA16F when `half` (see [`Enc::half_for`]; only kernels in
+    /// [`crate::half::KERNELS`] may write it, and it must never leave the effect that took it).
+    #[track_caller]
+    pub(crate) fn scratch_as(&mut self, w: u32, h: u32, half: bool) -> GpuImage {
+        if !half {
+            return self.scratch(w, h);
+        }
+        self.open_encoder();
+        let owner = self.enc.as_ref().map(|(_, id)| *id);
+        let (img, _) = self.g.pooled_format(w, h, crate::half::FORMAT, owner, Some(self.cell.clone()));
+        if cfg!(test) {
+            self.fill(&img, f32::NAN);
+        }
+        img
+    }
+
+    /// [`Enc::image`] (zeroed) as RGBA16F when `half` (see [`Enc::scratch_as`]).
+    #[track_caller]
+    pub(crate) fn image_as(&mut self, w: u32, h: u32, half: bool) -> GpuImage {
+        if !half {
+            return self.image(w, h);
+        }
+        self.open_encoder();
+        let owner = self.enc.as_ref().map(|(_, id)| *id);
+        let (img, reused) = self.g.pooled_format(w, h, crate::half::FORMAT, owner, Some(self.cell.clone()));
+        if reused {
+            self.fill(&img, 0.0);
+        }
+        img
+    }
+
     /// A transparent image to read from (shared per size; never written).
     pub fn zeros(&self, w: u32, h: u32) -> GpuImage {
         let (w, h) = (w.max(1), h.max(1));
@@ -2968,6 +3162,17 @@ impl<'g> Enc<'g> {
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
         let g = self.g;
+        if out.texture.format() == crate::half::FORMAT {
+            // A half working image (`Enc::scratch_as`): the kernel's half variant writes it.
+            let Some((bank, pipe)) = g.half_bank().and_then(|b| Some((b, b.get(entry)?))).filter(|_| ext.is_none()) else {
+                log::error!("gpu: no half kernel {entry}");
+                self.missing = true;
+                return;
+            };
+            let views = [&src.view, aux.map_or(&g.dummy.view, |a| &a.view), &out.view];
+            self.dispatch_views(entry, pipe, &bank.bgl, p, views, data, groups, None, None);
+            return;
+        }
         let Some(pipe) = g.pipelines.get(entry) else {
             if !g.unavailable.iter().any(|(e, _)| *e == entry) {
                 log::error!("gpu: no kernel {entry}");
@@ -3210,6 +3415,24 @@ impl<'g> Enc<'g> {
         let out = self.scratch(w, h);
         self.copy_region(src, &out, x, y, w, h);
         out
+    }
+
+    /// Copy the `w` × `h` region of `src` at (`x`, `y`) into `out` at (`dx`, `dy`) (the caller
+    /// checks that both lie inside their images).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn copy_region_to(&mut self, src: &GpuImage, out: &GpuImage, x: u32, y: u32, w: u32, h: u32, dx: u32, dy: u32) {
+        self.timed("copy", |enc| {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &out.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: dx, y: dy, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            )
+        });
     }
 
     /// Copy the `w` × `h` region of `src` at (`x`, `y`) to the top-left of `out`.
@@ -3710,6 +3933,29 @@ impl<'g> Enc<'g> {
 /// Mip levels of a full chain for a `w × h` texture (down to 1 × 1).
 pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
     u32::BITS - w.max(h).max(1).leading_zeros()
+}
+
+#[cfg(test)]
+mod scratch_meter_tests {
+    use super::ScratchMeter;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn scratch_meter_tracks_live_and_peak_through_its_shared_counters() {
+        let m = ScratchMeter::default();
+        let (live, peak) = (m.live_counter(), m.peak_counter());
+        m.add(100);
+        m.add(50);
+        m.sub(100);
+        assert_eq!(m.bytes(), (50, 150));
+        assert_eq!((live.load(Relaxed), peak.load(Relaxed)), (50, 150));
+        // Never below zero (a double give-back must not wrap).
+        m.sub(80);
+        assert_eq!(m.bytes(), (0, 150));
+        m.reset_peak();
+        m.add(10);
+        assert_eq!(m.bytes(), (10, 10));
+    }
 }
 
 #[cfg(test)]

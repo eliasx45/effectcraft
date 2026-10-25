@@ -43,7 +43,7 @@ pub(crate) fn rgba8(r: Rendered) -> (u32, u32, Vec<u8>) {
     }
 }
 
-/// `stream-bench F.ecproj [--comp C] [--start SECS] [--n FRAMES] [--gpu] [--scale S]`: render
+/// `stream-bench F.ecproj [--comp C] [--start SECS] [--n FRAMES] [--gpu] [--scale S] [--proxies]`: render
 /// `n` consecutive frames, then encode them as H.264 chunks every way the stream could.
 pub fn bench(args: &Args) -> Result<(), Failure> {
     let mut s = effectcraft_host::session();
@@ -69,6 +69,11 @@ pub fn bench(args: &Args) -> Result<(), Failure> {
         g.context().set_cache_budget(cache.budget());
     }
     let render: Arc<dyn FrameRender> = crate::frame_serve::renderer(&s, gpu, threads, &log);
+    // `--proxies`: as the frame server renders, with its half-size proxies of big clips.
+    let render = match args.flag("--proxies") {
+        true => crate::auto_proxy::wrap_ready(render, &s.project, std::time::Duration::from_secs(7200), log.clone()),
+        false => render,
+    };
     let project = s.project.clone();
     let first = rate.frame_at(start);
     let opts = RenderOpts { scale, backend: Backend::Auto, ..Default::default() };

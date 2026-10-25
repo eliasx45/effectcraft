@@ -427,6 +427,32 @@ pub fn motion_tile_growth(extra: f64, scale: f64) -> u32 {
     (extra * 0.5 * scale).round().clamp(0.0, 8192.0) as u32
 }
 
+/// A layer's Motion Tile output buffer: (width, height, offset of the layer's origin in it), for
+/// a `lw`×`lh` layer tiled out to `ow`×`oh` layer units at `scale` buffer pixels per unit, from a
+/// source buffer whose layer origin is at `src_off`. The output grows by whole pixels on each
+/// side, so its pixel grid stays on the source's: a fractional growth (Output Height 133.44% of
+/// 1080) resampled every pixel half a pixel off and blended the layer's edge row with the
+/// transparency outside it, a seam where the tiles meet.
+pub fn motion_tile_frame(lw: f64, lh: f64, ow: f64, oh: f64, scale: f64, src_off: [f64; 2]) -> (u32, u32, [f64; 2]) {
+    let axis = |l: f64, o: f64, off: f64| {
+        let grow = ((o - l) * 0.5 * scale).round().clamp(-16384.0, 16384.0);
+        let frac = if off.is_finite() { off - off.floor() } else { 0.0 };
+        let n = (2.0 * grow + l * scale + frac).round().clamp(1.0, 65536.0) as u32;
+        (n, grow + frac)
+    };
+    let (nw, ox) = axis(lw, ow, src_off[0]);
+    let (nh, oy) = axis(lh, oh, src_off[1]);
+    (nw, nh, [ox, oy])
+}
+
+/// Where Motion Tile reads a point `f` (0..1) across a layer `len` buffer pixels long, whose
+/// origin is at `off` in the source buffer: clamped to the layer's edge pixel centres, so a
+/// tile's edge never mixes in the transparency outside the layer.
+#[inline]
+pub fn motion_tile_sample(f: f64, len: f64, off: f64) -> f64 {
+    (f * len).clamp(0.5, (len - 0.5).max(0.5)) + off
+}
+
 fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
     let s = b.scale;
     let (lw, lh) = (ctx.layer_size[0], ctx.layer_size[1]);
@@ -448,7 +474,7 @@ fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
         let (ex, ey) = (motion_tile_growth(ow - lw, s), motion_tile_growth(oh - lh, s));
         (b.img.width.saturating_add(2 * ex), b.img.height.saturating_add(2 * ey), [b.offset[0] + ex as f64, b.offset[1] + ey as f64])
     } else {
-        ((ow * s).round().max(1.0) as u32, (oh * s).round().max(1.0) as u32, [(ow - lw) * 0.5 * s, (oh - lh) * 0.5 * s])
+        motion_tile_frame(lw, lh, ow, oh, s, b.offset)
     };
     let mut out = Image::new(nw, nh);
     let src = &b.img;
@@ -473,7 +499,7 @@ fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
                     fy = 1.0 - fy;
                 }
             }
-            *px = src.sample_bilinear(fx * lw * s + b.offset[0], fy * lh * s + b.offset[1]);
+            *px = src.sample_bilinear(motion_tile_sample(fx, lw * s, b.offset[0]), motion_tile_sample(fy, lh * s, b.offset[1]));
         }
     });
     Buf { img: out, offset: noff, scale: s }

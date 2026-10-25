@@ -101,6 +101,16 @@ pub trait FrameRender: Send + Sync {
     fn warm(&self, _project: &Project, _comp: ItemId, _time: Tick) {}
 }
 
+/// [`FrameRender::render`] with a panic turned into an error: a renderer bug fails its frame
+/// instead of ending the worker thread (a stream whose render threads all ended kept its chunks
+/// in flight forever and the app's playback waited on them, 17 Oct).
+pub(crate) fn render_guarded(render: &dyn FrameRender, job: &RenderJob<'_>) -> Result<(Rendered, bool), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render.render(job))).unwrap_or_else(|panic| {
+        let why = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
+        Err(format!("the renderer panicked{}", if why.is_empty() { String::new() } else { format!(": {why}") }))
+    })
+}
+
 /// Frames on the CPU.
 pub struct CpuRender {
     pub footage: Arc<dyn FootageSource>,
@@ -455,7 +465,7 @@ impl Sched {
             let mut looked = 0;
             while let Some(&frame) = plan.frames.get(plan.next) {
                 plan.next += 1;
-                let Some(key) = plan.precache.series.key(frame) else { continue };
+                let Some(key) = plan.precache.key(frame) else { continue };
                 if frames.contains(key) {
                     looked += 1;
                     if looked > 256 {
@@ -580,7 +590,10 @@ fn precache(p: &PrecacheJob, shared: &Shared) {
     let Some(comp) = p.project.comp(p.precache.comp) else { return };
     let time = comp.frame_rate.tick_of(p.frame);
     let t0 = Instant::now();
-    match shared.render.render(&RenderJob { project: &p.project, comp: p.precache.comp, time, opts: *p.precache.opts, cache: &shared.cache, times: None }) {
+    match render_guarded(
+        shared.render.as_ref(),
+        &RenderJob { project: &p.project, comp: p.precache.comp, time, opts: *p.precache.opts, cache: &shared.cache, times: None },
+    ) {
         Ok((frame, gpu)) => {
             let (w, h, rgba) = rgba8(frame);
             shared.frames.put(p.key, w, h, Arc::new(rgba));
@@ -600,7 +613,7 @@ fn precache(p: &PrecacheJob, shared: &Shared) {
 /// Tell the app which of a plan's frames the cache holds.
 fn report(plan: &Plan, frames: &FrameCache) {
     let pc = &plan.precache;
-    let mut cached: Vec<i64> = plan.frames.iter().copied().filter(|f| pc.series.key(*f).is_some_and(|k| frames.contains(k))).collect();
+    let mut cached: Vec<i64> = plan.frames.iter().copied().filter(|f| pc.key(*f).is_some_and(|k| frames.contains(k))).collect();
     cached.sort_unstable();
     cached.dedup();
     let st = frames.stats();
@@ -652,7 +665,8 @@ fn render_job(job: Job, depth: usize, sched: &Sched, shared: &Shared) -> Option<
     let (width, height, rgba, gpu, render_ms, convert_ms) = match hit {
         Some(f) => (f.width, f.height, f.rgba, false, 0.0, 0.0),
         None => {
-            let rendered = shared.render.render(&RenderJob { project: &project, comp, time, opts, cache: &shared.cache, times: Some(&times) });
+            let rendered =
+                render_guarded(shared.render.as_ref(), &RenderJob { project: &project, comp, time, opts, cache: &shared.cache, times: Some(&times) });
             let (frame, gpu) = match rendered {
                 Ok(r) => r,
                 Err(e) => {

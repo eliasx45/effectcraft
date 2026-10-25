@@ -26,6 +26,7 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("timeline.sourceName", source_name),
         Handler::ui("timeline.search", search),
         Handler::ui("timeline.graphEditor", graph_editor),
+        Handler::ui("timeline.graph.fit", graph_fit),
         Handler::ui("timeline.switchesModes", switches_modes),
         Handler::ui("timeline.collapseAll", collapse_all),
         Handler::ui("timeline.twirlSelected", twirl_selected),
@@ -77,16 +78,29 @@ pub fn reveal(app: &mut EffectcraftApp, kind: &str, now: f64, add: bool) {
     };
     let targets = reveal_targets(app);
     let tl = &mut app.ui.timeline;
+    if add {
+        // Shift+key adds to what each layer shows now, however it got there (another reveal
+        // key, U, Alt+Shift+key), as in After Effects; when every layer shows it already, it
+        // is taken away.
+        let on = !targets.iter().all(|id| tl.layer_reveal.get(id).is_some_and(|k| k.iter().any(|k| k == kind)));
+        let mut shown = Vec::with_capacity(targets.len());
+        for id in &targets {
+            let mut kinds = tl.layer_reveal.get(id).cloned().unwrap_or_default();
+            kinds.retain(|k| k != kind && (k != "props" || !tl.reveal_props.is_empty()));
+            if on {
+                kinds.push(kind.to_string());
+            }
+            tl.apply_reveal(&[*id], kinds.clone());
+            shown.push((*id, kinds));
+        }
+        for (id, kinds) in shown {
+            crate::panels::timeline::open_revealed(app, &[id], &kinds);
+        }
+        return;
+    }
     let present = tl.reveal.iter().any(|k| k == kind);
     let mut kinds = tl.reveal.clone();
-    if add {
-        if present {
-            kinds.retain(|k| k != kind);
-        } else {
-            kinds.retain(|k| k != "props" || !tl.reveal_props.is_empty());
-            kinds.push(kind.to_string());
-        }
-    } else if present && kinds.len() == 1 {
+    if present && kinds.len() == 1 {
         kinds.clear();
     } else {
         kinds = vec![kind.to_string()];
@@ -250,6 +264,16 @@ fn search(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Val
 fn graph_editor(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
     app.ui.timeline.graph_editor = !app.ui.timeline.graph_editor;
     Ok(Value::Null)
+}
+
+/// F in the Graph Editor (its bottom bar's Fit button): Fit All Graphs to View. The Graph Editor
+/// frames the graphs when it is next drawn, where its plot is known.
+fn graph_fit(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    if !app.ui.timeline.graph_editor {
+        return Err("Fit All Graphs to View needs the Graph Editor: open it first (timeline.graphEditor, Shift+F3)".into());
+    }
+    crate::panels::graph::request_fit_all(ctx);
+    Ok(json!({"fit": "all"}))
 }
 
 fn switches_modes(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {

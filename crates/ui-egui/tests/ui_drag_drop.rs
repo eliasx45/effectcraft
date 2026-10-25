@@ -609,3 +609,86 @@ fn illustrator_import_offers_and_applies_retain_layer_sizes() {
     assert_eq!((f.width, f.height), (30, 20));
     assert!(f.layer.as_ref().unwrap().layer_size);
 }
+
+/// The window as winit reports it on a display with `native` pixels per point and Settings ▸
+/// Appearance ▸ UI Scale at `zoom`: its content origin at `window_pts` global points is
+/// `window_pts × native` pixels, which egui divides by `native × zoom`.
+fn settle_display(h: &mut Harness<'_, EffectcraftApp>, native: f32, zoom: f32, window_pts: egui::Vec2) {
+    if let Some(viewport) = h.input_mut().viewports.get_mut(&egui::ViewportId::ROOT) {
+        viewport.native_pixels_per_point = Some(native);
+        viewport.inner_rect = Some(Rect::from_min_size((window_pts / zoom).to_pos2(), vec2(1600.0, 1000.0) / zoom));
+    }
+    let st = h.state_mut();
+    st.session.prefs.appearance.ui_scale = (zoom * 100.0).round() as u32;
+    st.session.prefs_revision += 1;
+    h.run_steps(4);
+}
+
+/// A Finder drag on macOS: winit sends no pointer motion while files hover over the window, so
+/// egui's pointer is gone (it left for the Finder) and the drop point must come from the OS cursor
+/// hook, as in the desktop app: global display points scaled by the window's native scale (what
+/// the app passes the hook, never the zoomed scale). At 1x, Retina (2x) and Retina with UI Scale
+/// 150 %, with the window away from the screen origin: the Timeline shows where the layer will go
+/// while hovering, and the drop lands where a Project item dropped there lands (between Top and
+/// Middle, starting at the drop time). Without the hook the file is only imported.
+#[test]
+fn finder_drop_on_the_timeline_lands_under_the_os_cursor_on_retina() {
+    let window_pts = vec2(240.0, 130.0);
+    for (native, zoom) in [(1.0_f32, 1.0_f32), (2.0, 1.0), (2.0, 1.5)] {
+        // Where a Project item dropped on the upper half of Middle's row, over the time graph,
+        // lands (whole points, so the OS cursor's pixels are exact).
+        let (mut reference, clip) = harness();
+        settle_display(&mut reference, native, zoom, window_pts);
+        let middle = rect(&reference, &format!("timeline.layer.{}.row", layer_id(&reference, "Middle")));
+        let bar = rect(&reference, &format!("timeline.layer.{}.bar", layer_id(&reference, "Middle")));
+        let at = pos2(bar.min.x + bar.width() * 0.5, middle.min.y + 3.0).round();
+        let item = rect(&reference, &format!("project.item.{clip}.name")).center();
+        drag(&mut reference, item, at, Modifiers::NONE);
+        assert_eq!(stack(&reference), ["Top", "Clip", "Middle", "Bottom"], "{native}x, zoom {zoom}: the reference drop");
+        let want_in = in_point(&reference, 1);
+
+        for with_hook in [false, true] {
+            let (mut h, _) = harness();
+            h.state_mut().session.importer = Some(Arc::new(Gated { started: AtomicUsize::new(0), allow: Arc::new(AtomicUsize::new(usize::MAX)) }));
+            settle_display(&mut h, native, zoom, window_pts);
+            let row = rect(&h, &format!("timeline.layer.{}.row", layer_id(&h, "Middle")));
+            assert_eq!(row, middle, "same layout as the reference");
+            let cursor_pts = window_pts + at.to_vec2() * zoom;
+            let scales = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = scales.clone();
+            h.state_mut().hooks.cursor_screen_position = Some(Box::new(move |scale: f32| {
+                seen.borrow_mut().push(scale);
+                with_hook.then(|| ((cursor_pts.x * scale).round() as i32, (cursor_pts.y * scale).round() as i32))
+            }));
+            // The pointer went to the Finder; no motion arrives during the OS drag.
+            h.event(Event::PointerMoved(pos2(at.x, 4.0)));
+            h.step();
+            h.event(Event::PointerGone);
+            h.step();
+            let name = format!("finder-{native}-{zoom}-{with_hook}.mp4");
+            h.input_mut().hovered_files.push(egui::HoveredFile { path: Some(std::env::temp_dir().join(&name)), mime: String::new() });
+            h.step();
+            let preview = h.state().auto.find("timeline.fileDropTarget").map(|e| e.label.clone());
+            h.input_mut().hovered_files.clear();
+            h.input_mut().dropped_files.push(Arc::new(Dropped(std::env::temp_dir().join(&name))));
+            h.step();
+            h.input_mut().dropped_files.clear();
+            step_until(&mut h, |h| h.state().session.project.items.values().any(|i| i.name == name));
+            h.run_steps(2);
+            assert!(
+                !scales.borrow().is_empty() && scales.borrow().iter().all(|s| *s == native),
+                "the hook gets the native scale, not the zoomed one: {:?}",
+                scales.borrow()
+            );
+            if with_hook {
+                assert_eq!(preview.as_deref(), Some("Layer 2"), "{native}x, zoom {zoom}: the line shows where it will go");
+                step_until(&mut h, |h| stack(h).contains(&name));
+                assert_eq!(stack(&h), ["Top", name.as_str(), "Middle", "Bottom"], "{native}x, zoom {zoom}: between Top and Middle");
+                assert_eq!(in_point(&h, 1), want_in, "{native}x, zoom {zoom}: starts where it was dropped");
+            } else {
+                assert_eq!(preview, None, "{native}x, zoom {zoom}: no OS cursor, no pointer: no Timeline preview");
+                assert_eq!(stack(&h), ["Top", "Middle", "Bottom"], "{native}x, zoom {zoom}: only imported");
+            }
+        }
+    }
+}

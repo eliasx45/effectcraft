@@ -7,6 +7,7 @@ use std::thread::ThreadId;
 
 use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
+use effectcraft_render::cache::shared::{Member, ShareKind, ShareLink, SharedBudget};
 use effectcraft_render::{FloatCurve, FootageFrame, FootageSource, SharedFrame, preview_size};
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
@@ -137,35 +138,54 @@ fn sample_time(at: usize, rate: u32) -> Tick {
 struct Lru {
     map: HashMap<Key, Entry>,
     order: BTreeMap<u64, Key>,
+    /// The latest use stamp, from the process-wide clock the caches share
+    /// ([`effectcraft_render::cache::shared::stamp`]).
     clock: u64,
     bytes: usize,
+    /// The shared cache budget, when the caches share one ([`MediaPool::share`]): told the
+    /// bytes and the oldest use after every change.
+    share: Option<ShareLink>,
 }
 
 impl Lru {
+    fn tick(&mut self) -> u64 {
+        self.clock = effectcraft_render::cache::shared::stamp_after(self.clock);
+        self.clock
+    }
+    /// Tell the shared budget the bytes held and the oldest use (two atomic stores).
+    fn report(&self) {
+        if let Some(l) = &self.share {
+            l.report(self.bytes as u64, self.order.first_key_value().map(|(s, _)| *s));
+        }
+    }
     fn get(&mut self, k: &Key) -> Option<Pixels> {
+        let now = self.tick();
         let e = self.map.get_mut(k)?;
         self.order.remove(&e.stamp);
-        self.clock += 1;
-        e.stamp = self.clock;
-        self.order.insert(e.stamp, k.clone());
-        Some(e.px.clone())
+        e.stamp = now;
+        let px = e.px.clone();
+        self.order.insert(now, k.clone());
+        self.report();
+        Some(px)
     }
     fn insert(&mut self, k: Key, px: Pixels, budget: usize) {
         let bytes = px.bytes();
-        self.clock += 1;
-        if let Some(old) = self.map.insert(k.clone(), Entry { px, stamp: self.clock, bytes }) {
+        let now = self.tick();
+        if let Some(old) = self.map.insert(k.clone(), Entry { px, stamp: now, bytes }) {
             self.order.remove(&old.stamp);
             self.bytes -= old.bytes;
         }
-        self.order.insert(self.clock, k);
+        self.order.insert(now, k);
         self.bytes += bytes;
         self.evict(budget);
+        self.report();
     }
     fn remove(&mut self, k: &Key) {
         if let Some(e) = self.map.remove(k) {
             self.order.remove(&e.stamp);
             self.bytes -= e.bytes;
         }
+        self.report();
     }
     /// Evict least-recently-used frames until within `budget` (the newest frame always stays).
     fn evict(&mut self, budget: usize) {
@@ -175,6 +195,33 @@ impl Lru {
                 self.bytes -= e.bytes;
             }
         }
+        self.report();
+    }
+    /// The least recently used frame, for the shared budget (the newest frame always stays):
+    /// the bytes freed.
+    fn evict_oldest(&mut self) -> usize {
+        if self.map.len() <= 1 {
+            return 0;
+        }
+        let Some((_, k)) = self.order.pop_first() else { return 0 };
+        let freed = self.map.remove(&k).map_or(0, |e| e.bytes);
+        self.bytes = self.bytes.saturating_sub(freed);
+        self.report();
+        freed
+    }
+}
+
+/// The footage frame cache as a member of the shared budget ([`MediaPool::share`]).
+struct MediaMember(std::sync::Weak<Inner>);
+
+impl Member for MediaMember {
+    fn evict_oldest(&self) -> u64 {
+        let Some(inner) = self.0.upgrade() else { return 0 };
+        let freed = lock(&inner.cache).lru.evict_oldest();
+        u64::try_from(freed).unwrap_or(u64::MAX)
+    }
+    fn alive(&self) -> bool {
+        self.0.strong_count() > 0
     }
 }
 
@@ -424,6 +471,19 @@ fn held_bytes(src: &SharedSource, whole: bool) -> usize {
         info.audio.as_ref().map_or(0.0, |a| info.duration.0 as f64 / TICKS_PER_SECOND as f64 * f64::from(a.sample_rate) * f64::from(a.channels) * 4.0);
     usize::try_from(file).unwrap_or(usize::MAX).max(decoded.clamp(0.0, usize::MAX as f64) as usize)
 }
+/// Decoded stills that took at least this long are kept in the disk cache (faster ones decode
+/// again quicker than their floats read back from disk).
+#[cfg(not(test))]
+const STILL_TO_DISK: std::time::Duration = std::time::Duration::from_millis(60);
+#[cfg(test)]
+const STILL_TO_DISK: std::time::Duration = std::time::Duration::ZERO;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: stills this thread read back from the disk cache.
+    static STILLS_FROM_DISK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// An animated GIF by path, as [`SourceSlot`] (the error message when it failed to load).
 type GifSlot = Arc<OnceLock<std::result::Result<Arc<Anim>, String>>>;
 
@@ -469,6 +529,9 @@ struct Inner {
     /// problem rather than an I/O one; see [`FootageSource::problem`]). The first failure of a
     /// file is logged, later ones are not (#886).
     problems: Mutex<HashMap<Arc<str>, (String, bool)>>,
+    /// The disk cache decoded stills that are slow to decode are kept in between sessions
+    /// ([`MediaPool::set_still_cache`]; `None` = off).
+    stills: Mutex<Option<Arc<effectcraft_render::disk_cache::DiskCache>>>,
 }
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
@@ -563,6 +626,7 @@ impl MediaPool {
             conforming: Mutex::default(),
             conform_failed: Mutex::default(),
             problems: Mutex::default(),
+            stills: Mutex::default(),
         });
         let twin = Some(Arc::new(Self { inner: inner.clone(), exact: true, twin: None }));
         Self { inner, exact: false, twin }
@@ -573,6 +637,13 @@ impl MediaPool {
     /// [`MediaPool::exact`] view never does.
     pub fn set_hardware_decoding(&self, on: bool) {
         self.inner.hardware.store(on, Ordering::Relaxed);
+    }
+
+    /// Keep decoded stills that are slow to decode (a PDF or SVG with big embedded pictures, a
+    /// huge PNG: [`STILL_TO_DISK`]) in `disk` between sessions, read back instead of decoding
+    /// again after the app restarts (`None` = off).
+    pub fn set_still_cache(&self, disk: Option<Arc<effectcraft_render::disk_cache::DiskCache>>) {
+        *lock(&self.inner.stills) = disk;
     }
 
     /// The view of this pool that always decodes exactly (exports, final renders): the same
@@ -600,6 +671,23 @@ impl MediaPool {
         lock(&self.inner.cache).lru.evict(bytes);
     }
 
+    /// Take part in the shared cache budget (`Some`, see
+    /// [`effectcraft_render::cache::shared`]) or keep to this cache's own budget (`None`). The
+    /// budget asks it to evict its least recently used frame (the newest always stays). Both
+    /// views of the pool ([`MediaPool::exact`]) share the one cache.
+    pub fn share(&self, budget: Option<&Arc<SharedBudget>>) {
+        let link = budget.and_then(|b| b.join(ShareKind::Media, Arc::new(MediaMember(Arc::downgrade(&self.inner)))));
+        let old = {
+            let mut c = lock(&self.inner.cache);
+            let old = std::mem::replace(&mut c.lru.share, link);
+            c.lru.report();
+            old
+        };
+        if let Some(old) = old {
+            old.leave();
+        }
+    }
+
     /// Enable or disable decoding ahead of sequential reads (on by default on native builds;
     /// ignored on wasm32).
     pub fn set_read_ahead(&self, on: bool) {
@@ -619,10 +707,27 @@ impl MediaPool {
         }
     }
 
+    /// The frame cache by file (the Memory panel): the lock is held to copy (path, bytes) out,
+    /// the totals are made after it.
+    pub fn cache_usage(&self) -> effectcraft_render::FootageCacheUsage {
+        let entries: Vec<(Arc<str>, usize)> = lock(&self.inner.cache).lru.map.iter().map(|(k, e)| (k.path.clone(), e.bytes)).collect();
+        let mut by: HashMap<Arc<str>, (usize, usize)> = HashMap::new();
+        for (path, bytes) in &entries {
+            let e = by.entry(path.clone()).or_default();
+            e.0 = e.0.saturating_add(*bytes);
+            e.1 += 1;
+        }
+        let mut by_file: Vec<(String, usize, usize)> = by.into_iter().map(|(p, (b, n))| (p.to_string(), b, n)).collect();
+        by_file.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        effectcraft_render::FootageCacheUsage { bytes: entries.iter().map(|e| e.1).fold(0usize, usize::saturating_add), frames: entries.len(), by_file }
+    }
+
     /// Drop every cached frame (decoders stay open).
     pub fn clear_frames(&self) {
         let mut c = lock(&self.inner.cache);
-        c.lru = Lru::default();
+        // (the shared budget's link stays)
+        c.lru = Lru { share: c.lru.share.take(), ..Lru::default() };
+        c.lru.report();
         c.last.clear();
         // Running decode-aheads stop.
         c.ahead.clear();
@@ -1202,11 +1307,21 @@ impl Inner {
     /// Start the decode-ahead runner `id` of `path`: a plain thread, not a rayon job (rayon
     /// workers wait for the frames it decodes). It decodes in its own thread pool, so codecs that
     /// parallelise with rayon don't queue their work behind the global pool's waiting workers.
+    /// The runner and the pool run at background priority, on all but a core or two (MEM3:
+    /// `effectcraft_render::concurrency`): a frame playback needs before they reach it is decoded
+    /// by the frame thread asking for it, at its own priority.
     #[cfg(not(target_arch = "wasm32"))]
     fn start_runner(self: &Arc<Self>, path: Arc<str>, id: u64) -> bool {
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let pool =
-            self.ahead_pool.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("ec-media-ahead-{i}")).build().ok());
+        use effectcraft_render::concurrency::{background_thread, interactive_threads};
+        let threads = interactive_threads(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let pool = self.ahead_pool.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("ec-media-ahead-{i}"))
+                .start_handler(|_| background_thread())
+                .build()
+                .ok()
+        });
         if pool.is_none() {
             return false;
         }
@@ -1214,6 +1329,7 @@ impl Inner {
         std::thread::Builder::new()
             .name("ec-media-decode-ahead".into())
             .spawn(move || {
+                background_thread();
                 let _stop = RunnerStop { inner: weak.clone(), path: path.clone(), id };
                 while let Some(inner) = weak.upgrade() {
                     if !inner.run_ahead(&path, id) {
@@ -1347,49 +1463,29 @@ impl Inner {
         match loc.media_t {
             None if &**path == PLACEHOLDER => Ok(float(colour_bars(footage.width, footage.height))),
             None => {
-                // Photoshop documents are parsed once per file, not once per layer item.
-                if let Some(psd) = lock(&self.psds).get(path) {
-                    return Ok(float(crate::layered::decode_psd(path, &psd, footage, op)?));
-                }
-                let bytes = self.read(path)?;
-                if effectcraft_psd::is_psd(&bytes) {
-                    let psd = Arc::new(crate::layered::parse_psd(path, &bytes)?);
-                    if !detached {
-                        lock(&self.psds).insert(path.clone(), psd.clone(), bytes.len());
-                    }
-                    return Ok(float(crate::layered::decode_psd(path, &psd, footage, op)?));
-                }
-                // DPX / Cineon film scans (our own reader; `image` has none).
-                if let Some(img) = crate::dpx::decode(path, &bytes)? {
-                    return Ok(match pack_dynamic(img, op) {
-                        Ok(img) => float(img),
-                        Err(packed) => Pixels::Packed(Arc::new(packed)),
-                    });
-                }
-                if let Some(img) = crate::layered::decode(path, &bytes, footage, op)? {
-                    return Ok(float(img));
-                }
-                if let Some(img) = crate::avif::decode(path, &bytes, op)? {
-                    return Ok(float(img));
-                }
-                // (an OpenEXR compression the decoder lacks came out transparent or as a missing
-                // channel error)
-                if path.to_ascii_lowercase().ends_with(".exr")
-                    && let Some(why) = crate::exr_channels::unsupported_compression(&bytes)
+                // A still that was slow to decode comes from the disk cache (exact pixels).
+                let disk = lock(&self.stills).clone().filter(|_| !lock(&self.files).contains_key(&**path)).and_then(|dc| {
+                    let how = format!(
+                        "{:?} {:?} {:?} {:?} {:?} {} {:?}",
+                        loc.key.frame, loc.key.interp, loc.key.matte, loc.key.crop, footage.layer, footage.page, op
+                    );
+                    Some((dc, effectcraft_render::disk_cache::still_key(path, &how)?))
+                });
+                if let Some((dc, k)) = &disk
+                    && let Some(img) = dc.get_still(*k)
                 {
-                    return Err(MediaError::Decode(format!("{path}: {why}")));
+                    #[cfg(test)]
+                    STILLS_FROM_DISK.with(|c| c.set(c.get() + 1));
+                    return Ok(float(img));
                 }
-                let loaded = crate::probe::load_oriented(&bytes, crate::still_format(path, &bytes));
-                let img = match loaded {
-                    Ok(img) => img,
-                    // A multi-layer OpenEXR file without an unnamed RGB layer: its colour layer.
-                    Err(e) => crate::exr_channels::cached_layered_image(path, bytes.clone()).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
-                };
-                drop(bytes);
-                Ok(match pack_dynamic(img, op) {
-                    Ok(img) => float(img),
-                    Err(packed) => Pixels::Packed(Arc::new(packed)),
-                })
+                let t0 = std::time::Instant::now();
+                let px = self.decode_still(path, footage, op, detached)?;
+                if let (Some((dc, k)), Pixels::Float(img)) = (&disk, &px)
+                    && t0.elapsed() >= STILL_TO_DISK
+                {
+                    dc.put_still(*k, img.clone());
+                }
+                Ok(px)
             }
             Some(mt) if gif_anim::is_animated(footage) => {
                 // A thumbnail decodes the GIF without keeping it.
@@ -1405,6 +1501,54 @@ impl Inner {
                 Ok(video_pixels(frame, op, turn))
             }
         }
+    }
+
+    /// Decode the image file `path` (a still or one image of a sequence).
+    fn decode_still(&self, path: &Arc<str>, footage: &Footage, op: AlphaOp, detached: bool) -> Result<Pixels> {
+        let float = |img: Image| Pixels::Float(Arc::new(img));
+        // Photoshop documents are parsed once per file, not once per layer item.
+        if let Some(psd) = lock(&self.psds).get(path) {
+            return Ok(float(crate::layered::decode_psd(path, &psd, footage, op)?));
+        }
+        let bytes = self.read(path)?;
+        if effectcraft_psd::is_psd(&bytes) {
+            let psd = Arc::new(crate::layered::parse_psd(path, &bytes)?);
+            if !detached {
+                lock(&self.psds).insert(path.clone(), psd.clone(), bytes.len());
+            }
+            return Ok(float(crate::layered::decode_psd(path, &psd, footage, op)?));
+        }
+        // DPX / Cineon film scans (our own reader; `image` has none).
+        if let Some(img) = crate::dpx::decode(path, &bytes)? {
+            return Ok(match pack_dynamic(img, op) {
+                Ok(img) => float(img),
+                Err(packed) => Pixels::Packed(Arc::new(packed)),
+            });
+        }
+        if let Some(img) = crate::layered::decode(path, &bytes, footage, op)? {
+            return Ok(float(img));
+        }
+        if let Some(img) = crate::avif::decode(path, &bytes, op)? {
+            return Ok(float(img));
+        }
+        // (an OpenEXR compression the decoder lacks came out transparent or as a missing
+        // channel error)
+        if path.to_ascii_lowercase().ends_with(".exr")
+            && let Some(why) = crate::exr_channels::unsupported_compression(&bytes)
+        {
+            return Err(MediaError::Decode(format!("{path}: {why}")));
+        }
+        let loaded = crate::probe::load_oriented(&bytes, crate::still_format(path, &bytes));
+        let img = match loaded {
+            Ok(img) => img,
+            // A multi-layer OpenEXR file without an unnamed RGB layer: its colour layer.
+            Err(e) => crate::exr_channels::cached_layered_image(path, bytes.clone()).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
+        };
+        drop(bytes);
+        Ok(match pack_dynamic(img, op) {
+            Ok(img) => float(img),
+            Err(packed) => Pixels::Packed(Arc::new(packed)),
+        })
     }
 
     /// The decoded movie frame of `path` at media time `mt`, from the source that may decode on
@@ -1442,6 +1586,9 @@ impl FootageSource for MediaPool {
     fn set_cache_budget(&self, bytes: usize) {
         self.set_budget(bytes);
     }
+    fn share_cache_budget(&self, budget: Option<&Arc<SharedBudget>>) {
+        self.share(budget);
+    }
     fn purge(&self) {
         self.clear_frames();
         lock(&self.inner.sources).close_idle();
@@ -1461,8 +1608,14 @@ impl FootageSource for MediaPool {
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
     }
+    fn cache_usage(&self) -> Option<effectcraft_render::FootageCacheUsage> {
+        Some(MediaPool::cache_usage(self))
+    }
     fn set_hardware_decoding(&self, on: bool) {
         MediaPool::set_hardware_decoding(self, on);
+    }
+    fn set_still_cache(&self, disk: Option<Arc<effectcraft_render::disk_cache::DiskCache>>) {
+        MediaPool::set_still_cache(self, disk)
     }
     fn exact(&self) -> Option<&dyn FootageSource> {
         self.twin.as_deref().map(|t| t as &dyn FootageSource)
@@ -1646,6 +1799,55 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A still that is slow to decode (vector artwork) is kept in the disk cache: a new pool
+    /// (the app reopened) reads it back instead of decoding it, with the same pixels, and an
+    /// edited file (another size or modification time) decodes again.
+    #[test]
+    fn slow_stills_come_back_from_the_disk_cache_after_a_restart() {
+        use effectcraft_render::disk_cache::DiskCache;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-still-disk");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg = |fill: &str| {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="48"><defs><linearGradient id="g"><stop offset="0" stop-color="{fill}"/><stop offset="1" stop-color="#2040ff" stop-opacity="0.5"/></linearGradient></defs><rect x="3" y="4" width="57" height="39" rx="9" fill="url(#g)"/></svg>"##
+            )
+        };
+        let path = dir.join("art.svg");
+        std::fs::write(&path, svg("#ff8000")).unwrap();
+        let dc = DiskCache::open(dir.join("cache"), 1 << 30).unwrap();
+        let read = |dc: &Arc<DiskCache>| {
+            let pool = MediaPool::new();
+            pool.set_still_cache(Some(dc.clone()));
+            let footage = crate::probe::probe(&path).unwrap();
+            let before = STILLS_FROM_DISK.with(std::cell::Cell::get);
+            let img = pool.inner.frame_at(&footage, Tick::ZERO, false).unwrap();
+            (img, STILLS_FROM_DISK.with(std::cell::Cell::get) - before)
+        };
+        let (first, from_disk) = read(&dc);
+        assert_eq!(from_disk, 0, "decoded the first time");
+        // Written in the background: a new pool finds it once it is on disk.
+        let mut again = None;
+        for _ in 0..500 {
+            dc.flush();
+            let (img, from_disk) = read(&dc);
+            if from_disk == 1 {
+                again = Some(img);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let again = again.expect("read back from the disk cache");
+        assert_eq!((again.width, again.height), (first.width, first.height));
+        assert!(again.data == first.data, "the same pixels as the decode");
+        // The file changes: decoded again, and the new pixels show.
+        std::fs::write(&path, svg("#00ff40ff")).unwrap();
+        let (edited, from_disk) = read(&dc);
+        assert_eq!(from_disk, 0, "an edited file decodes again");
+        assert!(edited.data != first.data, "the edit shows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Conforming a long file's audio reads every chunk at its own time: the sample index times
     /// ticks per second overflowed `i64` past 12:36 at 48 kHz, and later chunks came out silent

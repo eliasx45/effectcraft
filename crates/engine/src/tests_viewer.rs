@@ -216,6 +216,12 @@ fn channel_exposure_and_fast_preview_commands() {
     s.execute("view.fastPreviewMode", json!({"mode": "fastDraft"})).unwrap();
     assert_eq!(s.state.viewer.fast_previews, crate::commands::viewer_cmds::FastPreviews::FastDraft);
     assert!(s.execute("view.fastPreviewMode", json!({"mode": "nope"})).is_err());
+    assert!(s.prefs.previews.adaptive_playback);
+    assert_eq!(s.execute("view.adaptivePlayback", json!({})).unwrap(), json!({"on": false}));
+    assert!(!s.prefs.previews.adaptive_playback);
+    assert_eq!(s.execute("view.adaptivePlayback", json!({"on": true})).unwrap(), json!({"on": true}));
+    assert_eq!(s.prefs.get("previews.adaptivePlayback"), Some(json!(true)));
+    assert!(s.execute("view.adaptivePlayback", json!({"on": "yes"})).is_err());
     let was = s.state.snapping;
     s.execute("view.snapping", json!({})).unwrap();
     assert_eq!(s.state.snapping, !was);
@@ -322,8 +328,24 @@ fn shape_pen_builds_shape_group_and_renders() {
     assert!(s.execute("shape.newPath", json!({"layer": sol, "vertices": [[0, 0]]})).is_err());
 }
 
-/// The shape tools draw into the selected shape layer's Contents as a new group, as After
-/// Effects does, and a new shape layer only with none selected (#227).
+/// `shape.newShape` makes a new shape layer by default even with a shape layer selected; `into`
+/// names the layer to draw into (regression: it silently drew into the selection, 24 Oct 2026).
+#[test]
+fn new_shape_makes_a_new_layer_unless_told_into() {
+    let mut s = comp();
+    let a = s.execute("shape.newShape", json!({"kind": "rect"})).unwrap()["layer"].as_u64().unwrap();
+    assert_eq!(s.state.selected_layers, vec![LayerId(a)]);
+    let b = s.execute("shape.newShape", json!({"kind": "ellipse"})).unwrap()["layer"].as_u64().unwrap();
+    assert_ne!(a, b, "a new layer, not into the selected one");
+    assert_eq!(s.active_comp().unwrap().layers.len(), 2);
+    let r = s.execute("shape.newShape", json!({"kind": "star", "into": a})).unwrap();
+    assert_eq!(r["layer"].as_u64(), Some(a));
+    assert_eq!(layer(&s, a).props.sub("contents").unwrap().groups().count(), 2);
+    assert_eq!(s.active_comp().unwrap().layers.len(), 2);
+}
+
+/// The shape tools (`addToSelected`) draw into the selected shape layer's Contents as a new
+/// group, as After Effects does, and a new shape layer only with none selected (#227).
 #[test]
 fn shape_tools_draw_into_the_selected_shape_layer() {
     let mut s = comp();
@@ -336,7 +358,7 @@ fn shape_tools_draw_into_the_selected_shape_layer() {
     // Selected (and scaled 200%): the next shape goes on top of its Contents, in layer space.
     s.execute("prop.set", json!({"layer": lid, "path": "transform/scale", "value": [200, 200, 100]})).unwrap();
     let n = s.active_comp().unwrap().layers.len();
-    let r = s.execute("shape.newShape", json!({"kind": "ellipse", "size": [40, 20], "position": [300, 160]})).unwrap();
+    let r = s.execute("shape.newShape", json!({"kind": "ellipse", "size": [40, 20], "position": [300, 160], "addToSelected": true})).unwrap();
     assert_eq!(r["layer"].as_u64(), Some(lid));
     assert_eq!(s.active_comp().unwrap().layers.len(), n, "no new layer");
     let l = layer(&s, lid);
@@ -347,7 +369,7 @@ fn shape_tools_draw_into_the_selected_shape_layer() {
     assert_eq!(g.sub("transform").unwrap().get("position").unwrap().value.components(), [50.0, 30.0]);
     assert_eq!(g.sub("contents").unwrap().groups().next().unwrap().get("size").unwrap().value.components(), [20.0, 10.0]);
     // A second rectangle is "Rectangle 2"; it renders where it was drawn.
-    s.execute("shape.newShape", json!({"kind": "rect", "size": [40, 40], "position": [500, 300], "fill": [0, 1, 0]})).unwrap();
+    s.execute("shape.newShape", json!({"kind": "rect", "size": [40, 40], "position": [500, 300], "fill": [0, 1, 0], "addToSelected": true})).unwrap();
     let names: Vec<String> = layer(&s, lid).props.sub("contents").unwrap().groups().map(|g| g.name.clone()).collect();
     assert_eq!(names, ["Rectangle 2", "Ellipse 1", "Rectangle 1"]);
     let img = s.render(s.active_comp_id().unwrap(), Tick::ZERO, Default::default());
@@ -359,7 +381,7 @@ fn shape_tools_draw_into_the_selected_shape_layer() {
     // A locked shape layer isn't drawn into; a solid is refused when named.
     s.execute("layer.setSwitch", json!({"layers": [lid], "switch": "locked", "value": true})).unwrap();
     s.state.selected_layers = vec![LayerId(lid)];
-    let r = s.execute("shape.newShape", json!({"kind": "star"})).unwrap();
+    let r = s.execute("shape.newShape", json!({"kind": "star", "addToSelected": true})).unwrap();
     assert_ne!(r["layer"].as_u64(), Some(lid));
     let sol = s.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
     assert!(s.execute("shape.newShape", json!({"layer": sol})).is_err());
@@ -400,7 +422,7 @@ fn shape_tool_options_paint_new_shapes() {
     assert_eq!(g.groups().map(|x| x.match_id.as_str()).collect::<Vec<_>>(), ["path", "gstroke"]);
     assert_eq!((at(&g, "gstroke", "start").components(), at(&g, "gstroke", "end").components()), (vec![10.0, 30.0], vec![110.0, 30.0]));
     // A command's own paint wins over the Tools bar's.
-    let r = s.execute("shape.newShape", json!({"kind": "rect", "fill": "#00ff00", "strokeWidth": 0})).unwrap();
+    let r = s.execute("shape.newShape", json!({"into": lid, "kind": "rect", "fill": "#00ff00", "strokeWidth": 0})).unwrap();
     let g = items(&s, r["group"].as_u64().unwrap());
     assert_eq!(g.groups().map(|x| x.match_id.as_str()).collect::<Vec<_>>(), ["rect", "fill"]);
     assert_eq!(at(&g, "fill", "color").components(), [0.0, 1.0, 0.0, 1.0]);

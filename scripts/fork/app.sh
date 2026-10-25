@@ -1,6 +1,6 @@
 #!/bin/sh
-# Opens the EffectCraft desktop app, building it first only when the sources changed since the last
-# build (fork rule, docs/fork/agent-builds.md "Building the app"). Agents never build the app after
+# Opens the EffectCraft desktop app, building it (and effectcraft-cli, which agents drive) first only
+# when the sources changed since the last build (fork rule, docs/fork/agent-builds.md "Building the app"). Agents never build the app after
 # merging: merges pile up and the next launch builds once.
 #
 # The build uses the `local` profile (release without LTO, parallel codegen) in target/local, so a
@@ -19,17 +19,20 @@ export PATH
 root=$(cd "$(dirname "$0")/../.." && pwd)
 target="$root/target/local"
 bin="$target/local/effectcraft"
+cli="$target/local/effectcraft-cli"   # agents: point EFFECTCRAFT_CLI here, it's rebuilt with the app
 stamp="$target/built.stamp"
 lock="$target/build.lock"
 log="$target/build.log"
 mkdir -p "$target"
 
-running() { pgrep -f "^$bin( |$)" >/dev/null 2>&1; }
+# The app runs from a frozen copy in $target/run (scripts/frozen-exe.sh), or from $bin when the
+# Dock launcher started it.
+running() { pgrep -f "^($bin|$target/run/effectcraft-[0-9]+-[0-9]+)( |\$)" >/dev/null 2>&1; }
 
 # Sources newer than the last successful build (any file: a change that doesn't affect the app
 # costs one no-op cargo run, then the stamp moves on).
 stale() {
-    [ -x "$bin" ] && [ -f "$stamp" ] || return 0
+    [ -x "$bin" ] && [ -x "$cli" ] && [ -f "$stamp" ] || return 0
     [ -n "$(find "$root/apps" "$root/crates" "$root/assets" "$root/Cargo.toml" "$root/Cargo.lock" -newer "$stamp" -type f -print 2>/dev/null | head -n 1)" ]
 }
 
@@ -73,7 +76,7 @@ build() {
     echo "building EffectCraft (local profile) $(date)" >"$log"
     # Job control puts the build in its own process group, so stopping it stops every rustc too.
     set -m
-    CARGO_TARGET_DIR="$target" cargo build --profile local -p effectcraft --manifest-path "$root/Cargo.toml" >>"$log" 2>&1 &
+    CARGO_TARGET_DIR="$target" cargo build --profile local -p effectcraft -p effectcraft-cli --manifest-path "$root/Cargo.toml" >>"$log" 2>&1 &
     build_pid=$!
     set +m
     wait "$build_pid"
@@ -97,6 +100,12 @@ esac
 
 if [ "${1:-}" = "--build-only" ]; then
     shift
+    # Never replace a running app's binary: its image would no longer match its file, and macOS
+    # blocks and rescans every process it starts (scripts/frozen-exe.sh).
+    if running; then
+        echo "EffectCraft is running: not rebuilding under it" >&2
+        exit 0
+    fi
     if stale; then build || exit 1; fi
     exit 0
 fi
@@ -110,5 +119,6 @@ if stale; then
     build || { echo "build failed, see $log" >&2; exit 1; }
 fi
 cd "$root" || exit 1
-nohup "$bin" "$@" >"$target/app.log" 2>&1 &
+. "$root/scripts/frozen-exe.sh"
+nohup "$(frozen_exe "$bin" "$target/run")" "$@" >"$target/app.log" 2>&1 &
 exit 0

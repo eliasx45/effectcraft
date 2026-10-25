@@ -55,10 +55,15 @@ pub enum PanelKind {
     VrCompEditor,
     /// Window ▸ Motion Library (our own panel): the card catalog in the remote bucket.
     MotionLibrary,
+    /// Window ▸ Script (batch 1, SX5): the voice-over's script lined up with its words.
+    Script,
+    /// Window ▸ Memory (our own panel): what the app's memory holds, by cache and by
+    /// comp → layer → effect (`panels::memory_panel`).
+    Memory,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 36] = [
+    pub const ALL: [PanelKind; 38] = [
         PanelKind::Project,
         PanelKind::EffectControls,
         PanelKind::Composition,
@@ -95,6 +100,8 @@ impl PanelKind {
         PanelKind::CreateNullsFromPaths,
         PanelKind::VrCompEditor,
         PanelKind::MotionLibrary,
+        PanelKind::Script,
+        PanelKind::Memory,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -136,6 +143,8 @@ impl PanelKind {
             PanelKind::CreateNullsFromPaths => "Create Nulls From Paths",
             PanelKind::VrCompEditor => "VR Comp Editor",
             PanelKind::MotionLibrary => "Motion Library",
+            PanelKind::Script => "Script",
+            PanelKind::Memory => "Memory",
         }
     }
     pub fn id(self) -> String {
@@ -143,6 +152,15 @@ impl PanelKind {
     }
     pub fn from_name(s: &str) -> Option<PanelKind> {
         let n = s.to_ascii_lowercase().replace([' ', '_', '-', '&'], "");
+        // The id-carrying kinds (`id()`: "ScriptPanel(1)", "Viewer(2)"), so the panel menu's
+        // commands (`window.closePanel {panel}` ...) find them too.
+        let numbered = |prefix: &str| n.strip_prefix(prefix).and_then(|r| r.strip_suffix(')')).and_then(|d| d.parse::<u32>().ok());
+        if let Some(id) = numbered("scriptpanel(") {
+            return Some(PanelKind::ScriptPanel(id));
+        }
+        if let Some(id) = numbered("viewer(") {
+            return Some(PanelKind::Viewer(id));
+        }
         Self::ALL.iter().copied().find(|p| format!("{p:?}").to_ascii_lowercase() == n || p.title().to_ascii_lowercase().replace([' ', '&', '-'], "") == n)
     }
     /// Window-menu shortcut.
@@ -1725,12 +1743,21 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
                 icons::paint(&painter, r.shrink(4.0).translate(vec2(-2.0, 0.0)), Icon::ChevronRight, t.tab_text);
                 icons::paint(&painter, r.shrink(4.0).translate(vec2(2.0, 0.0)), Icon::ChevronRight, t.tab_text);
                 crate::widgets::focus_outline(ui, &resp, t);
-                reg.add_response(&format!("panel.tabs.{}.next", p.id()), &resp, "Show next tab");
+                reg.add_response(&format!("panel.tabs.{}.next", p.id()), &resp, "More tabs");
                 reg.add_response(&format!("panel.overflow.{}", g.path), &resp, "More tabs");
-                if resp.clicked()
-                    && let Some(next) = entries.get((ai + 1) % entries.len())
-                {
-                    out.actions.push(activate(next));
+                // The » list (After Effects): every tab that doesn't fit, in order; picking one
+                // shows it (the strip then scrolls it into view). It used to step to the next tab
+                // only, so a tab further on (Motion Library) was never in sight (23 Oct 2026).
+                let pop = egui::Id::new(("tab-overflow-pop", g.path.clone()));
+                if resp.clicked() {
+                    crate::widgets::open_popup(ui, pop);
+                }
+                if crate::widgets::popup_is_open(ui, pop) {
+                    let hidden: Vec<&Entry> = entries.iter().enumerate().filter(|(j, _)| *j < start || *j >= k).map(|(_, e)| e).collect();
+                    let labels: Vec<String> = hidden.iter().map(|e| e.label.clone()).collect();
+                    if let Some(e) = crate::widgets::popup_menu(ui, pop, pos2(r.max.x - 160.0, r.max.y), &labels, None).and_then(|i| hidden.get(i)) {
+                        out.actions.push(activate(e));
+                    }
                 }
                 break;
             }
@@ -1900,6 +1927,18 @@ pub fn placeholder(ui: &mut egui::Ui, rect: Rect, t: &Tokens, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_name_round_trips_the_id_carrying_panels() {
+        // The panel menu sends `id()`: a ScriptUI panel or an extra Composition viewer must
+        // resolve, or Close Panel / Undock Panel on them fail with "unknown panel".
+        for p in [PanelKind::ScriptPanel(1), PanelKind::Viewer(2), PanelKind::MotionLibrary] {
+            assert_eq!(PanelKind::from_name(&p.id()), Some(p), "{}", p.id());
+        }
+        assert_eq!(PanelKind::from_name("scriptpanel(7)"), Some(PanelKind::ScriptPanel(7)));
+        assert_eq!(PanelKind::from_name("ScriptPanel(x)"), None);
+        assert_eq!(PanelKind::from_name("Composition"), Some(PanelKind::Composition));
+    }
 
     /// More tabs than fit: the strip scrolls to show a newly shown tab, never past the point
     /// where the last tabs fill it, and keeps a scrolled position otherwise.

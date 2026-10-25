@@ -21,6 +21,10 @@ pub const SHORTCUTS_FILE: &str = "shortcuts.json";
 pub const DEFAULT_PRESET: &str = "EffectCraft Default";
 /// Scope of application-wide shortcuts.
 pub const APP_SCOPE: &str = "Application";
+/// Scope of the Graph Editor's shortcuts (`timeline.graph.*`): they work only while the Timeline
+/// is focused and shows the Graph Editor, and there they win over the Timeline's own keys (F
+/// fits the graphs instead of revealing Mask Feather, as in After Effects).
+pub const GRAPH_EDITOR_SCOPE: &str = "Graph Editor";
 
 /// A frontend-only command offered for binding (tools, timeline navigation…).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -58,7 +62,9 @@ pub fn binding_key(command: &str, params: &Value) -> String {
 
 /// Scope of a frontend command from its id.
 fn ui_scope(id: &str) -> &'static str {
-    if id.starts_with("timeline.") {
+    if id.starts_with("timeline.graph.") {
+        GRAPH_EDITOR_SCOPE
+    } else if id.starts_with("timeline.") {
         "Timeline"
     } else if id.starts_with("view.") {
         "Composition"

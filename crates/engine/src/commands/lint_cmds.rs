@@ -1,6 +1,7 @@
 //! `render.lint`: design problems in a comp at a time or over a time range, in plain language an
 //! agent can act on (MCP `lint_frame`). The rules are [`crate::lint`]; this samples the times,
-//! renders the text-free backdrop `low-contrast` measures and mixes the audio `off-beat` needs.
+//! renders the text-free backdrop `low-contrast` measures, mixes the audio `off-beat` needs and
+//! reads the comp's speech map for `off-accent`.
 
 use effectcraft_project::{ItemId, LayerSource, Project};
 use effectcraft_render::{Backend, RenderOpts, Renderer};
@@ -51,6 +52,17 @@ fn comp_beats(s: &Session, cid: ItemId, a0: f64, a1: f64) -> Vec<f64> {
         done += n;
     }
     lint::detect_beats(&mono, BEAT_RATE).into_iter().map(|b| b + a0).collect()
+}
+
+/// A frame count param (≥ `min`), `default` when absent.
+fn frames_p(p: &Value, k: &str, default: f64, min: f64, cmd: &str) -> Result<f64> {
+    match p.get(k).filter(|v| !v.is_null()) {
+        None => Ok(default),
+        Some(v) => v
+            .as_f64()
+            .filter(|x| x.is_finite() && *x >= min && *x <= 100.0)
+            .ok_or_else(|| bad(cmd, format!("`{k}` is a number of frames ({min} to 100), not {v}"))),
+    }
 }
 
 fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
@@ -151,6 +163,25 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     }
+    if set.on("off-accent") {
+        match comp.speech.as_deref().filter(|m| !m.words.is_empty()) {
+            None => notes.push("off-accent skipped: the comp has no speech map (make one with scripts/fork/speech-map, store it with speech.import)".into()),
+            Some(map) => {
+                let fps = comp.frame_rate.as_f64();
+                let lead = frames_p(p, "accentLead", lint::DEFAULT_ACCENT_LEAD, 0.0, C)?;
+                let window = frames_p(p, "accentWindow", lint::DEFAULT_ACCENT_WINDOW, 1.0, C)?;
+                let half = if range || fps.is_nan() || fps <= 0.0 { 0.0 } else { 0.5 / fps };
+                let (found, skipped) = lint::off_accent(&s.project, cid, map, span.0 - half, span.1 + half, fps, lead, window);
+                notes.extend(skipped.into_iter().map(|why| format!("off-accent: a precomp was not searched: {why}")));
+                notes.push(format!(
+                    "off-accent: {} stressed syllables in the speech map; peaks within {window} frames of an accent ({lead} frame(s) before the stressed vowel) that miss it by more than one frame: {}",
+                    map.stressed().len(),
+                    found.len()
+                ));
+                occurrences.extend(found);
+            }
+        }
+    }
 
     let problems = lint::merge(occurrences);
     let count = |sev: lint::Severity| problems.iter().filter(|p| p.finding.severity == sev).count();
@@ -192,7 +223,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![query!(
         "render.lint",
         "Design Lint",
-        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: [text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|text-overlap|hidden-visible|off-beat] (default all), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?}], notes}",
+        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: [text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|text-overlap|hidden-visible|off-beat|off-accent] (default all), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?}], notes}",
         render_lint
     )]
 }

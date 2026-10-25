@@ -19,11 +19,12 @@
 //! at other times, with every keyframe. The time counts when a layer is read at other times, and
 //! such a layer's expressions must read nothing but their own value and the time
 //! ([`crate::cache::free::self_contained`]): one that may read other layers or comps at those
-//! times, out of the key's sight, leaves the comp unkeyed.
+//! times, out of the key's sight, leaves the comp unkeyed. A layer the frame doesn't use (not
+//! active, and nothing used points at it) counts only by its place, expressions included.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use effectcraft_project::essential::{self, EgKind, Override};
 use effectcraft_project::{AutoOrient, Comp, FootageKind, FrameBlend, ItemId, ItemKind, Layer, LayerId, LayerSource, Layers, Project};
@@ -102,6 +103,27 @@ impl CompInfo {
 }
 
 static COMPS: LazyLock<RwLock<Memo<Comp, Arc<CompInfo>>>> = LazyLock::new(|| RwLock::new(Memo::new()));
+
+/// Comp and layer pairs already reported by [`warn_unkeyed`].
+static UNKEYED: LazyLock<Mutex<HashSet<(ItemId, LayerId)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Say once per comp and layer that `layer`'s expressions keep comp `comp` out of the layer
+/// cache (they may read other layers or comps out of the key's sight), so every precomp of it
+/// is drawn again on every frame. Removing those expressions, or baking them, makes it cacheable.
+fn warn_unkeyed(project: &Project, comp: ItemId, layer: &Layer) {
+    let Ok(mut seen) = UNKEYED.lock() else { return };
+    if seen.len() > 4096 {
+        seen.clear();
+    }
+    if seen.insert((comp, layer.id)) {
+        let name = project.item(comp).map_or("?", |i| i.name.as_str());
+        log::warn!(
+            target: "effectcraft_cache",
+            "comp {name:?} can't be cached: the expressions of its layer {:?} may read other layers or comps, so it is drawn again on every frame",
+            layer.name
+        );
+    }
+}
 
 fn comp_info(arc: &Arc<Comp>) -> Arc<CompInfo> {
     if let Some(i) = COMPS.read().ok().and_then(|m| m.get(Arc::as_ptr(arc))) {
@@ -237,6 +259,10 @@ impl<'a> Renderer<'a> {
         let strict = !free || info.spread;
         let mut h = hasher(0x9ae1_6a3b_2f90_404f);
         info.settings.hash(&mut h);
+        // Only the layers the frame uses count by their content (see [`needed_layers`]); the
+        // others by their place, so an edit to a layer that isn't on screen keeps the key.
+        let needed = if strict { None } else { Some(needed_layers(&ctx, &info, t)) };
+        let used = |i: usize| needed.as_ref().is_none_or(|n| n.get(i).copied().unwrap_or(true));
         // Layers read at other times than the frame's: their expressions must read nothing else.
         let mut timed = false;
         for (i, ((l, li), mode)) in nc.layers.iter().zip(&info.layers).zip(&modes).enumerate() {
@@ -247,7 +273,16 @@ impl<'a> Renderer<'a> {
                 Mode::Window(..) => li.contained_sampled,
                 Mode::Whole => li.contained_inner && (!sampled.get(i).copied().unwrap_or(true) || li.contained_sampled),
             };
+            if !used(i) {
+                // Unused: its id and switches (solo hides the comp's other layers at every time).
+                // Its expressions don't count either: the frame doesn't draw it, and a used layer
+                // that reads it by an expression is keyed by the value it reads (or isn't keyed).
+                (0xdead_u16, l.id).hash(&mut h);
+                hash_debug(&mut h, &l.switches);
+                continue;
+            }
             if li.expressions && !contained {
+                warn_unkeyed(self.project, id, l);
                 return None;
             }
             timed |= *mode != Mode::Free;
@@ -274,11 +309,11 @@ impl<'a> Renderer<'a> {
         for l in nc.layers.iter() {
             l.is_active_at(t).hash(&mut h);
         }
-        for &i in &info.animated {
+        for &i in info.animated.iter().filter(|i| used(**i)) {
             let l = nc.layers.get(i)?;
             hash_values(&mut h, &ctx, l, &l.props);
         }
-        for &i in &info.sources {
+        for &i in info.sources.iter().filter(|i| used(**i)) {
             let l = nc.layers.get(i)?;
             match &l.source {
                 LayerSource::Footage { item } | LayerSource::Model { item } => {
@@ -302,6 +337,62 @@ impl<'a> Renderer<'a> {
             }
         }
         Some(h.finish())
+    }
+}
+
+/// The layers of `ctx`'s comp a frame at `t` can draw or read: the layers active at `t`, the
+/// cameras and lights, and what those use, followed transitively: parents (a parent moves its
+/// children outside its own span), track mattes and the layers effects read (layer parameters).
+/// The renderer draws only layers active at the frame's time, so the others can't change it.
+fn needed_layers(ctx: &EvalCtx, info: &CompInfo, t: Tick) -> Vec<bool> {
+    let nc = ctx.comp;
+    let n = nc.layers.len();
+    let mut needed = vec![false; n];
+    let mut todo: Vec<usize> = Vec::new();
+    for (i, l) in nc.layers.iter().enumerate() {
+        if l.is_active_at(t) || matches!(l.source, LayerSource::Camera | LayerSource::Light { .. }) || l.environment {
+            todo.push(i);
+        }
+    }
+    let mut refs: Vec<LayerId> = Vec::new();
+    while let Some(i) = todo.pop() {
+        let Some(slot) = needed.get_mut(i) else { continue };
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        let Some(l) = nc.layers.get(i) else { continue };
+        refs.clear();
+        refs.extend(l.parent);
+        refs.extend(l.track_matte.as_ref().map(|m| m.layer));
+        layer_params(ctx, l, &l.props, 0, &mut refs);
+        for r in &refs {
+            match info.index.get(r) {
+                Some(j) => todo.push(*j),
+                // A reference this comp can't resolve: count every layer.
+                None => return vec![true; n],
+            }
+        }
+    }
+    needed
+}
+
+/// The layers `layer`'s layer parameters in `g` point at, at the context time.
+fn layer_params(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, depth: usize, out: &mut Vec<LayerId>) {
+    use effectcraft_project::Node;
+    if depth > 32 {
+        return;
+    }
+    for node in &g.children {
+        match node {
+            Node::Prop(p) if matches!(p.value, effectcraft_keyframe::Value::Layer(_)) => {
+                if let Some(id) = ctx.value(layer, p).as_layer() {
+                    out.push(LayerId(id));
+                }
+            }
+            Node::Group(sub) => layer_params(ctx, layer, sub, depth + 1, out),
+            Node::Prop(_) => {}
+        }
     }
 }
 

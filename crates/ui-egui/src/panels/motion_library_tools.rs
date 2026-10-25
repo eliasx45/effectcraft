@@ -53,6 +53,9 @@ const ANCHORS: [(&str, &str); 9] = [
 ];
 const SPLIT_MODES: [(&str, &str); 4] = [("words", "Words"), ("characters", "Characters / clusters"), ("lines", "Lines"), ("custom", "Isolate word or phrase")];
 const PROPERTIES: [(&str, &str); 4] = [("position", "Position"), ("scale", "Scale"), ("rotation", "Rotation"), ("opacity", "Opacity")];
+/// Bounce targets: the dropdown's properties, or `selected` (the properties with selected keys).
+const TARGETS: [(&str, &str); 5] =
+    [("selected", "Selected keys"), ("position", "Position"), ("scale", "Scale"), ("rotation", "Rotation"), ("opacity", "Opacity")];
 const MOTIONS: [(&str, &str); 2] = [("overshoot", "Overshoot / elastic"), ("bounce", "Bounce back")];
 const STYLES: [(&str, &str); 3] = [("ramp", "Ramp gradient"), ("four", "4-colour gradient"), ("sweep", "Light sweep")];
 const DEFAULT_COLORS: [&str; 4] = ["#1c8cff", "#8b5cf6", "#ff9640", "#22d3ee"];
@@ -311,8 +314,54 @@ fn arg_choice(p: &Value, key: &str, default: &str, options: &[(&str, &str)]) -> 
     Ok(s)
 }
 
+/// The names of the properties with selected keyframes in the active comp, in selection order.
+/// Bounce springs these rather than the Property dropdown, as After Effects tools act on the
+/// selected keys.
+fn keyed_props(s: &effectcraft_engine::Session) -> Vec<String> {
+    let Some(c) = s.active_comp() else { return vec![] };
+    let mut names: Vec<String> = vec![];
+    for k in &s.state.selected_keys {
+        if let Some(pr) = c.layer(k.layer).and_then(|l| l.props.find(k.prop))
+            && !names.contains(&pr.name)
+        {
+            names.push(pr.name.clone());
+        }
+    }
+    names
+}
+
+/// Whether a selected key is on a text Range Selector's Start, End or Offset (CX9): a spring there
+/// shows nothing (Ramp Up clamps the selection to 0..1), so Bounce applies Elias's bounce text
+/// preset instead (`text.unitBounce`, CX9c).
+fn reveal_keys(s: &effectcraft_engine::Session) -> bool {
+    let Some(c) = s.active_comp() else { return false };
+    s.state.selected_keys.iter().any(|k| c.layer(k.layer).and_then(|l| l.props.match_path_of(k.prop)).is_some_and(|m| is_range_reveal(&m)))
+}
+
+/// Only text layers are selected, and no keys (CX9c): Bounce applies the bounce text preset.
+fn text_layers_only(s: &effectcraft_engine::Session) -> bool {
+    let Some(c) = s.active_comp() else { return false };
+    s.state.selected_keys.is_empty()
+        && !s.state.selected_layers.is_empty()
+        && s.state.selected_layers.iter().all(|l| c.layer(*l).is_some_and(|x| matches!(x.source, effectcraft_engine::project::LayerSource::Text)))
+}
+
+/// `text/animators/animator#2/selectors/rangeSelector/offset` and the like
+/// (the engine's `styles::is_range_reveal_path`, which the UI can't reach).
+fn is_range_reveal(path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').collect();
+    let base = |s: &str| s.split('#').next().unwrap_or("").to_string();
+    let n = segs.len();
+    n >= 2
+        && segs.first().copied() == Some("text")
+        && segs.get(n - 2).is_some_and(|s| base(s) == "rangeSelector")
+        && segs.get(n - 1).is_some_and(|s| matches!(base(s).as_str(), "start" | "end" | "offset"))
+}
+
 /// The tool `tool` with the arguments in `p`; missing arguments take the panel's current values.
-fn build(tool: &str, p: &Value, set: &ToolSettings) -> Result<Built, String> {
+/// `keyed` names the properties with selected keyframes ([`keyed_props`]): when there are any,
+/// Bounce without a `property` springs those keys instead of the dropdown's property.
+fn build(tool: &str, p: &Value, set: &ToolSettings, keyed: &[String]) -> Result<Built, String> {
     let native = |cmd: &'static str, args: Value, label: &str| Built { plan: Plan::Native { cmd, args }, section: WORKFLOW, label: label.to_string() };
     let plug = |op: &'static str, args: Value, section: usize, label: &str| Built { plan: Plan::Plug { op, args }, section, label: label.to_string() };
     Ok(match tool {
@@ -393,7 +442,10 @@ fn build(tool: &str, p: &Value, set: &ToolSettings) -> Result<Built, String> {
             Built { plan: Plan::Native { cmd: "text.split", args }, section: TEXT, label: "Split text".into() }
         }
         "bounce" => {
-            let property = arg_choice(p, "property", &set.property, &PROPERTIES)?;
+            let property = match p.get("property") {
+                None | Some(Value::Null) if !keyed.is_empty() => "selected".to_string(),
+                _ => arg_choice(p, "property", &set.property, &TARGETS)?,
+            };
             let mode = arg_choice(p, "mode", &set.motion, &[("overshoot", ""), ("bounce", ""), ("remove", "")])?;
             if mode == "remove" {
                 plug("toolkit_bounce", json!({"property": property, "mode": "remove"}), BOUNCE, "Remove spring")
@@ -462,10 +514,21 @@ fn start(app: &mut EffectcraftApp, ctx: &egui::Context, tool: &str, p: &Value) -
         app.ui.status = e.clone();
         Err(e)
     };
-    let built = match build(tool, p, &settings()) {
+    let mut built = match build(tool, p, &settings(), &keyed_props(&app.session)) {
         Ok(b) => b,
         Err(e) => return fail(app, e),
     };
+    // CX9c: a spring on a Range Selector's Start / End / Offset does nothing visible, and a text
+    // layer bounces per unit: apply Elias's bounce text preset (a Motion Library card) instead,
+    // Strength → "Bounce Overshoot (%)", Bounces / s → "Bounce Speed (bounces/s)". Settle speed
+    // isn't passed: the preset's spring settles by itself. No preset = a clear error.
+    if let Plan::Plug { op: "toolkit_bounce", args } = &built.plan
+        && args["mode"] != json!("remove")
+        && ((args["property"] == json!("selected") && reveal_keys(&app.session)) || text_layers_only(&app.session))
+    {
+        let a = json!({"overshoot": args["strength"], "speed": args["frequency"]});
+        built = Built { plan: Plan::Native { cmd: "text.unitBounce", args: a }, section: BOUNCE, label: "Bounce text preset".into() };
+    }
     match built.plan {
         Plan::Native { cmd, args } => {
             let r = app.session.execute(cmd, args).map_err(|e| e.to_string()).map(|mut v| {
@@ -665,7 +728,8 @@ fn section_index(p: &Value) -> Result<usize, String> {
 /// values): create {kind: null|solid|adjustment, color?}, fill {color?}, anchor {at: topLeft…
 /// bottomRight | x, y (0–1)}, precompose {name?}, precompGroups {name?, count?}, decompose,
 /// deepDuplicate, gradientLock, purge, image {path? | png? (base64) | dialog?; else the
-/// clipboard}, split {mode?, text?, reverse?, deleteOriginal?}, bounce {property?, mode?:
+/// clipboard}, split {mode?, text?, reverse?, deleteOriginal?}, bounce {property?: selected|position|
+/// scale|rotation|opacity (default: the selected keys, else the dropdown), mode?:
 /// overshoot|bounce|remove, strength?, frequency?, decay?}, style {kind: ramp|four|fill|sweep,
 /// colors?, duration?, animate?}. Native tools return their result; the others run in the
 /// background and return `{running}` (then `{op: "status"}` has the result).
@@ -979,12 +1043,36 @@ fn text_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set: &
 }
 
 fn bounce_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
-    choice_row(app, ui, c, "motionLibrary.tools.bounce.property", "Property", &PROPERTIES, &mut set.property);
+    let keyed = keyed_props(&app.session);
+    if keyed.is_empty() {
+        choice_row(app, ui, c, "motionLibrary.tools.bounce.property", "Property", &PROPERTIES, &mut set.property);
+    } else {
+        // Selected keys win over the dropdown (Apply spring springs them); deselect to pick one.
+        let t = app.tokens;
+        let ctrl = labelled(ui, c, &t, "Property");
+        let label = format!("{} ({})", tr("Selected keys"), keyed.join(", "));
+        kit::dropdown(app, ui, ctrl, "motionLibrary.tools.bounce.property", &[label.as_str()], 0);
+        c.y += 30.0 * c.s;
+    }
+    // CX9c: Range Selector keys or text layers get Elias's bounce text preset (native, no plug).
+    let reveal = reveal_keys(&app.session) || text_layers_only(&app.session);
+    if reveal {
+        let t = app.tokens;
+        note(
+            ui,
+            c,
+            &t,
+            "On text, Apply spring applies your bounce text preset (Motion Library ▸ Elias ▸ Text animations, “Bounce In”): Strength sets its Bounce Overshoot (%), Bounces / s its Bounce Speed. The spring settles by itself. No preset yet: save one first.",
+        );
+    }
     choice_row(app, ui, c, "motionLibrary.tools.bounce.motion", "Motion", &MOTIONS, &mut set.motion);
     set.strength = number_row(app, ui, c, "motionLibrary.tools.bounce.strength", "Strength (%)", set.strength, STRENGTH, 0);
     set.frequency = number_row(app, ui, c, "motionLibrary.tools.bounce.frequency", "Bounces / s", set.frequency, FREQUENCY, 1);
-    set.decay = number_row(app, ui, c, "motionLibrary.tools.bounce.decay", "Settle speed", set.decay, DECAY, 1);
-    let items = [("apply", "Apply spring", true, en.plug()), ("remove", "Remove spring", false, en.plug())];
+    // The text preset's spring has no settle speed of its own (it follows from the overshoot).
+    if !reveal {
+        set.decay = number_row(app, ui, c, "motionLibrary.tools.bounce.decay", "Settle speed", set.decay, DECAY, 1);
+    }
+    let items = [("apply", "Apply spring", true, (reveal && en.idle) || en.plug()), ("remove", "Remove spring", false, en.plug())];
     match button_rows(app, ui, c, "bounce", &items, 110.0) {
         Some(0) => Some(("bounce", json!({}))),
         Some(_) => Some(("bounce", json!({"mode": "remove"}))),
@@ -1211,6 +1299,193 @@ pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
     }
 }
 
+// ── Style families (batch 1, CX3) ──────────────────────────────────────────────────────────────
+
+/// The Motion Library's Families tab: every style family of the project (`style.family.list`)
+/// with its size; dragging a size and letting go changes every linked layer
+/// (`style.family.set`, one undo step). "Link selected" adds the selected layers to a family.
+pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: f32) {
+    let t = app.tokens;
+    let ctx = ui.ctx().clone();
+    let p = ui.painter().with_clip_rect(area);
+    p.rect_filled(area, 0.0, t.panel_bg);
+    app.auto.add("motionLibrary.families", area, "Style families");
+    let x0 = area.min.x + 12.0 * s;
+    let w = (area.width() - 24.0 * s).max(80.0);
+    let mut y = area.min.y + 12.0 * s;
+    p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, tr("Style families · change one, all follow"), Tokens::semibold(12.5 * s), t.text);
+    y += 26.0 * s;
+    // The list, read again when the document changes.
+    let cache = egui::Id::new("ml-families-cache");
+    let rev = app.session.revision;
+    let list: Value = match ctx.data(|d| d.get_temp::<(u64, Value)>(cache)) {
+        Some((r, v)) if r == rev => v,
+        _ => {
+            let v = app.session.execute("style.family.list", json!({})).unwrap_or(Value::Null);
+            ctx.data_mut(|d| d.insert_temp(cache, (rev, v.clone())));
+            v
+        }
+    };
+    let fams = list["families"].as_array().cloned().unwrap_or_default();
+    if fams.is_empty() {
+        let g = p.layout(
+            tr("No families yet. Select the layers that share a style (all your captions), type a family name below and press Link selected.").to_string(),
+            Tokens::ui(11.0 * s),
+            t.text_dim,
+            w,
+        );
+        let gh = g.size().y;
+        p.galley(pos2(x0, y), g, t.text_dim);
+        y += gh + 10.0 * s;
+    }
+    for f in &fams {
+        let (Some(name), Some(count)) = (f["family"].as_str(), f["count"].as_u64()) else { continue };
+        let size = f["size"].as_f64().unwrap_or(100.0);
+        p.text(pos2(x0, y + 9.0 * s), Align2::LEFT_CENTER, name, Tokens::semibold(12.0 * s), t.text);
+        p.text(
+            pos2(x0 + 150.0 * s, y + 9.0 * s),
+            Align2::LEFT_CENTER,
+            format!("{count} layer{}", if count == 1 { "" } else { "s" }),
+            Tokens::ui(11.0 * s),
+            t.text_dim,
+        );
+        // Size: the slider shows the value while dragging; letting go runs the command once.
+        let drag_id = egui::Id::new(("ml-family-size", name));
+        let mut v: f64 = ctx.data(|d| d.get_temp(drag_id)).unwrap_or(size);
+        let sr = Rect::from_min_size(pos2(x0, y + 20.0 * s), vec2(w.min(320.0 * s), 18.0 * s));
+        let resp = ui.put(sr, egui::Slider::new(&mut v, 50.0..=250.0).suffix(" %").text(tr("Size")));
+        app.auto.add_response(&format!("motionLibrary.families.{name}.size"), &resp, &format!("{name} size"));
+        if resp.dragged() || resp.has_focus() {
+            ctx.data_mut(|d| d.insert_temp(drag_id, v));
+        }
+        let commit = resp.drag_stopped() || (resp.changed() && !resp.dragged());
+        if commit && (v - size).abs() > 1e-6 {
+            ctx.data_mut(|d| d.remove::<f64>(drag_id));
+            match crate::menus::invoke(app, &ctx, "style.family.set", json!({"family": name, "size": v})) {
+                Ok(r) => {
+                    let n = r["layers"].as_u64().unwrap_or(0);
+                    app.toast = Some((format!("{n} {name} updated: size {v:.0} %"), ctx.input(|i| i.time)));
+                }
+                Err(e) => app.ui.status = e,
+            }
+        } else if !resp.dragged() && !resp.has_focus() {
+            ctx.data_mut(|d| d.remove::<f64>(drag_id));
+        }
+        y += 48.0 * s;
+    }
+    // Link the selection to a family (new or existing).
+    y += 6.0 * s;
+    let name_id = egui::Id::new("ml-family-new-name");
+    let mut fname: String = ctx.data(|d| d.get_temp(name_id)).unwrap_or_else(|| "Captions".to_string());
+    let fr = Rect::from_min_size(pos2(x0, y), vec2((w - 130.0 * s).max(60.0), 22.0 * s));
+    let fresp = ui.put(fr, egui::TextEdit::singleline(&mut fname).hint_text(tr("Family name")));
+    app.auto.add_response("motionLibrary.families.name", &fresp, "Family name");
+    ctx.data_mut(|d| d.insert_temp(name_id, fname.clone()));
+    let b = Rect::from_min_size(pos2(fr.max.x + 8.0 * s, y), vec2(120.0 * s, 22.0 * s));
+    if kit::button(app, ui, b, "motionLibrary.families.link", "Link selected", true) {
+        match crate::menus::invoke(app, &ctx, "style.family.link", json!({"family": fname.trim()})) {
+            Ok(r) => {
+                app.toast = Some((format!("Linked {} layer(s) to {}", r["linked"].as_u64().unwrap_or(0), fname.trim()), ctx.input(|i| i.time)));
+            }
+            Err(e) => app.ui.status = e,
+        }
+    }
+    text_animations(app, ui, &ctx, area, y + 40.0 * s, s);
+}
+
+/// Text animations (CX8, CX8c): Elias's text preset cards (Motion Library ▸ Elias ▸ Text
+/// animations, from `text.presetFamilies`), each with the Expression Controls its file carries
+/// (read from the card, nothing built in). A preset applies to the selected text layers
+/// (`text.apply`); "Save selected as preset" saves the selected workshop layer's effects and
+/// text animators as a preset card (`ml.saveTextPreset`, again = update).
+fn text_animations(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, top: f32, s: f32) {
+    let t = app.tokens;
+    let p = ui.painter().with_clip_rect(area);
+    let x0 = area.min.x + 12.0 * s;
+    let w = (area.width() - 24.0 * s).max(80.0);
+    let mut y = top;
+    p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, tr("Text animations · Elias ▸ Text animations"), Tokens::semibold(12.5 * s), t.text);
+    y += 26.0 * s;
+    let cache = egui::Id::new("ml-text-presets-cache");
+    let rev = app.session.revision;
+    let now = ctx.input(|i| i.time);
+    // Read again when the project changes and every 10 s (a card saved meanwhile shows up).
+    let list: Value = match ctx.data(|d| d.get_temp::<(u64, f64, Value)>(cache)) {
+        Some((r, at, v)) if r == rev && now - at < 10.0 => v,
+        _ => {
+            let v = app.session.execute("text.presetFamilies", json!({})).unwrap_or(Value::Null);
+            ctx.data_mut(|d| d.insert_temp(cache, (rev, now, v.clone())));
+            v
+        }
+    };
+    let presets = list["presets"].as_array().cloned().unwrap_or_default();
+    if presets.is_empty() {
+        p.text(
+            pos2(x0, y + 8.0 * s),
+            Align2::LEFT_CENTER,
+            tr("No text presets yet: select a workshop layer and Save selected as preset."),
+            Tokens::ui(11.0 * s),
+            t.text_dim,
+        );
+        y += 24.0 * s;
+    }
+    let mut apply: Option<String> = None;
+    for (i, pr) in presets.iter().enumerate() {
+        if y > area.max.y - 60.0 * s {
+            break;
+        }
+        let Some(name) = pr["name"].as_str() else { continue };
+        let b = Rect::from_min_size(pos2(x0, y), vec2(150.0 * s, 20.0 * s));
+        if kit::button(app, ui, b, &format!("motionLibrary.textAnimations.{i}"), name, false) {
+            apply = Some(name.to_string());
+        }
+        // Its controls, as the card's file has them.
+        let controls: Vec<String> = pr["controls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                let n = c["name"].as_str()?;
+                Some(match &c["value"] {
+                    Value::Null => n.to_string(),
+                    Value::String(v) => format!("{n} {v}"),
+                    v => format!("{n} {v}"),
+                })
+            })
+            .collect();
+        let summary = if controls.is_empty() {
+            if pr["source"] == "motion" { tr("(controls show once it is downloaded)").to_string() } else { tr("(no controls)").to_string() }
+        } else {
+            controls.join(" · ")
+        };
+        let tx = b.max.x + 8.0 * s;
+        let room = (x0 + w - tx).max(0.0);
+        let p2 = ui.painter().with_clip_rect(Rect::from_min_size(pos2(tx, y), vec2(room, 20.0 * s)).intersect(area));
+        p2.text(pos2(tx, y + 10.0 * s), Align2::LEFT_CENTER, &summary, Tokens::ui(10.5 * s), t.text_dim);
+        ui.interact(b, egui::Id::new(("ml-text-preset-tip", i)), Sense::hover()).on_hover_text(summary.as_str());
+        y += 26.0 * s;
+    }
+    if let Some(name) = apply {
+        // On the selected text layers; text.apply's followUp (the glow style) runs too.
+        match super::text_apply::run(app, ctx, json!({"preset": name})) {
+            Ok(_) => app.toast = Some((format!("{name} applied"), ctx.input(|i| i.time))),
+            Err(e) => app.ui.status = e,
+        }
+    }
+    // Save the selected workshop layer as its preset.
+    let b = Rect::from_min_size(pos2(x0, y + 4.0 * s), vec2(190.0 * s, 22.0 * s));
+    if kit::button(app, ui, b, "motionLibrary.textAnimations.save", "Save selected as preset", false) {
+        let layer = app.session.state.selected_layers.first().map(|l| l.0);
+        match layer {
+            Some(l) => match crate::menus::invoke(app, ctx, "ml.saveTextPreset", json!({"layer": l})) {
+                Ok(r) => app.ui.status = format!("Saving “{}” to Motion Library ▸ {}", r["saving"].as_str().unwrap_or(""), r["folder"].as_str().unwrap_or("")),
+                Err(e) => app.ui.status = e,
+            },
+            None => app.ui.status = "Select the workshop layer to save (Creating Text Presets)".into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1229,69 +1504,103 @@ mod tests {
         }
     }
 
+    /// Regression (19 Oct): with Opacity keys selected and the dropdown left on Position, Apply
+    /// spring bounced Position ("Nothing to bounce: … › Position (needs 2 keyframes)"). Selected
+    /// keys now win: the plug gets `selected` and springs the keys' own properties.
+    #[test]
+    fn bounce_springs_the_selected_keys_not_the_dropdown_property() {
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+        let l = s.execute("layer.newSolid", json!({"name": "Tag", "width": 10, "height": 10})).unwrap()["layer"].as_u64().unwrap();
+        for (t, v) in [(0.0, 0.0), (0.5, 100.0), (1.0, 80.0)] {
+            s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "time": t, "value": v})).unwrap();
+        }
+        let set = ToolSettings::default();
+        assert_eq!(set.property, "position");
+        assert!(keyed_props(&s).is_empty(), "no keys selected yet");
+        let keys: Vec<Value> = [0.0, 0.5, 1.0].iter().map(|t| json!({"layer": l, "path": "transform/opacity", "time": t})).collect();
+        s.execute("keys.select", json!({"keys": keys})).unwrap();
+        let keyed = keyed_props(&s);
+        assert_eq!(keyed, vec!["Opacity".to_string()]);
+        let b = build("bounce", &json!({}), &set, &keyed).unwrap();
+        assert_eq!(
+            b.plan,
+            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "selected", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
+        );
+        let b = build("bounce", &json!({"mode": "remove"}), &set, &keyed).unwrap();
+        assert_eq!(b.plan, Plan::Plug { op: "toolkit_bounce", args: json!({"property": "selected", "mode": "remove"}) });
+        // An explicit property still wins, and `selected` can be asked for by name.
+        let b = build("bounce", &json!({"property": "scale"}), &set, &keyed).unwrap();
+        assert_eq!(
+            b.plan,
+            Plan::Plug { op: "toolkit_bounce", args: json!({"property": "scale", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
+        );
+        assert!(build("bounce", &json!({"property": "selected"}), &set, &[]).is_ok());
+    }
+
     #[test]
     fn tools_take_the_panel_values_and_check_their_arguments() {
         let set = ToolSettings::default();
-        let b = build("bounce", &json!({}), &set).unwrap();
+        let b = build("bounce", &json!({}), &set, &[]).unwrap();
         assert_eq!(b.section, BOUNCE);
         assert_eq!(
             b.plan,
             Plan::Plug { op: "toolkit_bounce", args: json!({"property": "position", "mode": "overshoot", "strength": 20.0, "frequency": 3.0, "decay": 5.0}) }
         );
-        let b = build("bounce", &json!({"mode": "remove", "property": "scale"}), &set).unwrap();
+        let b = build("bounce", &json!({"mode": "remove", "property": "scale"}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_bounce", args: json!({"property": "scale", "mode": "remove"}) });
-        assert!(build("bounce", &json!({"strength": 201}), &set).unwrap_err().contains("strength must be between 0 and 200"));
-        assert!(build("bounce", &json!({"frequency": 0}), &set).is_err());
-        assert!(build("bounce", &json!({"decay": "fast"}), &set).is_err());
-        assert!(build("bounce", &json!({"property": "skew"}), &set).is_err());
+        assert!(build("bounce", &json!({"strength": 201}), &set, &[]).unwrap_err().contains("strength must be between 0 and 200"));
+        assert!(build("bounce", &json!({"frequency": 0}), &set, &[]).is_err());
+        assert!(build("bounce", &json!({"decay": "fast"}), &set, &[]).is_err());
+        assert!(build("bounce", &json!({"property": "skew"}), &set, &[]).is_err());
 
-        let b = build("anchor", &json!({"at": "bottomRight"}), &set).unwrap();
+        let b = build("anchor", &json!({"at": "bottomRight"}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_anchor", args: json!({"x": 1.0, "y": 1.0}) });
-        let b = build("anchor", &json!({"x": 0.0}), &set).unwrap();
+        let b = build("anchor", &json!({"x": 0.0}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_anchor", args: json!({"x": 0.0, "y": 0.5}) });
-        assert!(build("anchor", &json!({"at": "middle"}), &set).is_err());
-        assert!(build("anchor", &json!({"x": 1.5}), &set).is_err());
+        assert!(build("anchor", &json!({"at": "middle"}), &set, &[]).is_err());
+        assert!(build("anchor", &json!({"x": 1.5}), &set, &[]).is_err());
 
-        let b = build("create", &json!({"kind": "solid", "color": "#F00"}), &set).unwrap();
+        let b = build("create", &json!({"kind": "solid", "color": "#F00"}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Native { cmd: "layer.newSolid", args: json!({"color": "#ff0000"}) });
-        assert!(build("create", &json!({"kind": "camera"}), &set).is_err());
-        let b = build("fill", &json!({}), &set).unwrap();
+        assert!(build("create", &json!({"kind": "camera"}), &set, &[]).is_err());
+        let b = build("fill", &json!({}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_style", args: json!({"kind": "fill", "colors": ["#ffffff", "#ffffff", "#ffffff", "#ffffff"]}) });
 
-        let b = build("style", &json!({"kind": "four", "animate": true}), &set).unwrap();
+        let b = build("style", &json!({"kind": "four", "animate": true}), &set, &[]).unwrap();
         assert_eq!(b.section, COLOUR);
         assert_eq!(b.plan, Plan::Plug { op: "toolkit_style", args: json!({"kind": "four", "colors": DEFAULT_COLORS, "duration": 2.0, "animate": true}) });
-        assert!(build("style", &json!({"colors": ["#fff"]}), &set).is_err());
-        assert!(build("style", &json!({"colors": ["#fff", "#000", "#123456", "blue"]}), &set).is_err());
-        assert!(build("style", &json!({"duration": 0.01}), &set).is_err());
-        assert!(build("style", &json!({"kind": "plaid"}), &set).is_err());
+        assert!(build("style", &json!({"colors": ["#fff"]}), &set, &[]).is_err());
+        assert!(build("style", &json!({"colors": ["#fff", "#000", "#123456", "blue"]}), &set, &[]).is_err());
+        assert!(build("style", &json!({"duration": 0.01}), &set, &[]).is_err());
+        assert!(build("style", &json!({"kind": "plaid"}), &set, &[]).is_err());
 
-        let b = build("precompGroups", &json!({"count": 3, "name": "  "}), &set).unwrap();
+        let b = build("precompGroups", &json!({"count": 3, "name": "  "}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Native { cmd: "layer.multiPrecompose", args: json!({"name": "Precomp", "count": 3}) });
-        assert!(build("precompGroups", &json!({"count": 2.5}), &set).is_err());
-        assert!(build("precompGroups", &json!({"count": 0}), &set).is_err());
-        assert!(build("precompGroups", &json!({"count": 257}), &set).is_err());
-        assert_eq!(build("purge", &json!({}), &set).unwrap().plan, Plan::Native { cmd: "edit.purge", args: json!({"what": "memory"}) });
-        assert!(build("explode", &json!({}), &set).is_err());
+        assert!(build("precompGroups", &json!({"count": 2.5}), &set, &[]).is_err());
+        assert!(build("precompGroups", &json!({"count": 0}), &set, &[]).is_err());
+        assert!(build("precompGroups", &json!({"count": 257}), &set, &[]).is_err());
+        assert_eq!(build("purge", &json!({}), &set, &[]).unwrap().plan, Plan::Native { cmd: "edit.purge", args: json!({"what": "memory"}) });
+        assert!(build("explode", &json!({}), &set, &[]).is_err());
     }
 
     #[test]
     fn text_split_needs_a_phrase_only_to_isolate_one() {
         let mut set = ToolSettings::default();
-        let b = build("split", &json!({"reverse": true}), &set).unwrap();
+        let b = build("split", &json!({"reverse": true}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Native { cmd: "text.split", args: json!({"mode": "words", "text": "", "reverse": true, "deleteOriginal": false}) });
-        assert!(build("split", &json!({"mode": "custom"}), &set).is_err());
+        assert!(build("split", &json!({"mode": "custom"}), &set, &[]).is_err());
         set.split_text = "Hello".into();
-        let b = build("split", &json!({"mode": "custom"}), &set).unwrap();
+        let b = build("split", &json!({"mode": "custom"}), &set, &[]).unwrap();
         assert_eq!(b.plan, Plan::Native { cmd: "text.split", args: json!({"mode": "custom", "text": "Hello", "reverse": false, "deleteOriginal": false}) });
-        assert!(build("split", &json!({"mode": "sentences"}), &set).is_err());
-        assert!(build("split", &json!({"mode": "custom", "text": "x".repeat(1025)}), &set).is_err());
+        assert!(build("split", &json!({"mode": "sentences"}), &set, &[]).is_err());
+        assert!(build("split", &json!({"mode": "custom", "text": "x".repeat(1025)}), &set, &[]).is_err());
     }
 
     #[test]
     fn images_come_from_a_path_data_a_dialog_or_the_clipboard() {
         let set = ToolSettings::default();
-        let src = |p: Value| match build("image", &p, &set).unwrap().plan {
+        let src = |p: Value| match build("image", &p, &set, &[]).unwrap().plan {
             Plan::Image(s) => s,
             other => panic!("{other:?}"),
         };
@@ -1299,7 +1608,7 @@ mod tests {
         assert_eq!(src(json!({"dialog": true})), ImageSource::Dialog);
         assert_eq!(src(json!({"path": "/a.png"})), ImageSource::Path("/a.png".into()));
         assert_eq!(src(json!({"png": "iVBO"})), ImageSource::Png("iVBO".into()));
-        assert!(build("image", &json!({"png": "A".repeat(7_000_001)}), &set).is_err());
+        assert!(build("image", &json!({"png": "A".repeat(7_000_001)}), &set, &[]).is_err());
         assert!(check_png(b"\x89PNG\r\n\x1a\nrest").is_ok());
         assert!(check_png(b"GIF89a").is_err());
         assert!(read_png("/definitely/not/here.png").is_err());

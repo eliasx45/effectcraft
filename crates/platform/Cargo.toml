@@ -34,6 +34,8 @@ log = { workspace = true }
 # objc2-core-foundation was already in Cargo.lock (through eframe / winit).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = "0.3.2"
+# Cursor location during a Finder drag (cursor.rs: CGEventCreate + CGEventGetLocation); already in the lockfile.
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes"] }
 objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
 objc2-video-toolbox = "0.3.2"

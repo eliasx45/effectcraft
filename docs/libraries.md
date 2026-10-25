@@ -30,6 +30,15 @@ All of them are engine commands, so the menus, the CLI, the control channel and 
 With no composition open, comps and media are only imported. An entry whose file is missing is an
 error that changes nothing.
 
+## Reading an entry (agents)
+
+An agent that should *reuse* a `comp` entry rather than drop it in as is reads it as a recipe:
+`library.get {id}` gives the `.ecproj` and comp name; `file.importProject {path}` brings it in;
+`comp.recipe {comp}` returns only what was authored (layers, shape contents, effects, styles,
+changed values and keyframes, a few KB instead of the project's tens), and
+`comp.fromRecipe {recipe}` builds an adapted copy after the agent edits it. See
+[agents.md, Reuse a library comp](agents.md#reuse-a-library-comp-recipes).
+
 ## `library.json`
 
 ```json

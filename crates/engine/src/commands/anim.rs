@@ -1,14 +1,14 @@
 //! Keyframe clipboard, selection, nudging, direct key/ease edits (Graph Editor handles) and key
 //! inspection for the Keyframe Velocity / Keyframe Interpolation dialogs.
 
-use effectcraft_keyframe::{Ease, Interp, Keyframe, key_at, retime_roving, side_ease};
+use effectcraft_keyframe::{Ease, Eases, Interp, Keyframe, key_at, retime_roving, side_ease};
 use effectcraft_project::{LayerId, Property, Uid};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use super::prop::{KeyTimeBase, key_time, key_timing, prop_ref};
 use super::{CommandSpec, bad, comp_id, f_p, has_comp, has_keys, layers_p, merge_p, str_p, time_p};
-use crate::{EngineError, KeyClip, KeyRef, Result, Session, cmd, query};
+use crate::{EngineError, GraphClip, KeyClip, KeyGraph, KeyRef, Result, Session, cmd, query};
 
 fn has_key_clip(s: &Session) -> std::result::Result<(), String> {
     has_comp(s)?;
@@ -45,9 +45,121 @@ fn copy(s: &mut Session, _: &Value) -> Result<Value> {
         clip.push(KeyClip { layer: lid, path, keys });
     }
     let n: usize = clip.iter().map(|c| c.keys.len()).sum();
+    s.state.graph_clipboard = graph_clip(comp, &s.state.selected_keys);
     s.state.key_clipboard = clip;
     s.state.clip_is_keys = true;
     Ok(json!(n))
+}
+
+impl KeyGraph {
+    fn of(k: &Keyframe) -> KeyGraph {
+        KeyGraph {
+            in_interp: k.in_interp,
+            out_interp: k.out_interp,
+            in_ease: k.in_ease.clone(),
+            out_ease: k.out_ease.clone(),
+            continuous: k.continuous,
+            auto_bezier: k.auto_bezier,
+        }
+    }
+}
+
+/// `eases` for a value of `dims` dimensions: the same list, or the missing ones repeating the last.
+fn fit_eases(eases: &Eases, dims: usize) -> Eases {
+    (0..dims.max(1)).filter_map(|d| eases.get(d).or_else(|| eases.last()).copied()).collect()
+}
+
+/// What copying `selected` keeps as the graph to paste: the one graph they all share, else the
+/// graphs of the last selected property's selected keys, in time order (one when those share it).
+fn graph_clip(comp: &effectcraft_project::Comp, selected: &[KeyRef]) -> GraphClip {
+    let key = |r: &KeyRef| comp.layer(r.layer).and_then(|l| l.props.find(r.prop)).and_then(|pr| pr.keys.iter().find(|k| k.time == r.time));
+    let all: Vec<KeyGraph> = selected.iter().filter_map(|r| key(r).map(KeyGraph::of)).collect();
+    let same = |g: &[KeyGraph]| g.windows(2).all(|w| w[0] == w[1]);
+    let keys = if same(&all) {
+        all.into_iter().take(1).collect()
+    } else {
+        let mut last: Vec<(Tick, KeyGraph)> = match selected.last() {
+            Some(l) => selected.iter().filter(|r| r.layer == l.layer && r.prop == l.prop).filter_map(|r| key(r).map(|k| (r.time, KeyGraph::of(k)))).collect(),
+            None => vec![],
+        };
+        last.sort_by_key(|(t, _)| *t);
+        let graphs: Vec<KeyGraph> = last.into_iter().map(|(_, g)| g).collect();
+        if same(&graphs) { graphs.into_iter().take(1).collect() } else { graphs }
+    };
+    GraphClip { keys, source: selected.to_vec() }
+}
+
+/// Whether Edit ▸ Paste puts the copied graph on the selected keyframes: keyframes were copied
+/// and a different set of keyframes is selected now (with the copied ones still selected, Paste
+/// pastes the keys themselves at the current time).
+pub(crate) fn graph_paste_applies(s: &Session) -> bool {
+    let (sel, src) = (&s.state.selected_keys, &s.state.graph_clipboard.source);
+    s.state.clip_is_keys
+        && s.state.value_clipboard.is_empty()
+        && !s.state.graph_clipboard.keys.is_empty()
+        && !sel.is_empty()
+        && (sel.iter().any(|k| !src.contains(k)) || src.iter().any(|k| !sel.contains(k)))
+}
+
+fn has_graph_paste(s: &Session) -> std::result::Result<(), String> {
+    has_comp(s)?;
+    if s.state.graph_clipboard.keys.is_empty() { Err("no keyframes have been copied".into()) } else { Ok(()) }
+}
+
+/// Put the copied graph on the selected keyframes of every property: one graph for all of them
+/// when the copied keys shared it; else the copied segments repeat over each property's selected
+/// keys in time order (the copied keys' outgoing and incoming sides, segment by segment), so any
+/// number of keys takes a graph copied from two.
+fn paste_graph(s: &mut Session, p: &Value) -> Result<Value> {
+    let clip = s.state.graph_clipboard.keys.clone();
+    if clip.is_empty() {
+        return Err(bad("keys.pasteGraph", "no keyframes have been copied"));
+    }
+    let cid = comp_id(s, p)?;
+    let mut groups: std::collections::BTreeMap<(LayerId, Uid), Vec<Tick>> = Default::default();
+    for k in &s.state.selected_keys {
+        groups.entry((k.layer, k.prop)).or_default().push(k.time);
+    }
+    if groups.is_empty() {
+        return Err(bad("keys.pasteGraph", "select keyframes first"));
+    }
+    s.edit("Paste Keyframe Graph", merge_p(p), |proj, _| {
+        let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
+        let mut n = 0;
+        for ((lid, uid), times) in groups {
+            let Some(pr) = comp.layer_mut(lid).and_then(|l| l.props.find_mut(uid)) else { continue };
+            if pr.hold_only || pr.static_only {
+                continue;
+            }
+            let idx: Vec<usize> = pr.keys.iter().enumerate().filter(|(_, k)| times.contains(&k.time)).map(|(i, _)| i).collect();
+            let count = idx.len();
+            for (j, i) in idx.into_iter().enumerate() {
+                let Some(k) = pr.keys.get_mut(i) else { continue };
+                let dims = k.value.dims();
+                let one = |at: usize| clip.get(at.min(clip.len().saturating_sub(1)));
+                let segs = clip.len().saturating_sub(1).max(1);
+                if clip.len() == 1 || count == 1 {
+                    let Some(g) = one(0) else { continue };
+                    (k.in_interp, k.out_interp, k.continuous, k.auto_bezier) = (g.in_interp, g.out_interp, g.continuous, g.auto_bezier);
+                    k.in_ease = fit_eases(&g.in_ease, dims);
+                    k.out_ease = fit_eases(&g.out_ease, dims);
+                } else {
+                    // Key j leaves along segment j and arrives along segment j - 1 (the pattern's).
+                    let out_at = if j + 1 < count { j % segs } else { (j.saturating_sub(1)) % segs + 1 };
+                    let in_at = if j == 0 { 0 } else { (j - 1) % segs + 1 };
+                    let (Some(go), Some(gi)) = (one(out_at), one(in_at)) else { continue };
+                    k.out_interp = go.out_interp;
+                    k.out_ease = fit_eases(&go.out_ease, dims);
+                    k.in_interp = gi.in_interp;
+                    k.in_ease = fit_eases(&gi.in_ease, dims);
+                    k.auto_bezier = false;
+                    k.continuous = k.continuous && k.in_ease.iter().zip(k.out_ease.iter()).all(|(a, b)| (a.speed - b.speed).abs() < 1e-9);
+                }
+                n += 1;
+            }
+        }
+        Ok(json!(n))
+    })
 }
 
 /// Values of the same kind (and dimensionality) can receive each other's keys.
@@ -122,7 +234,14 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
                     k = k.hold();
                 }
                 match pr.keys.binary_search_by(|x| x.time.cmp(&k.time)) {
-                    Ok(i) => pr.keys[i] = k,
+                    // Landing on a key: only its value changes; it keeps its own eases, tangents
+                    // and label, so the graph on either side keeps its shape (Paste Keyframe
+                    // Graph is the way to copy eases).
+                    Ok(i) => {
+                        if let Some(old) = pr.keys.get_mut(i) {
+                            old.value = k.value;
+                        }
+                    }
                     Err(i) => pr.keys.insert(i, k),
                 }
                 sel.push(KeyRef { layer: *lid, prop: *uid, time: lt });
@@ -389,8 +508,8 @@ fn info(s: &mut Session, p: &Value) -> Result<Value> {
             json!("bezier")
         };
         out.push(json!({
-            "layer": l.id.0, "prop": pr.uid, "name": pr.name, "path": l.props.match_path_of(pr.uid),
-            "time": k.time.seconds(), "compTime": l.comp_time(k.time).seconds(), "value": k.value.to_json(),
+            "layer": l.id.0, "prop": pr.uid, "name": pr.name, "path": super::query::tree_path_of(&l.props, pr.uid),
+            "matchPath": l.props.match_path_of(pr.uid), "time": k.time.seconds(), "compTime": l.comp_time(k.time).seconds(), "value": k.value.to_json(),
             "in": interp_name(k.in_interp), "out": interp_name(k.out_interp), "temporal": temporal,
             "autoBezier": k.auto_bezier, "continuous": k.continuous, "roving": k.roving, "spatial": spatial_kind,
             "dims": dims, "units": units(pr), "inEase": side(false), "outEase": side(true),
@@ -437,6 +556,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("keys.copy", "Copy Keyframes", [], None, "{}", has_keys, copy),
         cmd!("keys.paste", "Paste Keyframes", [], None, "{layers?, prop?|path?, time?}", has_key_clip, paste),
         cmd!(
+            "keys.pasteGraph",
+            "Paste Keyframe Graph",
+            [],
+            None,
+            "{merge?} (the copied keys' graph onto the selected keys; Edit ▸ Paste does it when other keys are selected)",
+            has_graph_paste,
+            paste_graph
+        ),
+        cmd!(
             "keys.selectAll",
             "Select All Keyframes",
             [],
@@ -480,4 +608,79 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("keys.timeReverse", "Time-Reverse Keyframes", ["Animation", "Keyframe Assistant"], None, "{}", has_keys, time_reverse),
         query!("keys.info", "Keyframe Info", "{keys?: [{layer, prop, time}]}", info),
     ]
+}
+
+#[cfg(test)]
+mod graph_paste_tests {
+    use effectcraft_keyframe::Interp;
+    use serde_json::json;
+
+    use crate::Session;
+
+    fn setup(keys: &[(f64, f64)]) -> (Session, u64, u64) {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "C", "width": 64, "height": 64, "frameRate": 30, "duration": 8})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "A", "width": 8, "height": 8})).unwrap();
+        let l = s.active_comp().unwrap().layers[0].id.0;
+        for (t, v) in keys {
+            s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "time": t, "value": v})).unwrap();
+        }
+        let uid = s.active_comp().unwrap().layers[0].props.prop("transform/opacity").unwrap().uid;
+        (s, l, uid)
+    }
+
+    fn select(s: &mut Session, l: u64, uid: u64, times: &[f64]) {
+        let keys: Vec<_> = times.iter().map(|t| json!({"layer": l, "prop": uid, "time": t})).collect();
+        s.execute("keys.select", json!({"keys": keys})).unwrap();
+    }
+
+    fn keys(s: &Session, l: u64) -> Vec<effectcraft_keyframe::Keyframe> {
+        s.active_comp().unwrap().layers.iter().find(|x| x.id.0 == l).unwrap().props.prop("transform/opacity").unwrap().keys.to_vec()
+    }
+
+    /// Copy two keys with a custom graph, select four others, Paste: every selected key gets the
+    /// graph, segment by segment; keys not selected stay; copying then pasting with the same keys
+    /// selected still pastes the keys themselves.
+    #[test]
+    fn paste_puts_the_copied_graph_on_any_number_of_selected_keys() {
+        let (mut s, l, uid) = setup(&[(0.0, 0.0), (1.0, 100.0), (2.0, 0.0), (3.0, 100.0), (4.0, 0.0), (5.0, 50.0)]);
+        select(&mut s, l, uid, &[0.0, 1.0]);
+        s.execute("keys.setEase", json!({"layer": l, "path": "transform/opacity", "time": 0.0, "side": "out", "influence": 80.0, "speed": 0.0})).unwrap();
+        s.execute("keys.setEase", json!({"layer": l, "path": "transform/opacity", "time": 1.0, "side": "in", "influence": 20.0, "speed": 0.0})).unwrap();
+        s.execute("edit.copy", json!({})).unwrap();
+        // The copied keys still selected: Paste pastes keys (at the CTI), not the graph.
+        assert!(!super::graph_paste_applies(&s));
+        select(&mut s, l, uid, &[2.0, 3.0, 4.0, 5.0]);
+        assert!(super::graph_paste_applies(&s));
+        let undo = s.history.undo.len();
+        s.execute("edit.paste", json!({})).unwrap();
+        assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+        let k = keys(&s, l);
+        assert_eq!(k.len(), 6, "no key added");
+        for i in 2..5 {
+            assert_eq!(k[i].out_interp, Interp::Bezier, "key {i} out");
+            assert!((k[i].out_ease[0].influence - 0.8).abs() < 1e-9, "key {i} out: {:?}", k[i].out_ease);
+        }
+        for i in 3..6 {
+            assert!((k[i].in_ease[0].influence - 0.2).abs() < 1e-9, "key {i} in: {:?}", k[i].in_ease);
+        }
+        assert_eq!(k[1].in_ease[0].influence, 0.2, "an unselected key keeps its own graph (here the copied one)");
+    }
+
+    /// Keys that all share one graph copy that graph: it goes on every selected key, both sides.
+    #[test]
+    fn one_shared_graph_goes_on_every_selected_key() {
+        let (mut s, l, uid) = setup(&[(0.0, 0.0), (1.0, 100.0), (2.0, 0.0), (3.0, 100.0)]);
+        select(&mut s, l, uid, &[0.0, 1.0]);
+        s.execute("keys.easyEase", json!({})).unwrap();
+        s.execute("edit.copy", json!({})).unwrap();
+        select(&mut s, l, uid, &[2.0, 3.0]);
+        s.execute("edit.paste", json!({})).unwrap();
+        let k = keys(&s, l);
+        for i in 2..4 {
+            assert_eq!((k[i].in_interp, k[i].out_interp), (Interp::Bezier, Interp::Bezier), "key {i}");
+            assert_eq!(k[i].in_ease, k[0].in_ease);
+            assert_eq!(k[i].out_ease, k[0].out_ease);
+        }
+    }
 }

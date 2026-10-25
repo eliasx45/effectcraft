@@ -192,6 +192,8 @@ fn forget(s: &mut Session, paths: &BTreeSet<String>) {
         s.footage.forget(p);
     }
     s.layer_cache.clear();
+    // Reloaded files may keep their footage settings but not their size and time.
+    s.refresh_disk_salt(true);
     s.events.push(crate::Event::PurgeCaches);
 }
 

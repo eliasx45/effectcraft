@@ -70,3 +70,20 @@ Hardware ProRes pictures are visually identical to the software decoder's, not b
 - ProRes previews decode on the media engines; the CPU goes to compositing.
 - The fork carries an `unsafe` crate upstream does not have: changes to `crates/platform` need
   the scrutiny of any FFI code, and it never goes into an upstream pull request.
+
+## Amendment (2026-10-20): background thread priority
+
+Cache Frames When Idle rendered at normal priority on every core and made the owner's whole Mac
+lag (300–470 % CPU). Its frames now render on their own small thread pool, and those threads
+lower themselves to macOS **utility** quality of service, so the UI, the window server and other
+apps run first. That needs one libSystem call, `pthread_set_qos_class_self_np`, which has no safe
+binding in the standard library or in the workspace's dependencies. It is the second job this
+crate may do, under the same containment rules:
+
+- the FFI module `qos` (`crates/platform/src/qos.rs`) carries `#[allow(unsafe_code)]` and holds
+  only the declaration, in an `unsafe extern` block with a `// SAFETY:` comment; the function is
+  declared `safe` because it takes plain integers, changes only the calling thread's scheduling
+  and reports bad values as an error code;
+- the public API is `effectcraft_platform::background_thread() -> bool` (safe; `false` and a no-op
+  off macOS). The desktop app hands it to the UI crate (`frames::set_idle_thread_start`), which
+  calls it at the start of each idle-cache thread; the UI crate itself stays `forbid(unsafe)`.

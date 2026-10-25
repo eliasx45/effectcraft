@@ -1168,3 +1168,13 @@ fn static_effect_layers_draw_from_the_cache() {
     assert!(frames[1] == frames[2]);
     check("static effect layer vs CPU", compare_at(&s, opts(), t(2)), 0.0);
 }
+
+/// The device the compositor owns asks for `MemoryUsage` so freed textures give
+/// their allocator blocks back, while its label and limits stay as they were.
+#[test]
+fn owned_devices_favour_memory_usage() {
+    let d = crate::context::device_descriptor(wgpu::Limits::default(), wgpu::Features::empty());
+    assert!(matches!(d.memory_hints, wgpu::MemoryHints::MemoryUsage));
+    assert_eq!(d.label, Some("effectcraft gpu"));
+    assert_eq!(d.required_limits.max_texture_dimension_2d, wgpu::Limits::default().max_texture_dimension_2d);
+}

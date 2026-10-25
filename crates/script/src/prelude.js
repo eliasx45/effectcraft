@@ -791,7 +791,7 @@ Property.prototype.property = function () { return null; };
   });
   def("expressionError", function () {
     var e = this.expression;
-    return e ? __get("exprError", { code: e }) : "";
+    return e ? __get("exprError", this.__ref({ code: e })) : "";
   });
   def("canSetExpression", function () { return !!this.__info().canSetExpression; });
   def("canVaryOverTime", function () { return !!this.__info().canVaryOverTime; });
@@ -814,7 +814,20 @@ Property.prototype.property = function () { return null; };
     for (var i = 0; i < k.length; i++) if (k[i].selected) out.push(i + 1);
     return out;
   });
-  def("isDropdownEffect", function () { return false; });
+  // The Menu of a Dropdown Menu Control.
+  def("isDropdownEffect", function () {
+    var g = this.parentProperty;
+    return !!g && g.matchName === "ADBE Dropdown Control";
+  });
+  // Dropdown Menu Control ▸ Menu: replace its items (a selection past the end moves to the last).
+  P.setPropertyParameters = function (items) {
+    if (!this.isDropdownEffect) throw __err("setPropertyParameters only works on the Menu of a Dropdown Menu Control");
+    if (!(items instanceof Array) || items.length === 0) throw __err("setPropertyParameters needs an array of item names");
+    var names = [];
+    for (var i = 0; i < items.length; i++) names.push(String(items[i]));
+    __call("effect.editDropdown", this.__ref({ items: names }));
+    return this;
+  };
 
   // Essential Graphics: expose this property in `comp` (its own composition).
   P.canAddToMotionGraphicsTemplate = function (comp) {
@@ -855,6 +868,12 @@ Property.prototype.property = function () { return null; };
       function fit(a) { var o = []; for (var i = 0; i < n; i++) o.push(a && a[i] ? [a[i][0], a[i][1]] : [0, 0]); return o; }
       return { vertices: fit(v.vertices), in_tangents: fit(v.inTangents), out_tangents: fit(v.outTangents), closed: v.closed !== false };
     }
+    // A gradient (text Gradient Fill Colors, shape gradients): the engine reads
+    // {colors: [[pos, [r, g, b, a]], …], opacities: [[pos, a], …]}, [[pos, colour], …] or [colour, …].
+    if (info.type === "gradient") {
+      if (!v || typeof v !== "object") throw __err("value must be a gradient: {colors: [[position, [r, g, b, a]], …]} or [[position, colour], …]");
+      return v;
+    }
     if (t === "LAYER_INDEX") {
       var idx = v && v.__id !== undefined ? v.index : __num(v);
       if (!idx) return null;
@@ -869,11 +888,21 @@ Property.prototype.property = function () { return null; };
     if (info.dims > 1) {
       if (!(v instanceof Array)) throw __err("value must be an array of " + info.dims + " numbers");
       var o = [];
-      for (var d = 0; d < info.dims; d++) o.push(d < v.length ? __num(v[d]) : (d === 2 ? 0 : __num(v[v.length - 1])));
+      // [x, y] for a 3D value keeps its z, as After Effects does (a 2D layer's Scale stays at 100).
+      for (var d = 0; d < info.dims; d++) o.push(d < v.length ? __num(v[d]) : (d === 2 ? this.__z(info, time) : __num(v[v.length - 1])));
       return o;
     }
     if (v instanceof Array) throw __err("value must be a number, not an array");
     return __num(v);
+  };
+  // The z a 2-number value leaves out: the property's current one (pre-expression, at `time` when
+  // keyed), else 100 for Scale and 0 for the rest.
+  P.__z = function (info, time) {
+    try {
+      var c = __get("value", { comp: this.__layer.__comp, layer: this.__layer.__id, uid: this.__uid, time: time === undefined ? 0 : __num(time, "time"), pre: true });
+      if (c instanceof Array && c.length > 2 && isFinite(c[2])) return c[2];
+    } catch (e) {}
+    return /Scale/.test(info.matchName || "") ? 100 : 0;
   };
   P.__fromEngine = function (v, info) {
     // The object model shows popups 1-based: our reversed (1) arrives as 2, After Effects says 3.
@@ -1060,11 +1089,11 @@ MarkerProperty.prototype = {
     if (!(mv instanceof MarkerValue)) throw __err("value must be a MarkerValue");
     var p = this.__p({ time: t, duration: mv.duration || 0, comment: mv.comment, chapter: mv.chapter, url: mv.url, frameTarget: mv.frameTarget, protected: !!mv.protectedRegion, label: mv.label || 0 });
     p.cuePoint = (mv.cuePointName || mv.__params.length) ? { name: mv.cuePointName, navigation: !mv.eventCuePoint, params: mv.__params } : null;
-    var l = this.__list(), at = -1;
-    for (var i = 0; i < l.length; i++) if (Math.abs(l[i].time - t) < 1e-6) at = i;
-    if (at >= 0) p.index = at;
-    else p["new"] = true;
-    __call("markers.set", p);
+    // A marker already at that time is replaced (one marker per time, as in After Effects); the
+    // engine reports it and the script's output gets a warning line, so it is never silent.
+    p["new"] = true;
+    var r = __call("markers.set", p);
+    if (r && r.warning) __print("Warning: " + r.warning);
   },
   setValueAtKey: function (i, mv) { this.setValueAtTime(this.keyTime(i), mv); },
   removeKey: function (i) { this.__at(i); __call("markers.delete", this.__p({ index: i - 1 })); },

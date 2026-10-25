@@ -137,7 +137,16 @@ pub trait FxTarget {
     /// Extend the text effect canvas without resampling existing pixels. Backends may
     /// retain their resident image; the default preserves the CPU reference behavior.
     fn effect_canvas(&mut self, size: [f64; 2]) {
-        self.cpu(&mut |buf| crate::fx::text_effect_canvas(buf, size));
+        self.effect_canvas_in([0.0; 2], size);
+    }
+    /// [`Self::effect_canvas`] of the region from `lo` to `hi` (effect-space layer units)
+    /// only: the part of the canvas the effects can make non-transparent.
+    fn effect_canvas_in(&mut self, lo: [f64; 2], hi: [f64; 2]) {
+        self.cpu(&mut |buf| crate::fx::text_effect_canvas_in(buf, lo, hi));
+    }
+    /// The buffer's size, offset and scale, when known without reading it back.
+    fn extent(&self) -> Option<([u32; 2], [f64; 2], f64)> {
+        None
     }
     /// Move the buffer's effect coordinates: subtract `d` (buffer px) from its offset.
     fn shift(&mut self, d: [f64; 2]);
@@ -183,7 +192,7 @@ impl<'a> Renderer<'a> {
             fn shift(&mut self, _: [f64; 2]) {}
         }
         let adjustment = layer.switches.adjustment;
-        self.run_effect_stack(ctx, layer, adjustment, limit, None, fx_origin(ctx, layer, adjustment), &mut Plan(visitor));
+        self.run_effect_stack(ctx, layer, adjustment, limit, None, fx_origin(ctx, layer, adjustment), &mut Plan(visitor), None);
         true
     }
 
@@ -287,6 +296,20 @@ impl<'a> Renderer<'a> {
         three_d::compose::gpu_run(self, ctx, run, out)
     }
 
+    /// [`Self::prepare_3d_run`] with the planes of some layers already made by the accelerator
+    /// (`bufs`: their size, offset and scale; their pixels stay on the device): those layers'
+    /// buffers aren't rendered on the CPU.
+    pub fn prepare_3d_run_with(&self, ctx: &EvalCtx<'a>, run: &[&Layer], out: (u32, u32), bufs: &three_d::PlaneBufs) -> Option<three_d::Run3d> {
+        three_d::compose::gpu_run(&Renderer { plane_bufs: Some(bufs), ..*self }, ctx, run, out)
+    }
+
+    /// The layer-space rectangle of a classic 3D layer's plane that an `out` canvas can show
+    /// (see `three_d::compose::plane_view`): an accelerator making the plane need not make the
+    /// rest. `None` = no such bound (the whole plane may matter).
+    pub fn plane_view_rect(&self, ctx: &EvalCtx<'a>, layer: &Layer, out: (u32, u32)) -> Option<[f64; 4]> {
+        three_d::compose::plane_view(self, ctx, layer, out)
+    }
+
     /// A run of consecutive 3D layers of an Advanced 3D comp prepared for an accelerator's
     /// compositor ([`three_d::adv::Prepared`]): rendered as one scene and composited (Normal,
     /// premultiplied over) onto the canvas. `None` = not an Advanced 3D comp, or a layer needs the
@@ -349,7 +372,7 @@ impl<'a> Renderer<'a> {
         let origin = fx_origin(ctx, layer, adjustment);
         let d = [origin[0] * self.opts.scale, origin[1] * self.opts.scale];
         target.shift([-d[0], -d[1]]);
-        self.run_effect_stack(ctx, layer, adjustment, usize::MAX, None, origin, target);
+        self.run_effect_stack(ctx, layer, adjustment, usize::MAX, None, origin, target, None);
         target.shift(d);
     }
 
@@ -357,8 +380,14 @@ impl<'a> Renderer<'a> {
     /// them in effect space (as [`Renderer::layer_input`] hands them out) and the result stays
     /// there. Returns the effect-space origin in layer coordinates (rebase by its negation).
     pub fn run_layer_effects_on(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget) -> [f64; 2] {
+        self.run_layer_effects_in(ctx, layer, target, crate::ContentClip::default())
+    }
+
+    /// [`Self::run_layer_effects_on`] for a source made in `clip` ([`Self::resident_content`]):
+    /// a text or shape layer's effect canvas only where it can show, as its key says.
+    pub fn run_layer_effects_in(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget, clip: crate::ContentClip) -> [f64; 2] {
         let origin = fx_origin(ctx, layer, false);
-        self.run_effect_stack(ctx, layer, false, usize::MAX, None, origin, target);
+        self.run_effect_stack(ctx, layer, false, usize::MAX, None, origin, target, clip.view());
         origin
     }
 

@@ -169,6 +169,19 @@ fn main() -> eframe::Result {
     };
     // Hardware ProRes decoding for previews; exports keep their exact decoder.
     log::info!("hardware ProRes decoding: {:?}", effectcraft_platform::register());
+    // MEM3: Rayon's global pool leaves a core or two to other apps (before anything uses it).
+    effectcraft_engine::render::concurrency::init_global_pool();
+    // Background work (prefetch away from the playhead, footage read-ahead, Cache Frames When
+    // Idle, RAM preview compression) runs at background priority (macOS utility QoS), after the
+    // UI, the frames the viewer and playback wait for (user-initiated) and other apps.
+    effectcraft_engine::render::concurrency::set_thread_priority_hooks(
+        || {
+            effectcraft_platform::background_thread();
+        },
+        || {
+            effectcraft_platform::foreground_thread();
+        },
+    );
     // The session log lives in the settings folder (`Logs/effectcraft.log`, the previous two runs
     // kept): a launch from the Dock or a menu has no terminal. Opened after the arguments, so
     // `--version` leaves no file behind; records logged until now are written to it first.
@@ -341,6 +354,9 @@ fn main() -> eframe::Result {
         app.hooks.pick_open_project = Some(Box::new(|| {
             rfd::FileDialog::new().add_filter("EffectCraft Project", &["ecproj", "ecprojx"]).pick_file().map(|p| p.to_string_lossy().to_string())
         }));
+        // Files dragged in from the Finder land under the cursor: winit sends no pointer motion
+        // during the drag (macOS reads it with CGEvent; elsewhere `None`, egui's pointer).
+        app.hooks.cursor_screen_position = Some(Box::new(effectcraft_platform::cursor::cursor_screen_position));
         app.hooks.system_theme = appearance::service();
         app.hooks.audio_device = Some(Box::new(audio_out::open));
         app.hooks.audio_devices = Some(Box::new(audio_out::devices));
@@ -450,13 +466,20 @@ fn wgpu_options(backends: Option<eframe::wgpu::Backends>, gate: Option<std::sync
         // with an out-of-memory error the frame's error scope catches (the GPU preview backs off)
         // instead of overcommitting until the device is lost (`effectcraft_gpu::vram`).
         setup.instance_descriptor.memory_budget_thresholds = eframe::wgpu::MemoryBudgetThresholds { for_resource_creation: Some(90), for_device_loss: None };
-        setup.device_descriptor = std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
-            label: Some("EffectCraft device"),
-            required_limits: device_limits(adapter.limits()),
-            ..Default::default()
-        });
+        setup.device_descriptor = std::sync::Arc::new(|adapter| device_descriptor(adapter.limits()));
     }
     config
+}
+
+/// The window device's descriptor: the adapter's limits ([`device_limits`]) and `MemoryUsage`,
+/// so memory the compositor frees on the shared device goes back to the driver.
+fn device_descriptor(adapter: eframe::wgpu::Limits) -> eframe::wgpu::DeviceDescriptor<'static> {
+    eframe::wgpu::DeviceDescriptor {
+        label: Some("EffectCraft device"),
+        required_limits: device_limits(adapter),
+        memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
+        ..Default::default()
+    }
 }
 
 /// The limits to request from an adapter that offers `adapter`: all of them, with textures
@@ -773,6 +796,17 @@ mod tests {
         tx.send(d).unwrap();
         let _d = app.recv_timeout(Duration::from_secs(5)).unwrap();
         wait_for("held again", &|| held.load(Ordering::SeqCst) == 1);
+    }
+
+    /// The window device asks for `MemoryUsage`: the adapter's limits, unchanged.
+    #[test]
+    fn the_window_device_favours_memory_usage() {
+        use eframe::wgpu::Limits;
+        let big = Limits { max_texture_dimension_2d: 32768, ..Limits::default() };
+        let d = super::device_descriptor(big);
+        assert!(matches!(d.memory_hints, eframe::wgpu::MemoryHints::MemoryUsage));
+        assert_eq!(d.required_limits.max_texture_dimension_2d, 16384);
+        assert_eq!(d.label, Some("EffectCraft device"));
     }
 
     /// A positional .ecprojx is a project file, not an unsupported media import (#528).

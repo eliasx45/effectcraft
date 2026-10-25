@@ -388,6 +388,38 @@ and lists what is wrong, in words an agent can act on. Run it before calling a d
   envelope, tempo by autocorrelation, beats by dynamic programming); with a single `time` only the
   key moments on that frame are checked. Without audio, or without a clear beat, a `notes` entry
   says it was skipped.
+- `off-accent` (warning, only when the comp has a speech map): a keyframed property's speed-graph
+  peak (the fastest moment between two eased keyframes; linear segments have none; keyframes only,
+  no expressions) within `accentWindow` frames (default 4) of a stressed syllable's accent that
+  misses it by more than one frame. The accent is `accentLead` frames (default 1) before the
+  stressed vowel, never before the syllable's onset: Elias's hand-timed peak on "CONtent" sits at
+  the k burst + 2 frames = the vowel − 1 frame. The message names the word, the onset, the vowel
+  and the time to move the peak to.
+
+### Speech maps (timing peaks to stressed syllables)
+
+1. `scripts/fork/speech-map MEDIA --start S --dur S --fps 29.97 --out map.json`: ElevenLabs Scribe
+   text (`scribe-words`), Montreal Forced Aligner phones with stress digits, then a forward
+   acoustic snap of each word-initial and stressed onset (0.15 frames median against hand labels;
+   `~/Developer/lab/S1-speech-timing/REPORT.md`). Times are media seconds + `--offset`.
+2. `speech.import {path, layer?}` stores it on the comp (undoable, saved with the project). With
+   `layer` (the voice footage) media time is mapped through the layer's start and stretch, and
+   words outside its in/out are dropped; without it the times are taken as comp seconds.
+3. `speech.get {stressed: true, start?, end?}` lists accents (`onset`, `vowel`, `accent`,
+   `accentFrame`): where to put a speed-graph peak. `speech.accents {layer?, start?, end?}` lists
+   every speed peak with its nearest accent and `offsetFrames` (negative = early); `hit` is
+   within one frame. `render.lint {rules: ["off-accent"]}` flags the near misses.
+4. `speech.clear` removes the map.
+5. `keys.alignPeak {layer, path | paths, speech: "content" | frame | time, mode?, graph?}` moves a
+   keyframed move so its speed-graph peak (the same finder as `off-accent`) lands on the target,
+   ±0.5 frame, in one undo step. Modes: `shift` (default, both keys, duration kept), `stretch-in` /
+   `stretch-out` (keep the second / first key), `ease` (keys stay, influences change). `graph` is one
+   of Devin's five (`fast-in`, `quick-launch`, `smooth-emphasis`, `slow-launch`, `fast-out`;
+   `keys.peakGraphs` lists them with their peak positions), `keep`, or a custom
+   `{out: {speed, influence}, in: {…}}`; without it, the graph peaking where the target falls is
+   picked. Keys in a precomp: `comp` is the layer's comp, `targetComp` the comp of the frame or
+   speech map (found automatically for speech), `via` the precomp layers when nested twice. Keys
+   land on whole frames unless that misses by more than half a target frame (`onFrames: false`).
 
 Geometry is the `get_layout` geometry (track-matte sources and adjustment layers are skipped);
 only `low-contrast` renders, at most 480 px on the long side, once per sample time that shows text.
@@ -420,6 +452,7 @@ Short recipes; every step is one tool call.
 | Open an After Effects project | `command_run file.importAep {"path":"x.aep"}` (needs Python with py-aep while converting; [packaging/aep/README.md](../packaging/aep/README.md)); the result is a native project |
 | Merge another EffectCraft project | `command_run file.importProject {"path":"other.ecproj"}` → `{folder, items, comps, rootComps, primaryComp, missingMedia, warnings}` (into a folder named after the file) |
 | Reuse motion from a library | `command_run library.search {"query":"lower third"}` → `command_run library.insert {"id":"<id>","time":2}` ([libraries.md](libraries.md)) |
+| Reuse a library comp, adapted | `command_run comp.recipe {"comp":"Lower Third"}` → read and edit the recipe → `command_run comp.fromRecipe {"recipe":{…}}` ([Reuse a library comp](#reuse-a-library-comp-recipes)) |
 | Save | `save_project {"path":"out.ecproj"}` |
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
@@ -465,6 +498,70 @@ scale and rotation; nothing is rendered, so it is cheap.
   fraction; layers covering the whole frame (backgrounds) are left out.
 - Cameras, lights, nulls, hidden (Video off) and content-less layers are listed with no segments
   and a `summary` saying why.
+
+### Reuse a library comp (recipes)
+
+A finished comp from a Motion Library can be inserted whole (`library.insert`), but an agent asked
+to *reuse* it (new colours, another text, a different size) needs to know how it is made. The
+`.ecproj` holds every default (43 KB for three shape layers); a **recipe** holds only what was
+authored, in a form that reads well and rebuilds the comp exactly:
+
+1. `command_run comp.recipe {"comp": "Main"}` (or `library.get` → `file.importProject` → the
+   comp; `path` writes the recipe to a file, `layers` picks some layers, `includeDefaults`
+   lists every property).
+2. Read it, change what the brief asks for (values, text, colours, timing, layers).
+3. `command_run comp.fromRecipe {"recipe": {…}}` (or `{"path": "r.json"}`, `name?`) builds a new
+   comp, its precomps first, as one undo step, and opens it. Check it with `render_preview` or
+   `render_compare` against the original.
+
+```json
+{"format": "effectcraft-recipe", "version": 1,
+ "comp": {"name": "Main", "width": 1920, "height": 1080, "frameRate": 29.97, "duration": 2.002},
+ "layers": [
+  {"name": "Circle", "type": "shape",
+   "contents": [{"kind": "group", "name": "Ellipse 1", "contents": [{"kind": "ellipse"}, {"kind": "stroke"}, {"kind": "gfill"}]}],
+   "styles": ["innerShadow"],
+   "props": {
+    "contents/group/contents/ellipse/size": [600, 600],
+    "contents/group/contents/stroke/width": 0.7,
+    "contents/group/contents/gfill/type": "Radial",
+    "contents/group/contents/gfill/colors": {"colors": [[0, [0.6235, 0.9098, 1, 1]], [1, [0.102, 0.1216, 0.4196, 1]]], "opacities": [[0, 1], [1, 1]]},
+    "layerStyles/innerShadow/size": 70,
+    "transform/position": [610, 540],
+    "transform/scale": {"keys": [{"time": 0, "value": [0, 0], "in": "easy", "out": "easy"},
+                                 {"time": 0.2669, "value": [115, 115], "in": "easy", "out": "easy"}]}}}]}
+```
+
+- **Layers** are listed top first. `type` is `shape`, `solid` (`color`, `size`), `text`
+  (`text`: what differs from a new text layer's Source Text, or just a string), `null`, `camera`,
+  `light` (`light`: Spot…), `primitive`, `footage` / `model` (`file`, `footage`: the item's
+  interpretation) or `precomp` (`comp`: a name from `precomps`, the nested comps' own recipes).
+  Timing (`start`, `in`, `out`, seconds), `parent` and `trackMatte` (`{layer, kind}`, layers by
+  name or `"#n"`, the n-th layer of the recipe), `blendMode`, `switches` and other layer
+  settings appear only when they differ from a new layer's.
+- **Structure** comes before values, in order: `contents` (shape items by kind: `group` with
+  its own `contents`, `rect`, `ellipse`, `star`, `polygon`, `path`, `fill`, `stroke`, `gfill`,
+  `gstroke`, `trim`, `repeater`, `round`, `offset`, `pucker`, `twist`, `zigzag`, `wiggle`, `merge`),
+  `effects` (`{effect: "ec.blur.gaussian"}`, then `effects/#1/…` paths), `masks` (`{mode?,
+  inverted?…}`), `styles` (layer style ids) and text `animators` (`{props: [position, opacity…],
+  selectors?}`). `name` / `enabled` appear when they aren't the default.
+- **`props`** holds only the properties whose value differs from a freshly made item of the same
+  kind, by path (the paths of `effectcraft-cli props` / `get_layer {"flat":true}`). A value is a
+  number, an array (2D layers leave out a default z; colours leave out alpha 1), a popup's option
+  name (`"Radial"`), a gradient, a path or a layer reference. An animated property is `{keys:
+  [{time, value, in?, out?}]}` with layer-time seconds and `in` / `out` easing `easy`, `hold`,
+  `bezier` or `[[speed, influence]…]` (linear when absent); an expression adds `expr`. `groups`
+  holds renamed or switched-off property groups by path.
+- Numbers are rounded to 4 decimals; times are exact (a time that lands on a frame is written to
+  4 decimals and read back as that frame). A rebuilt comp renders like the original within one
+  8-bit level, and `comp.recipe` of it is the same recipe.
+- What the menus' factories can't build (a stroke with extra dashes, a plug-in effect that isn't
+  installed, a tracker…) is a `raw` entry: the property group as stored. What can't come back at
+  all is listed in `unsupported` (`{comp, layer?, what, why}`): a footage file that isn't on this
+  machine (the layer comes back offline), a footage proxy, Essential Graphics and Essential
+  Properties overrides (they point at property uids), parents, mattes and layer parameters that
+  point at layers left out with `layers`.
+- Mistakes in a hand-written recipe are errors that name the layer and path and change nothing.
 
 ### Pitfalls
 

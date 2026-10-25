@@ -56,9 +56,11 @@ pub(crate) fn media_stamp(path: &str) -> Result<MediaStamp, String> {
     })
 }
 
-fn expressions(project: &Project, cid: ItemId) -> Result<bool, String> {
+/// Whether any layer of `cid` (only the `only` layers when given) has an expression.
+fn expressions(project: &Project, cid: ItemId, only: Option<&BTreeSet<LayerId>>) -> Result<bool, String> {
     let comp = project.comp(cid).ok_or("Smart Freeze composition is missing")?;
-    let mut nodes: Vec<_> = comp.layers.iter().flat_map(|l| l.props.children.iter().map(|n| (n, 0usize))).collect();
+    let mut nodes: Vec<_> =
+        comp.layers.iter().filter(|l| only.is_none_or(|ids| ids.contains(&l.id))).flat_map(|l| l.props.children.iter().map(|n| (n, 0usize))).collect();
     let mut count = 0usize;
     let mut found = false;
     while let Some((node, depth)) = nodes.pop() {
@@ -201,8 +203,21 @@ pub fn validate_target(project: &Project, target: &Target) -> Result<(), String>
     if positions.len() != selected.len() || positions.windows(2).any(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| a.checked_add(1) != Some(*b))) {
         return Err("Smart Freeze selection must be adjacent layers in one composition".into());
     }
-    if expressions(project, cid)? {
-        return Err("Selection has expression dependencies; freeze the complete composition instead".into());
+    // Expressions elsewhere in the comp cannot change how the selection renders; only the
+    // selected layers and the layers they link to matter.
+    let linked = selection_dependencies(project, target)?.unwrap_or_default();
+    if expressions(project, cid, Some(&linked))? {
+        let names: Vec<_> = comp
+            .layers
+            .iter()
+            .filter(|l| {
+                let mut found = false;
+                l.props.walk("", &mut |_, p| found |= p.has_expression());
+                linked.contains(&l.id) && found
+            })
+            .map(|l| l.name.as_str())
+            .collect();
+        return Err(format!("{} has expressions; freeze the complete composition instead", names.join(", ")));
     }
     for layer in &comp.layers {
         if !selected.contains(&layer.id) {
@@ -211,19 +226,34 @@ pub fn validate_target(project: &Project, target: &Target) -> Result<(), String>
             }
             continue;
         }
-        if layer.is_3d()
-            || layer.switches.locked
-            || layer.switches.guide
-            || layer.switches.adjustment
-            || layer.switches.collapse
-            || layer.track_matte.is_some()
-            || layer.preserve_transparency
-            || layer.blend_mode != effectcraft_color::BlendMode::Normal
-            || layer.parent.is_some_and(|id| !selected.contains(&id))
-            || matches!(layer.source, LayerSource::Null)
-            || layer.props.sub(effectcraft_project::styles::GROUP).is_some_and(|g| !g.children.is_empty())
-        {
-            return Err(format!("{} is not a self-contained 2D selection layer; freeze the complete composition", layer.name));
+        let reason = if let Some(parent) = layer.parent.filter(|id| !selected.contains(id)) {
+            let parent = comp.layer(parent).map_or("a layer", |p| p.name.as_str());
+            Some(format!("is parented to {parent}, which is not selected"))
+        } else if layer.is_3d() {
+            Some("is a 3D layer".into())
+        } else if layer.switches.locked {
+            Some("is locked".into())
+        } else if layer.switches.guide {
+            Some("is a guide layer".into())
+        } else if layer.switches.adjustment {
+            Some("is an adjustment layer".into())
+        } else if layer.switches.collapse {
+            Some("collapses transformations".into())
+        } else if layer.track_matte.is_some() {
+            Some("uses a track matte".into())
+        } else if layer.preserve_transparency {
+            Some("preserves underlying transparency".into())
+        } else if layer.blend_mode != effectcraft_color::BlendMode::Normal {
+            Some("uses a blending mode".into())
+        } else if matches!(layer.source, LayerSource::Null) {
+            Some("is a null".into())
+        } else if layer.props.sub(effectcraft_project::styles::GROUP).is_some_and(|g| !g.children.is_empty()) {
+            Some("has layer styles".into())
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(format!("{} {reason}; freeze the complete composition instead", layer.name));
         }
     }
     Ok(())
@@ -247,7 +277,9 @@ impl Capture {
             }
             let item = original.item(id).ok_or("Smart Freeze dependency is missing")?;
             if let ItemKind::Comp(comp) = &item.kind {
-                if expressions(&original, id)? {
+                // In the selection's own comp only the linked layers can affect the frames.
+                let only = if id == section.target.comp() { layer_dependencies.as_ref() } else { None };
+                if expressions(&original, id, only)? {
                     // A nested expression can inspect its parent comp. Keep that context in
                     // full, even when this freeze targets a selection in the parent.
                     if layer_dependencies.take().is_some() {
@@ -280,7 +312,7 @@ impl Capture {
         let mut paths = BTreeSet::new();
         for id in &items {
             if original.comp(*id).is_some() {
-                expressions(&original, *id)?;
+                expressions(&original, *id, None)?;
             }
             if let Some(item) = original.item(*id) {
                 let mut sources = vec![];

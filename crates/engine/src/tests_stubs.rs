@@ -122,6 +122,51 @@ fn free_transform_matrix_merges_into_one_undo_step() {
     assert_eq!(pr.keys.len(), 2, "a key at 1 s next to the first one");
 }
 
+/// What agents drive (`path.freeTransform` with offset / scale / rotation about an `anchor`): the
+/// whole mask moves, scales and turns about the given point; on an animated path one drag (one
+/// `merge` key) adds one key at the current time, and one undo removes it and keeps the first key.
+#[test]
+fn free_transform_about_an_anchor_and_undo_on_an_animated_mask() {
+    let mut s = comp();
+    let (l, m) = masked(&mut s);
+    s.state.selected_vertices.clear();
+    let start = mask_path(&s, l, m);
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9;
+    // Move down 30: every point follows.
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "offset": [0, 30]})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert!(p.vertices.iter().zip(&start.vertices).all(|(v, c)| near(*v, [c[0], c[1] + 30.0])), "{p:?}");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mask_path(&s, l, m), start);
+    // Scale 200 % about the top-left corner (100, 100): it stays, the opposite corner doubles away.
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "scale": 200, "anchor": [100, 100]})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert!(near(p.vertices[0], [100.0, 100.0]) && near(p.vertices[2], [500.0, 300.0]), "{p:?}");
+    s.execute("edit.undo", json!({})).unwrap();
+    // Rotate 90° about the bottom-left corner (100, 200): (300, 200) goes to (100, 400).
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "rotation": 90, "anchor": [100, 200]})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert!(near(p.vertices[3], [100.0, 200.0]) && near(p.vertices[2], [100.0, 400.0]), "{p:?}");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mask_path(&s, l, m), start);
+    // Animated: a key at 0 s, then a drag at 2 s in three steps sharing one merge key.
+    s.execute("prop.addKey", json!({"layer": l, "path": "masks/#1/path", "time": 0.0})).unwrap();
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    for _ in 0..3 {
+        s.execute("path.freeTransform", json!({"layer": l, "mask": m, "offset": [0, 10], "merge": "ft-anim"})).unwrap();
+    }
+    let keys = |s: &Session| layer(s, l).masks().unwrap().find_group(m).unwrap().get("path").unwrap().keys.clone();
+    let k = keys(&s);
+    assert_eq!(k.len(), 2, "one key added at 2 s");
+    let moved = k[1].value.as_path().unwrap().clone();
+    assert!(moved.vertices.iter().zip(&start.vertices).all(|(v, c)| near(*v, [c[0], c[1] + 30.0])), "{moved:?}");
+    assert_eq!(k[0].value.as_path(), Some(&start), "the first key is untouched");
+    s.execute("edit.undo", json!({})).unwrap();
+    let k = keys(&s);
+    assert_eq!(k.len(), 1, "one undo removes the whole drag's key");
+    assert_eq!(k[0].value.as_path(), Some(&start));
+}
+
 #[test]
 fn group_and_ungroup_shapes() {
     let mut s = comp();

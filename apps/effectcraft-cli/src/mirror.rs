@@ -359,10 +359,12 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], first: bool) -> Result<Report, F
     // Same content: the server copy gets the Mac's mtime, so every later check (the app's
     // preflight too, which may not know the big file's hash) is size + mtime alone. `--no-retime`
     // leaves it (the server's preflight then compares the hash, when the manifest carries one).
-    if opts.retime && !retime.is_empty() && !opts.dry_run {
-        if let Err(e) = ssh.retime(&retime.iter().map(|u| (u.dest.as_str(), u.mtime)).collect::<Vec<_>>()) {
-            note(&format!("⚠️  could not set the Mac's mtime on the server copies: {}", failure_text(&e)));
-        }
+    if opts.retime
+        && !retime.is_empty()
+        && !opts.dry_run
+        && let Err(e) = ssh.retime(&retime.iter().map(|u| (u.dest.as_str(), u.mtime)).collect::<Vec<_>>())
+    {
+        note(&format!("⚠️  could not set the Mac's mtime on the server copies: {}", failure_text(&e)));
     }
     for u in &retime {
         report.same_content += 1;

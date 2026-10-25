@@ -118,6 +118,27 @@ pub(crate) fn segment(g: &PropGroup, i: usize) -> String {
 
 const MAX_TREE_DEPTH: usize = 64;
 
+/// The path `layer.tree` gives the node with `uid` (`effects/#2/PEDG2-0001`): built from
+/// [`segment`], so an effect is addressed by its index, never by its dotted match id.
+pub(crate) fn tree_path_of(g: &PropGroup, uid: Uid) -> Option<String> {
+    fn walk(g: &PropGroup, uid: Uid, depth: usize) -> Option<String> {
+        for (i, c) in g.children.iter().enumerate() {
+            let seg = segment(g, i);
+            if c.uid() == uid {
+                return Some(seg);
+            }
+            if let Node::Group(sub) = c
+                && depth < MAX_TREE_DEPTH
+                && let Some(rest) = walk(sub, uid, depth + 1)
+            {
+                return Some(format!("{seg}/{rest}"));
+            }
+        }
+        None
+    }
+    walk(g, uid, 0)
+}
+
 /// Local group switches accumulate down to leaves; a property has no switch of its own.
 pub(crate) fn property_effective_enabled(root: &PropGroup, uid: Uid) -> Option<bool> {
     fn find(g: &PropGroup, uid: Uid, parent_enabled: bool, depth: usize) -> Option<bool> {

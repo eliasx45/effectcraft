@@ -187,6 +187,54 @@ mod tests {
         assert!((d.area() - s.area()).abs() < 1e-3);
     }
 
+    /// Picking a variable font's named-instance style (SF Pro `Bold`) draws the variable face at
+    /// the instance's axis values: heavier than the default style, by family and by PostScript
+    /// name. Before, `SFPro-Regular` + `Bold` silently drew Regular. Skipped on machines without
+    /// an installed variable font that has a bold instance (macOS ships several).
+    #[test]
+    fn a_bold_named_instance_renders_heavier_than_the_default() {
+        fonts::scan_system();
+        let faces = fonts::all_faces();
+        let bold_instance = |f: &fonts::Face| {
+            f.info.instances.iter().find(|n| n.name.eq_ignore_ascii_case("Bold") && n.coords.iter().any(|(t, v)| t == "wght" && *v >= 650.0)).cloned()
+        };
+        // SF Pro when it is installed (the reported case), else any variable face with a Bold
+        // instance its family has no static face for.
+        let pick = faces
+            .iter()
+            .filter(|f| !f.info.italic && f.info.weight <= 500)
+            .filter_map(|f| Some((f.clone(), bold_instance(f)?)))
+            .filter(|(f, n)| crate::resolve(&f.info.family, &n.name).face == f.id)
+            .min_by_key(|(f, _)| (f.info.family != "SF Pro", f.id));
+        let Some((face, bold)) = pick else {
+            eprintln!("no installed variable font with a Bold instance: skipped");
+            return;
+        };
+        let family = face.info.family.clone();
+        let r = crate::resolve(&family, "Bold");
+        assert_eq!(r.face, face.id);
+        assert!(!r.synth_bold, "{family} Bold is drawn through its axes, not synthesised");
+        assert_eq!(fonts::instance_coords(&r), bold.coords);
+        let ink = |font: &str, style: &str| {
+            let st = crate::TextStyle { family: font.into(), style: style.into(), size: 100.0, ..Default::default() };
+            let l = crate::layout::layout("Hamburg", &st, &crate::ParagraphStyle::default());
+            assert!(l.glyphs.iter().all(|g| g.face == face.id), "{font} {style} uses the variable face");
+            l.glyphs.iter().map(|g| crate::glyph_outline(g).area().abs()).sum::<f64>()
+        };
+        let regular = ink(&family, &face.info.style);
+        let heavy = ink(&family, "Bold");
+        assert!(heavy > regular * 1.1, "{family}: Bold ink {heavy} vs {} ink {regular}", face.info.style);
+        // Named by PostScript name (as After Effects and the font menu store SF Pro), the style
+        // still picks the instance.
+        if let Some(ps) = face.info.postscript.clone() {
+            assert!((ink(&ps, "Bold") - heavy).abs() < 1e-6, "{ps} + Bold");
+            assert!((ink(&ps, "") - regular).abs() < 1e-6, "{ps} alone stays {}", face.info.style);
+        }
+        // The style menus list it.
+        let styles = crate::families().into_iter().find(|(f, _)| *f == family).map(|(_, s)| s).unwrap_or_default();
+        assert!(styles.iter().any(|s| s == "Bold"), "{family}: {styles:?}");
+    }
+
     #[test]
     fn style_variations_change_advances_and_outlines() {
         assert_eq!(intern(&[]), 0);

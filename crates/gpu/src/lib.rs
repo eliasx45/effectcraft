@@ -23,7 +23,7 @@
 //! effect's exact steps (padding, box-blur radii, parameter conversions); chains of them are
 //! uploaded and read back once. Each family lives in its own module with its own WGSL file
 //! (`fx_color`, `fx_deepglow`, `fx_depth`, `fx_distort`, `fx_extra`, `fx_gen2`, `fx_generate`, `fx_key`,
-//! `fx_light`, `fx_lut`, `fx_noise`, `fx_particles`, `fx_pixel2`, `fx_sim`, `fx_stylize`,
+//! `fx_light`, `fx_lut`, `fx_noise`, `fx_particles`, `fx_pixel2`, `fx_shadowstudio`, `fx_sim`, `fx_stylize`,
 //! `fx_text`, `fx_time`, `fx_tone`, `fx_transition`, `fx_vr`, `fx_warp`); settings a kernel
 //! cannot match fall back to the CPU (`catalog::gpu_supported`, or `None` from the family's
 //! `apply`).
@@ -63,7 +63,9 @@ mod cull;
 pub mod deferred;
 mod effects;
 mod fusion;
+mod half;
 mod mips;
+mod plane3d;
 mod warmup;
 pub use warmup::WarmupReport;
 /// Whether per-pixel effect fusion is enabled (profiling builds support an A/B override).
@@ -83,7 +85,9 @@ mod fx_lut;
 mod fx_noise;
 mod fx_particles;
 mod fx_pixel2;
+mod fx_shadowstudio;
 mod fx_sim;
+mod fx_styles;
 mod fx_stylize;
 mod fx_text;
 mod fx_time;
@@ -105,7 +109,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "profile")]
 pub use context::take_pool_miss_sites;
-pub use context::{AllocStats, GpuContext, GpuImage, TransferStats, VramReport};
+pub use context::{AllocStats, GpuContext, GpuImage, ScratchMeter, TransferStats, VramReport, effect_scratch};
 use effectcraft_effects::Buf;
 use effectcraft_project::ItemId;
 use effectcraft_raster::Image;
@@ -272,6 +276,8 @@ impl Gpu {
         // Declared before the encoder: the frame lasts until its resident outputs are published.
         let _frame = r.frame_mark(comp);
         let mut e = Enc::with_resident(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
+        // Viewer frames only: effect intermediates may be half floats (exports stay f32).
+        e.half = self.ctx.half_intermediates();
         let img = walk::render(&mut e, r, comp, t)?;
         let texture = e.display_px(&img)?;
         e.submit();
@@ -518,7 +524,9 @@ impl Accelerator for Gpu {
 
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
         self.ctx.check_health().ok()?;
-        effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels).map(|(b, _)| b)
+        let mut e = Enc::new(&self.ctx);
+        e.half = half::in_frame();
+        effects::run_chain(&mut e, chain, buf, levels).map(|(b, _)| b)
     }
 
     fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
@@ -533,6 +541,8 @@ impl Accelerator for Gpu {
     ) -> Option<(Buf, Option<u64>)> {
         self.ctx.check_health().ok()?;
         let mut e = Enc::with_owner(&self.ctx, owner.cloned());
+        // A static layer of a viewer frame: half working images like the frame's own effects.
+        e.half = half::in_frame();
         let (b, img) = effects::run_chain(&mut e, chain, buf, levels)?;
         Some((b, img.and_then(|img| e.keep(img))))
     }
@@ -613,11 +623,15 @@ mod tests_adv3d;
 #[cfg(test)]
 mod tests_box;
 #[cfg(test)]
+mod tests_canvas_support;
+#[cfg(test)]
 mod tests_codes;
 #[cfg(test)]
 mod tests_deferred;
 #[cfg(test)]
 mod tests_deferred_jobs;
+#[cfg(test)]
+mod tests_fx_codes;
 #[cfg(test)]
 mod tests_fx_color;
 #[cfg(test)]
@@ -645,7 +659,11 @@ mod tests_fx_particles;
 #[cfg(test)]
 mod tests_fx_pixel2;
 #[cfg(test)]
+mod tests_fx_shadowstudio;
+#[cfg(test)]
 mod tests_fx_sim;
+#[cfg(test)]
+mod tests_fx_styles;
 #[cfg(test)]
 mod tests_fx_stylize;
 #[cfg(test)]
@@ -660,7 +678,13 @@ mod tests_fx_transition;
 mod tests_fx_vr;
 #[cfg(test)]
 mod tests_fx_warp;
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
+mod tests_glow_reach;
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests_half;
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests_init;
 #[cfg(test)]
 mod tests_inplace;
@@ -669,11 +693,20 @@ mod tests_layer_times;
 #[cfg(test)]
 mod tests_particles;
 #[cfg(test)]
+mod tests_plane3d;
+#[cfg(test)]
+mod tests_precomp_clip;
+#[cfg(test)]
 mod tests_precomp_resident;
 #[cfg(test)]
 mod tests_shape_clip;
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests_styles_static;
+#[cfg(test)]
 mod tests_traffic_light;
+#[cfg(test)]
+mod tests_view_clip;
 #[cfg(test)]
 mod tests_warmup;
 

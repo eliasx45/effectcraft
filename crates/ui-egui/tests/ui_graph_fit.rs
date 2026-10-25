@@ -176,7 +176,8 @@ fn wheel_pans_graph_values_without_scrolling_the_outline() {
     });
     h.run_steps(3);
     let (lo, hi) = h.state().ui.timeline.graph_range.unwrap();
-    assert!(lo < 0.0);
+    // Scrolling down moves the curve down, as a Hand drag does: the view shows higher values.
+    assert!(lo > 0.0, "{lo}");
     assert!((hi - lo - 1000.0).abs() < 1e-6);
     assert_eq!(h.state().ui.timeline.scroll_y, before_rows);
 }

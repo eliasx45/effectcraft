@@ -69,6 +69,7 @@ pub fn select_all_effects(app: &mut EffectcraftApp) {
         fx.groups().filter(|g| matches!(g.kind, GroupKind::Effect { .. })).map(|g| (layer.id, g.uid)).collect();
     if !uids.is_empty() {
         app.session.state.selected_props = uids;
+        app.session.state.selected_keys.clear();
     }
 }
 
@@ -417,6 +418,25 @@ fn prop_row(
                 .clicked()
             {
                 toggle_pick(app, "color", layer, prop);
+                // macOS: the system loupe samples anywhere on screen (keyers keep picking from
+                // their input in the Composition panel). Elsewhere the viewer samples, as before.
+                let keyer = layer
+                    .effects()
+                    .and_then(|fx| fx.groups().find(|g| g.find(prop.uid).is_some()))
+                    .is_some_and(|g| effectcraft_engine::effects::find(&g.match_id).is_some_and(|s| s.category == "Keying"));
+                if !active && !keyer && crate::screen_sampler::start(ui.ctx(), egui::Id::new(("ec-screen-pick", uid))) {
+                    app.ui.status = format!("Click anywhere on screen to sample {} (Esc cancels)", prop.name);
+                }
+            }
+            // The loupe's colour: one `prop.set`, one undo step (a cancel just ends the pick).
+            if let Some(rgb) = crate::screen_sampler::take(ui.ctx(), egui::Id::new(("ec-screen-pick", uid))) {
+                if let Some(s) = rgb {
+                    set(actions, json!([s[0], s[1], s[2], 1.0]));
+                }
+                if app.ui.fx_pick.as_ref().is_some_and(|k| k.prop == uid && k.kind == "color") {
+                    app.ui.fx_pick = None;
+                    app.ui.status.clear();
+                }
             }
             app.auto.add(&format!("effectControls.prop.{uid}.eyedropper"), er, &prop.name);
             let mut rgb = [c[0] as f32, c[1] as f32, c[2] as f32];
@@ -1204,7 +1224,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         let fxr = Rect::from_center_size(pos2(r.min.x + 14.0, r.center().y), vec2(16.0, 16.0));
         if widgets::icon_toggle(ui, fxr, Icon::Fx, g.enabled, &t, egui::Id::new(("ec-fx", g.uid)), Sense::click()).clicked() {
-            actions.push(("effect.toggle".into(), json!({"layer": layer.id.0, "effect": g.uid})));
+            actions.push(("effect.toggle".into(), json!({"layer": layer.id.0, "effect": g.uid, "selected": true})));
         }
         app.auto.add(&format!("effectControls.effect.{}.fx", g.uid), fxr, &g.name);
         let tw = Rect::from_center_size(pos2(r.min.x + 32.0, r.center().y), vec2(12.0, 12.0));
@@ -1296,6 +1316,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
             } else if !selected || hresp.clicked() {
                 app.session.state.selected_props = vec![(layer.id, g.uid)];
+                // Keyframes selected before are deselected (After Effects): left selected,
+                // Edit ▸ Copy would copy them instead of the effect.
+                app.session.state.selected_keys.clear();
             }
         }
         if hresp.drag_started() {
@@ -1394,7 +1417,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let ly = tops.get(slot).map(|(_, ty)| *ty).unwrap_or(y - 4.0);
             bp.line_segment([pos2(body.min.x + 4.0, ly), pos2(body.max.x - 4.0, ly)], Stroke::new(2.0, t.accent));
             if ctx.input(|i| i.pointer.any_released()) {
-                if let Some(from) = tops.iter().position(|(u, _)| *u == du) {
+                // A selected effect drags the layer's other selected effects along, as a block in
+                // their stack order (After Effects).
+                let sel = &app.session.state.selected_props;
+                let block: Vec<u64> =
+                    if sel.contains(&(layer.id, du)) { tops.iter().map(|(u, _)| *u).filter(|u| sel.contains(&(layer.id, *u))).collect() } else { vec![] };
+                if block.len() > 1 {
+                    actions.push(("effect.reorder".into(), json!({"layer": layer.id.0, "effect": du, "effects": block, "index": slot + 1})));
+                } else if let Some(from) = tops.iter().position(|(u, _)| *u == du) {
                     let to = if slot > from { slot - 1 } else { slot };
                     if to != from {
                         actions.push(("effect.reorder".into(), json!({"layer": layer.id.0, "effect": du, "index": to + 1})));
@@ -1427,7 +1457,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     {
         p.rect_stroke(rect, 0.0, Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
         if ctx.input(|i| i.pointer.any_released()) {
-            actions.push(("effect.apply".into(), json!({"effect": e, "layers": [layer.id.0]})));
+            // The shown layer, with the rest of the selection when it is selected (After Effects).
+            let layers = super::timeline::selection_targets(&app.session.state.selected_layers, layer.id.0);
+            actions.push(("effect.apply".into(), json!({"effect": e, "layers": layers})));
             egui::DragAndDrop::clear_payload(&ctx);
         }
     }

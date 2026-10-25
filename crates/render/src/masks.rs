@@ -69,13 +69,41 @@ fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, bu
     coverage_at(ctx, layer, g, buf)
 }
 
-fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, buf: &Geometry) -> Option<Mask> {
+/// How far past the layer buffer a feather draws the mask, per axis, at most: a bigger feather
+/// still blurs fully, it just sees the mask no further out than this.
+const MAX_FEATHER_PAD: usize = 1024;
+
+fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, out: &Geometry) -> Option<Mask> {
     let Value::Path(sp) = ctx.group_value(layer, g, "path")? else { return None };
     let path = effectcraft_path::to_kurbo(&sp);
-    let (w, h) = (buf.width, buf.height);
-    let m = Mat3::translate(vec2(buf.offset[0], buf.offset[1])) * Mat3::scale(vec2(buf.scale, buf.scale));
     let exp = ctx.f(layer, g, "expansion", 0.0);
     let linear = matches!(g.kind, GroupKind::Mask { feather_falloff: FeatherFalloff::Linear, .. });
+    let feather = ctx.v2(layer, g, "feather", [0.0; 2]);
+    let feather = feather.map(|f| if f.is_finite() { f.max(0.0) } else { 0.0 });
+    let box_r = |f: f64| ((f * out.scale / 2.0).round() as usize).max(if f > 0.0 { 1 } else { 0 });
+    let sigma = |f: f64| f * out.scale / 2.0;
+    // The feather blurs the mask as drawn, not as cut off by the layer's edges: drawn into a
+    // buffer this much larger, so a mask running past an edge stays covered up to that edge
+    // (an inverted mask showed a faint band along it, a normal one faded out there).
+    let pad = |f: f64| {
+        let p = if f <= 0.0 {
+            0
+        } else if linear {
+            box_r(f)
+        } else {
+            effectcraft_raster::gaussian_support(sigma(f))
+        };
+        p.min(MAX_FEATHER_PAD)
+    };
+    let (px, py) = (pad(feather[0]), pad(feather[1]));
+    let buf = &Geometry {
+        width: out.width.saturating_add(u32::try_from(px.saturating_mul(2)).unwrap_or(u32::MAX)),
+        height: out.height.saturating_add(u32::try_from(py.saturating_mul(2)).unwrap_or(u32::MAX)),
+        offset: [out.offset[0] + px as f64, out.offset[1] + py as f64],
+        scale: out.scale,
+    };
+    let (w, h) = (buf.width, buf.height);
+    let m = Mat3::translate(vec2(buf.offset[0], buf.offset[1])) * Mat3::scale(vec2(buf.scale, buf.scale));
     // Variable-width feather (Mask Feather tool points): expansion and the per-point feather
     // are applied together from the signed distance to the path.
     let variable = !sp.feather.is_empty();
@@ -104,19 +132,33 @@ fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup,
             *c = if exp > 0.0 { (*c + r - *c * r).min(1.0) } else { (*c * (1.0 - r)).max(0.0) };
         });
     }
-    let feather = ctx.v2(layer, g, "feather", [0.0; 2]);
     if feather[0] > 0.0 || feather[1] > 0.0 {
         // Coverage is one plane: blur just that.
         let (w, h) = (cov.width as usize, cov.height as usize);
         cov.data = if linear {
             // One box pass: a straight ramp `feather` pixels wide across the edge.
-            let r = |f: f64| ((f * buf.scale / 2.0).round() as usize).max(if f > 0.0 { 1 } else { 0 });
-            box_blur_plane(&cov.data, w, h, r(feather[0]), r(feather[1]), 1, false)
+            box_blur_plane(&cov.data, w, h, box_r(feather[0]), box_r(feather[1]), 1, false)
         } else {
-            gaussian_blur_plane(&cov.data, w, h, feather[0] * buf.scale / 2.0, feather[1] * buf.scale / 2.0, false)
+            gaussian_blur_plane(&cov.data, w, h, sigma(feather[0]), sigma(feather[1]), false)
         };
     }
-    Some(cov)
+    Some(crop(cov, px, py, out.width, out.height))
+}
+
+/// The `w`×`h` window of `cov` starting `x`, `y` pixels in (the layer buffer inside the padded one).
+fn crop(cov: Mask, x: usize, y: usize, w: u32, h: u32) -> Mask {
+    if x == 0 && y == 0 && cov.width == w && cov.height == h {
+        return cov;
+    }
+    let src_w = cov.width as usize;
+    let mut out = Mask::new(w, h, 0.0);
+    for (row, dst) in out.data.chunks_mut((w as usize).max(1)).enumerate() {
+        let start = (row + y).saturating_mul(src_w).saturating_add(x);
+        if let Some(src) = cov.data.get(start..start.saturating_add(dst.len())) {
+            dst.copy_from_slice(src);
+        }
+    }
+    out
 }
 
 /// Grow (`e` > 0) or shrink coverage by `e` buffer pixels from the Euclidean distance to the

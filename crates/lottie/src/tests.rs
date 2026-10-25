@@ -818,3 +818,28 @@ fn extreme_gradient_endpoints_keep_a_finite_inactive_width_handle() {
     assert!(width.iter().all(|v| v.is_finite()));
     assert!(im.warnings.iter().any(|w| w.contains("width handle")));
 }
+
+/// A text Gradient Fill (EffectCraft extension) has no Lottie equivalent: the export drops it
+/// with one clear note and keeps the rest of the animator.
+#[test]
+fn text_gradient_fill_is_dropped_with_a_note() {
+    let (mut p, cid) = setup();
+    let c = comp(&p, cid);
+    let mut l = build::layer(&mut p, &c, "Title", LayerSource::Text, (c.width, c.height), None);
+    l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "TESTING THIS".into(), size: 30.0, ..Default::default() }));
+    let mut next = p.next_id;
+    {
+        let mut ids = Ids(&mut next);
+        let mut props = build::text_anim_props(&mut ids, "gradientFill", false);
+        props.extend(build::text_anim_props(&mut ids, "opacity", false));
+        let a = build::text_animator(&mut ids, "Animator 1", props);
+        l.props.group_mut("text/animators").unwrap().children.push(Node::Group(a));
+    }
+    p.next_id = next;
+    push(&mut p, cid, l);
+    let res = export_comp(&p, cid, &ExportOptions::default(), &no_read).unwrap();
+    let notes: Vec<&String> = res.warnings.iter().filter(|w| w.contains("Gradient")).collect();
+    assert_eq!(notes.len(), 1, "{:?}", res.warnings);
+    assert!(notes[0].contains("EffectCraft extension"), "{notes:?}");
+    assert!(res.json["layers"][0]["t"]["a"][0]["a"].get("o").is_some(), "the opacity still exports");
+}

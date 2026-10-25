@@ -71,6 +71,14 @@ After the fix, all ten tangents equal AE's to the printed 0.001 px, and the two 
 test `spatial_auto_bezier_tangents_follow_after_effects` checks the rule on other original keys,
 including a timing change. AE's output stays local; only the script and these scores are tracked.
 
+**Deliberate difference: coincident keys hold still (18 October 2026).** AE's rule gives a key a
+tangent toward its far neighbour even when the near neighbour sits at the same spot, so two keys with
+one Position value still loop out and back between them (a real edit drifted about 140 px). In
+EffectCraft the side of an auto-Bezier key that faces a coincident key (within half a pixel, so keys a rounding error apart such as 417.917 and 417.9 count; 21 October) has no tangent,
+so that segment is a still point; the other side keeps AE's tangent. Keys imported from an .aep carry
+`ae_spatial` and keep AE's exact rule, so imports still match AE; keys made in EffectCraft (including
+new keys in an imported project) hold still. Test: `spatial_auto_bezier_holds_still_between_coincident_keys`.
+
 ## Animation behavior follow-up (15 October 2026)
 
 Thirteen original cases, 81 times each, were sampled through After Effects `26.0x67`

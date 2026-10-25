@@ -5,7 +5,7 @@ use crate::color::Region;
 use crate::motion_blur::MotionMemo;
 use crate::{EvalCtx, Image, Renderer, color, source_size, styles};
 use effectcraft_color::BlendMode;
-use effectcraft_effects::{Buf, EffectEnv};
+use effectcraft_effects::Buf;
 use effectcraft_geom::{Mat3, Rect, vec2};
 use effectcraft_project::{GroupKind, ItemKind, Layer, LayerSource, Quality, Sampling};
 use effectcraft_raster::{MipChain, WarpOpts, accumulate_warp_at, composite_warp_at, pool, warp_bounds};
@@ -27,6 +27,9 @@ impl<'a> Renderer<'a> {
     /// The region of interest of a top-level 2D frame: (x, y) offset of the output in output
     /// pixels and its size. `None` renders the whole comp (no ROI, or a nested comp).
     pub(crate) fn roi_offset(&self) -> Option<(f64, f64, u32, u32)> {
+        if let Some(w) = self.window {
+            return Some((f64::from(w.x), f64::from(w.y), w.w.max(1), w.h.max(1)));
+        }
         let r = self.opts.roi.filter(|_| self.top)?;
         let s = self.opts.scale;
         if r[2] <= 0.0 || r[3] <= 0.0 {
@@ -242,9 +245,13 @@ impl<'a> Renderer<'a> {
                 // Footage and comp proxies keep their own pixels (any scale).
                 let (scale, exact) = match &layer.source {
                     LayerSource::Solid { .. } => {
-                        let px = |v: u32| ((v as f64 * s).ceil() as u32).max(1);
-                        (Some(s), Some(([px(sw), px(sh)], [0.0; 2], s)))
+                        let k = self.solid_scale(sw, sh);
+                        let px = |v: u32| ((v as f64 * k).ceil() as u32).max(1);
+                        (Some(k), Some(([px(sw), px(sh)], [0.0; 2], k)))
                     }
+                    // Sharp zoom: a nested comp drawn whole may be drawn below the output
+                    // scale (see `source_window`), not known exactly here.
+                    LayerSource::Comp { item } if self.proxy_for(*item).is_none() && self.sharp() => (Some(1.0), None),
                     LayerSource::Comp { item } if self.proxy_for(*item).is_none() => {
                         // `comp_frame_cpu`'s frame at the nested renderer's scale (≥ `s`).
                         let (_, bs) = self.precomp_renderer(layer, *item);
@@ -323,7 +330,7 @@ impl<'a> Renderer<'a> {
     fn fx_pad(&self, ctx: &EvalCtx, layer: &Layer, scale: f64, reach: bool) -> Option<f64> {
         let Some(fx) = layer.effects().filter(|_| layer.switches.effects) else { return Some(0.0) };
         // Blur sizes of a layer whose effects run in comp space are in comp pixels.
-        let c = crate::fx::fx_comp_space(ctx, layer).map_or([1.0; 2], |m| EffectEnv { comp_space: Some([m.0[0], m.0[1]]), ..Default::default() }.comp_px());
+        let c = crate::fx::fx_comp_px(ctx, layer).unwrap_or([1.0; 2]);
         let (c, px) = (c[0].max(c[1]), 1.0 / scale);
         let mut grow = 0.0;
         for g in fx.groups().filter(|g| g.enabled) {
@@ -349,8 +356,28 @@ impl<'a> Renderer<'a> {
                     let len = p.f("length");
                     if len <= 0.0 { 0.0 } else { len + 2.0 * px }
                 }
-                "ec.stylize.glow" => 3.0 * (p.f("radius") * effectcraft_effects::GLOW_SIGMA_PER_RADIUS).max(0.5 * px) + 3.0 * px,
+                "ec.stylize.glow" => 3.0 * (p.f("radius") * effectcraft_effects::GLOW_SIGMA_PER_RADIUS * c).max(0.5 * px) + 3.0 * px,
                 "ec.perspective.dropshadow" => (p.f("distance") + p.f("softness") * 1.5).max(0.0) + 3.0 * px,
+                // What it paints, or its pad (up to 1.5 × Radius) when that is larger.
+                "ec.stylize.deepglow" => crate::fx::deep_glow_reach(&p, scale)?.max(1.5 * p.f("PEDG-0001").max(0.0)) + px,
+                // Shades the layer's own pixels from its alpha blurred over 1.5 × Edge Thickness.
+                "ec.perspective.bevelalpha" => {
+                    if reach {
+                        1.5 * p.f("edgeThickness").max(0.0) + 3.0 * px
+                    } else {
+                        0.0
+                    }
+                }
+                "ec.generate.fill" => 0.0,
+                // Per-pixel paint placed in layer (or comp) coordinates; Light Sweep's edge light
+                // reads the alpha within Edge Thickness, shifted by it. They fill the comp-sized
+                // canvas of a text or shape layer, which isn't a known growth.
+                "ec.generate.gradientramp" | "ec.generate.cclightsweep" => {
+                    if !reach && matches!(layer.source, LayerSource::Text | LayerSource::Shape) {
+                        return None;
+                    }
+                    if spec.id == "ec.generate.cclightsweep" { 2.0 * p.f("edgeThickness").clamp(0.0, 1000.0) * c + 3.0 * px } else { 0.0 }
+                }
                 // Per-pixel colour changes and Expression Controls: the buffer as it is.
                 "ec.color.levels"
                 | "ec.color.curves"

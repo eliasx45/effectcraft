@@ -17,6 +17,7 @@ use effectcraft_keyframe::text_doc::FontFileLink;
 use skrifa::instance::{LocationRef, Size};
 use skrifa::{FontRef, MetadataProvider};
 
+pub use crate::sfnt::NamedInstance;
 use crate::sfnt::{FaceNames, read_faces, read_faces_bytes};
 
 static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -68,6 +69,9 @@ pub struct FaceInfo {
     pub postscript: Option<String>,
     /// The face has variation axes (an `fvar` table), read from the table directory at scan time.
     pub variable: bool,
+    /// A variable face's named instances (`Bold` = `wght` 700 …), read from `fvar` at scan
+    /// time: styles the face renders through its axes rather than with a face of its own.
+    pub instances: Vec<NamedInstance>,
 }
 
 /// Something that can list fonts (system folders, a web font picker, a project's font folder…).
@@ -175,6 +179,7 @@ fn info_from(n: FaceNames, data: FaceData, origin: &'static str) -> FaceInfo {
         full_name: n.full_name,
         postscript: n.postscript,
         variable: n.variable,
+        instances: n.instances,
     }
 }
 
@@ -491,21 +496,75 @@ pub fn variable_families() -> std::collections::BTreeSet<String> {
 /// menus list, so it scans the system fonts first if that hasn't happened yet (before, only a
 /// project asking for a font the bundled ones lack started the scan, and the menus offered the
 /// three bundled families alone).
+///
+/// A variable face also offers its named instances (SF Pro's Thin … Black), which [`resolve`]
+/// renders through the face's axes; they sort after the default-width styles.
 pub fn families() -> Vec<(String, Vec<String>)> {
     scan_system();
-    let mut m: std::collections::BTreeMap<String, Vec<(bool, u16, String)>> = Default::default();
+    // (italic, other width, width, weight, name)
+    type Key = (bool, bool, i32, u16, String);
+    let mut m: std::collections::BTreeMap<String, Vec<Key>> = Default::default();
     for f in all_faces() {
         let v = m.entry(f.info.family.clone()).or_default();
-        if !v.iter().any(|(_, _, s)| s == &f.info.style) {
-            v.push((f.info.italic, f.info.weight, f.info.style.clone()));
+        if !v.iter().any(|k| k.4.eq_ignore_ascii_case(&f.info.style)) {
+            v.push((f.info.italic, false, 10_000, f.info.weight, f.info.style.clone()));
+        }
+        for n in &f.info.instances {
+            if !v.iter().any(|k| k.4.eq_ignore_ascii_case(&n.name)) {
+                let (weight, italic) = instance_weight(n, f.info.italic);
+                let width = n.coords.iter().find(|(t, _)| t == "wdth").map_or(100.0, |(_, w)| *w);
+                let w100 = (width * 100.0).round() as i32; // `as` saturates (NaN → 0)
+                v.push((italic, w100 != 10_000, w100, weight, n.name.clone()));
+            }
         }
     }
     m.into_iter()
         .map(|(k, mut v)| {
             v.sort();
-            (k, v.into_iter().map(|(_, _, s)| s).collect())
+            (k, v.into_iter().map(|k| k.4).collect())
         })
         .collect()
+}
+
+/// A named instance's weight (its `wght` coordinate, else what its name says) and italic flag.
+fn instance_weight(n: &NamedInstance, face_italic: bool) -> (u16, bool) {
+    let (named_w, named_it) = style_wants(&n.name);
+    let w = n.coords.iter().find(|(t, _)| t == "wght").map_or(named_w, |(_, w)| w.round().clamp(1.0, 1000.0) as u16);
+    (w, face_italic || named_it)
+}
+
+/// Style names are compared without case, spaces, hyphens or underscores (`SemiBold` =
+/// `Semi Bold` = `semibold`).
+fn same_style(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.chars().filter(|c| !matches!(c, ' ' | '-' | '_')).flat_map(char::to_lowercase).collect::<String>();
+    a.eq_ignore_ascii_case(b) || norm(a) == norm(b)
+}
+
+/// The family a font name stands for: the family itself, or the family of the face (or named
+/// instance) whose PostScript or full name it is (`SFPro-Regular` → `SF Pro`). `None` when no
+/// installed face answers to it.
+pub fn family_of(name: &str) -> Option<String> {
+    scan_system();
+    let faces = all_faces();
+    if let Some(f) = faces.iter().find(|f| f.info.family.eq_ignore_ascii_case(name)) {
+        return Some(f.info.family.clone());
+    }
+    resolve_by_name(name, "").map(|r| face(r.face).info.family.clone())
+}
+
+/// Whether `font` (a family, PostScript or full name) offers `style`: one of its family's faces
+/// or a variable face's named instance. `None` when the font itself isn't installed.
+pub fn has_style(font: &str, style: &str) -> Option<bool> {
+    let family = family_of(font)?;
+    let fam = families().into_iter().find(|(f, _)| f.eq_ignore_ascii_case(&family))?;
+    Some(fam.1.iter().any(|s| same_style(s, style)))
+}
+
+/// The axis values a resolved style stands for: a named instance's coordinates (`SF Pro` `Bold`
+/// → `wght` 700); empty for a face's own style.
+pub fn instance_coords(r: &Resolved) -> Vec<(String, f32)> {
+    let Some(i) = r.instance else { return Vec::new() };
+    face(r.face).info.instances.get(usize::from(i)).map(|n| n.coords.clone()).unwrap_or_default()
 }
 
 /// The face chosen for a family/style request, plus synthetic emboldening / slant when the family
@@ -517,6 +576,9 @@ pub struct Resolved {
     pub synth_italic: bool,
     /// The requested family was not found (shown as missing in the UI).
     pub missing: bool,
+    /// A named instance of the variable face (index into its [`FaceInfo::instances`]): the style
+    /// is drawn at the instance's axis values ([`instance_coords`]), not synthesised.
+    pub instance: Option<u16>,
 }
 
 /// How a requested editable font was resolved for rendering.
@@ -569,12 +631,12 @@ fn style_wants(style: &str) -> (u16, bool) {
 /// Resolve a family + style name. Family matching is case-insensitive; a style that the family
 /// lacks picks the nearest weight and synthesises bold (≥ 600 requested, ≤ 500 found) or italic.
 pub fn resolve(family: &str, style: &str) -> Resolved {
-    if let Some(r) = resolve_in(family, style).or_else(|| resolve_by_name(family)) {
+    if let Some(r) = resolve_in(family, style).or_else(|| resolve_by_name(family, style)) {
         return r;
     }
     if !system_scanned() && !family.is_empty() && !family.eq_ignore_ascii_case(DEFAULT_FAMILY) {
         scan_system();
-        if let Some(r) = resolve_in(family, style).or_else(|| resolve_by_name(family)) {
+        if let Some(r) = resolve_in(family, style).or_else(|| resolve_by_name(family, style)) {
             return r;
         }
     }
@@ -587,7 +649,7 @@ pub fn resolve(family: &str, style: &str) -> Resolved {
         return r;
     }
     // Inter is bundled; face 0 (the first bundled face) is the last resort.
-    let mut r = resolve_in(DEFAULT_FAMILY, style).unwrap_or(Resolved { face: 0, synth_bold: false, synth_italic: false, missing: true });
+    let mut r = resolve_in(DEFAULT_FAMILY, style).unwrap_or(Resolved { face: 0, synth_bold: false, synth_italic: false, missing: true, instance: None });
     r.missing = !family.is_empty() && !family.eq_ignore_ascii_case(DEFAULT_FAMILY);
     r
 }
@@ -625,19 +687,39 @@ fn resolve_in(family: &str, style: &str) -> Option<Resolved> {
         return None;
     }
     if let Some(f) = fam.iter().find(|f| f.info.style.eq_ignore_ascii_case(style)) {
-        return Some(Resolved { face: f.id, synth_bold: false, synth_italic: false, missing: false });
+        return Some(Resolved { face: f.id, synth_bold: false, synth_italic: false, missing: false, instance: None });
+    }
+    // A variable face's named instance (SF Pro `Bold`: the variable face at `wght` 700).
+    if let Some(r) = fam.iter().find_map(|f| instance_of(f, style)) {
+        return Some(r);
     }
     let (w, it) = style_wants(style);
     let best = fam.iter().min_by_key(|f| {
         let italic_pen = if f.info.italic == it { 0 } else { 1000 };
         italic_pen + (f.info.weight as i32 - w as i32).unsigned_abs()
     })?;
-    Some(Resolved { face: best.id, synth_bold: w >= 600 && best.info.weight <= 500, synth_italic: it && !best.info.italic, missing: false })
+    Some(Resolved { face: best.id, synth_bold: w >= 600 && best.info.weight <= 500, synth_italic: it && !best.info.italic, missing: false, instance: None })
+}
+
+/// Face `f` drawn as its named instance `style`, when it has one (other than its own style).
+fn instance_of(f: &Face, style: &str) -> Option<Resolved> {
+    if style.is_empty() || same_style(&f.info.style, style) {
+        return None;
+    }
+    let i = f.info.instances.iter().position(|n| same_style(&n.name, style))?;
+    Some(Resolved { face: f.id, synth_bold: false, synth_italic: false, missing: false, instance: Some(u16::try_from(i).ok()?) })
 }
 
 /// A face whose full name or PostScript name is `name` (case-insensitive), the way After Effects
-/// scripts (`textDocument.font = "YuGothic-Bold"`) and `.aep`-derived data refer to fonts.
-fn resolve_by_name(name: &str) -> Option<Resolved> {
+/// scripts (`textDocument.font = "YuGothic-Bold"`) and `.aep`-derived data refer to fonts; or a
+/// variable face's named instance by its PostScript name (`SFPro-Bold`) or full name
+/// (`SF Pro Bold`).
+///
+/// The name picks the face, so `style` is ignored for static faces (a script that sets
+/// `font = "YuGothic-Bold"` can leave an older style behind). A variable face is the one
+/// exception: a style that names one of its instances draws that instance, which is what the
+/// style menu shows (`SFPro-Regular` with style `Bold` is SF Pro at `wght` 700, not Regular).
+fn resolve_by_name(name: &str, style: &str) -> Option<Resolved> {
     let name = name.trim();
     if name.is_empty() {
         return None;
@@ -646,8 +728,19 @@ fn resolve_by_name(name: &str) -> Option<Resolved> {
     let f = faces
         .iter()
         .find(|f| f.info.postscript.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(name)))
-        .or_else(|| faces.iter().find(|f| f.info.full_name.eq_ignore_ascii_case(name)))?;
-    Some(Resolved { face: f.id, synth_bold: false, synth_italic: false, missing: false })
+        .or_else(|| faces.iter().find(|f| f.info.full_name.eq_ignore_ascii_case(name)));
+    if let Some(f) = f {
+        return Some(instance_of(f, style).unwrap_or(Resolved { face: f.id, synth_bold: false, synth_italic: false, missing: false, instance: None }));
+    }
+    faces.iter().find_map(|f| {
+        let i = f.info.instances.iter().position(|n| {
+            n.postscript.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(name))
+                || name.len() > f.info.family.len()
+                    && name.get(..f.info.family.len()).is_some_and(|fam| fam.eq_ignore_ascii_case(&f.info.family))
+                    && name.get(f.info.family.len()..).is_some_and(|rest| rest.starts_with(' ') && rest.trim().eq_ignore_ascii_case(&n.name))
+        })?;
+        Some(Resolved { face: f.id, synth_bold: false, synth_italic: false, missing: false, instance: Some(u16::try_from(i).ok()?) })
+    })
 }
 
 /// The writing systems that need a dedicated fallback family: the bundled fonts cover none of
@@ -1114,6 +1207,9 @@ mod tests {
             if let Some(exact) = candidates.iter().find(|f| f.info.style.eq_ignore_ascii_case("Bold Italic")) {
                 assert_eq!(resolved.face, exact.id, "real style wins for {family}");
                 assert!(!resolved.synth_bold && !resolved.synth_italic);
+            } else if resolved.instance.is_some() {
+                // An installed variable face's named instance draws the style through its axes.
+                assert!(!resolved.synth_bold && !resolved.synth_italic);
             } else {
                 // Italic mismatch dominates any supported font weight distance.
                 let distance = |f: &Face| u32::from(f.info.weight.abs_diff(700)) + if f.info.italic { 0 } else { 1_000 };
@@ -1185,6 +1281,50 @@ mod tests {
             let l = crate::layout_text("Helvetica", &crate::TextStyle { family: "Helvetica".into(), size: 30.0, ..Default::default() }, &Default::default());
             assert!(!l.missing_font && l.glyphs.iter().all(|g| g.id != 0));
         }
+    }
+
+    /// A variable face's named instances are styles of its family: listed in the font menus,
+    /// resolved to the variable face at the instance's axis values (not a synthesised bold of
+    /// the default instance), also when the font is named by its PostScript name, the way
+    /// `SFPro-Regular` + `Bold` is SF Pro at `wght` 700.
+    #[test]
+    fn variable_named_instances_are_styles() {
+        const FAMILY: &str = "EffectCraft Named Instance Test";
+        let ids = add_font_data(crate::sfnt::test_instances_font(FAMILY, "ECNamedInstanceTest"));
+        assert_eq!(ids.len(), 1);
+        let id = ids[0];
+        let styles = families().into_iter().find(|(f, _)| f == FAMILY).map(|(_, s)| s).unwrap();
+        assert_eq!(styles, ["Light", "Regular", "Bold"], "instances in weight order, no duplicate Regular");
+        let wght = |r: &Resolved| instance_coords(r).iter().find(|(t, _)| t == "wght").map(|(_, v)| *v);
+        for (font, style) in [
+            (FAMILY, "Bold"),
+            (FAMILY, "bold"),
+            ("ECNamedInstanceTest-Regular", "Bold"),
+            ("ECNamedInstanceTest-Bold", ""),
+            ("EffectCraft Named Instance Test Bold", ""),
+        ] {
+            let r = resolve(font, style);
+            assert_eq!(r.face, id, "{font} {style}");
+            assert!(!r.missing && !r.synth_bold, "{font} {style}: {r:?}");
+            assert_eq!(wght(&r), Some(700.0), "{font} {style}");
+        }
+        // The face's own style is the default instance: no coordinates.
+        let regular = resolve(FAMILY, "Regular");
+        assert_eq!((regular.face, regular.instance), (id, None));
+        assert!(instance_coords(&regular).is_empty());
+        // The PostScript name of the default face with no style (or its own) stays Regular.
+        assert_eq!(resolve("ECNamedInstanceTest-Regular", "").instance, None);
+        assert_eq!(resolve("ECNamedInstanceTest-Regular", "Regular").instance, None);
+        assert_eq!(wght(&resolve(FAMILY, "Light")), Some(300.0));
+        // A style the font doesn't have is not an instance: nearest face, synthesised as before.
+        let heavy = resolve(FAMILY, "Black");
+        assert_eq!((heavy.face, heavy.instance, heavy.synth_bold), (id, None, true));
+        // The family behind a PostScript name, and which styles it has.
+        assert_eq!(family_of("ECNamedInstanceTest-Regular").as_deref(), Some(FAMILY));
+        assert_eq!(family_of("ECNamedInstanceTest-Bold").as_deref(), Some(FAMILY));
+        assert_eq!(has_style("ECNamedInstanceTest-Regular", "Bold"), Some(true));
+        assert_eq!(has_style(FAMILY, "Black"), Some(false));
+        assert_eq!(has_style("No Such Font 123", "Bold"), None);
     }
 
     #[test]

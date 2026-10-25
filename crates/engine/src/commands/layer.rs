@@ -4,7 +4,7 @@ use effectcraft_color::{BlendMode, Label};
 use effectcraft_keyframe::{Justify, TextDoc, Value as KV};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{
-    Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Node, Project, PropGroup, Quality, Solid, TrackMatte,
+    Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Node, ParamUi, Project, PropGroup, Quality, Solid, TrackMatte,
     limits,
 };
 use effectcraft_time::Tick;
@@ -152,7 +152,61 @@ fn apply_text_params(cmd: &str, p: &Value, d: &mut TextDoc, r: Option<std::ops::
             return Err(bad(cmd, format!("unknown text attribute {k}")));
         }
     }
+    if obj.contains_key("style") && !obj.contains_key("font") {
+        let n = d.char_len();
+        d.apply_style(r.unwrap_or(0..n.max(1)), style_picks_family);
+    }
     Ok(())
+}
+
+/// A style picked for text whose font is a PostScript or full name (`SFPro-Regular`, how After
+/// Effects and its projects name fonts) is a style of that name's family, so the font becomes
+/// the family and the style draws: a name otherwise pins its own face, and picking `Bold` in the
+/// style menu did nothing. Only when the family has the style; a linked or substituted font keeps
+/// its name.
+fn style_picks_family(cs: &mut effectcraft_keyframe::text_doc::CharStyle) {
+    use effectcraft_text::fonts;
+    if cs.font_file.is_some() || cs.render_font.is_some() || cs.style.is_empty() {
+        return;
+    }
+    let Some(family) = fonts::family_of(&cs.font) else { return };
+    if !family.eq_ignore_ascii_case(&cs.font) && fonts::has_style(&family, &cs.style) == Some(true) {
+        cs.font = family;
+    }
+}
+
+/// A warning for `layer.setText {style}` when the font (in the edited range) doesn't offer that
+/// style: it draws the nearest style instead (synthesised bold / italic when needed), which is
+/// easy to miss. `None` when every font has it, or isn't installed (reported as missing instead).
+fn unknown_style_warning(doc: &TextDoc, r: Option<std::ops::Range<usize>>) -> Option<String> {
+    use effectcraft_text::fonts;
+    // The runs the range touches (a caret or empty text: the run at it).
+    let mut styles = Vec::new();
+    let mut pos = 0usize;
+    for run in doc.runs() {
+        let end = pos.saturating_add(run.len);
+        if r.as_ref().is_none_or(|r| (pos < r.end && end > r.start) || (r.start == r.end && r.start >= pos && r.start <= end)) {
+            styles.push(run.style);
+        }
+        pos = end;
+    }
+    let mut checked: Vec<(String, String)> = Vec::new();
+    for cs in styles {
+        let key = (cs.font.clone(), cs.style.clone());
+        if checked.contains(&key) {
+            continue;
+        }
+        if fonts::has_style(&cs.font, &cs.style) == Some(false) {
+            let family = fonts::family_of(&cs.font).unwrap_or_else(|| cs.font.clone());
+            let offered = crate::font_styles(&family);
+            let resolved = effectcraft_text::resolve(&cs.font, &cs.style);
+            let drawn = fonts::face(resolved.face).info.style.clone();
+            let synth = if resolved.synth_bold { " with synthetic bold" } else { "" };
+            return Some(format!("{family} has no style \"{}\" (it has: {}); drawing {drawn}{synth} instead", cs.style, offered.join(", ")));
+        }
+        checked.push(key);
+    }
+    None
 }
 
 fn text_range_p(p: &Value) -> Option<std::ops::Range<usize>> {
@@ -590,8 +644,16 @@ fn blend(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// `layer.setTrackMatte`: `layer` (or the first selected layer) gets the matte; with `layers`, each
+/// of them does (After Effects 2023+ sets every selected layer), the matte layer itself skipped.
 fn track_matte(s: &mut Session, p: &Value) -> Result<Value> {
-    let (cid, lid) = layer_p(s, p, "layer.setTrackMatte")?;
+    let (cid, ids) = match p.get("layers") {
+        Some(Value::Array(_)) => layers_p(s, p)?,
+        _ => {
+            let (cid, lid) = layer_p(s, p, "layer.setTrackMatte")?;
+            (cid, vec![lid])
+        }
+    };
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let matte = match p.get("matte") {
         None | Some(Value::Null) => None,
@@ -607,15 +669,18 @@ fn track_matte(s: &mut Session, p: &Value) -> Result<Value> {
         .unwrap_or(MatteKind::Alpha);
     s.edit("Track Matte", None, |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        if let Some(m) = matte {
-            if m == lid {
-                return Err(bad("layer.setTrackMatte", "a layer can't be its own matte"));
-            }
-            if let Some(ml) = comp.layer_mut(m) {
-                ml.switches.video = false;
-            }
+        // The matte layer can't matte itself: an error when it is the only layer named, else it is
+        // left out.
+        let targets: Vec<LayerId> = ids.iter().copied().filter(|l| Some(*l) != matte).collect();
+        if targets.is_empty() {
+            return Err(bad("layer.setTrackMatte", "a layer can't be its own matte"));
         }
-        comp.layer_mut(lid).ok_or(EngineError::NoComp)?.track_matte = matte.map(|layer| TrackMatte { layer, kind });
+        if let Some(ml) = matte.and_then(|m| comp.layer_mut(m)) {
+            ml.switches.video = false;
+        }
+        for lid in targets {
+            comp.layer_mut(lid).ok_or(EngineError::NoComp)?.track_matte = matte.map(|layer| TrackMatte { layer, kind });
+        }
         Ok(())
     })?;
     Ok(Value::Null)
@@ -929,12 +994,29 @@ fn check_parent_chain(comp: &Comp, ids: &[LayerId], parent: Option<LayerId>, max
 }
 
 fn set_parent(s: &mut Session, p: &Value) -> Result<Value> {
-    let (cid, ids) = layers_p(s, p)?;
+    let (cid, mut ids) = layers_p(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let parent = match p.get("parent") {
         None | Some(Value::Null) => None,
         Some(v) => Some(resolve_layer(comp, v).ok_or_else(|| bad("layer.setParent", "no such parent layer"))?),
     };
+    // Several layers (the pick whip or Parent menu on a selection): as in AE, the parent itself and
+    // the layers it descends from are skipped rather than failing the whole edit. One layer, or a
+    // set that is all skipped, still reports the cycle below.
+    if ids.len() > 1
+        && let Some(par) = parent
+    {
+        let mut skip = vec![par];
+        let mut cur = comp.layer(par).and_then(|l| l.parent);
+        while let Some(id) = cur.filter(|id| !skip.contains(id) && skip.len() < 4096) {
+            skip.push(id);
+            cur = comp.layer(id).and_then(|l| l.parent);
+        }
+        let kept: Vec<LayerId> = ids.iter().copied().filter(|id| !skip.contains(id)).collect();
+        if !kept.is_empty() {
+            ids = kept;
+        }
+    }
     // A loaded cycle need not include a selected child. Validate before compensation or edit;
     // do not impose the renderer's 64-ancestor truncation as a new ordinary hierarchy limit.
     check_parent_chain(comp, &ids, parent, 4096, 1_048_576)?;
@@ -1211,16 +1293,73 @@ fn precompose(s: &mut Session, p: &Value) -> Result<Value> {
         (a, b)
     };
     let (offset, dur) = if adjust && span.1 > span.0 { (span.0, span.1 - span.0) } else { (Tick(0), comp.duration) };
+    // Beyond After Effects (which drops the link and lets the layer jump): a layer parented to a
+    // layer left outside keeps its place on screen. A still parent chain is baked into the
+    // layer's transform; an animated one is copied into the new comp (hidden, same names and
+    // links) so the motion carries on. The originals stay for their other children.
+    let ancestors = |l: &effectcraft_project::Layer, stop_inside: bool| -> Vec<LayerId> {
+        let mut out = vec![];
+        let mut cur = l.parent;
+        while let Some(pid) = cur {
+            if (stop_inside && ids.contains(&pid)) || out.contains(&pid) || out.len() >= 64 {
+                break;
+            }
+            out.push(pid);
+            cur = comp.layer(pid).and_then(|p| p.parent);
+        }
+        out
+    };
+    let animated = |chain: &[LayerId]| chain.iter().filter_map(|id| comp.layer(*id)).any(|a| a.transform().is_some_and(|tr| tr.any_animated()));
+    let outside: Vec<&effectcraft_project::Layer> = comp.layers.iter().filter(|l| ids.contains(&l.id) && l.parent.is_some_and(|p| !ids.contains(&p))).collect();
+    let (rigged, baked): (Vec<&effectcraft_project::Layer>, Vec<&effectcraft_project::Layer>) =
+        outside.into_iter().partition(|l| animated(&ancestors(l, false)));
+    let baked: Vec<LayerId> = baked.iter().map(|l| l.id).collect();
+    let fixes = parent_fixes(s, cid, &baked, None);
+    // The outside ancestors to copy, in stack order.
+    let rig: Vec<LayerId> = {
+        let mut want: Vec<LayerId> = rigged.iter().flat_map(|l| ancestors(l, true)).collect();
+        want.sort_unstable_by_key(|id| id.0);
+        want.dedup();
+        comp.layers.iter().map(|l| l.id).filter(|id| want.contains(id)).collect()
+    };
     let new = s.edit("Pre-compose", None, |proj, st| {
         let mut inner = comp.nested_like(comp.width, comp.height, dur);
-        inner.layers = comp.layers.iter().filter(|l| ids.contains(&l.id)).cloned().collect();
-        for l in &mut inner.layers {
-            if l.parent.is_some_and(|p| !ids.contains(&p)) {
-                l.parent = None;
+        let mut next = proj.next_id;
+        let mut copies: Vec<effectcraft_project::Layer> = vec![];
+        let mut map: Vec<(LayerId, LayerId)> = vec![];
+        for aid in &rig {
+            let Some(src) = comp.layer(*aid) else { continue };
+            let mut c = src.clone();
+            super::edit::reid(&mut c, &mut next);
+            // A parent only: it doesn't render or play in the new comp.
+            c.switches.video = false;
+            c.switches.audio = false;
+            c.switches.solo = false;
+            c.track_matte = None;
+            map.push((*aid, c.id));
+            copies.push(c);
+        }
+        proj.next_id = next;
+        let link = |p: LayerId| if ids.contains(&p) { Some(p) } else { map.iter().find(|(o, _)| *o == p).map(|(_, c)| *c) };
+        for c in &mut copies {
+            c.parent = c.parent.and_then(link);
+        }
+        let mut layers: Vec<effectcraft_project::Layer> = comp.layers.iter().filter(|l| ids.contains(&l.id)).cloned().collect();
+        for l in &mut layers {
+            if let Some(p) = l.parent.filter(|p| !ids.contains(p)) {
+                l.parent = link(p);
+                if l.parent.is_none()
+                    && let Some(f) = fixes.iter().find(|f| f.layer == l.id)
+                {
+                    f.apply(l);
+                }
             }
             if l.track_matte.is_some_and(|m| !ids.contains(&m.layer)) {
                 l.track_matte = None;
             }
+        }
+        inner.layers = copies.into_iter().chain(layers).collect();
+        for l in &mut inner.layers {
             l.start_time -= offset;
             l.in_point -= offset;
             l.out_point -= offset;
@@ -1245,55 +1384,103 @@ fn precompose(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"comp": new.0.0, "layer": new.1.0}))
 }
 
+/// `layer.addMask`: a new mask on `layer`, else on each of `layers` (or the selected layers, as
+/// Layer ▸ Mask ▸ New Mask in After Effects), locked layers left alone, in one undo step. Without
+/// `rect` each layer's mask is sized to that layer. The result names the first layer's mask, and
+/// `masks` lists one per layer.
 fn add_mask(s: &mut Session, p: &Value) -> Result<Value> {
-    let (cid, lid) = layer_p(s, p, "layer.addMask")?;
-    let layer = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?.clone();
-    let (w, h) = effectcraft_render::source_size(&s.project, &layer);
-    let (w, h) = if w == 0 { (400.0, 300.0) } else { (w as f64, h as f64) };
+    // One named layer (a mask drawn in the viewer, scripts): that layer, an error if it can't
+    // have masks. Several: those that can't (cameras, lights) are skipped.
+    let single = p.get("layer").is_some_and(|v| !v.is_null()) && !matches!(p.get("layers"), Some(Value::Array(_)));
+    let (cid, ids) = if single {
+        let (cid, lid) = layer_p(s, p, "layer.addMask")?;
+        (cid, vec![lid])
+    } else {
+        let (cid, ids) = layers_p(s, p)?;
+        (cid, unlocked(s, cid, ids, "layer.addMask")?)
+    };
+    if ids.is_empty() {
+        return Err(bad("layer.addMask", "no `layer` given and no layer selected"));
+    }
     let shape = str_p(p, "shape").unwrap_or("rect");
     let r = p.get("rect").and_then(Value::as_array).map(|a| [0, 1, 2, 3].map(|i| a.get(i).and_then(Value::as_f64).unwrap_or(0.0)));
-    let (cx, cy, rw, rh) = match r {
-        Some([x, y, rw, rh]) => (x + rw / 2.0, y + rh / 2.0, rw, rh),
-        None => (if w > 0.0 { w / 2.0 } else { 0.0 }, h / 2.0, w * 0.6, h * 0.6),
-    };
-    // The shape tools' masks: rectangle, ellipse, rounded rectangle, polygon or star.
-    let path = super::shape_tool::mask_path(shape, [cx, cy], [rw, rh])
-        .ok_or_else(|| bad("layer.addMask", format!("unknown shape `{shape}`; one of rect, ellipse, rounded, polygon, star")))?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let mut paths = Vec::with_capacity(ids.len());
+    for lid in &ids {
+        let layer = comp.layer(*lid).ok_or(EngineError::NoComp)?;
+        let (w, h) = effectcraft_render::source_size(&s.project, layer);
+        let (w, h) = if w == 0 { (400.0, 300.0) } else { (w as f64, h as f64) };
+        let (cx, cy, rw, rh) = match r {
+            Some([x, y, rw, rh]) => (x + rw / 2.0, y + rh / 2.0, rw, rh),
+            None => (if w > 0.0 { w / 2.0 } else { 0.0 }, h / 2.0, w * 0.6, h * 0.6),
+        };
+        // The shape tools' masks: rectangle, ellipse, rounded rectangle, polygon or star.
+        let path = super::shape_tool::mask_path(shape, [cx, cy], [rw, rh])
+            .ok_or_else(|| bad("layer.addMask", format!("unknown shape `{shape}`; one of rect, ellipse, rounded, polygon, star")))?;
+        paths.push((*lid, path));
+    }
     let mode = str_p(p, "mode").and_then(MaskMode::from_name).unwrap_or(MaskMode::Add);
     let cycle = s.prefs.appearance.cycle_mask_colors;
-    let (uid, nth) = s.edit("New Mask", None, |proj, _| {
+    let added = s.edit("New Mask", None, |proj, _| {
         let mut next = proj.next_id;
-        let l = layer_mut(proj, cid, lid)?;
-        let masks = l.props.sub_mut("masks").ok_or_else(|| bad("layer.addMask", "this layer can't have masks"))?;
-        let n = masks.children.len();
-        let g = build::mask(&mut Ids(&mut next), &format!("Mask {}", n + 1), path, mode, crate::prefs::mask_color(cycle, n));
-        let uid = g.uid;
-        masks.children.push(g.into());
+        let mut added = Vec::with_capacity(paths.len());
+        for (lid, path) in &paths {
+            let l = layer_mut(proj, cid, *lid)?;
+            let Some(masks) = l.props.sub_mut("masks") else {
+                if single {
+                    return Err(bad("layer.addMask", "this layer can't have masks"));
+                }
+                continue;
+            };
+            let n = masks.children.len();
+            let g = build::mask(&mut Ids(&mut next), &format!("Mask {}", n + 1), path.clone(), mode, crate::prefs::mask_color(cycle, n));
+            added.push((*lid, g.uid, n + 1));
+            masks.children.push(g.into());
+        }
+        if added.is_empty() {
+            return Err(bad("layer.addMask", "none of these layers can have masks"));
+        }
         proj.next_id = next;
-        Ok((uid, n + 1))
+        Ok(added)
     })?;
     // `path` addresses the mask's properties (`masks/#2/feather`); `name` is how layer.setMask finds it.
-    Ok(json!({"mask": uid, "path": format!("masks/#{nth}"), "name": format!("Mask {nth}")}))
+    let entry = |(lid, uid, nth): &(LayerId, u64, usize)| json!({"layer": lid.0, "mask": uid, "path": format!("masks/#{nth}"), "name": format!("Mask {nth}")});
+    let masks: Vec<Value> = added.iter().map(entry).collect();
+    let mut out = masks.first().cloned().unwrap_or(Value::Null);
+    if let Value::Object(o) = &mut out {
+        o.insert("masks".into(), Value::Array(masks));
+    }
+    Ok(out)
 }
 
+/// `layer.setMask`: the mask's mode and Inverted. With `selected: true` and the mask among the
+/// selected masks (the Timeline's Mask Mode menu and Inverted box), every selected mask, on any
+/// layer of the comp, gets the change, in one undo step (After Effects).
 fn mask_props(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid) = layer_p(s, p, "layer.setMask")?;
     let target = p.get("mask").cloned().unwrap_or(json!("#1"));
     let mode = str_p(p, "mode").and_then(MaskMode::from_name);
     let inverted = b_p(p, "inverted");
+    let no_mask = || bad("layer.setMask", format!("no mask {target} (a number is the mask's uid; use \"#n\" for the n-th mask)"));
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let masks = comp.layer(lid).and_then(|l| l.masks()).ok_or_else(|| bad("layer.setMask", "the layer has no masks (add one with layer.addMask)"))?;
+    let uid = super::mask::mask_index(masks, &target).and_then(|i| masks.children.get(i)).map(|c| c.uid()).ok_or_else(no_mask)?;
+    let mut targets = vec![(lid, uid)];
+    if b_p(p, "selected") == Some(true) && s.state.selected_props.contains(&(lid, uid)) {
+        // Only masks: the selection can hold effects and properties too.
+        let is_mask = |l: &LayerId, u: &u64| comp.layer(*l).and_then(|l| l.masks()).is_some_and(|m| m.children.iter().any(|c| c.uid() == *u));
+        targets.extend(s.state.selected_props.iter().filter(|t| **t != (lid, uid) && is_mask(&t.0, &t.1)).copied());
+    }
     s.edit("Mask Settings", None, |proj, _| {
-        let l = layer_mut(proj, cid, lid)?;
-        let masks = l.props.sub_mut("masks").ok_or_else(|| bad("layer.setMask", "the layer has no masks (add one with layer.addMask)"))?;
-        let g = super::mask::mask_index(masks, &target)
-            .and_then(|i| masks.children.get_mut(i))
-            .and_then(|c| c.as_group_mut())
-            .ok_or_else(|| bad("layer.setMask", format!("no mask {target} (a number is the mask's uid; use \"#n\" for the n-th mask)")))?;
-        if let GroupKind::Mask { mode: m, inverted: inv, .. } = &mut g.kind {
-            if let Some(mm) = mode {
-                *m = mm;
-            }
-            if let Some(i) = inverted {
-                *inv = i;
+        for (tl, tu) in &targets {
+            let Some(g) = layer_mut(proj, cid, *tl).ok().and_then(|l| l.props.find_group_mut(*tu)) else { continue };
+            if let GroupKind::Mask { mode: m, inverted: inv, .. } = &mut g.kind {
+                if let Some(mm) = mode {
+                    *m = mm;
+                }
+                if let Some(i) = inverted {
+                    *inv = i;
+                }
             }
         }
         Ok(())
@@ -1339,21 +1526,7 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
             proj.next_id = next;
             return Ok(uid);
         }
-        let g = match kind.as_str() {
-            "group" => build::shape_group(&mut ids, "Group 1", vec![]),
-            "rect" | "rectangle" => build::shape_rect(&mut ids, [200.0, 200.0], [0.0, 0.0], 0.0),
-            "ellipse" => build::shape_ellipse(&mut ids, [200.0, 200.0], [0.0, 0.0]),
-            "star" => build::shape_star(&mut ids, true, 5.0, [0.0, 0.0], 100.0, 50.0),
-            "polygon" => build::shape_star(&mut ids, false, 5.0, [0.0, 0.0], 100.0, 0.0),
-            "fill" => build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]),
-            "stroke" => build::shape_stroke(&mut ids, [1.0, 1.0, 1.0, 1.0], 2.0),
-            "path" => build::shape_path(&mut ids, Default::default()),
-            "gfill" | "gradientFill" => build::shape_gradient_fill(&mut ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default()),
-            "gstroke" | "gradientStroke" => build::shape_gradient_stroke(&mut ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default(), 2.0),
-            "trim" | "trimPaths" => build::shape_trim(&mut ids, 0.0, 100.0, 0.0),
-            "repeater" => build::shape_repeater(&mut ids, 3.0, [100.0, 0.0]),
-            k => build::shape_simple_op(&mut ids, k).ok_or_else(|| bad("layer.addShapeItem", format!("unknown kind `{k}`")))?,
-        };
+        let g = new_shape_item(&mut ids, &kind).ok_or_else(|| bad("layer.addShapeItem", format!("unknown kind `{kind}`")))?;
         let uid = g.uid;
         proj.next_id = next;
         shape_item_target(proj, cid, lid, group_uid)?.children.push(g.into());
@@ -1362,6 +1535,27 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
     // The new item's property path, ready for prop.set / add_keyframe (`contents/trim#2/end`).
     let path = s.project.comp(cid).and_then(|c| c.layer(lid)).and_then(|l| l.props.match_path_of(uid));
     Ok(json!({"uid": uid, "path": path}))
+}
+
+/// A new shape contents item of `kind` with Add ▸ menu defaults (`group`, `rect`, `ellipse`,
+/// `star`, `polygon`, `fill`, `stroke`, `path`, `gfill`, `gstroke`, `trim`, `repeater` and the
+/// path operations of [`build::shape_simple_op`]); `None` for an unknown kind.
+pub(crate) fn new_shape_item(ids: &mut Ids, kind: &str) -> Option<PropGroup> {
+    Some(match kind {
+        "group" => build::shape_group(ids, "Group 1", vec![]),
+        "rect" | "rectangle" => build::shape_rect(ids, [200.0, 200.0], [0.0, 0.0], 0.0),
+        "ellipse" => build::shape_ellipse(ids, [200.0, 200.0], [0.0, 0.0]),
+        "star" => build::shape_star(ids, true, 5.0, [0.0, 0.0], 100.0, 50.0),
+        "polygon" => build::shape_star(ids, false, 5.0, [0.0, 0.0], 100.0, 0.0),
+        "fill" => build::shape_fill(ids, [1.0, 0.0, 0.0, 1.0]),
+        "stroke" => build::shape_stroke(ids, [1.0, 1.0, 1.0, 1.0], 2.0),
+        "path" => build::shape_path(ids, Default::default()),
+        "gfill" | "gradientFill" => build::shape_gradient_fill(ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default()),
+        "gstroke" | "gradientStroke" => build::shape_gradient_stroke(ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default(), 2.0),
+        "trim" | "trimPaths" => build::shape_trim(ids, 0.0, 100.0, 0.0),
+        "repeater" => build::shape_repeater(ids, 3.0, [100.0, 0.0]),
+        k => build::shape_simple_op(ids, k)?,
+    })
 }
 
 /// The contents a new shape item goes into: the shape group `group_uid` (its Contents), else the
@@ -1400,6 +1594,9 @@ fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
         for (k, v) in obj {
             any |= effectcraft_keyframe::text_doc::apply_char_attr(&mut st, k, v).map_err(|m| bad("layer.setText", m))?;
         }
+        if obj.contains_key("style") && !obj.contains_key("font") {
+            style_picks_family(&mut st);
+        }
         if any {
             e.pending = Some(st);
         }
@@ -1413,7 +1610,14 @@ fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
         set_text_doc(proj, cid, lid, t, p, range.clone())
     })?;
     // What the layer says now (the first 200 characters).
-    Ok(json!({"layer": lid.0, "text": text}))
+    let mut out = json!({"layer": lid.0, "text": text});
+    if str_p(p, "style").is_some()
+        && let Some(doc) = super::text_edit::layer_doc(s, lid)
+        && let Some(w) = unknown_style_warning(&doc, range)
+    {
+        out["warning"] = json!(w);
+    }
+    Ok(out)
 }
 
 /// With `selected: true` (the Properties, Character and Paragraph panels pass it) and no
@@ -1486,6 +1690,82 @@ pub(crate) fn offset_position(tr: &mut PropGroup, dx: f64, dy: f64) {
         for k in &mut pr.keys {
             k.value = shift(&k.value);
         }
+    }
+}
+
+/// Layers of `comp` whose effect space follows the comp's size (shape and text layers, see
+/// [`effectcraft_render::effect_space_follows_comp_size`]), read before the comp is resized.
+pub(crate) fn comp_sized_fx_layers(project: &Project, comp: &Comp) -> Vec<LayerId> {
+    comp.layers.iter().filter(|l| effectcraft_render::effect_space_follows_comp_size(project, l)).map(|l| l.id).collect()
+}
+
+/// Keep the effect point parameters of `comp`'s layers where they are on screen when the comp
+/// is resized by `resize` (new − old size) and its picture moves by `shift` (the offset given to
+/// the unparented layers' positions; parented layers follow them). Points in comp space (see
+/// [`effectcraft_render::effect_points_in_comp_space`]) move by `shift`; points in a comp-sized
+/// effect space (the layers in `comp_sized`, from [`comp_sized_fx_layers`]) move by half the
+/// resize, as that space's origin does; points in a layer's own pixels already move with it.
+/// Every keyframe moves too; expressions are left as they are.
+pub(crate) fn offset_effect_points(comp: &mut Comp, comp_sized: &[LayerId], resize: [f64; 2], shift: [f64; 2]) {
+    let fx_space = [resize[0] / 2.0, resize[1] / 2.0];
+    // Only the layers with an effect to move are copied (and so changed).
+    let moves = |l: &Layer| {
+        let own = comp_sized.contains(&l.id) && fx_space != [0.0; 2];
+        l.effects().is_some_and(|fx| {
+            fx.groups().any(|g| match &g.kind {
+                GroupKind::Effect { effect } if effectcraft_render::effect_points_in_comp_space(l, effect) => shift != [0.0; 2],
+                GroupKind::Effect { .. } => own,
+                _ => false,
+            })
+        })
+    };
+    for l in comp.layers.iter_mut_where(moves) {
+        let own = if comp_sized.contains(&l.id) { fx_space } else { [0.0; 2] };
+        // Per effect, read before the effects are borrowed mutably.
+        let layer: &Layer = l;
+        let deltas: Vec<[f64; 2]> = match layer.effects() {
+            Some(fx) => fx
+                .children
+                .iter()
+                .map(|n| match n {
+                    Node::Group(g) => match &g.kind {
+                        GroupKind::Effect { effect } if effectcraft_render::effect_points_in_comp_space(layer, effect) => shift,
+                        _ => own,
+                    },
+                    Node::Prop(_) => [0.0; 2],
+                })
+                .collect(),
+            None => continue,
+        };
+        let Some(fx) = l.props.sub_mut("effects") else { continue };
+        for (n, d) in fx.children.iter_mut().zip(deltas) {
+            let Node::Group(g) = n else { continue };
+            if !matches!(g.kind, GroupKind::Effect { .. }) || d == [0.0; 2] {
+                continue;
+            }
+            g.walk_mut(&mut |pr| {
+                if matches!(pr.ui, ParamUi::Point) {
+                    shift_point(&mut pr.value, d);
+                    for k in &mut pr.keys {
+                        shift_point(&mut k.value, d);
+                    }
+                }
+            });
+        }
+    }
+}
+
+fn shift_point(v: &mut KV, d: [f64; 2]) {
+    match v {
+        KV::Vec2(a) => {
+            a[0] += d[0];
+            a[1] += d[1];
+        }
+        KV::Vec3(a) => {
+            a[0] += d[0];
+            a[1] += d[1];
+        }
+        _ => {}
     }
 }
 
@@ -1718,7 +1998,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Track Matte",
             [],
             None,
-            "{layer?, matte: layer|null, kind?: alpha|alphaInverted|luma|lumaInverted}",
+            "{layer?, layers?, matte: layer|null, kind?: alpha|alphaInverted|luma|lumaInverted} (`layers`: each gets the matte, the matte layer itself skipped)",
             has_layers,
             track_matte
         ),
@@ -1787,11 +2067,19 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Mask",
             ["Layer", "Mask"],
             Some("Cmd+Shift+N"),
-            "{layer?, shape?: rect|ellipse|rounded|polygon|star, rect? [x,y,w,h] (layer space; a polygon or star fits its width), mode?} → {mask: uid, path: masks/#n, name}",
+            "{layer? | layers? (default the selected layers), shape?: rect|ellipse|rounded|polygon|star, rect? [x,y,w,h] (layer space; a polygon or star fits its width), mode?} → {mask: uid, path: masks/#n, name} of the first layer, masks: [{layer, mask, path, name}] one per layer",
             has_layers,
             add_mask
         ),
-        cmd!("layer.setMask", "Mask Mode", [], None, "{layer?, mask: uid|\"#n\"|name (default the first), mode?, inverted?}", has_layers, mask_props),
+        cmd!(
+            "layer.setMask",
+            "Mask Mode",
+            [],
+            None,
+            "{layer?, mask: uid|\"#n\"|name (default the first), mode?, inverted?, selected?: every selected mask}",
+            has_layers,
+            mask_props
+        ),
         cmd!(
             "layer.addShapeItem",
             "Add (Shape)",

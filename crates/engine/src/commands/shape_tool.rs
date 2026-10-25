@@ -252,12 +252,14 @@ pub fn selected_shape_target(s: &Session, comp: &Comp) -> Option<LayerId> {
     s.state.selected_layers.iter().copied().find(|l| comp.layer(*l).is_some_and(|l| matches!(l.source, LayerSource::Shape) && !l.switches.locked))
 }
 
-/// The shape layer a shape tool or the Pen draws into: `layer` (which must be a shape layer),
-/// else the first selected unlocked shape layer, else none (a new shape layer).
-pub(crate) fn draw_target(s: &Session, comp: &Comp, p: &Value, cmd: &str) -> Result<Option<LayerId>> {
-    let target = match p.get("layer") {
+/// The shape layer a shape tool or the Pen draws into: `into` / `layer` (which must be a shape
+/// layer), else with `use_selection` the first selected unlocked shape layer, else none (a new
+/// shape layer).
+pub(crate) fn draw_target(s: &Session, comp: &Comp, p: &Value, cmd: &str, use_selection: bool) -> Result<Option<LayerId>> {
+    let target = match p.get("into").or_else(|| p.get("layer")) {
         Some(l) => Some(super::resolve_layer(comp, l).ok_or_else(|| bad(cmd, format!("no layer {l}")))?),
-        None => selected_shape_target(s, comp),
+        None if use_selection => selected_shape_target(s, comp),
+        None => None,
     };
     if target.and_then(|l| comp.layer(l)).is_some_and(|l| !matches!(l.source, LayerSource::Shape)) {
         return Err(bad(cmd, "the layer is not a shape layer"));
@@ -309,10 +311,11 @@ fn pair_p(p: &Value, k: &str) -> Option<[f64; 2]> {
 }
 
 /// The shape tools: a rectangle, rounded rectangle, ellipse, polygon or star of `size`, centred
-/// at `position`, painted with the Tools bar's Fill and Stroke unless given. With a shape layer
-/// given or selected it goes on top of that layer's Contents as a new group ("Rectangle 2"…)
-/// placed by the group's Transform, as After Effects draws into the selected shape layer;
-/// otherwise a new shape layer is centred on it. `position` and `size` are in comp pixels, or
+/// at `position`, painted with the Tools bar's Fill and Stroke unless given. By default a new
+/// shape layer is centred on it, whatever is selected. With `into` (or `layer`) naming a shape
+/// layer, or `addToSelected: true` and a shape layer selected (the viewer's shape tools, as After
+/// Effects draws into the selected shape layer), it goes on top of that layer's Contents as a new
+/// group ("Rectangle 2"…) placed by the group's Transform. `position` and `size` are in comp pixels, or
 /// the layer's space with `space: "layer"`.
 fn new_shape(s: &mut Session, p: &Value) -> Result<Value> {
     let c = "shape.newShape";
@@ -329,7 +332,7 @@ fn new_shape(s: &mut Session, p: &Value) -> Result<Value> {
     let pos = position_p(p, c)?.unwrap_or([comp.width as f64 / 2.0, comp.height as f64 / 2.0]);
     let paint = paint_p(p, &s.state.shape_tool, c)?;
     let round = roundness_p(p, kind, c)?;
-    let target = draw_target(s, &comp, p, c)?;
+    let target = draw_target(s, &comp, p, c, b_p(p, "addToSelected") == Some(true))?;
     // In the target layer's space: the centre maps through the layer's transform, the size by
     // its scale.
     let (centre, size) = match target.and_then(|l| comp.layer(l)) {
@@ -386,7 +389,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shape Tool",
             [],
             None,
-            "{layer?, kind?: rect|rounded|ellipse|polygon|star, size? [w,h], position? [x,y] (the centre), space?: comp|layer, roundness? px (rect/rounded corners; rounded defaults to 15% of the shorter side), name? (a new layer's), fill?, fillType?, fillBlend?, fillOpacity?, stroke?, strokeType?, strokeBlend?, strokeOpacity?, strokeWidth? (default the Tools bar's, shape.toolOptions)} → {layer, group}",
+            "{into?: layer (draw into that shape layer; alias layer), addToSelected?: bool (draw into the first selected unlocked shape layer; default false = always a new shape layer), kind?: rect|rounded|ellipse|polygon|star, size? [w,h], position? [x,y] (the centre), space?: comp|layer, roundness? px (rect/rounded corners; rounded defaults to 15% of the shorter side), name? (a new layer's), fill?, fillType?, fillBlend?, fillOpacity?, stroke?, strokeType?, strokeBlend?, strokeOpacity?, strokeWidth? (default the Tools bar's, shape.toolOptions)} → {layer, group}",
             has_comp,
             new_shape
         ),

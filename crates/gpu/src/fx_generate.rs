@@ -181,25 +181,26 @@ fn camera_lens(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
 // ---------------------------------------------------------------- transitions
 
 fn linear_wipe(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
-    let done = ctx.params.f("completion") / 100.0;
-    let ang = ctx.params.f("angle").to_radians();
-    let feather = (ctx.params.f("feather") * b.scale).max(0.001);
-    let (w, h) = (b.img.width as f64, b.img.height as f64);
-    let (dx, dy) = (ang.sin(), -ang.cos());
-    let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)];
-    let proj: Vec<f64> = corners.iter().map(|(x, y)| x * dx + y * dy).collect();
-    let (lo, hi) = (proj.iter().cloned().fold(f64::INFINITY, f64::min), proj.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
-    let edge = lo - feather + (hi - lo + 2.0 * feather) * done;
+    let w = effectcraft_effects::LinearWipe::plan(
+        ctx.params.f("completion"),
+        ctx.params.f("angle"),
+        ctx.params.f("feather"),
+        ctx.layer_size,
+        b.offset,
+        b.scale,
+        [b.img.width as f64, b.img.height as f64],
+    );
     let mut data = Vec::with_capacity(2 * (b.img.width + b.img.height) as usize);
     for x in 0..b.img.width {
-        data.extend(hl((x as f64 + 0.5) * dx - edge));
+        data.extend(hl((x as f64 + 0.5) * w.dx - w.edge));
     }
     for y in 0..b.img.height {
-        data.extend(hl((y as f64 + 0.5) * dy));
+        data.extend(hl((y as f64 + 0.5) * w.dy));
     }
     let mut p = Params::default();
     p.u[0][0] = 2 * b.img.width;
-    p.f[0][0] = feather as f32;
+    p.f[0] = [w.sigma as f32, w.reach as f32, w.s_lo as f32, w.s_hi as f32];
+    p.f[1][0] = w.tail as f32;
     run(e, "gen_linear_wipe", &p, b, None, Some(&data))
 }
 

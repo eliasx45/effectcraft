@@ -49,6 +49,31 @@ fn to_comp_time(c: &Comp, o: Owner, t: Tick) -> Tick {
     }
 }
 
+/// Put `m` into `v` in time order, replacing the marker already at its time (After Effects keeps
+/// one marker per time). Returns the replaced marker, which the command reports (`replaced`) so
+/// the overwrite is never silent.
+pub(crate) fn place_marker(v: &mut Vec<Marker>, m: Marker) -> Option<Marker> {
+    let old = v.iter().position(|x| x.time == m.time).map(|i| v.remove(i));
+    v.push(m);
+    v.sort_by_key(|x| x.time);
+    old
+}
+
+/// The `replaced` / `warning` reply fields for a marker `old` overwritten at comp time `t`.
+pub(crate) fn replaced_reply(out: &mut Value, old: &Marker, t: Tick, layer: Option<LayerId>) {
+    let what = if old.comment.is_empty() { "a marker".to_string() } else { format!("the marker \"{}\"", old.comment) };
+    out["replaced"] = json!({"comment": old.comment, "time": t.seconds(), "layer": layer.map(|l| l.0)});
+    out["warning"] = json!(format!("replaced {what} at {:.3} s (one marker per time)", t.seconds()));
+}
+
+/// Show a reply's `warning` in the app too (the replaced marker).
+pub(crate) fn toast_warning(s: &mut Session, out: &Value) {
+    if let Some(w) = out.get("warning").and_then(Value::as_str).filter(|w| !w.is_empty()) {
+        let w = format!("Marker: {w}");
+        s.toast(w);
+    }
+}
+
 /// `index` (0-based) or `at` (comp seconds, within half a frame).
 fn find_index(c: &Comp, o: Owner, p: &Value, cmd: &str) -> Result<usize> {
     let ms = markers_of(c, o).ok_or_else(|| bad(cmd, "no such layer"))?;
@@ -227,15 +252,36 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             None => Marker { time: to_marker_time(&snapshot, o, snapshot.frame_rate.snap_nearest(now)), ..Default::default() },
         };
         apply_fields(&snapshot, o, &mut m, p, c)?;
+        let ct = to_comp_time(&snapshot, o, m.time);
         let v = markers_mut(comp, o).ok_or_else(|| bad(c, "no such layer"))?;
-        if let Some(i) = idx {
-            v.remove(i);
-        }
-        v.push(m.clone());
-        v.sort_by_key(|x| x.time);
-        Ok(v.iter().position(|x| *x == m).unwrap_or(0))
+        // A new marker replaces one already at its time; editing (or dragging) one keeps the
+        // others, so a drag passing over a marker never deletes it.
+        let old = match idx {
+            Some(i) => {
+                v.remove(i);
+                v.push(m.clone());
+                v.sort_by_key(|x| x.time);
+                None
+            }
+            None => place_marker(v, m.clone()),
+        };
+        Ok((v.iter().position(|x| *x == m).unwrap_or(0), old, ct))
     })?;
-    Ok(json!({"index": i}))
+    let (i, old, ct) = i;
+    let mut out = json!({"index": i});
+    if let Some(old) = old {
+        replaced_reply(
+            &mut out,
+            &old,
+            ct,
+            match o {
+                Owner::Layer(l) => Some(l),
+                Owner::Comp => None,
+            },
+        );
+        toast_warning(s, &out);
+    }
+    Ok(out)
 }
 
 fn delete(s: &mut Session, p: &Value) -> Result<Value> {
@@ -360,7 +406,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Marker Settings",
             [],
             None,
-            "{layer? (omit: comp marker), index? (0-based) | at? (comp s) | new?: true, time? (comp s), duration? (s), comment?, chapter?, url?, frameTarget?, cuePoint?: {name, navigation?, params?: [[name, value]…]} | null, protected?, label?}",
+            "{layer? (omit: comp marker), index? (0-based) | at? (comp s) | new?: true (a marker already at that time is replaced: the reply has replaced: {comment, time} and a warning), time? (comp s), duration? (s), comment?, chapter?, url?, frameTarget?, cuePoint?: {name, navigation?, params?: [[name, value]…]} | null, protected?, label?}",
             has_comp,
             set
         ),

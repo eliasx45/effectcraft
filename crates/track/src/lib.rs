@@ -384,9 +384,7 @@ impl PointState {
             .collect();
         // Best score first; ties (flat or repetitive regions) go to the candidate nearest the
         // prediction so featureless areas don't drift.
-        let cp = crop.to_level(predicted, top);
-        let d2 = |c: &[f64; 2]| (c[0] - cp[0]).powi(2) + (c[1] - cp[1]).powi(2);
-        cands.sort_by(|a, b| if (a.0 - b.0).abs() < 1e-9 { d2(&a.1).total_cmp(&d2(&b.1)) } else { b.0.total_cmp(&a.0) });
+        rank_candidates(&mut cands, crop.to_level(predicted, top));
         let mut seeds: Vec<[f64; 2]> = vec![];
         for (_, c) in &cands {
             if seeds.iter().all(|q| (q[0] - c[0]).abs() > 1.5 || (q[1] - c[1]).abs() > 1.5) {
@@ -615,6 +613,15 @@ fn lk_refine(crop: &Crop, p: &Patch, c0: [f64; 2], a0: [f64; 2], shape: bool) ->
         return None;
     }
     Some((c, a))
+}
+
+/// Sorts match candidates best score first; scores equal to 1e-9 go to the candidate nearest
+/// `cp`. Scores are bucketed rather than compared within a tolerance: "within 1e-9" isn't
+/// transitive, and the standard sort panics on a comparison that isn't a total order.
+fn rank_candidates(cands: &mut [(f64, [f64; 2])], cp: [f64; 2]) {
+    let d2 = |c: &[f64; 2]| (c[0] - cp[0]).powi(2) + (c[1] - cp[1]).powi(2);
+    let bucket = |s: f64| (s * 1e9).round();
+    cands.sort_by(|a, b| bucket(b.0).total_cmp(&bucket(a.0)).then_with(|| d2(&a.1).total_cmp(&d2(&b.1))));
 }
 
 /// Tracks a set of points frame by frame (the points of one tracker).

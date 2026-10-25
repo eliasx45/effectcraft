@@ -265,6 +265,9 @@ pub struct ViewerState {
     pub zoom: Option<f32>,
     /// Fit up to 100%: while fitting (`zoom` is None), the comp is never magnified past 100%.
     pub fit_up_to_100: bool,
+    /// View ▸ Sharp Zoom (beyond After Effects): above 100 % the visible region is also rendered
+    /// at the magnification, so text, shapes and footage stay sharp (see [`crate::sharp_zoom`]).
+    pub sharp_zoom: bool,
     /// Pan offset in points from the centred position.
     pub pan: [f32; 2],
     pub transparency_grid: bool,
@@ -307,6 +310,7 @@ impl Default for ViewerState {
         ViewerState {
             zoom: None,
             fit_up_to_100: false,
+            sharp_zoom: true,
             pan: [0.0, 0.0],
             transparency_grid: false,
             show_masks: true,
@@ -484,6 +488,14 @@ pub struct TimelineState {
     /// Graph Editor ▸ Show Transform Box When Multiple Keys Are Selected.
     #[serde(default = "yes")]
     pub graph_transform_box: bool,
+    /// Speed curves in the property rows (footer ∿ button): eased segments draw their speed
+    /// curve, peak dot and influence handles in the row (`panels::timeline::speed_rows`).
+    #[serde(default = "yes")]
+    pub speed_rows: bool,
+    /// Property rows whose speed curve was given more room (points high) by dragging the row's
+    /// bottom edge; the others are one row high.
+    #[serde(default)]
+    pub speed_row_heights: BTreeMap<u64, f32>,
     /// Properties whose inline expression editor is collapsed.
     #[serde(default)]
     pub expr_closed: BTreeSet<u64>,
@@ -491,7 +503,7 @@ pub struct TimelineState {
     /// the others grow with their text, up to 8 lines.
     #[serde(default)]
     pub expr_lines: BTreeMap<u64, usize>,
-    /// Scale and Mask Feather properties whose chain link (Constrain Proportions, on by default)
+    /// Scale, Mask Feather and Audio Levels properties whose chain link (on by default)
     /// was turned off.
     #[serde(default)]
     pub unlinked: BTreeSet<u64>,
@@ -514,6 +526,26 @@ pub struct TimelineState {
     /// A scroll asked for by a shortcut (D, X), done when the Timeline is next drawn.
     #[serde(skip)]
     pub scroll_to: Option<ScrollTo>,
+    /// Batch 1 (AX5): the quick-button row above the layers (pins, Fast In pick, find box).
+    #[serde(default)]
+    pub quick_row: crate::panels::quick_row::QuickRowState,
+    /// Where a Shift-drag in the time graph (a layer bar move, an In / Out trim, a slip or a
+    /// keyframe drag) is snapped right now, drawn as the guide line; `None` when nothing snaps.
+    /// Read-only for agents (`ui.get`): it is reset every frame and never restored.
+    #[serde(default, skip_deserializing)]
+    pub snap_guide: Option<SnapGuide>,
+}
+
+/// A Timeline snap (see `TimelineState::snap_guide`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapGuide {
+    /// The target's time (comp seconds).
+    pub time: f64,
+    /// `cti`, `key`, `layerIn`, `layerOut`, `compMarker`, `layerMarker`, `workAreaStart`,
+    /// `workAreaEnd`, `compStart` or `compEnd`.
+    pub kind: String,
+    /// The layer the target belongs to (In / Out point, layer marker, key).
+    pub layer: Option<u64>,
 }
 
 pub fn default_tl_columns() -> BTreeSet<String> {
@@ -565,6 +597,8 @@ impl Default for TimelineState {
             graph_reference: false,
             graph_expression_overlay: false,
             graph_transform_box: true,
+            speed_rows: true,
+            speed_row_heights: BTreeMap::new(),
             expr_closed: BTreeSet::new(),
             expr_lines: BTreeMap::new(),
             unlinked: BTreeSet::new(),
@@ -573,6 +607,8 @@ impl Default for TimelineState {
             column_order: Vec::new(),
             column_widths: BTreeMap::new(),
             scroll_to: None,
+            quick_row: Default::default(),
+            snap_guide: None,
         }
     }
 }
@@ -670,6 +706,9 @@ pub struct UiState {
     /// Window ▸ Script Console input, output and history.
     #[serde(default)]
     pub script_console: crate::panels::script_console::ScriptConsole,
+    /// Window ▸ Memory: sort order and the rows twirled open.
+    #[serde(default)]
+    pub memory: crate::panels::memory_panel::MemoryView,
     /// Tool shown in each toolbar slot.
     pub slot_tools: Vec<Tool>,
     pub workspace: String,
@@ -690,6 +729,9 @@ pub struct UiState {
     /// The panel maximized to fill the dock area (`~`), if any.
     #[serde(default)]
     pub maximized: Option<PanelKind>,
+    /// The maximized panel fills the area alone, without its group's tabs (full-screen playback).
+    #[serde(skip)]
+    pub maximized_solo: bool,
     /// Locked Composition / Timeline tabs (panel ids): opening another composition does not
     /// bring a locked panel forward (the tab's lock icon, as After Effects' viewer lock).
     #[serde(default)]
@@ -731,6 +773,11 @@ pub struct UiState {
     /// Vertical scroll of the Project panel's item list (points); only visible rows are drawn.
     #[serde(default)]
     pub project_scroll: f32,
+    /// Render Queue column widths in points by column (`render`, `label`, `num`, `name`, `status`,
+    /// `started`, `time`; see `panels::render_queue::COLUMNS`), set by dragging the header
+    /// dividers. A missing column has its default width; without `name`, Comp Name fills.
+    #[serde(default)]
+    pub render_queue_columns: BTreeMap<String, f32>,
     /// Effect Controls twirl state (group uids that are collapsed).
     pub fx_closed: BTreeSet<u64>,
     /// Slider params whose slider row is twirled open (AE hides sliders by default).
@@ -809,6 +856,7 @@ impl Default for UiState {
         UiState {
             tool: Tool::Selection,
             script_console: Default::default(),
+            memory: Default::default(),
             slot_tools: Tool::SLOTS.iter().map(|s| s[0]).collect(),
             workspace: "Default".into(),
             dock: crate::dock::workspace("Default"),
@@ -817,6 +865,7 @@ impl Default for UiState {
             saved_floating: Default::default(),
             panel_windows: vec![],
             maximized: None,
+            maximized_solo: false,
             locked_tabs: BTreeSet::new(),
             viewers: Default::default(),
             active_viewer: 0,
@@ -836,6 +885,7 @@ impl Default for UiState {
             project_hscroll: 0.0,
             project_scroll: 0.0,
             project_columns: default_project_columns(),
+            render_queue_columns: BTreeMap::new(),
             fx_closed: BTreeSet::new(),
             fx_slider_open: BTreeSet::new(),
             fx_pick: None,

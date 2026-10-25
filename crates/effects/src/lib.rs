@@ -53,12 +53,14 @@ use effectcraft_project::{GroupKind, ParamUi, PropGroup, Property};
 pub use effectcraft_raster::{AuxChannels, Image};
 pub use generate::four_color_softening;
 pub use misc::{
-    GLOW_KNEE, GLOW_OPERATIONS, GLOW_SIGMA_PER_RADIUS, INVERT_ALPHA, INVERT_CHANNELS, glow_ab_position, glow_ab_t, glow_bright, glow_composite, glow_operation,
+    GLOW_KNEE, GLOW_OPERATIONS, GLOW_SIGMA_PER_RADIUS, INVERT_ALPHA, INVERT_CHANNELS, LinearWipe, WIPE_END_RATE, WIPE_SIGMA_PER_FEATHER, exposure_gain,
+    glow_ab_position, glow_ab_t, glow_bright, glow_composite, glow_operation, glow_sigmas, wipe_phi,
 };
+pub use shadow_studio::{ShadowStudioPlan, shadow_studio_plan};
 pub use sim::particle_state;
 pub use sim3::{PgBlit, PgPlan, playground_plan, playground_state};
-pub use stylize2::motion_tile_growth;
 pub use stylize2::strobe_on;
+pub use stylize2::{motion_tile_frame, motion_tile_growth, motion_tile_sample};
 // CPU helpers the GPU kernels share (effectcraft-gpu).
 pub use blur2::{camera_lens_plain, camera_lens_spans};
 pub use generate::gen_mode;
@@ -386,16 +388,24 @@ pub struct EffectEnv<'a> {
     /// `[d, e, f]` take the effect coordinates [`Buf::to_px`] places to comp coordinates
     /// (`x' = a x + b y + c`). Effects that honour it say so.
     pub comp_space: Option<[[f64; 3]; 2]>,
+    /// A Continuously Rasterize 3D shape or text layer: layer units per comp pixel along the
+    /// effect's x and y axes, from the projection at its anchor (camera included). After Effects
+    /// sizes its effects on screen there too (a Glow keeps its reach however near the camera
+    /// brings the layer), but its points stay in layer space ([`Self::comp_space`] is 2D only).
+    pub comp_px_3d: Option<[f64; 2]>,
 }
 
 impl EffectEnv<'_> {
     /// Layer units per comp pixel along the effect's x and y axes: `[1, 1]` unless the layer
-    /// runs its effects in comp space ([`Self::comp_space`]). A size measured in comp pixels
+    /// runs its effects in comp space ([`Self::comp_space`]) or is a continuously rasterised 3D
+    /// one ([`Self::comp_px_3d`]). A size measured in comp pixels
     /// (a blur radius) times these is the size in layer units. For a rotated non-uniform scale
     /// this is the size's spread along each layer axis (the marginal of the comp-space
     /// footprint), exact for uniform scale with any rotation and for axis-aligned scale.
     pub fn comp_px(&self) -> [f64; 2] {
-        let Some([[a, b, _], [d, e, _]]) = self.comp_space else { return [1.0, 1.0] };
+        let Some([[a, b, _], [d, e, _]]) = self.comp_space else {
+            return self.comp_px_3d.filter(|k| k.iter().all(|v| v.is_finite() && *v > 0.0)).unwrap_or([1.0, 1.0]);
+        };
         let det = a * e - b * d;
         let det2 = det * det;
         if !det2.is_finite() || det2 < 1e-12 {
@@ -1152,6 +1162,9 @@ pub const GPU_EFFECTS: &[&str] = &[
     "ec.obsolete.pathtext",
     // effectcraft-gpu fx_deepglow
     "ec.stylize.deepglow",
+    // effectcraft-gpu fx_shadowstudio
+    "ec.perspective.shadowstudio2",
+    "ec.perspective.shadowstudio3",
 ];
 
 /// Effects that can read [`EffectHost::comp_scene`] (the comp camera or the first comp light):

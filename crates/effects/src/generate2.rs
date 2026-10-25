@@ -1220,6 +1220,73 @@ fn sweep_edge_plane(alpha: &Plane, rx: usize, ry: usize, pad: usize) -> Plane {
     box_plane(&p, rx, ry)
 }
 
+/// One value of the CC Light Sweep edge plane ([`sweep_edge_plane`]) at padded-plane pixel
+/// (`qx`, `qy`), computed from `alpha` alone (transparent outside it): the same row sums, then
+/// column sums, in f64 as `util::box_plane` runs them (to float rounding of its running sums).
+fn sweep_edge_value(alpha: &Plane, pad: usize, rx: usize, ry: usize, qx: i64, qy: i64) -> f32 {
+    let at = |x: i64, y: i64| -> f32 {
+        let (x, y) = (x - pad as i64, y - pad as i64);
+        if x < 0 || y < 0 || x >= alpha.w as i64 || y >= alpha.h as i64 {
+            0.0
+        } else {
+            alpha.data.get(y as usize * alpha.w + x as usize).copied().unwrap_or(0.0)
+        }
+    };
+    let row = |y: i64| -> f32 {
+        if rx == 0 {
+            return at(qx, y);
+        }
+        let r = rx as i64;
+        ((-r..=r).map(|i| f64::from(at(qx + i, y))).sum::<f64>()) as f32 * (1.0 / (2 * rx + 1) as f32)
+    };
+    if ry == 0 {
+        return row(qy);
+    }
+    let r = ry as i64;
+    ((-r..=r).map(|j| f64::from(row(qy + j))).sum::<f64>()) as f32 * (1.0 / (2 * ry + 1) as f32)
+}
+
+/// The edge plane's bilinear sample at padded-plane position (`x`, `y`) (`Plane::sample` of
+/// [`sweep_edge_plane`], edges clamped to the `w × h` padded plane), from [`sweep_edge_value`].
+fn sweep_edge_sample(alpha: &Plane, pad: usize, rx: usize, ry: usize, x: f64, y: f64) -> f32 {
+    let (w, h) = ((alpha.w + 2 * pad) as i64, (alpha.h + 2 * pad) as i64);
+    let (fx, fy) = (x - 0.5, y - 0.5);
+    let (x0, y0) = (fx.floor(), fy.floor());
+    let (tx, ty) = ((fx - x0) as f32, (fy - y0) as f32);
+    let (x0, y0) = (x0 as i64, y0 as i64);
+    let v = |x: i64, y: i64| sweep_edge_value(alpha, pad, rx, ry, x.clamp(0, w - 1), y.clamp(0, h - 1));
+    let (a, b, c, d) = (v(x0, y0), v(x0 + 1, y0), v(x0, y0 + 1), v(x0 + 1, y0 + 1));
+    let top = a + (b - a) * tx;
+    let bot = c + (d - c) * tx;
+    top + (bot - top) * ty
+}
+
+/// The pixels `[x0, x1)` of buffer row `y` (of `w`) that CC Light Sweep's band can reach
+/// (|ax · x + ay · y + k| < half at the pixel centre, with 2 px of slack); outside it the band
+/// is 0. The whole row when the geometry isn't finite.
+fn light_sweep_span(g: &SweepGeometry, y: usize, w: usize) -> (usize, usize) {
+    let fy = y as f64 + 0.5;
+    let c = g.ay * fy + g.k;
+    if !(c.is_finite() && g.ax.is_finite() && g.half.is_finite()) {
+        return (0, w);
+    }
+    if g.ax.abs() < 1e-9 {
+        return if c.abs() < g.half + 1.0 { (0, w) } else { (0, 0) };
+    }
+    let (a, b) = ((-g.half - c) / g.ax, (g.half - c) / g.ax);
+    let (lo, hi) = (a.min(b) - 0.5, a.max(b) - 0.5);
+    if !(lo.is_finite() && hi.is_finite()) {
+        return (0, w);
+    }
+    let x0 = (lo.floor() - 2.0).clamp(0.0, w as f64) as usize;
+    let x1 = (hi.ceil() + 3.0).clamp(0.0, w as f64) as usize;
+    (x0, x1.max(x0))
+}
+
+/// The edge plane's box is evaluated per pixel (from the alpha) up to this many alpha reads per
+/// bilinear sample; thicker edges blur the whole padded plane once.
+const SWEEP_DIRECT_TAPS: usize = 64;
+
 fn light_sweep(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let g = light_sweep_geometry(ctx, b.offset, b.scale);
     let shape = ctx.params.e("shape");
@@ -1228,15 +1295,27 @@ fn light_sweep(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let lc = ctx.params.color("lightColor");
     let mode = ctx.params.e("lightReceptionMode");
     let pad = g.pad();
-    let soft = if g.edges { sweep_edge_plane(&Plane::alpha(&b.img), g.rx, g.ry, pad) } else { Plane::default() };
-    map_xy(&mut b.img, |x, y, px| {
+    // The band covers a strip of the buffer: only its pixels are lit (Cutout clears the rest),
+    // and the edge plane is only read there, so a thin edge's box is summed per lit pixel from
+    // the alpha instead of blurring the whole padded plane.
+    let direct = g.edges && (2 * g.rx + 2).saturating_mul(2 * g.ry + 2) <= SWEEP_DIRECT_TAPS;
+    let alpha = if g.edges { Plane::alpha(&b.img) } else { Plane::default() };
+    let soft = if g.edges && !direct { sweep_edge_plane(&alpha, g.rx, g.ry, pad) } else { Plane::default() };
+    let w = b.img.width as usize;
+    let light_px = |x: usize, y: usize, px: Px| -> Px {
         let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
         let band = light_sweep_band(shape, (g.ax * fx + g.ay * fy + g.k).abs(), g.half);
         if band <= 0.0 {
             return if mode == 2 { [0.0; 4] } else { px };
         }
         let a = px[3];
-        let edge = if g.edges { (a - soft.sample(fx + pad as f64 + g.shift.0, fy + pad as f64 + g.shift.1)).max(0.0) } else { 0.0 };
+        let edge = if !g.edges {
+            0.0
+        } else {
+            let (sx, sy) = (fx + pad as f64 + g.shift.0, fy + pad as f64 + g.shift.1);
+            let s = if direct { sweep_edge_sample(&alpha, pad, g.rx, g.ry, sx, sy) } else { soft.sample(sx, sy) };
+            (a - s).max(0.0)
+        };
         let light = band * (sweep + edge * edge_i);
         match mode {
             1 => {
@@ -1249,6 +1328,17 @@ fn light_sweep(ctx: &EffectCtx, mut b: Buf) -> Buf {
                 [lc[0] * la, lc[1] * la, lc[2] * la, la]
             }
             _ => [px[0] + lc[0] * light * a, px[1] + lc[1] * light * a, px[2] + lc[2] * light * a, a],
+        }
+    };
+    b.img.rows_mut().for_each(|(y, row)| {
+        let (x0, x1) = light_sweep_span(&g, y, w);
+        let (x0, x1) = (x0.min(row.len()), x1.min(row.len()));
+        if mode == 2 {
+            row[..x0].fill([0.0; 4]);
+            row[x1..].fill([0.0; 4]);
+        }
+        for (x, px) in row.iter_mut().enumerate().take(x1).skip(x0) {
+            *px = light_px(x, y, *px);
         }
     });
     b
@@ -1469,6 +1559,136 @@ mod tests {
             }
         }
         img
+    }
+
+    /// CC Light Sweep as it was before LS1 (every pixel, the edge plane blurred whole): the
+    /// oracle for the strip version.
+    fn light_sweep_whole(ctx: &EffectCtx, mut b: Buf) -> Buf {
+        let g = light_sweep_geometry(ctx, b.offset, b.scale);
+        let shape = ctx.params.e("shape");
+        let sweep = (ctx.params.f("sweepIntensity") / 100.0) as f32;
+        let edge_i = (ctx.params.f("edgeIntensity") / 100.0 * 2.0) as f32;
+        let lc = ctx.params.color("lightColor");
+        let mode = ctx.params.e("lightReceptionMode");
+        let pad = g.pad();
+        let soft = if g.edges { sweep_edge_plane(&Plane::alpha(&b.img), g.rx, g.ry, pad) } else { Plane::default() };
+        map_xy(&mut b.img, |x, y, px| {
+            let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+            let band = light_sweep_band(shape, (g.ax * fx + g.ay * fy + g.k).abs(), g.half);
+            if band <= 0.0 {
+                return if mode == 2 { [0.0; 4] } else { px };
+            }
+            let a = px[3];
+            let edge = if g.edges { (a - soft.sample(fx + pad as f64 + g.shift.0, fy + pad as f64 + g.shift.1)).max(0.0) } else { 0.0 };
+            let light = band * (sweep + edge * edge_i);
+            match mode {
+                1 => {
+                    let l = light.clamp(0.0, 1.0);
+                    let k = 1.0 - l;
+                    [px[0] * k + lc[0] * l * a, px[1] * k + lc[1] * l * a, px[2] * k + lc[2] * l * a, a]
+                }
+                2 => {
+                    let la = (light * a).clamp(0.0, 1.0);
+                    [lc[0] * la, lc[1] * la, lc[2] * la, la]
+                }
+                _ => [px[0] + lc[0] * light * a, px[1] + lc[1] * light * a, px[2] + lc[2] * light * a, a],
+            }
+        });
+        b
+    }
+
+    /// A soft-edged, partly transparent pattern on a 240 × 150 layer.
+    fn soft_card() -> Image {
+        let mut img = Image::new(240, 150);
+        for y in 0..150u32 {
+            for x in 0..240u32 {
+                let (u, v) = (x as f32 / 240.0 - 0.5, y as f32 / 150.0 - 0.5);
+                let a = ((0.42 - (u * u + v * v).sqrt()) * 9.0).clamp(0.0, 1.0) * if (x / 7 + y / 5) % 4 == 0 { 0.5 } else { 1.0 };
+                img.set(x, y, [0.8 * a * (0.5 + u), 0.6 * a, 0.3 * a, a]);
+            }
+        }
+        img
+    }
+
+    /// LS1: the strip version (lit span per row, thin edges summed per pixel) matches the whole
+    /// buffer version: shapes, reception modes, angles (vertical and horizontal lines too),
+    /// thin and thick edges, at full and half resolution.
+    #[test]
+    fn light_sweep_strip_matches_whole_buffer() {
+        let s = crate::find("ec.generate.cclightsweep").unwrap();
+        let mut worst = 0.0f32;
+        for (dir, width, thick, shape, mode) in [
+            (-30.0, 40.0, 1.0, 1, 0),
+            (30.0, 50.0, 1.0, 0, 1),
+            (0.0, 20.0, 2.0, 2, 2),
+            (90.0, 15.0, 1.5, 1, 0),
+            (-30.0, 40.0, 9.0, 1, 2),
+            (135.0, 300.0, 0.0, 1, 1),
+            (12.0, 0.0, 1.0, 1, 0),
+        ] {
+            for scale in [1.0, 0.5] {
+                let img = soft_card();
+                let ls = [240.0, 150.0];
+                let mut params = crate::Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+                for (k, v) in [
+                    ("center", Value::Vec2([110.0, 70.0])),
+                    ("direction", num(dir)),
+                    ("width", num(width)),
+                    ("edgeThickness", num(thick)),
+                    ("shape", Value::Enum(shape)),
+                    ("lightReceptionMode", Value::Enum(mode)),
+                ] {
+                    params.values.insert(k.to_string(), v);
+                }
+                let img = if scale < 1.0 { effectcraft_raster::resample(&img, 120, 75) } else { img };
+                let ctx = EffectCtx { params: &params, time: 0.0, layer_size: ls, seed: 1, adjustment: false, env: Default::default() };
+                let buf = Buf { img, offset: [3.0, -2.0], scale };
+                let a = light_sweep(&ctx, buf.clone());
+                let b = light_sweep_whole(&ctx, buf);
+                for (p, q) in a.img.data.iter().zip(&b.img.data) {
+                    for c in 0..4 {
+                        worst = worst.max((p[c] - q[c]).abs());
+                    }
+                }
+            }
+        }
+        assert!(worst <= 1e-5, "strip vs whole-buffer CC Light Sweep: max diff {worst}");
+    }
+
+    /// LS1 perf: a comp-sized (1920 × 1080) card lit by 10-10 Edit's sweep (Width 40,
+    /// Thickness 1): strip vs whole buffer (`cargo test -p effectcraft-effects --lib
+    /// light_sweep_comp_perf -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "perf"]
+    fn light_sweep_comp_perf() {
+        let s = crate::find("ec.generate.cclightsweep").unwrap();
+        let mut img = Image::new(1920, 1080);
+        for y in 200..880 {
+            for x in 300..1620 {
+                img.set(x, y, [0.2, 0.3, 0.4, 1.0]);
+            }
+        }
+        let mut params = crate::Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        for (k, v) in [("center", Value::Vec2([960.0, 540.0])), ("width", num(40.0)), ("sweepIntensity", num(70.0)), ("edgeIntensity", num(60.0))] {
+            params.values.insert(k.to_string(), v);
+        }
+        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [1920.0, 1080.0], seed: 1, adjustment: false, env: Default::default() };
+        let buf = Buf { img, offset: [0.0; 2], scale: 1.0 };
+        let time = |f: &dyn Fn(Buf) -> Buf| {
+            let mut v: Vec<f64> = (0..9)
+                .map(|_| {
+                    let input = buf.clone();
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(f(input));
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[4]
+        };
+        let strip = time(&|b| light_sweep(&ctx, b));
+        let whole = time(&|b| light_sweep_whole(&ctx, b));
+        eprintln!("CC Light Sweep 1920x1080 (median of 9): strip {strip:.2} ms, whole buffer {whole:.2} ms");
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::frontend("view.grid", grid),
         Handler::frontend("view.snapToGrid", snap_to_grid),
         Handler::frontend("view.layerControls", layer_controls),
+        Handler::frontend("view.sharpZoom", sharp_zoom),
         Handler::frontend("view.options", options),
         Handler::frontend("view.panelBackground", panel_background),
         Handler::frontend("view.fullScreen", full_screen),
@@ -113,7 +114,13 @@ fn free_transform(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: 
     if let Some((layer, path)) = start
         && ov::free_transform_target(app) != Some((effectcraft_engine::project::LayerId(layer), path))
     {
-        ov::begin_free_transform(app, effectcraft_engine::project::LayerId(layer), path);
+        // The viewer shows paths of selected layers only: a mask picked in the Timeline (or
+        // named by an agent) selects its layer too, so the box appears.
+        let lid = effectcraft_engine::project::LayerId(layer);
+        if !app.session.state.selected_layers.contains(&lid) {
+            app.session.execute("layer.select", json!({"layers": [layer], "add": true})).map_err(|e| e.to_string())?;
+        }
+        ov::begin_free_transform(app, lid, path);
     }
     let anchor = p.get("anchor").and_then(Value::as_array).and_then(|a| Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?]));
     ov::set_free_transform(app, p.get("angle").and_then(Value::as_f64), anchor);
@@ -259,6 +266,12 @@ fn snap_to_grid(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: Va
 
 fn layer_controls(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: Value) -> Result<Value, String> {
     Ok(toggle(&mut app.ui.viewer.show_layer_controls, &p))
+}
+
+/// View ▸ Sharp Zoom: render the visible region at the magnification above 100 % (on by
+/// default; `value` sets it, else it toggles).
+fn sharp_zoom(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: Value) -> Result<Value, String> {
+    Ok(toggle(&mut app.ui.viewer.sharp_zoom, &p))
 }
 
 fn options(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _p: Value) -> Result<Value, String> {

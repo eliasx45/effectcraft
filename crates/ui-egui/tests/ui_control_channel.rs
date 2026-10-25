@@ -224,3 +224,28 @@ fn control_requests_take_turns_by_client() {
     let order: Vec<String> = control::fair_order(reqs).iter().map(|(r, _)| r.params["params"]["name"].as_str().unwrap().to_string()).collect();
     assert_eq!(order, ["a1", "b1", "1", "a2", "b2", "a3"]);
 }
+
+/// Regression (batch 1): in a comp without a speech map (most comps), the learning loop's
+/// `speech.get` over the control channel put "invalid parameters for `speech.get`: the comp has no
+/// speech map …" in the user's status toast. A failed query is its caller's error and changes
+/// nothing: no toast. A failed edit still shows.
+#[test]
+fn a_failed_query_does_not_toast_the_user() {
+    let mut app = EffectcraftApp::new(Session::default());
+    let ctx = egui::Context::default();
+    let send = |app: &mut EffectcraftApp, command: &str, params: Value| -> Value {
+        let (req, _rx) = ControlRequest::new("engine.execute", json!({"command": command, "params": params}));
+        match control::handle(app, &ctx, &req) {
+            control::Outcome::Done(v) => v,
+            _ => Value::Null,
+        }
+    };
+    assert_eq!(send(&mut app, "comp.new", json!({"name": "Creating Text Presets"}))["ok"], true);
+    let r = send(&mut app, "speech.get", json!({}));
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(r["error"].as_str().unwrap_or("").contains("no speech map"), "the caller still gets the error: {r}");
+    assert_eq!(app.ui.status, "", "no toast for a failed read");
+    let r = send(&mut app, "speech.import", json!({}));
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(!app.ui.status.is_empty(), "a failed edit is still reported");
+}

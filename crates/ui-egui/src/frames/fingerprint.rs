@@ -82,6 +82,7 @@ impl Cache {
         let Some(img) = self.map.remove(&from) else { return };
         self.map.insert(to, img);
         self.move_draft(&from, to);
+        self.moved(&from, to);
         self.order.rename(&from, to);
         if let Some(rank) = self.protected.remove(&from) {
             self.protected.insert(to, rank);
@@ -298,7 +299,7 @@ mod tests {
     }
 
     fn pixels(f: &Frames, k: &FrameKey) -> Vec<egui::Color32> {
-        match f.cache.lock().unwrap().map.get(k).unwrap() {
+        match f.cache.lock().unwrap().map.get(k).unwrap().image().unwrap() {
             FrameImage::Cpu(c) => c.pixels.clone(),
             FrameImage::Gpu(_) => panic!("CPU frames"),
         }
@@ -386,6 +387,148 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let kept: Vec<i64> = FRAMES.into_iter().filter(|fr| *fr != 0 && f.is_cached(&key(&f, &after, 2, id, *fr))).collect();
         assert_eq!(kept, Vec::<i64>::new());
+    }
+
+    /// A cloud stand-in (eager, like the cloud server): renders each frame here on the CPU and
+    /// keeps every request's frame and disk key, so a test sees what would have downloaded.
+    #[derive(Default)]
+    struct Cloud {
+        sent: Mutex<Vec<(i64, Option<u128>)>>,
+    }
+
+    impl crate::frames::RemoteFrames for Cloud {
+        fn slots(&self) -> usize {
+            4
+        }
+        fn eager(&self) -> bool {
+            true
+        }
+        fn gpu(&self) -> bool {
+            true
+        }
+        fn disk(&self) -> bool {
+            true
+        }
+        fn start(&self, job: crate::frames::RemoteJob, done: crate::frames::RemoteDone) {
+            let fps = job.project.comp(job.comp).unwrap().frame_rate;
+            self.sent.lock().unwrap().push((fps.frame_at(job.t), job.disk_key));
+            let img = to_color_image(&effectcraft_engine::render::render_frame(&job.project, job.comp, job.t, job.opts.scale));
+            let rgba = img.pixels.iter().flat_map(|p| p.to_array()).collect();
+            done(Ok(crate::frames::RemoteFrame { width: img.size[0] as u32, height: img.size[1] as u32, rgba, ms: 0. }));
+        }
+    }
+
+    fn with_cloud() -> (Frames, Arc<Cloud>) {
+        let cloud = Arc::new(Cloud::default());
+        let mut f = Frames::default();
+        f.set_remote(Some(cloud.clone()));
+        (f, cloud)
+    }
+
+    /// Ask for every frame of `FRAMES` through the cloud and wait until they are in.
+    fn request_all_cloud(f: &Frames, project: &Arc<Project>, revision: u64, id: ItemId) {
+        let src = source(project);
+        for frame in FRAMES {
+            f.request(&src, key(f, project, revision, id, frame), id, at(frame), RenderOpts::default());
+            f.dispatch_remote();
+        }
+        wait(|| {
+            f.dispatch_remote();
+            f.inflight() == 0
+        });
+    }
+
+    /// With the cloud rendering, an edit downloads only the frames it changed: the frames that
+    /// came from the cloud carry their fingerprints, so the ones outside the edited keyframe's
+    /// neighbours (0–2 s) are taken over in RAM, each equal to a fresh render; the frames sent
+    /// again are exactly those between the neighbours.
+    #[test]
+    fn with_the_cloud_an_edit_downloads_only_the_frames_it_changes() {
+        let (before, id) = scene();
+        let (f, cloud) = with_cloud();
+        request_all_cloud(&f, &before, 1, id);
+        assert_eq!(cloud.sent.lock().unwrap().len(), FRAMES.len(), "every frame downloaded once");
+        assert!(FRAMES.iter().all(|fr| f.is_cached(&key(&f, &before, 1, id, *fr))));
+        let after = edit(&before, id, 1, 10.);
+        cloud.sent.lock().unwrap().clear();
+        request_all_cloud(&f, &after, 2, id);
+        let mut again: Vec<i64> = cloud.sent.lock().unwrap().iter().map(|(fr, _)| *fr).collect();
+        again.sort_unstable();
+        assert_eq!(again, vec![10, 20, 30, 40, 50], "only the frames between the edited key's neighbours");
+        for fr in FRAMES {
+            let expected = to_color_image(&effectcraft_engine::render::render_frame(&after, id, at(fr), 1.));
+            assert_eq!(pixels(&f, &key(&f, &after, 2, id, fr)), expected.pixels, "frame {fr} equals a fresh render");
+        }
+        // Undo: nothing downloads, every frame of the first state is still here.
+        cloud.sent.lock().unwrap().clear();
+        request_all_cloud(&f, &before, 3, id);
+        assert!(cloud.sent.lock().unwrap().is_empty(), "undo downloads nothing");
+    }
+
+    /// The disk keys the cloud server caches frames under follow what each frame shows: an edit
+    /// keeps the key of every frame it doesn't change (the server's cache, which outlives the
+    /// app, serves them) and changes the others'.
+    #[test]
+    fn server_disk_keys_change_only_for_the_frames_an_edit_changes() {
+        let (before, id) = scene();
+        let (f, cloud) = with_cloud();
+        request_all_cloud(&f, &before, 1, id);
+        let first: HashMap<i64, Option<u128>> = cloud.sent.lock().unwrap().iter().copied().collect();
+        assert!(first.values().all(Option::is_some), "every frame has a disk key");
+        // A fresh app (nothing in RAM) at the edited state: the server is asked for every frame.
+        let after = edit(&before, id, 1, 10.);
+        let (g, cloud2) = with_cloud();
+        request_all_cloud(&g, &after, 7, id);
+        let second: HashMap<i64, Option<u128>> = cloud2.sent.lock().unwrap().iter().copied().collect();
+        let same: Vec<i64> = {
+            let mut v: Vec<i64> = FRAMES.into_iter().filter(|fr| first[fr] == second[fr]).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(same, vec![0, 60, 70, 80, 90, 100, 110, 119], "the frames outside 0–2 s keep their keys");
+    }
+
+    /// The local disk cache names frames by their fingerprints too: after a restart (a fresh
+    /// cache in RAM) at an edited state, the frames the edit didn't change come from disk (the
+    /// blue bar shows them before they're asked for), the others don't, and every frame shown
+    /// equals a fresh render.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_disk_cache_keeps_the_frames_an_edit_doesnt_change_across_a_restart() {
+        use effectcraft_engine::render::disk_cache::DiskCache;
+        let (before, id) = scene();
+        let dir = std::env::temp_dir().join(format!("effectcraft-print-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let disk_src = |p: &Arc<Project>| RenderSource { disk: Some(dc.clone()), ..source(p) };
+        let opts = RenderOpts::default();
+        let f = Frames::default();
+        for frame in FRAMES {
+            assert!(f.request_to_disk(&disk_src(&before), key(&f, &before, 1, id, frame), id, at(frame), opts));
+        }
+        wait(|| f.inflight() == 0);
+        dc.flush();
+        let after = edit(&before, id, 1, 10.);
+        let g = Frames::default();
+        let base = key(&g, &after, 9, id, 0);
+        let mut blue = vec![];
+        for _ in 0..400 {
+            blue = g.disk_frames(&disk_src(&after), &base, 120, &opts);
+            if !blue.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(blue, vec![0, 60, 70, 80, 90, 100, 110, 119], "on disk: the frames outside 0–2 s");
+        for frame in FRAMES {
+            g.request(&disk_src(&after), key(&g, &after, 9, id, frame), id, at(frame), opts);
+        }
+        wait(|| g.inflight() == 0);
+        for fr in FRAMES {
+            let expected = to_color_image(&effectcraft_engine::render::render_frame(&after, id, at(fr), 1.));
+            assert_eq!(pixels(&g, &key(&g, &after, 9, id, fr)), expected.pixels, "frame {fr} equals a fresh render");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Measure on a real project (`EC_PRINTS_PROJECT=…/project.ecproj`): for each layer with
@@ -483,5 +626,120 @@ mod tests {
             100. * kept_total as f64 / all,
             100. * excess_total as f64 / all
         );
+    }
+
+    /// Frames a typical small edit invalidates in a real comp (`EC_PRINTS_PROJECT=…`, comp
+    /// `EC_PRINTS_COMP`, default the largest top-level one): by the comp-wide content key (the
+    /// disk cache's and the cloud server's frame keys before) and by the frame fingerprint
+    /// (every cache now). Edits: a text layer nudged 12 px (the shortest-lived in the comp, then
+    /// one inside a precomp) and the middle position keyframe of a keyed layer moved.
+    #[test]
+    #[ignore = "needs a local project file; prints counts"]
+    fn real_project_small_edit_invalidation() {
+        use effectcraft_engine::project::{ItemKind, LayerSource};
+        use effectcraft_engine::render::disk_cache;
+        let Ok(path) = std::env::var("EC_PRINTS_PROJECT") else { return };
+        let project = Arc::new(Project::from_json(&std::fs::read_to_string(path).unwrap()).unwrap());
+        let want = std::env::var("EC_PRINTS_COMP").ok();
+        let (id, comp) = project
+            .items
+            .iter()
+            .filter_map(|(id, i)| if let ItemKind::Comp(c) = &i.kind { Some((*id, i.name.clone(), c.clone())) } else { None })
+            .filter(|(_, name, _)| want.as_ref().is_none_or(|w| w == name))
+            .max_by_key(|(_, _, c)| c.layers.len())
+            .map(|(id, _, c)| (id, c))
+            .unwrap();
+        let fps = comp.frame_rate;
+        let total = fps.frame_at(comp.duration).max(1);
+        let n = total.min(std::env::var("EC_PRINTS_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1500));
+        let frame = |i: i64| i * total / n;
+        let src = source(&project);
+        let t0 = web_time::Instant::now();
+        let before: Vec<Option<u64>> = (0..n).map(|i| of(&src, id, fps.tick_of(frame(i)), RenderOpts::default())).collect();
+        eprintln!(
+            "comp {} layers, {total} frames ({n} sampled): fingerprint {:.3} ms/frame, {} without one",
+            comp.layers.len(),
+            t0.elapsed().as_secs_f64() * 1000. / n as f64,
+            before.iter().filter(|p| p.is_none()).count()
+        );
+        let nudge = |p: &mut effectcraft_engine::project::Property, dx: f64| {
+            let f = |v: &Value| match v {
+                Value::Vec2(v) => Value::Vec2([v[0] + dx, v[1]]),
+                Value::Vec3(v) => Value::Vec3([v[0] + dx, v[1], v[2]]),
+                v => v.clone(),
+            };
+            if p.keys.is_empty() {
+                p.value = f(&p.value);
+            } else {
+                p.keys.iter_mut().for_each(|k| k.value = f(&k.value));
+            }
+        };
+        let report = |label: &str, after: &Arc<Project>, span: Option<(Tick, Tick)>| {
+            let src = source(after);
+            let (mut kept, mut outside) = (0, 0);
+            for i in 0..n {
+                let t = fps.tick_of(frame(i));
+                if before[i as usize].is_some() && of(&src, id, t, RenderOpts::default()) == before[i as usize] {
+                    kept += 1;
+                } else if span.is_some_and(|(a, b)| t < a || t > b) {
+                    outside += 1;
+                }
+            }
+            let comp_key_kept = disk_cache::comp_content_key(&project, id) == disk_cache::comp_content_key(after, id);
+            let span = span.map(|(a, b)| format!("{:.2}–{:.2} s", a.seconds(), b.seconds())).unwrap_or_default();
+            eprintln!(
+                "{label} [{span}]: comp-wide key invalidates {}/{n}; fingerprint invalidates {}/{n} ({outside} outside the span)",
+                if comp_key_kept { 0 } else { n },
+                n - kept
+            );
+        };
+        // 1. The shortest-lived text layer of the comp, nudged.
+        if let Some(i) = (0..comp.layers.len()).filter(|i| matches!(comp.layers.get(*i).unwrap().source, LayerSource::Text)).min_by_key(|i| {
+            let l = comp.layers.get(*i).unwrap();
+            l.out_point.0 - l.in_point.0
+        }) {
+            let mut after = project.clone();
+            let l = Arc::make_mut(&mut after).comp_mut(id).unwrap().layers.get_mut(i).unwrap();
+            nudge(l.props.prop_mut("transform/position").unwrap(), 12.);
+            let span = (l.in_point, l.out_point);
+            let name = l.name.clone();
+            report(&format!("text layer {name:?} moved 12 px"), &after, Some(span));
+        }
+        // 2. A text layer inside a precomp the comp uses (its precomp layer's span).
+        'nested: for l in comp.layers.iter() {
+            let LayerSource::Comp { item } = l.source else { continue };
+            let Some(inner) = project.comp(item) else { continue };
+            for j in 0..inner.layers.len() {
+                if !matches!(inner.layers.get(j).unwrap().source, LayerSource::Text) {
+                    continue;
+                }
+                let mut after = project.clone();
+                let tl = Arc::make_mut(&mut after).comp_mut(item).unwrap().layers.get_mut(j).unwrap();
+                nudge(tl.props.prop_mut("transform/position").unwrap(), 12.);
+                let name = format!("{:?} in {:?}", tl.name, project.item(item).map(|i| i.name.clone()).unwrap_or_default());
+                // Every use of the precomp in the comp shows it.
+                let uses: Vec<(Tick, Tick)> =
+                    comp.layers.iter().filter(|k| matches!(k.source, LayerSource::Comp { item: x } if x == item)).map(|k| (k.in_point, k.out_point)).collect();
+                let span = uses.iter().fold(None, |acc: Option<(Tick, Tick)>, (a, b)| Some(acc.map_or((*a, *b), |(x, y)| (x.min(*a), y.max(*b)))));
+                report(&format!("text layer {name} moved 12 px ({} uses)", uses.len()), &after, span);
+                break 'nested;
+            }
+        }
+        // 3. The middle position keyframe of the first layer with 3 or more.
+        if let Some(i) = (0..comp.layers.len()).find(|i| comp.layers.get(*i).unwrap().props.prop("transform/position").is_some_and(|p| p.keys.len() >= 3)) {
+            let mut after = project.clone();
+            let l = Arc::make_mut(&mut after).comp_mut(id).unwrap().layers.get_mut(i).unwrap();
+            let p = l.props.prop_mut("transform/position").unwrap();
+            let k = p.keys.len() / 2;
+            let span = (p.keys[k - 1].time, p.keys[k + 1].time);
+            p.keys[k].value = match &p.keys[k].value {
+                Value::Vec2(v) => Value::Vec2([v[0] + 7., v[1] - 3.]),
+                Value::Vec3(v) => Value::Vec3([v[0] + 7., v[1] - 3., v[2]]),
+                v => v.clone(),
+            };
+            let l = after.comp(id).unwrap().layers.get(i).unwrap();
+            let name = l.name.clone();
+            report(&format!("position keyframe of {name:?} moved"), &after, Some((l.comp_time(span.0), l.comp_time(span.1))));
+        }
     }
 }

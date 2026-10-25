@@ -128,3 +128,68 @@ fn stream_messages_keep_their_shape_and_defaults() {
     let m = FrameMsg::Stream(StreamMsg::Seek { stream: 1, time: secs(2.0) });
     assert!(matches!(crate::remote::decode_msg(&crate::remote::encode_msg(&m)).unwrap(), FrameMsg::Stream(StreamMsg::Seek { stream: 1, .. })));
 }
+
+/// Put `text` as the expression of layer `layer`'s opacity.
+fn with_expression(p: &mut Project, comp: ItemId, layer: usize, text: &str) {
+    let l = p.comp_mut(comp).unwrap().layers.get_mut(layer).unwrap();
+    l.props.prop_mut("transform/opacity").unwrap().expr = Some(effectcraft_project::props::Expression { text: text.into(), enabled: true });
+}
+
+/// Edit audit B7, 18 Oct: a layer whose expression reads what an edit changed changes with it.
+/// Before, only the edited layer counted, so frames of the reading layer before the edited one's
+/// in-point kept their old pixels (and, on the Mac, were kept as current).
+#[test]
+fn an_expression_that_reads_the_edited_layer_or_comp_counts_from_its_own_in_point() {
+    let (base, main, _) = project();
+    // A controls comp the main comp doesn't show.
+    let mut base = base;
+    let mut controls = Comp::new(10, 10, FrameRate::default(), secs(60.0));
+    let ctrl = layer(&mut base, &controls, "CTRL", LayerSource::Null, (10, 10), None);
+    controls.layers.push(ctrl);
+    let controls = base.add_item("Controls", Label::None, None, ItemKind::Comp(Arc::new(controls)));
+
+    // n0 (in at 0) reads n2 (in at 20) by name: editing n2 changes n0's frames from 0.
+    let mut old = base.clone();
+    with_expression(&mut old, main, 0, "thisComp.layer(\"n2\").transform.opacity");
+    let mut new = old.clone();
+    new.comp_mut(main).unwrap().layers.get_mut(2).unwrap().out_point = secs(50.0);
+    assert_eq!(first_change(&old, &new, main), Some(secs(0.0)));
+
+    // n0 reads a layer of the controls comp: editing it changes n0 (and nothing else) from 0.
+    let mut old = base.clone();
+    with_expression(&mut old, main, 0, "comp(\"Controls\").layer(\"CTRL\").transform.opacity");
+    let mut new = old.clone();
+    new.comp_mut(controls).unwrap().layers.get_mut(0).unwrap().out_point = secs(30.0);
+    assert_eq!(first_change(&old, &new, main), Some(secs(0.0)));
+    // ... while without the expression the controls comp is nothing the main comp shows.
+    let mut plain = base.clone();
+    plain.comp_mut(controls).unwrap().layers.get_mut(0).unwrap().out_point = secs(30.0);
+    assert_eq!(first_change(&base, &plain, main), None);
+
+    // An expression reading only its own layer (wiggle) doesn't widen an edit elsewhere.
+    let mut old = base.clone();
+    with_expression(&mut old, main, 0, "wiggle(2, 10)");
+    let mut new = old.clone();
+    new.comp_mut(main).unwrap().layers.get_mut(2).unwrap().out_point = secs(50.0);
+    assert_eq!(first_change(&old, &new, main), Some(secs(20.0)));
+    // ... nor does an edit of an unrelated comp.
+    let mut new = old.clone();
+    new.comp_mut(controls).unwrap().layers.get_mut(0).unwrap().out_point = secs(30.0);
+    assert_eq!(first_change(&old, &new, main), None);
+
+    // A lookup built at run time can read anything: any edit counts it.
+    let mut old = base.clone();
+    with_expression(&mut old, main, 1, "var n = \"Con\" + \"trols\"; comp(n).layer(1).transform.opacity");
+    let mut new = old.clone();
+    new.comp_mut(controls).unwrap().layers.get_mut(0).unwrap().out_point = secs(30.0);
+    assert_eq!(first_change(&old, &new, main), Some(secs(10.0)), "n1 (in at 10) and its child n2");
+
+    // Renaming the comp an expression names counts (the name now finds another item, or none).
+    let mut old = base.clone();
+    with_expression(&mut old, main, 0, "comp(\"Controls\").layer(1).transform.opacity");
+    let mut new = old.clone();
+    if let Some(item) = new.items.get_mut(&controls) {
+        item.name = "Controls old".into();
+    }
+    assert_eq!(first_change(&old, &new, main), Some(secs(0.0)));
+}

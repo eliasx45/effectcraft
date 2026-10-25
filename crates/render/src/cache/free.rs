@@ -85,8 +85,9 @@ pub(super) fn pointwise(layer: &Layer, time_dependent: bool, reads_other_times: 
         || forced_mask_blur
         || layer.auto_orient == AutoOrient::AlongPath
         || layer.switches.frame_blend != FrameBlend::Off
-        // (A constant Time Remap, like a literal `0.5`, shows one nested time.)
-        || layer.props.get("timeRemap").is_some_and(|p| !p.keys.is_empty() || super::live_expression(p)))
+        // (A constant Time Remap, like a literal `0.5` or a single keyframe — what imported
+        // stills and icons carry — shows one nested time.)
+        || layer.props.get("timeRemap").is_some_and(|p| p.keys.len() > 1 || super::live_expression(p)))
 }
 
 /// Hash, for every keyframed property of `g`, the keyframes its values between layer times

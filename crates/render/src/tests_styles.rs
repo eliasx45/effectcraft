@@ -539,3 +539,363 @@ fn repeated_drop_shadows_render_both_sides_and_respect_enabled_state() {
     assert!(img.get(60, 50)[0] > 0.99);
     assert_eq!(img.get(140, 50)[3], 0.0);
 }
+
+/// Styles run on the content's visible part only (cropped to its alpha, then padded by their
+/// reach): the same pixels as styling the whole mostly transparent buffer a shape layer with
+/// effects is drawn on, noise, Dissolve and jitter grain included, within 1/255.
+#[test]
+fn cropped_styles_match_the_whole_buffer() {
+    const DISSOLVE: u32 = 1;
+    let sets: [&[(&str, &[(&str, Value)])]; 2] = [
+        &[
+            ("dropShadow", &[("size", Value::Scalar(9.0)), ("distance", Value::Scalar(6.0)), ("noise", Value::Scalar(30.0))]),
+            ("outerGlow", &[("size", Value::Scalar(12.0)), ("noise", Value::Scalar(20.0)), ("jitter", Value::Scalar(40.0)), ("colorType", Value::Enum(1))]),
+            ("innerShadow", &[("size", Value::Scalar(5.0)), ("noise", Value::Scalar(10.0))]),
+            ("satin", &[]),
+            // Dissolve on an interior style: its grain is the buffer's (an exterior pass is
+            // dissolved by the compositor, in comp pixels).
+            ("colorOverlay", &[("opacity", Value::Scalar(40.0)), ("blendMode", Value::Enum(DISSOLVE))]),
+            ("gradientOverlay", &[("opacity", Value::Scalar(60.0)), ("alignWithLayer", Value::Bool(true))]),
+        ],
+        &[
+            ("innerGlow", &[("technique", Value::Enum(1)), ("source", Value::Enum(0)), ("noise", Value::Scalar(15.0))]),
+            ("stroke", &[("size", Value::Scalar(4.0)), ("position", Value::Enum(2))]),
+            ("bevelEmboss", &[("size", Value::Scalar(8.0)), ("soften", Value::Scalar(2.0))]),
+            ("dropShadow", &[("spread", Value::Scalar(40.0)), ("size", Value::Scalar(10.0))]),
+        ],
+    ];
+    // A soft-edged blob in a 300×200 transparent canvas (a comp-sized effect canvas).
+    let (cw, ch) = (300u32, 200u32);
+    let mut img = Image::new(cw, ch);
+    for y in 0..ch {
+        for x in 0..cw {
+            let (dx, dy) = ((x as f32 - 140.0) / 22.0, (y as f32 - 95.0) / 15.0);
+            let a = (1.6 - (dx * dx + dy * dy).sqrt() * 1.2).clamp(0.0, 1.0);
+            img.data[(y * cw + x) as usize] = [0.9 * a, 0.4 * a, 0.2 * a, a];
+        }
+    }
+    let content = effectcraft_effects::Buf { img, offset: [150.0, 100.0], scale: 1.0 };
+    for styles in sets {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, [1.0; 3], 40, 40);
+        for (style, params) in styles {
+            add(&mut p, &comp, &mut l, style);
+            for (k, v) in *params {
+                set(&mut l, &format!("{style}/{k}"), v.clone());
+            }
+        }
+        let ctx = crate::eval::EvalCtx::new(&p, cid, &comp, Tick::ZERO);
+        let whole = crate::styles::render_in(&ctx, &l, &content, [40.0, 40.0], false).flatten();
+        let cropped = crate::styles::render_in(&ctx, &l, &content, [40.0, 40.0], true).flatten();
+        assert!(cropped.img.width * 2 < whole.img.width && cropped.img.height * 2 < whole.img.height, "not cropped");
+        let (dx, dy) = (whole.offset[0] - cropped.offset[0], whole.offset[1] - cropped.offset[1]);
+        assert!(dx.fract() == 0.0 && dy.fract() == 0.0 && dx >= 0.0 && dy >= 0.0, "{dx} {dy}");
+        let mut worst = (0.0f32, 0, 0);
+        for y in 0..whole.img.height {
+            for x in 0..whole.img.width {
+                let a = whole.img.get(x as i64, y as i64);
+                let (cx, cy) = (x as i64 - dx as i64, y as i64 - dy as i64);
+                let inside = cx >= 0 && cy >= 0 && (cx as u32) < cropped.img.width && (cy as u32) < cropped.img.height;
+                let b = if inside { cropped.img.get(cx, cy) } else { [0.0; 4] };
+                for c in 0..4 {
+                    if (a[c] - b[c]).abs() > worst.0 {
+                        worst = ((a[c] - b[c]).abs(), x, y);
+                    }
+                }
+            }
+        }
+        assert!(worst.0 <= 1.0 / 255.0, "{:?}: max difference {worst:?}", styles.iter().map(|s| s.0).collect::<Vec<_>>());
+    }
+}
+
+/// A text layer with an effect is a comp-sized canvas; its styles run on the visible part
+/// (`layer_buf::crop_visible`). The frame must be exactly the one styled on the whole canvas,
+/// for every style, at Full and Half, and a style hashed by buffer pixel (noise) keeps the
+/// whole canvas.
+#[test]
+fn styles_on_a_cropped_text_canvas_match_the_whole_canvas() {
+    use crate::layer_buf::{NO_STYLE_CROP, STYLE_CROPS};
+    use effectcraft_keyframe::TextDoc;
+    use std::sync::atomic::Ordering;
+    type Setup = fn(&mut Project, &Comp, &mut Layer);
+    let setups: [(&str, Setup); 10] = [
+        ("drop", |p, c, l| {
+            add(p, c, l, "dropShadow");
+            set(l, "dropShadow/size", Value::Scalar(12.0));
+            set(l, "dropShadow/spread", Value::Scalar(20.0));
+        }),
+        ("outer glow", |p, c, l| {
+            add(p, c, l, "outerGlow");
+            set(l, "outerGlow/size", Value::Scalar(8.0));
+        }),
+        ("precise glow", |p, c, l| {
+            add(p, c, l, "outerGlow");
+            set(l, "outerGlow/technique", Value::Enum(1));
+            set(l, "outerGlow/size", Value::Scalar(15.0));
+        }),
+        ("inner glow + shadow", |p, c, l| {
+            add(p, c, l, "innerGlow");
+            add(p, c, l, "innerShadow");
+        }),
+        ("bevel", |p, c, l| add(p, c, l, "bevelEmboss")),
+        ("satin", |p, c, l| add(p, c, l, "satin")),
+        ("stroke", |p, c, l| {
+            add(p, c, l, "stroke");
+            set(l, "stroke/size", Value::Scalar(6.0));
+        }),
+        ("Comp 29 counter", |p, c, l| {
+            add(p, c, l, "outerGlow");
+            set(l, "outerGlow/size", Value::Scalar(8.0));
+            add(p, c, l, "gradientOverlay");
+        }),
+        ("gradient, not aligned", |p, c, l| {
+            add(p, c, l, "gradientOverlay");
+            set(l, "gradientOverlay/alignWithLayer", Value::Bool(false));
+            add(p, c, l, "colorOverlay");
+            set(l, "colorOverlay/opacity", Value::Scalar(40.0));
+        }),
+        ("noisy glow", |p, c, l| {
+            add(p, c, l, "outerGlow");
+            set(l, "outerGlow/noise", Value::Scalar(30.0));
+        }),
+    ];
+    for (name, f) in setups {
+        let mut p = Project::default();
+        let comp = Comp::new(400, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (400, 200), None);
+        l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "$165".into(), size: 40.0, ..Default::default() }));
+        l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.7, 90.3, 0.0]);
+        l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([103.0, 103.0, 100.0]);
+        // A Transform effect that moves the text gives it a comp-sized effect canvas.
+        let spec = effectcraft_effects::find("ec.distort.transform").unwrap();
+        let mut next = p.next_id;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
+        p.next_id = next;
+        g.prop_mut("position").unwrap().value = Value::Vec2([210.0, 105.0]);
+        l.props.sub_mut("effects").unwrap().children.push(g.into());
+        f(&mut p, &comp, &mut l);
+        let bg = solid(&mut p, &comp, [0.3, 0.4, 0.5], 400, 200);
+        p.comp_mut(cid).unwrap().layers = vec![l, bg].into();
+        for scale in [1.0, 0.5] {
+            NO_STYLE_CROP.store(true, Ordering::Relaxed);
+            let whole = render_frame(&p, cid, Tick::ZERO, scale);
+            NO_STYLE_CROP.store(false, Ordering::Relaxed);
+            let before = STYLE_CROPS.load(Ordering::Relaxed);
+            let cropped = render_frame(&p, cid, Tick::ZERO, scale);
+            let crops = STYLE_CROPS.load(Ordering::Relaxed) - before;
+            if name == "noisy glow" {
+                assert_eq!(crops, 0, "{name}: noise is hashed by buffer pixel, no crop");
+            } else {
+                assert!(crops > 0, "{name} at {scale}: styles ran on the whole canvas");
+            }
+            let diff = whole.data.iter().zip(&cropped.data).filter(|(a, b)| a != b).count();
+            assert_eq!(diff, 0, "{name} at {scale}: {diff} pixels differ");
+            assert!(whole.data.iter().any(|px| px[0] > 0.31 || px[0] < 0.29), "{name}: the text is drawn");
+        }
+    }
+}
+
+/// A Transform effect that only fades (Anchor Point = Position, Scale 100 %, no Rotation or
+/// Skew) leaves a text layer on its tight glyph buffer instead of the comp-sized effect canvas,
+/// with the frame the canvas gives; one that moves pixels keeps the canvas.
+#[test]
+fn a_fading_transform_effect_keeps_text_on_its_glyph_buffer() {
+    use crate::fx::ALWAYS_TEXT_CANVAS;
+    use crate::{EvalCtx, NoFootage, RenderOpts, Renderer};
+    use effectcraft_keyframe::TextDoc;
+    use std::sync::atomic::Ordering;
+    for (rotation, styled) in [(0.0, false), (0.0, true), (12.0, false)] {
+        let mut p = Project::default();
+        let comp = Comp::new(400, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (400, 200), None);
+        l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "$165".into(), size: 40.0, ..Default::default() }));
+        l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.7, 90.3, 0.0]);
+        l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([103.0, 103.0, 100.0]);
+        let spec = effectcraft_effects::find("ec.distort.transform").unwrap();
+        let mut next = p.next_id;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
+        p.next_id = next;
+        g.prop_mut("opacity").unwrap().value = Value::Scalar(60.0);
+        g.prop_mut("rotation").unwrap().value = Value::Scalar(rotation);
+        l.props.sub_mut("effects").unwrap().children.push(g.into());
+        if styled {
+            add(&mut p, &comp, &mut l, "outerGlow");
+            add(&mut p, &comp, &mut l, "gradientOverlay");
+        }
+        let bg = solid(&mut p, &comp, [0.3, 0.4, 0.5], 400, 200);
+        p.comp_mut(cid).unwrap().layers = vec![l, bg].into();
+        let c = p.comp(cid).unwrap();
+        let layer = c.layers.iter().next().unwrap();
+        let width = |scale: f64| {
+            let r = Renderer::new(&p, &NoFootage, RenderOpts { scale, ..Default::default() });
+            r.content_buf(&EvalCtx::new(&p, cid, c, Tick::ZERO), layer).unwrap().img.width
+        };
+        for scale in [1.0, 0.5] {
+            ALWAYS_TEXT_CANVAS.store(true, Ordering::Relaxed);
+            let canvas = render_frame(&p, cid, Tick::ZERO, scale);
+            let wide = width(scale);
+            ALWAYS_TEXT_CANVAS.store(false, Ordering::Relaxed);
+            let tight = render_frame(&p, cid, Tick::ZERO, scale);
+            let narrow = width(scale);
+            let comp_w = (400.0 * scale) as u32;
+            if rotation == 0.0 {
+                assert!(narrow < comp_w / 2 && wide >= comp_w, "fade only, styled {styled}, at {scale}: {narrow} vs {wide} px wide");
+            } else {
+                assert_eq!(narrow, wide, "a rotating Transform keeps the canvas");
+            }
+            let worst = canvas.data.iter().zip(&tight.data).flat_map(|(a, b)| (0..4).map(move |i| (a[i] - b[i]).abs())).fold(0.0f32, f32::max);
+            assert!(worst <= 1.0 / 255.0, "rotation {rotation}, styled {styled}, at {scale}: differs by {worst}");
+        }
+    }
+}
+
+/// Blurs, Glow and CC Radial Fast Blur on a text layer run on the part of the comp-sized effect
+/// canvas they can reach (`Renderer::canvas_support`), with the frame the whole canvas gives:
+/// 2D and a 3D Continuously Rasterized layer at a raster scale over 1 (P01 Clock's circle).
+/// The canvas tests flip [`crate::fx::WHOLE_TEXT_CANVAS`]: one at a time.
+static CANVAS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn blurs_and_glows_run_on_the_reachable_part_of_the_text_canvas() {
+    let _serial = CANVAS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    use crate::fx::WHOLE_TEXT_CANVAS;
+    use crate::{EvalCtx, NoFootage, RenderOpts, Renderer};
+    use effectcraft_keyframe::TextDoc;
+    use std::sync::atomic::Ordering;
+    for (three_d, radial) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut p = Project::default();
+        let comp = Comp::new(400, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (400, 200), None);
+        l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "O".into(), size: 30.0, ..Default::default() }));
+        l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.7, 90.3, 0.0]);
+        if three_d {
+            l.switches.three_d = true;
+            l.switches.collapse = true;
+            l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([180.0, 180.0, 100.0]);
+        }
+        let mut next = p.next_id;
+        for (id, set) in [
+            ("ec.blur.gaussian", vec![("blurriness", Value::Scalar(3.0)), ("repeatEdge", Value::Bool(true))]),
+            ("ec.blur.ccradialfast", vec![("center", Value::Vec2([170.0, 110.0])), ("amount", Value::Scalar(60.0))]),
+            ("ec.stylize.glow", vec![("radius", Value::Scalar(14.0)), ("threshold", Value::Scalar(40.0))]),
+            ("ec.stylize.glow", vec![("radius", Value::Scalar(6.0)), ("based", Value::Enum(0))]),
+        ] {
+            if id == "ec.blur.ccradialfast" && !radial {
+                continue;
+            }
+            let spec = effectcraft_effects::find(id).unwrap();
+            let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
+            for (k, v) in set {
+                g.prop_mut(k).unwrap().value = v;
+            }
+            l.props.sub_mut("effects").unwrap().children.push(g.into());
+        }
+        p.next_id = next;
+        let bg = solid(&mut p, &comp, [0.3, 0.4, 0.5], 400, 200);
+        p.comp_mut(cid).unwrap().layers = vec![l, bg].into();
+        let c = p.comp(cid).unwrap();
+        let layer = c.layers.iter().next().unwrap();
+        let area = |scale: f64| {
+            let r = Renderer::new(&p, &NoFootage, RenderOpts { scale, ..Default::default() });
+            let b = r.content_buf(&EvalCtx::new(&p, cid, c, Tick::ZERO), layer).unwrap();
+            b.img.width as u64 * b.img.height as u64
+        };
+        for scale in [1.0, 0.5] {
+            WHOLE_TEXT_CANVAS.store(true, Ordering::Relaxed);
+            let whole = render_frame(&p, cid, Tick::ZERO, scale);
+            let big = area(scale);
+            WHOLE_TEXT_CANVAS.store(false, Ordering::Relaxed);
+            let part = render_frame(&p, cid, Tick::ZERO, scale);
+            let small = area(scale);
+            // With CC Radial Fast Blur the canvas keeps its top-left corner (`canvas_support`).
+            let shrunk = if radial { small < big } else { small * 3 < big * 2 };
+            assert!(shrunk, "3D {three_d}, radial {radial}, at {scale}: {small} vs {big} px");
+            let worst = whole.data.iter().zip(&part.data).flat_map(|(a, b)| (0..4).map(move |i| (a[i] - b[i]).abs())).fold(0.0f32, f32::max);
+            assert!(worst <= 1.0 / 255.0, "3D {three_d}, radial {radial}, at {scale}: differs by {worst}");
+        }
+    }
+}
+
+/// Drop Shadow, Deep Glow, Bevel Alpha and Fill on a text or shape layer run on the part of the
+/// comp-sized effect canvas they can reach (`Renderer::canvas_support`), with the frame the whole
+/// canvas gives: each alone and stacked as on 10-10's captions (Deep Glow, two Drop Shadows,
+/// Bevel Alpha), 2D and a 3D Continuously Rasterized layer scaled up.
+#[test]
+fn shadows_deep_glow_and_bevel_run_on_the_reachable_part_of_the_canvas() {
+    let _serial = CANVAS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    use crate::fx::WHOLE_TEXT_CANVAS;
+    use crate::{EvalCtx, NoFootage, RenderOpts, Renderer};
+    use effectcraft_keyframe::TextDoc;
+    use std::sync::atomic::Ordering;
+    let shadow = |d: f64, s: f64| ("ec.perspective.dropshadow", vec![("distance", Value::Scalar(d)), ("softness", Value::Scalar(s))]);
+    let glow = ("ec.stylize.deepglow", vec![("PEDG-0001", Value::Scalar(24.0))]);
+    let bevel = ("ec.perspective.bevelalpha", vec![("edgeThickness", Value::Scalar(3.0))]);
+    let fill = ("ec.generate.fill", vec![("color", Value::Color([0.2, 0.9, 0.4, 1.0]))]);
+    let stacks = [vec![shadow(12.0, 20.0)], vec![glow.clone()], vec![bevel.clone(), fill.clone()], vec![glow, shadow(4.0, 9.0), shadow(0.0, 30.0), bevel]];
+    for (n, stack) in stacks.iter().enumerate() {
+        for (text, three_d) in [(true, false), (true, true), (false, false), (false, true)] {
+            let mut p = Project::default();
+            let comp = Comp::new(400, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+            let src = if text { LayerSource::Text } else { LayerSource::Shape };
+            let mut l = build::layer(&mut p, &comp, "L", src, (400, 200), None);
+            let mut next = p.next_id;
+            if text {
+                l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "Ok".into(), size: 30.0, ..Default::default() }));
+            } else {
+                let mut ids = Ids(&mut next);
+                let items = vec![build::shape_rect(&mut ids, [40.0, 26.0], [0.0, 0.0], 6.0), build::shape_fill(&mut ids, [0.9, 0.6, 0.2, 1.0])];
+                let g = build::shape_group(&mut ids, "R", items);
+                l.props.sub_mut("contents").unwrap().children.push(g.into());
+            }
+            l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.7, 90.3, 0.0]);
+            if three_d {
+                l.switches.three_d = true;
+                l.switches.collapse = true;
+                l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([180.0, 180.0, 100.0]);
+            }
+            for (id, set) in stack {
+                let spec = effectcraft_effects::find(id).unwrap();
+                let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [400.0, 200.0]);
+                for (k, v) in set {
+                    g.prop_mut(k).unwrap().value = v.clone();
+                }
+                l.props.sub_mut("effects").unwrap().children.push(g.into());
+            }
+            p.next_id = next;
+            let bg = solid(&mut p, &comp, [0.3, 0.4, 0.5], 400, 200);
+            p.comp_mut(cid).unwrap().layers = vec![l, bg].into();
+            let c = p.comp(cid).unwrap();
+            let layer = c.layers.iter().next().unwrap();
+            let area = |scale: f64| {
+                let r = Renderer::new(&p, &NoFootage, RenderOpts { scale, ..Default::default() });
+                let b = r.content_buf(&EvalCtx::new(&p, cid, c, Tick::ZERO), layer).unwrap();
+                b.img.width as u64 * b.img.height as u64
+            };
+            for scale in [1.0, 0.5] {
+                let at = format!("stack {n}, text {text}, 3D {three_d}, at {scale}");
+                WHOLE_TEXT_CANVAS.store(true, Ordering::Relaxed);
+                let whole = render_frame(&p, cid, Tick::ZERO, scale);
+                let big = area(scale);
+                WHOLE_TEXT_CANVAS.store(false, Ordering::Relaxed);
+                let part = render_frame(&p, cid, Tick::ZERO, scale);
+                let small = area(scale);
+                // The whole caption stack reaches most of this small comp.
+                let shrunk = if stack.len() > 2 { small < big } else { small * 3 < big * 2 };
+                assert!(shrunk, "{at}: {small} vs {big} px");
+                // One 8-bit step at most (the float sums round either way). Deep Glow's
+                // Downsample pass resamples the whole canvas and its Dither follows buffer
+                // pixels, so its halo may move by two steps on a few pixels.
+                let deep = stack.iter().any(|(id, _)| *id == "ec.stylize.deepglow");
+                let (steps, share) = if deep { (2.0, 100) } else { (1.0, 1000) };
+                let diffs: Vec<f32> = whole.data.iter().zip(&part.data).flat_map(|(a, b)| (0..4).map(move |i| (a[i] - b[i]).abs())).collect();
+                let worst = diffs.iter().copied().fold(0.0f32, f32::max);
+                let off = diffs.iter().filter(|d| **d > 1e-6).count();
+                assert!(worst <= steps / 255.0 + 1e-6 && off * share <= diffs.len(), "{at}: differs by {worst} on {off} of {} channels", diffs.len());
+            }
+        }
+    }
+}

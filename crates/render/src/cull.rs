@@ -81,7 +81,7 @@ impl<'a> Renderer<'a> {
         if self.pipe.quantize_px([0.0, 0.0, 0.0, 1.0])[3] != 1.0 {
             return false;
         }
-        let s = self.opts.scale;
+        let s = self.solid_scale(sol.width, sol.height);
         let bw = ((sol.width as f64 * s).ceil() as u32).max(1);
         let bh = ((sol.height as f64 * s).ceil() as u32).max(1);
         let shape = Buf { img: Image { width: bw, height: bh, data: Vec::new() }, offset: [0.0; 2], scale: s };
@@ -114,6 +114,7 @@ impl<'a> Renderer<'a> {
             || self.through.iter().any(Option::is_some)
             || self.canvas_origin != [0; 2]
             || self.out_comp.is_some()
+            || self.window.is_some()
             || self.layer_view.is_some()
         {
             return None;
