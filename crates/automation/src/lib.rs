@@ -38,6 +38,7 @@ mod prompts;
 pub mod render_route;
 pub mod resources;
 mod result_store;
+mod senses;
 pub mod server;
 pub mod tools;
 

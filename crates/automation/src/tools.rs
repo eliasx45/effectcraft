@@ -22,14 +22,15 @@ pub struct ToolDef {
     pub description: &'static str,
     /// Only listed (and usable) with a UI: bridged to the running app, or `mcp --ui` (offscreen).
     pub bridge_only: bool,
-    schema: fn() -> Value,
-    run: fn(&mut Backend, &Value) -> Result<Reply>,
+    pub(crate) schema: fn() -> Value,
+    pub(crate) run: fn(&mut Backend, &Value) -> Result<Reply>,
 }
 
 impl ToolDef {
     /// The JSON Schema of the tool's arguments.
     pub fn input_schema(&self) -> Value {
         let mut schema = (self.schema)();
+        crate::senses::widen_time_schema(&mut schema);
         if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
             for (key, value) in [
                 ("full", full_s("reply")),
@@ -104,6 +105,7 @@ impl ToolDef {
 
 /// Tools that only read.
 const READ_ONLY: &[&str] = &[
+    "edit_feed",
     "command_list",
     "list_commands",
     "describe_command",
@@ -379,6 +381,8 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
             }
         }
     }
+    // Timecode / frame times ("6:20", {"frame": 200}) become seconds before a tool checks them.
+    let run_args = crate::senses::resolve_times(b, run_args)?;
     let outer = b.set_expected_revision(expected);
     let result = (t.run)(b, &run_args);
     b.set_expected_revision(outer);
@@ -409,6 +413,7 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
             Err(e) => value["contextWarning"] = json!(format!("operation already finished; could not observe current session: {e}; inspect before retrying")),
         }
     }
+    crate::senses::attach_notices(b, name, &mut reply);
     b.finish_reply(name, args, reply)
 }
 
@@ -948,7 +953,24 @@ fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
 fn render_frames(b: &mut Backend, a: &Value) -> Result<Reply> {
     let mut p = render_params(
         a,
-        &["comp", "item", "layer", "times", "count", "start", "end", "cols", "max_side", "labels", "transparent", "region", "overlays", "path", "gif"],
+        &[
+            "comp",
+            "item",
+            "layer",
+            "times",
+            "frames",
+            "count",
+            "start",
+            "end",
+            "cols",
+            "max_side",
+            "labels",
+            "transparent",
+            "region",
+            "overlays",
+            "path",
+            "gif",
+        ],
     );
     p["base64"] = json!(true);
     let mut r = b.exec("render.contactSheet", p)?;
@@ -1322,6 +1344,7 @@ fn control(b: &mut Backend, a: &Value) -> Result<Reply> {
 // ------------------------------------------------------------------ the catalogue
 
 static TOOLS: &[ToolDef] = &[
+    crate::senses::EDIT_FEED,
     ToolDef {
         name: "list_commands",
         description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with command_run. The full list is large (~130 KB): narrow with `filter` (e.g. `layer.new`, `keys`, `effect`) or pass `brief: true` for just ids and labels, then describe_command for one command's parameters.",
@@ -1585,6 +1608,7 @@ static TOOLS: &[ToolDef] = &[
                     "item": item_s(),
                     "layer": solo_s(),
                     "times": {"type": "array", "items": {"type": "number"}, "description": "Comp times in seconds (at most 64)."},
+                    "frames": {"type": ["array", "object"], "items": {"type": "integer"}, "description": "Comp frame numbers instead of `times`: a list ([190, 195, 200]) or every frame of a range ({\"from\": 190, \"to\": 210, \"every\": 1}, both ends included; at most 64)."},
                     "count": {"type": "integer", "minimum": 1, "description": "Frames spread evenly from `start` to `end` when `times` is not given (default 6, capped at 64)."},
                     "start": {"type": "number", "description": "First time in seconds (default: work area start)."},
                     "end": {"type": "number", "description": "End time in seconds, exclusive (default: work area end)."},

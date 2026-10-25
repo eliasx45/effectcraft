@@ -20,19 +20,19 @@ fn setup() -> (Session, ItemId, [LayerId; 4]) {
     let inner = id(&s.execute("comp.new", json!({"name": "Inner", "duration": 5})).unwrap(), "comp");
     let main = id(&s.execute("comp.new", json!({"name": "Main", "duration": 10, "frameRate": 30})).unwrap(), "comp");
     let mk = |s: &mut Session, name: &str| LayerId(id(&s.execute("layer.newSolid", json!({"name": name})).unwrap(), "layer"));
-    let null = mk(&mut s, "Null");
+    let null_l = mk(&mut s, "Null");
     let shadow = mk(&mut s, "Shadow");
     let screen = mk(&mut s, "Screen");
     let phone = mk(&mut s, "Phone");
     s.execute("layer.setTrackMatte", json!({"layer": screen.0, "matte": phone.0, "kind": "alpha"})).unwrap();
-    s.execute("layer.setParent", json!({"layers": [phone.0], "parent": null.0})).unwrap();
+    s.execute("layer.setParent", json!({"layers": [phone.0], "parent": null_l.0})).unwrap();
     s.execute("prop.addKey", json!({"layer": phone.0, "path": "transform/scale", "time": 0.0, "value": [0, 0, 100]})).unwrap();
     s.execute("prop.addKey", json!({"layer": phone.0, "path": "transform/scale", "time": 0.5, "value": [100, 100, 100]})).unwrap();
     let cid = ItemId(main);
     let l = Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(shadow).unwrap();
     l.props.prop_mut("transform/position").unwrap().expr = Some(Expression { text: "thisComp.layer(\"Phone\").position".into(), enabled: true });
     let _ = inner;
-    (s, cid, [phone, screen, shadow, null])
+    (s, cid, [phone, screen, shadow, null_l])
 }
 
 #[test]
@@ -45,14 +45,14 @@ fn expression_refs_find_names_and_indices() {
 
 #[test]
 fn related_lists_parent_matte_and_expression_links() {
-    let (mut s, cid, [phone, screen, shadow, null]) = setup();
+    let (mut s, cid, [phone, screen, shadow, null_l]) = setup();
     let r = s.execute_checked("layer.related", json!({"comp": cid.0, "layer": phone.0})).unwrap();
-    assert_eq!(r["parents"][0]["id"], null.0);
+    assert_eq!(r["parents"][0]["id"], null_l.0);
     assert_eq!(r["matteFor"][0]["layer"]["id"], screen.0);
     assert_eq!(r["expressionReferredBy"][0]["id"], shadow.0);
     let r = s.execute_checked("layer.related", json!({"comp": cid.0, "layer": shadow.0})).unwrap();
     assert_eq!(r["expressionRefersTo"][0]["id"], phone.0);
-    let r = s.execute_checked("layer.related", json!({"comp": cid.0, "layer": null.0})).unwrap();
+    let r = s.execute_checked("layer.related", json!({"comp": cid.0, "layer": null_l.0})).unwrap();
     assert_eq!(r["children"][0]["id"], phone.0);
 }
 
@@ -77,7 +77,7 @@ fn packet_carries_selected_keys_with_eases_and_text() {
     assert!(prop["keys"][0]["outEase"].is_array());
     assert_eq!(layer["related"]["matteFor"][0]["layer"]["name"], "Screen");
     let text = p["text"].as_str().unwrap();
-    for needle in ["Comp \"Main\"", "Selected #", "transform/scale  2 keys", "▸ 0.500s (f15)", "is matte for", "used by expressions in", "Recent edits"] {
+    for needle in ["Comp \"Main\"", "Selected #", "transform/scale  2 keys", "▸ 0:15 (f15)", "is matte for", "used by expressions in", "Recent edits"] {
         assert!(text.contains(needle), "missing {needle:?} in\n{text}");
     }
     assert_eq!(s.revision, revision, "a query cannot edit the project");

@@ -263,6 +263,12 @@ Two things follow:
   last connection that used that `client` closes (keep one connection open, as the MCP bridge does).
   Without `client`, `comp.release` needs `force: true` (the user overriding a claim).
 
+### Seeing what the editor sees: timecode, eases, who changed what
+- **Timecode.** Key and playhead times carry `tc`, the Timeline's timecode in short form (`6:20` = 6 s 20 frames, `1:02:15` = 1 min 2 s 15 frames), and the comp `frame` next to seconds. Every time parameter (`time`, `times`, `start`, `end`, `duration`, … and `keys: [{time}]`) also takes `"6:20"`, `"0:00:06:20"`, `"200f"` or `{"frame": 200}`; plain numbers stay seconds. `render_frames` / `render.contactSheet` take `frames: [190, 200]` or `frames: {from, to, every}`.
+- **Eases.** `get_property` keys show `ease` in words (`in bezier 0/s 33.33% · out bezier 0/s 75%`, per dimension when they differ), `continuous` (false = split handles) and `autoBezier`; `full: true` gives `inEase` / `outEase` as `[{speed, influence %}]` per dimension, as the Graph Editor reads them.
+- **Who changed what.** `edit_feed` (engine `history.feed`) lists changes since a revision, each with `by` (`user`, or the agent / script client; `who` is `you` for your own) and lines such as `Card › Opacity: key @ 6:20 40 → 60`. Any other tool reply carries a one-time `notice` when the user or another agent changed the project since your last call, or `projectChanged` when another project was opened (engine `agent.notices`).
+- **One-call context.** `context.packet` returns the selection with its keys (timecode, value, eases, neighbours), related layers (`layer.related`) and the recent feed, plus a short `text`.
+
 ### Undo with several people in one project
 
 `edit.undo` undoes the caller's own latest step: the user's (no `client`) or the agent's. When

@@ -591,14 +591,20 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
     let l = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
     let pr = l.props.find(uid).ok_or_else(|| bad("prop.get", "property vanished"))?;
     let t = f_p(p, "time").map(Tick::from_seconds_f64).unwrap_or_else(|| s.time_of(cid));
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let keys: Vec<Value> = pr
         .keys
         .iter()
-        .map(|k| {
+        .enumerate()
+        .map(|(i, k)| {
             let mut info = key_timing(l, k.time);
+            crate::readout::put_time(&mut info, "", comp, l.comp_time(k.time));
             info["value"] = k.value.to_json();
             info["in"] = json!(k.in_interp.label());
             info["out"] = json!(k.out_interp.label());
+            if let (Some(o), Value::Object(e)) = (info.as_object_mut(), crate::readout::ease_fields(&pr.keys, i, pr.spatial)) {
+                o.extend(e);
+            }
             info
         })
         .collect();
@@ -606,13 +612,12 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
     let mut out = json!({
         "layer": lid.0, "uid": pr.uid, "match": pr.match_id, "name": pr.name, "type": pr.value.kind_name(),
         "comp": cid.0, "revision": s.revision, "timeBase": "comp",
-        "time": t.seconds(), "value": raw.to_json(), "rawValue": raw.to_json(), "animated": !pr.keys.is_empty(),
+        "time": t.seconds(), "tc": crate::readout::short_timecode(comp, t), "frame": crate::readout::frame_of(comp.frame_rate, t), "value": raw.to_json(), "rawValue": raw.to_json(), "animated": !pr.keys.is_empty(),
         "expressionEnabled": pr.expr.as_ref().is_some_and(|e| e.enabled),
         "keys": keys, "expression": pr.expr.as_ref().map(|e| e.text.clone()),
     });
     out["enabled"] = json!(true);
     out["effectiveEnabled"] = json!(super::query::property_effective_enabled(&l.props, pr.uid).unwrap_or(false));
-    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let mut ctx = crate::render::EvalCtx::new(&s.project, cid, comp, t);
     ctx.expr = s.expr.as_deref();
     super::query::expression_readback(s, &ctx, l, pr, &mut out);
