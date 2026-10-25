@@ -1732,6 +1732,19 @@ fn time_dependent(layer: &Layer, effects: bool) -> bool {
     false
 }
 
+/// [`time_dependent`]'s effects test over the layer's first `n` effects (enabled or not, as a
+/// layer's input counts them, see [`input_key`]).
+fn time_dependent_upto(layer: &Layer, n: usize) -> bool {
+    layer.switches.effects
+        && layer.effects().is_some_and(|fx| {
+            fx.groups().take(n).any(|g| {
+                g.enabled
+                    && (matches!(&g.kind, effectcraft_project::GroupKind::Effect { effect } if effectcraft_effects::is_time_dependent(effect))
+                        || (effectcraft_effects::paint::is_paint(g) && effectcraft_effects::paint::cache_key(g, 0.0).1))
+            })
+        })
+}
+
 fn group_has(g: &PropGroup, match_id: &str) -> bool {
     g.children.iter().any(|c| match c {
         Node::Group(sub) => sub.match_id == match_id || group_has(sub, match_id),
@@ -2275,7 +2288,13 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
     if mask_motion_blur(ctx, layer, blur) {
         layer.layer_time(ctx.time).0.hash(&mut h);
     }
-    if info.time_dependent && (effects != Some(0) || time_dependent(layer, false)) {
+    // A layer's input sees the time through its first effects only (a Transform's motion blur
+    // after a static Deep Glow leaves the glowing input the same every frame).
+    let reads_time = match effects {
+        Some(n) if n > 0 => time_dependent(layer, false) || time_dependent_upto(layer, n),
+        _ => info.time_dependent && (effects != Some(0) || time_dependent(layer, false)),
+    };
+    if reads_time {
         layer.layer_time(ctx.time).0.hash(&mut h);
         // Effects also see the layer's time mapping.
         layer.start_time.0.hash(&mut h);
