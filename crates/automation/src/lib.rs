@@ -113,3 +113,5 @@ pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
 mod tests;
 #[cfg(test)]
 mod tests_plumbing;
+#[cfg(test)]
+mod tests_taste;

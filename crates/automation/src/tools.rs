@@ -160,6 +160,8 @@ fn arg_alias(key: &str, props: &Map<String, Value>) -> Option<String> {
 /// Tools that only read.
 const READ_ONLY: &[&str] = &[
     "edit_feed",
+    "taste_check",
+    "ease_graph",
     "command_list",
     "list_commands",
     "describe_command",
@@ -1302,6 +1304,49 @@ fn lint_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("render.lint", p)?)
 }
 
+fn taste_check(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let p = obj(&[
+        ("comp", get(a, "comp")),
+        ("layer", get(a, "layer")),
+        ("layers", get(a, "layers")),
+        ("start", get(a, "start")),
+        ("end", get(a, "end")),
+        ("all", get(a, "all")),
+        ("problemsOnly", get(a, "problems_only")),
+    ]);
+    json_reply(b.exec("taste.check", p)?)
+}
+
+fn ease_graph(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let keep = get(a, "path").and_then(Value::as_str).map(str::to_string);
+    if let (Some(c), Some(p)) = (b.confinement(), &keep) {
+        c.check(p, crate::confine::Access::Write)?;
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out = keep
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("effectcraft-mcp-ease-{}-{n}.png", std::process::id())).to_string_lossy().into_owned());
+    let mut p = obj(&[
+        ("comp", get(a, "comp")),
+        ("layer", get(a, "layer")),
+        ("path", get(a, "property")),
+        ("prop", get(a, "prop")),
+        ("start", get(a, "start")),
+        ("end", get(a, "end")),
+        ("width", get(a, "width")),
+        ("height", get(a, "height")),
+    ]);
+    p["out"] = json!(out);
+    let mut info = b.exec("taste.graph", p)?;
+    let png = std::fs::read(&out).map_err(|e| Error::Other(format!("ease_graph: {e}")))?;
+    if keep.is_none() {
+        let _ = std::fs::remove_file(&out);
+        info["path"] = Value::Null;
+    }
+    Ok(Reply::Image { png, info })
+}
+
 fn get_motion(b: &mut Backend, a: &Value) -> Result<Reply> {
     let range = [("comp", get(a, "comp")), ("start", get(a, "start")), ("end", get(a, "end")), ("step", get(a, "step"))];
     if let Some(l) = get(a, "layer") {
@@ -1719,7 +1764,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "lint_frame",
-        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). Rules: text-too-small (on-screen font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio of text against what is under it under min_contrast, default 3:1), outside-title-safe (text), outside-action-safe, cut-off (partly outside the frame), text-overlap, hidden-visible (switched on but off-screen, transparent or covered), off-beat (keyframes and in points just missing the audio's beat), off-accent (speed-graph peaks just missing a stressed syllable of the comp's speech map, see speech.import / speech.accents). Returns {clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}; each message says what to fix. Run it before calling a design done.",
+        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). Rules: text-too-small (on-screen font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio of text against what is under it under min_contrast, default 3:1), outside-title-safe (text), outside-action-safe, cut-off (partly outside the frame), text-overlap, hidden-visible (switched on but off-screen, transparent or covered), off-beat (keyframes and in points just missing the audio's beat), off-accent (speed-graph peaks just missing a stressed syllable of the comp's speech map, see speech.import / speech.accents), nested-cut-off (layers inside precomps measured in this comp's frame), text-off-centre (text vs its card/pill), exposed-edge (empty frame edges, transition gaps), off-taste (eases off Elias's profile, see taste_check). Returns {clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}; each message says what to fix. Run it before calling a design done.",
         bridge_only: false,
         schema: || {
             schema(
@@ -1737,6 +1782,48 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: lint_frame,
+    },
+    ToolDef {
+        name: "taste_check",
+        description: "Elias's ease taste check (taste.check): every keyframed move (position, scale, rotation, opacity; `all` for other properties) judged against his ease profile. ✅ approved = one of his approved curves for that move type (entrance, exit, on-screen move, fade-in, fade-out, scale pop); 🟡 close = inside his learned ranges but not an approved curve (the message says how it differs from the nearest, e.g. \"like Expo Out 1, launch softer (out 12 % vs 0.1 %)\"); ❌ off = linear, Easy Ease 33/33, a speed jump at a key, baked one-key-per-frame, or outside his ranges (speed peak position for the move type, peak sharpness for its length, speed cap in % of the frame per frame, frames on the last 10 % of an entrance). A ❌ is `blocking` once its move type has enough approved curves (else warn only). Each non-✅ move carries `fix`: the taste.apply call (command_run) that puts the nearest approved curve on it. Returns {summary {line}, clean, moves: [...]}. Run it over the animated range before handing a comp over; new curves go to taste.propose (⏳ until Elias approves).",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "layer": layer_s(),
+                    "layers": {"type": "array", "items": layer_s(), "description": "Only these layers (default every layer)."},
+                    "start": {"type": "number", "description": "Range start, comp seconds (default the comp's start)."},
+                    "end": {"type": "number", "description": "Range end, comp seconds (default the comp's end)."},
+                    "all": {"type": "boolean", "description": "Also other animated properties (hard fails only)."},
+                    "problems_only": {"type": "boolean", "description": "Leave out the ✅ moves."}
+                }),
+                &[],
+            )
+        },
+        run: taste_check,
+    },
+    ToolDef {
+        name: "ease_graph",
+        description: "A property's value graph with its speed graph under it, as an image (taste.graph): keys marked with their frames, each move's speed curve coloured by its taste verdict (green ✅ approved, amber 🟡 close, red ❌ off) and labelled with its curve. Use it to see an ease without rendering, and to show Elias a move. `path` keeps a copy of the PNG.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "layer": layer_s(),
+                    "property": {"type": "string", "description": "Property path, e.g. transform/position."},
+                    "prop": {"type": "integer", "description": "Property uid instead of `property`."},
+                    "start": {"type": "number", "description": "Range start, comp seconds (default the keys with a margin)."},
+                    "end": {"type": "number", "description": "Range end, comp seconds."},
+                    "width": {"type": "integer", "description": "Image width in px (default 1280)."},
+                    "height": {"type": "integer", "description": "Image height in px (default 720)."},
+                    "path": {"type": "string", "description": "Also save the PNG here."}
+                }),
+                &["layer"],
+            )
+        },
+        run: ease_graph,
     },
     ToolDef {
         name: "get_motion",
