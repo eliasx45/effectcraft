@@ -1,10 +1,12 @@
 //! `render.lint`: design problems in a comp at a time or over a time range, in plain language an
 //! agent can act on (MCP `lint_frame`). The rules are [`crate::lint`]; this samples the times,
 //! renders the text-free backdrop `low-contrast` measures and the frames `exposed-edge` checks
-//! for empty pixels, walks the precomps for the nested rules, mixes the audio `off-beat` needs
-//! and reads the comp's speech map for `off-accent`.
+//! for empty pixels, walks the precomps for the nested rules, mixes the audio `off-beat` needs,
+//! reads the comp's speech map for `off-accent` (errors for the calling agent's own keys, from
+//! the undo history), measures keyed texts at their rest pose for `text-off-centre` and renders
+//! the comp's end without its base shot for `exit-at-cut`.
 
-use effectcraft_project::{ItemId, LayerSource, Project};
+use effectcraft_project::{ItemId, LayerId, LayerSource, Project};
 use effectcraft_render::{Backend, RenderOpts, Renderer};
 use effectcraft_time::{TICKS_PER_SECOND, Tick};
 use serde_json::{Value, json};
@@ -13,7 +15,7 @@ use super::layout_cmds::renderer;
 use super::{CommandSpec, bad, comp_id, f_p, time_p};
 use crate::lint::{self, Backdrop, Settings};
 use crate::render_view::seconds_p;
-use crate::{EngineError, Result, Session, query};
+use crate::{EngineError, Result, Session, layout, query};
 
 /// Sample rate the beat tracker mixes the audio at (Hz).
 const BEAT_RATE: u32 = 12_000;
@@ -64,6 +66,26 @@ fn frames_p(p: &Value, k: &str, default: f64, min: f64, cmd: &str) -> Result<f64
             .filter(|x| x.is_finite() && *x >= min && *x <= 100.0)
             .ok_or_else(|| bad(cmd, format!("`{k}` is a number of frames ({min} to 100), not {v}"))),
     }
+}
+
+/// Whether one of `client`'s undo steps on the working line changed the keyframes of the
+/// property at uid path `path` of layer `layer` in `comp`.
+fn keyed_by(s: &Session, client: &str, comp: ItemId, layer: LayerId, path: &str) -> bool {
+    let keys = |p: &Project| {
+        let l = p.comp(comp)?.layer(layer)?;
+        let mut found = None;
+        l.props.walk("", &mut |at, pr| {
+            if at == path {
+                found = Some(pr.keys.clone());
+            }
+        });
+        found
+    };
+    let line = &s.history.undo;
+    line.iter().enumerate().any(|(i, (_, before))| {
+        let after = line.get(i + 1).map_or(&s.project, |x| &x.1);
+        s.history.author(after) == Some(client) && keys(before) != keys(after)
+    })
 }
 
 fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
@@ -133,6 +155,18 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
     let scale = (lint::BACKDROP_SIDE / comp.width.max(comp.height).max(1) as f64).min(1.0);
     let mut occurrences = vec![];
     let mut coverage = vec![];
+    let mut notes: Vec<String> = vec![];
+    // Texts whose layer or parents are keyed: `text-off-centre` measures them at a rest pose.
+    let rests: Vec<(LayerId, Vec<Tick>)> = if set.on("text-off-centre") {
+        comp.layers
+            .iter()
+            .filter(|l| matches!(l.source, LayerSource::Text) && l.in_point.seconds() <= span.1 + 1e-9 && l.out_point.seconds() > span.0)
+            .map(|l| (l.id, lint::rest_poses(comp, l)))
+            .filter(|(_, poses)| !poses.is_empty())
+            .collect()
+    } else {
+        vec![]
+    };
     for &t in &times {
         let Some(ctx) = r.eval_ctx(cid, t) else { continue };
         let backdrop = match &text_free {
@@ -151,8 +185,21 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     occurrences.extend(lint::exposed_edges(comp, &coverage));
+    if !rests.is_empty() {
+        occurrences.retain(|(_, f)| f.rule != "text-off-centre" || !rests.iter().any(|(l, _)| *l == f.layer));
+        let only = Settings { rules: vec!["text-off-centre"], ..set.clone() };
+        for (lid, poses) in &rests {
+            let Some(l) = comp.layer(*lid) else { continue };
+            // The latest rest pose where the text is fully in.
+            let at = poses.iter().find_map(|&t| r.eval_ctx(cid, t).filter(|ctx| layout::visibility(ctx, l).0 && ctx.opacity(l) >= 0.99).map(|ctx| (t, ctx)));
+            let Some((t, ctx)) = at else { continue };
+            for mut f in lint::lint_at(&ctx, &only, None).into_iter().filter(|f| f.layer == *lid) {
+                f.message.push_str(&format!(" (Measured at its rest pose, {:.3} s, frame {:.0}.)", t.seconds(), t.seconds() * comp.frame_rate.as_f64()));
+                occurrences.push((t, f));
+            }
+        }
+    }
 
-    let mut notes: Vec<String> = vec![];
     if set.on("off-beat") {
         let fps = comp.frame_rate.as_f64();
         if !effectcraft_render::audio::comp_has_audio(&s.project, cid) {
@@ -183,7 +230,9 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
                 let lead = frames_p(p, "accentLead", lint::DEFAULT_ACCENT_LEAD, 0.0, C)?;
                 let window = frames_p(p, "accentWindow", lint::DEFAULT_ACCENT_WINDOW, 1.0, C)?;
                 let half = if range || fps.is_nan() || fps <= 0.0 { 0.0 } else { 0.5 / fps };
-                let (found, skipped) = lint::off_accent(&s.project, cid, map, span.0 - half, span.1 + half, fps, lead, window);
+                // Peaks of keys the linting agent made are errors (they block its handover).
+                let own = |c: ItemId, l: LayerId, path: &str| s.client.as_deref().is_some_and(|who| keyed_by(s, who, c, l, path));
+                let (found, skipped) = lint::off_accent(&s.project, cid, map, span.0 - half, span.1 + half, fps, lead, window, &own);
                 notes.extend(skipped.into_iter().map(|why| format!("off-accent: a precomp was not searched: {why}")));
                 notes.push(format!(
                     "off-accent: {} stressed syllables in the speech map; peaks within {window} frames of an accent ({lead} frame(s) before the stressed vowel) that miss it by more than one frame: {}",
@@ -217,9 +266,28 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
                 .unwrap_or_default();
             occurrences.push((
                 Tick::from_seconds_f64(m.t0),
-                lint::Finding { rule: "off-taste", severity, layer: m.at.layer, other: None, inner: None, message: format!("{}{fix}", m.message) },
+                lint::Finding { rule: "off-taste", severity, layer: m.at.layer, other: None, inner: None, message: format!("{}{fix}", m.message), fix: None },
             ));
         }
+    }
+
+    if set.on("exit-at-cut")
+        && let Some(tail) = lint::exit_tail(&r, cid)
+    {
+        // Full-screen: what is drawn over the base shot covers the frame when everything is in.
+        let img = match tail.base.and_then(|b| lint::without_layer(&s.project, cid, b)) {
+            Some(p) => render_backdrop(s, &p, cid, tail.reference, scale, comp.background).img,
+            None => render_backdrop(s, &s.project, cid, tail.reference, scale, comp.background).img,
+        };
+        let full = lint::opaque_share(&img) >= lint::FULL_SCREEN_SHARE;
+        notes.push(format!(
+            "exit-at-cut: {} (at {:.3} s, what is drawn over {} {} the frame)",
+            if full { "a full-screen cutaway: it holds to its last frame and hard-cuts" } else { "an overlay: it may fade out into its last frame" },
+            tail.reference.seconds(),
+            tail.base.and_then(|b| comp.layer(b)).map_or("the background", |l| l.name.as_str()),
+            if full { "covers" } else { "doesn't cover" }
+        ));
+        occurrences.extend(lint::exit_at_cut(comp, &tail, full));
     }
 
     let problems = lint::merge(occurrences);
@@ -245,6 +313,11 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(i) = &f.inner {
                 o["inner"] = json!({"comp": i.comp.0, "layer": i.layer.0, "path": i.path});
             }
+            if let Some(fix) = &f.fix {
+                let mut fix = fix.clone();
+                fix["params"]["comp"] = json!(cid.0);
+                o["fix"] = fix;
+            }
             o
         })
         .collect();
@@ -265,7 +338,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![query!(
         "render.lint",
         "Design Lint",
-        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: [text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|nested-cut-off|text-overlap|text-off-centre|hidden-visible|exposed-edge|off-beat|off-accent|off-taste] (default all), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner? {comp, layer, path} (a layer inside a precomp: `layer` is the precomp layer showing it)}], notes}",
+        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: [text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|nested-cut-off|text-overlap|text-off-centre|hidden-visible|exposed-edge|off-beat|off-accent|off-taste|exit-at-cut] (default all), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner? {comp, layer, path} (a layer inside a precomp: `layer` is the precomp layer showing it), fix? {command, params} (the call that fixes it: text-off-centre)}], notes}",
         render_lint
     )]
 }

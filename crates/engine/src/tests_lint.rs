@@ -478,3 +478,131 @@ fn texts_on_one_card_are_centred_as_a_block() {
     let m = p["message"].as_str().unwrap();
     assert!(m.contains("“Role” and “Name” (together) are 6.0 px below") || m.contains("“Name” and “Role” (together) are 6.0 px below"), "{m}");
 }
+
+fn key(s: &mut Session, layer: u64, path: &str, time: f64, value: Value) {
+    s.execute("prop.addKey", json!({"layer": layer, "path": path, "time": time, "timeBase": "comp", "value": value})).unwrap();
+}
+
+/// Talking-head footage with sound for the whole comp: the shot a cutaway cuts back to.
+fn base_shot(s: &mut Session) -> u64 {
+    use effectcraft_project::{Footage, FootageKind, ItemKind};
+    let p = std::sync::Arc::make_mut(&mut s.project);
+    let f =
+        Footage { path: "/nowhere/main.mov".into(), kind: FootageKind::Still, width: 320, height: 180, has_video: true, has_audio: true, ..Default::default() };
+    let item = p.add_item("MAIN", Default::default(), None, ItemKind::Footage(f)).0;
+    let comp = s.active_comp_id().unwrap().0;
+    s.execute("layer.addItem", json!({"comp": comp, "item": item})).unwrap()["layer"].as_u64().unwrap()
+}
+
+#[test]
+fn exit_at_cut_full_screen_cutaway_holds_to_the_end() {
+    // 2 s at 25 fps: frames 0–49. A background over the footage, with a title on it.
+    let mut s = comp(2.0);
+    let main = base_shot(&mut s);
+    let bg = solid(&mut s, "BG", 320, 180, "#102040");
+    let title = text(&mut s, "Title", "Hello", 24.0, "#ffffff", [160.0, 90.0]);
+    let rules = json!({"start": 0, "end": 2, "rules": ["exit-at-cut"]});
+    let r = lint(&mut s, rules.clone());
+    assert!(of(&r, "exit-at-cut").is_empty(), "{r:#}");
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("a full-screen cutaway")), "{r:#}");
+    // Both fade out over the last 8 frames, into the cut: one warning on the background.
+    for l in [bg, title] {
+        key(&mut s, l, "transform/opacity", 1.64, json!(100.0));
+        key(&mut s, l, "transform/opacity", 1.96, json!(0.0));
+    }
+    let p = one(&lint(&mut s, rules.clone()), "exit-at-cut");
+    assert_eq!((p["severity"].as_str(), p["layer"].as_u64(), p["other"].as_u64()), (Some("warning"), Some(bg), Some(main)), "{p}");
+    let m = p["message"].as_str().unwrap();
+    assert!(m.contains("“Title”, “BG” fade or move out from frame 41 to 49") && m.contains("hold to the end and hard-cut"), "{m}");
+
+    // Leaving early while the comp runs on (cut at 1.2 s, frame 30): a warning too.
+    let mut s = comp(2.0);
+    base_shot(&mut s);
+    let bg = solid(&mut s, "BG", 320, 180, "#102040");
+    s.execute("layer.timing", json!({"layers": [bg], "out": 1.2})).unwrap();
+    let p = one(&lint(&mut s, rules.clone()), "exit-at-cut");
+    assert_eq!((p["severity"].as_str(), p["time"].as_f64()), (Some("warning"), Some(1.2)), "{p}");
+    assert!(
+        p["message"].as_str().unwrap().contains("gone from frame 30") && p["message"].as_str().unwrap().contains("runs 20 more frames, to frame 49"),
+        "{p}"
+    );
+    // A hard cut one frame before the end is a cut, not an exit.
+    s.execute("layer.timing", json!({"layers": [bg], "out": 1.96})).unwrap();
+    assert!(of(&lint(&mut s, rules), "exit-at-cut").is_empty());
+}
+
+#[test]
+fn exit_at_cut_lets_overlays_fade_into_the_end() {
+    // A card over the footage (an overlay): fading into the cut is right.
+    let mut s = comp(2.0);
+    base_shot(&mut s);
+    let card = solid(&mut s, "Card", 120, 40, "#2060c0");
+    key(&mut s, card, "transform/opacity", 1.64, json!(100.0));
+    key(&mut s, card, "transform/opacity", 1.96, json!(0.0));
+    let rules = json!({"start": 0, "end": 2, "rules": ["exit-at-cut"]});
+    let r = lint(&mut s, rules.clone());
+    assert!(of(&r, "exit-at-cut").is_empty(), "{r:#}");
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("an overlay")), "{r:#}");
+    // Gone well before the end: only a note (info), the tail may be footage on purpose.
+    let mut s = comp(2.0);
+    base_shot(&mut s);
+    let card = solid(&mut s, "Card", 120, 40, "#2060c0");
+    key(&mut s, card, "transform/opacity", 1.0, json!(100.0));
+    key(&mut s, card, "transform/opacity", 1.2, json!(0.0));
+    let p = one(&lint(&mut s, rules), "exit-at-cut");
+    assert_eq!(p["severity"], "info", "{p}");
+}
+
+#[test]
+fn text_off_centre_is_measured_at_rest_with_a_fix_in_its_own_units() {
+    let mut s = comp(2.0);
+    // A 60×20 pill shown at 200 % (120×40 on screen), popping in 0 → 220 → 200 % over 0.4 s.
+    let pill = solid(&mut s, "Pill", 60, 20, "#2060c0");
+    let t = text(&mut s, "Label", "Hi", 12.0, "#ffffff", [160.0, 90.0]);
+    // The pill centred on the text, then the text parented to it.
+    let c = centre(&mut s, t);
+    set(&mut s, pill, "transform/position", json!([c[0], c[1], 0.0]));
+    s.execute("layer.setParent", json!({"layers": [t], "parent": pill})).unwrap();
+    let pos = s.execute("prop.get", json!({"layer": t, "path": "transform/position"})).unwrap()["value"].clone();
+    let (x, y) = (pos[0].as_f64().unwrap(), pos[1].as_f64().unwrap());
+    // At 200 % the text sits 3 pill units (6 comp px) low.
+    set(&mut s, pill, "transform/scale", json!([200.0, 200.0, 100.0]));
+    set(&mut s, t, "transform/position", json!([x, y + 3.0, 0.0]));
+    for (time, v) in [(0.0, 0.0), (0.2, 220.0), (0.4, 200.0)] {
+        key(&mut s, pill, "transform/scale", time, json!([v, v, 100.0]));
+    }
+    // Linted mid-pop (0.1 s): measured at the rest pose (0.4 s), 6 px, a 3-unit fix.
+    let r = lint(&mut s, json!({"time": 0.1, "rules": ["text-off-centre"]}));
+    let p = one(&r, "text-off-centre");
+    assert_eq!(p["time"].as_f64(), Some(0.4), "{p}");
+    let m = p["message"].as_str().unwrap();
+    assert!(m.contains("6.0 px below") && m.contains("in “Pill”'s layer space") && m.contains("rest pose, 0.400 s"), "{m}");
+    let fix = &p["fix"];
+    assert_eq!(
+        (fix["command"].as_str(), fix["params"]["layer"].as_u64(), fix["params"]["path"].as_str()),
+        (Some("prop.set"), Some(t), Some("transform/position")),
+        "{p}"
+    );
+    let to = fix["params"]["value"].as_array().unwrap();
+    assert!((to[0].as_f64().unwrap() - x).abs() < 0.02 && (to[1].as_f64().unwrap() - y).abs() < 0.02, "{fix}");
+    // Running the fix centres it.
+    s.execute(fix["command"].as_str().unwrap(), fix["params"].clone()).unwrap();
+    let r = lint(&mut s, json!({"start": 0, "end": 2, "rules": ["text-off-centre"]}));
+    assert!(of(&r, "text-off-centre").is_empty(), "{r:#}");
+}
+
+#[test]
+fn rest_poses_skip_moving_keys() {
+    let mut s = comp(2.0);
+    let l = solid(&mut s, "Pill", 60, 20, "#2060c0");
+    // Pop in (0 → 0.4 s), hold, fade out (1.52 → 1.8 s).
+    for (time, v) in [(0.0, 0.0), (0.2, 110.0), (0.4, 100.0)] {
+        key(&mut s, l, "transform/scale", time, json!([v, v, 100.0]));
+    }
+    key(&mut s, l, "transform/opacity", 1.52, json!(100.0));
+    key(&mut s, l, "transform/opacity", 1.8, json!(0.0));
+    let c = s.active_comp().unwrap();
+    let poses: Vec<f64> = lint::rest_poses(c, c.layer(LayerId(l)).unwrap()).iter().map(|t| (t.seconds() * 100.0).round() / 100.0).collect();
+    // 0.2 s (the overshoot) is mid-move; 1.8 s and 1.52 s hold on one side; 0.4 s and 0 too.
+    assert_eq!(poses, vec![1.8, 1.52, 0.4, 0.0], "{poses:?}");
+}
