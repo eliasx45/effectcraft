@@ -84,6 +84,13 @@ fn toggle(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, r: R
     resp.clicked()
 }
 
+/// The panel's status line sits on a strip of panel background, so it stays readable over rows
+/// scrolled under it when the panel is short (the rows leave room to scroll clear of it).
+fn status_strip(p: &egui::Painter, rect: Rect, t: &Tokens) {
+    let strip = Rect::from_min_max(pos2(rect.min.x, rect.max.y - 32.0), pos2(rect.max.x - 8.0, rect.max.y));
+    p.rect_filled(strip.intersect(rect), 0.0, t.panel_bg);
+}
+
 pub fn character(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens();
     let p = ui.painter().with_clip_rect(rect);
@@ -303,11 +310,13 @@ pub fn character(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     scroll.end(ui, app.auto_mut(), "character.scroll", y + 44.0 - top, &t);
     match &target {
         None => {
+            status_strip(&p, rect, &t);
             p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, tr("Select a text layer"), Tokens::ui(11.0), t.text_faint);
         }
         Some(tt) if tt.range.is_some() => {
             let [a, b] = tt.range.unwrap_or_default();
             let msg = if a == b { "Editing: caret (applies to typed text)".to_string() } else { format!("Editing: {} characters selected", b - a) };
+            status_strip(&p, rect, &t);
             p.text(pos2(x0, rect.max.y - 14.0), Align2::LEFT_CENTER, msg, Tokens::ui(10.5), t.text_faint);
         }
         _ => {}
@@ -556,6 +565,7 @@ pub fn paragraph(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     // (Room for the status line at the bottom.)
     scroll.end(ui, app.auto_mut(), "paragraph.scroll", y + 44.0 - top, &t);
     if !enabled {
+        status_strip(&p, rect, &t);
         p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, tr("Select a text layer"), Tokens::ui(11.0), t.text_faint);
     }
     let Some(tt) = target else { return };
