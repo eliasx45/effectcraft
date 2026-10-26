@@ -566,6 +566,20 @@ everywhere. Junk parameters are an error (`{"ok": false, "error": "figcraft.<met
   seconds, kept inside the comp) and brings the window to the front. FigCraft calls it when a card
   is double-clicked.
 
+- **Editing a project the app has open** (FigCraft's hosted Timeline, fork): FigCraft keeps a
+  replica of the app's project and edits it; the app stays the one source of truth. Both are
+  engine commands (`engine.execute`), not journaled, `client` required (`"figcraft"`):
+  - `project.mirror {client, reset?}` → `{revision, path, idFloor, unchanged: true | patch |
+    project}`: brings the client's replica to this revision, as a patch of the comps and layers
+    that changed since what it was last sent (`effectcraft_engine::remote_sync`, the cloud
+    replica's format), or the whole project's JSON the first time or with `reset`.
+  - `project.applyPatch {client, patch: {fromRev, toRev, ops}, label?, merge?}` → `{revision}`:
+    the replica's edit (a patch from revision `fromRev`) as one undo step here, labelled `label`
+    and authored by `client`; consecutive patches with the same `merge` key are one step (a drag).
+    Refused with `document changed …`, changing nothing, when the project moved on since
+    `fromRev`: the client pulls again and drops its edit (the app wins).
+  - Undo, redo and save from FigCraft are this app's `edit.undo`, `edit.redo`, `file.save`.
+
 **Composition ▸ Send to FigCraft** (`comp.sendToFigCraft {comp?, start?, end?}`, also in the
 Timeline layer context menu and the Project panel's context menu of a comp) places a comp range on
 FigCraft's canvas. The comp is the active one (the right-clicked one in the Project panel); the
