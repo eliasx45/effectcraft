@@ -19,6 +19,8 @@ fn every_test_file_is_a_module() {
 
 #[path = "../background_presets.rs"]
 mod background_presets;
+#[path = "../comp_tools.rs"]
+mod comp_tools;
 #[path = "../determinism.rs"]
 mod determinism;
 #[path = "../exam_tasks.rs"]

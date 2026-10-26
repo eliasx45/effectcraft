@@ -233,13 +233,55 @@ pub(crate) fn tolerance(depth: BitDepth) -> f32 {
     }
 }
 
-/// Render on the CPU and the GPU; `Some(diff)` (None without an adapter).
+/// A second test device whose working images are all f32 (no 8 bpc codes, see `crate::codes`):
+/// the reference [`compare_at`] holds every codes render to, bit for bit.
+pub(crate) fn gpu_f32() -> Option<&'static Gpu> {
+    static G: OnceLock<Result<Gpu, String>> = OnceLock::new();
+    hold_gpu_lock();
+    let g = G.get_or_init(|| {
+        let mut ctx = pollster::block_on(crate::context::GpuContext::request())?;
+        ctx.codes = None;
+        Ok(Gpu::from_context(ctx))
+    });
+    g.as_ref().ok()
+}
+
+/// `a` and `b` hold the very same bits (8 bpc codes against f32 working images).
+#[track_caller]
+pub(crate) fn assert_same_bits(label: &str, a: &Image, b: &Image) {
+    assert_eq!((a.width, a.height), (b.width, b.height), "{label}: size");
+    let bits = |i: &Image| i.data.iter().flat_map(|p| p.map(f32::to_bits)).collect::<Vec<u32>>();
+    let (x, y) = (bits(a), bits(b));
+    let differ = x.iter().zip(&y).filter(|(p, q)| p != q).count();
+    if let Some(i) = x.iter().zip(&y).position(|(p, q)| p != q) {
+        let px = i / 4;
+        panic!(
+            "{label}: {differ} channels differ between 8 bpc codes and f32 working images; first at ({}, {}) channel {}: {} vs {}",
+            px as u32 % a.width,
+            px as u32 / a.width,
+            i % 4,
+            f32::from_bits(x[i]),
+            f32::from_bits(y[i])
+        );
+    }
+}
+
+/// Render on the CPU and the GPU; `Some(diff)` (None without an adapter). The GPU frame is also
+/// rendered with f32 working images only ([`gpu_f32`]) and must match it bit for bit.
 pub(crate) fn compare_at(s: &Scene, opts: RenderOpts, t: Tick) -> Option<Diff> {
     let g = gpu()?;
     let cpu = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Cpu, ..opts }).comp_frame_cpu(s.cid, t);
     let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts });
     r.accel = Some(g);
     let img = g.render(&r, s.cid, t).expect("the GPU renders the frame");
+    if g.ctx.codes.is_some()
+        && let Some(f) = gpu_f32()
+    {
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts });
+        r.accel = Some(f);
+        let reference = f.render(&r, s.cid, t).expect("the f32 GPU renders the frame");
+        assert_same_bits(&format!("{:?} at {t:?}", s.p.settings.bit_depth), &img, &reference);
+    }
     let mut d = diff(&cpu, &img, tolerance(s.p.settings.bit_depth));
     d.quantized = s.p.settings.bit_depth != BitDepth::Bpc32;
     Some(d)
@@ -1125,4 +1167,14 @@ fn static_effect_layers_draw_from_the_cache() {
     }
     assert!(frames[1] == frames[2]);
     check("static effect layer vs CPU", compare_at(&s, opts(), t(2)), 0.0);
+}
+
+/// The device the compositor owns asks for `MemoryUsage` so freed textures give
+/// their allocator blocks back, while its label and limits stay as they were.
+#[test]
+fn owned_devices_favour_memory_usage() {
+    let d = crate::context::device_descriptor(wgpu::Limits::default(), wgpu::Features::empty());
+    assert!(matches!(d.memory_hints, wgpu::MemoryHints::MemoryUsage));
+    assert_eq!(d.label, Some("effectcraft gpu"));
+    assert_eq!(d.required_limits.max_texture_dimension_2d, wgpu::Limits::default().max_texture_dimension_2d);
 }

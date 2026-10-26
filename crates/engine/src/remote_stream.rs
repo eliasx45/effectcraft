@@ -100,6 +100,10 @@ pub enum StreamMsg {
         /// Largest frame sent (the viewer's size); frames are scaled to fit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_size: Option<[u32; 2]>,
+        /// The viewer's frame series at `revision` (its keys): the server takes full-size frames
+        /// from its frame cache and keeps the ones it renders there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache: Option<crate::remote::CacheSeries>,
     },
     /// The playhead jumped: play from `time`.
     Seek {
@@ -215,13 +219,111 @@ const MAX_DEPTH: usize = 32;
 /// mattes it counts too, a precomp layer counts whole when anything inside it changed, and a
 /// change outside the comps (settings, footage, items) counts from the start.
 ///
-/// Expressions that read other layers are not followed.
+/// Expressions aren't evaluated: a layer whose expression reads something that changed counts
+/// from its in-point — another layer or a marker of its comp (`thisComp`, `layer(…)`), a comp
+/// or footage it names (`comp("…")`, `footage("…")`), or, for a lookup that can't be followed
+/// (a name built at run time), anything in the project.
 pub fn first_change(old: &Project, new: &Project, comp: ItemId) -> Option<Tick> {
     if old.settings != new.settings {
         return Some(Tick(i64::MIN));
     }
+    let ctx = Ctx { anything: items_differ(old, new) };
     let mut memo = std::collections::HashMap::new();
-    changed_from(old, new, comp, 0, &mut memo).flatten()
+    changed_from(old, new, comp, 0, &mut memo, &ctx).flatten()
+}
+
+/// What [`changed_from`] knows about the whole edit.
+struct Ctx {
+    /// Some project item differs (comps by snapshot, the rest by value).
+    anything: bool,
+}
+
+/// Whether any item of the project differs between the snapshots (a comp that isn't the same
+/// snapshot counts: unchanged comps are shared).
+fn items_differ(old: &Project, new: &Project) -> bool {
+    old.items.len() != new.items.len()
+        || old.items.iter().any(|(id, a)| {
+            new.items.get(id).is_none_or(|b| {
+                let same = match (&a.kind, &b.kind) {
+                    (ItemKind::Comp(x), ItemKind::Comp(y)) => std::sync::Arc::ptr_eq(x, y),
+                    (x, y) => x == y,
+                };
+                !same || a.name != b.name || a.proxy != b.proxy
+            })
+        })
+}
+
+/// What a layer's expressions can read beyond the layer itself.
+#[derive(Default)]
+struct Reads {
+    /// Comps (`true`) and footage named with `comp("…")` / `footage("…")`.
+    items: Vec<(bool, String)>,
+    /// Other layers or markers of its own comp.
+    own_comp: bool,
+    /// A lookup that can't be followed: anything.
+    anything: bool,
+}
+
+/// Most property nodes looked at per layer for expressions (past it: reads anything).
+const MAX_EXPRESSION_NODES: usize = 100_000;
+
+/// Words in an expression that reach past its own layer into its comp.
+const OWN_COMP_WORDS: [&str; 5] = ["thisComp", "layer(", "parent", "marker", "sampleImage"];
+
+/// What `layer`'s expressions read (`None`: it has none).
+fn layer_reads(layer: &crate::project::Layer) -> Option<Reads> {
+    use crate::project::props::{Node, PropGroup};
+    let mut reads: Option<Reads> = None;
+    let mut stack: Vec<&PropGroup> = vec![&layer.props];
+    let mut seen = 0usize;
+    while let Some(g) = stack.pop() {
+        for c in &g.children {
+            seen = seen.saturating_add(1);
+            if seen > MAX_EXPRESSION_NODES {
+                reads.get_or_insert_with(Reads::default).anything = true;
+                return reads;
+            }
+            match c {
+                Node::Group(sub) => stack.push(sub),
+                Node::Prop(p) => {
+                    let Some(e) = p.expr.as_ref().filter(|_| p.has_expression()) else { continue };
+                    let r = reads.get_or_insert_with(Reads::default);
+                    match crate::freeze_expressions::references(&e.text) {
+                        Some(items) => r.items.extend(items),
+                        None => r.anything = true,
+                    }
+                    r.own_comp |= OWN_COMP_WORDS.iter().any(|w| e.text.contains(w));
+                }
+            }
+        }
+    }
+    reads
+}
+
+/// Whether the comp (`is_comp`) or footage item called `name` changed what it shows. Another
+/// item under that name (renamed, added, removed) counts as a change.
+fn named_item_changed(
+    old: &Project,
+    new: &Project,
+    is_comp: bool,
+    name: &str,
+    depth: usize,
+    memo: &mut std::collections::HashMap<ItemId, Option<Tick>>,
+    ctx: &Ctx,
+) -> bool {
+    let find = |p: &Project| p.items.values().find(|i| i.name == name && matches!(i.kind, ItemKind::Comp(_)) == is_comp).map(|i| i.id);
+    match (find(old), find(new)) {
+        (None, None) => false,
+        (Some(a), Some(b)) if a == b => {
+            if is_comp {
+                // `None` (too deep to tell) counts as changed.
+                changed_from(old, new, a, depth.saturating_add(1), memo, ctx) != Some(None)
+            } else {
+                old.items.get(&a).map(|i| (&i.kind, &i.proxy)) != new.items.get(&b).map(|i| (&i.kind, &i.proxy))
+            }
+        }
+        _ => true,
+    }
 }
 
 /// The project item a layer shows, if any.
@@ -233,7 +335,14 @@ fn source_item(s: &LayerSource) -> Option<ItemId> {
 }
 
 /// `Some(None)`: nothing changed; `Some(Some(t))`: changed from `t`; `None`: not known (depth).
-fn changed_from(old: &Project, new: &Project, comp: ItemId, depth: usize, memo: &mut std::collections::HashMap<ItemId, Option<Tick>>) -> Option<Option<Tick>> {
+fn changed_from(
+    old: &Project,
+    new: &Project,
+    comp: ItemId,
+    depth: usize,
+    memo: &mut std::collections::HashMap<ItemId, Option<Tick>>,
+    ctx: &Ctx,
+) -> Option<Option<Tick>> {
     let start = Some(Tick(i64::MIN));
     if depth > MAX_DEPTH {
         return Some(start);
@@ -293,7 +402,7 @@ fn changed_from(old: &Project, new: &Project, comp: ItemId, depth: usize, memo: 
                 if let Some(src) = source_item(&l.source) {
                     let inside = match (old.items.get(&src), new.items.get(&src)) {
                         (Some(a), Some(b)) => match (&a.kind, &b.kind) {
-                            (ItemKind::Comp(_), ItemKind::Comp(_)) => changed_from(old, new, src, depth + 1, memo)?,
+                            (ItemKind::Comp(_), ItemKind::Comp(_)) => changed_from(old, new, src, depth + 1, memo, ctx)?,
                             (x, y) if x == y && a.proxy == b.proxy => None,
                             _ => Some(lo),
                         },
@@ -306,6 +415,23 @@ fn changed_from(old: &Project, new: &Project, comp: ItemId, depth: usize, memo: 
                     }
                 }
             }
+        }
+    }
+    // Layers whose expressions read something that changed (edit audit B7, 18 Oct: a layer
+    // reading a controller layer, or `comp("Controls")`, kept its old frames).
+    // (Nothing in the project changed: nothing an expression reads did either; skips the walk.)
+    let own_changed = !changed_ids.is_empty() || oc.markers != nc.markers;
+    for l in nc.layers.arcs().iter().filter(|_| ctx.anything) {
+        if changed_ids.contains(&l.id) {
+            continue;
+        }
+        let Some(r) = layer_reads(l) else { continue };
+        let reads_change = (r.anything && (ctx.anything || own_changed))
+            || (r.own_comp && own_changed)
+            || r.items.iter().any(|(is_comp, name)| named_item_changed(old, new, *is_comp, name, depth, memo, ctx));
+        if reads_change {
+            take(l.in_point.min(l.out_point), &mut earliest);
+            changed_ids.insert(l.id);
         }
     }
     // Layers that follow a changed layer (parent, track matte) change with it.

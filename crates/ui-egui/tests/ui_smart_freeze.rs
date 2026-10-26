@@ -59,6 +59,52 @@ fn smart_freeze_panel_controls_use_real_click_targets_and_preserve_originals() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn a_heavy_layer_gets_a_timeline_hint_whose_button_freezes_it_and_whose_cross_dismisses_it() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name":"Heavy UI","width":32,"height":18,"duration":0.2,"frameRate":10})).unwrap();
+    s.execute("layer.newSolid", json!({"name":"Stat Stack","color":"#ff0000"})).unwrap();
+    let comp = s.active_comp_id().unwrap();
+    let layer = s.active_comp().unwrap().layers[0].id;
+    for _ in 0..12 {
+        s.note_layer_costs(comp, [(comp, layer, 1800.0)]);
+    }
+    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    h.run_steps(3);
+    assert!(h.state().auto.elements.iter().chain(h.state().auto.previous.iter()).any(|e| e.id == "timeline.freezeHint"), "the hint is drawn");
+    assert!(h.state().session.project.freeze.sections.is_empty(), "a hint alone freezes nothing");
+    click(&mut h, "timeline.freezeHint.dismiss");
+    h.run_steps(2);
+    assert!(!h.state().auto.elements.iter().any(|e| e.id == "timeline.freezeHint"), "dismissed");
+    assert!(h.state().session.project.freeze.sections.is_empty());
+
+    let mut s2 = Session::default();
+    s2.execute("comp.new", json!({"name":"Heavy UI 2","width":32,"height":18,"duration":0.2,"frameRate":10})).unwrap();
+    s2.execute("layer.newSolid", json!({"name":"Stat Stack","color":"#ff0000"})).unwrap();
+    let comp = s2.active_comp_id().unwrap();
+    let layer = s2.active_comp().unwrap().layers[0].id;
+    for _ in 0..12 {
+        s2.note_layer_costs(comp, [(comp, layer, 1800.0)]);
+    }
+    drop(h);
+    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s2));
+    h.run_steps(3);
+    click(&mut h, "timeline.freezeHint.freeze");
+    h.state_mut().session.freeze_runtime.pause_until.store(0, std::sync::atomic::Ordering::Relaxed);
+    h.state_mut().session.wait_jobs();
+    h.run_steps(3);
+    let sections = &h.state().session.project.freeze.sections;
+    assert_eq!(sections.len(), 1, "status={}", h.state().ui.status);
+    assert!(sections[0].auto, "a frozen hint stays fresh");
+    let root = effectcraft_engine::freeze_storage::root(&h.state().session.project.freeze.namespace).unwrap();
+    h.run_steps(3);
+    let result = h.state().auto.elements.iter().chain(h.state().auto.previous.iter()).find(|e| e.id == "timeline.freezeHint.result");
+    assert_eq!(result.map(|e| e.label.as_str()), Some("Frozen ✓ Stat Stack"), "the click ends in a visible result");
+    assert!(!h.state().auto.elements.iter().any(|e| e.id == "timeline.freezeHint"), "frozen layers are not suggested again");
+    drop(h);
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn settle_viewer(h: &mut Harness<'_, EffectcraftApp>) {
     for _ in 0..600 {
         h.step();

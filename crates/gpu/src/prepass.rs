@@ -13,7 +13,7 @@ use effectcraft_render::cache::GpuStage;
 use effectcraft_render::prepass::prefetch_slot;
 use effectcraft_render::{ContentClip, EvalCtx, Renderer};
 
-use crate::context::{Enc, GpuImage};
+use crate::context::Enc;
 
 thread_local! {
     /// Resident sources produced ahead of the walk on this thread, by
@@ -44,11 +44,14 @@ impl Drop for Prefetched {
 
 /// Run the pre-pass for `visible` (drawn into `canvas`). `resident`: the walk's ordinary
 /// resident path is on (it still needs [`Enc::can_retain_resident`]).
-pub(crate) fn run<'a>(e: &Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &GpuImage, resident: bool) -> Prefetched {
+pub(crate) fn run<'a>(e: &Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: (u32, u32), resident: bool) -> Prefetched {
     let resident = resident && e.can_retain_resident();
     let held = |slot: u64| READY.try_with(|m| m.try_borrow().map(|m| m.contains_key(&slot)).unwrap_or(true)).unwrap_or(true);
-    let have = |key: u64, slot: u64| held(slot) || e.has_resident(key, GpuStage::Processed);
-    let made = r.prefetch(ctx, visible, (canvas.width, canvas.height), resident.then_some(&have as &dyn Fn(u64, u64) -> bool));
+    // Shape and text layers the walk rasterises on the GPU (`shapes_gpu`): no CPU raster ahead.
+    let gpu_shapes: Vec<&Layer> = visible.iter().copied().filter(|l| crate::shapes_gpu::eligible(r, ctx, l)).collect();
+    let on_gpu = |key: u64, slot: u64| gpu_shapes.iter().any(|l| prefetch_slot(ctx, l, key) == slot);
+    let have = |key: u64, slot: u64| held(slot) || e.has_resident(key, GpuStage::Processed) || on_gpu(key, slot);
+    let made = r.prefetch(ctx, visible, canvas, resident.then_some(&have as &dyn Fn(u64, u64) -> bool));
     let mut keys = Vec::with_capacity(made.len());
     let _ = READY.try_with(|m| {
         if let Ok(mut m) = m.try_borrow_mut() {

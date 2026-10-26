@@ -33,6 +33,8 @@ pub struct Runtime {
     pub changed: web_time::Instant,
     pub activity: web_time::Instant,
     pub retry_after: BTreeMap<u64, web_time::Instant>,
+    /// Render times of the layers the viewer drew, for `freeze.suggest`.
+    pub cost: crate::freeze_cost::CostBook,
     font_revision: u64,
     view: Mutex<Option<(u64, usize, Arc<Project>)>>,
 }
@@ -53,6 +55,7 @@ impl Default for Runtime {
             changed: web_time::Instant::now(),
             activity: web_time::Instant::now(),
             retry_after: BTreeMap::new(),
+            cost: Default::default(),
             font_revision: effectcraft_text::fonts::revision(),
             view: Mutex::new(None),
         }
@@ -219,6 +222,7 @@ impl Session {
                 self.layer_cache.clear();
             }
         }
+        self.auto_freeze_heavy();
         if cfg!(target_arch = "wasm32") || !self.project.freeze.sections.iter().any(|s| s.auto && s.enabled) {
             return;
         }

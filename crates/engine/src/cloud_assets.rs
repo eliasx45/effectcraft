@@ -275,9 +275,74 @@ pub fn stat(path: &str) -> Option<(u64, i64)> {
     }
 }
 
-/// Remembered hashes: (size, mtime) → sha256 per path, so the 6 GB clip is read once.
-fn hash_cache() -> &'static Mutex<Option<BTreeMap<String, (u64, i64, String)>>> {
-    static C: Mutex<Option<BTreeMap<String, (u64, i64, String)>>> = Mutex::new(None);
+/// Remembered hashes: (size, mtime) → sha256 per path, so the 6 GB clip is read once. The file is
+/// shared with other processes on this machine (the mirror CLI hashes while the app runs), so it
+/// is read again whenever it changed on disk: a lookup that misses, and every write, first take
+/// in what another process added (else the app's manifest goes without the hash the mirror just
+/// computed, and the server calls a same-content copy with another mtime missing).
+#[derive(Default)]
+struct HashCache {
+    map: BTreeMap<String, (u64, i64, String)>,
+    /// The file's (length, modified) when it was last read or written; `None`: not yet.
+    seen: Option<(u64, Option<std::time::SystemTime>)>,
+}
+
+type HashEntry = (String, u64, i64, String);
+
+impl HashCache {
+    /// Take in the file's entries if it changed since it was last seen.
+    fn refresh(&mut self, file: Option<&std::path::Path>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(file) = file else { return };
+            let now = std::fs::metadata(file).ok().map(|m| (m.len(), m.modified().ok()));
+            if now.is_some() && now == self.seen {
+                return;
+            }
+            let loaded: BTreeMap<String, (u64, i64, String)> = std::fs::read(file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            self.map.extend(loaded);
+            self.seen = Some(now.unwrap_or((0, None)));
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = file;
+    }
+
+    fn get(&mut self, file: Option<&std::path::Path>, path: &str, size: u64, mtime: i64) -> Option<String> {
+        let hit = |c: &Self| c.map.get(path).filter(|(s, m, _)| *s == size && *m == mtime).map(|(_, _, h)| h.clone());
+        if self.seen.is_some()
+            && let Some(h) = hit(self)
+        {
+            return Some(h);
+        }
+        self.refresh(file);
+        hit(self)
+    }
+
+    fn insert(&mut self, file: Option<&std::path::Path>, found: Vec<HashEntry>) {
+        if found.is_empty() {
+            return;
+        }
+        self.refresh(file);
+        for (path, size, mtime, h) in found {
+            self.map.insert(path, (size, mtime, h));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(file), Ok(bytes)) = (file, serde_json::to_vec(&self.map)) {
+            // Best effort: a cache that can't be written is only slower next time.
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+            if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, file).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            self.seen = std::fs::metadata(file).ok().map(|m| (m.len(), m.modified().ok()));
+        }
+    }
+}
+
+fn hash_cache() -> &'static Mutex<HashCache> {
+    static C: Mutex<HashCache> = Mutex::new(HashCache { map: BTreeMap::new(), seen: None });
     &C
 }
 
@@ -285,6 +350,10 @@ fn hash_cache() -> &'static Mutex<Option<BTreeMap<String, (u64, i64, String)>>> 
 fn hash_cache_file() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("EFFECTCRAFT_HASH_CACHE").filter(|p| !p.is_empty()) {
         return Some(p.into());
+    }
+    // Tests keep their hashes to themselves (and out of the owner's cache).
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!("ec-file-hashes-test-{}.json", std::process::id())));
     }
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(std::path::PathBuf::from);
     let base = if cfg!(target_os = "macos") {
@@ -297,36 +366,19 @@ fn hash_cache_file() -> Option<std::path::PathBuf> {
     Some(base.join("file-hashes.json"))
 }
 
-fn cached_hash(path: &str, size: u64, mtime: i64) -> Option<String> {
-    let mut c = hash_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    #[cfg(not(target_arch = "wasm32"))]
-    if c.is_none() {
-        let loaded = hash_cache_file().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        *c = Some(loaded);
-    }
-    c.as_ref()?.get(path).filter(|(s, m, _)| *s == size && *m == mtime).map(|(_, _, h)| h.clone())
+#[cfg(target_arch = "wasm32")]
+fn hash_cache_file() -> Option<std::path::PathBuf> {
+    None
 }
 
-fn remember_hashes(found: Vec<(String, u64, i64, String)>) {
-    if found.is_empty() {
-        return;
-    }
-    let mut c = hash_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let map = c.get_or_insert_with(BTreeMap::new);
-    for (path, size, mtime, h) in found {
-        map.insert(path, (size, mtime, h));
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    if let (Some(file), Ok(bytes)) = (hash_cache_file(), serde_json::to_vec(map)) {
-        // Best effort: a cache that can't be written is only slower next time.
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &file).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
+fn cached_hash(path: &str, size: u64, mtime: i64) -> Option<String> {
+    let file = hash_cache_file();
+    hash_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(file.as_deref(), path, size, mtime)
+}
+
+fn remember_hashes(found: Vec<HashEntry>) {
+    let file = hash_cache_file();
+    hash_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(file.as_deref(), found);
 }
 
 /// Remember `sha256` for `path` as it is now (a file this program just wrote or verified).
@@ -400,13 +452,29 @@ struct Need {
     proxied: bool,
 }
 
-/// Whether frames read `item`'s proxy instead of its source (with `proxy_use`; the viewer's is
+/// Whether preview frames (the viewer, the cloud frame server: renders through a preview view of
+/// the footage) read `item`'s proxy instead of its source (with `proxy_use`; the viewer's is
 /// [`ProxyUse::CurrentSettings`], the item's Use Proxy switch). Audio stays on the Mac.
 pub fn reads_proxy(item: &Item, proxy_use: ProxyUse) -> bool {
+    reads_proxy_in(item, proxy_use, true)
+}
+
+/// [`reads_proxy`] for preview frames (`preview`) or for final renders (Render Queue, exports,
+/// which read the exact view). As `Renderer::proxy_for`: an automatic proxy
+/// ([`effectcraft_project::Proxy::auto`]) is preview-only, so under Current Settings a final
+/// render reads the original; only Use All Proxies reads it in every render.
+pub fn reads_proxy_in(item: &Item, proxy_use: ProxyUse, preview: bool) -> bool {
     item.proxy.as_deref().is_some_and(|p| {
-        proxy_use.uses(matches!(item.kind, ItemKind::Comp(_)), p.enabled)
-            && p.footage.has_video
-            && (!p.footage.path.is_empty() || !p.footage.sequence.is_empty())
+        let used = if p.auto {
+            match proxy_use {
+                ProxyUse::UseAll => true,
+                ProxyUse::CurrentSettings => p.enabled && preview,
+                _ => false,
+            }
+        } else {
+            proxy_use.uses(matches!(item.kind, ItemKind::Comp(_)), p.enabled)
+        };
+        used && p.footage.has_video && (!p.footage.path.is_empty() || !p.footage.sequence.is_empty())
     })
 }
 
@@ -689,8 +757,11 @@ pub fn manifest(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>, hash:
     }
     if hash != Hash::None {
         use rayon::prelude::*;
-        files.par_iter_mut().filter(|e| e.exists && e.sha256.is_none() && (hash == Hash::All || e.size <= SMALL_FILE)).for_each(|e| {
-            e.sha256 = hash_file(&e.path, &mut |_| {});
+        files.par_iter_mut().filter(|e| e.exists && e.sha256.is_none()).for_each(|e| {
+            // A big file is hashed only when asked for, but a hash already known for it as it is
+            // now still goes (no read): a server copy with another mtime is then compared by
+            // content instead of being reported missing.
+            e.sha256 = if hash == Hash::All || e.size <= SMALL_FILE { hash_file(&e.path, &mut |_| {}) } else { cached_hash(&e.path, e.size, e.mtime) };
         });
     }
     fonts.sort_by(|a, b| (&a.font, &a.style).cmp(&(&b.font, &b.style)));
@@ -978,9 +1049,19 @@ pub fn blockers(project: &Project) -> Vec<Missing> {
     blockers_cached(project, ProxyUse::CurrentSettings, &mut BlockerCache::default())
 }
 
-/// [`blockers`] for frames rendered with `proxy_use`, recomputing only comps that changed since
-/// the last call with `cache`.
+/// [`blockers`] for preview frames rendered with `proxy_use` (the frame server), recomputing only
+/// comps that changed since the last call with `cache`.
 pub fn blockers_cached(project: &Project, proxy_use: ProxyUse, cache: &mut BlockerCache) -> Vec<Missing> {
+    blockers_in(project, proxy_use, true, cache)
+}
+
+/// [`blockers`] for a final render (Render Queue, export) with `proxy_use`: an item with an
+/// automatic proxy needs its original under Current Settings (see [`reads_proxy_in`]).
+pub fn final_blockers(project: &Project, proxy_use: ProxyUse) -> Vec<Missing> {
+    blockers_in(project, proxy_use, false, &mut BlockerCache::default())
+}
+
+fn blockers_in(project: &Project, proxy_use: ProxyUse, preview: bool, cache: &mut BlockerCache) -> Vec<Missing> {
     let mut comps = Vec::new();
     for item in project.items.values() {
         if let ItemKind::Comp(c) = &item.kind {
@@ -1006,7 +1087,7 @@ pub fn blockers_cached(project: &Project, proxy_use: ProxyUse, cache: &mut Block
     };
     for item in project.items.values().filter(|i| used.contains(&i.id)) {
         // Frames read the proxy instead (with this render's Proxy Use): only it must be here.
-        let via_proxy = reads_proxy(item, proxy_use);
+        let via_proxy = reads_proxy_in(item, proxy_use, preview);
         let main = match &item.kind {
             ItemKind::Footage(f) if !via_proxy => Some((f, if f.sequence.is_empty() { "footage" } else { "sequence" })),
             _ => None,
@@ -1130,6 +1211,28 @@ pub fn pending_uploads(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>
     pending.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
     pending.dedup();
     json!({"count": pending.len(), "bytes": bytes, "pending": pending, "missingHere": missing_here, "confirmed": have.len()})
+}
+
+/// Record that the server has the files of a [`pending_uploads`] answer, as they were then: its
+/// `cloud.preflight` passed for the manifest made with it. After an app restart nothing is
+/// confirmed until the mirror runs again, so without this a server that already has everything
+/// would wait for a mirror run that uploads nothing. A file changed since stays pending (its size
+/// or mtime differs). Returns how many files were recorded.
+pub fn confirm_on_server(pending: &Value) -> usize {
+    let files: Vec<(String, u64, i64)> = pending["pending"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| Some((f["path"].as_str()?.to_string(), f["size"].as_u64()?, f["mtime"].as_i64().unwrap_or(0))))
+        .collect();
+    if files.is_empty() {
+        return 0;
+    }
+    let mut guard = confirmed().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let n = files.len();
+    guard.1.extend(files.into_iter().map(|(p, size, mtime)| (p, (size, mtime))));
+    guard.0 = guard.0.wrapping_add(1);
+    n
 }
 
 fn pending_cmd(s: &mut Session, _: &Value) -> Result<Value> {
@@ -1411,6 +1514,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// CR6b: a footage file over the small-file limit isn't read for the manifest, but a hash
+    /// already known for it goes along, so the server compares a copy with another mtime by
+    /// content instead of calling it missing (10-10 Edit's 6 GB presenter clip on the 3090).
+    #[test]
+    fn a_big_file_carries_its_known_hash_without_being_read() {
+        let d = tmp("bighash");
+        let (known, unknown) = (d.join("known.mov"), d.join("unknown.mov"));
+        for f in [&known, &unknown] {
+            // Sparse: no 129 MB written.
+            std::fs::File::create(f).and_then(|h| h.set_len(SMALL_FILE + 1)).unwrap();
+        }
+        let (known_s, unknown_s) = (known.to_string_lossy().to_string(), unknown.to_string_lossy().to_string());
+        let h = "ab".repeat(32);
+        remember_hash(&known_s, &h);
+        let mut s = Session::default();
+        let p = std::sync::Arc::make_mut(&mut s.project);
+        for path in [&known_s, &unknown_s] {
+            p.add_item("clip", Default::default(), None, ItemKind::Footage(effectcraft_project::Footage { path: path.clone(), ..Default::default() }));
+        }
+        let m: Manifest = serde_json::from_value(s.execute("project.dependencies", json!({})).unwrap()).unwrap();
+        let sha = |p: &str| m.files.iter().find(|f| f.path == p).and_then(|f| f.sha256.clone());
+        assert_eq!(sha(&known_s), Some(h));
+        assert_eq!(sha(&unknown_s), None, "a big file is not hashed unless asked");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Another process (the mirror CLI) adding a hash to the shared file is seen by a cache that
+    /// already read the file, and a write here keeps what the other process added.
+    #[test]
+    fn the_hash_cache_takes_in_what_another_process_wrote() {
+        let d = tmp("hashcache");
+        let file = d.join("file-hashes.json");
+        let mut c = HashCache::default();
+        assert_eq!(c.get(Some(&file), "/a.mov", 5, 7), None, "nothing on disk yet");
+        let other: BTreeMap<&str, (u64, i64, &str)> = [("/a.mov", (5, 7, "aa"))].into();
+        std::fs::write(&file, serde_json::to_vec(&other).unwrap()).unwrap();
+        assert_eq!(c.get(Some(&file), "/a.mov", 5, 7).as_deref(), Some("aa"));
+        assert_eq!(c.get(Some(&file), "/a.mov", 5, 8), None, "another mtime is another file");
+        let other: BTreeMap<&str, (u64, i64, &str)> = [("/a.mov", (5, 7, "aa")), ("/b.mov", (1, 2, "bb"))].into();
+        std::fs::write(&file, serde_json::to_vec(&other).unwrap()).unwrap();
+        c.insert(Some(&file), vec![("/c.mov".into(), 3, 4, "cc".into())]);
+        let on_disk: BTreeMap<String, (u64, i64, String)> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(on_disk.keys().map(String::as_str).collect::<Vec<_>>(), vec!["/a.mov", "/b.mov", "/c.mov"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 17 Oct, 3090: the mirror hashed the 6 GB presenter clip on the Mac ("1 same content (other
+    /// mtime)"), but the app had read the hash file before that, so its preflight manifest went
+    /// without the sha256 and the server's copy (pulled from Drive, another mtime) was "missing".
+    /// Same content with another mtime must pass once any process here knows the hash.
+    #[test]
+    fn same_content_with_another_mtime_passes_preflight_after_another_process_hashed_it() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let d = tmp("othermtime");
+        let clip = d.join("presenter keyed clean.mov");
+        std::fs::File::create(&clip).and_then(|h| h.set_len(SMALL_FILE + 1)).unwrap();
+        let clip_s = clip.to_string_lossy().to_string();
+        // The app read the hash file before the mirror ran.
+        assert_eq!(cached_sha256(&clip_s), None);
+        // The mirror (another process) hashes the clip and writes the shared file.
+        let (size, mtime) = stat(&clip_s).unwrap();
+        let sha = hash_uncached(&clip_s, &mut |_| {}).unwrap();
+        let file = hash_cache_file().unwrap();
+        let mut on_disk: BTreeMap<String, (u64, i64, String)> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        on_disk.insert(clip_s.clone(), (size, mtime, sha.clone()));
+        std::fs::write(&file, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        let mut s = Session::default();
+        let p = std::sync::Arc::make_mut(&mut s.project);
+        p.add_item("clip", Default::default(), None, ItemKind::Footage(effectcraft_project::Footage { path: clip_s.clone(), ..Default::default() }));
+        let m: Manifest = serde_json::from_value(s.execute("project.dependencies", json!({})).unwrap()).unwrap();
+        assert_eq!(m.files.iter().find(|f| f.path == clip_s).and_then(|f| f.sha256.clone()), Some(sha), "the app's manifest carries the mirror's hash");
+        // The server's copy: same bytes, another mtime.
+        std::fs::File::options().write(true).open(&clip).and_then(|f| f.set_modified(UNIX_EPOCH + Duration::from_secs(1_792_222_222))).unwrap();
+        let (missing, warnings) = check(&m, false);
+        assert!(missing.is_empty() && warnings.is_empty(), "{missing:?} {warnings:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn preflight_reports_a_missing_file_changed_size_and_passes_a_present_one() {
         let d = tmp("preflight");
@@ -1518,6 +1699,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// After an app restart nothing is confirmed in memory: a server whose preflight passes has
+    /// every file, so the app is ready without a mirror run (17 Oct: 181 pending, all there).
+    #[test]
+    fn a_passed_preflight_confirms_pending_files_after_a_restart() {
+        let d = tmp("restart");
+        let f = d.join("already on the server.mov");
+        std::fs::write(&f, b"footage").ok();
+        let path = f.to_string_lossy().to_string();
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "C"})).ok();
+        let id = std::sync::Arc::make_mut(&mut s.project).add_item(
+            "f",
+            Default::default(),
+            None,
+            ItemKind::Footage(effectcraft_project::Footage { path: path.clone(), ..Default::default() }),
+        );
+        let cid = s.active_comp_id().unwrap();
+        s.execute("layer.addItem", json!({"comp": cid.0, "item": id.0, "time": 0.0})).unwrap();
+        let ours = |p: &Value| p["pending"].as_array().unwrap().iter().any(|e| e["path"] == path.as_str());
+        // A fresh app: the mirror has confirmed nothing in this process.
+        let files = pending_uploads(&s.project, &|_| None, &Sidecar::default());
+        assert!(ours(&files), "{files}");
+        // The server (here the same disk) has the file: its preflight passes.
+        let m = manifest(&s.project, &|_| None, Hash::Small, &Sidecar::default(), None);
+        let r = s.execute("cloud.preflight", json!({"manifest": m})).unwrap();
+        assert!(r["missing"].as_array().unwrap().iter().all(|m| m["path"] != path.as_str()), "{r}");
+        assert!(confirm_on_server(&files) >= 1);
+        let p = pending_uploads(&s.project, &|_| None, &Sidecar::default());
+        assert!(!ours(&p), "{p}");
+        // Changed on the Mac since: pending again (the server has the old version).
+        std::fs::write(&f, b"new footage, longer").ok();
+        let p = pending_uploads(&s.project, &|_| None, &Sidecar::default());
+        assert!(ours(&p), "{p}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// `CR7_PROJECT=/path/to/real.ecproj cargo test -p effectcraft-engine --lib guard_cost -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -1542,6 +1759,10 @@ mod tests {
 
     /// A saved project with one used clip (`clip.mov`, 1920 wide) and a 50% proxy of it.
     fn proxied_project(dir: &std::path::Path, proxy_on: bool) -> (Session, String, String) {
+        proxied_project_as(dir, proxy_on, false)
+    }
+
+    fn proxied_project_as(dir: &std::path::Path, proxy_on: bool, auto: bool) -> (Session, String, String) {
         let clip = dir.join("presenter keyed clean.mov").to_string_lossy().to_string();
         let proxy = dir.join("presenter 50%.mov").to_string_lossy().to_string();
         std::fs::write(&clip, vec![7u8; 4096]).ok();
@@ -1559,6 +1780,7 @@ mod tests {
             item.proxy = Some(Box::new(effectcraft_project::Proxy {
                 footage: effectcraft_project::Footage { path: proxy.clone(), width: 960, height: 540, has_video: true, ..Default::default() },
                 enabled: proxy_on,
+                auto,
             }));
         }
         let cid = s.active_comp_id().unwrap();
@@ -1612,6 +1834,38 @@ mod tests {
         assert!(blockers(&s.project).is_empty());
         // Frames rendered with "Use No Proxies" need the original, which isn't here.
         assert!(!blockers_cached(&s.project, ProxyUse::UseNone, &mut BlockerCache::default()).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// PROXY-AUTO1's automatic proxies are preview-only on the cloud too: the frame server's
+    /// preview frames read the proxy, a final render needs the original (unless Use All Proxies).
+    #[test]
+    fn an_automatic_proxy_serves_previews_and_final_renders_need_the_original() {
+        let d = tmp("auto-proxy");
+        let (s, clip, proxy) = proxied_project_as(&d, true, true);
+        let item = s.project.items.values().find(|i| i.proxy.is_some()).unwrap();
+        assert!(reads_proxy(item, ProxyUse::CurrentSettings));
+        assert!(!reads_proxy_in(item, ProxyUse::CurrentSettings, false));
+        assert!(!reads_proxy_in(item, ProxyUse::UseCompOnly, true) && !reads_proxy_in(item, ProxyUse::UseNone, true));
+        assert!(reads_proxy_in(item, ProxyUse::UseAll, false));
+        // A hand-set proxy is unchanged: Current Settings reads it in final renders too.
+        let mut manual = item.clone();
+        if let Some(p) = manual.proxy.as_mut() {
+            p.auto = false;
+        }
+        assert!(reads_proxy_in(&manual, ProxyUse::CurrentSettings, false));
+        // Only the proxy on this machine: previews render, a final render is refused (never the
+        // proxy in its place), and with Use All Proxies it renders.
+        std::fs::remove_file(&clip).ok();
+        assert!(blockers(&s.project).is_empty());
+        let missing = final_blockers(&s.project, ProxyUse::CurrentSettings);
+        assert_eq!(missing.iter().filter_map(|m| m.path.clone()).collect::<Vec<_>>(), vec![clip.clone()]);
+        assert!(final_blockers(&s.project, ProxyUse::UseAll).is_empty());
+        // Only the original: a final render is fine, previews need the proxy.
+        std::fs::write(&clip, b"x").ok();
+        std::fs::remove_file(&proxy).ok();
+        assert!(final_blockers(&s.project, ProxyUse::CurrentSettings).is_empty());
+        assert!(!blockers(&s.project).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 

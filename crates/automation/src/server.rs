@@ -319,6 +319,9 @@ impl McpServer {
                     let hint = if tools::find(name).is_some() { format!(" ({})", crate::backend::NEED_BRIDGE) } else { String::new() };
                     return Err((INVALID_PARAMS, format!("unknown tool `{name}`{hint}")));
                 }
+                if let Some(t) = tools::find(name) {
+                    t.normalize_args(&mut args);
+                }
                 if let Some(m) = tools::find(name).and_then(|t| t.unknown_arg(&args)) {
                     return Err((INVALID_PARAMS, m));
                 }
@@ -569,6 +572,7 @@ pub(crate) fn guarded_run(backend: &mut Backend, name: &str, args: &Value) -> Re
     if let Some(o) = args.to_mut().as_object_mut() {
         o.remove("client");
     }
+    let outer_named = backend.set_client_named(client.is_some());
     let outer = client.map(|c| backend.set_client(c));
     let outer_revision = backend.set_expected_revision(None);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tools::run(backend, name, &args))).unwrap_or_else(|p| {
@@ -576,6 +580,7 @@ pub(crate) fn guarded_run(backend: &mut Backend, name: &str, args: &Value) -> Re
         Err(Error::Other(format!("internal error: {msg}")))
     });
     backend.set_expected_revision(outer_revision);
+    backend.set_client_named(outer_named);
     if let Some(outer) = outer {
         backend.set_client(outer);
     }
@@ -692,10 +697,13 @@ mod result_tests {
     #[test]
     fn stopped_script_reports_rollback_and_kept_partial_edits() {
         let mut server = script_server();
-        for (group, name, kept) in [("app.beginUndoGroup('Build');", "RolledBack", false), ("", "KeptPartial", true)] {
+        // A stopped script undoes all its edits; with rollback: false only an open undo group.
+        for (group, name, kept, rollback) in
+            [("app.beginUndoGroup('Build');", "RolledBack", false, true), ("", "AllRolledBack", false, true), ("", "KeptPartial", true, false)]
+        {
             let code = format!("{group} app.project.items.addComp('{name}', 64, 64, 1, 1, 25); $.writeln('before timeout'); while (true) {{}}");
             let started = std::time::Instant::now();
-            let result = call(&mut server, "run_script", json!({"code":code,"timeout":0.3}));
+            let result = call(&mut server, "run_script", json!({"code":code,"timeout":0.3,"rollback":rollback}));
             assert!(started.elapsed() < std::time::Duration::from_secs(3));
             assert_eq!(result["isError"], true, "{result}");
             let data = text_json(&result);
@@ -703,7 +711,7 @@ mod result_tests {
             assert!(data["error"]["message"].as_str().unwrap().contains("time limit"), "{data}");
             let output = data["output"].as_str().unwrap();
             assert!(output.contains("before timeout"), "{data}");
-            assert!(output.contains(if kept { "kept" } else { "rolled back" }), "{data}");
+            assert!(output.contains(if kept { "are kept" } else { "olled back" }), "{data}");
             assert_eq!(result["structuredContent"], tools::structured(data));
             let project = call(&mut server, "get_project", json!({}));
             assert_eq!(text_json(&project).to_string().contains(name), kept, "{project}");

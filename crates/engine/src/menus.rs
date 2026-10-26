@@ -725,6 +725,8 @@ Composition
   Composition Flowchart | comp.flowchart
   Composition Mini-Flowchart | comp.miniFlowchart
   ---
+  Send to FigCraft | comp.sendToFigCraft
+  ---
   VR
     Create VR Environment... | comp.vr.createEnvironment
     Extract Cubemap... | comp.vr.extractCubemap
@@ -1035,6 +1037,7 @@ Animation
       Saturation | layer.addTextAnimator {"properties":["fillSaturation"]}
       Brightness | layer.addTextAnimator {"properties":["fillBrightness"]}
       Opacity | layer.addTextAnimator {"properties":["fillOpacity"]}
+    Gradient Fill | layer.addTextAnimator {"properties":["gradientFill"]}
     Stroke Color
       RGB | layer.addTextAnimator {"properties":["strokeColor"]}
       Hue | layer.addTextAnimator {"properties":["strokeHue"]}
@@ -1136,6 +1139,7 @@ View
   ---
   View Options... | view.options
   Show Layer Controls | view.layerControls
+  Sharp Zoom | view.sharpZoom
   ---
   Camera Settings... | layer.cameraSettings
   Reset 3D View | view.reset3DView
@@ -1209,6 +1213,7 @@ Window
   Lumetri Scopes | window.panel {"panel":"lumetriScopes"}
   Mask Interpolation | window.panel {"panel":"maskInterpolation"}
   Media Browser | window.panel {"panel":"mediaBrowser"}
+  Memory | window.panel {"panel":"memory"}
   Metadata | window.panel {"panel":"metadata"}
   Motion Library | window.panel {"panel":"motionLibrary"}
   Motion Sketch | window.panel {"panel":"motionSketch"}
@@ -1218,6 +1223,7 @@ Window
   Progress | window.panel {"panel":"progress"}
   Smart Freeze | window.panel {"panel":"smartFreeze"}
   Properties | window.panel {"panel":"properties"}
+  Script | window.panel {"panel":"script"}
   Script Console | window.panel {"panel":"scriptConsole"}
   Smoother | window.panel {"panel":"smoother"}
   Tools | window.panel {"panel":"tools"} | Cmd+1

@@ -747,6 +747,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "byteorder-lite"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1479,10 +1485,14 @@ dependencies = [
  "effectcraft-gpu",
  "effectcraft-host",
  "effectcraft-media",
+ "effectcraft-motionlib",
  "effectcraft-platform",
  "effectcraft-render",
  "effectcraft-time",
  "effectcraft-ui-egui",
+ "filmcraft-isobmff",
+ "filmcraft-prores",
+ "fs4",
  "image",
  "rayon",
  "rustls-rustcrypto",
@@ -1524,6 +1534,7 @@ dependencies = [
  "effectcraft-buildgen",
  "effectcraft-color",
  "effectcraft-effects",
+ "effectcraft-expr",
  "effectcraft-geom",
  "effectcraft-interchange",
  "effectcraft-keyframe",
@@ -1546,10 +1557,12 @@ dependencies = [
  "image",
  "kurbo",
  "log",
+ "memory-stats",
  "rayon",
  "ruzstd",
  "serde",
  "serde_json",
+ "sysctl",
  "thiserror 2.0.21",
  "time",
  "trash",
@@ -1813,6 +1826,8 @@ dependencies = [
 name = "effectcraft-platform"
 version = "0.10.0"
 dependencies = [
+ "effectcraft-gpu",
+ "effectcraft-hevcenc",
  "effectcraft-media",
  "effectcraft-project",
  "effectcraft-render",
@@ -1820,14 +1835,23 @@ dependencies = [
  "filmcraft-codecs",
  "filmcraft-color",
  "filmcraft-frame",
+ "filmcraft-h264",
+ "filmcraft-h264enc",
+ "filmcraft-hevc",
  "filmcraft-isobmff",
  "filmcraft-prores",
  "filmcraft-time",
  "log",
+ "objc2 0.6.4",
  "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-core-media",
  "objc2-core-video",
+ "objc2-io-surface",
+ "objc2-metal 0.3.2",
  "objc2-video-toolbox",
+ "pollster 0.4.0",
+ "wgpu",
 ]
 
 [[package]]
@@ -1978,6 +2002,7 @@ dependencies = [
  "effectcraft-gpu",
  "effectcraft-host",
  "effectcraft-keyframe",
+ "effectcraft-media",
  "effectcraft-path",
  "effectcraft-project",
  "effectcraft-render",
@@ -2213,6 +2238,18 @@ name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
+
+[[package]]
+name = "enum-as-inner"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "enumflags2"
@@ -3702,6 +3739,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-stats"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "minicov"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4225,8 +4272,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
 dependencies = [
  "bitflags 2.13.2",
+ "libc",
  "objc2 0.6.4",
  "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -4261,8 +4310,11 @@ checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
 dependencies = [
  "bitflags 2.13.2",
  "block2 0.6.2",
+ "dispatch2",
  "objc2 0.6.4",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.2",
+ "objc2-io-surface",
 ]
 
 [[package]]
@@ -6024,6 +6076,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "sysctl"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01198a2debb237c62b6826ec7081082d951f46dbb64b0e8c7649a452230d1dfc"
+dependencies = [
+ "bitflags 2.13.2",
+ "byteorder",
+ "enum-as-inner",
+ "libc",
+ "thiserror 1.0.69",
+ "walkdir",
 ]
 
 [[package]]

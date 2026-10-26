@@ -13,6 +13,9 @@
 //! layers), `footage` and `audio` (media files). Relative paths resolve against the library
 //! folder. Settings ▸ `libraries` lists the folders.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -47,6 +50,12 @@ struct Entry {
     duration: Option<f64>,
     thumbnail: String,
     preview: String,
+    /// A folder of PNG frames played on hover (the Motion Library's MotionEssence cards).
+    frames: String,
+    /// The visible artwork inside a transparent thumbnail.
+    crop: Option<effectcraft_motionlib::Crop>,
+    /// When the card was made (Unix seconds; a number or a numeric string), when the index says.
+    created_at: Option<Value>,
 }
 
 /// A library folder, read.
@@ -86,6 +95,90 @@ fn read_library(s: &Session, folder: &str) -> std::result::Result<Library, Strin
 /// Every configured library that reads (the others are reported by `library.folders`).
 fn libraries(s: &Session) -> Vec<Library> {
     s.prefs.libraries.iter().filter_map(|f| read_library(s, f).ok()).collect()
+}
+
+/// A library folder's entry with absolute paths. On the Mac that keeps the Motion Library, its
+/// cards apply and preview from these files (same ids) instead of the bucket.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LocalEntry {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub category: String,
+    pub file: String,
+    pub preview: String,
+    pub thumbnail: String,
+    /// A folder of PNG frames to play on hover (the index's `frames`, else `Png` beside the
+    /// thumbnail); may not exist.
+    pub frames: String,
+    /// The visible artwork inside its transparent thumbnail and frames.
+    pub crop: Option<effectcraft_motionlib::Crop>,
+    pub folder: String,
+    /// When the card was made (the index's `created_at`, Unix seconds), when it says.
+    pub created: Option<f64>,
+}
+
+/// Local entries by id (the first folder listing an id wins).
+pub type LocalIndex = BTreeMap<String, LocalEntry>;
+
+/// An index file's size and modification time (none on the web).
+fn stamp(path: &str) -> Option<(u64, std::time::SystemTime)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let m = std::fs::metadata(path).ok()?;
+        Some((m.len(), m.modified().ok()?))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        None
+    }
+}
+
+type LocalKey = Vec<(String, Option<(u64, std::time::SystemTime)>)>;
+
+/// Every configured folder's entries, read again only when a folder or its index changes (the
+/// Motion Library panel asks every frame).
+pub(crate) fn local_entries(s: &Session) -> Arc<LocalIndex> {
+    static CACHE: Mutex<Option<(LocalKey, Arc<LocalIndex>)>> = Mutex::new(None);
+    let key: LocalKey = s.prefs.libraries.iter().map(|f| (f.clone(), stamp(&index_path(f)))).collect();
+    if let Ok(c) = CACHE.lock()
+        && let Some((k, index)) = c.as_ref()
+        && *k == key
+    {
+        return index.clone();
+    }
+    let mut index = LocalIndex::new();
+    for lib in libraries(s) {
+        for e in &lib.entries {
+            index.entry(e.id.clone()).or_insert_with(|| LocalEntry {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                kind: e.kind.clone(),
+                category: e.category.clone(),
+                file: resolve(&lib.folder, &e.file),
+                preview: resolve(&lib.folder, &e.preview),
+                thumbnail: resolve(&lib.folder, &e.thumbnail),
+                frames: if e.frames.is_empty() {
+                    std::path::Path::new(&resolve(&lib.folder, &e.thumbnail)).parent().map(|d| d.join("Png").to_string_lossy().to_string()).unwrap_or_default()
+                } else {
+                    resolve(&lib.folder, &e.frames)
+                },
+                crop: e.crop.and_then(effectcraft_motionlib::Crop::valid),
+                folder: lib.folder.clone(),
+                created: e
+                    .created_at
+                    .as_ref()
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|t| t.trim().parse().ok())))
+                    .filter(|t: &f64| t.is_finite()),
+            });
+        }
+    }
+    let index = Arc::new(index);
+    if let Ok(mut c) = CACHE.lock() {
+        *c = Some((key, index.clone()));
+    }
+    index
 }
 
 fn summary(lib: &Library, e: &Entry) -> Value {
@@ -199,6 +292,7 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
         }
         return Err(bad(C, format!("no library entry `{id}`")));
     };
+    let snap = s.project.clone();
     let file = resolve(&lib.folder, &e.file);
     if file.is_empty() || !s.services.exists(&file) {
         return Err(bad(C, format!("“{}” has no file EffectCraft can use yet ({})", e.name, if file.is_empty() { "none listed" } else { &file })));
@@ -247,7 +341,30 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
         }
         layer = s.execute("layer.addItem", params)?["layer"].clone();
     }
-    Ok(json!({"entry": entry, "item": item, "layer": layer, "import": imported}))
+    let mut r = json!({"entry": entry, "item": item, "layer": layer, "import": imported});
+    report_problems(s, &snap, &mut r);
+    Ok(r)
+}
+
+/// What went wrong bringing a library entry in, at the top of its reply instead of buried in
+/// `import`: the import's `warnings` and missing media, and expressions that fail in the
+/// compositions it added or changed (`expressionErrors`, e.g. one reading a marker or match name
+/// the entry doesn't have), also toasted.
+pub(crate) fn report_problems(s: &mut Session, before: &effectcraft_project::Project, r: &mut Value) {
+    let mut warnings: Vec<String> = r["import"]["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+    if let Some(missing) = r["import"]["missingMedia"].as_array().filter(|m| !m.is_empty()) {
+        r["missingMedia"] = json!(missing);
+    }
+    if let Some(errors) = super::expr_tools::new_errors(s, before) {
+        let count = errors["count"].as_u64().unwrap_or(0);
+        let first = errors["errors"][0]["message"].as_str().unwrap_or_default().to_string();
+        warnings.push(format!("{count} expression{} fail{} after applying ({first})", if count == 1 { "" } else { "s" }, if count == 1 { "s" } else { "" }));
+        r["expressionErrors"] = errors;
+    }
+    if !warnings.is_empty() {
+        s.toast(format!("Library: {}", warnings.join("; ")));
+        r["warnings"] = json!(warnings);
+    }
 }
 
 fn folders(s: &mut Session, _: &Value) -> Result<Value> {

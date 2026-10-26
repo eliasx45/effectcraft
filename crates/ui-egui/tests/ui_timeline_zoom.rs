@@ -1,6 +1,7 @@
 //! The Timeline's time ruler with real input: Alt+wheel zooms out until the whole comp shows
 //! (#158); the Time Navigator's ends drag to zoom and `;` toggles frame level / the whole comp
-//! (#159); markers dragged out of the composition marker bin (#275).
+//! (#159); markers dragged out of the composition marker bin (#275); each comp keeps its own
+//! zoom when the Timeline goes into a precomp and back.
 
 use effectcraft_engine::Session;
 use effectcraft_ui_egui::EffectcraftApp;
@@ -167,6 +168,8 @@ fn semicolon_toggles_frame_level_and_the_whole_comp() {
 #[test]
 fn shift_semicolon_toggles_the_whole_comp_and_the_span_before() {
     let (mut h, _) = harness();
+    // From the whole comp (`;` then zooms to frame level).
+    h.state_mut().ui.timeline.pps = None;
     h.state_mut().session.execute("time.set", json!({"time": 120.0})).unwrap();
     h.run_steps(3);
     let ctx = h.ctx.clone();
@@ -294,6 +297,42 @@ fn shift_dragging_the_work_area_snaps_to_the_current_time() {
     reset(&mut h);
     drag_with(&mut h, mid, to, Modifiers::SHIFT);
     assert!(near(work_area(&h), (3.0, 6.0)), "the bar snaps its end to the CTI: {:?}", work_area(&h));
+}
+
+/// Shift-dragging the work area end onto a layer's out point stays snapped while the pointer
+/// rests: the snapped end used to drop its own target on the next frame and flicker between
+/// the out point and the pointer every frame.
+#[test]
+fn shift_dragged_work_area_end_holds_its_snap_without_flicker() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Short", "width": 320, "height": 180, "frameRate": 30, "duration": 10})).unwrap();
+    let l = s.execute("layer.newSolid", json!({"name": "Plate", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.timing", json!({"layers": [l], "out": 6.0})).unwrap();
+    s.execute("comp.workArea", json!({"start": 1.0, "end": 4.0})).unwrap();
+    let mut app = EffectcraftApp::new(s);
+    app.ui.timeline.pps = Some(100.0);
+    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_eframe(|_| app);
+    h.run_steps(3);
+    let (b, e) = (rect(&h, "timeline.workArea.begin").center(), rect(&h, "timeline.workArea.end").center());
+    let pps = (e.x - b.x) / 3.0;
+    let to = pos2(b.x + 5.0 * pps - 5.0, e.y);
+    h.event(Event::ModifiersChanged(Modifiers::SHIFT));
+    h.event(Event::PointerMoved(e));
+    h.step();
+    h.event(Event::PointerButton { pos: e, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::SHIFT });
+    h.step();
+    for k in 1..=8 {
+        h.event(Event::PointerMoved(e + (to - e) * (k as f32 / 8.0)));
+        h.step();
+    }
+    for frame in 0..6 {
+        h.event(Event::PointerMoved(to));
+        h.step();
+        let end = h.state().session.active_comp().unwrap().work_area.1.seconds();
+        assert!((end - 6.0).abs() < 1e-6, "frame {frame}: the end stays on the out point, got {end}");
+    }
+    h.event(Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::SHIFT });
+    h.run_steps(2);
 }
 
 /// #284: pressing in the time ruler moves the current time there at once, before the pointer
@@ -484,4 +523,32 @@ fn profile_long_comp_scrub_and_zoom() {
     time(&mut h, "idle", &|_, _| {});
     time(&mut h, "scrub", &|a, i| a.session.set_time(effectcraft_engine::time::Tick::from_seconds_f64(i as f64 * 37.0)));
     time(&mut h, "zoom", &|a, i| a.ui.timeline.pps = Some(0.5 + i as f64 * 3.0));
+}
+
+/// Going into a precomp and back (or switching comp tabs) puts back each comp's own zoom and
+/// scroll; a comp the Timeline hasn't shown yet fits.
+#[test]
+fn each_comp_keeps_its_zoom_across_opening_a_precomp() {
+    let (mut h, layer) = harness();
+    let r = h.state_mut().session.execute("layer.precompose", json!({"layers": [layer], "name": "Inner", "mode": "move", "open": false})).unwrap();
+    let (main, inner) = (h.state().session.active_comp_id().unwrap().0, r["comp"].as_u64().unwrap());
+    h.state_mut().ui.timeline.start = 30.0;
+    h.run_steps(2);
+    let main_view = (h.state().ui.timeline.start, h.state().ui.timeline.pps);
+    assert_eq!(main_view.1, Some(200.0));
+
+    h.state_mut().session.execute("comp.open", json!({"comp": inner})).unwrap();
+    h.run_steps(2);
+    assert_eq!(h.state().ui.timeline.pps, None, "a comp shown for the first time fits");
+    h.state_mut().ui.timeline.pps = Some(80.0);
+    h.state_mut().ui.timeline.start = 12.0;
+    h.run_steps(2);
+    let inner_view = (h.state().ui.timeline.start, h.state().ui.timeline.pps);
+
+    h.state_mut().session.execute("comp.open", json!({"comp": main})).unwrap();
+    h.run_steps(2);
+    assert_eq!((h.state().ui.timeline.start, h.state().ui.timeline.pps), main_view);
+    h.state_mut().session.execute("comp.open", json!({"comp": inner})).unwrap();
+    h.run_steps(2);
+    assert_eq!((h.state().ui.timeline.start, h.state().ui.timeline.pps), inner_view);
 }

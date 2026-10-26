@@ -194,3 +194,35 @@ fn layer_add_marker_without_selection_adds_comp_marker() {
     assert!((comp.markers[0].time.seconds() - 1.5).abs() < 1e-9);
     assert_eq!(comp.markers[0].comment, "timeline marker");
 }
+
+/// One marker per time, as in After Effects: adding a marker where one already is replaces it
+/// and says so (`replaced`, `warning`) instead of overwriting silently (regression, 24 Oct 2026).
+#[test]
+fn adding_a_marker_onto_an_occupied_time_reports_the_replaced_one() {
+    let (mut s, l) = setup();
+    let r = s.execute("comp.addMarker", json!({"time": 1.0, "comment": "a"})).unwrap();
+    assert!(r.get("replaced").is_none(), "{r}");
+    let r = s.execute("comp.addMarker", json!({"time": 1.0, "comment": "b"})).unwrap();
+    assert_eq!(r["replaced"]["comment"], "a", "{r}");
+    assert!(r["warning"].as_str().unwrap().contains("\"a\""), "{r}");
+    let r = s.execute("markers.set", json!({"new": true, "time": 1.0, "comment": "c"})).unwrap();
+    assert_eq!(r["replaced"]["comment"], "b", "{r}");
+    s.execute("edit.deselectAll", json!({})).unwrap();
+    let r = s.execute("layer.addMarker", json!({"time": 1.0, "comment": "d"})).unwrap();
+    assert_eq!(r["replaced"]["comment"], "c", "{r}");
+    let comp = s.active_comp().unwrap();
+    assert_eq!(comp.markers.len(), 1);
+    assert_eq!(comp.markers[0].comment, "d");
+    // Layer markers.
+    s.execute("layer.addMarker", json!({"layers": [l], "time": 2.0, "comment": "x"})).unwrap();
+    let r = s.execute("layer.addMarker", json!({"layers": [l], "time": 2.0, "comment": "y"})).unwrap();
+    assert_eq!(r["replaced"][0]["comment"], "x", "{r}");
+    assert_eq!(r["replaced"][0]["layer"], l, "{r}");
+    let r = s.execute("markers.set", json!({"layer": l, "new": true, "time": 2.0, "comment": "z"})).unwrap();
+    assert_eq!(r["replaced"]["comment"], "y", "{r}");
+    // A free time: no warning; moving a marker onto another keeps both.
+    let r = s.execute("markers.set", json!({"new": true, "time": 3.0, "comment": "e"})).unwrap();
+    assert!(r.get("warning").is_none(), "{r}");
+    s.execute("markers.set", json!({"index": 1, "time": 1.0})).unwrap();
+    assert_eq!(s.active_comp().unwrap().markers.len(), 2);
+}

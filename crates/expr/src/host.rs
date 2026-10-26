@@ -8,6 +8,8 @@
 //! script again. Expressions are pure functions of these answers, so re-running is exact, and
 //! the runtime stays free of borrowed state.
 
+use std::sync::Arc;
+
 use effectcraft_geom::{Mat3, Mat4};
 use effectcraft_keyframe::Value;
 use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerId, LayerSource, Node, PropGroup, Property};
@@ -247,6 +249,44 @@ pub struct Resolver<'a> {
     pub own: Own<'a>,
 }
 
+/// A keyframed property whose `Value` reads at any time the script can answer without leaving
+/// the run (see [`crate::runtime::Frame::inline`]): the layer handle the property was found in
+/// (`Arc`, so nothing borrowed enters the thread's runtime state) and the request path.
+///
+/// Without this a read whose time depends on an earlier read (a bisection over `valueAtTime`)
+/// cost one script run per step: the stand-in answer sent the rest of the run down the wrong
+/// branch. Answers are computed exactly as [`Resolver::resolve`] computes them.
+pub struct Curve {
+    pub comp: u64,
+    pub layer_id: u64,
+    pub path: String,
+    pub layer: Arc<Layer>,
+    /// Reads without `pre` give the keyframed value too: the property has no expression and isn't
+    /// a Position (Separate Dimensions reads X/Y/Z Position instead, see `EvalCtx::value`).
+    pub plain: bool,
+}
+
+impl Curve {
+    /// Whether this curve answers reads of `path` on layer `layer` of comp `comp`.
+    pub fn is(&self, comp: u64, layer: u64, path: &str) -> bool {
+        self.comp == comp && self.layer_id == layer && self.path == path
+    }
+
+    /// The answer to `Value { t, pre }` on this property, `None` when only the evaluator may
+    /// answer it (an expression to run).
+    pub fn value(&self, t: Secs, pre: bool) -> Option<Resp> {
+        if !pre && !self.plain {
+            return None;
+        }
+        let l: &Layer = &self.layer;
+        let p = l.props.prop(&self.path)?;
+        // `Resolver::try_resolve`'s `Req::Value`: `pre` reads `value_at` at the layer time; the
+        // other reads go through `EvalCtx::value`, which for a plain property is the same.
+        let v = p.value_at(l.layer_time(Tick::from_seconds_f64(f64::from_bits(t))));
+        Some(value_resp(&v, prop_dims(l, p)))
+    }
+}
+
 fn mat3(m: &Mat3) -> Resp {
     Resp::nums(m.0.iter().flatten().copied())
 }
@@ -278,7 +318,11 @@ fn alias(key: &str) -> &str {
     }
 }
 
-fn find_child<'g>(g: &'g PropGroup, key: &Key) -> Option<&'g Node> {
+/// The child of `g` that `key` names: by index, `@uid`, our match id, display name, or the After
+/// Effects match name ([`effectcraft_project::matchnames`]: `ADBE Root Vectors Group`, `ADBE
+/// Vector Shape`, `ADBE Slider Control-0001`…). `chain` is the nodes from the layer root down to
+/// `g` (empty for the layer root itself), which the AE match name depends on.
+fn find_child<'g>(g: &'g PropGroup, chain: &[&'g Node], key: &Key) -> Option<&'g Node> {
     match key {
         Key::Index(i) => usize::try_from(*i).ok().filter(|i| *i >= 1).and_then(|i| g.children.get(i - 1)),
         Key::Name(name) => {
@@ -292,8 +336,37 @@ fn find_child<'g>(g: &'g PropGroup, key: &Key) -> Option<&'g Node> {
                 .find(|n| n.match_id() == m)
                 .or_else(|| g.children.iter().find(|n| n.name().eq_ignore_ascii_case(name)))
                 .or_else(|| g.children.iter().find(|n| compact(n.name()) == c || compact(n.match_id()) == c))
+                .or_else(|| {
+                    let mut full: Vec<&Node> = chain.to_vec();
+                    g.children.iter().find(|n| {
+                        full.truncate(chain.len());
+                        full.push(n);
+                        effectcraft_project::matchnames::node(&full).eq_ignore_ascii_case(name)
+                    })
+                })
         }
     }
+}
+
+/// The nodes from the layer root `root` down to the group at `path` (empty for the root).
+fn node_chain<'g>(root: &'g PropGroup, path: &str) -> Option<Vec<&'g Node>> {
+    if path.is_empty() {
+        return Some(vec![]);
+    }
+    let walk = root.resolve_path(path);
+    if !walk.rest.is_empty() {
+        return None;
+    }
+    let mut chain = Vec::with_capacity(walk.indices.len());
+    let mut g = root;
+    for i in &walk.indices {
+        let n = g.children.get(*i)?;
+        chain.push(n);
+        if let Some(sub) = n.as_group() {
+            g = sub;
+        }
+    }
+    Some(chain)
 }
 
 impl<'a> Resolver<'a> {
@@ -316,6 +389,19 @@ impl<'a> Resolver<'a> {
             return Some((layer, self.own.prop));
         }
         Some((layer, layer.props.prop(path)?))
+    }
+
+    /// The [`Curve`] of the property `req` (a `Keys` or `Value` read) names, when it can be
+    /// answered from its layer alone: the layer found is the comp's own `Arc` (not a stand-in
+    /// copy) and the path finds the very same property in it.
+    pub fn curve(&self, req: &Req) -> Option<Curve> {
+        let (Req::Value { comp, layer, path, .. } | Req::Keys { comp, layer, path }) = req else { return None };
+        let (l, p) = self.prop(*comp, *layer, path)?;
+        let arc = self.comp(*comp)?.layers.arcs().iter().find(|a| a.id.0 == *layer)?;
+        if !std::ptr::eq(&**arc, l) || !arc.props.prop(path).is_some_and(|q| std::ptr::eq(q, p)) {
+            return None;
+        }
+        Some(Curve { comp: *comp, layer_id: *layer, path: path.clone(), layer: Arc::clone(arc), plain: !p.has_expression() && p.match_id != "position" })
     }
 
     pub fn resolve(&self, req: &Req) -> Resp {
@@ -377,7 +463,8 @@ impl<'a> Resolver<'a> {
             Req::Child { comp, layer, group, key } => {
                 let l = self.layer(*comp, *layer)?;
                 let g = if group.is_empty() { &l.props } else { l.props.group(group)? };
-                let n = find_child(g, key)?;
+                let chain = node_chain(&l.props, group).unwrap_or_default();
+                let n = find_child(g, &chain, key)?;
                 let path = if group.is_empty() { format!("@{}", n.uid()) } else { format!("{group}/@{}", n.uid()) };
                 let count = n.as_group().map_or(0, |g| g.children.len());
                 let index = g.children.iter().position(|child| child.uid() == n.uid())? + 1;

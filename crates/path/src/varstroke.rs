@@ -363,6 +363,37 @@ mod tests {
         assert!((area - (100.0 * 10.0 + 50.0 * 20.0)).abs() < 40.0, "{area}");
     }
 
+    /// VW-TAPER: a 2 px stroke tapered to a point over 53 px (10-10 "S6 06 Q Line") at comp
+    /// resolution. tiny-skia's 4 sub-scanlines gave each column a quarter-step coverage, so the
+    /// taper showed as a 2 px band fading in plateaus 13 px long (the viewer magnified exactly
+    /// that). The fine coverage follows the width every few columns.
+    #[test]
+    fn thin_taper_shades_smoothly_at_comp_resolution() {
+        let t = Taper { percent: false, start_len: 0.0, end_len: 70.0, start_width: 1.0, end_width: 0.0, start_ease: 0.0, end_ease: 0.0 };
+        let st = StrokeStyle { width: 2.0, taper: Some(t), ..Default::default() };
+        let id = Mat3::IDENTITY;
+        let (fine, coarse) = (
+            crate::stroke_coverage(&[line(53.0)], &st, &id, 80, 100),
+            fill_coverage(&[outline(&[line(53.0)], &st, 1.0).unwrap()], &id, 80, 100, FillRule::NonZero),
+        );
+        let longest_plateau = |m: &effectcraft_raster::Mask| {
+            let cols: Vec<f32> = (11..62).map(|x| column(m, x)).collect();
+            let (mut best, mut run) = (1, 1);
+            for w in cols.windows(2) {
+                run = if (w[0] - w[1]).abs() < 1e-3 { run + 1 } else { 1 };
+                best = best.max(run);
+            }
+            best
+        };
+        assert!(longest_plateau(&coarse) >= 10, "the quarter steps this guards against: {}", longest_plateau(&coarse));
+        assert!(longest_plateau(&fine) <= 4, "fine coverage plateaus: {}", longest_plateau(&fine));
+        for x in 11..62usize {
+            let want = 2.0 * width_factor(st.taper.as_ref(), None, x as f64 + 0.5 - 10.0, 53.0) as f32;
+            let got = column(&fine, x);
+            assert!((got - want).abs() < 0.1, "column {x}: coverage {got}, width {want}");
+        }
+    }
+
     #[test]
     fn dash_intervals_multi_segment() {
         let iv = dash_intervals(&[10.0, 5.0, 2.0, 3.0], 0.0, 45.0);

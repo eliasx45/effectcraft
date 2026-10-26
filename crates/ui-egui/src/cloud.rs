@@ -18,26 +18,34 @@
 //! - [`CloudPreview`] is the app's side: **Preview on: This Mac / Cloud / Auto** (Settings ▸
 //!   Previews, the viewer's bar), the status note when the source changes, and Auto's pick
 //!   (the cloud when this Mac's frame cost is above the cloud's round trip).
+//! - Cache Frames When Idle (CR8): with the cloud the server renders the frames into its own
+//!   frame cache ([`RemoteFrames::precache`], one plan message) and nothing is downloaded; the
+//!   server reports what it holds as ranges, which the timeline's cache bar shows (blue: on the
+//!   server). Render requests carry their frame key, so a frame the server cached comes back
+//!   encode-only. [`CloudStatus`] counts the bytes on the wire both ways (the internet use).
 //! - Footage paths: the server mirrors media to the same absolute paths (CR7), so frames go with
 //!   the paths as they are; [`PathRemap`] rewrites them for a server that keeps them elsewhere.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use effectcraft_engine::project::{ItemKind, Project};
-use effectcraft_engine::remote::{FrameMsg, FrameReply, Mirror};
+use effectcraft_engine::remote::{CacheSeries, FrameMsg, FrameReply, Mirror, Precache};
 use effectcraft_engine::remote_encode::{self, Codec, Want};
+use effectcraft_engine::remote_stream::{StreamCodec, StreamMsg, StreamReply};
 use effectcraft_engine::remote_wire::{Backoff, Down, Event, FrameClient, Up};
 use effectcraft_engine::render::Backend;
+use effectcraft_engine::time::Tick;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::cloud_stream::{ChunkMeta, Decoders, StreamShared, StreamStart};
 use crate::frames::times::FrameTimes;
-use crate::frames::{RemoteDone, RemoteFrame, RemoteFrames, RemoteJob, RemoteRefine, RemoteTimes};
+use crate::frames::{RemoteDone, RemoteFrame, RemoteFrames, RemoteJob, RemotePrecache, RemoteRefine, RemoteTimes};
 
 /// Rewrites a footage path for the server (`None`: keep it).
 pub type PathRemap = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -53,6 +61,8 @@ const DEAD: Duration = Duration::from_secs(4);
 const PROJECT_DEAD: Duration = Duration::from_secs(120);
 /// How long before asking the server again whether it has the project's files.
 const PREFLIGHT_RETRY: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(10) };
+/// Frame series whose server-cached frames the client remembers (the newest).
+const KEPT_SERIES: usize = 4;
 /// Refines kept waiting at most this long.
 const REFINE_WAIT: Duration = Duration::from_secs(30);
 
@@ -86,14 +96,44 @@ pub struct CloudStatus {
     /// The server refused the token (the client stopped).
     pub refused: bool,
     pub frames: u64,
+    /// Pixel bytes received (frames and stream chunks).
     pub bytes: u64,
+    /// Bytes on the wire this session, received and sent (everything, headers and projects too):
+    /// what the cloud preview costs the internet connection.
+    pub bytes_down: u64,
+    pub bytes_up: u64,
+    /// The server's frame cache (CR8), from its last report.
+    pub server_cache: Option<ServerCache>,
     pub reconnects: u64,
     /// Whole projects sent (the first, after a reconnect, after a resync).
     pub projects: u64,
 }
 
+/// The server's frame cache as it last reported it.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerCache {
+    /// Frames of the current Cache Frames When Idle plan cached, of `total`.
+    pub done: u64,
+    pub total: u64,
+    /// The whole cache: frames in RAM, MB in RAM of its budget, MB on its disk.
+    pub frames: u64,
+    pub ram_mb: u64,
+    pub ram_budget_mb: u64,
+    pub disk_mb: u64,
+}
+
+/// Keys of the frames the server's cache holds, per frame series (the newest few).
+#[derive(Default)]
+struct ServerKeys {
+    series: VecDeque<(CacheSeries, HashSet<u128>)>,
+}
+
 struct Shared {
     status: Mutex<CloudStatus>,
+    server_keys: Mutex<ServerKeys>,
+    /// Bumps when `server_keys` changes.
+    keys_generation: AtomicU64,
     /// Frames it renders at once (0 while not ready).
     slots: AtomicUsize,
     /// The comp's frame rate (f32 bits), for the frames in flight.
@@ -109,12 +149,23 @@ enum Cmd {
     Start(Box<RemoteJob>, RemoteDone),
     Purge,
     /// This Mac's manifest for the server's preflight (CR7), for connection `generation`.
-    Manifest(u64, Value),
+    /// A manifest for `cloud.preflight` (generation, manifest, what the mirror would upload then:
+    /// confirmed on the server when the preflight passes).
+    Manifest(u64, Value, Value),
     /// Files the project needs that the mirror hasn't confirmed uploaded, at `revision`.
     Pending {
         revision: u64,
         count: usize,
     },
+    /// CR6b: play a comp from the server's playback stream into `StreamShared`.
+    StreamStart(Box<StreamStart>, Arc<StreamShared>),
+    /// The project changed while the stream plays (sent as a patch: the server answers `stale`).
+    StreamSync(u64, Arc<Project>),
+    StreamSeek(Tick),
+    StreamPlayhead(Tick, bool),
+    StreamStop,
+    /// CR8: Cache Frames When Idle on the server.
+    Precache(Box<RemotePrecache>),
 }
 
 /// Whether the server has every file and font the project needs (CR7 `cloud.preflight`).
@@ -142,6 +193,8 @@ impl CloudFrames {
     pub fn connect(addr: &str, token: &str, remap: Option<PathRemap>) -> Arc<CloudFrames> {
         let shared = Arc::new(Shared {
             status: Mutex::new(CloudStatus { address: addr.to_string(), ..CloudStatus::default() }),
+            server_keys: Mutex::default(),
+            keys_generation: AtomicU64::new(0),
             slots: AtomicUsize::new(0),
             fps: AtomicU32::new(30f32.to_bits()),
             latest: Mutex::new(None),
@@ -149,7 +202,9 @@ impl CloudFrames {
             stop: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
-        let client = FrameClient::connect(addr, token, "effectcraft-app", Backoff::default());
+        // Retry at least every 2 s: the address is the local end of the ssh tunnel, so an attempt
+        // is cheap, and the frames come back soon after `cloud.sh`'s watchdog reopens it (CR11).
+        let client = FrameClient::connect(addr, token, "effectcraft-app", Backoff { max: Duration::from_secs(2), ..Backoff::default() });
         let link = Link {
             me: tx.clone(),
             preflight: Preflight::Unknown,
@@ -157,6 +212,7 @@ impl CloudFrames {
             uploads: None,
             checking_uploads: false,
             uploads_checked: None,
+            preflight_files: Value::Null,
             shared: shared.clone(),
             client,
             remap,
@@ -167,6 +223,9 @@ impl CloudFrames {
             ping: None,
             last_ping: None,
             syncing: None,
+            stream: None,
+            next_stream: 1,
+            plan: None,
         };
         let spawned = std::thread::Builder::new().name("ec-cloud-frames".into()).spawn(move || link.run(rx));
         if let Err(e) = spawned {
@@ -207,6 +266,36 @@ impl CloudFrames {
     pub fn ready(&self) -> bool {
         self.shared.slots.load(Ordering::Acquire) > 0
     }
+
+    fn send(&self, c: Cmd) {
+        let _ = self.cmd.lock().unwrap_or_else(PoisonError::into_inner).send(c);
+    }
+
+    /// CR6b: start playing from the server's playback stream (replaces a running stream); its
+    /// chunks decode into `shared`. A link that is gone fails it at once.
+    pub fn stream_start(&self, start: StreamStart, shared: Arc<StreamShared>) {
+        let sent = self.cmd.lock().unwrap_or_else(PoisonError::into_inner).send(Cmd::StreamStart(Box::new(start), shared));
+        if let Err(std::sync::mpsc::SendError(Cmd::StreamStart(_, shared))) = sent {
+            shared.fail("the cloud link stopped".into());
+        }
+    }
+
+    /// The project changed while the stream plays.
+    pub fn stream_sync(&self, revision: u64, project: &Arc<Project>) {
+        self.send(Cmd::StreamSync(revision, project.clone()));
+    }
+
+    pub fn stream_seek(&self, time: Tick) {
+        self.send(Cmd::StreamSeek(time));
+    }
+
+    pub fn stream_playhead(&self, time: Tick, playing: bool) {
+        self.send(Cmd::StreamPlayhead(time, playing));
+    }
+
+    pub fn stream_stop(&self) {
+        self.send(Cmd::StreamStop);
+    }
 }
 
 impl Drop for CloudFrames {
@@ -239,6 +328,23 @@ impl RemoteFrames for CloudFrames {
     fn eager(&self) -> bool {
         true
     }
+
+    /// The server's frame cache stands in for a disk cache (the blue bar: frames on the server).
+    fn disk(&self) -> bool {
+        true
+    }
+
+    fn disk_contains(&self, key: u128) -> bool {
+        self.shared.server_keys.lock().unwrap_or_else(PoisonError::into_inner).series.iter().any(|(_, k)| k.contains(&key))
+    }
+
+    fn disk_generation(&self) -> u64 {
+        self.shared.keys_generation.load(Ordering::Acquire)
+    }
+
+    fn precache(&self, plan: RemotePrecache) -> bool {
+        self.cmd.lock().unwrap_or_else(PoisonError::into_inner).send(Cmd::Precache(Box::new(plan))).is_ok()
+    }
 }
 
 /// A render request on its way.
@@ -248,6 +354,13 @@ struct Pending {
     timed: Option<RemoteTimes>,
     cancel: Arc<AtomicBool>,
     sent: Instant,
+}
+
+/// The playback stream running on this connection (CR6b).
+struct LinkStream {
+    id: u64,
+    shared: Arc<StreamShared>,
+    decoders: Decoders,
 }
 
 /// The link thread's state.
@@ -269,12 +382,35 @@ struct Link {
     /// The link's own command channel (background checks report back through it).
     me: Sender<Cmd>,
     preflight: Preflight,
+    /// The files pending when the manifest in flight was made ([`pending_uploads`] answer).
+    ///
+    /// [`pending_uploads`]: effectcraft_engine::cloud_assets::pending_uploads
+    preflight_files: Value,
     /// Bumps on every connection: a manifest made for an older one is not sent.
     generation: u64,
     /// Files waiting for the mirror at a revision: (revision, count).
     uploads: Option<(u64, usize)>,
     checking_uploads: bool,
     uploads_checked: Option<Instant>,
+    stream: Option<LinkStream>,
+    next_stream: u64,
+    /// The newest Cache Frames When Idle plan and whether the server has it (sent again after a
+    /// reconnection).
+    plan: Option<(RemotePrecache, bool)>,
+}
+
+/// The frames a plan covers, whatever their order (a playhead move reorders, doesn't change it).
+fn plan_cover(ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut r: Vec<(i64, i64)> = ranges.iter().filter(|(a, b)| a <= b).copied().collect();
+    r.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for (a, b) in r {
+        match out.last_mut() {
+            Some((_, e)) if a <= e.saturating_add(1) => *e = (*e).max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
 }
 
 /// Exponential smoothing (a quarter of each new sample).
@@ -322,10 +458,11 @@ impl Link {
                 }
             }
             Cmd::Start(job, done) => self.start(*job, done),
-            Cmd::Manifest(generation, manifest) => {
+            Cmd::Manifest(generation, manifest, files) => {
                 if generation != self.generation || !self.client.connected() || !matches!(self.preflight, Preflight::Asking(None)) {
                     return;
                 }
+                self.preflight_files = files;
                 let id = self.id();
                 let params = json!({"command": "cloud.preflight", "params": {"manifest": manifest}});
                 if self.client.send(Up::Control { id, method: "engine.execute".into(), params }, vec![]) {
@@ -340,6 +477,180 @@ impl Link {
                 self.status().pending_uploads = count;
                 self.update_slots();
             }
+            Cmd::StreamStart(start, shared) => self.stream_start(*start, shared),
+            Cmd::StreamSync(revision, project) => {
+                if self.stream.is_some() && self.mirror.revision().is_some_and(|r| r < revision) {
+                    self.sync_to(revision, &project);
+                }
+            }
+            Cmd::StreamSeek(time) => {
+                if let Some(id) = self.stream.as_ref().map(|s| s.id) {
+                    self.stream_msg(StreamMsg::Seek { stream: id, time });
+                }
+            }
+            Cmd::StreamPlayhead(time, playing) => {
+                if let Some(s) = &self.stream {
+                    let received = s.shared.buffer().received;
+                    let msg = StreamMsg::Playhead { stream: s.id, time, playing, received };
+                    self.stream_msg(msg);
+                }
+            }
+            Cmd::StreamStop => self.stream_stop(),
+            Cmd::Precache(plan) => {
+                let same = self.plan.as_ref().is_some_and(|(p, _)| {
+                    p.revision == plan.revision && p.comp == plan.comp && p.series == plan.series && plan_cover(&p.ranges) == plan_cover(&plan.ranges)
+                });
+                if !same {
+                    self.plan = Some((*plan, false));
+                    self.send_plan();
+                }
+            }
+        }
+    }
+
+    /// Send the precache plan once the server holds its revision (a patch first).
+    fn send_plan(&mut self) {
+        if !self.ready() {
+            return;
+        }
+        let Some((plan, sent)) = &self.plan else { return };
+        if *sent {
+            return;
+        }
+        // The project moved on: the app sends a plan for the new revision.
+        if self.mirror.revision().is_some_and(|r| r > plan.revision) {
+            self.plan = None;
+            return;
+        }
+        let (revision, project) = (plan.revision, plan.project.clone());
+        if !self.sync_to(revision, &project) {
+            return;
+        }
+        let Some((plan, sent)) = &mut self.plan else { return };
+        let mut opts = plan.opts;
+        opts.backend = Backend::Auto;
+        let prints = plan.prints.as_deref().cloned();
+        let msg =
+            FrameMsg::Precache(Precache { revision, comp: plan.comp, series: plan.series.clone(), opts: Box::new(opts), ranges: plan.ranges.clone(), prints });
+        *sent = self.client.send(Up::Msg { msg, want: Want::default(), urgent: false }, vec![]);
+    }
+
+    /// The server's frame cache report: remember its frames' keys (the cache bar).
+    #[allow(clippy::too_many_arguments)]
+    fn cached(&mut self, series: CacheSeries, ranges: &[(i64, i64)], done: u64, total: u64, frames: u64, ram: u64, budget: u64, disk: u64) {
+        // Frames named by their fingerprints: the plan the report is about has them.
+        let plan = self.plan.as_ref().map(|(p, _)| p).filter(|p| p.series == series);
+        let (prints, comp) = (plan.and_then(|p| p.prints.as_deref()), plan.map_or(effectcraft_engine::project::ItemId(0), |p| p.comp));
+        let keys: HashSet<u128> =
+            ranges.iter().flat_map(|&(a, b)| a..=b.min(a.saturating_add(200_000))).filter_map(|f| series.key_with(prints, comp, f)).collect();
+        {
+            let mut k = self.shared.server_keys.lock().unwrap_or_else(PoisonError::into_inner);
+            k.series.retain(|(s, _)| *s != series);
+            k.series.push_front((series, keys));
+            k.series.truncate(KEPT_SERIES);
+        }
+        self.shared.keys_generation.fetch_add(1, Ordering::AcqRel);
+        self.status().server_cache = Some(ServerCache { done, total, frames, ram_mb: ram >> 20, ram_budget_mb: budget >> 20, disk_mb: disk >> 20 });
+    }
+
+    fn stream_msg(&mut self, m: StreamMsg) -> bool {
+        self.client.send(Up::Msg { msg: FrameMsg::Stream(m), want: Want::default(), urgent: false }, vec![])
+    }
+
+    /// Bring the server's replica to `revision` (a patch; the whole project when no patch can be
+    /// made). Whether it holds that revision once the messages arrive.
+    fn sync_to(&mut self, revision: u64, project: &Arc<Project>) -> bool {
+        let project = remap_project(project, self.remap.as_ref());
+        match self.mirror.sync(revision, &project) {
+            None => self.mirror.revision() == Some(revision),
+            Some(msg @ FrameMsg::Patch(_)) => {
+                if self.client.send(Up::Msg { msg, want: Want::default(), urgent: false }, vec![]) {
+                    true
+                } else {
+                    self.mirror.reset();
+                    false
+                }
+            }
+            Some(msg) => {
+                self.send_project(msg);
+                false
+            }
+        }
+    }
+
+    fn stream_start(&mut self, start: StreamStart, shared: Arc<StreamShared>) {
+        self.stream_stop();
+        if !self.ready() {
+            return shared.fail("the cloud is not ready".into());
+        }
+        if self.mirror.revision().is_some_and(|r| start.revision < r) {
+            return shared.fail("an older revision than the cloud's".into());
+        }
+        if !self.sync_to(start.revision, &start.project) {
+            return shared.fail("the cloud is loading the project".into());
+        }
+        let id = self.next_stream;
+        self.next_stream = self.next_stream.wrapping_add(1).max(1);
+        let mut opts = start.opts;
+        opts.backend = Backend::Auto;
+        let msg = StreamMsg::Start {
+            stream: id,
+            revision: start.revision,
+            comp: start.comp,
+            from: start.from,
+            to: start.to,
+            loop_from: start.loop_from,
+            looping: start.looping,
+            opts: Box::new(opts),
+            codec: StreamCodec::H264,
+            crf: 23.0,
+            chunk_frames: crate::cloud_stream::CHUNK_FRAMES,
+            ahead_secs: start.ahead_secs,
+            adaptive: true,
+            max_size: None,
+            cache: start.cache,
+        };
+        if !self.stream_msg(msg) {
+            return shared.fail("the cloud connection dropped".into());
+        }
+        let decoders = Decoders::start(&shared);
+        self.stream = Some(LinkStream { id, shared, decoders });
+    }
+
+    fn stream_stop(&mut self) {
+        if let Some(s) = self.stream.take() {
+            self.stream_msg(StreamMsg::Stop { stream: s.id });
+        }
+    }
+
+    /// A playback stream reply.
+    fn stream_reply(&mut self, r: StreamReply, payload: Vec<u8>) {
+        let Some(s) = &self.stream else { return };
+        let id = s.id;
+        match r {
+            StreamReply::Started { stream, width, height, .. } if stream == id => {
+                s.shared.buffer().stats.size = Some([width, height]);
+            }
+            StreamReply::Chunk { stream, seq, revision, first, frames, scale, .. } if stream == id => {
+                s.shared.buffer().arrived(seq, payload.len());
+                self.status().bytes += payload.len() as u64;
+                s.decoders.push(ChunkMeta { seq, revision, first, frames, scale }, payload);
+            }
+            StreamReply::Stale { stream, revision, from } if stream == id => {
+                let f = if from.0 == i64::MIN { i64::MIN } else { s.shared.rate.frame_at(from) };
+                s.shared.buffer().mark_stale(revision, f);
+            }
+            StreamReply::End { stream, .. } if stream == id => {
+                let mut b = s.shared.buffer();
+                if b.failed.is_none() {
+                    b.stats.state = "ended".into();
+                }
+            }
+            StreamReply::Failed { stream, error } if stream == id => {
+                s.shared.fail(error);
+                self.stream = None;
+            }
+            _ => {}
         }
     }
 
@@ -362,12 +673,14 @@ impl Link {
         let (me, generation, remap) = (self.me.clone(), self.generation, self.remap.clone());
         let path = self.shared.path.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let spawned = std::thread::Builder::new().name("ec-cloud-manifest".into()).spawn(move || {
-            use effectcraft_engine::cloud_assets::{Hash, manifest, read_sidecar};
-            let project = remap_project(&project, remap.as_ref());
+            use effectcraft_engine::cloud_assets::{Hash, manifest, pending_uploads, read_sidecar};
             let read = |p: &str| std::fs::read(p).ok();
             let sidecar = read_sidecar(&read, path.as_deref());
-            let m = manifest(&project, &read, Hash::Small, &sidecar, path.as_deref());
-            let _ = me.send(Cmd::Manifest(generation, serde_json::to_value(m).unwrap_or(Value::Null)));
+            // Before the manifest: a file that changes in between is then stat'ed newer in the
+            // manifest, so the server checks that version and this one stays pending.
+            let files = pending_uploads(&project, &read, &sidecar);
+            let m = manifest(&remap_project(&project, remap.as_ref()), &read, Hash::Small, &sidecar, path.as_deref());
+            let _ = me.send(Cmd::Manifest(generation, serde_json::to_value(m).unwrap_or(Value::Null), files));
         });
         if spawned.is_err() {
             self.preflight = Preflight::Unknown;
@@ -377,9 +690,10 @@ impl Link {
     /// The server's `cloud.preflight` answer (`reply`: the control reply `{ok, result | error}`).
     fn preflight_answer(&mut self, reply: &Value) {
         let error = reply.get("error").and_then(Value::as_str).unwrap_or("");
-        let (ok, summary) = if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        // `checked`: the server compared the manifest with its disk.
+        let (ok, checked, summary) = if reply.get("ok").and_then(Value::as_bool) == Some(true) {
             let r = reply.get("result").cloned().unwrap_or(Value::Null);
-            (r.get("ok").and_then(Value::as_bool) != Some(false), r.get("summary").and_then(Value::as_str).map(str::to_string))
+            (r.get("ok").and_then(Value::as_bool) != Some(false), true, r.get("summary").and_then(Value::as_str).map(str::to_string))
         } else if error.contains("still starting") {
             // Ask again shortly.
             self.preflight = Preflight::Missing { retry: Instant::now() + Duration::from_secs(2) };
@@ -388,8 +702,16 @@ impl Link {
             // An older server (no `cloud.preflight`, no control host): it can't say; its own guard
             // still refuses frames with missing files.
             log::info!("cloud preview: no preflight on the server ({error})");
-            (true, None)
+            (true, false, None)
         };
+        let files = std::mem::take(&mut self.preflight_files);
+        if ok && checked {
+            // The server checked every file of the manifest and has it: those the mirror had
+            // not confirmed in this app run (none, after a restart) are no longer pending.
+            if effectcraft_engine::cloud_assets::confirm_on_server(&files) > 0 {
+                self.uploads_checked = None;
+            }
+        }
         self.preflight = if ok { Preflight::Ok } else { Preflight::Missing { retry: Instant::now() + PREFLIGHT_RETRY } };
         self.status().missing = if ok { None } else { Some(summary.unwrap_or_else(|| "files are missing on the cloud machine".into())) };
         self.update_slots();
@@ -452,8 +774,17 @@ impl Link {
         // The server's default renderer is its CPU; Auto picks its GPU (CR4 hand-over).
         opts.backend = Backend::Auto;
         let id = self.id();
-        let render =
-            FrameMsg::Render { id, revision: job.revision, comp: job.comp, time: job.t, opts: Box::new(opts), disk: None, layers: false, prefetch: vec![] };
+        let render = FrameMsg::Render {
+            id,
+            revision: job.revision,
+            comp: job.comp,
+            time: job.t,
+            opts: Box::new(opts),
+            // The server's frame cache key (CR8): a frame it holds comes back without a render.
+            disk: job.disk_key.map(|k| format!("{k:032x}")),
+            layers: false,
+            prefetch: vec![],
+        };
         let want = Want { codec: Codec::Jpeg, quality: 85, max_size: None, refine: job.urgent };
         if !self.client.send(Up::Msg { msg: render, want, urgent: job.urgent }, vec![]) {
             return done(Err("the cloud connection dropped".into()));
@@ -502,10 +833,16 @@ impl Link {
                     s.refused = false;
                 }
                 self.fail_all("reconnected");
+                if let Some(s) = self.stream.take() {
+                    s.shared.fail("the cloud reconnected".into());
+                }
                 self.ping = None;
                 self.syncing = None;
                 self.generation = self.generation.wrapping_add(1);
                 self.preflight = Preflight::Unknown;
+                if let Some((_, sent)) = &mut self.plan {
+                    *sent = false;
+                }
                 self.resync();
             }
             Event::Disconnected { error } => self.lost(error),
@@ -519,6 +856,9 @@ impl Link {
 
     /// The connection is gone: every frame in flight renders here instead.
     fn lost(&mut self, error: String) {
+        if let Some(s) = self.stream.take() {
+            s.shared.fail(format!("the cloud connection dropped: {error}"));
+        }
         self.mirror.reset();
         self.syncing = None;
         self.preflight = Preflight::Unknown;
@@ -590,7 +930,7 @@ impl Link {
                     // pane has them when it shows the frame).
                     if let Some(timed) = p.timed.take() {
                         let layers = layer_times.into_iter().map(|(c, l, ms)| ((c, l), f64::from(ms))).collect();
-                        timed(FrameTimes { frame_ms: ms, layers, remote: true });
+                        timed(FrameTimes { frame_ms: ms, layers, remote: true, ..FrameTimes::default() });
                     }
                     if let Some(refined) = p.refined.take() {
                         self.refining.insert(id, (refined, Instant::now()));
@@ -621,8 +961,11 @@ impl Link {
                     log::info!("cloud preview: resync ({error})");
                     self.resync();
                 }
-                // Playback stream replies: the Mac half (CR6b) decodes them.
-                FrameReply::Stored { .. } | FrameReply::Info { .. } | FrameReply::Stream(_) => {}
+                FrameReply::Stream(r) => self.stream_reply(r, payload),
+                FrameReply::Cached { series, ranges, done, total, frames, ram_bytes, ram_budget, disk_bytes, .. } => {
+                    self.cached(series, &ranges, done, total, frames, ram_bytes, ram_budget, disk_bytes);
+                }
+                FrameReply::Stored { .. } | FrameReply::Info { .. } => {}
             },
             Down::Control { id, reply } => {
                 if self.preflight == Preflight::Asking(Some(id)) {
@@ -652,8 +995,17 @@ impl Link {
             }
         }
         self.refining.retain(|_, (_, at)| at.elapsed() < REFINE_WAIT);
+        let (down, up) = self.client.bytes();
+        {
+            let mut s = self.status();
+            s.bytes_down = down;
+            s.bytes_up = up;
+        }
         if !self.client.connected() {
             return;
+        }
+        if self.plan.as_ref().is_some_and(|(_, sent)| !sent) {
+            self.send_plan();
         }
         // Connected before the app offered a project: send it once there is one.
         if self.mirror.revision().is_none() && self.syncing.is_none() {
@@ -893,6 +1245,7 @@ pub fn auto_picks_cloud(local_ms: Option<f64>, cloud: &CloudStatus, on_cloud: bo
 mod tests {
     use super::*;
     use effectcraft_engine::project::{ItemId, LayerId};
+    use effectcraft_engine::time::Tick;
 
     #[test]
     fn slots_cover_a_round_trip() {
@@ -931,6 +1284,42 @@ mod tests {
         streams: Arc<Mutex<Vec<std::net::TcpStream>>>,
         /// What `cloud.preflight` says is missing (`None`: nothing).
         missing: Arc<Mutex<Option<String>>>,
+        /// Precache plans received (CR8; answered: every frame cached) and render requests' keys.
+        precaches: Arc<Mutex<Vec<Precache>>>,
+        render_keys: Arc<Mutex<Vec<Option<String>>>>,
+        /// CR6c: the streams started (from, to), and whether they send half-size chunks only.
+        starts: Arc<Mutex<Vec<(Tick, Option<Tick>)>>>,
+        half_only: Arc<AtomicBool>,
+    }
+
+    fn stream_down(r: StreamReply) -> Down {
+        Down::Reply { reply: FrameReply::Stream(r), pixels: None }
+    }
+
+    /// Chunk `index` (15 frames of one colour at `w`×`h`) of a 32×18 stream.
+    fn fake_chunk(stream: u64, seq: u64, revision: u64, index: i64, w: u32, h: u32, color: [u8; 3]) -> (Down, Vec<u8>) {
+        use effectcraft_media::preview_stream::{ChunkSpec, encode_chunk};
+        let px: Vec<u8> = [color[0], color[1], color[2], 255].repeat((w * h) as usize);
+        let frames: Vec<&[u8]> = (0..15).map(|_| px.as_slice()).collect();
+        let bytes = encode_chunk(&frames, w, h, [0.0; 3], &ChunkSpec { crf: 10.0, ..ChunkSpec::new(w, h, 30, 1) }).unwrap();
+        let rate = effectcraft_engine::time::FrameRate::new(30, 1);
+        let chunk = StreamReply::Chunk {
+            stream,
+            seq,
+            revision,
+            index,
+            first: index * 15,
+            start: rate.tick_of(index * 15),
+            frames: 15,
+            frame_rate: rate,
+            width: w,
+            height: h,
+            scale: w as f32 / 32.0,
+            codec: StreamCodec::H264,
+            render_ms: 1.0,
+            encode_ms: 1.0,
+        };
+        (stream_down(chunk), bytes)
     }
 
     impl FakeServer {
@@ -944,6 +1333,10 @@ mod tests {
             let (k, st, r, ss) = (kill.clone(), stall.clone(), renders.clone(), streams.clone());
             let missing: Arc<Mutex<Option<String>>> = Arc::default();
             let mi = missing.clone();
+            let (precaches, render_keys): (Arc<Mutex<Vec<Precache>>>, Arc<Mutex<Vec<Option<String>>>>) = Default::default();
+            let (pcs, rks) = (precaches.clone(), render_keys.clone());
+            let (starts, half_only): (Arc<Mutex<Vec<(Tick, Option<Tick>)>>>, Arc<AtomicBool>) = (Arc::default(), Arc::default());
+            let (sa, ho) = (starts.clone(), half_only.clone());
             std::thread::spawn(move || {
                 while !k.load(Ordering::Acquire) {
                     let Ok((stream, _)) = listener.accept() else {
@@ -952,7 +1345,8 @@ mod tests {
                     };
                     stream.set_nonblocking(false).unwrap();
                     ss.lock().unwrap().push(stream.try_clone().unwrap());
-                    let (st, r, mi) = (st.clone(), r.clone(), mi.clone());
+                    let (st, r, mi, pcs, rks, sa, ho) = (st.clone(), r.clone(), mi.clone(), pcs.clone(), rks.clone(), sa.clone(), ho.clone());
+                    let ls: Arc<Mutex<Option<u64>>> = Arc::default();
                     std::thread::spawn(move || {
                         let (mut rd, mut wr) = (stream.try_clone().unwrap(), stream);
                         let Ok((Up::Hello { token: t, .. }, _)) = read_frame::<Up>(&mut rd, MAX_PART) else { return };
@@ -970,8 +1364,60 @@ mod tests {
                                     let reply = json!({"ok": true, "result": {"ok": summary.is_none(), "summary": summary.unwrap_or_default()}});
                                     (Down::Control { id, reply }, vec![])
                                 }
-                                Up::Msg { msg: FrameMsg::Render { id, .. }, .. } if !st.load(Ordering::Acquire) => {
+                                // CR6b: a playback stream of 32×18 chunks — chunk 1 before chunk 0
+                                // (out of order), chunk 0 at half size, then its full-size upgrade.
+                                Up::Msg { msg: FrameMsg::Stream(StreamMsg::Start { stream, from, to, .. }), .. } => {
+                                    sa.lock().unwrap().push((from, to));
+                                    let rate = effectcraft_engine::time::FrameRate::new(30, 1);
+                                    let started =
+                                        StreamReply::Started { stream, width: 32, height: 18, frame_rate: rate, chunk_frames: 15, codec: StreamCodec::H264 };
+                                    let mut out = vec![(stream_down(started), vec![])];
+                                    let chunks: &[(u64, i64, u32, u32, [u8; 3])] = if ho.load(Ordering::Acquire) {
+                                        &[(1, 0, 16, 8, [255, 0, 0]), (2, 1, 16, 8, [255, 0, 0])]
+                                    } else {
+                                        &[(1, 1, 32, 18, [255, 0, 0]), (2, 0, 16, 8, [255, 0, 0]), (3, 0, 32, 18, [255, 0, 0])]
+                                    };
+                                    for &(seq, index, w, h, color) in chunks {
+                                        out.push(fake_chunk(stream, seq, 1, index, w, h, color));
+                                    }
+                                    *ls.lock().unwrap() = Some(stream);
+                                    for (d, p) in out {
+                                        if write_frame(&mut wr, &d, &p).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                // An edit while it plays: everything is stale; the new revision's
+                                // first chunk is green.
+                                Up::Msg { msg: FrameMsg::Patch(p), .. } => {
+                                    let Some(stream) = *ls.lock().unwrap() else { continue };
+                                    let stale = StreamReply::Stale { stream, revision: p.to_rev, from: Tick(0) };
+                                    if write_frame(&mut wr, &stream_down(stale), &[]).is_err() {
+                                        return;
+                                    }
+                                    let (d, payload) = fake_chunk(stream, 4, p.to_rev, 0, 32, 18, [0, 255, 0]);
+                                    (d, payload)
+                                }
+                                Up::Msg { msg: FrameMsg::Precache(p), .. } => {
+                                    let n: u64 = p.ranges.iter().map(|(a, b)| (b - a + 1) as u64).sum();
+                                    let reply = FrameReply::Cached {
+                                        comp: p.comp,
+                                        series: p.series.clone(),
+                                        ranges: p.ranges.clone(),
+                                        done: n,
+                                        total: n,
+                                        frames: n,
+                                        ram_bytes: n * 2304,
+                                        ram_budget: 1 << 30,
+                                        disk_bytes: 0,
+                                    };
+                                    pcs.lock().unwrap().push(p);
+                                    (Down::Reply { reply, pixels: None }, vec![])
+                                }
+                                Up::Msg { msg: FrameMsg::Render { id, disk, .. }, .. } if !st.load(Ordering::Acquire) => {
                                     r.fetch_add(1, Ordering::AcqRel);
+                                    rks.lock().unwrap().push(disk);
                                     let rgba: Vec<u8> = [255u8, 0, 0, 255].repeat(32 * 18);
                                     let (px, payload) = remote_encode::encode(&rgba, 32, 18, Codec::Raw, 85).unwrap();
                                     let frame = FrameReply::Frame {
@@ -996,7 +1442,7 @@ mod tests {
                     });
                 }
             });
-            FakeServer { addr, kill, stall, renders, streams, missing }
+            FakeServer { addr, kill, stall, renders, streams, missing, precaches, render_keys, starts, half_only }
         }
 
         /// Pull the tunnel: every connection drops and nothing answers on the port again.
@@ -1087,6 +1533,224 @@ mod tests {
         assert_eq!(server.renders.load(Ordering::Acquire), 1, "nothing more went to the cloud");
     }
 
+    /// CR6b acceptance (fake server, in-process): a playing cloud preview takes its frames from
+    /// the stream (out of order, half size then upgraded), nothing renders here meanwhile; an
+    /// edit makes the server send `stale` and the new revision's frames replace the old ones;
+    /// pulling the tunnel ends the stream and the preview goes on here; stopping takes the stream's
+    /// low-resolution and stale frames out of the cache.
+    #[test]
+    fn a_cloud_preview_plays_from_the_stream_and_falls_back_when_the_tunnel_goes() {
+        use crate::cloud_stream::{CloudPlayback, PlayNow};
+        use crate::frames::{FrameKey, Frames, opts_hash};
+        use effectcraft_engine::render::RenderOpts;
+        let server = FakeServer::start("secret");
+        let cloud = CloudFrames::connect(&server.addr, "secret", None);
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 2, "frameRate": 30})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        cloud.offer(s.revision, &s.project);
+        wait_until("the cloud to hold the project", || cloud.ready());
+        let mut frames = Frames::default();
+        frames.set_remote(Some(cloud.clone()));
+        let rate = s.project.comp(cid).unwrap().frame_rate;
+        let opts = RenderOpts::default();
+        let series = |frames: &Frames, s: &effectcraft_engine::Session| FrameKey {
+            revision: s.revision,
+            content: frames.content_of(&s.project, s.revision, cid),
+            comp: cid.0,
+            frame: 0,
+            scale: 1000,
+            view: 0,
+            opts: opts_hash(&opts),
+        };
+        let mut play = CloudPlayback::default();
+        let mut now = 0.0;
+        let tick = |play: &mut CloudPlayback, frames: &Frames, s: &effectcraft_engine::Session, playing: bool, now: f64| {
+            let p = PlayNow {
+                playing,
+                now,
+                comp: cid,
+                rate,
+                project: &s.project,
+                revision: s.revision,
+                series: series(frames, s),
+                opts,
+                cur: 0,
+                start: 0,
+                end: 59,
+                looping: false,
+                waiting: true,
+                fit: 1000,
+                disk: None,
+            };
+            play.tick(Some(&cloud), &p, frames, None)
+        };
+        let color = |frames: &Frames, k: &FrameKey| match frames.get(k) {
+            Some(crate::frames::FrameImage::Cpu(img)) => img.pixels.first().map(|p| (p.r(), p.g(), img.size[0])),
+            _ => None,
+        };
+        let k0 = series(&frames, &s);
+        assert!(tick(&mut play, &frames, &s, true, now).streamed);
+        wait_until("the stream's frames in the cache", || {
+            now += 0.02;
+            assert!(tick(&mut play, &frames, &s, true, now).streamed);
+            color(&frames, &FrameKey { frame: 0, ..k0 }).is_some_and(|c| c.2 == 32) && frames.is_cached(&FrameKey { frame: 29, ..k0 })
+        });
+        let c = color(&frames, &FrameKey { frame: 20, ..k0 }).unwrap();
+        assert!(c.0 > 200 && c.1 < 60, "red from the stream: {c:?}");
+        assert!(!frames.is_cached(&FrameKey { frame: 30, ..k0 }));
+        assert_eq!(frames.inflight(), 0, "nothing rendered or asked for here");
+        assert_eq!(server.renders.load(Ordering::Acquire), 0, "no frame requests while the stream plays");
+        let st = play.stats().unwrap();
+        assert!(st.warmup_ms.is_some() && st.chunks == 3 && st.kbps.is_some(), "{st:?}");
+        assert_eq!(st.size, Some([32, 18]));
+
+        // An edit while it plays: stale from 0, then the new revision's green chunk.
+        s.execute("layer.newSolid", serde_json::json!({"name": "Box", "color": "#0000ff"})).unwrap();
+        let k1 = series(&frames, &s);
+        assert_ne!(k1.content, k0.content);
+        wait_until("the edited frames", || {
+            now += 0.02;
+            tick(&mut play, &frames, &s, true, now);
+            color(&frames, &FrameKey { frame: 3, ..k1 }).is_some_and(|c| c.1 > 200 && c.0 < 60)
+        });
+        // Frames 15–29 are of the old revision under the new key: shown until replaced, stale.
+        assert!(frames.is_cached(&FrameKey { frame: 20, ..k1 }));
+        assert_eq!(play.stats().unwrap().stale, 1);
+
+        // Pull the tunnel: the stream ends, playback goes on here (not streamed), no hang.
+        server.unplug();
+        wait_until("the cloud to be gone", || !cloud.ready());
+        let t = tick(&mut play, &frames, &s, true, now + 0.1);
+        assert!(!t.streamed);
+        assert!(!play.active());
+        assert!(!frames.is_cached(&FrameKey { frame: 20, ..k1 }), "the stale frames left the cache");
+        assert!(frames.is_cached(&FrameKey { frame: 3, ..k1 }), "current full frames stay");
+        let st = play.stats().unwrap();
+        assert!(st.state == "failed" || st.state == "stopped", "{st:?}");
+    }
+
+    /// CR6c: a preview's half-size stream frames stay on this Mac when it stops (drafts, in RAM
+    /// and in the disk cache); playing it again starts no stream, and neither does playing it
+    /// after a restart (the frames are read back from the disk cache, still drafts). The paused
+    /// viewer renders the exact frame over a draft.
+    #[test]
+    fn played_frames_stay_on_this_mac_and_replay_without_streaming_even_after_a_restart() {
+        use crate::cloud_stream::{CloudPlayback, PlayNow};
+        use crate::frames::{FrameKey, Frames, RenderSource, opts_hash};
+        use effectcraft_engine::render::RenderOpts;
+        use effectcraft_engine::render::disk_cache::DiskCache;
+        let server = FakeServer::start("secret");
+        server.half_only.store(true, Ordering::Release);
+        let cloud = CloudFrames::connect(&server.addr, "secret", None);
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 1, "frameRate": 30})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        cloud.offer(s.revision, &s.project);
+        wait_until("the cloud to hold the project", || cloud.ready());
+        let dir = std::env::temp_dir().join(format!("effectcraft-cr6c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let rate = s.project.comp(cid).unwrap().frame_rate;
+        let opts = RenderOpts::default();
+        let series = |frames: &Frames| FrameKey {
+            revision: s.revision,
+            content: frames.content_of(&s.project, s.revision, cid),
+            comp: cid.0,
+            frame: 0,
+            scale: 1000,
+            view: 0,
+            opts: opts_hash(&opts),
+        };
+        let tick = |play: &mut CloudPlayback, frames: &Frames, playing: bool, cur: i64, now: f64| {
+            let p = PlayNow {
+                playing,
+                now,
+                comp: cid,
+                rate,
+                project: &s.project,
+                revision: s.revision,
+                series: series(frames),
+                opts,
+                cur,
+                start: 0,
+                end: 29,
+                looping: false,
+                waiting: true,
+                fit: 1000,
+                disk: Some(dc.clone()),
+            };
+            play.tick(Some(&cloud), &p, frames, None)
+        };
+        let all_cached = |frames: &Frames| (0..30).all(|f| frames.is_cached(&FrameKey { frame: f, ..series(frames) }));
+        let warm = |frames: &Frames| wait_until("the content key", || frames.content_key_ready(&s.project, &series(frames)));
+
+        // First play: one stream for frames 0–29; they come at half size.
+        let mut frames = Frames::default();
+        frames.set_remote(Some(cloud.clone()));
+        warm(&frames);
+        let mut play = CloudPlayback::default();
+        let mut now = 0.0;
+        wait_until("the streamed frames", || {
+            now += 0.02;
+            assert!(tick(&mut play, &frames, true, 0, now).streamed);
+            all_cached(&frames)
+        });
+        assert_eq!(server.starts.lock().unwrap().clone(), vec![(Tick(0), Some(rate.tick_of(30)))], "one stream, for the missing run");
+        // Pause: the drafts stay (lighter on the cache bar).
+        tick(&mut play, &frames, false, 0, now + 0.02);
+        assert!(!play.active());
+        assert!(all_cached(&frames), "pausing keeps the drafts");
+        let k5 = FrameKey { frame: 5, ..series(&frames) };
+        assert!(frames.is_draft(&k5) && !frames.is_exact(&k5));
+        assert_eq!(frames.draft_frames(&series(&frames)), (0..30).collect::<Vec<_>>(), "all drafts (the one on screen shows until its exact frame lands)");
+
+        // Play again: no stream, the frames play from this Mac.
+        for i in 0..20 {
+            assert!(tick(&mut play, &frames, true, i, now + 0.1 + f64::from(i as u8) * 0.033).streamed);
+        }
+        assert_eq!(server.starts.lock().unwrap().len(), 1, "a replay asks the cloud for nothing it holds");
+        assert!(play.stats().is_some_and(|st| st.held >= 10), "{:?}", play.stats());
+        tick(&mut play, &frames, false, 19, now + 1.0);
+
+        // The paused viewer renders the frame on screen exactly: over a draft, not as a hit.
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: s.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let renders = server.renders.load(Ordering::Acquire);
+        frames.request_urgent(&src, k5, cid, rate.tick_of(5), opts);
+        assert_eq!(frames.inflight(), 0, "playback's request takes the draft");
+        frames.request_exact(&src, k5, cid, rate.tick_of(5), opts);
+        wait_until("the exact frame", || frames.is_exact(&k5));
+        assert_eq!(server.renders.load(Ordering::Acquire), renders + 1);
+        assert_eq!(frames.get(&k5).map(|i| i.size()), Some([32, 18]), "the full frame replaced the draft");
+
+        // Restart: an empty RAM preview, the disk cache holds the drafts.
+        dc.flush();
+        drop(play);
+        let mut frames = Frames::default();
+        frames.set_remote(Some(cloud.clone()));
+        warm(&frames);
+        let mut play = CloudPlayback::default();
+        let mut now = 10.0;
+        wait_until("the frames read back from disk", || {
+            now += 0.02;
+            assert!(tick(&mut play, &frames, true, 0, now).streamed);
+            all_cached(&frames)
+        });
+        assert_eq!(server.starts.lock().unwrap().len(), 1, "after a restart too, nothing is streamed again");
+        assert!(frames.is_draft(&FrameKey { frame: 7, ..series(&frames) }), "a draft on disk comes back a draft");
+        assert!(play.stats().is_some_and(|st| st.from_disk >= 29), "{:?}", play.stats());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// CR7: while the cloud machine lacks a file or font, frames render here and the status
     /// says what is missing; once it has them, frames go to the cloud.
     #[test]
@@ -1115,5 +1779,142 @@ mod tests {
         *server.missing.lock().unwrap() = None;
         wait_until("the cloud to be ready", || cloud.ready());
         assert!(cloud.status().missing.is_none());
+    }
+
+    /// CR8: with the cloud, Cache Frames When Idle sends the server one plan and downloads no
+    /// frames; the server's report fills the blue cache bar; the same plan isn't sent twice, a
+    /// playhead move doesn't resend it; render requests carry their frame keys; the status counts
+    /// the bytes on the wire both ways.
+    #[test]
+    fn idle_caching_goes_to_the_server_and_its_report_fills_the_cache_bar() {
+        use crate::frames::{FrameKey, Frames, RenderSource, opts_hash};
+        use effectcraft_engine::render::RenderOpts;
+        let server = FakeServer::start("secret");
+        let cloud = CloudFrames::connect(&server.addr, "secret", None);
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 1, "frameRate": 10})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        cloud.offer(s.revision, &s.project);
+        wait_until("the cloud to hold the project", || cloud.ready());
+        let mut frames = Frames::default();
+        frames.set_remote(Some(cloud.clone()));
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: s.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let opts = RenderOpts::default();
+        let content = frames.content_of(&s.project, s.revision, cid);
+        let base = FrameKey { revision: s.revision, content, comp: cid.0, frame: 0, scale: 1000, view: 0, opts: opts_hash(&opts) };
+        // The content key is computed on a worker first.
+        let mut sent = None;
+        wait_until("the plan to go", || {
+            sent = frames.precache_remote(&src, &base, cid, opts, vec![(3, 9), (0, 2)]);
+            sent == Some(true)
+        });
+        wait_until("the server's report", || cloud.status().server_cache.is_some_and(|c| c.done == 10));
+        assert_eq!(frames.disk_frames(&src, &base, 10, &opts), (0..10).collect::<Vec<_>>(), "the blue bar: every frame is on the server");
+        assert_eq!(server.renders.load(Ordering::Acquire), 0, "no frame was downloaded");
+        assert_eq!(frames.inflight(), 0);
+        // The playhead moved (other order, same frames): not sent again.
+        assert_eq!(frames.precache_remote(&src, &base, cid, opts, vec![(5, 9), (0, 4)]), Some(true));
+        std::thread::sleep(Duration::from_millis(100));
+        let plans = server.precaches.lock().unwrap().clone();
+        assert_eq!(plans.len(), 1);
+        assert_eq!((plans[0].comp, plans[0].revision, plans[0].ranges.clone()), (cid, s.revision, vec![(3, 9), (0, 2)]));
+        // A viewer frame names its key: the server answers it from its cache.
+        // (At frame 4's own time: PC3 names a frame by its fingerprint, which hashes the time.)
+        let at = s.project.comp(cid).unwrap().frame_rate.tick_of(4);
+        frames.request_urgent(&src, FrameKey { frame: 4, ..base }, cid, at, opts);
+        wait_until("the viewer frame", || frames.is_cached(&FrameKey { frame: 4, ..base }));
+        let key = server.render_keys.lock().unwrap().first().cloned().flatten().expect("a key");
+        // (PC3: frames are named by their fingerprints, as the plan names them.)
+        assert_eq!(u128::from_str_radix(&key, 16).ok(), plans[0].key(4));
+        let st = cloud.status();
+        assert!(st.bytes_down > 2304 && st.bytes_up > 0, "{st:?}");
+    }
+
+    /// Edit audit, 18 Oct: a stream that stops sending while playback waits (17 Oct: chunks in
+    /// flight forever at 14.5 s) gives up after a while, and the preview plays on here instead of
+    /// hanging; a comp settings change (frame rate) while it plays starts a new stream instead of
+    /// filing old-grid frames under the new frame numbers.
+    #[test]
+    fn a_stuck_stream_gives_up_and_a_frame_rate_change_starts_a_new_one() {
+        use crate::cloud_stream::{CloudPlayback, PlayNow};
+        use crate::frames::{FrameKey, Frames, opts_hash};
+        use effectcraft_engine::render::RenderOpts;
+        let server = FakeServer::start("secret");
+        let cloud = CloudFrames::connect(&server.addr, "secret", None);
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 4, "frameRate": 30})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        cloud.offer(s.revision, &s.project);
+        wait_until("the cloud to hold the project", || cloud.ready());
+        let mut frames = Frames::default();
+        frames.set_remote(Some(cloud.clone()));
+        let opts = RenderOpts::default();
+        let tick = |play: &mut CloudPlayback, frames: &Frames, s: &effectcraft_engine::Session, cur: i64, now: f64| {
+            let p = PlayNow {
+                playing: true,
+                now,
+                comp: cid,
+                rate: s.project.comp(cid).unwrap().frame_rate,
+                project: &s.project,
+                revision: s.revision,
+                series: FrameKey {
+                    revision: s.revision,
+                    content: frames.content_of(&s.project, s.revision, cid),
+                    comp: cid.0,
+                    frame: 0,
+                    scale: 1000,
+                    view: 0,
+                    opts: opts_hash(&opts),
+                },
+                opts,
+                cur,
+                start: 0,
+                end: 99,
+                looping: false,
+                waiting: true,
+                fit: 1000,
+                disk: None,
+            };
+            play.tick(Some(&cloud), &p, frames, None)
+        };
+
+        // Playback waits at frame 40; the (fake) server only ever sends frames 0–29.
+        let mut play = CloudPlayback::default();
+        let mut now = 0.0;
+        wait_until("the stream's chunks", || {
+            now += 0.02;
+            assert!(tick(&mut play, &frames, &s, 40, now).note.is_none());
+            play.stats().is_some_and(|st| st.chunks == 3)
+        });
+        // (One more tick sees the last chunk: the 12 s count from here.)
+        tick(&mut play, &frames, &s, 40, now);
+        assert!(tick(&mut play, &frames, &s, 40, now + 5.0).note.is_none(), "5 s without a chunk: still waiting for the stream");
+        tick(&mut play, &frames, &s, 40, now + 13.0);
+        let t = tick(&mut play, &frames, &s, 40, now + 13.1);
+        assert!(!t.streamed, "the preview plays on here");
+        assert!(t.note.as_deref().is_some_and(|n| n.contains("no frames from the cloud")), "{t:?}");
+        assert!(!play.active());
+
+        // A new preview: a frame rate change while it plays restarts the stream.
+        play.stop(&frames, None, s.revision);
+        let starts = server.starts.lock().unwrap().len();
+        now += 20.0;
+        assert!(tick(&mut play, &frames, &s, 0, now).streamed);
+        wait_until("the second stream", || server.starts.lock().unwrap().len() == starts + 1);
+        s.execute("comp.settings", serde_json::json!({"frameRate": 25})).unwrap();
+        wait_until("a new stream for the new frame grid", || {
+            now += 0.02;
+            tick(&mut play, &frames, &s, 0, now);
+            server.starts.lock().unwrap().len() == starts + 2
+        });
     }
 }

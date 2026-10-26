@@ -31,7 +31,7 @@ pub mod publish;
 
 pub use client::{BlobState, Client, Prepared, Status, UpdateInfo, rewrite_paths};
 pub use hash::sha256_hex;
-pub use manifest::{BlobRef, Card, CardFile, Changes, FORMAT, HEAD_KEY, Head, Manifest, Placeholder, decode_blob, encode_blob};
+pub use manifest::{BlobRef, Card, CardFile, Changes, Collection, Crop, FORMAT, FolderRow, HEAD_KEY, Head, Manifest, Placeholder, decode_blob, encode_blob};
 pub use remote::{DirRemote, Done, Remote};
 pub use search::{score, search, tokens};
 pub use store::{DirStore, MemStore, Store, valid_key};

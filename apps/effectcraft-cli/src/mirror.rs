@@ -56,7 +56,8 @@ pub fn run(args: &Args, json_out: bool) -> Result<(), Failure> {
         dry_run: args.flag("--dry-run"),
         all: args.flag("--all"),
         verify_hash: args.flag("--verify-hash"),
-        retime: args.flag("--retime"),
+        // On unless `--no-retime` (`--retime` is the old opt-in, still accepted).
+        retime: !args.flag("--no-retime"),
         upload: args.opts("--upload").into_iter().map(str::to_string).collect(),
         limit: args.num("--upload-limit-mb")?.map(|mb| (mb.max(0.0) * 1e6) as u64),
     };
@@ -75,7 +76,7 @@ pub fn run(args: &Args, json_out: bool) -> Result<(), Failure> {
     let preflight = if opts.dry_run { Value::Null } else { remote_preflight(&ssh, &opts, &manifest)? };
     let mut out = json!({
         "uploaded": report.uploaded, "bytes": report.bytes, "upToDate": report.up_to_date, "sameContent": report.same_content,
-        "copiedOnServer": report.copied, "fromDrive": report.from_drive, "needDriveLink": report.need_link,
+        "copiedOnServer": report.copied, "fromDrive": report.from_drive, "fromLibrary": report.from_library, "libraryBytes": report.library_bytes, "needDriveLink": report.need_link,
         "missingOnMac": report.missing_on_mac, "nondeterministic": manifest.nondeterministic, "preflight": preflight,
     });
     if json_out {
@@ -153,6 +154,7 @@ struct Opts {
     dry_run: bool,
     all: bool,
     verify_hash: bool,
+    /// Give a same-content server copy the Mac's mtime (`--no-retime`: leave it).
     retime: bool,
     /// Big files Elias said may be uploaded from the Mac (paths or file names).
     upload: Vec<String>,
@@ -166,6 +168,12 @@ enum Source {
     Mac,
     Drive(String),
     DriveFolders(Vec<String>),
+    /// A Motion Library file (in the Mac's library cache): the server fetches blob `hash` from the
+    /// library's Worker itself. `mac_ok`: it may be uploaded from the Mac when that fails.
+    Library {
+        hash: String,
+        mac_ok: bool,
+    },
     NeedsLink,
 }
 
@@ -194,11 +202,13 @@ fn units_of(m: &Manifest, opts: &Opts) -> Vec<Unit> {
     let folders: Vec<String> = m.files.iter().filter(|f| f.source == "drive-folder").take(1).flat_map(|_| sidecar_folders(m)).collect();
     let mut out: BTreeMap<String, Unit> = BTreeMap::new();
     for f in m.files.iter().filter(|f| f.exists && !f.proxied && (f.used || opts.all)) {
-        let source = match (&f.drive, f.source.as_str()) {
-            (Some(link), _) => Source::Drive(link.clone()),
+        // A card applied from the Motion Library: the server fetches it from the library itself.
+        let source = match (crate::library_pull::blob_of(&f.path), &f.drive, f.source.as_str()) {
+            (Some(hash), _, _) => Source::Library { hash, mac_ok: f.size <= limit || allowed(&f.path) },
+            (None, Some(link), _) => Source::Drive(link.clone()),
             _ if f.size <= limit || allowed(&f.path) => Source::Mac,
-            (None, "drive-folder") if !folders.is_empty() => Source::DriveFolders(folders.clone()),
-            (None, "mac") => Source::Mac,
+            (None, None, "drive-folder") if !folders.is_empty() => Source::DriveFolders(folders.clone()),
+            (None, None, "mac") => Source::Mac,
             _ => Source::NeedsLink,
         };
         out.insert(
@@ -258,6 +268,9 @@ struct Report {
     same_content: usize,
     copied: usize,
     from_drive: usize,
+    /// Fetched by the server from the Motion Library: files, bytes.
+    from_library: usize,
+    library_bytes: u64,
     /// Big files without a Drive link: (path, size).
     need_link: Vec<Value>,
     missing_on_mac: Vec<String>,
@@ -343,11 +356,15 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], first: bool) -> Result<Report, F
             need.push(u);
         }
     }
-    // Same content: the server's preflight compares the hash (once; it remembers). `--retime` also
-    // sets the Mac's mtime there, so the next check is size + mtime alone; off by default because
-    // an app running there may reload footage whose mtime changed.
-    if opts.retime && !retime.is_empty() && !opts.dry_run {
-        ssh.retime(&retime.iter().map(|u| (u.dest.as_str(), u.mtime)).collect::<Vec<_>>())?;
+    // Same content: the server copy gets the Mac's mtime, so every later check (the app's
+    // preflight too, which may not know the big file's hash) is size + mtime alone. `--no-retime`
+    // leaves it (the server's preflight then compares the hash, when the manifest carries one).
+    if opts.retime
+        && !retime.is_empty()
+        && !opts.dry_run
+        && let Err(e) = ssh.retime(&retime.iter().map(|u| (u.dest.as_str(), u.mtime)).collect::<Vec<_>>())
+    {
+        note(&format!("⚠️  could not set the Mac's mtime on the server copies: {}", failure_text(&e)));
     }
     for u in &retime {
         report.same_content += 1;
@@ -369,6 +386,7 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], first: bool) -> Result<Report, F
         }
     }
     let (mac, rest): (Vec<Unit>, Vec<Unit>) = need.into_iter().partition(|u| u.source == Source::Mac);
+    let (library, rest): (Vec<Unit>, Vec<Unit>) = rest.into_iter().partition(|u| matches!(u.source, Source::Library { .. }));
     let (drive, no_link): (Vec<Unit>, Vec<Unit>) = rest.into_iter().partition(|u| matches!(u.source, Source::Drive(_) | Source::DriveFolders(_)));
     for u in &no_link {
         report.need_link.push(json!({"path": u.src, "size": u.size}));
@@ -378,26 +396,37 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], first: bool) -> Result<Report, F
     for u in mac.iter_mut().filter(|u| u.sha256.is_none()) {
         u.sha256 = cloud_assets::hash_file(&u.src, &mut |_| {});
     }
+    // A library file's name is its hash (checked again on the server).
+    let mut library = library;
+    for u in &mut library {
+        if let Source::Library { hash, .. } = &u.source {
+            u.sha256 = Some(hash.clone());
+        }
+    }
     let store = ssh.store()?;
-    let (copies, send): (Vec<(Unit, String)>, Vec<Unit>) = {
-        let (mut c, mut s) = (vec![], vec![]);
-        for u in mac {
+    let (copies, send, lib): (Vec<(Unit, String)>, Vec<Unit>, Vec<Unit>) = {
+        let (mut c, mut s, mut l) = (vec![], vec![], vec![]);
+        for u in mac.into_iter().chain(library) {
             match u.sha256.as_deref().and_then(|h| store.locate(h, u.size)).filter(|p| *p != u.dest) {
                 Some(from) => c.push((u, from)),
-                None => s.push(u),
+                None if u.source == Source::Mac => s.push(u),
+                None => l.push(u),
             }
         }
-        (c, s)
+        (c, s, l)
     };
     let send_bytes: u64 = send.iter().map(|u| u.size).fold(0, u64::saturating_add);
     let drive_bytes: u64 = drive.iter().map(|u| u.size).fold(0, u64::saturating_add);
+    let lib_bytes: u64 = lib.iter().map(|u| u.size).fold(0, u64::saturating_add);
     say(&format!(
-        "📦 {} up to date, {} same content (other mtime), {} copied from the server's own store, {} from Google Drive ({}), {} to upload from this Mac ({})",
+        "📦 {} up to date, {} same content (other mtime), {} copied from the server's own store, {} from Google Drive ({}), {} from the Motion Library ({}), {} to upload from this Mac ({})",
         report.up_to_date,
         report.same_content,
         copies.len(),
         drive.len(),
         gb(drive_bytes),
+        lib.len(),
+        gb(lib_bytes),
         send.len(),
         gb(send_bytes)
     ));
@@ -428,11 +457,14 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], first: bool) -> Result<Report, F
         for u in &drive {
             say(&format!("   would pull from Drive → {}", u.dest));
         }
+        for u in &lib {
+            say(&format!("   would fetch from the Motion Library → {}", u.dest));
+        }
         return Ok(report);
     }
     // Keep 1 GB free on the server (renders write caches and logs).
     let free = ssh.free_bytes()?;
-    let needed = send_bytes.saturating_add(drive_bytes).saturating_add(copies.iter().map(|(u, _)| u.size).sum());
+    let needed = send_bytes.saturating_add(drive_bytes).saturating_add(lib_bytes).saturating_add(copies.iter().map(|(u, _)| u.size).sum());
     if needed.saturating_add(BIG_FILE) > free {
         return Err(Failure::Error(format!(
             "the server has {} free and this needs {} (+1 GB headroom): free space there first, nothing was sent",
@@ -450,8 +482,33 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], first: bool) -> Result<Report, F
         report.from_drive = pulled.len();
         arrived.extend(pulled);
     }
-    // Small files first: fonts and stills are usable while bigger ones are on their way.
     let mut send = send;
+    if !lib.is_empty() {
+        say(&format!("📚 the server fetches {} Motion Library file(s) ({}) from the library itself (nothing leaves this Mac)", lib.len(), gb(lib_bytes)));
+        let (ok, error) = match ssh.pull_on_server(&opts.remote_cli, "library-pull", &library_jobs(&lib)) {
+            Ok(r) => r,
+            Err(e) => (BTreeSet::new(), Some(failure_text(&e).to_string())),
+        };
+        let (got, fallback, too_big) = split_library(lib, &ok);
+        report.from_library = got.len();
+        report.library_bytes = got.iter().map(|u| u.size).fold(0, u64::saturating_add);
+        arrived.extend(got);
+        if !fallback.is_empty() || !too_big.is_empty() {
+            let bytes: u64 = fallback.iter().map(|u| u.size).fold(0, u64::saturating_add);
+            say(&format!(
+                "⚠️  the server couldn't fetch {} file(s) from the Motion Library ({}): uploading {} from this Mac ({})",
+                fallback.len() + too_big.len(),
+                error.as_deref().unwrap_or("see above"),
+                fallback.len(),
+                gb(bytes)
+            ));
+        }
+        for u in &too_big {
+            report.need_link.push(json!({"path": u.src, "size": u.size}));
+        }
+        send.extend(fallback);
+    }
+    // Small files first: fonts and stills are usable while bigger ones are on their way.
     send.sort_by_key(|u| u.size);
     let sent = if send.is_empty() { vec![] } else { ssh.upload(&send)? };
     report.uploaded = sent.len();
@@ -482,6 +539,30 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], first: bool) -> Result<Report, F
         let _ = ssh.remote_exec(&opts.remote_cli, "cloud.rememberHashes", &json!({"files": remember}));
     }
     Ok(report)
+}
+
+/// The server's `library-pull` jobs for these library files.
+fn library_jobs(files: &[Unit]) -> Vec<Value> {
+    files
+        .iter()
+        .filter_map(|u| match &u.source {
+            Source::Library { hash, .. } => Some(json!({"dest": u.dest, "hash": hash, "size": u.size, "mtime": u.mtime, "name": short_name(&u.src)})),
+            _ => None,
+        })
+        .collect()
+}
+
+/// After `library-pull`: (fetched by the server, to upload from the Mac instead, too big for that).
+fn split_library(lib: Vec<Unit>, ok: &BTreeSet<String>) -> (Vec<Unit>, Vec<Unit>, Vec<Unit>) {
+    let (mut got, mut mac, mut big) = (vec![], vec![], vec![]);
+    for u in lib {
+        match &u.source {
+            _ if ok.contains(&u.dest) => got.push(u),
+            Source::Library { mac_ok: true, .. } => mac.push(Unit { source: Source::Mac, ..u }),
+            _ => big.push(u),
+        }
+    }
+    (got, mac, big)
 }
 
 fn hash_with_progress(path: &str, size: u64) -> Option<String> {
@@ -793,14 +874,22 @@ impl Ssh {
                 j
             })
             .collect();
-        let jobs_file = "/tmp/effectcraft-drive-jobs.json";
-        let body = serde_json::to_vec(&jobs).map_err(|e| Failure::Error(e.to_string()))?;
         say(&format!("☁️  the server pulls {} file(s) from Google Drive (nothing leaves this Mac)", files.len()));
+        let (ok, _) = self.pull_on_server(cli, "drive-pull", &jobs)?;
+        Ok(files.iter().filter(|u| ok.contains(u.dest.as_str())).cloned().collect())
+    }
+
+    /// Run `effectcraft-cli <subcommand> --jobs` there (its progress shows here). Returns the
+    /// destinations that arrived verified and the first error.
+    fn pull_on_server(&self, cli: &str, subcommand: &str, jobs: &[Value]) -> Result<(BTreeSet<String>, Option<String>), Failure> {
+        let jobs_file = format!("/tmp/effectcraft-{subcommand}-jobs.json");
+        let body = serde_json::to_vec(&jobs).map_err(|e| Failure::Error(e.to_string()))?;
         let mut child = self
             .command(&format!(
-                "cat > {jf}; cli={cli}; if [ ! -x \"$cli\" ]; then echo {MARK}; echo '{{\"results\":[]}}'; echo \"no effectcraft-cli at $cli\" >&2; exit 0; fi; out=$(\"$cli\" drive-pull --jobs {jf}); echo {MARK}; echo \"$out\"",
-                jf = sh_quote(jobs_file),
-                cli = sh_quote(cli)
+                "cat > {jf}; cli={cli}; if [ ! -x \"$cli\" ]; then echo {MARK}; echo '{{\"results\":[]}}'; echo \"no effectcraft-cli at $cli\" >&2; exit 0; fi; out=$(\"$cli\" {sub} --jobs {jf}); rm -f {jf}; echo {MARK}; echo \"$out\"",
+                jf = sh_quote(&jobs_file),
+                cli = sh_quote(cli),
+                sub = sh_quote(subcommand)
             ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -813,8 +902,13 @@ impl Ssh {
         let out = child.wait_with_output().map_err(|e| Failure::Error(format!("ssh: {e}")))?;
         let text = String::from_utf8_lossy(&after_mark(&out.stdout)).into_owned();
         let v: Value = text.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap_or(Value::Null);
-        let ok: BTreeSet<&str> = v["results"].as_array().into_iter().flatten().filter(|r| r["ok"] == true).filter_map(|r| r["dest"].as_str()).collect();
-        Ok(files.iter().filter(|u| ok.contains(u.dest.as_str())).cloned().collect())
+        let results = v["results"].as_array().cloned().unwrap_or_default();
+        let ok = results.iter().filter(|r| r["ok"] == true).filter_map(|r| r["dest"].as_str()).map(str::to_string).collect();
+        let error =
+            results.iter().find_map(|r| r["error"].as_str()).map(str::to_string).or_else(|| {
+                (results.is_empty() && !jobs.is_empty()).then(|| format!("the server's effectcraft-cli has no `{subcommand}` (connect rebuilds it)"))
+            });
+        Ok((ok, error))
     }
 
     /// Run one engine command there in an empty session (`exec … --json`).
@@ -1057,6 +1151,94 @@ fn short(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opts() -> Opts {
+        Opts {
+            font_dir: DEFAULT_FONT_DIR.into(),
+            remote_cli: DEFAULT_REMOTE_CLI.into(),
+            env_file: DEFAULT_ENV_FILE.into(),
+            dry_run: false,
+            all: false,
+            verify_hash: false,
+            retime: false,
+            upload: vec![],
+            limit: Some(100_000_000),
+        }
+    }
+
+    fn file(path: &str, size: u64) -> cloud_assets::FileEntry {
+        cloud_assets::FileEntry {
+            path: path.into(),
+            kind: "footage".into(),
+            size,
+            mtime: 1_700_000_000,
+            used: true,
+            exists: true,
+            source: "mac".into(),
+            ..Default::default()
+        }
+    }
+
+    /// A card applied on the Mac: its files are fetched by the server from the library (a fake
+    /// Worker here), not uploaded; one the library can't give falls back to the Mac upload, and one
+    /// over the upload limit then needs a Drive link.
+    #[test]
+    fn library_files_are_fetched_by_the_server_and_fall_back_to_the_mac() {
+        let root = std::env::temp_dir().join(format!("ec-mirror-library-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let glow = b"glow png bytes".to_vec();
+        let hg = effectcraft_motionlib::sha256_hex(&glow);
+        let hm = effectcraft_motionlib::sha256_hex(b"a blob the bucket doesn't have");
+        let hb = "c".repeat(64);
+        let cache = root.join("Mac/Library/Caches/EffectCraft/Motion Library/blobs");
+        let p = |h: &str, n: &str| cache.join(h).join(n).to_string_lossy().into_owned();
+        let footage = root.join("Mac/footage.mov").to_string_lossy().into_owned();
+        let m = Manifest {
+            files: vec![file(&p(&hg, "glow.png"), glow.len() as u64), file(&p(&hm, "gone.png"), 30), file(&p(&hb, "huge.png"), 200_000_000), file(&footage, 5)],
+            ..Default::default()
+        };
+        let units = units_of(&m, &opts());
+        let source = |path: &str| units.iter().find(|u| u.src == path).map(|u| u.source.clone());
+        assert_eq!(source(&p(&hg, "glow.png")), Some(Source::Library { hash: hg.clone(), mac_ok: true }));
+        assert_eq!(source(&p(&hb, "huge.png")), Some(Source::Library { hash: hb.clone(), mac_ok: false }));
+        assert_eq!(source(&footage), Some(Source::Mac));
+
+        // The server side: dests under a stand-in for the server's root.
+        let server = root.join("server");
+        let mut lib: Vec<Unit> = units.into_iter().filter(|u| matches!(u.source, Source::Library { .. })).collect();
+        for u in &mut lib {
+            u.dest = format!("{}{}", server.display(), u.src);
+        }
+        let jobs = library_jobs(&lib);
+        assert_eq!(jobs.len(), 3);
+        assert!(jobs.iter().all(|j| j["hash"].as_str().is_some_and(|h| h.len() == 64) && j["size"].as_u64().is_some()));
+        let url = crate::library_pull::tests::fake_worker(vec![(format!("blobs/{hg}"), glow.clone())]);
+        let remote = effectcraft_motionlib::remote_for(&url, Some(crate::library_pull::tests::TOKEN)).unwrap();
+        let results = crate::library_pull::pull_all(remote.as_ref(), &jobs);
+        let ok: BTreeSet<String> = results.iter().filter(|r| r["ok"] == true).filter_map(|r| r["dest"].as_str()).map(str::to_string).collect();
+        let (got, mac, big) = split_library(lib, &ok);
+        assert_eq!(got.len(), 1);
+        assert_eq!(std::fs::read(&got[0].dest).unwrap(), glow, "the server has the card's file");
+        assert_eq!(mac.iter().map(|u| (u.src.clone(), u.source.clone())).collect::<Vec<_>>(), [(p(&hm, "gone.png"), Source::Mac)]);
+        assert_eq!(big.iter().map(|u| u.src.clone()).collect::<Vec<_>>(), [p(&hb, "huge.png")]);
+
+        // The server unreachable or without the token: everything falls back.
+        let (got, mac, big) = split_library(
+            vec![Unit {
+                src: p(&hg, "glow.png"),
+                dest: "/x".into(),
+                size: 1,
+                mtime: 0,
+                sha256: None,
+                font_folder: false,
+                project: false,
+                source: Source::Library { hash: hg, mac_ok: true },
+            }],
+            &BTreeSet::new(),
+        );
+        assert!(got.is_empty() && big.is_empty() && mac.len() == 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn pax_record_length_counts_itself() {

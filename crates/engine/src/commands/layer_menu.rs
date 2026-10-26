@@ -550,15 +550,19 @@ fn add_marker(s: &mut Session, p: &Value) -> Result<Value> {
     let t = time_p(s, p, s.project.comp(cid));
     let comment = str_p(p, "comment").unwrap_or_default().to_string();
     if ids.is_empty() {
-        s.edit("Add Marker", None, |proj, _| {
+        let old = s.edit("Add Marker", None, |proj, _| {
             let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-            c.markers.push(Marker { time: t, comment, ..Default::default() });
-            c.markers.sort_by_key(|m| m.time);
-            Ok(())
+            Ok(super::markers::place_marker(&mut c.markers, Marker { time: t, comment, ..Default::default() }))
         })?;
-        return Ok(json!({"time": t.seconds()}));
+        let mut out = json!({"time": t.seconds()});
+        if let Some(old) = old {
+            super::markers::replaced_reply(&mut out, &old, t, None);
+            super::markers::toast_warning(s, &out);
+        }
+        return Ok(out);
     }
-    s.edit("Add Marker", None, |proj, _| {
+    let replaced = s.edit("Add Marker", None, |proj, _| {
+        let mut replaced = vec![];
         for lid in &ids {
             let l = layer_mut(proj, cid, *lid)?;
             if l.markers_locked {
@@ -566,13 +570,28 @@ fn add_marker(s: &mut Session, p: &Value) -> Result<Value> {
             }
             // Layer markers are stored in layer time.
             let lt = l.layer_time(t);
-            l.markers.retain(|m| m.time != lt);
-            l.markers.push(Marker { time: lt, comment: comment.clone(), ..Default::default() });
-            l.markers.sort_by_key(|m| m.time);
+            if let Some(old) = super::markers::place_marker(&mut l.markers, Marker { time: lt, comment: comment.clone(), ..Default::default() }) {
+                replaced.push((*lid, old));
+            }
         }
-        Ok(())
+        Ok(replaced)
     })?;
-    Ok(Value::Null)
+    if replaced.is_empty() {
+        return Ok(Value::Null);
+    }
+    // One entry per layer whose marker at that time was overwritten.
+    let list: Vec<Value> = replaced
+        .iter()
+        .map(|(lid, old)| {
+            let mut o = json!({});
+            super::markers::replaced_reply(&mut o, old, t, Some(*lid));
+            o
+        })
+        .collect();
+    let warning = list.iter().filter_map(|o| o["warning"].as_str()).collect::<Vec<_>>().join("; ");
+    let out = json!({"time": t.seconds(), "replaced": list.iter().map(|o| o["replaced"].clone()).collect::<Vec<_>>(), "warning": warning});
+    super::markers::toast_warning(s, &out);
+    Ok(out)
 }
 
 fn markers_lock(s: &mut Session, p: &Value) -> Result<Value> {
@@ -850,7 +869,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("layer.mask.lock", "Locked", ["Layer", "Mask"], None, "{layer?, mask?, value?}", has_masks, mask_lock),
         cmd!("layer.mask.unlockAll", "Unlock All Masks", ["Layer", "Mask"], None, "{layers?}", has_masks, mask_unlock_all),
         cmd!("layer.mask.lockOthers", "Lock Other Masks", ["Layer", "Mask"], None, "{layer?, mask?}", has_masks, mask_lock_others),
-        cmd!("layer.addMarker", "Add Marker", ["Layer", "Markers"], None, "{layers?, time?, comment?}", has_comp, add_marker),
+        cmd!(
+            "layer.addMarker",
+            "Add Marker",
+            ["Layer", "Markers"],
+            None,
+            "{layers?, time?, comment?} → null, or with no layers {time}; a marker already at that time is replaced and reported (replaced, warning)",
+            has_comp,
+            add_marker
+        ),
         cmd!("layer.markersLock", "Lock Markers", ["Layer", "Markers"], None, "{layers?, value?}", has_layers, markers_lock),
         cmd!("layer.deleteAllMarkers", "Delete All Markers", ["Layer", "Markers"], None, "{layers?}", has_markers, delete_all_markers),
         cmd!("layer.trackMatte", "Track Matte", [], None, "{layers?, op: none|alpha|alphaInverted|luma|lumaInverted|above|below}", has_layers, track_matte_op),

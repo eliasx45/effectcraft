@@ -3,6 +3,7 @@
 
 use crate::{EvalCtx, Image, Renderer, color};
 use effectcraft_effects::Buf;
+use effectcraft_project::render_queue::ProxyUse;
 use effectcraft_project::{Footage, FootageKind, FrameBlend, ItemId, ItemKind, Layer};
 use effectcraft_raster::Px;
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
@@ -143,6 +144,15 @@ pub enum FloatCurve {
 }
 
 /// Supplies decoded footage frames (implemented by the media layer).
+/// A footage source's decoded-frame cache ([`FootageSource::cache_usage`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FootageCacheUsage {
+    pub bytes: usize,
+    pub frames: usize,
+    /// Per file: (path, bytes, frames), most bytes first.
+    pub by_file: Vec<(String, usize, usize)>,
+}
+
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
     fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>>;
@@ -200,6 +210,9 @@ pub trait FootageSource: Send + Sync {
     /// Set the decoded-frame cache budget in bytes (Settings ▸ Memory & CPU); sources without
     /// a cache ignore it.
     fn set_cache_budget(&self, _bytes: usize) {}
+    /// Take part in the shared cache budget (`Some`, see [`crate::cache::shared`]) or keep to
+    /// the budget [`Self::set_cache_budget`] gives (`None`). Sources without a cache ignore it.
+    fn share_cache_budget(&self, _budget: Option<&Arc<crate::cache::shared::SharedBudget>>) {}
     /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory) and close
     /// the files nobody is reading: the next reads decode again. Sources without a cache ignore it.
     fn purge(&self) {}
@@ -226,9 +239,12 @@ pub trait FootageSource: Send + Sync {
     /// Settings ▸ Disk ▸ Conformed Audio Folder: where decoded audio is kept between reads
     /// (`None` = off); sources that don't decode audio ignore it.
     fn set_conform_folder(&self, _folder: Option<std::path::PathBuf>) {}
-    /// Settings ▸ Previews ▸ Hardware ProRes Decoding: let previews decode footage on a hardware
+    /// Settings ▸ Previews ▸ Hardware Video Decoding: let previews decode footage on a hardware
     /// decoder (visually identical, not bit-exact). Sources without one ignore it.
     fn set_hardware_decoding(&self, _on: bool) {}
+    /// Settings ▸ Media & Disk Cache ▸ Disk Cache: where decoded stills that are slow to decode
+    /// persist between sessions (`None` = off). Sources without a still decoder ignore it.
+    fn set_still_cache(&self, _disk: Option<Arc<crate::disk_cache::DiskCache>>) {}
     /// The view of this source that decodes exactly (never on a hardware decoder): what exports
     /// and other final renders read. `None`: this source is exact already. A source returns the
     /// same view every time (jobs compare footage sources by address).
@@ -237,6 +253,11 @@ pub trait FootageSource: Send + Sync {
     }
     /// The decoded-frame cache budget in bytes, if the source has a cache.
     fn cache_budget(&self) -> Option<usize> {
+        None
+    }
+    /// What the decoded-frame cache holds now, by file (the Memory panel, `memory.stats`): `None`
+    /// for sources without a cache. Called only while the panel is open or an agent asks.
+    fn cache_usage(&self) -> Option<FootageCacheUsage> {
         None
     }
     /// Vector footage (SVG) rasterised at `scale` × its pixel size, for Continuously Rasterize.
@@ -316,6 +337,9 @@ impl FootageSource for CancellableFootage<'_> {
     fn set_cache_budget(&self, bytes: usize) {
         self.inner.set_cache_budget(bytes)
     }
+    fn share_cache_budget(&self, budget: Option<&Arc<crate::cache::shared::SharedBudget>>) {
+        self.inner.share_cache_budget(budget)
+    }
     fn purge(&self) {
         self.inner.purge()
     }
@@ -334,12 +358,18 @@ impl FootageSource for CancellableFootage<'_> {
     fn set_hardware_decoding(&self, on: bool) {
         self.inner.set_hardware_decoding(on)
     }
+    fn set_still_cache(&self, disk: Option<Arc<crate::disk_cache::DiskCache>>) {
+        self.inner.set_still_cache(disk)
+    }
     fn exact(&self) -> Option<&dyn FootageSource> {
         // (the exact view reads without this wrapper's cancellation: final renders finish)
         Some(exact_footage(self.inner))
     }
     fn cache_budget(&self) -> Option<usize> {
         self.inner.cache_budget()
+    }
+    fn cache_usage(&self) -> Option<FootageCacheUsage> {
+        self.inner.cache_usage()
     }
     fn vector_frame(&self, item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
         self.inner.vector_frame(item, footage, scale)
@@ -436,10 +466,26 @@ impl<'a> Renderer<'a> {
     }
 
     /// The proxy footage used for `item` under this render's Proxy Use, if any.
+    ///
+    /// An automatic proxy ([`effectcraft_project::Proxy::auto`]) is preview-only: under Current
+    /// Settings it is used only when this render reads through a preview view of the footage
+    /// (one with an [exact twin](FootageSource::exact): the viewer, RAM preview). Final renders
+    /// (Render Queue, exports, Save Frame As) read the exact view and so use the original; only
+    /// Use All Proxies renders with an automatic proxy.
     pub fn proxy_for(&self, item: ItemId) -> Option<&'a Footage> {
         let it = self.project.item(item)?;
         let px = it.proxy.as_deref()?;
-        (self.opts.proxy.uses(matches!(it.kind, ItemKind::Comp(_)), px.enabled) && px.footage.has_video).then_some(&px.footage)
+        let comp = matches!(it.kind, ItemKind::Comp(_));
+        let used = if px.auto {
+            match self.opts.proxy {
+                ProxyUse::UseAll => true,
+                ProxyUse::CurrentSettings => px.enabled && self.footage.exact().is_some(),
+                _ => false,
+            }
+        } else {
+            self.opts.proxy.uses(comp, px.enabled)
+        };
+        (used && px.footage.has_video).then_some(&px.footage)
     }
 
     /// A decoded frame of `f` as a layer buffer covering `w`×`h` layer pixels (the footage's

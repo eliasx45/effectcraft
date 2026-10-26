@@ -94,6 +94,79 @@ fn set_first_vertex_and_free_transform() {
     assert!(s.execute("path.freeTransform", json!({})).is_err());
 }
 
+/// The viewer's Free Transform box sends a general matrix (scale along a rotated box's axes), and
+/// every step of one drag shares a `merge` key: the whole drag is one undo step, and a path with a
+/// stopwatch gets a key at the current time.
+#[test]
+fn free_transform_matrix_merges_into_one_undo_step() {
+    let mut s = comp();
+    let (l, m) = masked(&mut s);
+    s.state.selected_vertices.clear();
+    let before = mask_path(&s, l, m);
+    // Mirror X about x = 200 (a = -1, e = 400), then move 5 down, as two steps of one drag.
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "matrix": [-1, 0, 0, 1, 400, 0], "merge": "ft-1"})).unwrap();
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "offset": [0, 5], "merge": "ft-1"})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert_eq!(p.vertices[0], [300.0, 105.0]);
+    assert_eq!(p.vertices[1], [100.0, 105.0]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mask_path(&s, l, m), before, "one undo step undoes the whole drag");
+    assert!(s.execute("path.freeTransform", json!({"layer": l, "mask": m, "matrix": [1, 0, 0]})).is_err());
+    // With the stopwatch on, the drag keys the path at the current time.
+    let g = layer(&s, l).masks().unwrap().find_group(m).unwrap().get("path").unwrap().uid;
+    s.execute("prop.toggleAnimation", json!({"layer": l, "prop": g, "value": true})).unwrap();
+    s.execute("time.set", json!({"time": 1.0})).unwrap();
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "offset": [10, 0]})).unwrap();
+    let ly = layer(&s, l);
+    let pr = ly.masks().unwrap().find_group(m).unwrap().get("path").unwrap();
+    assert_eq!(pr.keys.len(), 2, "a key at 1 s next to the first one");
+}
+
+/// What agents drive (`path.freeTransform` with offset / scale / rotation about an `anchor`): the
+/// whole mask moves, scales and turns about the given point; on an animated path one drag (one
+/// `merge` key) adds one key at the current time, and one undo removes it and keeps the first key.
+#[test]
+fn free_transform_about_an_anchor_and_undo_on_an_animated_mask() {
+    let mut s = comp();
+    let (l, m) = masked(&mut s);
+    s.state.selected_vertices.clear();
+    let start = mask_path(&s, l, m);
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9;
+    // Move down 30: every point follows.
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "offset": [0, 30]})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert!(p.vertices.iter().zip(&start.vertices).all(|(v, c)| near(*v, [c[0], c[1] + 30.0])), "{p:?}");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mask_path(&s, l, m), start);
+    // Scale 200 % about the top-left corner (100, 100): it stays, the opposite corner doubles away.
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "scale": 200, "anchor": [100, 100]})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert!(near(p.vertices[0], [100.0, 100.0]) && near(p.vertices[2], [500.0, 300.0]), "{p:?}");
+    s.execute("edit.undo", json!({})).unwrap();
+    // Rotate 90° about the bottom-left corner (100, 200): (300, 200) goes to (100, 400).
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "rotation": 90, "anchor": [100, 200]})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert!(near(p.vertices[3], [100.0, 200.0]) && near(p.vertices[2], [100.0, 400.0]), "{p:?}");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mask_path(&s, l, m), start);
+    // Animated: a key at 0 s, then a drag at 2 s in three steps sharing one merge key.
+    s.execute("prop.addKey", json!({"layer": l, "path": "masks/#1/path", "time": 0.0})).unwrap();
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    for _ in 0..3 {
+        s.execute("path.freeTransform", json!({"layer": l, "mask": m, "offset": [0, 10], "merge": "ft-anim"})).unwrap();
+    }
+    let keys = |s: &Session| layer(s, l).masks().unwrap().find_group(m).unwrap().get("path").unwrap().keys.clone();
+    let k = keys(&s);
+    assert_eq!(k.len(), 2, "one key added at 2 s");
+    let moved = k[1].value.as_path().unwrap().clone();
+    assert!(moved.vertices.iter().zip(&start.vertices).all(|(v, c)| near(*v, [c[0], c[1] + 30.0])), "{moved:?}");
+    assert_eq!(k[0].value.as_path(), Some(&start), "the first key is untouched");
+    s.execute("edit.undo", json!({})).unwrap();
+    let k = keys(&s);
+    assert_eq!(k.len(), 1, "one undo removes the whole drag's key");
+    assert_eq!(k[0].value.as_path(), Some(&start));
+}
+
 #[test]
 fn group_and_ungroup_shapes() {
     let mut s = comp();

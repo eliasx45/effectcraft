@@ -29,8 +29,10 @@ use serde_json::json;
 
 use super::effect_controls::gesture_key;
 use super::fx_widgets as fw;
+use crate::panels::timeline::TimelineHost;
+use crate::panels::timeline::ids::tl_id;
 use crate::theme::Tokens;
-use crate::{EffectcraftApp, widgets};
+use crate::widgets;
 
 type Actions = Vec<(String, serde_json::Value)>;
 
@@ -58,16 +60,16 @@ fn set_str(actions: &mut Actions, layer: &Layer, g: &PropGroup, id: &str, v: Str
 }
 
 /// Register automation ids for a curve's control points (`<prefix>.point.<i>`).
-fn register_points(app: &mut EffectcraftApp, prefix: &str, gr: Rect, pts: &[[f32; 2]]) {
+fn register_points(app: &mut dyn TimelineHost, prefix: &str, gr: Rect, pts: &[[f32; 2]]) {
     for (i, q) in pts.iter().enumerate() {
         let s = pos2(gr.min.x + q[0] * gr.width(), gr.max.y - q[1] * gr.height());
-        app.auto.add(&format!("{prefix}.point.{i}"), Rect::from_center_size(s, vec2(9.0, 9.0)), &format!("Point {}", i + 1));
+        app.auto_mut().add(&format!("{prefix}.point.{i}"), Rect::from_center_size(s, vec2(9.0, 9.0)), &format!("Point {}", i + 1));
     }
 }
 
 /// Small coloured tabs (`names[i]`, swatch `cols[i]`); returns the clicked one.
 fn tabs(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     p: &egui::Painter,
     x0: f32,
@@ -77,13 +79,13 @@ fn tabs(
     cols: &[Color32],
     id: &str,
 ) -> Option<usize> {
-    let t = app.tokens;
+    let t = app.tokens();
     let mut x = x0;
     let mut out = None;
     for (i, name) in names.iter().enumerate() {
         let w = if cols.is_empty() { 16.0 + name.chars().count() as f32 * 6.2 } else { 20.0 };
         let r = Rect::from_min_size(pos2(x, cy - 9.0), vec2(w, 18.0));
-        let resp = ui.interact(r, egui::Id::new((id, i)), Sense::click());
+        let resp = ui.interact(r, tl_id((id, i)), Sense::click());
         let sel = i == cur;
         if sel {
             p.rect_filled(r, 3.0, t.row_selected);
@@ -101,7 +103,7 @@ fn tabs(
                 p.text(r.center(), Align2::CENTER_CENTER, *name, Tokens::ui(11.0), if sel { t.text } else { t.text_dim });
             }
         }
-        app.auto.add(&format!("{id}.{i}"), r, name);
+        app.auto_mut().add(&format!("{id}.{i}"), r, name);
         if resp.clicked() {
             out = Some(i);
         }
@@ -111,11 +113,11 @@ fn tabs(
     out
 }
 
-fn reset_link(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, r: Rect, id: &str) -> bool {
-    let t = app.tokens;
-    let resp = ui.interact(r, egui::Id::new(id), Sense::click());
+fn reset_link(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, r: Rect, id: &str) -> bool {
+    let t = app.tokens();
+    let resp = ui.interact(r, tl_id(id), Sense::click());
     p.text(r.center(), Align2::CENTER_CENTER, tr("Reset"), Tokens::ui(11.5), if resp.hovered() { t.hot_text } else { t.text_dim });
-    app.auto.add(id, r, "Reset");
+    app.auto_mut().add(id, r, "Reset");
     resp.clicked()
 }
 
@@ -140,7 +142,7 @@ pub fn inline_height(effect: &str, path: &str, width: f32) -> f32 {
 /// Draw the editor of group `g` (at `path`) in `r`. `root`: the effect's group.
 #[allow(clippy::too_many_arguments)]
 pub fn inline_editor(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     p: &egui::Painter,
     layer: &Layer,
@@ -164,7 +166,7 @@ const RGB_CURVES: [(&str, &str); 4] = [("master", "Master"), ("red", "Red"), ("g
 
 #[allow(clippy::too_many_arguments)]
 fn rgb_curves(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     p: &egui::Painter,
     layer: &Layer,
@@ -174,16 +176,16 @@ fn rgb_curves(
     r: Rect,
     actions: &mut Actions,
 ) {
-    let t = app.tokens;
+    let t = app.tokens();
     let euid = root.uid;
     let prefix = format!("effectControls.effect.{euid}.lumetri.rgbCurves");
-    let ch = app.ui.fx_curve_channel.get(&g.uid).copied().unwrap_or(0).min(3);
+    let ch = app.ui().fx_curve_channel.get(&g.uid).copied().unwrap_or(0).min(3);
     let x0 = r.min.x + 38.0;
     let cy = r.min.y + 15.0;
     let cols = [Color32::from_gray(0xe8), Color32::from_rgb(0xf0, 0x50, 0x50), Color32::from_rgb(0x50, 0xd0, 0x60), Color32::from_rgb(0x50, 0x80, 0xff)];
     let names: Vec<&str> = RGB_CURVES.iter().map(|c| c.1).collect();
     if let Some(n) = tabs(app, ui, p, x0, cy, ch, &names, &cols, &format!("{prefix}.channel")) {
-        app.ui.fx_curve_channel.insert(g.uid, n);
+        app.ui_mut().fx_curve_channel.insert(g.uid, n);
     }
     let id = RGB_CURVES[ch].0;
     let cur = fw::CurvePoints::parse(&str_value(layer, ectx, g, id));
@@ -192,9 +194,9 @@ fn rgb_curves(
         set_str(actions, layer, g, id, fw::CurvePoints::identity().format(), None);
     }
     let gr = Rect::from_min_size(pos2(x0, r.min.y + 30.0), vec2(size, size));
-    let gid = egui::Id::new(("lumetri-rgb", euid, ch));
+    let gid = tl_id(("lumetri-rgb", euid, ch));
     let (resp, edit) = fw::curves_graph(ui, gr, &cur, ch, false, gid, &t);
-    app.auto.add(&format!("{prefix}.graph"), gr, "RGB Curves");
+    app.auto_mut().add(&format!("{prefix}.graph"), gr, "RGB Curves");
     register_points(app, &prefix, gr, &cur.0);
     let key = gesture_key(ui, gid, resp.drag_started() || resp.clicked());
     if let Some(np) = edit.changed {
@@ -271,7 +273,7 @@ fn hue_color(h: f32) -> Color32 {
 
 #[allow(clippy::too_many_arguments)]
 fn huesat_curves(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     p: &egui::Painter,
     layer: &Layer,
@@ -281,15 +283,15 @@ fn huesat_curves(
     r: Rect,
     actions: &mut Actions,
 ) {
-    let t = app.tokens;
+    let t = app.tokens();
     let euid = root.uid;
     let prefix = format!("effectControls.effect.{euid}.lumetri.hueSatCurves");
-    let k = app.ui.fx_curve_channel.get(&g.uid).copied().unwrap_or(0).min(4);
+    let k = app.ui().fx_curve_channel.get(&g.uid).copied().unwrap_or(0).min(4);
     let x0 = r.min.x + 38.0;
     let cy = r.min.y + 15.0;
     let names: Vec<&str> = HUESAT.iter().map(|c| c.1).collect();
     if let Some(n) = tabs(app, ui, p, x0, cy, k, &names, &[], &format!("{prefix}.curve")) {
-        app.ui.fx_curve_channel.insert(g.uid, n);
+        app.ui_mut().fx_curve_channel.insert(g.uid, n);
     }
     let (id, name, axis, periodic) = HUESAT[k];
     let cur = OffsetPoints::parse(&str_value(layer, ectx, g, id));
@@ -321,9 +323,9 @@ fn huesat_curves(
         })
         .collect();
     p.add(egui::Shape::line(line, Stroke::new(1.5, Color32::from_gray(0xe8))));
-    let gid = egui::Id::new(("lumetri-hs", euid, k));
+    let gid = tl_id(("lumetri-hs", euid, k));
     let resp = ui.interact(gr.expand(6.0), gid, Sense::click_and_drag());
-    app.auto.add(&format!("{prefix}.graph"), gr, name);
+    app.auto_mut().add(&format!("{prefix}.graph"), gr, name);
     let drag_id = gid.with("drag");
     let dragging: Option<usize> = ui.data(|d| d.get_temp(drag_id));
     for (i, q) in cur.0.iter().enumerate() {
@@ -331,7 +333,7 @@ fn huesat_curves(
         let hr = Rect::from_center_size(s, vec2(7.0, 7.0));
         p.circle_filled(s, 3.5, if dragging == Some(i) { Color32::WHITE } else { Color32::from_rgb(0x1c, 0x1c, 0x1c) });
         p.circle_stroke(s, 3.5, Stroke::new(1.2, Color32::WHITE));
-        app.auto.add(&format!("{prefix}.point.{i}"), hr, &format!("Point {}", i + 1));
+        app.auto_mut().add(&format!("{prefix}.point.{i}"), hr, &format!("Point {}", i + 1));
     }
     let to_g = |s: Pos2| [((s.x - gr.min.x) / gr.width()).clamp(0.0, 1.0), ((gr.max.y - s.y) / gr.height()).clamp(0.0, 1.0)];
     let hit_r = [7.0 / gr.width(), 7.0 / gr.height()];
@@ -340,7 +342,7 @@ fn huesat_curves(
     // One undo step per click or drag.
     let key = gesture_key(ui, gid, resp.drag_started() || resp.clicked());
     if resp.drag_started()
-        && let Some(pt) = ui.input(|i| i.pointer.press_origin())
+        && let Some(pt) = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.press_origin()))
     {
         let q = to_g(pt);
         let i = match cur.hit(q[0], q[1], hit_r) {
@@ -443,7 +445,7 @@ fn wheel_point(c: Pos2, radius: f32, phase: f32) -> Pos2 {
 
 #[allow(clippy::too_many_arguments)]
 fn colorama_wheel(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     p: &egui::Painter,
     layer: &Layer,
@@ -453,7 +455,7 @@ fn colorama_wheel(
     r: Rect,
     actions: &mut Actions,
 ) {
-    let t = app.tokens;
+    let t = app.tokens();
     let euid = root.uid;
     let prefix = format!("effectControls.effect.{euid}.colorama");
     let preset = g.get("usePresetPalette").map(|pr| ectx.value(layer, pr).as_enum()).unwrap_or(0);
@@ -476,10 +478,10 @@ fn colorama_wheel(
     }
     p.circle_stroke(c, outer, Stroke::new(1.0, Color32::from_black_alpha(160)));
     p.circle_stroke(c, inner, Stroke::new(1.0, Color32::from_black_alpha(160)));
-    let wid = egui::Id::new(("colorama-wheel", euid));
+    let wid = tl_id(("colorama-wheel", euid));
     let ring = Rect::from_center_size(c, vec2(outer * 2.0 + 40.0, outer * 2.0 + 40.0));
     let resp = ui.interact(ring, wid, Sense::click_and_drag());
-    app.auto.add(&format!("{prefix}.wheel"), ring, "Output Cycle");
+    app.auto_mut().add(&format!("{prefix}.wheel"), ring, "Output Cycle");
     let sel_id = wid.with("sel");
     let drag_id = wid.with("drag");
     let mut sel: usize = ui.data(|d| d.get_temp(sel_id)).unwrap_or(0);
@@ -500,7 +502,7 @@ fn colorama_wheel(
             Stroke::new(if i == sel || dragging == Some(i) { 1.6 } else { 1.0 }, if i == sel { Color32::WHITE } else { Color32::from_gray(0x80) }),
         ));
         let hr = Rect::from_center_size(wheel_point(c, outer + 8.0, *ph), vec2(14.0, 14.0));
-        app.auto.add(&format!("{prefix}.stop.{i}"), hr, &format!("Stop {}", i + 1));
+        app.auto_mut().add(&format!("{prefix}.stop.{i}"), hr, &format!("Stop {}", i + 1));
         stop_rects.push(hr);
     }
     let hit = |q: Pos2| -> Option<usize> {
@@ -516,7 +518,7 @@ fn colorama_wheel(
     // One undo step per click or drag (a colour pick is its own step).
     let key = gesture_key(ui, wid, resp.drag_started() || resp.clicked() || !resp.dragged());
     if resp.drag_started()
-        && let Some(q) = ui.input(|i| i.pointer.press_origin())
+        && let Some(q) = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.press_origin()))
         && let Some(i) = hit(q)
     {
         ui.data_mut(|d| {
@@ -575,7 +577,7 @@ fn colorama_wheel(
         if widgets::swatch(ui, sr, col, wid.with("swatch"), &t).clicked() {
             widgets::open_popup(ui, pop);
         }
-        app.auto.add(&format!("{prefix}.color"), sr, "Stop color");
+        app.auto_mut().add(&format!("{prefix}.color"), sr, "Stop color");
         p.text(
             pos2(sr.max.x + 8.0, sr.center().y),
             Align2::LEFT_CENTER,
@@ -629,7 +631,7 @@ pub fn header_height(effect: &str, g: &PropGroup, width: f32) -> f32 {
 
 #[allow(clippy::too_many_arguments)]
 pub fn header_editor(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     p: &egui::Painter,
     layer: &Layer,
@@ -658,8 +660,8 @@ pub fn join_map(m: &[fw::CurvePoints; 3]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn glow_map(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, layer: &Layer, g: &PropGroup, ectx: &EvalCtx, r: Rect, actions: &mut Actions) {
-    let t = app.tokens;
+fn glow_map(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, layer: &Layer, g: &PropGroup, ectx: &EvalCtx, r: Rect, actions: &mut Actions) {
+    let t = app.tokens();
     let euid = g.uid;
     let prefix = format!("effectControls.effect.{euid}.glow");
     let mode = g.get("colors").map(|pr| ectx.value(layer, pr).as_enum()).unwrap_or(0);
@@ -696,15 +698,15 @@ fn glow_map(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, laye
         p.rect_filled(Rect::from_min_max(pos2(x, strip.min.y), pos2(x + strip.width() / n as f32 + 0.5, strip.max.y)), 0.0, color_at(f));
     }
     p.rect_stroke(strip, 0.0, Stroke::new(1.0, t.field_border), StrokeKind::Outside);
-    app.auto.add(&format!("{prefix}.colorMap"), strip, "Glow colour map");
+    app.auto_mut().add(&format!("{prefix}.colorMap"), strip, "Glow colour map");
     p.text(pos2(strip.max.x + 8.0, strip.center().y), Align2::LEFT_CENTER, tr("Colour map"), Tokens::ui(10.5), t.text_faint);
     if mode != 2 {
         return;
     }
-    let ch = app.ui.fx_curve_channel.get(&euid).copied().unwrap_or(0).min(2);
+    let ch = app.ui().fx_curve_channel.get(&euid).copied().unwrap_or(0).min(2);
     let cols = [Color32::from_rgb(0xf0, 0x50, 0x50), Color32::from_rgb(0x50, 0xd0, 0x60), Color32::from_rgb(0x50, 0x80, 0xff)];
     if let Some(n) = tabs(app, ui, p, x0, r.min.y + 15.0, ch, &["Red", "Green", "Blue"], &cols, &format!("{prefix}.channel")) {
-        app.ui.fx_curve_channel.insert(euid, n);
+        app.ui_mut().fx_curve_channel.insert(euid, n);
     }
     if reset_link(app, ui, p, Rect::from_min_size(pos2(x0 + size - 44.0, r.min.y + 6.0), vec2(44.0, 18.0)), &format!("{prefix}.reset")) {
         let mut m = map.clone();
@@ -712,9 +714,9 @@ fn glow_map(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, laye
         set_str(actions, layer, g, "arbitraryMap", join_map(&m), None);
     }
     let gr = Rect::from_min_size(pos2(x0, r.min.y + 30.0), vec2(size, size));
-    let gid = egui::Id::new(("glow-map", euid, ch));
+    let gid = tl_id(("glow-map", euid, ch));
     let (resp, edit) = fw::curves_graph(ui, gr, &map[ch], ch + 1, false, gid, &t);
-    app.auto.add(&format!("{prefix}.graph"), gr, "Arbitrary Map");
+    app.auto_mut().add(&format!("{prefix}.graph"), gr, "Arbitrary Map");
     register_points(app, &prefix, gr, &map[ch].0);
     let key = gesture_key(ui, gid, resp.drag_started() || resp.clicked());
     if let Some(np) = edit.changed {
@@ -771,7 +773,7 @@ pub fn add_pair(v: &[(f64, f64)]) -> (f64, f64) {
 
 #[allow(clippy::too_many_arguments)]
 fn reshape_buttons(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     p: &egui::Painter,
     layer: &Layer,
@@ -780,28 +782,28 @@ fn reshape_buttons(
     r: Rect,
     actions: &mut Actions,
 ) {
-    let t = app.tokens;
+    let t = app.tokens();
     let euid = g.uid;
     let pairs = parse_pairs(&str_value(layer, ectx, g, "correspondencePoints"));
     let b1 = Rect::from_min_size(pos2(r.min.x + 24.0, r.min.y + 4.0), vec2(84.0, 22.0));
     let b2 = Rect::from_min_size(pos2(b1.max.x + 8.0, b1.min.y), vec2(96.0, 22.0));
     let b3 = Rect::from_min_size(pos2(b2.max.x + 8.0, b1.min.y), vec2(56.0, 22.0));
-    if widgets::text_button(ui, b1, "Add Point", false, &t, egui::Id::new(("reshape-add", euid))).clicked() {
+    if widgets::text_button(ui, b1, "Add Point", false, &t, tl_id(("reshape-add", euid))).clicked() {
         let mut v = pairs.clone();
         v.push(add_pair(&pairs));
         set_str(actions, layer, g, "correspondencePoints", format_pairs(&v), None);
     }
-    app.auto.add(&format!("effectControls.effect.{euid}.reshape.add"), b1, "Add Point");
-    if widgets::text_button(ui, b2, "Remove Point", false, &t, egui::Id::new(("reshape-remove", euid))).clicked() && !pairs.is_empty() {
+    app.auto_mut().add(&format!("effectControls.effect.{euid}.reshape.add"), b1, "Add Point");
+    if widgets::text_button(ui, b2, "Remove Point", false, &t, tl_id(("reshape-remove", euid))).clicked() && !pairs.is_empty() {
         let mut v = pairs.clone();
         v.pop();
         set_str(actions, layer, g, "correspondencePoints", format_pairs(&v), None);
     }
-    app.auto.add(&format!("effectControls.effect.{euid}.reshape.remove"), b2, "Remove Point");
-    if widgets::text_button(ui, b3, "Clear", false, &t, egui::Id::new(("reshape-clear", euid))).clicked() && !pairs.is_empty() {
+    app.auto_mut().add(&format!("effectControls.effect.{euid}.reshape.remove"), b2, "Remove Point");
+    if widgets::text_button(ui, b3, "Clear", false, &t, tl_id(("reshape-clear", euid))).clicked() && !pairs.is_empty() {
         set_str(actions, layer, g, "correspondencePoints", String::new(), None);
     }
-    app.auto.add(&format!("effectControls.effect.{euid}.reshape.clear"), b3, "Clear");
+    app.auto_mut().add(&format!("effectControls.effect.{euid}.reshape.clear"), b3, "Clear");
     let status = if pairs.is_empty() {
         "Correspondence: automatic (select the effect to edit points on the viewer)".to_string()
     } else {
@@ -836,7 +838,7 @@ fn extractor_layer(vals: &[String; 4]) -> Option<&str> {
 /// undo step, as After Effects' EXtractoR dialog does.
 #[allow(clippy::too_many_arguments)]
 fn extractor_layers(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     p: &egui::Painter,
     layer: &Layer,
@@ -845,7 +847,7 @@ fn extractor_layers(
     r: Rect,
     actions: &mut Actions,
 ) {
-    let t = app.tokens;
+    let t = app.tokens();
     let euid = g.uid;
     let vals = EXTRACTOR_CHANNELS.map(|id| str_value(layer, ectx, g, id));
     let label = match extractor_layer(&vals) {
@@ -857,19 +859,19 @@ fn extractor_layers(
     p.text(pos2(r.min.x + 37.0, r.center().y), Align2::LEFT_CENTER, tr("Layer"), Tokens::ui(12.0), t.text);
     let vx = (r.min.x + r.width() * 0.48).max(r.min.x + 161.0);
     let dr = Rect::from_min_size(pos2(vx, r.center().y - 9.0), vec2((r.max.x - vx - 56.0).clamp(80.0, 200.0), 18.0));
-    let pop = egui::Id::new(("extractor-layers", euid));
-    if widgets::dropdown(ui, dr, &label, &t, egui::Id::new(("extractor-layer", euid)))
+    let pop = tl_id(("extractor-layers", euid));
+    if widgets::dropdown(ui, dr, &label, &t, tl_id(("extractor-layer", euid)))
         .on_hover_text(tr("The OpenEXR layer shown in red, green, blue and alpha"))
         .clicked()
     {
         widgets::open_popup(ui, pop);
     }
-    app.auto.add(&format!("effectControls.effect.{euid}.extractor.layer"), dr, "Layer");
+    app.auto_mut().add(&format!("effectControls.effect.{euid}.extractor.layer"), dr, "Layer");
     // The footage's layers, read only while the list is open (each frame of a sequence is a file).
     if !widgets::popup_is_open(ui, pop) {
         return;
     }
-    let aux = app.session.layer_channels(layer.id);
+    let aux = app.session().layer_channels(layer.id);
     let layers: Vec<&str> = aux.as_ref().map(|a| a.layers()).unwrap_or_default();
     let names: Vec<String> = match layers.as_slice() {
         [] => vec!["No layers: not a multi-layer OpenEXR file".into()],
@@ -888,7 +890,7 @@ fn extractor_layers(
 /// An EXtractoR channel popup (in place of a text field): the layer's own R, G, B and A, then
 /// every channel of its OpenEXR footage, and (none).
 pub fn channel_popup(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     layer: &Layer,
     prop: &effectcraft_engine::project::Property,
@@ -896,19 +898,19 @@ pub fn channel_popup(
     r: Rect,
     actions: &mut Actions,
 ) {
-    let t = app.tokens;
+    let t = app.tokens();
     let uid = prop.uid;
     let label = if cur.trim().is_empty() { NO_CHANNEL } else { cur };
-    let pop = egui::Id::new(("ec-chpop", uid));
-    if widgets::dropdown(ui, r, label, &t, egui::Id::new(("ec-ch", uid))).clicked() {
+    let pop = tl_id(("ec-chpop", uid));
+    if widgets::dropdown(ui, r, label, &t, tl_id(("ec-ch", uid))).clicked() {
         widgets::open_popup(ui, pop);
     }
-    app.auto.add(&format!("effectControls.prop.{uid}.value"), r, &prop.name);
+    app.auto_mut().add(&format!("effectControls.prop.{uid}.value"), r, &prop.name);
     if !widgets::popup_is_open(ui, pop) {
         return;
     }
     let mut opts: Vec<String> = ["R", "G", "B", "A"].map(String::from).to_vec();
-    if let Some(aux) = app.session.layer_channels(layer.id) {
+    if let Some(aux) = app.session().layer_channels(layer.id) {
         opts.extend(aux.names().into_iter().filter(|n| !opts.iter().any(|o| o.eq_ignore_ascii_case(n))).map(String::from).collect::<Vec<_>>());
     }
     opts.push(NO_CHANNEL.into());
@@ -949,7 +951,7 @@ pub fn nearest_fraction(pts: &[[f64; 2]], closed: bool, q: [f64; 2]) -> f64 {
 /// handles; dragging a handle slides it along its outline (one undo step per drag).
 #[allow(clippy::too_many_arguments)]
 pub fn reshape_overlay(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     map: &super::viewer::ViewerMap,
@@ -992,13 +994,13 @@ pub fn reshape_overlay(
         painter.line_segment([ps, pd], Stroke::new(1.0, Color32::from_white_alpha(150)));
         for (end, s, col) in [(0usize, ps, ys), (1, pd, cs)] {
             let hr = Rect::from_center_size(s, vec2(12.0, 12.0));
-            let id = egui::Id::new(("reshape-pt", g.uid, i, end));
+            let id = tl_id(("reshape-pt", g.uid, i, end));
             let resp = ui.interact(hr, id, Sense::drag());
             let hot = resp.hovered() || resp.dragged();
             painter.rect_filled(Rect::from_center_size(s, vec2(7.0, 7.0)), 0.0, if hot { Color32::WHITE } else { col });
             painter.rect_stroke(Rect::from_center_size(s, vec2(7.0, 7.0)), 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Outside);
             let which = if end == 0 { "source" } else { "dest" };
-            app.auto.add(&format!("viewer.reshape.{}.{which}.{i}", g.uid), hr, &format!("Correspondence point {} ({which})", i + 1));
+            app.auto_mut().add(&format!("viewer.reshape.{}.{which}.{i}", g.uid), hr, &format!("Correspondence point {} ({which})", i + 1));
             if hot {
                 ctx.set_cursor_icon(egui::CursorIcon::Move);
             }
@@ -1050,7 +1052,7 @@ fn format_mesh(offs: &[(f64, f64)]) -> String {
 /// space to comp.
 #[allow(clippy::too_many_arguments)]
 pub fn mesh_warp_overlay(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     map: &super::viewer::ViewerMap,
@@ -1083,17 +1085,17 @@ pub fn mesh_warp_overlay(
         }
     }
     let ctx = ui.ctx().clone();
-    let accent = app.tokens.accent;
+    let accent = app.tokens().accent;
     for (k, s) in screen.iter().enumerate() {
         let hr = Rect::from_center_size(*s, vec2(10.0, 10.0));
-        let id = egui::Id::new(("mesh-warp-vertex", g.uid, k));
+        let id = tl_id(("mesh-warp-vertex", g.uid, k));
         let resp = ui.interact(hr, id, Sense::drag());
         let hot = resp.hovered() || resp.dragged();
         let dot = Rect::from_center_size(*s, vec2(5.0, 5.0));
         painter.rect_filled(dot, 0.0, if hot { accent } else { Color32::WHITE });
         painter.rect_stroke(dot, 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Outside);
         let (row, col) = (k / (cols + 1), k % (cols + 1));
-        app.auto.add(&format!("viewer.meshWarp.{}.{row}.{col}", g.uid), hr, &format!("Mesh vertex (row {row}, column {col})"));
+        app.auto_mut().add(&format!("viewer.meshWarp.{}.{row}.{col}", g.uid), hr, &format!("Mesh vertex (row {row}, column {col})"));
         if hot {
             ctx.set_cursor_icon(egui::CursorIcon::Move);
         }

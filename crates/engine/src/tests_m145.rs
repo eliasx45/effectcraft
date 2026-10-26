@@ -189,13 +189,24 @@ fn cache_budgets_leave_reserved_ram_and_shrink_when_low() {
     p.memory.ram_reserved_gb = 6;
     let b = p.cache_budgets(None);
     assert_eq!((b.layer >> 20, b.preview >> 20, b.capped), (4096, 8192, false));
-    // 16 GB machine, 6 GB reserved: 16 GB of caches scaled into 10 GB.
-    let m = SysMemory { total: 16 << 30, available: 12 << 30 };
+    // 16 GB machine, 6 GB reserved (more than the 25 % Maximum Share of RAM for Caches leaves):
+    // 16 GB of caches scaled into 10 GB.
+    let m = SysMemory { total: 16 << 30, available: 12 << 30, pressure: None };
     let b = p.cache_budgets(Some(m));
     assert!(b.capped && !b.reduced);
     assert!(((b.layer + b.media + b.preview) as i64 - (10i64 << 30)).abs() < 4, "{b:?}");
+    // A lower Maximum Share wins over a smaller reserve: 50 % leaves 8 GB of caches.
+    p.memory.cache_max_percent = 50;
+    let half = p.cache_budgets(Some(m));
+    assert!(((half.layer + half.media + half.preview) as i64 - (8i64 << 30)).abs() < 4, "{half:?}");
+    p.memory.cache_max_percent = crate::prefs::DEFAULT_CACHE_MAX_PERCENT;
+    // A larger reserve still wins: 12 GB reserved leaves 4 GB.
+    p.memory.ram_reserved_gb = 12;
+    let b12 = p.cache_budgets(Some(m));
+    assert!(((b12.layer + b12.media + b12.preview) as i64 - (4i64 << 30)).abs() < 4, "{b12:?}");
+    p.memory.ram_reserved_gb = 6;
     // Low on memory: halved; off: not.
-    let low = SysMemory { total: 16 << 30, available: 512 << 20 };
+    let low = SysMemory { total: 16 << 30, available: 512 << 20, pressure: None };
     let r = p.cache_budgets(Some(low));
     assert!(r.reduced && r.preview < b.preview / 2 + 2);
     p.memory.reduce_cache_when_low = false;
@@ -203,24 +214,61 @@ fn cache_budgets_leave_reserved_ram_and_shrink_when_low() {
 }
 
 /// On a large-memory machine the layer and preview caches at their defaults grow with the RAM
-/// (64 GB: 8 and 16 GB); configured sizes and smaller machines keep theirs.
+/// (64 GB: 8 GB of layers, and 8 GB of compressed preview frames or 16 GB uncompressed);
+/// configured sizes and smaller machines keep theirs.
 #[test]
 fn default_cache_budgets_grow_with_a_large_memory() {
     use crate::sysinfo::SysMemory;
     let mut p = crate::prefs::Prefs::default();
-    let big = SysMemory { total: 64 << 30, available: 40 << 30 };
+    let big = SysMemory { total: 64 << 30, available: 40 << 30, pressure: None };
     let b = p.cache_budgets(Some(big));
-    assert_eq!((b.layer >> 30, b.media >> 20, b.preview >> 30, b.capped), (8, 1024, 16, false));
-    let small = SysMemory { total: 16 << 30, available: 12 << 30 };
+    // Compressed RAM preview frames (the default): 8 GB hold what 16 GB did and more.
+    assert_eq!((b.layer >> 30, b.media >> 20, b.preview >> 30, b.capped), (8, 1024, 8, false));
+    p.memory.preview_compress = false;
+    assert_eq!(p.cache_budgets(Some(big)).preview >> 30, 16, "uncompressed: a quarter of the memory");
+    p.memory.preview_compress = true;
+    let small = SysMemory { total: 16 << 30, available: 12 << 30, pressure: None };
     let b = p.cache_budgets(Some(small));
     assert_eq!((b.layer >> 20, b.preview >> 20), (1024, 3072));
     assert_eq!(p.cache_budgets(None).layer >> 20, 1024, "unknown memory: as configured");
     p.memory.layer_cache_mb = 2048;
     let b = p.cache_budgets(Some(big));
-    assert_eq!((b.layer >> 20, b.preview >> 30), (2048, 16), "a configured size is kept");
+    assert_eq!((b.layer >> 20, b.preview >> 30), (2048, 8), "a configured size is kept");
+    p.memory.preview_cache_mb = 32288;
+    p.memory.layer_cache_mb = 1024;
+    let b = p.cache_budgets(Some(big));
+    assert_eq!((b.preview >> 20, b.capped), (32288, false), "a configured preview size is kept, compressed or not");
     // Low on memory: halved as before.
-    let low = SysMemory { total: 64 << 30, available: 1 << 30 };
+    let low = SysMemory { total: 64 << 30, available: 1 << 30, pressure: None };
     assert!(p.cache_budgets(Some(low)).reduced);
+}
+
+/// MEM3: the owner's settings on the 64 GB Mac that froze on 22 Oct 2026 (10 GB reserved, a
+/// 32288 MB RAM preview, shared budget, compression on): the caches shared 40.5 GB, and nothing
+/// shrank them while macOS swapped. They keep their 40.5 GB under the default Maximum Share of
+/// RAM for Caches (75 %, 48 GB), and shrink to half under memory pressure and a quarter under
+/// critical pressure; at 50 % they share 32 GB.
+#[test]
+fn owner_cache_budgets_on_a_64_gb_mac_shrink_under_pressure() {
+    use crate::sysinfo::{MemoryPressure, SysMemory};
+    let mut p = crate::prefs::Prefs::default();
+    p.memory.ram_reserved_gb = 10;
+    p.memory.preview_cache_mb = 32288;
+    p.memory.idle_cache_cores = 4;
+    let at = |pressure| SysMemory { total: 64 << 30, available: 15 << 30, pressure: Some(pressure) };
+    let total = |b: &crate::prefs::CacheBudgets| b.shared.expect("shared").total;
+    // 8 GB of layers (an eighth of 64), 1 GB of footage, 32288 MB of preview frames.
+    let full = (8192u64 + 1024 + 32288) << 20;
+    let normal = p.cache_budgets(Some(at(MemoryPressure::Normal)));
+    assert!(!normal.capped && !normal.reduced, "{normal:?}");
+    assert!((total(&normal) as i64 - full as i64).abs() < 4, "{normal:?}");
+    let warning = p.cache_budgets(Some(at(MemoryPressure::Warning)));
+    assert!(warning.reduced && (total(&warning) as i64 - (full / 2) as i64).abs() < 8, "{warning:?}");
+    let critical = p.cache_budgets(Some(at(MemoryPressure::Critical)));
+    assert!(critical.reduced && (total(&critical) as i64 - (full / 4) as i64).abs() < 8, "{critical:?}");
+    p.memory.cache_max_percent = 50;
+    let half = p.cache_budgets(Some(at(MemoryPressure::Normal)));
+    assert!(half.capped && (total(&half) as i64 - (32i64 << 30)).abs() < 4, "{half:?}");
 }
 
 /// Eight stacked 1080p clips ran the browser build out of its 4 GiB of memory: the footage and

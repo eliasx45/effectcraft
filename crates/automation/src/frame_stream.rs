@@ -34,7 +34,7 @@ use effectcraft_engine::time::{FrameRate, Tick};
 use effectcraft_media::preview_stream::{ChunkSpec, encode_chunk, even};
 
 use crate::control_wire::lock;
-use crate::frame_server::{FrameRender, LogFn, Out, RenderJob, Rendered};
+use crate::frame_server::{FrameRender, LogFn, Out, RenderJob, Rendered, render_guarded};
 
 /// Chunks rendering or encoding at once per stream (encoding a chunk takes longer than
 /// rendering it on a busy CPU, so several encode at once).
@@ -63,6 +63,8 @@ const AHEAD_ENCODE_THREADS: usize = 1;
 pub(crate) struct StreamHost {
     pub render: Arc<dyn FrameRender>,
     pub cache: Arc<LayerCache>,
+    /// Finished frames (CR8): full-size frames come from it and go to it.
+    pub frames: Arc<crate::frame_cache::FrameCache>,
     pub log: LogFn,
     /// Render workers per stream.
     pub render_threads: usize,
@@ -114,7 +116,23 @@ impl Streams {
     pub(crate) fn message(&mut self, m: StreamMsg) {
         let id = m.stream();
         match m {
-            StreamMsg::Start { stream, revision, comp, from, to, loop_from, looping, opts, codec, crf, chunk_frames, ahead_secs, adaptive, max_size } => {
+            StreamMsg::Start {
+                stream,
+                revision,
+                comp,
+                from,
+                to,
+                loop_from,
+                looping,
+                opts,
+                codec,
+                crf,
+                chunk_frames,
+                ahead_secs,
+                adaptive,
+                max_size,
+                cache,
+            } => {
                 if let Some(old) = self.live.remove(&stream) {
                     old.stop();
                 }
@@ -154,6 +172,7 @@ impl Streams {
                     full,
                     rate,
                     bg: c.background,
+                    cache,
                 };
                 let shared = Arc::new(Shared::new(self.host.clone(), self.out.clone(), self.conn, stream, p, revision, project, start));
                 if let Err(e) = shared.spawn() {
@@ -185,6 +204,14 @@ impl Streams {
                 }
             }
         }
+    }
+
+    /// Whether a stream is playing (and has chunks left to make).
+    pub(crate) fn playing(&self) -> bool {
+        self.live.values().any(|s| {
+            let st = lock(&s.state);
+            !st.stop && st.playing && st.ended.is_none()
+        })
     }
 
     /// The connection closed: stop every stream.
@@ -225,6 +252,8 @@ struct Params {
     full: (u32, u32),
     rate: FrameRate,
     bg: [f32; 3],
+    /// The viewer's frame series in the frame cache, until the first edit.
+    cache: Option<effectcraft_engine::remote::CacheSeries>,
 }
 
 impl Params {
@@ -287,6 +316,7 @@ struct FrameJob {
     project: Arc<Project>,
     slot: usize,
     time: Tick,
+    frame: i64,
 }
 
 /// A chunk's frames as they come in.
@@ -505,6 +535,8 @@ impl Shared {
         let from = rs::first_change(&st.project, project, st.p.comp);
         st.project = project.clone();
         st.revision = revision;
+        // Another content key: the frame cache's frames are not this revision's.
+        st.p.cache = None;
         let from = from?;
         let f = st.p.rate.frame_at(from).max(st.p.lo);
         self.forget_from(&mut st, f);
@@ -570,6 +602,9 @@ impl Shared {
                 let lead = st.lead();
                 let missing = window.iter().copied().find(|c| !st.sent.contains_key(c) && !st.flying.contains_key(c));
                 let next = match missing {
+                    // Frames the frame cache holds cost an encode only: full size from the first
+                    // chunk (no low-resolution warm-up copy sent first and its upgrade after).
+                    Some(c) if self.cached(&st, c) => Some((c, 0)),
                     Some(c) => Some((c, st.level(lead))),
                     // The window is full: send chunks below full size again at full size, if
                     // there is time for it before the app plays them (paused: always).
@@ -609,6 +644,12 @@ impl Shared {
         }
     }
 
+    /// Whether the frame cache holds every frame of chunk `c` at full size (CR8).
+    fn cached(&self, st: &State, c: i64) -> bool {
+        let (Some(series), Some((first, count))) = (st.p.cache.as_ref(), st.p.frames(c)) else { return false };
+        (first..first.saturating_add(i64::from(count))).all(|f| series.key(f).is_some_and(|k| self.host.frames.contains(k)))
+    }
+
     /// Queue chunk `c`'s frames at `level`.
     fn issue(&self, st: &mut State, c: i64, level: usize, lead: f64) {
         let Some((first, count)) = st.p.frames(c) else { return };
@@ -628,7 +669,10 @@ impl Shared {
         }));
         for slot in 0..count as usize {
             let time = st.p.rate.tick_of(first + slot as i64);
-            st.jobs.insert((order, slot), FrameJob { chunk: Arc::clone(&chunk), index: c, level, project: st.project.clone(), slot, time });
+            st.jobs.insert(
+                (order, slot),
+                FrameJob { chunk: Arc::clone(&chunk), index: c, level, project: st.project.clone(), slot, time, frame: first + slot as i64 },
+            );
         }
         st.flying.insert(c, Flight { epoch: st.epoch });
         self.work.notify_all();
@@ -643,7 +687,7 @@ impl Shared {
 
     fn render_worker(self: Arc<Self>) {
         loop {
-            let (job, opts, comp, scale) = {
+            let (job, opts, comp, scale, key) = {
                 let mut st = lock(&self.state);
                 loop {
                     if st.stop {
@@ -651,7 +695,9 @@ impl Shared {
                     }
                     if let Some((_, j)) = st.jobs.pop_first() {
                         let scale = LEVELS.get(j.level).copied().unwrap_or(1.0);
-                        break (j, st.p.opts, st.p.comp, scale);
+                        // Full-size frames only: they are the viewer's frames.
+                        let key = st.p.cache.as_ref().filter(|_| j.level == 0).and_then(|c| c.key(j.frame));
+                        break (j, st.p.opts, st.p.comp, scale, key);
                     }
                     st = self.work.wait_timeout(st, Duration::from_millis(200)).map(|(g, _)| g).unwrap_or_else(|e| e.into_inner().0);
                 }
@@ -659,13 +705,26 @@ impl Shared {
             let project = job.project.clone();
             let base = if opts.scale > 0.0 { opts.scale } else { 1.0 };
             let opts = RenderOpts { scale: base * f64::from(scale), ..opts };
-            let rendered = self.host.render.render(&RenderJob { project: &project, comp, time: job.time, opts, cache: &self.host.cache, times: None });
-            let frame = match rendered {
-                Ok((Rendered::Image(img), _)) => Ok((img.width, img.height, remote_encode::rgba8_premultiplied_par(&img))),
-                Ok((Rendered::Rgba8 { width, height, bytes }, _)) => Ok((width, height, bytes)),
-                Err(e) => {
-                    self.log(&format!("frame at {:.3} s: {e}", job.time.seconds()));
-                    Err(e)
+            let cached = key.and_then(|k| self.host.frames.get(k)).map(|f| (f.width, f.height, f.rgba.as_ref().clone()));
+            let frame = match cached {
+                Some(f) => Ok(f),
+                None => {
+                    let rendered = render_guarded(
+                        self.host.render.as_ref(),
+                        &RenderJob { project: &project, comp, time: job.time, opts, cache: &self.host.cache, times: None },
+                    );
+                    let frame = match rendered {
+                        Ok((Rendered::Image(img), _)) => Ok((img.width, img.height, remote_encode::rgba8_premultiplied_par(&img))),
+                        Ok((Rendered::Rgba8 { width, height, bytes }, _)) => Ok((width, height, bytes)),
+                        Err(e) => {
+                            self.log(&format!("frame at {:.3} s: {e}", job.time.seconds()));
+                            Err(e)
+                        }
+                    };
+                    if let (Ok((w, h, px)), Some(k)) = (&frame, key) {
+                        self.host.frames.put(k, *w, *h, Arc::new(px.clone()));
+                    }
+                    frame
                 }
             };
             let complete = {

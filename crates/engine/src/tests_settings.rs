@@ -292,6 +292,8 @@ fn renamed_labels_show_in_the_label_menu_and_apply_by_name() {
 #[test]
 fn cache_budgets_are_applied() {
     let mut s = Session::default();
+    // Each cache on its own budget (the shared budget is `shared_budget_limits_and_off_switch`).
+    s.execute("prefs.set", json!({"key": "memory.sharedCacheBudget", "value": false})).unwrap();
     s.execute("prefs.set", json!({"key": "memory.layerCacheMb", "value": 128})).unwrap();
     assert_eq!(s.layer_cache.budget(), 128 << 20);
     struct Src(std::sync::Mutex<usize>);
@@ -307,6 +309,65 @@ fn cache_budgets_are_applied() {
     s.footage = src.clone();
     s.execute("prefs.set", json!({"key": "memory.mediaCacheMb", "value": 256})).unwrap();
     assert_eq!(*src.0.lock().unwrap(), 256 << 20);
+}
+
+/// Share One Budget Between the Caches (on by default): each cache may grow to the total less
+/// the others' floors, and the setting off gives every cache exactly its old budget back.
+#[test]
+fn shared_budget_limits_and_off_switch() {
+    use effectcraft_render::cache::shared::ShareKind;
+    struct Src(std::sync::Mutex<usize>);
+    impl effectcraft_render::FootageSource for Src {
+        fn frame(&self, _: effectcraft_project::ItemId, _: &effectcraft_project::Footage, _: effectcraft_time::Tick) -> Option<Arc<effectcraft_raster::Image>> {
+            None
+        }
+        fn set_cache_budget(&self, b: usize) {
+            *self.0.lock().unwrap() = b;
+        }
+    }
+    let mut s = Session::default();
+    let src = Arc::new(Src(Default::default()));
+    s.footage = src.clone();
+    s.execute("prefs.set", json!({"key": "memory.layerCacheMb", "value": 1024})).unwrap();
+    let b = s.prefs.cache_budgets(s.sys_memory);
+    let split = b.shared.expect("on by default");
+    // The total is what the three budgets add up to (1 + 1 + 3 GB with memory unknown).
+    assert_eq!(split.total, (b.layer + b.media + b.preview) as u64);
+    assert_eq!(split.total, 5 << 30);
+    // Floors: an eighth of the total each, the footage cache's at least 512 MB and at most its
+    // own budget.
+    assert_eq!(split.floors, [640 << 20, 640 << 20, 640 << 20]);
+    assert_eq!(s.layer_cache.budget() as u64, split.total - (1280 << 20), "the total less the others' floors");
+    assert_eq!(*src.0.lock().unwrap() as u64, split.total - (1280 << 20));
+    for kind in ShareKind::ALL {
+        assert!(b.limit(kind) as u64 <= split.total, "no cache past the total");
+    }
+    assert!(s.cache_share.is_on());
+    // Plans keep the old share: as many frames render at once as before.
+    assert_eq!(s.layer_cache.planning_budget(), 1 << 30);
+    // Off: today's split, exactly.
+    s.execute("prefs.set", json!({"key": "memory.sharedCacheBudget", "value": false})).unwrap();
+    let off = s.prefs.cache_budgets(s.sys_memory);
+    assert_eq!(off.shared, None);
+    assert_eq!((off.layer, off.media, off.preview), (b.layer, b.media, b.preview));
+    assert_eq!(s.layer_cache.budget(), 1 << 30);
+    assert_eq!(*src.0.lock().unwrap(), 1 << 30);
+    assert_eq!(s.layer_cache.planning_budget(), 1 << 30);
+    assert!(!s.cache_share.is_on());
+    // RAM Reserved for Other Applications still caps the total.
+    s.execute("prefs.set", json!({"key": "memory.sharedCacheBudget", "value": true})).unwrap();
+    s.sys_memory = Some(crate::sysinfo::SysMemory { total: 8 << 30, available: 6 << 30, pressure: None });
+    s.execute("prefs.set", json!({"key": "memory.ramReservedGb", "value": 6})).unwrap();
+    let capped = s.prefs.cache_budgets(s.sys_memory);
+    assert!(capped.capped);
+    assert!(capped.shared.is_some_and(|sp| sp.total <= 2 << 30), "{capped:?}");
+    // Maximum Share of RAM for Caches (75 % by default) caps it too, when it leaves more free.
+    assert_eq!(s.prefs.memory.cache_max_percent, 75);
+    s.execute("prefs.set", json!({"key": "memory.ramReservedGb", "value": 0})).unwrap();
+    s.execute("prefs.set", json!({"key": "memory.cacheMaxPercent", "value": 25})).unwrap();
+    assert_eq!(s.prefs.memory.cache_max_percent, 25);
+    let quarter = s.prefs.cache_budgets(s.sys_memory);
+    assert!(quarter.capped && quarter.shared.is_some_and(|sp| sp.total <= 2 << 30), "{quarter:?}");
 }
 
 #[test]

@@ -240,6 +240,8 @@ impl<'a> Proof<'a> {
             }
             if let Some(image) = cache.map.remove(&previous) {
                 cache.map.insert(current, image);
+                cache.move_draft(&previous, current);
+                cache.moved(&previous, current);
                 cache.order.rename(&previous, current);
                 if let Some(rank) = cache.protected.remove(&previous) {
                     cache.protected.insert(current, rank);

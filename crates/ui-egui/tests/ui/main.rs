@@ -135,12 +135,18 @@ mod ui_script_console;
 mod ui_scriptui;
 #[path = "../ui_scrolling.rs"]
 mod ui_scrolling;
+#[path = "../ui_scrub_expression.rs"]
+mod ui_scrub_expression;
 #[path = "../ui_settings_info.rs"]
 mod ui_settings_info;
+#[path = "../ui_sharp_zoom.rs"]
+mod ui_sharp_zoom;
 #[path = "../ui_smart_freeze.rs"]
 mod ui_smart_freeze;
 #[path = "../ui_solo_small_tabs.rs"]
 mod ui_solo_small_tabs;
+#[path = "../ui_sound_preview.rs"]
+mod ui_sound_preview;
 #[path = "../ui_source_icons.rs"]
 mod ui_source_icons;
 #[path = "../ui_tabs.rs"]
@@ -149,6 +155,8 @@ mod ui_tabs;
 mod ui_tail;
 #[path = "../ui_text_edit.rs"]
 mod ui_text_edit;
+#[path = "../ui_text_gradient.rs"]
+mod ui_text_gradient;
 #[path = "../ui_theme_favorites.rs"]
 mod ui_theme_favorites;
 #[path = "../ui_time_zoom_controls.rs"]
@@ -211,12 +219,18 @@ mod ui_quick_offset;
 #[path = "../ui_video_preview_off.rs"]
 mod ui_video_preview_off;
 
+#[path = "../ui_animator_prop_delete.rs"]
+mod ui_animator_prop_delete;
 #[path = "../ui_effect_drop_highlight.rs"]
 mod ui_effect_drop_highlight;
 #[path = "../ui_media_browser_cache.rs"]
 mod ui_media_browser_cache;
 #[path = "../ui_media_browser_copy_path.rs"]
 mod ui_media_browser_copy_path;
+#[path = "../ui_multi_selection.rs"]
+mod ui_multi_selection;
+#[path = "../ui_parent_selection.rs"]
+mod ui_parent_selection;
 #[path = "../ui_timeline_effect_label.rs"]
 mod ui_timeline_effect_label;
 #[path = "../ui_viewer_trackpad.rs"]

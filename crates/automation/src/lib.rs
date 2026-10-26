@@ -26,6 +26,7 @@ pub mod confine;
 pub mod control_wire;
 pub mod figma_bridge;
 pub mod follow;
+pub mod frame_cache;
 pub mod frame_link;
 pub mod frame_server;
 mod frame_stream;
@@ -37,6 +38,7 @@ mod prompts;
 pub mod render_route;
 pub mod resources;
 mod result_store;
+mod senses;
 pub mod server;
 pub mod tools;
 
@@ -109,3 +111,7 @@ pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_plumbing;
+#[cfg(test)]
+mod tests_taste;

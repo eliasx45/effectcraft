@@ -72,6 +72,31 @@ fn delete_and_duplicate_items() {
     assert!(s.project.item(dup).is_none());
 }
 
+/// PD1: items given to `project.delete` are deleted, never the Project panel's selection: `ids` is
+/// an alias of `items`, a single id works, and a malformed value is an error, not the selection.
+#[test]
+fn delete_honours_given_items_over_the_selection() {
+    let mut s = Session::default();
+    let comp = |s: &mut Session, name: &str| {
+        s.execute("comp.new", json!({"name": name, "width": 16, "height": 16, "duration": 1})).unwrap();
+        s.active_comp_id().unwrap()
+    };
+    let keep = comp(&mut s, "Keep");
+    let a = comp(&mut s, "A");
+    let b = comp(&mut s, "B");
+    s.execute("project.select", json!({"items": [keep.0]})).unwrap();
+    s.execute("project.delete", json!({"ids": [a.0]})).unwrap();
+    assert!(s.project.item(a).is_none() && s.project.item(keep).is_some());
+    s.execute("project.delete", json!({"items": b.0})).unwrap();
+    assert!(s.project.item(b).is_none() && s.project.item(keep).is_some());
+    assert!(s.execute("project.delete", json!({"items": {"id": keep.0}})).is_err());
+    assert!(s.execute("project.delete", json!({"ids": [999_999]})).is_err());
+    assert!(s.project.item(keep).is_some(), "a bad id deletes nothing");
+    // Nothing given: the selection.
+    s.execute("project.delete", json!({})).unwrap();
+    assert!(s.project.item(keep).is_none());
+}
+
 /// A new layer takes its Project item's label (#153); layers made before keep their own when the
 /// item's label changes. Layers with no item keep their type's default.
 #[test]

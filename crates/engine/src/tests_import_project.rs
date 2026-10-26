@@ -207,7 +207,7 @@ fn opening_project_anchors_relative_footage_sequences_and_proxies() {
             ..Default::default()
         }),
     );
-    p.item_mut(id).unwrap().proxy = Some(Box::new(Proxy { footage: Footage { path: "proxy.mov".into(), ..Default::default() }, enabled: true }));
+    p.item_mut(id).unwrap().proxy = Some(Box::new(Proxy { footage: Footage { path: "proxy.mov".into(), ..Default::default() }, enabled: true, auto: false }));
     let absolute = dir.join("absolute.wav").to_string_lossy().into_owned();
     let aid = p.add_item("absolute", crate::color::Label::None, None, ItemKind::Footage(Footage { path: absolute.clone(), ..Default::default() }));
     let path = dir.join("show.ecproj");

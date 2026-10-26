@@ -11,6 +11,8 @@ use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
 
 use crate::icons::{self, Icon};
+use crate::panels::timeline::TimelineHost;
+use crate::panels::timeline::ids::tl_id;
 use crate::state::TimelineState;
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
@@ -370,13 +372,13 @@ fn drop_target(cw: &Cols, dragged: &str, x: f32) -> (Option<&'static str>, f32) 
 }
 
 fn drag_id() -> egui::Id {
-    egui::Id::new("tl-col-drag")
+    tl_id("tl-col-drag")
 }
 
 /// The column headers: labels, dividers to resize, drag to reorder, click the name header for
 /// Source Name / Layer Name, right-click for Hide This and Columns.
-pub(super) fn header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, cw: &Cols, hdr: Rect, actions: &mut Vec<(String, Value)>) {
-    let t = app.tokens;
+pub(super) fn header(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, cw: &Cols, hdr: Rect, actions: &mut Vec<(String, Value)>) {
+    let t = app.tokens();
     let ctx = ui.ctx().clone();
     let vis = cw.vis;
     let hy = hdr.center().y;
@@ -402,7 +404,7 @@ pub(super) fn header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pain
     if vis.num {
         htext(cw.num + 6.0, room("num", 6.0), "#");
     }
-    htext(cw.name + 22.0, room("name", 22.0), column_label(&app.ui.timeline, "name"));
+    htext(cw.name + 22.0, room("name", 22.0), column_label(&app.ui().timeline, "name"));
     if vis.comment {
         htext(cw.comment + 6.0, room("comment", 6.0), "Comment");
     }
@@ -438,15 +440,16 @@ pub(super) fn header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pain
         hp.line_segment([pos2(b - 0.5, hdr.min.y + 5.0), pos2(b - 0.5, hdr.max.y - 5.0)], Stroke::new(1.0, t.separator));
     }
 
-    let hresp = ui.interact(hdr, egui::Id::new("tl-colhdr"), Sense::click_and_drag());
-    app.auto.add("timeline.header", hdr, "Columns (right-click)");
+    let hresp = ui.interact(hdr, tl_id("tl-colhdr"), Sense::click_and_drag());
+    app.auto_mut().add("timeline.header", hdr, "Columns (right-click)");
     for (id, a, b) in &cw.spans {
-        app.auto.add(&format!("timeline.header.{id}"), Rect::from_min_max(pos2(*a, hdr.min.y), pos2(*b, hdr.max.y)), column_label(&app.ui.timeline, id));
+        let label = column_label(&app.ui().timeline, id);
+        app.auto_mut().add(&format!("timeline.header.{id}"), Rect::from_min_max(pos2(*a, hdr.min.y), pos2(*b, hdr.max.y)), label);
     }
 
     // Reorder: drag a header left or right.
     if hresp.drag_started()
-        && let Some(origin) = ctx.input(|i| i.pointer.press_origin())
+        && let Some(origin) = crate::layer_pointer::Lp::of(ui).pos(ctx.input(|i| i.pointer.press_origin()))
         && let Some(id) = column_at(cw, origin.x)
     {
         ctx.data_mut(|d| d.insert_temp(drag_id(), (id, origin)));
@@ -454,12 +457,12 @@ pub(super) fn header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pain
     let dragging: Option<(&'static str, egui::Pos2)> = ctx.data(|d| d.get_temp(drag_id()));
     if let Some((id, origin)) = dragging
         && let Some((a, b)) = cw.span(id)
-        && let Some(ptr) = ctx.input(|i| i.pointer.latest_pos())
+        && let Some(ptr) = crate::layer_pointer::Lp::of(ui).pos(ctx.input(|i| i.pointer.latest_pos()))
     {
-        let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tl-col-drag-ghost")));
+        let fg = crate::layer_pointer::Lp::of(ui).overlay(&ctx, egui::Order::Tooltip, tl_id("tl-col-drag-ghost"));
         let ghost = Rect::from_min_max(pos2(a, hdr.min.y), pos2(b, hdr.max.y)).translate(vec2(ptr.x - origin.x, 0.0));
         fg.rect_filled(ghost, 2.0, t.accent.gamma_multiply(0.25));
-        fg.text(ghost.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, crate::i18n::tr(column_label(&app.ui.timeline, id)), Tokens::ui(11.0), t.text);
+        fg.text(ghost.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, crate::i18n::tr(column_label(&app.ui().timeline, id)), Tokens::ui(11.0), t.text);
         let (_, mx) = drop_target(cw, id, ptr.x);
         fg.line_segment([pos2(mx, hdr.min.y), pos2(mx, hdr.max.y)], Stroke::new(2.0, t.accent));
         if hresp.drag_stopped() || !ctx.input(|i| i.pointer.any_down()) {
@@ -481,20 +484,20 @@ pub(super) fn header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pain
             continue;
         }
         let r = Rect::from_min_max(pos2(b - 3.0, hdr.min.y), pos2(b + 3.0, hdr.max.y));
-        let resp = ui.interact(r, egui::Id::new(("tl-colw", id)), Sense::drag());
-        app.auto.add(&format!("timeline.header.{id}.resize"), r, "Drag to resize the column");
+        let resp = ui.interact(r, tl_id(("tl-colw", id)), Sense::drag());
+        app.auto_mut().add(&format!("timeline.header.{id}.resize"), r, "Drag to resize the column");
         if resp.hovered() || resp.dragged() {
             ctx.set_cursor_icon(egui::CursorIcon::ResizeColumn);
         }
-        let start_id = egui::Id::new(("tl-colw-start", id));
+        let start_id = tl_id(("tl-colw-start", id));
         if resp.drag_started() {
-            ctx.data_mut(|d| d.insert_temp(start_id, column_width(&app.ui.timeline, id)));
+            ctx.data_mut(|d| d.insert_temp(start_id, column_width(&app.ui().timeline, id)));
         }
         if resp.dragged()
-            && let (Some(origin), Some(ptr)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+            && let (Some(origin), Some(ptr)) = crate::layer_pointer::Lp::of(ui).pair(ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos())))
         {
-            let start = ctx.data(|d| d.get_temp::<f32>(start_id)).unwrap_or_else(|| column_width(&app.ui.timeline, id));
-            let _ = set_column_width(&mut app.ui.timeline, id, start + ptr.x - origin.x);
+            let start = ctx.data(|d| d.get_temp::<f32>(start_id)).unwrap_or_else(|| column_width(&app.ui().timeline, id));
+            let _ = set_column_width(&mut app.ui_mut().timeline, id, start + ptr.x - origin.x);
         }
         if resp.drag_stopped() {
             ctx.data_mut(|d| d.remove::<f32>(start_id));
@@ -505,30 +508,31 @@ pub(super) fn header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pain
         && let Some(pt) = hresp.interact_pointer_pos()
         && column_at(cw, pt.x) == Some("name")
     {
-        app.ui.timeline.source_name = !app.ui.timeline.source_name;
+        app.ui_mut().timeline.source_name = !app.ui().timeline.source_name;
     }
     if hresp.secondary_clicked() {
         let under = hresp.interact_pointer_pos().and_then(|pt| column_at(cw, pt.x));
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-colhdr-under"), under.unwrap_or("")));
+        ctx.data_mut(|d| d.insert_temp(tl_id("tl-colhdr-under"), under.unwrap_or("")));
     }
     crate::widgets::context_menu(&hresp, |ui| {
-        let under: &str = ctx.data(|d| d.get_temp(egui::Id::new("tl-colhdr-under"))).unwrap_or("");
+        let under: &str = ctx.data(|d| d.get_temp(tl_id("tl-colhdr-under"))).unwrap_or("");
         if !under.is_empty() && under != "name" && ui.button(crate::i18n::tr("Hide This")).clicked() {
             actions.push(("timeline.column".into(), json!({"column": under, "visible": false})));
             ui.close();
         }
         ui.menu_button(crate::i18n::tr("Columns"), |ui| {
             for id in COLUMNS_MENU {
-                let on = column_visible(&app.ui.timeline, id);
-                let resp = ui.add_enabled(id != "name", egui::Button::new(crate::i18n::tr(column_label(&app.ui.timeline, id))).selected(on));
-                app.auto.add(&format!("timeline.columnsMenu.{id}"), resp.rect, column_label(&app.ui.timeline, id));
+                let on = column_visible(&app.ui().timeline, id);
+                let resp = ui.add_enabled(id != "name", egui::Button::new(crate::i18n::tr(column_label(&app.ui().timeline, id))).selected(on));
+                let label = column_label(&app.ui().timeline, id);
+                app.auto_mut().add(&format!("timeline.columnsMenu.{id}"), resp.rect, label);
                 if resp.clicked() {
                     actions.push(("timeline.column".into(), json!({"column": id, "visible": !on})));
                     ui.close();
                 }
             }
         });
-        let other = if app.ui.timeline.source_name { "Show Layer Name" } else { "Show Source Name" };
+        let other = if app.ui().timeline.source_name { "Show Layer Name" } else { "Show Source Name" };
         if ui.button(crate::i18n::tr(other)).clicked() {
             actions.push(("timeline.sourceName".into(), json!({})));
             ui.close();
@@ -538,60 +542,62 @@ pub(super) fn header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pain
 
 /// The divider between the layer outline and the time graph: drag it to resize the outline,
 /// double-click it to fit the outline to its columns again.
-pub(super) fn splitter(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, y0: f32, y1: f32, left_w: f32, panel_w: f32) {
+pub(super) fn splitter(app: &mut dyn TimelineHost, ui: &mut egui::Ui, x: f32, y0: f32, y1: f32, left_w: f32, panel_w: f32) {
     let ctx = ui.ctx().clone();
     let r = Rect::from_min_max(pos2(x - 3.0, y0), pos2(x + 3.0, y1));
-    let resp = ui.interact(r, egui::Id::new("tl-splitter"), Sense::click_and_drag());
-    app.auto.add("timeline.splitter", r, "Drag to resize the layer outline");
+    let resp = ui.interact(r, tl_id("tl-splitter"), Sense::click_and_drag());
+    app.auto_mut().add("timeline.splitter", r, "Drag to resize the layer outline");
     if resp.hovered() || resp.dragged() {
         ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     }
-    let start_id = egui::Id::new("tl-splitter-start");
+    let start_id = tl_id("tl-splitter-start");
     if resp.drag_started() {
         ctx.data_mut(|d| d.insert_temp(start_id, left_w));
     }
     if resp.dragged()
-        && let (Some(origin), Some(ptr)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+        && let (Some(origin), Some(ptr)) = crate::layer_pointer::Lp::of(ui).pair(ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos())))
     {
         let start = ctx.data(|d| d.get_temp::<f32>(start_id)).unwrap_or(left_w);
-        app.ui.timeline.outline_w = Some(clamp_outline(start + ptr.x - origin.x, panel_w));
+        app.ui_mut().timeline.outline_w = Some(clamp_outline(start + ptr.x - origin.x, panel_w));
     }
     if resp.drag_stopped() {
         ctx.data_mut(|d| d.remove::<f32>(start_id));
     }
     if resp.double_clicked() {
-        app.ui.timeline.outline_w = None;
+        app.ui_mut().timeline.outline_w = None;
     }
 }
 
 /// The footer's pane buttons (After Effects' lower-left corner): Layer Switches, Transfer
-/// Controls (Modes), In/Out/Duration/Stretch and Render Time. Returns where the next footer item
-/// goes.
-pub(super) fn pane_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, footer: Rect) -> f32 {
-    let t = app.tokens;
+/// Controls (Modes), In/Out/Duration/Stretch and Render Time, then the speed curves in the rows
+/// (EffectCraft). Returns where the next footer item goes.
+pub(super) fn pane_buttons(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, footer: Rect) -> f32 {
+    let t = app.tokens();
     let mut x = footer.min.x + 6.0;
-    let panes: [(&str, &str, bool); 4] = [
-        ("switches", "Expand or Collapse the Layer Switches pane", column_visible(&app.ui.timeline, "switches")),
-        ("modes", "Expand or Collapse the Transfer Controls pane", app.ui.timeline.show_modes),
-        ("inOut", "Expand or Collapse the In/Out/Duration/Stretch panes", IN_OUT_PANE.iter().any(|c| column_visible(&app.ui.timeline, c))),
-        ("renderTime", "Expand or Collapse the Render Time pane", column_visible(&app.ui.timeline, "renderTime")),
+    let panes: [(&str, &str, bool); 5] = [
+        ("switches", "Expand or Collapse the Layer Switches pane", column_visible(&app.ui().timeline, "switches")),
+        ("modes", "Expand or Collapse the Transfer Controls pane", app.ui().timeline.show_modes),
+        ("inOut", "Expand or Collapse the In/Out/Duration/Stretch panes", IN_OUT_PANE.iter().any(|c| column_visible(&app.ui().timeline, c))),
+        ("renderTime", "Expand or Collapse the Render Time pane", column_visible(&app.ui().timeline, "renderTime")),
+        ("speedRows", "Show or Hide Speed Curves in the Property Rows (⌘-drag a curve to sculpt it)", app.ui().timeline.speed_rows),
     ];
     for (id, tip, on) in panes {
         let r = Rect::from_min_size(pos2(x, footer.center().y - 9.0), vec2(18.0, 18.0));
-        let resp = ui.interact(r, egui::Id::new(("tl-pane", id)), Sense::click()).on_hover_text(crate::i18n::tr(tip));
+        let resp = ui.interact(r, tl_id(("tl-pane", id)), Sense::click()).on_hover_text(crate::i18n::tr(tip));
         if on {
             p.rect_filled(r, 2.0, t.hover);
         }
         let col = if resp.hovered() || on { t.text } else { t.text_dim };
         pane_glyph(p, r.shrink(3.0), id, col);
-        app.auto.add(&format!("timeline.pane.{id}"), r, tip);
+        app.auto_mut().add(&format!("timeline.pane.{id}"), r, tip);
         if resp.clicked() {
-            let tl = &mut app.ui.timeline;
+            let tl = &mut app.ui_mut().timeline;
             match id {
                 "switches" => {
                     let _ = set_column(tl, "switches", !on);
                 }
                 "modes" => tl.show_modes = !on,
+                "speedRows" => tl.speed_rows = !on,
                 "renderTime" => {
                     let _ = set_column(tl, "renderTime", !on);
                 }
@@ -617,6 +623,18 @@ fn pane_glyph(p: &egui::Painter, r: Rect, id: &str, col: Color32) {
         "modes" => {
             p.circle_stroke(pos2(r.center().x - 2.0, r.center().y), 3.5, s);
             p.circle_stroke(pos2(r.center().x + 2.0, r.center().y), 3.5, s);
+        }
+        "speedRows" => {
+            // A small eased speed curve over its baseline.
+            let pts: Vec<egui::Pos2> = (0..=12)
+                .map(|i| {
+                    let s = i as f32 / 12.0;
+                    let bump = (std::f32::consts::PI * s).sin().powi(3);
+                    pos2(r.min.x + s * r.width(), r.max.y - 1.0 - bump * (r.height() - 2.0))
+                })
+                .collect();
+            p.add(egui::Shape::line(pts, s));
+            p.line_segment([pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)], s);
         }
         "renderTime" => {
             let c = pos2(r.center().x, r.center().y + 1.0);
@@ -689,13 +707,13 @@ impl ColumnLayout {
 /// The layout saved in an earlier session, from the settings store (a file that doesn't read is
 /// ignored). Run once when the app starts.
 pub(crate) fn load_layout(app: &mut EffectcraftApp) {
-    let text = app.session.config.as_ref().and_then(|c| c.read(LAYOUT_FILE));
+    let text = app.session().config.as_ref().and_then(|c| c.read(LAYOUT_FILE));
     match text.map(|t| serde_json::from_str::<ColumnLayout>(&t)) {
-        Some(Ok(l)) => l.apply(&mut app.ui.timeline),
+        Some(Ok(l)) => l.apply(&mut app.ui_mut().timeline),
         Some(Err(e)) => log::warn!("{LAYOUT_FILE}: {e}"),
         None => {}
     }
-    app.timeline_layout_saved = Some(ColumnLayout::of(&app.ui.timeline));
+    app.timeline_layout_saved = Some(ColumnLayout::of(&app.ui().timeline));
 }
 
 /// Keep the layout for the next session once it changed (not in the middle of a drag). Run
@@ -704,11 +722,11 @@ pub(crate) fn store_layout(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if ctx.input(|i| i.pointer.any_down()) {
         return;
     }
-    let now = ColumnLayout::of(&app.ui.timeline);
+    let now = ColumnLayout::of(&app.ui().timeline);
     if app.timeline_layout_saved.as_ref() == Some(&now) {
         return;
     }
-    if let Some(c) = &app.session.config {
+    if let Some(c) = &app.session().config {
         let written = serde_json::to_string(&now).map_err(std::io::Error::other).and_then(|t| c.write(LAYOUT_FILE, &t));
         if let Err(e) = written {
             log::warn!("{LAYOUT_FILE}: {e}");
@@ -719,8 +737,8 @@ pub(crate) fn store_layout(app: &mut EffectcraftApp, ctx: &egui::Context) {
 
 /// `timeline.columnLayout {reset?, outlineWidth?}`: the column layout (and the splitter), or
 /// back to After Effects' defaults with `reset`.
-pub(crate) fn layout_command(app: &mut EffectcraftApp, params: &Value) -> Result<Value, String> {
-    let tl = &mut app.ui.timeline;
+pub(crate) fn layout_command(app: &mut dyn TimelineHost, params: &Value) -> Result<Value, String> {
+    let tl = &mut app.ui_mut().timeline;
     if params.get("reset").and_then(Value::as_bool) == Some(true) {
         let d = TimelineState::default();
         tl.columns = d.columns;

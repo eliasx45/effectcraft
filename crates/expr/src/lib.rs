@@ -102,11 +102,12 @@ impl ExprHost for Expressions {
     }
 
     fn eval_text_selector(&self, ctx: &EvalCtx, layer: &Layer, prop: &Property, index: usize, total: usize, selector: [f64; 3]) -> Result<[f64; 3], String> {
+        // The keyframed Amount, once (it was evaluated twice per unit).
+        let value = prop.value_at(layer.layer_time(ctx.time));
         let Some(e) = prop.expr.as_ref().filter(|_| prop.has_expression()) else {
-            let v = prop.value_at(layer.layer_time(ctx.time)).components();
+            let v = value.components();
             return Ok([v.first().copied().unwrap_or(100.0), v.get(1).copied().unwrap_or(100.0), v.get(2).copied().unwrap_or(100.0)]);
         };
-        let value = prop.value_at(layer.layer_time(ctx.time));
         let out = evaluate_out(self, ctx, layer, prop, &value, &e.text, [index as f64 + 1.0, total as f64], selector)?;
         let num = |o: &runtime::Out| match o {
             runtime::Out::Num(x) => Some(*x),
@@ -193,7 +194,7 @@ fn evaluate_out(
     frame.owner = Some(owner);
     FRAMES.with(|f| f.borrow_mut().push(frame));
     let _guard = FrameGuard;
-    let key = prefetch::Key::new(text, comp, layer.id.0, prop.uid);
+    let key = prefetch::Key::new(text, comp, layer.id.0, prop.uid, text_sel);
     let now = secs(ctx.time.seconds());
     // The same inputs evaluated before (by another layer reading this property, or another
     // frame): when everything that run read answers the same now, so does the result.
@@ -206,6 +207,17 @@ fn evaluate_out(
             memo::check(&memo_key, |q, r| fr.answer(q).is_some_and(|a| memo::same(a, r)))
         });
         if let Some(out) = hit {
+            prefetch::store(key, now, reqs);
+            return Ok(out);
+        }
+    }
+    // The same inputs at another time, from a run that never read the time (a control without
+    // keyframes, a constant), or evaluated on another thread: the same check (EXPR-PERF9).
+    if let Some(c) = memo::candidate(&memo_key, text, &begin) {
+        answer(&resolver, depth, c.reqs.clone());
+        let hit = FRAMES.with(|f| f.borrow().get(depth).is_some_and(|fr| c.matches(|q, r| fr.answer(q).is_some_and(|a| memo::same(a, r)))));
+        if hit {
+            let (reqs, out) = c.take(text, &begin);
             prefetch::store(key, now, reqs);
             return Ok(out);
         }
@@ -224,6 +236,8 @@ fn evaluate_out(
         RUNS.with(|r| r.set(r.get().saturating_add(1)));
         match runtime::run(text, &begin) {
             Run::Done(r) => {
+                // Read before anything else runs a script (see `runtime::time_read`).
+                let time_read = runtime::time_read();
                 let (used, resps) = FRAMES.with(|f| {
                     let mut f = f.borrow_mut();
                     let Some(fr) = f.get_mut(depth) else { return (vec![], None) };
@@ -232,6 +246,14 @@ fn evaluate_out(
                     (used, resps)
                 });
                 if let (Ok(out), Some(resps)) = (&r, resps) {
+                    // Holds at every time where its answers are the same: it never read the
+                    // time, and asked for nothing at another time than its own.
+                    // It is kept under its own key too: a revisit of this time (the walk after
+                    // the pre-pass, scrubbing back) still hits when its inputs changed since.
+                    let timeless = !time_read && used.iter().all(|q| q.time().is_none_or(|t| t == now));
+                    if timeless {
+                        memo::store(memo_key.timeless(), text, &begin, used.clone(), resps.clone(), out.clone());
+                    }
                     memo::store(memo_key, text, &begin, used.clone(), resps, out.clone());
                 }
                 prefetch::store(key, now, used);
@@ -248,13 +270,24 @@ fn evaluate_out(
 
 /// Resolve `reqs` not answered yet into the memo of the frame at `depth`.
 fn answer(resolver: &Resolver, depth: usize, reqs: impl IntoIterator<Item = Req>) {
+    let now = secs(resolver.ctx.time.seconds());
     for req in reqs {
         if FRAMES.with(|f| f.borrow().get(depth).is_none_or(|fr| fr.has(&req))) {
             continue;
         }
         // May evaluate other expressions (nested frames above ours).
         let r = resolver.resolve(&req);
-        FRAMES.with(|f| f.borrow_mut().get_mut(depth).map(|fr| fr.insert(req, r)));
+        // The key API and reads at other times than the evaluation's own (`valueAtTime(t)`,
+        // bisections over a keyframed property) let the run answer further reads of the same
+        // property itself (see `host::Curve`).
+        let curve = matches!(req, Req::Keys { .. }) || (matches!(req, Req::Value { .. }) && req.time() != Some(now));
+        let curve = (curve && FRAMES.with(|f| f.borrow().get(depth).is_some_and(|fr| !fr.has_curve(&req)))).then(|| resolver.curve(&req)).flatten();
+        FRAMES.with(|f| {
+            f.borrow_mut().get_mut(depth).map(|fr| {
+                fr.curves.extend(curve);
+                fr.insert(req, r)
+            })
+        });
     }
 }
 

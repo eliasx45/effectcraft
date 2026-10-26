@@ -298,11 +298,26 @@ fn parse_line(bytes: &[u8]) -> Line {
             return Line::Reject(format!("`requestId` must be a non-empty string of at most {MAX_REQUEST_ID} UTF-8 bytes or a number; closing the connection"));
         }
     };
-    Line::Request {
-        id: obj.get("id").cloned().unwrap_or(Value::Null),
-        method: method.to_string(),
-        params: obj.get("params").cloned().filter(|p| !p.is_null()).unwrap_or_else(|| json!({})),
-        request_id,
+    let mut params = obj.get("params").cloned().filter(|p| !p.is_null()).unwrap_or_else(|| json!({}));
+    hoist_client(method, obj.get("client"), &mut params);
+    Line::Request { id: obj.get("id").cloned().unwrap_or(Value::Null), method: method.to_string(), params, request_id }
+}
+
+/// `engine.execute` runs as the `client` in its command's `params`; one written next to `command`
+/// (or next to `method`) is moved there, so a script that puts it one level up doesn't silently
+/// run as the user (changing his selection and showing up as his edits).
+fn hoist_client(method: &str, top: Option<&Value>, params: &mut Value) {
+    if !matches!(method, "engine.execute" | "ui.menu.invoke") {
+        return;
+    }
+    let Some(outer) = params.as_object_mut() else { return };
+    let Some(client) = outer.remove("client").or_else(|| top.cloned()).filter(Value::is_string) else { return };
+    match outer.entry("params").or_insert_with(|| json!({})) {
+        Value::Object(inner) => {
+            inner.entry("client").or_insert(client);
+        }
+        p @ Value::Null => *p = json!({"client": client}),
+        _ => {}
     }
 }
 
@@ -375,6 +390,24 @@ mod tests {
         });
         let replies = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).collect();
         (replies, calls)
+    }
+
+    #[test]
+    fn a_client_next_to_command_runs_the_command_as_that_client() {
+        let params = |line: &str| match parse_line(line.as_bytes()) {
+            Line::Request { params, .. } => params,
+            _ => panic!("not a request: {line}"),
+        };
+        let p = params(r#"{"method":"engine.execute","params":{"command":"script.run","params":{"code":"1"},"client":"ec-comp-diff"}}"#);
+        assert_eq!(p, json!({"command": "script.run", "params": {"code": "1", "client": "ec-comp-diff"}}));
+        assert_eq!(request_client("engine.execute", &p), Some("ec-comp-diff"));
+        // Next to `method`, and with no command params at all.
+        let p = params(r#"{"method":"engine.execute","client":"bot","params":{"command":"comp.info"}}"#);
+        assert_eq!(p["params"]["client"], "bot");
+        // The command's own `client` wins; other methods are left alone.
+        let p = params(r#"{"method":"engine.execute","params":{"command":"x","client":"a","params":{"client":"b"}}}"#);
+        assert_eq!(p, json!({"command": "x", "params": {"client": "b"}}));
+        assert_eq!(params(r#"{"method":"ui.inspect","params":{"client":"a"}}"#), json!({"client": "a"}));
     }
 
     #[test]

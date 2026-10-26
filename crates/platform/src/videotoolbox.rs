@@ -1,5 +1,5 @@
-//! VideoToolbox ProRes decompression sessions: the crate's only `unsafe` code
-//! (docs/adr/0001-platform-ffi.md).
+//! VideoToolbox ProRes decompression sessions (FFI: `unsafe` code, docs/adr/0001-platform-ffi.md;
+//! H.264 / HEVC sessions are in `videotoolbox_nal`, which shares the sample-buffer helper here).
 //!
 //! Rules: every `unsafe` block has a `// SAFETY:` comment; no panic may unwind into VideoToolbox
 //! (the output callback runs under `catch_unwind`); every failure is a `Result` the caller
@@ -126,8 +126,20 @@ unsafe extern "C-unwind" fn output_callback(
     *shared.out.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
 }
 
-/// Unlocks a pixel buffer's base address when dropped.
-struct Locked<'a>(&'a CVImageBuffer);
+/// Unlocks a pixel buffer's base address when dropped (made after a successful read-only lock).
+pub(crate) struct Locked<'a>(&'a CVImageBuffer);
+
+impl<'a> Locked<'a> {
+    /// Lock `pb`'s base address read-only until the guard is dropped.
+    pub(crate) fn new(pb: &'a CVImageBuffer) -> Result<Self, String> {
+        // SAFETY: `pb` is a valid pixel buffer borrowed for 'a; the guard unlocks it with the
+        // same flags exactly once.
+        if unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) } != 0 {
+            return Err("cannot lock the decoded picture".into());
+        }
+        Ok(Locked(pb))
+    }
+}
 
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
@@ -162,11 +174,7 @@ fn copy_out(pb: &CVImageBuffer, s: &Shared, alpha: bool) -> Result<Planes, Strin
     if (bw, bh) != (s.width, s.height) {
         return Err(format!("decoded picture is {bw}x{bh}, expected {}x{}", s.width, s.height));
     }
-    // SAFETY: `pb` is a valid pixel buffer for the duration of this call (see the callback).
-    if unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) } != 0 {
-        return Err("cannot lock the decoded picture".into());
-    }
-    let lock = Locked(pb);
+    let lock = Locked::new(pb)?;
     let planes = match fmt {
         S4AS if CVPixelBufferGetPlaneCount(pb) == 3 => {
             let a = if alpha { Some(rows(pb, &lock, 2)?) } else { None };
@@ -217,7 +225,7 @@ impl Session {
 
     /// Decode one ProRes frame (synchronously) into planes; alpha only when `alpha`.
     pub(crate) fn decode(&self, sample: &[u8], alpha: bool) -> Result<Planes, String> {
-        let buffer = sample_buffer(sample, &self.format)?;
+        let buffer = sample_buffer(sample, 0, &self.format)?;
         *self.shared.out.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let mut info = VTDecodeInfoFlags(0);
         let frame_refcon = if alpha { NonNull::<c_void>::dangling().as_ptr() } else { std::ptr::null_mut() };
@@ -234,8 +242,8 @@ impl Session {
     }
 }
 
-/// A ready `CMSampleBuffer` holding a copy of `sample`.
-fn sample_buffer(sample: &[u8], format: &CMFormatDescription) -> Result<CFRetained<CMSampleBuffer>, String> {
+/// A ready `CMSampleBuffer` holding a copy of `sample`, presented at `pts` (timescale 1).
+pub(crate) fn sample_buffer(sample: &[u8], pts: i64, format: &CMFormatDescription) -> Result<CFRetained<CMSampleBuffer>, String> {
     if sample.is_empty() {
         return Err("empty sample".into());
     }
@@ -267,7 +275,7 @@ fn sample_buffer(sample: &[u8], format: &CMFormatDescription) -> Result<CFRetain
     let invalid = CMTime { value: 0, timescale: 0, flags: CMTimeFlags(0), epoch: 0 };
     let timing = CMSampleTimingInfo {
         duration: invalid,
-        presentationTimeStamp: CMTime { value: 0, timescale: 1, flags: CMTimeFlags::Valid, epoch: 0 },
+        presentationTimeStamp: CMTime { value: pts, timescale: 1, flags: CMTimeFlags::Valid, epoch: 0 },
         decodeTimeStamp: invalid,
     };
     let size = sample.len();

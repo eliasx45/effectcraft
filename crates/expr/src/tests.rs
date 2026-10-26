@@ -122,7 +122,7 @@ impl Fx {
             Err(e) => e,
         }
     }
-    fn set_expr(&mut self, layer: LayerId, path: &str, text: &str) {
+    pub(crate) fn set_expr(&mut self, layer: LayerId, path: &str, text: &str) {
         let l = self.p.comp_mut(self.cid).unwrap().layer_mut(layer).unwrap();
         l.props.prop_mut(path).unwrap().expr = Some(Expression { text: text.into(), enabled: true });
     }
@@ -1389,4 +1389,44 @@ fn time_to_frames_preserves_coercion_and_small_durations() {
     ] {
         assert_eq!(f.num(expression, 0.0), expected, "{expression}");
     }
+}
+
+/// After Effects match names address shape groups, paths and effect params, and a layer is
+/// callable like a property group (regression: these evaluated to the raw value, 24 Oct 2026).
+#[test]
+fn match_names_resolve_shape_paths_and_effect_params() {
+    let mut f = fx();
+    let g = group_push(&mut f.p, |ids| {
+        let path = build::shape_path(ids, ShapePath::rect([10.0, 20.0], 30.0, 40.0));
+        build::shape_group(ids, "Path Group", vec![path])
+    });
+    f.layer_mut(f.shape).props.sub_mut("contents").unwrap().children.insert(0, g.into());
+    let by_match = "thisComp.layer('Shape')('ADBE Root Vectors Group')(1)('ADBE Vectors Group')(1)('ADBE Vector Shape').points()[1][0]";
+    let by_name = "thisComp.layer('Shape').content('Path Group').content('Path 1').path.points()[1][0]";
+    assert_close!(f.num(by_match, 0.0), f.num(by_name, 0.0));
+    assert_eq!(f.text("thisComp.layer('Shape')('ADBE Root Vectors Group')(2).name", 0.0), "Rectangle 1");
+    assert_close!(f.num("thisComp.layer('Shape')('ADBE Root Vectors Group')(2)('ADBE Vectors Group')(1)('ADBE Vector Rect Size')[0]", 0.0), 60.0);
+    assert_close!(f.num("thisLayer('ADBE Transform Group')('ADBE Rotate Z').numKeys", 0.0), 2.0);
+    // Effect and parameter match names.
+    assert_close!(f.num("effect('ADBE Slider Control')('ADBE Slider Control-0001')", 0.0), 42.0);
+    assert_close!(f.num("effect('Slider Control')('ADBE Slider Control-0001')", 0.0), 42.0);
+    // A pseudo effect keeps its AE match names (as imported from a project).
+    let fx_a = f.layer_mut(f.a).props.sub_mut("effects").unwrap();
+    if let Some(effectcraft_project::Node::Group(g)) = fx_a.children.get_mut(0) {
+        g.match_id = "Pseudo/ADBE Trace Path".into();
+        g.prop_mut("slider").unwrap().match_id = "Pseudo/ADBE Trace Path-0001".into();
+    }
+    assert_close!(f.num("effect('Pseudo/ADBE Trace Path')('Pseudo/ADBE Trace Path-0001')", 0.0), 42.0);
+    // A lookup that fails is an error, never a silent raw value.
+    assert!(f.err("thisComp.layer('Shape')('ADBE Root Vectors Group')(1)('ADBE Nope')").contains("ADBE Nope"));
+    assert!(f.err("thisComp.layer('Shape')('Nope')").contains("Nope"));
+    assert!(f.err("effect('Pseudo/ADBE Missing')('Pseudo/ADBE Missing-0001')").contains("Pseudo/ADBE Missing"));
+}
+
+/// A comp or layer marker name that doesn't exist is an expression error (regression, 24 Oct 2026).
+#[test]
+fn missing_marker_name_is_an_error() {
+    let f = fx();
+    assert!(f.err("thisComp.marker.key('NOPE').time").contains("NOPE"));
+    assert!(f.err("marker.key('NOPE').time").contains("NOPE"));
 }

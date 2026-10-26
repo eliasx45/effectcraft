@@ -1,13 +1,15 @@
 //! Host information for Settings ▸ Memory & CPU (RAM reserved for other applications, reducing
 //! caches when the system is low on memory) and Help ▸ System Compatibility Report.
 //!
-//! Pure Rust and dependency-free: the values come from the operating system's own reporting
-//! (`/proc/meminfo` on Linux, `sysctl`/`vm_stat` on macOS, `wmic`/PowerShell on Windows). Every
-//! query may fail (sandboxes, the web): callers treat `None` as "unknown" and keep their
-//! configured budgets. The periodic reading behind the cache budgets runs on a background
-//! thread ([`MemoryWatch`]): on Windows it starts PowerShell, which takes about a second.
+//! Pure Rust, no `unsafe`: the values come from the operating system's own reporting
+//! (`/proc/meminfo` on Linux, the kernel's `sysctl` counters on macOS through the safe `sysctl`
+//! and `memory-stats` crates, PowerShell on Windows). Every query may fail (sandboxes, the web):
+//! callers treat `None` as "unknown" and keep their configured budgets. The periodic readings
+//! behind the cache budgets and the memory chip ([`MemoryWatch`], [`ProcessWatch`]) take a few
+//! microseconds and run inline; only Windows reads in the background (PowerShell takes about a
+//! second). MEM3: macOS used to start `vm_stat`, `sysctl` and `ps` every 2 to 5 s.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
@@ -16,15 +18,123 @@ use serde::Serialize;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct SysMemory {
     pub total: u64,
-    /// Memory the system can hand out without swapping (free + reclaimable caches).
+    /// Memory the system can hand out without swapping: free pages and caches it can drop
+    /// (file-backed pages), never pages of other apps it would have to compress or swap out.
     pub available: u64,
+    /// The system's memory pressure at the same reading, where it reports one (macOS).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<MemoryPressure>,
 }
 
 impl SysMemory {
-    /// The system is low on memory: less than 10% (or less than 1 GB) is available.
+    /// The system is low on memory: less than 10% (or less than 1 GB) is available, or macOS
+    /// reports memory pressure (Warning or Critical: it compresses and swaps to keep up).
     pub fn is_low(&self) -> bool {
-        self.total > 0 && (self.available < self.total / 10 || self.available < 1 << 30)
+        self.pressure.is_some_and(|p| p >= MemoryPressure::Warning) || (self.total > 0 && (self.available < self.total / 10 || self.available < 1 << 30))
     }
+
+    /// How much the caches shrink at this reading: 1 (not at all), 2 while memory is low or
+    /// under Warning pressure, 4 under Critical pressure (the system asks apps to give memory
+    /// back).
+    pub fn cache_divisor(&self) -> u64 {
+        if self.pressure == Some(MemoryPressure::Critical) {
+            4
+        } else if self.is_low() {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// How hard the operating system finds it to hand out memory (macOS's memory pressure level,
+/// as Activity Monitor's Memory Pressure graph shows it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum MemoryPressure {
+    Normal,
+    /// The system compresses and swaps memory to keep up (yellow in Activity Monitor).
+    Warning,
+    /// Apps are being asked to give memory back (red).
+    Critical,
+}
+
+/// Parse macOS `sysctl -n kern.memorystatus_vm_pressure_level` (1 normal, 2 warning, 4 critical).
+pub fn parse_pressure_level(text: &str) -> Option<MemoryPressure> {
+    pressure_level(text.trim().parse::<u64>().ok()?)
+}
+
+/// macOS `kern.memorystatus_vm_pressure_level` as a [`MemoryPressure`].
+pub fn pressure_level(level: u64) -> Option<MemoryPressure> {
+    match level {
+        1 => Some(MemoryPressure::Normal),
+        2 => Some(MemoryPressure::Warning),
+        4 => Some(MemoryPressure::Critical),
+        _ => None,
+    }
+}
+
+/// The system's memory pressure, where the system reports one (macOS).
+pub fn memory_pressure() -> Option<MemoryPressure> {
+    #[cfg(target_os = "macos")]
+    {
+        return pressure_level(macos::read("kern.memorystatus_vm_pressure_level")?);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// The kernel's counters on macOS, read with `sysctlbyname` through the `sysctl` crate (no
+/// process started, no `unsafe` here).
+#[cfg(target_os = "macos")]
+mod macos {
+    use sysctl::Sysctl;
+
+    /// A numeric sysctl value.
+    pub(super) fn read(name: &str) -> Option<u64> {
+        sysctl::Ctl::new(name).ok()?.value_string().ok()?.trim().parse().ok()
+    }
+
+    /// Total and available memory (see [`super::macos_memory`]).
+    pub(super) fn memory() -> Option<super::SysMemory> {
+        let total = read("hw.memsize")?;
+        let pages = super::MacPages {
+            page: read("vm.pagesize").or_else(|| read("hw.pagesize"))?,
+            free: read("vm.page_free_count")?,
+            speculative: read("vm.page_speculative_count").unwrap_or(0),
+            purgeable: read("vm.page_purgeable_count").unwrap_or(0),
+            file_backed: read("vm.page_pageable_external_count").unwrap_or(0),
+        };
+        let level = read("kern.memorystatus_level");
+        let pressure = read("kern.memorystatus_vm_pressure_level").and_then(super::pressure_level);
+        Some(super::macos_memory(total, pages, level, pressure))
+    }
+}
+
+/// macOS page counts (`vm.page_*_count`) and their page size.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MacPages {
+    pub page: u64,
+    pub free: u64,
+    pub speculative: u64,
+    pub purgeable: u64,
+    /// File-backed (external) pageable pages: cached file data the system drops without
+    /// writing anything out.
+    pub file_backed: u64,
+}
+
+/// macOS memory from the kernel's counters: available = free + speculative + purgeable +
+/// file-backed pages, and never more than the kernel's own estimate (`kern.memorystatus_level`,
+/// the percentage it considers available). Inactive anonymous pages are other apps' memory that
+/// the system would have to compress or swap out first: counting them as free (as `vm_stat`'s
+/// "Pages inactive" did here before MEM3) read a Mac with 210 MB free and 9 GB swapped as having
+/// plenty, so the caches never shrank.
+pub fn macos_memory(total: u64, p: MacPages, level: Option<u64>, pressure: Option<MemoryPressure>) -> SysMemory {
+    let pages = p.free.saturating_add(p.speculative).saturating_add(p.purgeable).saturating_add(p.file_backed);
+    let mut available = pages.saturating_mul(p.page).min(total);
+    if let Some(level) = level.filter(|l| *l <= 100) {
+        available = available.min(total / 100 * level);
+    }
+    SysMemory { total, available, pressure }
 }
 
 /// The system's memory, read in the background: [`MemoryWatch::poll`] starts a reading (unless
@@ -32,28 +142,31 @@ impl SysMemory {
 #[derive(Clone, Default)]
 pub struct MemoryWatch {
     latest: Arc<Mutex<Option<SysMemory>>>,
+    pressure: Arc<Mutex<Option<MemoryPressure>>>,
     busy: Arc<AtomicBool>,
 }
 
 impl MemoryWatch {
-    /// Start a new reading in the background (no threads on the web: read inline, it is
-    /// unknown there anyway).
+    /// Take a new reading: inline where it is a few system calls (macOS, Linux, the web), on a
+    /// background thread on Windows (PowerShell).
     pub fn poll(&self) {
         if self.busy.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (latest, busy) = (self.latest.clone(), self.busy.clone());
+        let (latest, pressure, busy) = (self.latest.clone(), self.pressure.clone(), self.busy.clone());
         let read = move || {
-            if let Some(m) = memory() {
+            let m = memory();
+            if let Some(m) = m {
                 *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(m);
             }
+            *pressure.lock().unwrap_or_else(PoisonError::into_inner) = m.and_then(|m| m.pressure).or_else(memory_pressure);
             busy.store(false, Ordering::Release);
         };
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(target_os = "windows")]
         if std::thread::Builder::new().name("ec-memory".into()).spawn(read).is_err() {
             self.busy.store(false, Ordering::Release);
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(not(target_os = "windows"))]
         read();
     }
 
@@ -61,12 +174,108 @@ impl MemoryWatch {
     pub fn latest(&self) -> Option<SysMemory> {
         *self.latest.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// The memory pressure at the last reading (`None`: unknown, or the system has no such
+    /// level).
+    pub fn pressure(&self) -> Option<MemoryPressure> {
+        *self.pressure.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// This process's resident memory and the system's memory pressure, for the status bar's
+/// memory chip and the Memory panel. [`ProcessWatch::poll`] takes a reading (the chip asks at
+/// most every 2 s); [`ProcessWatch::resident`] is an atomic load. On macOS a reading is two
+/// kernel calls (`task_info` through `memory-stats`, a `sysctl`), on Linux it reads
+/// `/proc/self/status`, both inline; FreeBSD still runs `ps` on a background thread; elsewhere
+/// it is unknown and the chip shows the bytes the caches track instead.
+#[derive(Clone, Default)]
+pub struct ProcessWatch {
+    /// Resident bytes at the last reading (0 = unknown).
+    resident: Arc<AtomicU64>,
+    /// [`MemoryPressure`] at the last reading: 0 unknown, 1 normal, 2 warning, 3 critical.
+    pressure: Arc<std::sync::atomic::AtomicU8>,
+    busy: Arc<AtomicBool>,
+}
+
+impl ProcessWatch {
+    /// Take a reading: inline, except where it starts a process (FreeBSD's `ps`).
+    pub fn poll(&self) {
+        if self.busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (resident, pressure, busy) = (self.resident.clone(), self.pressure.clone(), self.busy.clone());
+        let read = move || {
+            resident.store(process_resident().unwrap_or(0), Ordering::Relaxed);
+            let level = match memory_pressure() {
+                None => 0,
+                Some(MemoryPressure::Normal) => 1,
+                Some(MemoryPressure::Warning) => 2,
+                Some(MemoryPressure::Critical) => 3,
+            };
+            pressure.store(level, Ordering::Relaxed);
+            busy.store(false, Ordering::Release);
+        };
+        #[cfg(target_os = "freebsd")]
+        if std::thread::Builder::new().name("ec-process-memory".into()).spawn(read).is_err() {
+            self.busy.store(false, Ordering::Release);
+        }
+        #[cfg(not(target_os = "freebsd"))]
+        read();
+    }
+
+    /// The process's resident bytes at the last reading (`None`: unknown, or none yet).
+    pub fn resident(&self) -> Option<u64> {
+        Some(self.resident.load(Ordering::Relaxed)).filter(|b| *b > 0)
+    }
+
+    /// The memory pressure at the last reading (`None`: unknown).
+    pub fn pressure(&self) -> Option<MemoryPressure> {
+        match self.pressure.load(Ordering::Relaxed) {
+            1 => Some(MemoryPressure::Normal),
+            2 => Some(MemoryPressure::Warning),
+            3 => Some(MemoryPressure::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// Parse the resident set (`VmRSS:`) of Linux `/proc/<pid>/status`, in bytes.
+pub fn parse_proc_status_rss(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kb.checked_mul(1024)
+}
+
+/// Parse `ps -o rss=` output (kilobytes), in bytes.
+pub fn parse_ps_rss(text: &str) -> Option<u64> {
+    text.trim().parse::<u64>().ok()?.checked_mul(1024).filter(|b| *b > 0)
+}
+
+/// This process's resident memory in bytes, when the system reports it. (macOS's Activity
+/// Monitor shows the physical footprint, which also counts compressed memory; the resident size
+/// `task_info` reports stands in: it is lower while the system compresses.)
+pub fn process_resident() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        return parse_proc_status_rss(&std::fs::read_to_string("/proc/self/status").ok()?);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return memory_stats::memory_stats().and_then(|m| u64::try_from(m.physical_mem).ok()).filter(|b| *b > 0);
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let pid = std::process::id().to_string();
+        return parse_ps_rss(&run("ps", &["-o", "rss=", "-p", &pid])?);
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
-    let mut c = std::process::Command::new(cmd);
+    let mut c = crate::system_tool::command(cmd);
     c.args(args);
     // A console program started from the windowed app would flash a console window.
     #[cfg(target_os = "windows")]
@@ -84,21 +293,7 @@ pub fn parse_meminfo(text: &str) -> Option<SysMemory> {
     };
     let total = field("MemTotal:")?;
     let available = field("MemAvailable:").or_else(|| Some(field("MemFree:")? + field("Cached:").unwrap_or(0)))?;
-    Some(SysMemory { total, available })
-}
-
-/// Parse macOS `vm_stat` output: free + inactive + speculative + purgeable pages.
-pub fn parse_vm_stat(text: &str, total: u64) -> Option<SysMemory> {
-    let page: u64 = text.split("page size of ").nth(1)?.split_whitespace().next()?.parse().ok()?;
-    let pages = |name: &str| -> u64 {
-        text.lines()
-            .find(|l| l.starts_with(name))
-            .and_then(|l| l.rsplit(':').next())
-            .and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok())
-            .unwrap_or(0)
-    };
-    let free = pages("Pages free") + pages("Pages inactive") + pages("Pages speculative") + pages("Pages purgeable");
-    Some(SysMemory { total, available: (free * page).min(total) })
+    Some(SysMemory { total, available, pressure: None })
 }
 
 /// Parse `sysctl -n hw.physmem hw.pagesize vm.stats.vm.v_free_count vm.stats.vm.v_inactive_count`
@@ -108,7 +303,7 @@ pub fn parse_freebsd_sysctl(text: &str) -> Option<SysMemory> {
     let total = it.next()??;
     let page = it.next()??;
     let free = it.next()??.saturating_add(it.next()??);
-    Some(SysMemory { total, available: free.saturating_mul(page).min(total) })
+    Some(SysMemory { total, available: free.saturating_mul(page).min(total), pressure: None })
 }
 
 /// Total and available physical memory, when the system reports them.
@@ -119,8 +314,7 @@ pub fn memory() -> Option<SysMemory> {
     }
     #[cfg(target_os = "macos")]
     {
-        let total: u64 = run("sysctl", &["-n", "hw.memsize"])?.trim().parse().ok()?;
-        return parse_vm_stat(&run("vm_stat", &[])?, total).or(Some(SysMemory { total, available: total }));
+        return macos::memory();
     }
     #[cfg(target_os = "freebsd")]
     {
@@ -133,7 +327,7 @@ pub fn memory() -> Option<SysMemory> {
             &["-NoProfile", "-Command", "$o=Get-CimInstance Win32_OperatingSystem; \"$($o.TotalVisibleMemorySize) $($o.FreePhysicalMemory)\""],
         )?;
         let mut it = text.split_whitespace().filter_map(|v| v.parse::<u64>().ok());
-        return Some(SysMemory { total: it.next()? * 1024, available: it.next()? * 1024 });
+        return Some(SysMemory { total: it.next()? * 1024, available: it.next()? * 1024, pressure: None });
     }
     #[allow(unreachable_code)]
     None
@@ -228,11 +422,69 @@ mod tests {
     #[test]
     fn parses_proc_meminfo_and_vm_stat() {
         let m = parse_meminfo("MemTotal:       16000000 kB\nMemFree:  1000 kB\nMemAvailable:    8000000 kB\n").unwrap();
-        assert_eq!(m, SysMemory { total: 16_000_000 * 1024, available: 8_000_000 * 1024 });
+        assert_eq!(m, SysMemory { total: 16_000_000 * 1024, available: 8_000_000 * 1024, pressure: None });
         assert!(!m.is_low());
-        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               1000.\nPages active:  5.\nPages inactive:                           3000.\nPages speculative:                         100.\n";
-        let m = parse_vm_stat(vm, 8 << 30).unwrap();
-        assert_eq!(m.available, 4100 * 16384);
+    }
+
+    /// MEM3: the Mac of 22 Oct 2026 (64 GB, 210 MB free, 9 GB swapped) read as having memory to
+    /// spare because inactive pages counted as free. Only free, speculative, purgeable and
+    /// file-backed pages count now, capped by the kernel's own estimate.
+    #[test]
+    fn macos_available_memory_leaves_out_other_apps_inactive_pages() {
+        let total = 64u64 << 30;
+        let page = 16384;
+        // 210 MB free, 1 GB of file cache; the 20 GB of inactive anonymous pages don't count.
+        let swapping = MacPages { page, free: (210 << 20) / page, speculative: 0, purgeable: 0, file_backed: (1 << 30) / page };
+        let m = macos_memory(total, swapping, Some(40), Some(MemoryPressure::Warning));
+        assert_eq!(m.available, (210 << 20) + (1 << 30));
         assert!(m.is_low());
+        assert_eq!(m.cache_divisor(), 2);
+        // The live reading of the same Mac after a reboot: 3.2 GB free, 1 GB speculative, 10 GB
+        // file-backed: about 15 GB, not low; the kernel estimate (81%) is higher and doesn't cap.
+        let calm = MacPages { page, free: 204_599, speculative: 60_968, purgeable: 16_297, file_backed: 625_637 };
+        let m = macos_memory(total, calm, Some(81), Some(MemoryPressure::Normal));
+        assert_eq!(m.available, (204_599 + 60_968 + 16_297 + 625_637) * page);
+        assert!(!m.is_low());
+        assert_eq!(m.cache_divisor(), 1);
+        // The kernel's estimate caps the page sum; never more than the machine has.
+        assert_eq!(macos_memory(total, calm, Some(10), None).available, total / 100 * 10);
+        assert_eq!(macos_memory(total, MacPages { page, free: u64::MAX, ..calm }, None, None).available, total);
+        // Critical pressure shrinks the caches to a quarter even with memory "available".
+        assert_eq!(macos_memory(total, calm, Some(81), Some(MemoryPressure::Critical)).cache_divisor(), 4);
+    }
+
+    /// On this Mac the kernel calls return real numbers without starting a process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reads_memory_and_resident_size_from_the_kernel() {
+        let m = memory().expect("hw.memsize and the page counts");
+        assert!(m.total >= 1 << 30 && m.available <= m.total);
+        assert!(m.pressure.is_some(), "kern.memorystatus_vm_pressure_level");
+        assert!(process_resident().is_some_and(|b| b > 1 << 20));
+        let w = ProcessWatch::default();
+        w.poll();
+        assert!(w.resident().is_some(), "an inline reading");
+    }
+
+    #[test]
+    fn parses_process_resident_size() {
+        assert_eq!(parse_proc_status_rss("Name:\tx\nVmRSS:\t  2048 kB\nVmSwap: 0 kB\n"), Some(2048 * 1024));
+        assert_eq!(parse_proc_status_rss("Name: x\n"), None);
+        assert_eq!(parse_ps_rss(" 8059600\n"), Some(8_059_600 * 1024));
+        assert_eq!(parse_ps_rss(""), None);
+        assert_eq!(parse_ps_rss("0"), None);
+        let w = ProcessWatch::default();
+        assert_eq!(w.resident(), None);
+        assert_eq!(w.pressure(), None);
+    }
+
+    #[test]
+    fn parses_macos_memory_pressure_level() {
+        assert_eq!(parse_pressure_level("1\n"), Some(MemoryPressure::Normal));
+        assert_eq!(parse_pressure_level("2"), Some(MemoryPressure::Warning));
+        assert_eq!(parse_pressure_level(" 4 "), Some(MemoryPressure::Critical));
+        assert_eq!(parse_pressure_level("0"), None);
+        assert_eq!(parse_pressure_level("garbage"), None);
+        assert!(MemoryPressure::Warning > MemoryPressure::Normal && MemoryPressure::Critical > MemoryPressure::Warning);
     }
 }

@@ -224,14 +224,29 @@ fn remove_all(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// `effect.toggle`: the effect on or off (`value`, else the opposite). With `selected: true` and the
+/// effect among the selected ones (an fx switch clicked in Effect Controls or the Timeline), every
+/// selected effect, on any layer, gets that effect's new state, in one undo step (After Effects).
 fn toggle(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = find_fx(s, p, "effect.toggle")?;
     let v = b_p(p, "value");
+    let mut targets = vec![(lid, uid)];
+    if b_p(p, "selected") == Some(true) && s.state.selected_props.contains(&(lid, uid)) {
+        let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+        // Only effect groups: the selection can hold properties and masks too.
+        let is_fx = |l: &LayerId, u: &Uid| comp.layer(*l).and_then(|l| l.effects()).is_some_and(|fx| fx.groups().any(|g| g.uid == *u));
+        targets.extend(s.state.selected_props.iter().filter(|t| **t != (lid, uid) && is_fx(&t.0, &t.1)).copied());
+    }
     let r = s.edit("Toggle Effect", None, |proj, _| {
         let l = layer_mut(proj, cid, lid)?;
         let g = l.props.find_group_mut(uid).ok_or_else(|| bad("effect.toggle", "gone"))?;
-        g.enabled = v.unwrap_or(!g.enabled);
-        Ok(g.enabled)
+        let on = v.unwrap_or(!g.enabled);
+        for (tl, tu) in &targets {
+            if let Some(g) = layer_mut(proj, cid, *tl).ok().and_then(|l| l.props.find_group_mut(*tu)) {
+                g.enabled = on;
+            }
+        }
+        Ok(on)
     })?;
     Ok(json!(r))
 }
@@ -255,11 +270,26 @@ fn set_label(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// `effect.reorder`: `effect` to 1-based `index` in the new stack. With `effects` (uids on the
+/// layer, the dragged ones in Effect Controls), they move as a block, in their stack order, to
+/// the insertion line before the effect now at `index` (one past the last for the end), in one
+/// undo step (After Effects).
 fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = find_fx(s, p, "effect.reorder")?;
     let to = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad("effect.reorder", "missing `index` (1-based)"))? as usize;
+    let block: Vec<Uid> = p.get("effects").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
     s.edit("Reorder Effect", None, |proj, _| {
         let fx = layer_mut(proj, cid, lid)?.props.sub_mut("effects").ok_or_else(|| bad("effect.reorder", "no effects"))?;
+        if !block.is_empty() {
+            // The insertion line counted among the effects that stay.
+            let line = to.saturating_sub(1).min(fx.children.len());
+            let at = fx.children.iter().take(line).filter(|c| !block.contains(&c.uid())).count();
+            let (moved, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut fx.children).into_iter().partition(|c| block.contains(&c.uid()));
+            fx.children = rest;
+            let at = at.min(fx.children.len());
+            fx.children.splice(at..at, moved);
+            return Ok(());
+        }
         let Some(i) = fx.children.iter().position(|c| c.uid() == uid) else { return Ok(()) };
         let g = fx.children.remove(i);
         let to = to.saturating_sub(1).min(fx.children.len());
@@ -434,11 +464,9 @@ fn copy(s: &mut Session, p: &Value) -> Result<Value> {
             retime_effect(group, 1.0, CMD, |t| Ok(Tick(t.0.checked_sub(first.0).ok_or_else(|| effect_time_error(CMD))?)))?;
         }
     }
-    s.state.clipboard.clear();
-    s.state.key_clipboard.clear();
-    s.state.contents_clipboard.clear();
-    s.state.link_clipboard = None;
-    s.state.clip_is_keys = false;
+    // Every other clipboard too: copied property values left behind would win at Paste over
+    // the effects (Edit ▸ Paste tries them first) and the effects would never be pasted.
+    super::edit::clear_clipboards(s);
     let n = groups.len();
     s.state.effect_clipboard = groups;
     Ok(json!({"effects": n}))
@@ -656,14 +684,14 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("effect.applyLast", "Last Effect", ["Effect"], Some("Cmd+Alt+Shift+E"), "{layers?}", has_layers, last),
         cmd!("effect.removeAll", "Remove All", ["Effect"], Some("Cmd+Shift+E"), "{layers?}", has_layers, remove_all),
         cmd!("effect.remove", "Remove Effect", [], None, "{layer?, effect: index|uid|name}", has_layers, remove),
-        cmd!("effect.toggle", "Toggle Effect", [], None, "{layer?, effect, value?}", has_layers, toggle),
+        cmd!("effect.toggle", "Toggle Effect", [], None, "{layer?, effect, value?, selected?: every selected effect}", has_layers, toggle),
         cmd!("effect.setLabel", "Effect Label", [], None, "{layer?, effect, label: name|index 0-16 (None clears)}", has_layers, set_label),
         cmd!(
             "effect.reorder",
             "Reorder Effect",
             [],
             None,
-            "{layer?, effect: index (1-based)|uid|name, index (1-based new stack position)} → {layer, effects: [{index, name, uid}]}",
+            "{layer?, effect: index (1-based)|uid|name, index (1-based new stack position), effects? [uid] (move these as a block to the line before the effect at `index`)} → {layer, effects: [{index, name, uid}]}",
             has_layers,
             reorder
         ),

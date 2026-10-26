@@ -196,6 +196,34 @@ mod client {
         /// Bumps on every connection: messages queued for an older one are dropped.
         generation: AtomicU64,
         connected: AtomicBool,
+        /// Bytes read and written on every connection (the wire, frame headers included).
+        down: Arc<AtomicU64>,
+        up: Arc<AtomicU64>,
+    }
+
+    /// Counts the bytes that go through a reader or writer.
+    struct Counted<T> {
+        inner: T,
+        n: Arc<AtomicU64>,
+    }
+
+    impl<T: std::io::Read> std::io::Read for Counted<T> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let k = self.inner.read(buf)?;
+            self.n.fetch_add(k as u64, Ordering::Relaxed);
+            Ok(k)
+        }
+    }
+
+    impl<T: std::io::Write> std::io::Write for Counted<T> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let k = self.inner.write(buf)?;
+            self.n.fetch_add(k as u64, Ordering::Relaxed);
+            Ok(k)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
     }
 
     /// A frame-channel client: one connection on a background thread, reconnecting with
@@ -211,14 +239,25 @@ mod client {
         /// Connect to `addr` (`host:port`; through an SSH tunnel, `127.0.0.1:<local port>`)
         /// with `token`, in the background.
         pub fn connect(addr: &str, token: &str, client: &str, backoff: Backoff) -> FrameClient {
-            let shared =
-                Arc::new(Shared { stop: AtomicBool::new(false), live: Mutex::new(None), generation: AtomicU64::new(0), connected: AtomicBool::new(false) });
+            let shared = Arc::new(Shared {
+                stop: AtomicBool::new(false),
+                live: Mutex::new(None),
+                generation: AtomicU64::new(0),
+                connected: AtomicBool::new(false),
+                down: Arc::default(),
+                up: Arc::default(),
+            });
             let (out, out_rx) = channel();
             let (ev_tx, events) = channel();
             let link =
                 Link { addr: addr.to_string(), token: token.to_string(), client: client.to_string(), backoff, shared: Arc::clone(&shared), events: ev_tx };
             let thread = std::thread::Builder::new().name("ec-frames-link".into()).spawn(move || link.run(out_rx)).ok();
             FrameClient { shared, out, events, thread }
+        }
+
+        /// Bytes received and sent since the client started, over every connection: (down, up).
+        pub fn bytes(&self) -> (u64, u64) {
+            (self.shared.down.load(Ordering::Relaxed), self.shared.up.load(Ordering::Relaxed))
         }
 
         /// Whether a connection is up now.
@@ -341,10 +380,11 @@ mod client {
 
         /// Run one connection until it drops (`Some(why)`) or the client stops (`None`).
         fn serve(&self, stream: TcpStream, welcome: Down, out: &Receiver<(u64, Up, Vec<u8>)>) -> Option<String> {
-            let (Ok(mut reader), Ok(keep)) = (stream.try_clone(), stream.try_clone()) else {
+            let (Ok(reader), Ok(keep), Ok(shut)) = (stream.try_clone(), stream.try_clone(), stream.try_clone()) else {
                 return Some("cannot share the socket".into());
             };
-            let mut writer = stream;
+            let mut reader = Counted { inner: reader, n: Arc::clone(&self.shared.down) };
+            let mut writer = Counted { inner: stream, n: Arc::clone(&self.shared.up) };
             let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
             *self.shared.live.lock().unwrap_or_else(PoisonError::into_inner) = Some(keep);
             // Messages queued for an earlier connection are dropped.
@@ -386,7 +426,7 @@ mod client {
                 }
             }
             self.shared.connected.store(false, Ordering::Release);
-            let _ = writer.shutdown(Shutdown::Both);
+            let _ = shut.shutdown(Shutdown::Both);
             *self.shared.live.lock().unwrap_or_else(PoisonError::into_inner) = None;
             let read_error = reader_thread.and_then(|t| t.join().ok());
             if self.stopped() {

@@ -34,6 +34,7 @@ fn start(s: &Session, threads: usize, control: Option<ControlFn>) -> FrameHandle
         threads,
         render: Arc::new(CpuRender { footage: s.footage.clone(), expr: s.expr.clone() }),
         cache: Arc::new(LayerCache::new(256 << 20)),
+        frames: Arc::new(crate::frame_cache::FrameCache::new(256 << 20, None)),
         preload: None,
         control,
         log: Arc::new(|_| {}),
@@ -278,6 +279,7 @@ fn job(conn: u64, id: u64, urgent: bool, s: &Session, out: &Out) -> Job {
         time: Tick::ZERO,
         opts: RenderOpts::default(),
         want: Want::default(),
+        key: None,
         out: out.clone(),
         current: Arc::new(AtomicU64::new(0)),
         queued: Instant::now(),
@@ -296,14 +298,14 @@ fn urgent_frames_go_first_newest_first_and_cancel_by_id() {
     q.cancel(2, &[1]);
     let mut order = vec![];
     for _ in 0..4 {
-        let Some((Work::Render(j), _)) = q.next() else { panic!() };
+        let Some((Work::Render(j), _)) = q.next(&FrameCache::new(0, None)) else { panic!() };
         order.push(j.id);
         assert!(!q.done(j.conn, j.id));
     }
     assert_eq!(order, vec![4, 3, 1, 2]);
     // Cancelling a frame that is rendering drops its reply.
     q.push(job(1, 6, true, &s, &out));
-    let Some((Work::Render(j), _)) = q.next() else { panic!() };
+    let Some((Work::Render(j), _)) = q.next(&FrameCache::new(0, None)) else { panic!() };
     q.cancel(1, &[6]);
     assert!(q.done(j.conn, j.id), "cancelled while rendering");
     // A closed connection's work is gone.
@@ -345,4 +347,69 @@ fn tokens_come_from_the_flag_the_environment_or_a_private_file() {
         assert_eq!(frame_token(Some(&dir), None).unwrap().0, a, "reused");
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CR8: a precache plan renders into the server's frame cache without sending pixels and
+/// reports the cached frames as ranges; a render request naming a cached frame's key is
+/// answered from the cache (no render); a stream that plays holds the plan back.
+#[test]
+fn precache_fills_the_frame_cache_and_cached_frames_skip_the_render() {
+    use effectcraft_engine::remote::{CacheSeries, Precache};
+    let s = demo();
+    let comp = s.active_comp_id().unwrap();
+    let frames = Arc::new(FrameCache::new(256 << 20, None));
+    let h = spawn(FrameConfig {
+        port: 0,
+        token: TOKEN.into(),
+        threads: 2,
+        render: Arc::new(CpuRender { footage: s.footage.clone(), expr: s.expr.clone() }),
+        cache: Arc::new(LayerCache::new(64 << 20)),
+        frames: frames.clone(),
+        preload: None,
+        control: None,
+        log: Arc::new(|_| {}),
+    })
+    .unwrap();
+    let c = FrameClient::connect(&format!("127.0.0.1:{}", h.port), TOKEN, "test", quick());
+    connected(&c);
+    let mut mirror = Mirror::default();
+    let msg = mirror.sync(s.revision, &s.project).unwrap();
+    assert!(c.send(Up::Msg { msg, want: Want::default(), urgent: false }, vec![]));
+    let opts = RenderOpts { scale: 0.1, ..Default::default() };
+    let series = CacheSeries::new(0x1234_5678_9abc_def0_1234_5678_9abc_def0, 100, 42);
+    let plan = Precache { revision: s.revision, comp, series: series.clone(), opts: Box::new(opts), ranges: vec![(4, 7), (0, 1)], prints: None };
+    assert!(c.send(Up::Msg { msg: FrameMsg::Precache(plan), want: Want::default(), urgent: false }, vec![]));
+    // The first report (nothing cached yet), then the last once all six frames are in.
+    let mut last = None;
+    while last.is_none() {
+        let (r, px, payload) = reply(&c);
+        assert!(px.is_none() && payload.is_empty(), "a precache sends no pixels");
+        let FrameReply::Cached { done, total, ranges, series: got, frames: n, .. } = r else { panic!("{r:?}") };
+        assert_eq!((total, &got), (6, &series));
+        if done == total {
+            last = Some((ranges, n));
+        }
+    }
+    assert_eq!(last, Some((vec![(0, 1), (4, 7)], 6)));
+    for f in [0, 1, 4, 5, 6, 7] {
+        assert!(frames.contains(series.key(f).unwrap()), "frame {f} cached");
+    }
+    assert!(!frames.contains(series.key(2).unwrap()));
+    // A viewer request for a cached frame: from the cache, the same pixels as a render.
+    let t = s.project.comp(comp).unwrap().frame_rate.tick_of(5);
+    let key = format!("{:032x}", series.key(5).unwrap());
+    let msg = FrameMsg::Render { id: 9, revision: s.revision, comp, time: t, opts: Box::new(opts), disk: Some(key), layers: false, prefetch: vec![] };
+    let raw = Want { codec: Codec::Raw, quality: 85, max_size: None, refine: false };
+    assert!(c.send(Up::Msg { msg, want: raw, urgent: true }, vec![]));
+    let (r, px, payload) = reply(&c);
+    let FrameReply::Frame { id: 9, ms, .. } = r else { panic!("{r:?}") };
+    assert_eq!(ms, 0.0, "not rendered");
+    let local = {
+        let mut r = Renderer::new(&s.project, s.footage.as_ref(), opts);
+        r.expr = s.expr.as_deref();
+        rgba8_premultiplied(&r.comp_frame_cpu(comp, t))
+    };
+    assert_eq!(decode(&px.unwrap(), &payload).unwrap(), local);
+    assert_eq!(frames.stats().hits, 1);
+    h.stop();
 }

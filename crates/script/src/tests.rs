@@ -733,6 +733,51 @@ fn path_direction_uses_after_effects_values() {
     assert!(o.error.as_ref().is_some_and(|e| format!("{e:?}").contains("can not be set")), "{:?}", o.error);
 }
 
+/// Regression: `layer.property("Position")` on a shape layer is the layer's Transform ▸ Position
+/// (as `layer.position`), not the first shape group's Transform ▸ Position under Contents, which
+/// the nested-name search found first because Contents precedes Transform. Also for a layer made
+/// by `shape.newShape` and duplicated.
+#[test]
+fn shape_layer_property_position_is_the_layer_transform() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var comp = app.project.items.addComp("Main", 1920, 1080, 1, 2, 30);
+        var l = comp.layers.addShape();
+        var g = l.property("Contents").addProperty("ADBE Vector Group");
+        g.property("Contents").addProperty("ADBE Vector Shape - Ellipse");
+        l.property("Position").setValue([610, 540]);
+        l.property("Opacity").setValue(40);
+        l.property("Scale").setValue([50, 50, 100]);
+        var lt = l.property("Transform"), gt = g.property("Transform");
+        [lt.property("Position").value, gt.property("Position").value, lt.property("Opacity").value, gt.property("Opacity").value,
+         lt.property("Scale").value, gt.property("Scale").value, g.property("Position").value]
+        "#,
+    );
+    assert_eq!(o.result, json!([[610, 540, 0], [0, 0], 40, 100, [50, 50, 100], [100, 100], [0, 0]]));
+
+    // A shape layer from shape.newShape, duplicated by the script.
+    let mut s = session();
+    s.execute("comp.new", json!({"name": "N", "width": 1920, "height": 1080, "duration": 2})).unwrap();
+    s.execute("shape.newShape", json!({"kind": "ellipse", "size": [100, 100]})).unwrap();
+    let o = ok(
+        &mut s,
+        r#"
+        var comp = app.project.activeItem;
+        var sq = comp.layer(1).duplicate();
+        sq.property("Position").setValue([1310, 540, 0]);
+        [sq.property("ADBE Transform Group").property("ADBE Position").value, sq.position.value]
+        "#,
+    );
+    assert_eq!(o.result, json!([[1310, 540, 0], [1310, 540, 0]]));
+    let (_, c) = comp_named(&s, "N");
+    let dup =
+        c.layers.iter().find(|l| l.props.prop("transform/position").is_some_and(|p| p.value == KV::Vec3([1310.0, 540.0, 0.0]))).expect("the duplicate moved");
+    let gp = dup.props.prop("contents/#1/transform/position").expect("group position");
+    assert_eq!(gp.value, KV::Vec2([0.0, 0.0]), "the group's Position is unchanged");
+}
+
 /// After Effects compatibility the Reel builds tripped over: legacy string builtins, the
 /// Repeater's and gradient items' own match names, and adding dashes by match name.
 #[test]
@@ -1660,4 +1705,142 @@ fn layer_property_resolves_transform_and_source_text_shortcuts() {
     );
     let (_, c) = comp_named(&s, "x");
     assert_eq!(layer(c, "s").props.prop("transform/opacity").unwrap().value, KV::Scalar(25.0));
+}
+
+/// Text Gradient Fill (EffectCraft extension, match name "EC Text Gradient Fill"): a script adds
+/// it to an animator, reads Gradient Fill Colors as `{colors: [[position, [r, g, b, a]], …],
+/// opacities: […]}` and sets stops in that shape or as `[[position, "#rrggbb"], …]`; Gradient
+/// Start / End are percent pairs; an expression can drive the stops from colour controls.
+#[test]
+fn text_gradient_fill_stops_are_scriptable() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r##"
+        var c = app.project.items.addComp("G", 640, 200, 1, 3, 30);
+        var t = c.layers.addText("TESTING THIS ANIMATION");
+        var a = t.property("ADBE Text Properties").property("ADBE Text Animators").addProperty("ADBE Text Animator");
+        var props = a.property("ADBE Text Animator Properties");
+        props.addProperty("EC Text Gradient Fill");
+        var g = props.property("Gradient Fill Colors");
+        var before = g.value;
+        g.setValue([[0, "#ffd500"], [0.5, "#ff7a00"], [1, "#e01010"]]);
+        var mid = g.value;
+        var v = g.value;
+        v.colors[0][1] = [0, 0, 1, 1];
+        g.setValue(v);
+        props.property("Gradient End").setValue([80, 50]);
+        [props.numProperties, before.colors.length, mid.colors[1][0], mid.colors[1][1][1] > 0.47 && mid.colors[1][1][1] < 0.49, g.value.colors[0][1],
+         props.property("Gradient End").value, props.property("Gradient Start").value]
+        "##,
+    );
+    assert_eq!(o.result, json!([4, 3, 0.5, true, [0, 0, 1, 1], [80, 50], [0, 50]]));
+    // Driven by an expression: two colours, evenly spaced.
+    let (_, comp) = comp_named(&s, "G");
+    let l = layer(comp, "TESTING THIS ANIMATION").clone();
+    let colors = l.props.prop("text/animators/#1/properties/gradientFillColors").unwrap().uid;
+    let o = ok(
+        &mut s,
+        r##"
+        var p = app.project.item(1).layer(1).property("ADBE Text Properties").property("ADBE Text Animators").property(1).property("ADBE Text Animator Properties").property("Gradient Fill Colors");
+        p.expression = '[[0, 1, 0, 1], "#0000ff"]';
+        [p.expressionEnabled, p.expressionError, p.value.colors.length, p.value.colors[0][1], p.value.colors[1][0]]
+        "##,
+    );
+    assert_eq!(o.result, json!([true, "", 2, [0, 1, 0, 1], 1]), "uid {colors}");
+}
+
+/// PROP-REMOVE: `Property.remove()` on a text animator property deletes just it, as in After
+/// Effects (it used to fail with "no property group"); Tracking Type and Tracking Amount go
+/// together; a Range Selector's Offset is fixed and `remove()` throws.
+#[test]
+fn removing_a_text_animator_property_from_a_script() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("R", 640, 200, 1, 3, 30);
+        var t = c.layers.addText("REMOVE");
+        var animator = t.property("ADBE Text Properties").property("ADBE Text Animators").addProperty("ADBE Text Animator");
+        var props = animator.property("ADBE Text Animator Properties");
+        props.addProperty("ADBE Text Fill Color");
+        props.addProperty("ADBE Text Opacity");
+        props.addProperty("ADBE Text Tracking Amount");
+        var n0 = props.numProperties;
+        animator.property("ADBE Text Animator Properties").property("Fill Color").remove();
+        var n1 = props.numProperties;
+        var fillGone = props.property("Fill Color") === null;
+        props.property("Tracking Type").remove();
+        var n2 = props.numProperties;
+        var sel = animator.property("ADBE Text Selectors").addProperty("ADBE Text Selector");
+        var err = "";
+        try { sel.property("ADBE Text Percent Offset").remove(); } catch (e) { err = e.message; }
+        [n0, n1, fillGone, n2, props.property(1).name, err.indexOf("fixed") >= 0, sel.property("ADBE Text Percent Offset") !== null]
+        "#,
+    );
+    assert_eq!(o.result, json!([4, 3, true, 1, "Opacity", true, true]));
+    let (_, comp) = comp_named(&s, "R");
+    let l = layer(comp, "REMOVE");
+    let kinds: Vec<&str> = l.props.group("text/animators/#1/properties").unwrap().props().map(|p| p.match_id.as_str()).collect();
+    assert_eq!(kinds, ["opacity"]);
+}
+
+/// `setValue([x, y])` on a 3D-valued property (Scale, Position) keeps its z, as After Effects
+/// does: a 2D layer's Scale stays at z 100 instead of becoming `[x, y, 0]`.
+#[test]
+fn two_values_keep_the_z_of_three_d_properties() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var comp = app.project.items.addComp("Z", 320, 180, 1, 2, 30);
+        var l = comp.layers.addSolid([1, 0, 0], "S", 100, 100, 1);
+        l.property("Scale").setValue([50, 50]);
+        l.property("Position").setValue([10, 20]);
+        var before = [l.property("Scale").value, l.property("Position").value];
+        l.threeDLayer = true;
+        l.property("Position").setValue([30, 40, -50]);
+        l.property("Position").setValue([60, 70]);
+        l.property("Scale").setValueAtTime(1, [20, 30]);
+        before.concat([l.property("Position").value, l.property("Scale").valueAtTime(1, true)])
+        "#,
+    );
+    assert_eq!(o.result, json!([[50, 50, 100], [10, 20, 0], [60, 70, -50], [20, 30, 100]]));
+}
+
+/// `expressionError` reports what the expression raises when it runs (a missing marker name, an
+/// AE match name that names nothing), not only syntax errors, and `marker.setValueAtTime` onto an
+/// occupied time warns that it replaced the marker (regression, 24 Oct 2026).
+#[test]
+fn expression_errors_and_marker_replacement_are_reported() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("M", 200, 100, 1, 4, 30);
+        c.markerProperty.setValueAtTime(1, new MarkerValue("beat"));
+        var l = c.layers.addSolid([1, 0, 0], "S", 50, 50, 1);
+        var op = l.transform.opacity;
+        op.expression = 'thisComp.marker.key("NOPE").time';
+        var missing = op.expressionError;
+        op.expression = 'thisComp.marker.key("beat").time * 10';
+        var found = op.expressionError;
+        var v = op.value;
+        op.expression = 'thisLayer("ADBE Transform Group")("ADBE Nope")';
+        var badMatch = op.expressionError;
+        op.expression = 'thisLayer("ADBE Transform Group")("ADBE Opacity") / 2';
+        var goodMatch = op.expressionError;
+        c.markerProperty.setValueAtTime(1, new MarkerValue("again"));
+        [missing, found, v, badMatch, goodMatch, c.markerProperty.numKeys, c.markerProperty.keyValue(1).comment]
+        "#,
+    );
+    let r = o.result.as_array().unwrap();
+    assert!(r[0].as_str().unwrap().contains("NOPE"), "{r:?}");
+    assert_eq!(r[1], "");
+    assert_eq!(r[2], 10.0);
+    assert!(r[3].as_str().unwrap().contains("ADBE Nope"), "{r:?}");
+    assert_eq!(r[4], "");
+    assert_eq!(r[5], 1);
+    assert_eq!(r[6], "again");
+    assert!(o.output.iter().any(|l| l.contains("Warning") && l.contains("\"beat\"")), "{:?}", o.output);
 }

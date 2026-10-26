@@ -254,6 +254,7 @@ pub(crate) fn chain_key(chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> u12
         k.u64(e.working_linear as u64);
         k.debug(&e.shutter);
         k.debug(&e.comp_space);
+        k.debug(&e.comp_px_3d);
     }
     k.finish()
 }

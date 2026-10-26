@@ -29,41 +29,61 @@ pub fn format_angle(v: f64, decimals: usize) -> String {
     format!("{rev}x{sign}{:.decimals$}°", deg.abs())
 }
 
-/// Parse typed angles: `45`, `-30.5°`, `1x+45`, `-1x-40°`, `2x` (revolutions only).
+/// Parse typed angles: `45`, `+90`, `-30.5°`, `1x+45`, `1x45`, `-1x-40°`, `2x` (revolutions
+/// only). Anything else, and anything that isn't a finite angle, is `None`.
 pub fn parse_angle(s: &str) -> Option<f64> {
     let s = s.trim().trim_end_matches('°').trim().replace(',', ".");
-    if let Some((r, d)) = s.split_once(['x', 'X']) {
+    let v = if let Some((r, d)) = s.split_once(['x', 'X']) {
         let rev: f64 = r.trim().parse().ok()?;
         let d = d.trim();
-        let deg: f64 = if d.is_empty() { 0.0 } else { d.trim_start_matches('+').trim().parse().ok()? };
-        return Some(rev * 360.0 + deg);
-    }
-    s.parse().ok()
+        let deg: f64 = if d.is_empty() { 0.0 } else { d.parse().ok()? };
+        rev * 360.0 + deg
+    } else {
+        s.parse().ok()?
+    };
+    v.is_finite().then_some(v)
 }
 
-/// The angle after the degrees field of `v` (which shows `shown`, the remainder's size) went to
-/// `new`. A drag moves the angle by the pointer's distance, so it runs through zero into negative
-/// angles; a typed number is a size, so the remainder keeps its sign.
-fn degrees_edit(v: f64, shown: f64, new: f64, dragging: bool) -> f64 {
-    if dragging {
-        return v + (new - shown);
+/// The angle typed into the degrees field of `v`: a plain number is the signed degrees and keeps
+/// the revolutions (`0x-90°` + `+90` = `0x+90°`, `1x+30°` + `45` = `1x+45°`); a whole angle
+/// (`1x45`) replaces the angle. `None` leaves the angle as it is.
+pub fn typed_degrees(v: f64, text: &str) -> Option<f64> {
+    let text = text.trim();
+    if text.contains(['x', 'X']) {
+        return parse_angle(text);
     }
-    let (rev, deg) = split_angle(v);
-    rev as f64 * 360.0 + if deg < 0.0 || (deg == 0.0 && v < 0.0) { -new } else { new }
+    let deg = parse_angle(text)?;
+    let (rev, _) = split_angle(v);
+    let out = rev as f64 * 360.0 + deg;
+    out.is_finite().then_some(out)
+}
+
+/// The angle after a drag moved the degrees field of `v` (which shows `shown`, the remainder's
+/// size) to `new`: the angle moves by the pointer's distance, so it runs through zero into
+/// negative angles.
+fn degrees_drag(v: f64, shown: f64, new: f64) -> f64 {
+    v + (new - shown)
 }
 
 /// An angle value, `0x+45.0°`, at `at` (top left): the revolutions and the degrees
 /// are hot numbers of their own (drag to scrub, click to type) and changing one keeps the other.
+/// The degrees field shows the remainder's size but is typed signed (`-90.0` for `0x-90.0°`),
+/// and takes a whole angle (`1x45`), as in After Effects.
 /// Returns the revolutions' rect, the degrees' rect and the new angle when either changed.
 pub fn angle_field(ui: &mut egui::Ui, at: Pos2, id: egui::Id, v: f64, decimals: usize, t: &Tokens) -> (Rect, Rect, Option<f64>) {
     let (rev, deg) = split_angle(v);
     let (rr, new_rev, _) = widgets::hot_int_at(ui, at, id.with("rev"), rev, 0.1, "x", t);
     let sign = ui.painter().text(pos2(rr.max.x - 2.0, rr.center().y), Align2::LEFT_CENTER, if deg < 0.0 { "-" } else { "+" }, Tokens::ui(12.0), t.hot_text);
-    let (dr, new_deg, _) = widgets::hot_number_at(ui, pos2(sign.max.x - 2.0, at.y), id, deg.abs(), 0.5, (-1e9, 1e9), decimals, "°", t);
+    // A drag returns the shown size moved; typing returns the whole new angle.
+    let edit_text = format!("{deg:.decimals$}");
+    let parse = |s: &str| typed_degrees(v, s);
+    let (dr, new_deg, _) =
+        widgets::hot_number_typed_at(ui, pos2(sign.max.x - 2.0, at.y), id, deg.abs(), 0.5, (-1e9, 1e9), decimals, "°", t, &edit_text, &parse);
     let dragging = new_deg.is_some() && ui.ctx().is_being_dragged(id);
     let out = match (new_rev, new_deg) {
         (Some(r), _) => Some(r as f64 * 360.0 + deg),
-        (None, Some(d)) => Some(degrees_edit(v, deg.abs(), d, dragging)),
+        (None, Some(d)) if dragging => Some(degrees_drag(v, deg.abs(), d)),
+        (None, Some(d)) => Some(d),
         (None, None) => None,
     };
     (rr, dr, out)
@@ -389,7 +409,7 @@ pub fn curves_graph(ui: &mut egui::Ui, rect: Rect, pts: &CurvePoints, channel: u
         return (resp, edit);
     }
     if resp.drag_started()
-        && let Some(pt) = ui.input(|i| i.pointer.press_origin())
+        && let Some(pt) = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.press_origin()))
     {
         let g = to_g(pt);
         let i = match pts.hit(g[0], g[1], hit_r) {
@@ -563,15 +583,47 @@ mod tests {
         let mut v = 0.3;
         for _ in 0..3 {
             let (_, deg) = split_angle(v);
-            v = degrees_edit(v, deg.abs(), deg.abs() - 1.0, true);
+            v = degrees_drag(v, deg.abs(), deg.abs() - 1.0);
         }
         assert!((v + 2.7).abs() < 1e-9, "{v}");
         // And back up through zero.
         let (_, deg) = split_angle(v);
-        assert!((degrees_edit(v, deg.abs(), deg.abs() + 3.0, true) - 0.3).abs() < 1e-9);
-        // Typing keeps the sign shown.
-        assert_eq!(degrees_edit(-30.0, 30.0, 45.0, false), -45.0);
-        assert_eq!(degrees_edit(405.0, 45.0, 10.0, false), 370.0);
+        assert!((degrees_drag(v, deg.abs(), deg.abs() + 3.0) - 0.3).abs() < 1e-9);
+    }
+
+    /// Typing `+90` into `0x-90.0°` left it at -90° (the typed number was taken as a size that
+    /// kept the shown minus sign).
+    #[test]
+    fn typed_angles_parse_like_after_effects() {
+        assert_eq!(parse_angle("+90"), Some(90.0));
+        assert_eq!(parse_angle("-90"), Some(-90.0));
+        assert_eq!(parse_angle("90°"), Some(90.0));
+        assert_eq!(parse_angle("1x45"), Some(405.0));
+        assert_eq!(parse_angle("0x-90.0°"), Some(-90.0));
+        assert_eq!(parse_angle("-1x-30"), Some(-390.0));
+        assert_eq!(parse_angle("+1x+45"), Some(405.0));
+        for bad in ["", "x", "x45", "1x2x3", "°", "abc", "NaN", "inf", "-inf", "1e999", "1e308x0", "1x1e999"] {
+            assert_eq!(parse_angle(bad), None, "{bad:?}");
+        }
+        let huge = "9".repeat(100_000);
+        assert_eq!(parse_angle(&huge), None, "overflows to infinity");
+        assert_eq!(parse_angle(&format!("{huge}x{huge}")), None);
+
+        // The degrees field: a plain number is the signed degrees and keeps the revolutions.
+        assert_eq!(typed_degrees(-90.0, "+90"), Some(90.0));
+        assert_eq!(typed_degrees(-90.0, "90"), Some(90.0));
+        assert_eq!(typed_degrees(-90.0, "-45°"), Some(-45.0));
+        assert_eq!(typed_degrees(390.0, "45"), Some(405.0));
+        assert_eq!(typed_degrees(-390.0, "-10"), Some(-370.0));
+        // A whole angle replaces it.
+        assert_eq!(typed_degrees(390.0, "0x-90.0°"), Some(-90.0));
+        assert_eq!(typed_degrees(0.0, "-1x-30"), Some(-390.0));
+        assert_eq!(typed_degrees(0.0, "2X"), Some(720.0));
+        // Garbage changes nothing.
+        for bad in ["", "abc", "+", "NaN", "1e999", huge.repeat(4).as_str()] {
+            assert_eq!(typed_degrees(-90.0, bad), None, "{bad:?}");
+        }
+        assert!(typed_degrees(f64::MAX, "1").is_some_and(f64::is_finite));
     }
 
     #[test]

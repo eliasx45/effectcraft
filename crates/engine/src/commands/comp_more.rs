@@ -15,12 +15,18 @@ fn has_roi(s: &Session) -> std::result::Result<(), String> {
 }
 
 /// Crop the comp to `[x, y, w, h]`: the comp shrinks and every unparented layer moves by -x, -y
-/// (all position keys too) so nothing moves on screen.
+/// (all position keys too) so nothing moves on screen. Effect point parameters stay put too
+/// ([`super::layer::offset_effect_points`]): a shape or text layer's effect space is sized by
+/// the comp, and a few effects place their points in comp space.
 fn crop(s: &mut Session, cid: effectcraft_project::ItemId, r: [f64; 4], label: &str) -> Result<Value> {
     let (x, y) = (r[0].round(), r[1].round());
     // At most 30,000 px a side, like any composition (#788).
     let (w, h) = (effectcraft_project::limits::size_f64(r[2]), effectcraft_project::limits::size_f64(r[3]));
     s.edit(label, None, |proj, st| {
+        let comp_sized = {
+            let pr: &effectcraft_project::Project = proj;
+            super::layer::comp_sized_fx_layers(pr, pr.comp(cid).ok_or(EngineError::NoComp)?)
+        };
         let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let (old_w, old_h) = (c.width, c.height);
         c.width = w;
@@ -30,6 +36,8 @@ fn crop(s: &mut Session, cid: effectcraft_project::ItemId, r: [f64; 4], label: &
                 super::layer::offset_position(tr, -x, -y);
             }
         }
+        let resize = [f64::from(w) - f64::from(old_w), f64::from(h) - f64::from(old_h)];
+        super::layer::offset_effect_points(c, &comp_sized, resize, [-x, -y]);
         for g in &mut c.guides {
             let px = g.px(old_w, old_h) - if g.vertical { x } else { y };
             g.set_px(px, w, h);

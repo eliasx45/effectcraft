@@ -1,7 +1,8 @@
 //! Timeline rows for shape layers, masks and keyframing: the Contents "Add:" menu and the Classic
 //! 3D "Change Renderer…" row (#206), Alt+Shift+P revealing the key it adds and clicks below the
 //! layers deselecting them (#205), Mask Feather's linked values (#203), and copying shape items
-//! between shape layers (#227), and Ctrl+V of SVG markup making a shape layer (#738).
+//! between shape layers (#227), Ctrl+V of SVG markup making a shape layer (#738), and Cmd+C /
+//! Cmd+V of a selected effect onto another shape layer.
 
 use effectcraft_engine::Session;
 use effectcraft_engine::project::LayerId;
@@ -466,4 +467,57 @@ fn damaged_figcraft_paste_does_not_paste_the_old_internal_clipboard() {
         assert_eq!(*h.state().session.project, *before);
         assert!(h.state().ui.status.contains("invalid FigCraft clipboard"), "{}", h.state().ui.status);
     }
+}
+
+fn effect_names(h: &Harness<'_, EffectcraftApp>, l: u64) -> Vec<String> {
+    h.state().session.active_comp().unwrap().layer(LayerId(l)).unwrap().effects().map(|f| f.groups().map(|g| g.name.clone()).collect()).unwrap_or_default()
+}
+
+/// Elias: Drop Shadow selected on a shape layer (its Contents open), ⌘C, another shape layer
+/// selected, ⌘V: nothing was pasted. Keyframes selected before (clicking an animated
+/// property's name selects its keys) stayed selected when the effect was clicked, so ⌘C copied
+/// them instead of the effect. Clicking the effect in the Timeline or in Effect Controls copies
+/// the effect, and ⌘V adds it to the selected layer with its values.
+#[test]
+fn cmd_c_and_cmd_v_copy_a_selected_effect_onto_another_shape_layer() {
+    let mut s = session();
+    let a = s.execute("layer.newShape", json!({"kind": "rect", "name": "A • player frame"})).unwrap()["layer"].as_u64().unwrap();
+    let b = s.execute("layer.newShape", json!({"kind": "ellipse", "name": "A • player progress"})).unwrap()["layer"].as_u64().unwrap();
+    let shadow = s.execute("effect.apply", json!({"layers": [a], "effect": "Drop Shadow"})).unwrap()["effects"][0].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/distance", "value": 20.0})).unwrap();
+    s.execute("prop.toggleAnimation", json!({"layer": a, "path": "transform/opacity"})).unwrap();
+    s.execute("time.set", json!({"time": 1.0})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/opacity", "value": 40})).unwrap();
+    s.execute("time.set", json!({"time": 0.0})).unwrap();
+    let l = s.active_comp().unwrap().layer(LayerId(a)).unwrap().clone();
+    let (contents, effects) = (l.props.sub("contents").unwrap().uid, l.props.sub("effects").unwrap().uid);
+    let mut h = harness(s);
+    h.state_mut().show_panel(effectcraft_ui_egui::dock::PanelKind::EffectControls);
+    h.state_mut().ui.timeline.open_groups.extend([contents, effects]);
+    open_layer(&mut h, a);
+    let distance = |h: &Harness<'_, EffectcraftApp>, l: u64, n: usize| {
+        let layer = h.state().session.active_comp().unwrap().layer(LayerId(l)).unwrap().clone();
+        layer.effects().unwrap().groups().nth(n).unwrap().get("distance").unwrap().value.clone()
+    };
+    for (n, at) in [format!("timeline.group.{shadow}.name"), format!("effectControls.effect.{shadow}")].into_iter().enumerate() {
+        // Opacity's name clicked before: its two keys are selected.
+        h.state_mut().session.execute("layer.select", json!({"layers": [a]})).unwrap();
+        h.state_mut().session.execute("prop.select", json!({"layer": a, "path": "transform/opacity"})).unwrap();
+        assert_eq!(h.state().session.state.selected_keys.len(), 2);
+        h.run_steps(3);
+        click(&mut h, &at);
+        assert_eq!(h.state().session.state.selected_props, vec![(LayerId(a), shadow)], "{at}");
+        h.input_mut().events.push(Event::Copy);
+        h.step();
+        assert_eq!(h.state().session.state.effect_clipboard.len(), 1, "{at}: {}", h.state().ui.status);
+        click(&mut h, &format!("timeline.layer.{b}.row"));
+        assert_eq!(h.state().session.state.selected_layers, vec![LayerId(b)]);
+        h.input_mut().events.push(Event::Paste("EffectCraft: 1 effect".into()));
+        h.run_steps(3);
+        assert_eq!(effect_names(&h, b).len(), n + 1, "{at}: {}", h.state().ui.status);
+        assert_eq!(effect_names(&h, b)[n], if n == 0 { "Drop Shadow" } else { "Drop Shadow 2" });
+        assert_eq!(distance(&h, b, n), effectcraft_engine::keyframe::Value::Scalar(20.0));
+        assert_eq!(h.state().session.active_comp().unwrap().layers.len(), 2, "no layer pasted");
+    }
+    assert_eq!(effect_names(&h, a), ["Drop Shadow"]);
 }

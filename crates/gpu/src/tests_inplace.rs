@@ -72,7 +72,7 @@ fn in_place_layers_match_full_canvas_passes() {
         assert!(e.owns(&canvas), "step {i}: the canvas is the encoder's own");
         full = ops::warp_q(&mut e, &full, &layer, &s.m, s.sampling, s.mode, s.opacity, 5, s.accumulate, s.levels);
         let before = canvas.texture.clone();
-        ops::warp_q_in(&mut e, &mut canvas, &layer, &s.m, s.sampling, s.mode, s.opacity, 5, s.accumulate, s.levels);
+        ops::warp_q_in(&mut e, &mut canvas, &layer.clone().into(), &s.m, s.sampling, s.mode, s.opacity, 5, s.accumulate, s.levels);
         assert_eq!(canvas.texture == before, s.in_place, "step {i}: in place");
         assert_eq!(canvas.levels, full.levels, "step {i}");
         if let Some(l) = s.levels {
@@ -123,7 +123,7 @@ fn in_place_mattes_blends_and_motion_blur_match_full_passes() {
     let mut e = Enc::new(&g.ctx);
     let zeros = e.zeros(w, h);
     let m = at(60.0, 50.0, 25.0, 1.1);
-    let reach = ops::warp_bounds(&zeros, &layer, &m);
+    let reach = ops::warp_bounds((zeros.width, zeros.height), (layer.width, layer.height), &m);
     let iso = ops::warp(&mut e, &zeros, &layer, &m, Bilinear, Normal, 1.0, 0, None);
     let q = Some(255.0);
     let bg_q = ops::quantize(&mut e, &bg, 255.0);
@@ -184,7 +184,7 @@ fn in_place_mattes_blends_and_motion_blur_match_full_passes() {
         }
         let mut sum = if sum_in_place { own(&mut e, base) } else { zeros.clone() };
         let before = sum.texture.clone();
-        let b = ops::warp_accumulate_in(&mut e, &mut sum, &layer, &samples, Bilinear, k);
+        let b = ops::warp_accumulate_in(&mut e, &mut sum, &layer.clone().into(), &samples, Bilinear, k);
         assert_eq!(sum.texture == before, sum_in_place, "{label}: in place");
         same_bits(&mut e, label, &acc, &sum);
         if sum_in_place {
@@ -201,7 +201,7 @@ fn in_place_mattes_blends_and_motion_blur_match_full_passes() {
 
     // Layer styles: the canvas moved toward the styled result on the enabled channels.
     let mut tmp = own(&mut e, &bg);
-    ops::warp_q_in(&mut e, &mut tmp, &layer, &m, Bilinear, Multiply, 1.0, 0, None, None);
+    ops::warp_q_in(&mut e, &mut tmp, &layer.clone().into(), &m, Bilinear, Multiply, 1.0, 0, None, None);
     let full = ops::channel_mix(&mut e, &bg, &tmp, [true, false, true], 0.6);
     let mut canvas = own(&mut e, &bg);
     let before = canvas.texture.clone();
@@ -236,7 +236,7 @@ fn in_place_layers_survive_early_submits() {
         assert!(e.owns(&canvas), "step {i}: the canvas is the encoder's own across submits");
         full = ops::warp_q(&mut e, &full, &layer, &m, Bilinear, mode, 0.7, 5, None, None);
         let before = canvas.texture.clone();
-        ops::warp_q_in(&mut e, &mut canvas, &layer, &m, Bilinear, mode, 0.7, 5, None, None);
+        ops::warp_q_in(&mut e, &mut canvas, &layer.clone().into(), &m, Bilinear, mode, 0.7, 5, None, None);
         assert!(canvas.texture == before, "step {i}: drawn in place");
     }
     same_bits(&mut e, "150 layers over several submits", &full, &canvas);

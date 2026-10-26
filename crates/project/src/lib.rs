@@ -12,10 +12,12 @@ mod finite;
 pub mod freeze;
 pub mod layers;
 pub mod limits;
+pub mod matchnames;
 pub mod props;
 pub mod render_queue;
 pub mod render_templates;
 pub mod sequence;
+pub mod speech;
 pub mod styles;
 pub mod tracking;
 
@@ -25,7 +27,7 @@ use std::sync::Arc;
 pub use effectcraft_color::ColorSpace;
 use effectcraft_color::{BlendMode, Label};
 use effectcraft_time::{FrameRate, Tick};
-pub use props::{Expression, FeatherFalloff, GroupKind, MaskMode, MaskMotionBlur, Node, ParamUi, PropGroup, Property, Uid, parse_path};
+pub use props::{Expression, FeatherFalloff, GroupKind, MaskMode, MaskMotionBlur, Node, ParamUi, PathWalk, PropGroup, Property, Uid, parse_path};
 use serde::{Deserialize, Serialize};
 
 pub use effectcraft_keyframe as keyframe;
@@ -373,6 +375,9 @@ pub struct ProjectSettings {
     /// working space (as in After Effects).
     #[serde(default = "gamma_22")]
     pub working_gamma: f64,
+    /// Footage items whose automatic proxy suggestion was turned down ("No"): never asked again.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub proxy_hint_dismissed: std::collections::BTreeSet<ItemId>,
 }
 
 fn gamma_22() -> f64 {
@@ -402,6 +407,7 @@ impl Default for ProjectSettings {
             hdr: HdrMode::Clip,
             output_space: None,
             working_gamma: 2.2,
+            proxy_hint_dismissed: Default::default(),
         }
     }
 }
@@ -576,6 +582,10 @@ pub struct Comp {
     /// the undo history.
     #[serde(default, skip_serializing_if = "Resolution::is_auto")]
     pub resolution: Resolution,
+    /// The voice-over's words and stressed syllables (`speech.import`), for timing animation to
+    /// speech. Draws nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech: Option<std::sync::Arc<speech::SpeechMap>>,
 }
 
 /// A viewer guide line: vertical guides sit at an x position, horizontal ones at a y position.
@@ -652,6 +662,7 @@ impl Comp {
             global_light: styles::GlobalLight::default(),
             essential: None,
             resolution: Resolution::Auto,
+            speech: None,
         }
     }
     /// Whether the composition has a frame at its time `t`: nested, it shows nothing before it
@@ -1007,6 +1018,7 @@ impl Comp {
             guides,
             essential,
             resolution: _,
+            speech: _,
         } = self;
         *width == o.width
             && *height == o.height
@@ -1046,6 +1058,7 @@ impl Comp {
     pub fn pixel_form_with(&self, with_markers: bool) -> std::borrow::Cow<'_, Comp> {
         if !self.hide_shy
             && self.resolution.is_auto()
+            && self.speech.is_none()
             && self.layers.iter().all(|l| l.switches == l.switches.pixels())
             && (with_markers || (self.markers.iter().all(is_timing_marker) && self.layers.iter().all(|l| l.markers.is_empty())))
         {
@@ -1054,6 +1067,7 @@ impl Comp {
         let mut c = self.clone();
         c.hide_shy = false;
         c.resolution = Resolution::Auto;
+        c.speech = None;
         if !with_markers {
             c.markers.retain(is_timing_marker);
         }
@@ -1378,6 +1392,11 @@ pub struct Proxy {
     /// Use Proxy (the Project panel's proxy indicator: filled = in use, hollow = set but off).
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Made by EffectCraft's automatic proxy suggestion (`proxy.autoCreate`): a preview-only
+    /// stand-in. Final renders (Render Queue, exports, Save Frame As) use the original under
+    /// Proxy Use ▸ Current Settings; only Use All Proxies renders with it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
 }
 
 /// A layer of a layered still (a Photoshop document, or a PDF / Illustrator / EPS file) used as

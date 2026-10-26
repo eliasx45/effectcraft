@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::hash::sha256_hex;
-use crate::manifest::{BlobRef, Card, CardFile, HEAD_KEY, Head, Manifest, Placeholder, decode_blob, encode_blob};
+use crate::manifest::{BlobRef, Card, CardFile, Collection, Crop, HEAD_KEY, Head, Manifest, Placeholder, decode_blob, encode_blob};
 use crate::remote::{Remote, get_blocking};
 
 /// Ticks per second (`effectcraft_time::Tick`), to report placeholder durations in seconds.
@@ -40,6 +40,12 @@ pub struct Options {
     /// `max_file_bytes` (e.g. `SceneYard` = 5 MB keeps its big footage images home).
     pub folder_max_bytes: Vec<(String, u64)>,
     pub include_video: bool,
+    /// List every other library entry too, with its thumbnail only ([`Card::on_mac`]): entries
+    /// outside `folders`, and the index's `catalog_only` ones (what EffectCraft can't apply).
+    pub catalog_all: bool,
+    /// Entries published in full wherever they are (a card saved from the panel). Cards a
+    /// previous publish had in full stay so ("saved" cards keep their files).
+    pub ids: Vec<String>,
     /// Work everything out, upload nothing.
     pub dry_run: bool,
     /// Upload every blob again (a remote that lost files).
@@ -55,6 +61,8 @@ impl Options {
             max_preview_bytes: 90 * 1000 * 1000,
             folder_max_bytes: vec![],
             include_video: false,
+            catalog_all: false,
+            ids: vec![],
             dry_run: false,
             force: false,
         }
@@ -81,6 +89,9 @@ pub struct Report {
     pub cards: usize,
     #[serde(rename = "needsFootage")]
     pub needs_footage: usize,
+    /// Cards listed with their thumbnail only (applied on the Mac).
+    #[serde(rename = "onMac")]
+    pub on_mac: usize,
     /// Blobs uploaded (or to upload, dry run) and the bytes sent (gzipped blobs compressed).
     pub uploads: usize,
     #[serde(rename = "uploadBytes")]
@@ -200,6 +211,102 @@ fn project_paths(v: &Value) -> Vec<(String, Option<&serde_json::Map<String, Valu
     out
 }
 
+/// An image's width and height from its header (PNG, JPEG, GIF), reading at most 512 KB.
+pub fn image_size(path: &Path) -> Option<[u32; 2]> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path).ok()?.take(512 * 1024).read_to_end(&mut head).ok()?;
+    image_size_of(&head)
+}
+
+fn image_size_of(b: &[u8]) -> Option<[u32; 2]> {
+    let be16 = |i: usize| Some(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32);
+    let be32 = |i: usize| Some(u32::from_be_bytes([*b.get(i)?, *b.get(i + 1)?, *b.get(i + 2)?, *b.get(i + 3)?]));
+    let size = |w: u32, h: u32| (w > 0 && h > 0).then_some([w, h]);
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return size(be32(16)?, be32(20)?);
+    }
+    if b.starts_with(b"GIF8") {
+        let le16 = |i: usize| Some(u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32);
+        return size(le16(6)?, le16(8)?);
+    }
+    if b.starts_with(&[0xFF, 0xD8]) {
+        // Walk the segments to the first start-of-frame (SOF0…SOF15 except DHT, JPG, DAC).
+        let mut i = 2usize;
+        while i + 4 <= b.len() {
+            if *b.get(i)? != 0xFF {
+                return None;
+            }
+            let marker = *b.get(i + 1)?;
+            if marker == 0xFF {
+                i += 1;
+                continue;
+            }
+            if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                return size(be16(i + 7)?, be16(i + 5)?);
+            }
+            let len = be16(i + 2)? as usize;
+            i = i.checked_add(2)?.checked_add(len)?;
+        }
+    }
+    None
+}
+
+/// The library's folders under the published ones, in its order: saved positions first, then
+/// (top folders) the library's priority list, then by name; parents before their subfolders.
+fn collections(index: &Value, folders: &[String], cards: &[Card], b: &mut Builder) -> Vec<Collection> {
+    let meta = index.get("collections");
+    // `""` among `folders`: every folder.
+    let published = |path: &str| folders.iter().any(|f| f.is_empty() || path == f || path.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')));
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    let listed = meta.and_then(|m| m.get("folders")).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str);
+    for path in listed.map(str::to_string).chain(cards.iter().map(|c| c.category.clone())) {
+        let mut acc = String::new();
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(part);
+            if published(&acc) {
+                all.insert(acc.clone());
+            }
+        }
+    }
+    let order = |path: &str| meta.and_then(|m| m.get("order")).and_then(|o| o.get(path)).and_then(Value::as_i64);
+    let priorities: Vec<&str> =
+        meta.and_then(|m| m.get("priorities")).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for path in &all {
+        let parent = path.rsplit_once('/').map_or("", |(p, _)| p);
+        children.entry(parent.to_string()).or_default().push(path.clone());
+    }
+    for (parent, list) in children.iter_mut() {
+        list.sort_by(|a, b| {
+            let key = |p: &str| {
+                let pri = if parent.is_empty() { priorities.iter().position(|x| *x == p).unwrap_or(99) } else { 99 };
+                (order(p).is_none(), order(p).unwrap_or(0), pri, p.to_lowercase())
+            };
+            key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+        });
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<String> = children.get("").map(|c| c.iter().rev().cloned().collect()).unwrap_or_default();
+    while let Some(path) = stack.pop() {
+        let icon = meta.and_then(|m| m.get("icons")).and_then(|i| i.get(&path)).and_then(Value::as_str).filter(|p| !p.is_empty());
+        // Icons are small images; a big file stays home (the folder shows the plain glyph).
+        let icon = icon.map(|p| b.resolve(p)).filter(|p| Hasher::stat(p).is_some_and(|(size, _)| size <= 4 * 1000 * 1000)).and_then(|p| {
+            let name = file_name(&p.to_string_lossy());
+            b.blob(&p, &name)
+        });
+        let group = meta.and_then(|m| m.get("groups")).and_then(|g| g.get(&path)).and_then(Value::as_str).unwrap_or_default().to_string();
+        if let Some(kids) = children.get(&path) {
+            stack.extend(kids.iter().rev().cloned());
+        }
+        out.push(Collection { path, icon, group });
+    }
+    out
+}
+
 fn text(e: &Value, key: &str) -> String {
     e.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
@@ -246,6 +353,41 @@ impl Builder<'_> {
         Some(blob)
     }
 
+    /// A card listed with its thumbnail only (no project, preview or files).
+    fn mac_card(&mut self, e: &Value) -> Card {
+        let mut card = Card {
+            id: text(e, "id"),
+            name: text(e, "name"),
+            category: text(e, "category"),
+            kind: "mac".into(),
+            kind_label: text(e, "type_label"),
+            location: text(e, "location"),
+            crop: e.get("crop").and_then(|c| serde_json::from_value::<Crop>(c.clone()).ok()).and_then(Crop::valid),
+            description: e.get("raw_description").and_then(Value::as_str).map_or_else(|| text(e, "description"), str::to_string),
+            tags: strings(e, "tags"),
+            aliases: strings(e, "aliases"),
+            visual_caption: text(e, "visual_caption"),
+            motion_events: strings(e, "motion_events"),
+            summary: text(e, "summary"),
+            generated_summary: text(e, "generated_summary"),
+            motion_terms: text(e, "motion_terms"),
+            priority: e.get("priority").and_then(Value::as_bool).unwrap_or(false),
+            duration: e.get("duration").and_then(Value::as_f64).filter(|d| d.is_finite()),
+            on_mac: true,
+            ..Card::default()
+        };
+        let p = text(e, "thumbnail");
+        if !p.is_empty() {
+            let path = self.resolve(&p);
+            if Hasher::stat(&path).is_some_and(|(size, _)| size <= self.opts.max_preview_bytes.min(self.opts.max_file_bytes)) {
+                card.thumbnail = self.blob(&path, &file_name(&p));
+                card.thumb_size = card.thumbnail.as_ref().and_then(|_| image_size(&path));
+            }
+        }
+        card.rev = card.compute_rev();
+        card
+    }
+
     fn card(&mut self, e: &Value) -> Result<Card, String> {
         let id = text(e, "id");
         let name = text(e, "name");
@@ -260,6 +402,9 @@ impl Builder<'_> {
             name: name.clone(),
             category: text(e, "category"),
             kind: kind.clone(),
+            kind_label: text(e, "type_label"),
+            location: text(e, "location"),
+            crop: e.get("crop").and_then(|c| serde_json::from_value::<Crop>(c.clone()).ok()).and_then(Crop::valid),
             comp: text(e, "comp"),
             // The library's own description when the index carries it (search parity with
             // retrieval.py); else the index's display text.
@@ -293,7 +438,12 @@ impl Builder<'_> {
             let limit = if slot == 1 { self.opts.max_preview_bytes.min(self.opts.max_file_bytes) } else { self.opts.max_file_bytes };
             if Hasher::stat(&path).is_some_and(|(size, _)| size <= limit) {
                 let b = self.blob(&path, &file_name(&p));
-                if slot == 0 { card.thumbnail = b } else { card.preview = b }
+                if slot == 0 {
+                    card.thumb_size = b.as_ref().and_then(|_| image_size(&path));
+                    card.thumbnail = b;
+                } else {
+                    card.preview = b;
+                }
             }
         }
         let project_name = file_name(&file);
@@ -357,21 +507,39 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
     if folders.is_empty() {
         return Err("no folders to publish".into());
     }
-    let entries: Vec<&Value> = index
-        .get("entries")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| matches!(e.get("kind").and_then(Value::as_str), Some("comp" | "footage")))
-        .filter(|e| {
-            let cat = text(e, "category");
-            folders.iter().any(|f| cat == *f || cat.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')))
-        })
-        .collect();
-    progress(format!("{} cards in {}", entries.len(), folders.join(", ")));
-
+    let listed = |key: &str| index.get(key).and_then(Value::as_array).map(|a| a.iter().collect::<Vec<_>>()).unwrap_or_default();
     let previous = current(remote)?;
+    // Saved cards: asked for now, or published in full before (outside the folders too).
+    let saved: BTreeSet<String> = opts
+        .ids
+        .iter()
+        .cloned()
+        .chain(previous.iter().flat_map(|(_, m)| m.cards.iter().filter(|c| !c.on_mac && c.project.is_some()).map(|c| c.id.clone())))
+        .collect();
+    let in_folders = |e: &Value| {
+        let cat = text(e, "category");
+        saved.contains(text(e, "id").as_str()) || folders.iter().any(|f| cat == *f || cat.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')))
+    };
+    let applicable = |e: &Value| matches!(e.get("kind").and_then(Value::as_str), Some("comp" | "footage"));
+    let entries: Vec<&Value> = listed("entries").into_iter().filter(|e| applicable(e) && in_folders(e)).collect();
+    // Everything else, thumbnails only (applied on the Mac).
+    let mac_entries: Vec<&Value> = if opts.catalog_all {
+        listed("entries")
+            .into_iter()
+            .filter(|e| !(applicable(e) && in_folders(e)))
+            .chain(listed("catalog_only"))
+            .filter(|e| !text(e, "id").is_empty())
+            .collect()
+    } else {
+        vec![]
+    };
+    progress(format!(
+        "{} cards in {}{}",
+        entries.len(),
+        folders.join(", "),
+        if opts.catalog_all { format!(", {} listed only", mac_entries.len()) } else { String::new() }
+    ));
+
     let mut b = Builder { opts, hasher: Hasher::open(&opts.library), uploads: BTreeMap::new(), report: Report { dry_run: opts.dry_run, ..Report::default() } };
     let mut cards = Vec::new();
     for (i, e) in entries.iter().enumerate() {
@@ -383,22 +551,29 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
             Err(err) => b.report.errors.push(err),
         }
     }
-    b.hasher.save();
+    for e in &mac_entries {
+        cards.push(b.mac_card(e));
+    }
     let mut seen = BTreeSet::new();
     cards.retain(|c| seen.insert(c.id.clone()));
+    let shown: Vec<String> = if opts.catalog_all { vec![String::new()] } else { folders.clone() };
+    let collections = collections(&index, &shown, &cards, &mut b);
+    b.hasher.save();
 
     let prev_version = previous.as_ref().map_or(0, |(h, _)| h.version);
     let mut report = std::mem::take(&mut b.report);
     report.previous = prev_version;
     report.cards = cards.len();
     report.needs_footage = cards.iter().filter(|c| c.needs_footage()).count();
+    report.on_mac = cards.iter().filter(|c| c.on_mac).count();
     let prev_cards: Vec<(String, String)> = previous.as_ref().map(|(_, m)| m.cards.iter().map(|c| (c.id.clone(), c.rev.clone())).collect()).unwrap_or_default();
     let now_cards: Vec<(String, String)> = cards.iter().map(|c| (c.id.clone(), c.rev.clone())).collect();
-    let same_folders = previous.as_ref().is_some_and(|(_, m)| m.folders == folders && m.name == lib_name);
+    let same_folders = previous.as_ref().is_some_and(|(_, m)| m.folders == folders && m.name == lib_name && m.collections == collections);
     report.unchanged = previous.is_some() && prev_cards == now_cards && same_folders && !opts.force;
     let version = if report.unchanged { prev_version } else { prev_version + 1 };
     report.version = version;
-    let manifest = Manifest::new(&lib_name, folders, cards, version);
+    let mut manifest = Manifest::new(&lib_name, folders, cards, version);
+    manifest.collections = collections;
     if let Some((_, m)) = &previous {
         let ch = m.changes_to(&manifest);
         (report.new, report.changed, report.removed) = (ch.new, ch.changed, ch.removed);
@@ -413,6 +588,7 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
             m.cards
                 .iter()
                 .flat_map(|c| c.thumbnail.iter().chain(c.preview.iter()).chain(c.project.iter()).chain(c.files.iter().map(|f| &f.blob)))
+                .chain(m.collections.iter().filter_map(|c| c.icon.as_ref()))
                 .map(BlobRef::remote_key)
                 .chain(std::iter::once(h.manifest.remote_key()))
                 .collect()
@@ -468,4 +644,52 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
     remote.put(HEAD_KEY, &serde_json::to_vec_pretty(&head).map_err(|e| e.to_string())?)?;
     progress(format!("published version {version}: {} cards", manifest.cards.len()));
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn image_sizes_from_headers() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&640u32.to_be_bytes());
+        png.extend_from_slice(&360u32.to_be_bytes());
+        assert_eq!(image_size_of(&png), Some([640, 360]));
+        // SOI, an APP0 segment, then SOF0 (precision, height, width).
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xC0, 0, 11, 8, 0x01, 0x68, 0x02, 0x80, 3];
+        assert_eq!(image_size_of(&jpeg), Some([640, 360]));
+        assert_eq!(image_size_of(b"GIF89a\x10\x00\x20\x00"), Some([16, 32]));
+        assert_eq!(image_size_of(b"nope"), None);
+        assert_eq!(image_size_of(&[0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xFF]), None);
+        assert_eq!(image_size_of(&png[..20]), None);
+    }
+
+    #[test]
+    fn collections_in_library_order() {
+        let dir = std::env::temp_dir().join(format!("ml-collections-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("icon.png"), b"png").unwrap();
+        let opts = Options::new(&dir, vec!["Devin Jatho".into(), "SceneYard".into()]);
+        let mut b = Builder { opts: &opts, hasher: Hasher::open(&dir), uploads: BTreeMap::new(), report: Report::default() };
+        let index = json!({"collections": {
+            "order": {"Devin Jatho": 2, "Devin Jatho/Screen Setups": 0, "Devin Jatho/Basics": 1, "Tapa": 0},
+            "icons": {"Devin Jatho": "icon.png", "SceneYard": "missing.png"},
+            "groups": {"SceneYard": "Stock"},
+            "folders": ["Tapa", "Devin Jatho/Icons", "Devin Jatho/Basics"],
+            "priorities": ["Devin Jatho"],
+        }});
+        let card = |cat: &str| Card { id: cat.into(), category: cat.into(), ..Default::default() };
+        let cards = [card("SceneYard"), card("Devin Jatho/Screen Setups"), card("Devin Jatho/Era elements"), card("Devin Jatho")];
+        let folders = ["Devin Jatho".to_string(), "SceneYard".to_string()];
+        let got = collections(&index, &folders, &cards, &mut b);
+        let paths: Vec<&str> = got.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["Devin Jatho", "Devin Jatho/Screen Setups", "Devin Jatho/Basics", "Devin Jatho/Era elements", "Devin Jatho/Icons", "SceneYard"]);
+        assert_eq!(got[0].icon.as_ref().map(|i| i.name.as_str()), Some("icon.png"));
+        assert!(got[5].icon.is_none());
+        assert_eq!(got[5].group, "Stock");
+        assert_eq!(b.uploads.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

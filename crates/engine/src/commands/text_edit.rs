@@ -562,7 +562,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "List Fonts",
             [],
             None,
-            "{query?, variable?, rescan?} → {count, families: [{family, styles, origin: bundled|system|user, variable, nativeName?}], added} (variable: only variable fonts; rescan picks up fonts installed since launch)",
+            "{query?, variable?, rescan?} → {count, families: [{family, styles, origin: bundled|system|user, variable, nativeName?}], added} (styles include a variable font's named instances, e.g. SF Pro Thin … Black; variable: only variable fonts; rescan picks up fonts installed since launch)",
             always_ok,
             fonts
         ),

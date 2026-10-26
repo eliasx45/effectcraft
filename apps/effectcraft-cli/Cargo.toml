@@ -30,7 +30,11 @@ effectcraft-render = { workspace = true }
 effectcraft-gpu = { workspace = true }
 effectcraft-time = { workspace = true }
 effectcraft-media = { workspace = true }
+# `library-pull`: Motion Library files from the Worker on the cloud machine.
+effectcraft-motionlib = { workspace = true }
 rayon = { workspace = true }
+# the disk guard of the server's proxies (free space on their volume)
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 serde_json = { workspace = true }
 image = { workspace = true }
 cpu-time = "1"
@@ -40,3 +44,5 @@ rustls-rustcrypto = "0.0.2-alpha"
 
 [dev-dependencies]
 effectcraft-media = { workspace = true }
+filmcraft-prores = { workspace = true }
+filmcraft-isobmff = { workspace = true }

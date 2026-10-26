@@ -33,7 +33,9 @@ pub(crate) fn prop_ref(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, Lay
 /// Why `path` names no property under `root`: the level that failed, the closest ids there and
 /// the valid ids at that level (so an agent can fix the path without another lookup).
 pub(crate) fn missing_prop(root: &PropGroup, path: &str) -> String {
-    let segs: Vec<&str> = path.split(['/', '.']).filter(|x| !x.is_empty()).collect();
+    // Segments as the resolver reads them: a dotted match id (`ec.stylize.deepglow`) stays one.
+    let walk = root.resolve_path(path);
+    let segs: Vec<&str> = walk.segs.iter().chain(&walk.rest).map(String::as_str).collect();
     if path.trim().starts_with('@') || segs.is_empty() {
         return format!("no property `{path}` (get_layer / layer.tree lists every path)");
     }
@@ -383,6 +385,65 @@ pub(crate) fn proportional_share(index: usize, count: usize) -> f64 {
 /// by its place in the selection order, the scrubbed layer too. One undo step (with `merge`,
 /// one that a continuing scrub keeps folding into).
 fn set_selected(s: &mut Session, p: &Value) -> Result<Value> {
+    // Several keys of this property selected and the CTI on one of them: the edit moves them all
+    // by the same change (After Effects), as one undo step.
+    let Some((cid, lid, uid, others, delta)) = key_followers(s, p) else { return set_selected_layers(s, p) };
+    let run = |s: &mut Session| -> Result<Value> {
+        let out = set_selected_layers(s, p)?;
+        let (label, merge) = ("Change Property", merge_p(p));
+        // (a follower that can't take it, e.g. a clamped value, keeps its own)
+        let _ = s.edit(label, merge, |proj, _| {
+            let layer = layer_mut(proj, cid, lid)?;
+            let pr = layer.props.find_mut(uid).ok_or_else(|| bad("prop.set", "property vanished"))?;
+            for t in &others {
+                let Some(i) = key_at(&pr.keys, *t) else { continue };
+                let Some(k) = pr.keys.get(i) else { continue };
+                let c: Vec<f64> = k.value.components().iter().enumerate().map(|(d, x)| x + delta.get(d).copied().unwrap_or(0.0)).collect();
+                let target = match c.as_slice() {
+                    [x] => json!(x),
+                    _ => json!(c),
+                };
+                let nv = coerce_for(pr, &k.value.clone(), &target, "prop.set").map(|(v, _)| v).unwrap_or_else(|_| k.value.with_components(&c));
+                if let Some(k) = pr.keys.get_mut(i) {
+                    k.value = nv;
+                }
+            }
+            Ok(())
+        });
+        Ok(out)
+    };
+    if merge_p(p).is_some() { run(s) } else { super::app_more::grouped(s, "Change Property", run) }
+}
+
+/// For a value edit at the CTI (`selected`, no explicit `time`) of a numeric property with two
+/// or more selected keys, the CTI on one of them: the layer-time of every other selected key and
+/// the change the edit makes to the key at the CTI (per component). `None` otherwise.
+fn key_followers(s: &Session, p: &Value) -> Option<(ItemId, LayerId, Uid, Vec<Tick>, Vec<f64>)> {
+    if b_p(p, "selected") != Some(true) || p.get("time").is_some() {
+        return None;
+    }
+    let (cid, lid, uid) = prop_ref(s, p, "prop.set").ok()?;
+    let layer = s.project.comp(cid)?.layer(lid)?;
+    let pr = layer.props.find(uid)?;
+    let at = layer.layer_time(s.time_of(cid));
+    let mine: Vec<Tick> = s.state.selected_keys.iter().filter(|k| k.layer == lid && k.prop == uid).map(|k| k.time).collect();
+    if !mine.contains(&at) {
+        return None;
+    }
+    let others: Vec<Tick> = mine.into_iter().filter(|t| *t != at && key_at(&pr.keys, *t).is_some()).collect();
+    if others.is_empty() {
+        return None;
+    }
+    let cur = pr.keys.get(key_at(&pr.keys, at)?)?;
+    if !matches!(cur.value, KValue::Scalar(_) | KValue::Vec2(_) | KValue::Vec3(_)) {
+        return None;
+    }
+    let new = p.get("value").and_then(json_numbers)?;
+    let delta: Vec<f64> = new.iter().zip(cur.value.components().iter().chain(std::iter::repeat(&0.0))).map(|(a, b)| a - b).collect();
+    delta.iter().any(|d| d.abs() > 1e-12).then_some((cid, lid, uid, others, delta))
+}
+
+fn set_selected_layers(s: &mut Session, p: &Value) -> Result<Value> {
     let twins = selected_twins(s, p, "prop.set")?;
     if twins.is_empty() {
         return set(s, p);
@@ -530,14 +591,20 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
     let l = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
     let pr = l.props.find(uid).ok_or_else(|| bad("prop.get", "property vanished"))?;
     let t = f_p(p, "time").map(Tick::from_seconds_f64).unwrap_or_else(|| s.time_of(cid));
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let keys: Vec<Value> = pr
         .keys
         .iter()
-        .map(|k| {
+        .enumerate()
+        .map(|(i, k)| {
             let mut info = key_timing(l, k.time);
+            crate::readout::put_time(&mut info, "", comp, l.comp_time(k.time));
             info["value"] = k.value.to_json();
             info["in"] = json!(k.in_interp.label());
             info["out"] = json!(k.out_interp.label());
+            if let (Some(o), Value::Object(e)) = (info.as_object_mut(), crate::readout::ease_fields(&pr.keys, i, pr.spatial)) {
+                o.extend(e);
+            }
             info
         })
         .collect();
@@ -545,13 +612,12 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
     let mut out = json!({
         "layer": lid.0, "uid": pr.uid, "match": pr.match_id, "name": pr.name, "type": pr.value.kind_name(),
         "comp": cid.0, "revision": s.revision, "timeBase": "comp",
-        "time": t.seconds(), "value": raw.to_json(), "rawValue": raw.to_json(), "animated": !pr.keys.is_empty(),
+        "time": t.seconds(), "tc": crate::readout::short_timecode(comp, t), "frame": crate::readout::frame_of(comp.frame_rate, t), "value": raw.to_json(), "rawValue": raw.to_json(), "animated": !pr.keys.is_empty(),
         "expressionEnabled": pr.expr.as_ref().is_some_and(|e| e.enabled),
         "keys": keys, "expression": pr.expr.as_ref().map(|e| e.text.clone()),
     });
     out["enabled"] = json!(true);
     out["effectiveEnabled"] = json!(super::query::property_effective_enabled(&l.props, pr.uid).unwrap_or(false));
-    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let mut ctx = crate::render::EvalCtx::new(&s.project, cid, comp, t);
     ctx.expr = s.expr.as_deref();
     super::query::expression_readback(s, &ctx, l, pr, &mut out);
@@ -793,9 +859,17 @@ fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
         },
     };
     let add = b_p(p, "add").unwrap_or(false);
+    let select_keys = b_p(p, "selectKeys").unwrap_or(true);
+    let leaf = s.project.comp(cid).and_then(|c| c.layer(lid)).is_some_and(|l| l.props.find(uid).is_some());
     if !add {
         s.state.selected_props.clear();
         s.state.selected_vertices.clear();
+        // Clicking an effect or a group (Drop Shadow, Gradient Stroke 1) deselects the keyframes
+        // selected before, as in After Effects: left selected, Edit ▸ Copy would copy those keys
+        // instead of the effect.
+        if select_keys || !leaf {
+            s.state.selected_keys.clear();
+        }
     }
     if !s.state.selected_layers.contains(&lid) {
         s.state.selected_layers = vec![lid];
@@ -809,13 +883,8 @@ fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
         s.state.selected_vertices.extend((0..n).map(|index| VertexRef { layer: lid, mask, index }));
     }
     // Selecting a property selects all its keys (as in AE).
-    if b_p(p, "selectKeys").unwrap_or(true)
-        && let Some(pr) = s.active_comp().and_then(|c| c.layer(lid)).and_then(|l| l.props.find(uid))
-    {
+    if select_keys && let Some(pr) = s.active_comp().and_then(|c| c.layer(lid)).and_then(|l| l.props.find(uid)) {
         let keys: Vec<KeyRef> = pr.keys.iter().map(|k| KeyRef { layer: lid, prop: uid, time: k.time }).collect();
-        if !add {
-            s.state.selected_keys.clear();
-        }
         s.state.selected_keys.extend(keys);
     }
     Ok(Value::Null)
@@ -1386,7 +1455,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Property Value",
             [],
             None,
-            "{layer?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers), offset? (them by the same change), proportional? (with offset: Proportional Scrubbing, each layer by its share in selection order, the first none, the last all)}",
+            "{layer?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers, and, with the CTI on one of several selected keys of the property, those keys by the same change), offset? (them by the same change), proportional? (with offset: Proportional Scrubbing, each layer by its share in selection order, the first none, the last all)}",
             has_layers,
             set_selected
         ),
@@ -1469,4 +1538,50 @@ pub fn specs() -> Vec<CommandSpec> {
             velocity
         ),
     ]
+}
+
+#[cfg(test)]
+mod key_follow_tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    fn key_values(s: &Session, l: u64, path: &str) -> Vec<Vec<f64>> {
+        let comp = s.active_comp().unwrap();
+        let layer = comp.layers.iter().find(|x| x.id.0 == l).unwrap();
+        layer.props.prop(path).unwrap().keys.iter().map(|k| k.value.components()).collect()
+    }
+
+    /// Editing X (or Y) of Position at the CTI on one of several selected keys moves every
+    /// selected key by the same change (After Effects, Elias 23 Oct 2026: only one moved); an
+    /// unselected key, and the other axis, stay.
+    #[test]
+    fn a_value_edit_on_a_selected_key_moves_every_selected_key_of_the_property() {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "C", "width": 64, "height": 64, "frameRate": 30, "duration": 6})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "A", "width": 8, "height": 8})).unwrap();
+        let l = s.active_comp().unwrap().layers[0].id.0;
+        for (t, x) in [(0.0, 10.0), (1.0, 20.0), (2.0, 30.0)] {
+            s.execute("prop.addKey", json!({"layer": l, "path": "transform/position", "time": t, "value": [x, 5.0]})).unwrap();
+        }
+        let uid = s.active_comp().unwrap().layers[0].props.prop("transform/position").unwrap().uid;
+        s.execute("keys.select", json!({"keys": [{"layer": l, "prop": uid, "time": 0.0}, {"layer": l, "prop": uid, "time": 1.0}]})).unwrap();
+        s.execute("time.set", json!({"time": 1.0})).unwrap();
+        let undo = s.history.undo.len();
+        s.execute("prop.set", json!({"layer": l, "path": "transform/position", "value": [25.0, 5.0], "selected": true})).unwrap();
+        let v = key_values(&s, l, "transform/position");
+        assert_eq!((v[0][0], v[1][0], v[2][0]), (15.0, 25.0, 30.0), "both selected keys moved by +5 in X: {v:?}");
+        assert_eq!((v[0][1], v[1][1], v[2][1]), (5.0, 5.0, 5.0), "Y stays");
+        assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+        // The same for Y.
+        s.execute("prop.set", json!({"layer": l, "path": "transform/position", "value": [25.0, 9.0], "selected": true})).unwrap();
+        let v = key_values(&s, l, "transform/position");
+        assert_eq!((v[0][1], v[1][1], v[2][1]), (9.0, 9.0, 5.0), "{v:?}");
+        // The CTI off the selected keys: only the value there changes (a new key).
+        s.execute("time.set", json!({"time": 1.5})).unwrap();
+        s.execute("prop.set", json!({"layer": l, "path": "transform/position", "value": [0.0, 0.0], "selected": true})).unwrap();
+        let v = key_values(&s, l, "transform/position");
+        assert_eq!(v.len(), 4);
+        assert_eq!((v[0][0], v[1][0]), (15.0, 25.0));
+    }
 }

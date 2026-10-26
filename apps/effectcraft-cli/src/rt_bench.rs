@@ -262,7 +262,23 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         if !timestamps {
             note!("  GPU timestamps unavailable on this adapter/device");
         }
-        rows.push(json!({"comp": name, "resolution": label, "frames": n, "transformDrag": drag, "coldMs": cold_ms, "p50Ms": p50, "p95Ms": p95,
+        // `--rt-checksum`: the first frames read back as f32 and hashed bit for bit (FNV-1a), to
+        // compare builds and settings (`EFFECTCRAFT_Q8=0/1`) pixel for pixel.
+        let mut hashes = Vec::new();
+        if args.flag("--rt-checksum") {
+            for i in 0..n.min(8) {
+                let t = comp.frame_rate.tick_of(base_frame.saturating_add(i as i64));
+                let img = gpu.render(&r, cid, t).ok_or_else(|| Failure::Error("GPU checksum frame failed".into()))?;
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for v in img.data.iter().flatten() {
+                    for b in v.to_bits().to_le_bytes() {
+                        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+                    }
+                }
+                hashes.push(format!("{h:016x}"));
+            }
+        }
+        rows.push(json!({"comp": name, "resolution": label, "frames": n, "transformDrag": drag, "coldMs": cold_ms, "p50Ms": p50, "p95Ms": p95, "frameHashes": hashes,
             "samplesMs": samples, "framesInOrder": frames, "bitDepth": format!("{:?}", project.settings.bit_depth), "stagesInclusiveMs": stages, "profiledOffset": profiled, "droppedTraceEvents": dropped,
             "yuvConversions": after.yuv_conversions.saturating_sub(before.yuv_conversions),
             "yuvInputBytes": after.yuv_bytes.saturating_sub(before.yuv_bytes), "timestampQueries": timestamps, "gpuDiagnosticWindowMs": gpu_window_ms,
@@ -283,7 +299,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         .map_err(|e| Failure::Error(e.to_string()))?;
         std::fs::write(path, bytes).map_err(|e| Failure::Error(format!("writing {path}: {e}")))?;
     }
-    let report = json!({"adapter": effectcraft_render::Accelerator::name(&gpu), "initializationMs": initialization_ms, "colorFusion": effectcraft_gpu::color_fusion_enabled(), "yuvTransport": effectcraft_gpu::yuv_transport_enabled(), "warmup": warmup, "warmupMs": warmup_ms, "staticPipelines": gpu.static_pipeline_count(), "path": "GPU viewer + completion wait (no window presentation)", "rows": rows});
+    let report = json!({"adapter": effectcraft_render::Accelerator::name(&gpu), "initializationMs": initialization_ms, "colorFusion": effectcraft_gpu::color_fusion_enabled(), "yuvTransport": effectcraft_gpu::yuv_transport_enabled(), "q8Codes": gpu.codes_stats().map(|(passes, decodes)| json!({"passes": passes, "decodes": decodes, "sites": gpu.codes_sites()})), "warmup": warmup, "warmupMs": warmup_ms, "staticPipelines": gpu.static_pipeline_count(), "path": "GPU viewer + completion wait (no window presentation)", "rows": rows});
     println!("{}", serde_json::to_string(&report).map_err(|e| Failure::Error(e.to_string()))?);
     Ok(())
 }

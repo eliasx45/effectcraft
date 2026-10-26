@@ -34,8 +34,6 @@ pub(crate) const KERNELS: &[&str] = &[
     "fxs_texturize",
     "fxs_glow_map",
     "fxs_glow_op",
-    "fxs_add",
-    "fxs_div",
     "fxs_flomotion",
 ];
 
@@ -643,7 +641,7 @@ fn motion_tile(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         let (ex, ey) = (effectcraft_effects::motion_tile_growth(ow - lw, s), effectcraft_effects::motion_tile_growth(oh - lh, s));
         (b.img.width.saturating_add(2 * ex), b.img.height.saturating_add(2 * ey), [b.offset[0] + ex as f64, b.offset[1] + ey as f64])
     } else {
-        ((ow * s).round().max(1.0) as u32, (oh * s).round().max(1.0) as u32, [(ow - lw) * 0.5 * s, (oh - lh) * 0.5 * s])
+        effectcraft_effects::motion_tile_frame(lw, lh, ow, oh, s, b.offset)
     };
     if !e.g.fits(nw, nh) {
         return None;
@@ -792,8 +790,10 @@ fn roughen_edges(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let ec = ctx.params.color("edgeColor");
     let border = ctx.params.f("border") * b.scale;
     let sharp = ctx.params.f("edgeSharpness").max(0.01) as f32;
-    let infl = ctx.params.f("fractalInfluence") as f32;
-    let scale = (ctx.params.f("scale") * b.scale * 0.1).max(0.5) as f32;
+    // Matched to After Effects 2026 (a masked rectangle, defaults, Border 30, Scale 300, Sharpness 5):
+    // its roughness is ~2.4x finer, pushes ~1.4x further and cuts ~2x harder than our first fit.
+    let infl = ctx.params.f("fractalInfluence") as f32 * 1.4;
+    let scale = (ctx.params.f("scale") * b.scale * 0.042).max(0.5) as f32;
     let (ox, oy) = b.to_px(ctx.params.v2("offset"));
     let oct = ctx.params.f("complexity") as f32;
     let evo = ctx.params.f("evolution") as f32 / 360.0;
@@ -819,8 +819,8 @@ fn roughen_edges(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     };
     let extra = if kind == 4 || kind == 5 { 1.0 } else { 0.0 };
     let seed = ctx.seed ^ 0x40f1 ^ (ctx.params.f("evolutionOptions/randomSeed").round() as i64 as u32).wrapping_mul(0x9e37_79b9);
-    // util::gauss_plane of the alpha (edges repeated); the kernel reads .w.
-    let d = if border > 0.05 { gaussian_blur(e, &b.img, border * 0.5, border * 0.5, true) } else { b.img.clone() };
+    // util::gauss_plane_edges of the alpha (transparent outside); the kernel reads .w.
+    let d = if border > 0.05 { gaussian_blur(e, &b.img, border * 0.5, border * 0.5, false) } else { b.img.clone() };
     let mut p = Params::default();
     p.u[0] = [seed, cycle.is_some() as u32, colored as u32, 0];
     p.f[0] = [ox as f32, oy as f32, scale * sx, scale * sy];
@@ -912,14 +912,15 @@ pub(crate) fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let intensity = ctx.params.f("intensity") as f32;
     let colors = ctx.params.e("colors");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
-    let s = (radius * effectcraft_effects::GLOW_SIGMA_PER_RADIUS).max(0.5);
+    let [cx, cy] = ctx.env.comp_px();
+    let (sx, sy) = effectcraft_effects::glow_sigmas(radius, cx, cy);
     if !ctx.adjustment {
-        b.pad(e, (s * 3.0).ceil() as u32 + 2)?;
+        b.pad(e, (sx.max(sy) * 3.0).ceil() as u32 + 2)?;
     }
     let mut p = crate::effects::glow_params(ctx);
     let bright = e.image(b.img.width, b.img.height);
     e.pixels("glow_bright", &p, &b.img, None, &bright, None);
-    let mut blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    let mut blurred = gaussian_blur(e, &bright, sx * kx, sy * ky, false);
     if colors == 2 {
         // Arbitrary Map: Curves tables per channel (see effects::curves).
         let mut parts = ctx.params.s("arbitraryMap").split('|');
@@ -980,36 +981,33 @@ pub(crate) fn transform(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBu
     let host = ctx.env.host?;
     let sampling = if ctx.params.e("sampling") == 1 { Sampling::Bicubic } else { Sampling::Bilinear };
     let fd = 1.0 / ctx.fps();
-    let (w, h) = (b.img.width, b.img.height);
-    // Content carried past the buffer edges grows the CPU buffer; render that case there.
-    let ms: Vec<Mat3> = (0..n)
+    let samples: Vec<(Mat3, f32)> = (0..n)
         .filter_map(|k| host.params_at(ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd))
-        .map(|pr| transform_matrix(&pr, &b))
+        .map(|pr| (transform_matrix(&pr, &b), pr.f("opacity") as f32 / 100.0))
         .collect();
-    if effectcraft_effects::transform_extent(ctx.adjustment, (w, h), &ms) != (0, 0, w, h) {
-        return None;
-    }
-    let mut acc = e.image(w, h);
-    let mut count = 0u32;
-    for k in 0..n {
-        let t = ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd;
-        let Some(pr) = host.params_at(t) else { continue };
-        let op = pr.f("opacity") as f32 / 100.0;
-        let empty = e.image(w, h);
-        let one = ops::warp(e, &empty, &b.img, &transform_matrix(&pr, &b), sampling, BlendMode::Normal, op, 0, None);
-        let sum = e.image(w, h);
-        e.pixels("fxs_add", &Params::default(), &acc, Some(&one), &sum, None);
-        acc = sum;
-        count += 1;
-    }
-    if count == 0 {
+    if samples.is_empty() {
         // The CPU renders the frame sharp.
         return None;
     }
-    let mut p = Params::default();
-    p.f[0][0] = count as f32;
-    let out = e.scratch(w, h);
-    e.pixels("fxs_div", &p, &acc, None, &out, None);
-    b.img = out;
+    // The buffer grows to hold every sample (the CPU's extent), and each sample adds straight
+    // into it over its own bounds, weighted by its opacity over the sample count.
+    let ms: Vec<Mat3> = samples.iter().map(|s| s.0).collect();
+    let ext = effectcraft_effects::transform_extent(ctx.adjustment, (b.img.width, b.img.height), &ms);
+    if !e.g.fits(ext.2, ext.3) {
+        return None;
+    }
+    let shift = Mat3::translate(vec2(-ext.0 as f64, -ext.1 as f64));
+    let src = crate::codes::Pixels::Float(b.img.clone());
+    let mut acc = e.image(ext.2, ext.3);
+    let k = 1.0 / samples.len() as f32;
+    // Runs of samples with one opacity (usually all of them) sum in one pass.
+    for run in samples.chunk_by(|a, b| a.1 == b.1) {
+        let ms: Vec<Mat3> = run.iter().map(|(m, _)| shift * *m).collect();
+        ops::warp_accumulate_in(e, &mut acc, &src, &ms, sampling, run[0].1 * k);
+    }
+    drop(src);
+    b.img = acc;
+    b.offset[0] -= ext.0 as f64;
+    b.offset[1] -= ext.1 as f64;
     Some(b)
 }

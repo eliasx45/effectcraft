@@ -520,28 +520,35 @@ fn preview_on(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, cy: f32) -> f
     let on_cloud = app.cloud.source == Some(Source::Cloud);
     let rtt = status.as_ref().and_then(|s| s.rtt_ms).map(|r| format!(" {r:.0} ms")).unwrap_or_default();
     let ready = status.as_ref().is_some_and(|s| s.ready);
+    // It was connected and lost it (a network blip; the client retries and `cloud.sh`'s watchdog
+    // reopens the tunnel, CR11): "reconnecting", not "offline".
+    let gone = if status.as_ref().is_some_and(|s| s.server.is_some() && !s.refused) { "reconnecting…" } else { "cloud offline" };
     let label = match mode.as_str() {
         "cloud" if on_cloud => format!("Preview: Cloud{rtt}"),
         "cloud" if status.as_ref().is_some_and(|s| s.connected) => "Preview: Cloud (loading)".to_string(),
-        "cloud" => "Preview: Mac (cloud offline)".to_string(),
+        "cloud" => format!("Preview: Mac ({gone})"),
         "auto" if on_cloud => format!("Preview: Auto · Cloud{rtt}"),
         "auto" if ready => "Preview: Auto · Mac".to_string(),
-        "auto" => "Preview: Auto · Mac (cloud offline)".to_string(),
+        "auto" => format!("Preview: Auto · Mac ({gone})"),
         _ => "Preview: This Mac".to_string(),
     };
     let tip = match &status {
-        Some(s) => format!(
-            "Where the viewer's preview frames render. Exports always render on this Mac.\n{}: {}{}",
-            s.address,
-            if s.ready {
-                "ready"
-            } else if s.connected {
-                "loading the project"
-            } else {
-                "not connected"
-            },
-            s.gpu.as_ref().map(|g| format!(" · {g}")).unwrap_or_default()
-        ),
+        Some(s) => {
+            format!(
+                "Where the viewer's preview frames render. Exports always render on this Mac.\n{}: {}{}",
+                s.address,
+                if s.ready {
+                    "ready"
+                } else if s.connected {
+                    "loading the project"
+                } else if s.server.is_some() {
+                    "connection lost, reconnecting"
+                } else {
+                    "not connected"
+                },
+                s.gpu.as_ref().map(|g| format!(" · {g}")).unwrap_or_default()
+            ) + &cloud_usage(s)
+        }
         None => "Where the viewer's preview frames render. Exports always render on this Mac.".to_string(),
     };
     let w = ui.painter().layout_no_wrap(label.clone(), crate::theme::Tokens::ui(11.5), t.text).size().x + 26.0;
@@ -570,6 +577,24 @@ fn preview_on(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, cy: f32) -> f
         None => {}
     }
     r.max.x
+}
+
+/// The Preview On tooltip's internet use and server cache lines (CR8).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn cloud_usage(s: &crate::cloud::CloudStatus) -> String {
+    let mb = |b: u64| b as f64 / 1_048_576.0;
+    let mut out = format!("\nInternet this session: {:.1} MB down · {:.1} MB up", mb(s.bytes_down), mb(s.bytes_up));
+    if let Some(c) = &s.server_cache {
+        out += &format!(
+            "\nCached on the server: {} of {} frames (blue cache bar) · {:.1} of {:.1} GB RAM{}",
+            c.done,
+            c.total,
+            c.ram_mb as f64 / 1024.0,
+            c.ram_budget_mb as f64 / 1024.0,
+            if c.disk_mb > 0 { format!(" · {:.1} GB on disk", c.disk_mb as f64 / 1024.0) } else { String::new() }
+        );
+    }
+    out
 }
 
 fn toggle_popup(ui: &egui::Ui, id: &str) {
@@ -853,9 +878,18 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
     if clicked {
         toggle_popup(ui, "vw-fast-pop");
     }
-    let items: Vec<(String, bool)> = FastPreviews::ALL.iter().map(|m| (m.label().to_string(), fp == *m)).collect();
+    let mut items: Vec<(String, bool)> = FastPreviews::ALL.iter().map(|m| (m.label().to_string(), fp == *m)).collect();
+    // Settings ▸ Previews: drafts while playing in any mode.
+    items.push(("Adaptive Resolution While Playing".to_string(), app.session.prefs.previews.adaptive_playback));
+    // UP1: Half / Third / Quarter frames upscaled with FSR1 instead of shown as blocks.
+    items.push(("Sharpen Low-Resolution Previews (FSR)".to_string(), app.session.prefs.previews.upscale_low_res));
     if let Some(i) = popup(app, ui, "vw-fast-pop", fr, &items, "fastPreviewsItem") {
-        let _ = app.session.execute("view.fastPreviewMode", json!({"mode": FastPreviews::ALL[i].id()}));
+        let n = FastPreviews::ALL.len();
+        let _ = match FastPreviews::ALL.get(i) {
+            Some(m) => app.session.execute("view.fastPreviewMode", json!({"mode": m.id()})),
+            None if i == n => app.session.execute("view.adaptivePlayback", json!({})),
+            None => app.session.execute("view.upscaleLowRes", json!({})),
+        };
     }
     x += 4.0;
     #[cfg(not(target_arch = "wasm32"))]

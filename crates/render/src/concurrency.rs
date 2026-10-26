@@ -44,9 +44,79 @@ fn cap(default: usize, var: Option<&str>) -> usize {
     }
 }
 
+/// Cores the desktop app leaves to the rest of the machine (MEM3): 2 from 8 cores, 1 from 4,
+/// none below. With every core busy at normal priority during playback, other apps (the window
+/// server, a screen recorder, dictation) stopped responding on a 10-core Mac.
+pub fn spare_cores(parallelism: usize) -> usize {
+    match parallelism {
+        8.. => 2,
+        4.. => 1,
+        _ => 0,
+    }
+}
+
+/// Threads the desktop app's own pools take on a machine with `parallelism` cores: all but the
+/// [`spare_cores`], at least 1.
+pub fn interactive_threads(parallelism: usize) -> usize {
+    parallelism.saturating_sub(spare_cores(parallelism)).max(1)
+}
+
+/// Make Rayon's global pool [`interactive_threads`] wide (the desktop app, before anything runs
+/// on it). Whether it was built here (`false`: something built it first, it keeps its size).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn init_global_pool() -> bool {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    rayon::ThreadPoolBuilder::new().num_threads(interactive_threads(cores)).build_global().is_ok()
+}
+
+/// How the app changes the calling thread's priority ([`set_thread_priority_hooks`]).
+#[derive(Clone, Copy)]
+struct Hooks {
+    background: fn(),
+    foreground: fn(),
+}
+
+static HOOKS: std::sync::OnceLock<Hooks> = std::sync::OnceLock::new();
+
+/// Set how a thread lowers itself for background work nobody waits for (prefetch, read-ahead,
+/// Cache Frames When Idle, RAM preview compression) and raises itself again for work the viewer
+/// or playback waits for. The desktop app: macOS utility and user-initiated quality of service
+/// (`effectcraft_platform`). The first call wins; without one these do nothing.
+pub fn set_thread_priority_hooks(background: fn(), foreground: fn()) {
+    let _ = HOOKS.set(Hooks { background, foreground });
+}
+
+/// Lower the calling thread to background priority (see [`set_thread_priority_hooks`]).
+pub fn background_thread() {
+    if let Some(h) = HOOKS.get() {
+        (h.background)();
+    }
+}
+
+thread_local! {
+    /// The priority [`thread_priority`] last gave this thread (`None`: never set).
+    static FOREGROUND: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Give the calling thread foreground or background priority for its next piece of work (a
+/// frame worker between jobs). Changes it only when it differs from the last call's.
+pub fn thread_priority(foreground: bool) {
+    let Some(h) = HOOKS.get() else { return };
+    if FOREGROUND.with(|f| f.replace(Some(foreground))) != Some(foreground) {
+        if foreground { (h.foreground)() } else { (h.background)() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_app_leaves_cores_to_other_apps() {
+        assert_eq!((interactive_threads(10), interactive_threads(8)), (8, 6), "10-core M1 Max: 8");
+        assert_eq!((interactive_threads(4), interactive_threads(2), interactive_threads(1), interactive_threads(0)), (3, 2, 1, 1));
+        assert_eq!(interactive_threads(64), 62);
+    }
 
     #[test]
     fn the_env_value_caps_the_default() {

@@ -22,7 +22,7 @@ struct TabOrder {
 
 fn tab_order_id(ui: &Ui) -> egui::Id {
     let panel = ui.stack().iter().find(|s| s.tags().contains(PANEL_TAG)).map_or(egui::Id::NULL, |s| s.id);
-    egui::Id::new(("hot-tab-order", panel))
+    crate::panels::timeline::ids::tl_id(("hot-tab-order", panel))
 }
 
 /// Puts hot-text field `id` in its panel's Tab order. True when a Tab in the field before it
@@ -61,10 +61,31 @@ pub fn hot_number_at(
     suffix: &str,
     t: &Tokens,
 ) -> (Rect, Option<f64>, bool) {
+    let edit_text = format!("{value:.decimals$}");
+    let parse = |txt: &str| txt.trim().trim_end_matches(suffix).trim().replace(',', ".").parse::<f64>().ok();
+    hot_number_typed_at(ui, rect_min, id, value, speed, range, decimals, suffix, t, &edit_text, &parse)
+}
+
+/// [`hot_number_at`] whose editor opens with `edit_text` and whose typed text `parse` reads
+/// (a typed value is still kept only when finite and is clamped to `range`). An angle's degrees
+/// show their size but are typed signed, and take a whole `NxD` angle.
+pub fn hot_number_typed_at(
+    ui: &mut Ui,
+    rect_min: egui::Pos2,
+    id: egui::Id,
+    value: f64,
+    speed: f64,
+    range: (f64, f64),
+    decimals: usize,
+    suffix: &str,
+    t: &Tokens,
+    edit_text: &str,
+    parse: &dyn Fn(&str) -> Option<f64>,
+) -> (Rect, Option<f64>, bool) {
     let editing_id = id.with("editing");
     let mut editing: Option<String> = ui.data(|d| d.get_temp(editing_id));
     if tab_stop(ui, id) && editing.is_none() {
-        editing = Some(format!("{value:.decimals$}"));
+        editing = Some(edit_text.to_owned());
     }
     let text = format!("{value:.decimals$}{suffix}");
     let galley = ui.painter().layout_no_wrap(text, Tokens::ui(12.0), t.hot_text);
@@ -84,9 +105,8 @@ pub fn hot_number_at(
         let tab = r.has_focus().then(|| ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab).then_some(i.modifiers.shift))).flatten();
         let mut out = None;
         if r.lost_focus() || tab.is_some() {
-            let txt = buf.trim().trim_end_matches(suffix).trim().replace(',', ".");
             if !ui.input(|i| i.key_pressed(egui::Key::Escape))
-                && let Ok(v) = txt.parse::<f64>()
+                && let Some(v) = parse(&buf)
                 && v.is_finite()
             {
                 out = Some(v.clamp(range.0, range.1));
@@ -133,9 +153,38 @@ pub fn hot_number_at(
         }
     }
     if resp.clicked() {
-        ui.data_mut(|d| d.insert_temp(editing_id, format!("{value:.decimals$}")));
+        ui.data_mut(|d| d.insert_temp(editing_id, edit_text.to_owned()));
     }
     (rect, out, resp.drag_stopped())
+}
+
+/// The value a hot-text edit of a property writes. A property with an expression shows the
+/// expression's result, as in After Effects, but a drag moves the value under the expression
+/// (`raw`) by the drag's change: writing the shown value back would add the expression's offset
+/// again every frame, and a `wiggle` ran the angle away by hundreds of degrees whatever the Cmd
+/// (fine) or Shift (coarse) multiplier. A typed value is the new pre-expression value as it is.
+pub fn scrub_value(
+    has_expression: bool,
+    raw: &effectcraft_engine::keyframe::Value,
+    shown: &effectcraft_engine::keyframe::Value,
+    new: serde_json::Value,
+    dragging: bool,
+) -> serde_json::Value {
+    if !has_expression || !dragging {
+        return new;
+    }
+    let (r, s) = (raw.components(), shown.components());
+    let n: Option<Vec<f64>> = match &new {
+        serde_json::Value::Number(x) => x.as_f64().map(|x| vec![x]),
+        serde_json::Value::Array(a) => a.iter().map(serde_json::Value::as_f64).collect(),
+        _ => None,
+    };
+    let Some(n) = n.filter(|n| n.len() == r.len() && n.len() == s.len()) else { return new };
+    let out: Vec<f64> = n.iter().zip(r.iter().zip(s.iter())).map(|(n, (r, s))| r + (n - s)).collect();
+    match (&new, out.as_slice()) {
+        (serde_json::Value::Number(_), [x]) => serde_json::json!(x),
+        _ => serde_json::json!(out),
+    }
 }
 
 /// Ctrl+Alt (Cmd+Opt on macOS) held while scrubbing hot text: After Effects' Proportional
@@ -441,7 +490,7 @@ pub fn scroll_bar(ui: &mut Ui, auto: &mut Registry, key: &str, track: Rect, scro
     let thumb_len = (len * len / (len + max.max(0.0)).max(1.0)).max(16.0).min(len).max(0.0);
     let travel = (len - thumb_len).max(1.0);
     let thumb_at = |s: f32| track.min[a] + (len - thumb_len) * if max > 0.0 { (s / max).clamp(0.0, 1.0) } else { 0.0 };
-    let resp = ui.interact(track.expand2(if vertical { vec2(3.0, 0.0) } else { vec2(0.0, 3.0) }), egui::Id::new(key), Sense::drag());
+    let resp = ui.interact(track.expand2(if vertical { vec2(3.0, 0.0) } else { vec2(0.0, 3.0) }), crate::panels::timeline::ids::tl_id(key), Sense::drag());
     let pressed = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.any_pressed());
     let mut s = scroll;
     if let Some(p) = resp.interact_pointer_pos().filter(|p| pressed && !(thumb_at(scroll)..=thumb_at(scroll) + thumb_len).contains(&p[a])) {
@@ -599,6 +648,10 @@ const POPUP_LIST_MAX_H: f32 = 440.0;
 /// when `body` returns a choice, on Escape, or on a press outside it and outside `anchor` (a
 /// control that toggles the list itself). Returns the choice.
 pub fn popup_list<R>(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, anchor: Rect, rows: usize, seps: usize, body: impl FnOnce(&mut Ui) -> Option<R>) -> Option<R> {
+    // The list is a window-level area: a control in a scaled layer (a host's canvas) opens it at
+    // the control's place in the window.
+    let lp = crate::layer_pointer::Lp::of(ui);
+    let (pos, anchor) = (lp.window_p(pos), if anchor.is_positive() { lp.to_window(anchor) } else { anchor });
     let screen = ui.ctx().content_rect();
     let sp = ui.spacing();
     let want = rows as f32 * (sp.interact_size.y + sp.item_spacing.y + 4.0) + seps as f32 * (2.0 * sp.item_spacing.y + 2.0) + 16.0;
@@ -718,9 +771,23 @@ pub(crate) fn constrained(c: &[f64], d: usize, v: f64) -> Vec<f64> {
         .collect()
 }
 
+/// Linked values after component `d` of `c` became `v`: the others move by the same amount.
+/// Audio Levels' left and right (dB) stay linked this way, as in After Effects: the balance
+/// between the channels is kept, and 0 dB on both sides is no special case.
+pub(crate) fn offset_linked(c: &[f64], d: usize, v: f64) -> Vec<f64> {
+    let Some(&old) = c.get(d) else { return c.to_vec() };
+    c.iter().enumerate().map(|(e, &x)| if e == d { v } else { x + (v - old) }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_levels_move_together_by_the_same_amount() {
+        assert_eq!(offset_linked(&[0.0, 0.0], 0, -6.0), vec![-6.0, -6.0]);
+        assert_eq!(offset_linked(&[-3.0, 0.0], 1, 2.0), vec![-1.0, 2.0]);
+    }
 
     /// #488: an inline editor selects its whole text only as it opens. Should it be without the
     /// keyboard for a frame later (an input method, another handler), it takes the keyboard back

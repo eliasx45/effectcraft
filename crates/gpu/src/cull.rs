@@ -7,7 +7,8 @@
 //! - layers under an opaque solid that covers the whole canvas are overwritten pixel for pixel
 //!   (Normal over with source alpha 1 returns the source): not drawn;
 //! - identical precomp instances (the same nested comp at the same nested time through equal
-//!   renderers) render their nested frame once per frame; each instance then runs its own
+//!   renderers) render their nested frame once per frame, in the same comp or in different
+//!   comps of the frame (an icon precomp in several screens); each instance then runs its own
 //!   effects, masks, transform and blend on it.
 
 use effectcraft_project::{ItemId, Layer, LayerSource};
@@ -15,19 +16,22 @@ use effectcraft_render::cull::NestedKey;
 use effectcraft_render::{EvalCtx, Renderer};
 use effectcraft_time::Tick;
 
-use crate::context::{Enc, GpuImage};
+use crate::context::Enc;
 
 /// Nested comp frames kept for the other instances of their precomp within one frame.
 #[derive(Default)]
 pub(crate) struct Shared {
     entries: Vec<Entry>,
     texels: u64,
+    /// Precomp layers showing each comp, in the whole project (counted once per frame).
+    uses: std::collections::HashMap<ItemId, usize>,
 }
 
 struct Entry {
     key: NestedKey,
-    img: GpuImage,
-    /// Instances that may still ask for it (other layers of the comp with the same source).
+    img: crate::codes::Pixels,
+    /// Instances that may still ask for it (the project's other layers with the same source;
+    /// what's left is dropped with the frame).
     uses: usize,
 }
 
@@ -110,9 +114,9 @@ pub(crate) fn first_drawn(r: &Renderer, ctx: &EvalCtx, visible: &[&Layer], size:
 }
 
 /// `walk::render` of a precomp layer's nested comp (`sub` drawing `item` at `t`), shared with
-/// the comp's other instances of `item` that render it identically this frame.
-pub(crate) fn nested(e: &mut Enc, ctx: &EvalCtx, sub: &Renderer, item: ItemId, t: Tick) -> Option<GpuImage> {
-    let others = ctx.comp.layers.iter().filter(|l| matches!(l.source, LayerSource::Comp { item: i } if i == item)).count().saturating_sub(1);
+/// the frame's other instances of `item` (in this comp or another) that render it identically.
+pub(crate) fn nested(e: &mut Enc, ctx: &EvalCtx, sub: &Renderer, item: ItemId, t: Tick) -> Option<crate::codes::Pixels> {
+    let others = instances(&mut e.shared, ctx, item).saturating_sub(1);
     let key = if enabled() && others > 0 { sub.nested_key(item, t) } else { None };
     let Some(key) = key else {
         #[cfg(test)]
@@ -145,6 +149,27 @@ pub(crate) fn nested(e: &mut Enc, ctx: &EvalCtx, sub: &Renderer, item: ItemId, t
     Some(img)
 }
 
-fn texels(img: &GpuImage) -> u64 {
-    u64::from(img.width).saturating_mul(u64::from(img.height))
+/// Precomp layers of the project showing `item` (at least the comp's own).
+fn instances(shared: &mut Shared, ctx: &EvalCtx, item: ItemId) -> usize {
+    let here = ctx.comp.layers.iter().filter(|l| matches!(l.source, LayerSource::Comp { item: i } if i == item)).count();
+    if here == 0 {
+        return 0;
+    }
+    let all = *shared.uses.entry(item).or_insert_with(|| {
+        ctx.project
+            .items
+            .values()
+            .filter_map(|it| match &it.kind {
+                effectcraft_project::ItemKind::Comp(c) => {
+                    Some(c.layers.iter().filter(|l| matches!(l.source, LayerSource::Comp { item: i } if i == item)).count())
+                }
+                _ => None,
+            })
+            .sum()
+    });
+    all.max(here)
+}
+
+fn texels(img: &crate::codes::Pixels) -> u64 {
+    u64::from(img.width()).saturating_mul(u64::from(img.height()))
 }

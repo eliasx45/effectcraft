@@ -37,6 +37,26 @@ fn sheet_times(s: &Session, p: &Value, target: Target, rate: FrameRate) -> Resul
         }
         return Ok((out, a.len()));
     }
+    // Comp frame numbers: a list, or every `every`th frame from `from` to `to` (both included).
+    if let Some(v) = present(p, "frames") {
+        let frame = |x: &Value| x.as_i64().ok_or_else(|| bad(CMD, format!("`frames` holds {x}, not a whole frame number")));
+        let list: Vec<i64> = match v {
+            Value::Array(a) if !a.is_empty() => a.iter().map(frame).collect::<Result<_>>()?,
+            Value::Object(o) => {
+                let (from, to) = (o.get("from").map(frame).transpose()?, o.get("to").map(frame).transpose()?);
+                let (Some(from), Some(to)) = (from, to) else { return Err(bad(CMD, "`frames` range needs `from` and `to` (comp frames)")) };
+                let every = o.get("every").map(frame).transpose()?.unwrap_or(1).max(1);
+                if to < from {
+                    return Err(bad(CMD, format!("`frames.to` ({to}) is before `frames.from` ({from})")));
+                }
+                let n = (to.saturating_sub(from) / every).saturating_add(1);
+                (0..n.min(MAX_CELLS as i64 + 1)).map(|i| from.saturating_add(i.saturating_mul(every))).collect()
+            }
+            _ => return Err(bad(CMD, "`frames` must be a non-empty list of comp frame numbers or {from, to, every?}")),
+        };
+        let n = list.len();
+        return Ok((list.into_iter().take(MAX_CELLS).map(|f| rate.tick_of(f)).collect(), n));
+    }
     let requested = uint_p(p, &["count"], u64::MAX, CMD)?.unwrap_or(DEFAULT_COUNT);
     if requested == 0 {
         return Err(bad(CMD, "`count` must be at least 1"));

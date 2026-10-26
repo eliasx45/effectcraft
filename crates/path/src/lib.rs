@@ -452,12 +452,49 @@ pub fn stroke_outline(paths: &[BezPath], style: &StrokeStyle, res_scale: f64) ->
     Some(from_skia(&out))
 }
 
-/// Coverage of a stroke.
+/// Coverage of a stroke. A variable-width stroke (Taper, Wave) is rasterised finely
+/// ([`fill_coverage_fine`]): its edges run almost parallel to the path, where tiny-skia's four
+/// sub-scanlines per pixel turned a thin taper into a band of constant thickness fading in
+/// quarter steps (VW-TAPER).
 pub fn stroke_coverage(paths: &[BezPath], style: &StrokeStyle, m: &Mat3, w: u32, h: u32) -> Mask {
     match stroke_outline(paths, style, m.mean_scale()) {
+        Some(o) if style.is_variable() => fill_coverage_fine(&[o], m, w, h, FillRule::NonZero),
         Some(o) => fill_coverage(&[o], m, w, h, FillRule::NonZero),
         None => Mask::new(w, h, 0.0),
     }
+}
+
+/// The most supersampled pixels [`fill_coverage_fine`] rasterises (64 MiB of `f32`); larger
+/// masks are supersampled less, down to plain [`fill_coverage`].
+const FINE_MAX_PIXELS: u64 = 16 << 20;
+
+/// [`fill_coverage`] rasterised at up to 4 × 4 the resolution and box-averaged down: coverage in
+/// steps of 1/16 of a pixel row instead of tiny-skia's 1/4 (its anti-aliasing takes four
+/// sub-scanlines per pixel), so a nearly horizontal or vertical edge that moves less than a
+/// pixel over many pixels — a thin tapered stroke — shades smoothly instead of in plateaus.
+pub fn fill_coverage_fine(paths: &[BezPath], m: &Mat3, w: u32, h: u32, rule: FillRule) -> Mask {
+    let px = u64::from(w) * u64::from(h);
+    let k = [4u32, 2].into_iter().find(|k| px.saturating_mul(u64::from(k * k)) <= FINE_MAX_PIXELS).unwrap_or(1);
+    let (Some(kw), Some(kh)) = (w.checked_mul(k), h.checked_mul(k)) else { return fill_coverage(paths, m, w, h, rule) };
+    if k == 1 {
+        return fill_coverage(paths, m, w, h, rule);
+    }
+    let kf = f64::from(k);
+    let big = fill_coverage(paths, &(Mat3::scale(effectcraft_geom::vec2(kf, kf)) * *m), kw, kh, rule);
+    let mut out = Mask::new(w, h, 0.0);
+    let (k, kw) = (k as usize, kw as usize);
+    let inv = 1.0 / (k * k) as f32;
+    for (y, row) in out.data.chunks_mut(w.max(1) as usize).enumerate() {
+        for (x, o) in row.iter_mut().enumerate() {
+            let mut sum = 0.0f32;
+            for sy in 0..k {
+                let start = (y * k + sy) * kw + x * k;
+                sum += big.data.get(start..start + k).map_or(0.0, |s| s.iter().sum());
+            }
+            *o = sum * inv;
+        }
+    }
+    out
 }
 
 /// Bounding box of paths in local space.

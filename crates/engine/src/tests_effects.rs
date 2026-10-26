@@ -565,7 +565,8 @@ fn opening_an_old_project_upgrades_effect_instances() {
             }
             for (e, old_id, new_id) in PARAM_ID_ALIASES {
                 if g.match_id == *e {
-                    let mut p = take(g, new_id).unwrap_or_else(|| panic!("{e}: no {new_id}"));
+                    // A parameter with several old ids is saved under the first.
+                    let Some(mut p) = take(g, new_id) else { continue };
                     // Put it back at its old path (which may be inside a group).
                     let (path, leaf) = old_id.rsplit_once('/').map(|(p, l)| (Some(p), l)).unwrap_or((None, old_id));
                     p.match_id = leaf.to_string();
@@ -619,6 +620,48 @@ fn opening_an_old_project_upgrades_effect_instances() {
     }
     // The upgraded project renders.
     let _ = s2.render(cid, s2.time(), Default::default());
+}
+
+/// Deep Glow's Exposure keeps its strength through both renames: `exposure` (half-strength,
+/// 18-25 Oct 2026) is halved onto Deep Glow 2's scale, the plug-in's `PEDG-0002` carries over.
+#[test]
+fn opening_an_old_project_keeps_deep_glow_exposure() {
+    use effectcraft_project::{Node, PropGroup};
+    for (old_id, saved, want) in [("exposure", 0.08, 0.04), ("PEDG-0002", 0.3, 0.3)] {
+        let (mut s, a, _) = comp_with_two_solids();
+        apply(&mut s, a, "ec.stylize.deepglow");
+        let mut old = (*s.project).clone();
+        let cid = s.active_comp_id().unwrap();
+        {
+            let comp = std::sync::Arc::make_mut(match &mut old.items.get_mut(&cid).unwrap().kind {
+                effectcraft_project::ItemKind::Comp(c) => c,
+                _ => panic!("not a composition"),
+            });
+            let l = comp.layers.iter_mut().find(|l| l.id == LayerId(a)).unwrap();
+            for n in &mut l.props.sub_mut("effects").unwrap().children {
+                let Node::Group(g) = n else { continue };
+                let g: &mut PropGroup = g;
+                if g.match_id == "ec.stylize.deepglow" {
+                    let p = g.get_mut("glowExposure").unwrap();
+                    p.match_id = old_id.to_string();
+                    p.value = KV::Scalar(saved);
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ec-dg-exposure-{}-{old_id}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.ecproj").to_string_lossy().to_string();
+        std::fs::write(&path, old.to_json()).unwrap();
+        let mut s2 = Session::default();
+        s2.execute("file.open", json!({"path": path})).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        let l = s2.project.comp(cid).unwrap().layer(LayerId(a)).unwrap().clone();
+        let fx = l.effects().unwrap();
+        let g = fx.groups().find(|g| g.match_id == "ec.stylize.deepglow").unwrap();
+        assert!(g.get(old_id).is_none(), "{old_id} still present");
+        let KV::Scalar(v) = g.get("glowExposure").unwrap().value else { panic!("not a scalar") };
+        assert!((v - want).abs() < 1e-9, "{old_id} {saved} opened as {v}, want {want}");
+    }
 }
 
 /// A project saved before schema 2 (#227): effect points on a shape layer were measured from
@@ -745,4 +788,93 @@ fn effect_colour_labels_set_clear_undo_and_round_trip() {
     let old = effectcraft_project::Project::from_json(&old).unwrap();
     let l = old.comp(s.active_comp_id().unwrap()).unwrap().layer(LayerId(a)).unwrap().clone();
     assert_eq!(l.effects().unwrap().groups().next().unwrap().label, None);
+}
+
+fn three_shape_layers() -> (Session, u64, u64, u64) {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 640, "height": 360, "frameRate": 30, "duration": 10})).unwrap();
+    let mut shape = |kind: &str, name: &str| s.execute("layer.newShape", json!({"kind": kind, "name": name})).unwrap()["layer"].as_u64().unwrap();
+    let a = shape("rect", "A • player frame");
+    let b = shape("ellipse", "A • player progress");
+    let c = shape("rect", "A • player knob");
+    (s, a, b, c)
+}
+
+/// Elias: Drop Shadow clicked in the timeline on a shape layer, ⌘C, another shape layer
+/// selected, ⌘V pasted nothing. Clicking a property name before (it selects that property's
+/// keys) left its keys selected when the effect was clicked, so Copy copied those keys instead
+/// of the effect. The pasted Drop Shadow keeps its values, keyframes and expression.
+#[test]
+fn drop_shadow_clicked_in_the_timeline_copies_and_pastes_onto_another_shape_layer() {
+    let (mut s, a, b, _) = three_shape_layers();
+    let shadow = apply(&mut s, a, "Drop Shadow");
+    let param = |s: &Session, lid: u64, uid: u64, id: &str| effect_group(s, lid, uid).prop(id).unwrap().clone();
+    let distance = param(&s, a, shadow, "distance").uid;
+    s.execute("prop.set", json!({"layer": a, "prop": distance, "value": 20.0})).unwrap();
+    animate_effect(&mut s, a, shadow, "opacity", &[(0.0, 10.0), (1.0, 90.0)]);
+    let softness = param(&s, a, shadow, "softness").uid;
+    s.execute("prop.setExpression", json!({"layer": a, "prop": softness, "expression": "value + 3"})).unwrap();
+    // A shape item (Gradient Stroke 1 in Elias's comp) and an animated property clicked first.
+    let item = layer(&s, a).props.sub("contents").unwrap().groups().next().unwrap().uid;
+    s.execute("prop.select", json!({"layer": a, "prop": item, "selectKeys": false})).unwrap();
+    s.execute("prop.toggleAnimation", json!({"layer": a, "path": "transform/opacity"})).unwrap();
+    s.execute("time.set", json!({"time": 1.0})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/opacity", "value": 40})).unwrap();
+    s.execute("prop.select", json!({"layer": a, "path": "transform/opacity"})).unwrap();
+    assert_eq!(s.state.selected_keys.len(), 2);
+    s.execute("time.set", json!({"time": 0.0})).unwrap();
+    // The timeline's click on the effect's name.
+    s.execute("prop.select", json!({"layer": a, "prop": shadow, "selectKeys": false})).unwrap();
+    assert!(s.state.selected_keys.is_empty(), "clicking the effect deselects the keys");
+    s.execute("edit.copy", json!({})).unwrap();
+    assert_eq!(s.state.effect_clipboard.len(), 1);
+    assert!(s.state.key_clipboard.is_empty() && !s.state.clip_is_keys);
+    s.execute("layer.select", json!({"layers": [b]})).unwrap();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(fx_names(&s, b), vec!["Drop Shadow"]);
+    let pasted = layer(&s, b).effects().unwrap().groups().next().unwrap().uid;
+    assert_eq!(param(&s, b, pasted, "distance").value, KV::Scalar(20.0));
+    let keys: Vec<(Tick, KV)> = param(&s, b, pasted, "opacity").keys.iter().map(|k| (k.time, k.value.clone())).collect();
+    let source: Vec<(Tick, KV)> = param(&s, a, shadow, "opacity").keys.iter().map(|k| (k.time, k.value.clone())).collect();
+    assert_eq!(keys, source);
+    assert_eq!(param(&s, b, pasted, "softness").expr.map(|e| e.text), Some("value + 3".to_string()));
+    assert_eq!(fx_names(&s, a), vec!["Drop Shadow"], "the source keeps its effect");
+}
+
+/// Copying effects replaces copied property values: Edit ▸ Paste tries those first, so a value
+/// copied earlier pasted instead of the effects. Several effects paste onto several layers in
+/// one step, after any effects they already have.
+#[test]
+fn copied_effects_paste_after_the_existing_effects_of_every_selected_layer() {
+    let (mut s, a, b, c) = three_shape_layers();
+    let shadow = apply(&mut s, a, "Drop Shadow");
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    apply(&mut s, b, "Gaussian Blur");
+    // A property's value copied before (Rotation, no keys).
+    s.execute("prop.select", json!({"layer": a, "path": "transform/rotation"})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    assert!(!s.state.value_clipboard.is_empty());
+    // Both effects selected (click, then Shift-click).
+    s.execute("prop.select", json!({"layer": a, "prop": shadow, "selectKeys": false})).unwrap();
+    s.execute("prop.select", json!({"layer": a, "prop": blur, "selectKeys": false, "add": true})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    assert_eq!(s.state.effect_clipboard.len(), 2);
+    assert!(s.state.value_clipboard.is_empty(), "the copied values are replaced");
+    s.execute("layer.select", json!({"layers": [b, c]})).unwrap();
+    let undo = s.history.undo.len();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    assert_eq!(fx_names(&s, b), vec!["Gaussian Blur", "Drop Shadow", "Gaussian Blur 2"]);
+    assert_eq!(fx_names(&s, c), vec!["Drop Shadow", "Gaussian Blur"]);
+    s.undo();
+    assert_eq!(fx_names(&s, b), vec!["Gaussian Blur"]);
+    assert!(fx_names(&s, c).is_empty());
+    // effect.copy (the command, Effect Controls' context menu) clears copied values too.
+    s.execute("prop.select", json!({"layer": a, "path": "transform/rotation"})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    s.execute("effect.copy", json!({"layer": a, "effect": shadow})).unwrap();
+    assert!(s.state.value_clipboard.is_empty());
+    s.execute("layer.select", json!({"layers": [c]})).unwrap();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(fx_names(&s, c), vec!["Drop Shadow"]);
 }

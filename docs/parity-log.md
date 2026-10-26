@@ -1105,3 +1105,79 @@ before.
   write failures, metadata, invalid serialization, embedded data, warnings and existing output.
   Tests were added but runtime execution is deferred under the fork's daytime policy; no claim
   of visual fidelity or cross-platform acceptance is made. Feature percentages are unchanged.
+
+## Update: motion-path segment bend (17 October 2026)
+
+- Pen (or Convert Vertex) drag on the motion path between two Position keys bends that segment
+  through the pointer: only the first key's out and the second key's in spatial tangent change
+  (`keys.bendSpatialSegment`, one undo step); key count, times, values and temporal ease stay.
+- After Effects parity checked against its documented behaviour (not driven live): a Pen click on
+  a motion path is Add Vertex and adds a keyframe (kept); Convert Vertex click toggles a key
+  between Linear and Auto Bezier, and dragging from a key pulls out its handles (kept). After
+  Effects has no segment drag on motion paths; the bend is an EffectCraft addition (as in
+  Illustrator and Figma). Feature percentages are unchanged.
+
+## Update: viewer Sharp Zoom (19 October 2026)
+
+- View ▸ Sharp Zoom (on by default; beyond After Effects, which magnifies comp pixels): above
+  100 % at Full or Auto resolution, the Composition viewer also renders the visible region at the
+  magnification (up to 16 output pixels per comp pixel) and draws it over the magnified frame.
+  Text, shapes and solids are drawn at their on-screen size, footage and nested comps are
+  resampled from their own pixels, and pixel-sized effect parameters follow the buffer scale.
+- The tile renders on its own thread on the CPU, one at a time; until it lands (an edit, a pan
+  past the 256-pixel grid) the magnified comp-resolution frame shows. Not while playing,
+  scrubbing or dragging, in 3D comps, with Show Channel / exposure / display colour management,
+  snapshots or the cloud preview.
+- Renders flag it (`RenderOpts::sharp`, viewer only): each layer buffer stays within 16 Mpx
+  (bigger sources are drawn at a lower scale, never below 100 %), nested comps drawn whole are
+  held to it, and static nested comps are windowed to what shows. Without the flag (exports,
+  RAM preview, every viewer frame up to 100 %, upscaled outputs) nothing changes, and the
+  render options' cache keys keep their text. Feature percentages are unchanged.
+
+## Update: text Gradient Fill animator (19 October 2026)
+
+- GRADFILL, an EffectCraft extension (After Effects has no gradient text animator): Animate
+  Text ▸ Gradient Fill adds Gradient Type (Linear / Radial), Gradient Start, Gradient End and
+  Gradient Fill Colors to a text animator. The selected characters are filled with a smooth
+  gradient per pixel, blended over the fill by the selection and stacked in order with Fill
+  Color animators. Start and End are in percent of the box of the group the first selector
+  picks (Based On Words: each word; Lines: each line; Characters: each run of consecutive
+  selected characters; no selector: the whole text), 0,0 top left to 100,100 bottom right,
+  default 0,50 → 100,50; each character carries its part of the gradient when animators move,
+  rotate or scale it. Composition viewer: Gradient Start / End dots on the first group, where
+  the animation draws it (drag = one undo step, snaps to the box's edges and centre, Alt places
+  freely). Properties panel: a colour stops bar per Gradient Fill animator. Animation presets,
+  scripts (`EC Text Gradient Fill`) and expressions carry it; Lottie export drops it with a
+  note; `.aep` import never produces it. Glyphs without a selected gradient draw on the solid
+  path as before (bit-identical). Extruded (Advanced 3D) characters and text → shapes use the colour
+  at the gradient's middle.
+
+## Update: deleting one text animator property (19 October 2026)
+
+- PROP-REMOVE: a single property of a text animator's Properties (Fill Color, Blur, Rotation,
+  Tracking…) can be deleted, as in After Effects: Edit ▸ Clear / the Delete key with it
+  selected in the Timeline, Delete in its row's context menu, scripting's `Property.remove()`,
+  and `prop.removeGroup` (which now also takes these properties and returns `{removed}`).
+  Properties one Animate entry adds together go together: Tracking Type with Tracking Amount,
+  Skew Axis with Skew, Character Alignment / Range with Character Offset (Character Range stays
+  while Character Value uses it), and the four Gradient Fill properties. Fixed properties
+  (a selector's Start / End / Offset, Transform, Source Text…) are refused with an error. One
+  undo step; the removed properties and their keyframes leave the selection.
+
+## Update: Cache Frames When Idle without slowing the machine (20 October 2026)
+
+- Cache Frames When Idle rendered up to half the frame threads' worth of frames at normal
+  priority, and each frame's parallel pixel loops (blurs, shadows, quantisation) ran on every
+  core: 300–470 % CPU on the owner's Mac while the app sat idle, and the whole machine lagged.
+  Now one idle frame renders at a time inside its own small Rayon pool (a quarter of the cores,
+  1 to 4, or Memory & CPU ▸ CPU Cores for Cache Frames When Idle), whose threads run at macOS
+  utility QoS (`effectcraft_platform::background_thread`, ADR 0001 amendment); the viewer's
+  frame and playback keep every core and go first. It waits while the system is short of memory
+  (macOS memory pressure, low memory, or less available than RAM Reserved for Other
+  Applications, read every 5 s while it is on) and goes on when memory frees up, the disk-cache
+  phase included.
+- Nothing interactive waits for an idle frame: the viewer or playback asking for the frame being
+  idle-rendered calls that render off and renders it at full speed (the idle render ends as an
+  orphan that frees only its idle slot), and a layer an idle thread is rendering is rendered
+  again by a viewer or playback frame instead of waited for
+  (`effectcraft_render::cache::set_background_thread`).

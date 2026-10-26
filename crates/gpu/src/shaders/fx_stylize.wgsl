@@ -613,7 +613,10 @@ fn fxs_motiontile(@builtin(global_invocation_id) gid: vec3<u32>) {
             fy = 1.0 - fy;
         }
     }
-    textureStore(out, p, sample_bilinear(src, fx * P.f[0].y + P.f[1].x, fy * P.f[0].z + P.f[1].y));
+    // stylize2::motion_tile_sample: clamped to the layer's edge pixel centres.
+    let sx = clamp(fx * P.f[0].y, 0.5, max(P.f[0].y - 0.5, 0.5)) + P.f[1].x;
+    let sy = clamp(fy * P.f[0].z, 0.5, max(P.f[0].z - 0.5, 0.5)) + P.f[1].y;
+    textureStore(out, p, sample_bilinear(src, sx, sy));
 }
 
 // CC RepeTile (stylize2::repetile) into a new output size. data: per output column (tile index,
@@ -834,6 +837,17 @@ fn fxs_fbm(u: f32, v: f32, z: f32, seed: u32, octaves0: f32) -> f32 {
 // f[0] = (offset x, offset y, scale · stretch x, scale · stretch y); f[1] = (frequency, evolution,
 // cycle, cycle weight); f[2] = (octaves, influence, influence multiplier, sharpness);
 // f[3] = (edge colour, sharpness multiplier)
+// stylize2::evo_fbm: fxs_fbm blended linearly between Evolution slices
+// (ROUGHEN_EVO_SLICES = 2.8 per revolution), rescaled to keep its spread.
+fn fxs_evo_fbm(u: f32, v: f32, evo: f32, seed: u32, oct: f32) -> f32 {
+    let z = evo * 2.8;
+    let z0 = floor(z);
+    let t = z - z0;
+    let a = fxs_fbm(u, v, z0, seed, oct) - 0.5;
+    let b = fxs_fbm(u, v, z0 + 1.0, seed, oct) - 0.5;
+    return 0.5 + (a * (1.0 - t) + b * t) / sqrt((1.0 - t) * (1.0 - t) + t * t);
+}
+
 @compute @workgroup_size(16, 16)
 fn fxs_roughen(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
@@ -852,13 +866,13 @@ fn fxs_roughen(@builtin(global_invocation_id) gid: vec3<u32>) {
     let seed = P.u[0].x;
     let evo = P.f[1].y;
     let oct = P.f[2].x;
-    var n = fxs_fbm(nx, ny, evo, seed, oct);
+    var n = fxs_evo_fbm(nx, ny, evo, seed, oct);
     if (P.u[0].y != 0u) {
-        n += (fxs_fbm(nx, ny, evo - P.f[1].z, seed, oct) - n) * P.f[1].w;
+        n += (fxs_evo_fbm(nx, ny, evo - P.f[1].z, seed, oct) - n) * P.f[1].w;
     }
     let infl = P.f[2].y;
     let s = dv - 0.5 + (n - 0.5) * infl * P.f[2].z * 0.5;
-    let m = clamp(s * P.f[2].w * P.f[3].w * 4.0 + 0.5, 0.0, 1.0);
+    let m = clamp(s * P.f[2].w * P.f[3].w * 8.0 + 0.5, 0.0, 1.0);
     let u = fxs_unpremul(px);
     var c = u.xyz;
     if (P.u[0].z != 0u) {
@@ -931,24 +945,3 @@ fn fxs_glow_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out, p, o);
 }
 
-// ---------------------------------------------------------------- accumulation (Transform motion blur)
-
-// out = src + aux
-@compute @workgroup_size(16, 16)
-fn fxs_add(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = vec2<i32>(gid.xy);
-    if (!fxs_inside(p)) {
-        return;
-    }
-    textureStore(out, p, textureLoad(src, p, 0) + textureLoad(aux, p, 0));
-}
-
-// out = src / f[0].x
-@compute @workgroup_size(16, 16)
-fn fxs_div(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = vec2<i32>(gid.xy);
-    if (!fxs_inside(p)) {
-        return;
-    }
-    textureStore(out, p, textureLoad(src, p, 0) / P.f[0].x);
-}

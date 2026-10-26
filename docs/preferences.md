@@ -49,11 +49,34 @@ Commands (CLI, MCP, control channel):
 - `autoSave.folder`: Custom Location
 - `autoSave.saveOnRenderStart`: Save When Starting Render Queue
 - `composition.showRenderingProgress`: Show Rendering Progress in Info Panel and Flowchart
+- `previews.adaptivePlayback`: Adaptive Resolution While Playing (on): spacebar playback at Auto
+  resolution that can't keep real time renders Half, then Third, then Quarter, in any Fast Previews
+  mode, and full quality again as soon as it stops or you scrub; the viewer shows a "Draft · Half"
+  badge (`viewer.draftBadge`) while the frame on screen is below full quality. Off: only Fast
+  Previews ▸ Adaptive Resolution does. Also `view.adaptivePlayback {on?}` and the viewer's Fast
+  Previews menu. An explicit Resolution (the viewer's or the Preview panel's), a cloud preview
+  (its stream has its own levels) and exports never change.
+- `previews.upscaleLowRes`: Sharpen Low-Resolution Previews (FSR) (on; beyond After Effects): a
+  GPU viewer frame rendered below Full (Half, Third, Quarter, or adaptive playback) and shown
+  magnified is upscaled to its size on screen with AMD FidelityFX Super Resolution 1.0 (EASU, then
+  RCAS sharpening at 0.2 stops; about 0.4 ms for 960×540 → 1920×1080) instead of showing its pixels
+  as blocks. Off: blocks, as in After Effects (#882). Frames composited on the CPU, Show Channel /
+  exposure views, renders and exports never change. Also `view.upscaleLowRes {on?}` and the
+  viewer's Fast Previews menu.
 - `previews.adaptiveResolutionLimit`: Adaptive Resolution Limit (the lowest resolution Fast Previews ▸
-  Adaptive Resolution drops to while you drag; a playing preview keeps the viewer's resolution)
+  Adaptive Resolution drops to while you drag, and adaptive playback while it plays)
 - `previews.cacheFramesWhenIdle`: Cache Frames When Idle (Composition ▸ Preview): after a second
   without input or edits, the viewer renders the work area into the RAM preview in the
-  background, from the current time on, until it is cached or the budget is full
+  background, from the current time on, until it is cached or the budget is full (then into
+  the disk cache). It is meant to stay on without slowing the machine down: one frame renders at
+  a time, on its own few threads (`memory.idleCacheCores`) whose parallel pixel loops stay
+  there, at background priority (macOS utility QoS), after the viewer's frame and playback. Nothing
+  interactive waits for it: the viewer or playback asking for the frame it is rendering calls
+  that render off and renders the frame at full speed, and a layer it is rendering is rendered
+  again rather than waited for. It
+  waits while the system is short of memory (macOS memory pressure Warning or Critical, the
+  system low on memory, or less memory available than `memory.ramReservedGb`; the desktop app
+  reads it every 5 s while this is on) and goes on when memory frees up
 - `previews.fastPreviews`: Fast Previews (Draft 3D, Faster Effects)
 - `appearance.appearanceMode`: Appearance Mode (`auto` / `dark` / `light`). `auto` (Sync with System) follows the operating system's light or dark appearance while the app runs: on Linux the desktop app reads the XDG desktop portal (`org.freedesktop.appearance` `color-scheme`) once and then listens for its `SettingChanged` signal on a worker thread, repainting only when the value changes (nothing polls); `gsettings` runs at most once at start-up, by absolute path, when the portal gives no answer. Elsewhere it uses what the window system reports. With no answer it shows the dark theme. New installs stay `dark`; Sync with System is opt-in. The Tools bar's appearance button (a monitor, sun or moon) cycles Sync with System, Light and Dark (`view.theme.toggle`, Next Appearance Mode).
 - `appearance.darkTheme`: Dark Theme (`dark` / `darker`), shown in dark appearance
@@ -149,6 +172,25 @@ Commands (CLI, MCP, control channel):
 - `memory.ramReservedGb`: the cache budgets together leave this much physical memory free
 - `memory.reduceCacheWhenLow`: cache budgets halve while the system is low on memory (checked
   every 30 s by the desktop app, on a background thread)
+- `memory.previewCompress`: Compress RAM Preview Frames (on): frames away from the playhead are
+  kept LZ4-compressed in 16 strips (lossless, about 2.4× the frames per GB; the Preview (RAM)
+  Cache budget counts compressed bytes, and a default budget on a large-memory machine grows to
+  8 GB instead of a quarter of the RAM). A frame worth caching that leaves RAM is written to the
+  disk cache first, and playback reads queued frames from the disk cache ahead of the playhead
+  (`plan/memory/compressed-cache.md`)
+- `memory.previewRawWindow`: Uncompressed Frames Around the Playhead (8): frames the preview
+  reaches next that keep their pixels, so they show without a decode
+- `memory.sharedCacheBudget`: Share One Budget Between the Caches (on): the layer, footage and
+  RAM preview caches share one budget, what their three budgets add up to (still within RAM
+  Reserved for Other Applications). Each keeps a floor (an eighth of the total; the footage
+  cache at least 512 MB, never more than its own budget) and can grow into the rest; past the
+  total the least recently used entry of any cache goes, by that cache's own rules (the layer
+  cache's probation and current frames, the RAM preview's playback range and protected window).
+  Off: each cache keeps to its own budget. `memory.stats` → `sharedBudget` shows the split
+  live (`plan/memory/shared-budget.md`)
+- `memory.idleCacheCores`: CPU Cores for Cache Frames When Idle (0 = automatic: a quarter of the
+  cores, 1 to 4; otherwise that many, up to the cores there are). The viewer and playback keep
+  every core
 - `video.enableOutput`, `video.device`, `video.outputDuringPlayback`, `video.mirrorOnMonitor`,
   `video.disableWhenBackground`: Video Preview, a second window (or full screen on the display
   it is on) showing the composition frame, Mercury Transmit-style

@@ -86,6 +86,9 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
         if config.as_object().is_some_and(|m| m.len() > 1) {
             s.execute("freeze.configure", config)?;
         }
+        if b_p(p, "auto").unwrap_or(false) {
+            s.execute("freeze.auto", json!({"section": id, "enabled": true}))?;
+        }
         return refresh(s, &json!({"section": id, "wait": b_p(p, "wait").unwrap_or(false)}));
     }
     if let Target::Selection { comp, layers } = &target
@@ -115,6 +118,7 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
         }
     });
     let draft = b_p(p, "quickDraft").unwrap_or(true);
+    let auto = b_p(p, "auto").unwrap_or(false);
     let explicit_range = p.get("start").is_some_and(|v| !v.is_null()) || p.get("end").is_some_and(|v| !v.is_null());
     let follow_comp_range = match p.get("followCompositionRange") {
         Some(v) => v.as_bool().ok_or_else(|| bad("freeze.freeze", "followCompositionRange must be a boolean"))?,
@@ -130,8 +134,7 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let id = project.next_id;
         project.next_id = id.checked_add(1).ok_or_else(|| bad("freeze.freeze", "project IDs exhausted"))?;
-        let section =
-            Section { id, name, target, start, end, follow_comp_range, enabled: true, auto: false, quick_draft: draft, cache: None, previous: vec![] };
+        let section = Section { id, name, target, start, end, follow_comp_range, enabled: true, auto, quick_draft: draft, cache: None, previous: vec![] };
         section.validate().map_err(EngineError::Other)?;
         project.freeze.sections.push(section);
         Ok(id)
@@ -482,7 +485,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Freeze",
             ["Composition", "Smart Freeze"],
             None,
-            "{comp?, layers?, mode?: auto|comp|precomp|selection, name?, start?, end?, followCompositionRange?: bool, quickDraft?, wait?}",
+            "{comp?, layers?, mode?: auto|comp|precomp|selection, name?, start?, end?, followCompositionRange?: bool, quickDraft?, auto?: bool (keep it fresh, as freeze.auto), wait?}",
             has_comp,
             create
         ),
@@ -600,6 +603,24 @@ pub fn specs() -> Vec<CommandSpec> {
             cancel_freeze(s);
             Ok(json!({"cancelled": true}))
         }),
+        query!(
+            "freeze.suggest",
+            "Suggest Layers to Freeze",
+            "{comp?: id (default: the active comp), all?: bool (every comp), dismiss?: {comp, layer}} -> {candidates: [{comp, layer, name, msPerFrame, frameBudgetMs, ratio, samples, target: precomp|selection|comp, question, freeze: freeze.freeze params}], autoHeavy}",
+            |s, p| {
+                if let Some(d) = p.get("dismiss").filter(|d| !d.is_null()) {
+                    let id = |key: &str| d.get(key).and_then(Value::as_u64).ok_or_else(|| bad("freeze.suggest", format!("dismiss.{key} must be an id")));
+                    s.dismiss_freeze_suggestion(effectcraft_project::ItemId(id("comp")?), effectcraft_project::LayerId(id("layer")?));
+                }
+                let scope = match p.get("comp") {
+                    _ if b_p(p, "all").unwrap_or(false) => None,
+                    Some(v) if !v.is_null() => Some(comp_id(s, p).map_err(|_| bad("freeze.suggest", format!("no composition {v}")))?),
+                    _ => s.active_comp_id(),
+                };
+                let candidates: Vec<_> = s.freeze_suggestions_in(scope).iter().map(|c| c.to_json()).collect();
+                Ok(json!({"candidates": candidates, "autoHeavy": s.prefs.previews.freeze_auto_heavy}))
+            }
+        ),
         query!("freeze.list", "Frozen Sections", "{}", |s, _| Ok(json!({"sections": s.project.freeze.sections}))),
     ]
 }

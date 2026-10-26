@@ -179,6 +179,18 @@ pub trait Importer: Send + Sync {
     /// An image sequence's other frames (its first was probed) are footage now: hosts whose
     /// media layer reads from memory (the browser) register them; file-based ones need nothing.
     fn add_frames(&self, _paths: &[String]) {}
+    /// Whether previews of `footage` decode in software although this host has a hardware video
+    /// decoder (it refused the stream, or cannot take one like it): the automatic proxy
+    /// suggestion's "hardware can't take it" rule.
+    fn hardware_refuses(&self, _footage: &effectcraft_project::Footage) -> bool {
+        false
+    }
+    /// Build a preview proxy of the movie at `src`: `width`×`height` (even, aspect kept),
+    /// hardware-friendly H.264 in an MP4 at `out`, written whole or not at all; the source is
+    /// never written to. `progress(done, total)` returns `false` to stop (an error then).
+    fn build_proxy(&self, _src: &str, _out: &str, _width: u32, _height: u32, _progress: &mut dyn FnMut(u64, u64) -> bool) -> std::result::Result<(), String> {
+        Err("making proxies is not available in this build".into())
+    }
 }
 
 /// A keyframe reference: layer, property uid, key time (layer time).
@@ -208,6 +220,27 @@ pub struct KeyClip {
     pub path: String,
     /// Keys with times relative to the earliest copied key (layer time).
     pub keys: Vec<effectcraft_keyframe::Keyframe>,
+}
+
+/// The temporal graph of one keyframe: how it eases in and out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyGraph {
+    pub in_interp: effectcraft_keyframe::Interp,
+    pub out_interp: effectcraft_keyframe::Interp,
+    pub in_ease: effectcraft_keyframe::Eases,
+    pub out_ease: effectcraft_keyframe::Eases,
+    pub continuous: bool,
+    pub auto_bezier: bool,
+}
+
+/// The graph Edit ▸ Paste puts on the selected keyframes: one key's graph for all of them (the
+/// copied keys all had the same graph), else the graphs of the last selected property's keys
+/// in time order, repeated segment by segment over any number of keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GraphClip {
+    pub keys: Vec<KeyGraph>,
+    /// The keys that were copied: pasting with exactly these selected pastes the keys themselves.
+    pub source: Vec<KeyRef>,
 }
 
 /// A selected mask vertex: layer, mask group uid, vertex index.
@@ -261,6 +294,9 @@ pub struct EditorState {
     /// Copied keyframes (times relative to the earliest copied key).
     #[serde(skip)]
     pub key_clipboard: Vec<KeyClip>,
+    /// The graph of the copied keyframes (Paste onto other selected keyframes pastes it).
+    #[serde(skip)]
+    pub graph_clipboard: GraphClip,
     /// The last copy was keyframes (Paste pastes keys at the CTI).
     #[serde(skip)]
     pub clip_is_keys: bool,
@@ -427,6 +463,8 @@ pub struct Session {
     pub claims: agents::Claims,
     /// Bumped whenever another project replaces this one ([`Session::replace_project`]).
     pub epoch: u64,
+    /// Who changed what, revision by revision ([`feed`]): `history.feed`, `agent.notices`.
+    pub feed: feed::Feed,
     /// Identity of this in-memory session, stable across project replacement.
     pub session_id: String,
     /// The highest `next_id` any state has reached: ids stay unique across undo / redo, so an
@@ -488,6 +526,10 @@ pub struct Session {
     pub journal: Vec<(String, Value)>,
     /// Processed-layer pixels reused across frames and edits (content-keyed, never stale).
     pub layer_cache: Arc<LayerCache>,
+    /// One memory budget for the layer cache, the footage frame cache and the frontend's RAM
+    /// preview (Settings ▸ Memory & CPU ▸ Share One Budget Between the Caches; see
+    /// [`effectcraft_render::cache::shared`]). Applied with the cache budgets.
+    pub cache_share: Arc<effectcraft_render::cache::shared::SharedBudget>,
     /// The persistent disk cache (Settings ▸ Media & Disk Cache), when enabled.
     pub disk_cache: Option<Arc<effectcraft_render::disk_cache::DiskCache>>,
     /// Settings (Preferences).
@@ -533,6 +575,9 @@ pub struct Session {
     pub key_move: Option<KeyMove>,
     /// Reads the system's memory in the background for [`Session::memory_tick`].
     pub memory_watch: sysinfo::MemoryWatch,
+    /// The live memory map's process reading and the frontend's probes (Window ▸ Memory, the
+    /// status bar's memory chip, `memory.stats`; see [`memory_map`]).
+    pub memory_map: memory_map::Hooks,
     /// Switches Affect Nested Comps as last applied (a change empties the layer cache).
     pub applied_nested_switches: Option<bool>,
     /// Runs renders and analyses off the UI thread where there are no threads (the web app's
@@ -565,10 +610,14 @@ pub struct Session {
     pub footage_stamps: std::collections::HashMap<String, footage_reload::Stamp>,
     /// The stamps being taken on a worker thread ([`footage_reload::start_scan`]).
     pub footage_scan: Option<footage_reload::Scan>,
+    /// The disk cache's footage salt and the footage it was taken for ([`Session::refresh_disk_salt`]).
+    pub disk_salt: Option<(u64, u64)>,
     /// How many script-issued commands are running ([`Session::execute_for_script`]): while one
     /// is, settings that guard what scripts may do can't change (see
     /// [`prefs::Scripting::same_permissions`]).
     pub script_calls: ScriptCalls,
+    /// The current state as last seen (who made it survives writes outside the history).
+    pub seen_state: history::SeenState,
     /// The Motion Library (cards in a remote bucket, cached locally): made on first use from
     /// `motion-library.json` or the environment, or set by the host (the web app's fetch).
     pub motion_library: motion_library::Handle,
@@ -645,6 +694,7 @@ impl Default for Session {
             cursors: Default::default(),
             claims: Default::default(),
             epoch: 0,
+            feed: Default::default(),
             session_id: build_info::next_session_id(),
             id_floor: 0,
             saved_revision: 0,
@@ -675,6 +725,7 @@ impl Default for Session {
             events: vec![],
             journal: vec![],
             layer_cache: Arc::new(LayerCache::default()),
+            cache_share: effectcraft_render::cache::shared::SharedBudget::new(),
             disk_cache: None,
             prefs: prefs::Prefs::default(),
             prefs_revision: 0,
@@ -694,6 +745,7 @@ impl Default for Session {
             sys_memory: None,
             key_move: None,
             memory_watch: Default::default(),
+            memory_map: Default::default(),
             applied_nested_switches: None,
             offload: None,
             offloaded: vec![],
@@ -709,8 +761,10 @@ impl Default for Session {
             learn: None,
             check_footage_on_open: false,
             footage_stamps: Default::default(),
+            disk_salt: None,
             footage_scan: None,
             script_calls: ScriptCalls::default(),
+            seen_state: Default::default(),
         }
     }
 }
@@ -752,8 +806,11 @@ impl Session {
         }
     }
 
-    fn execute_inner(&mut self, id: &str, params: Value) -> Result<Value> {
+    fn execute_inner(&mut self, id: &str, mut params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        self.adopt_moved_state();
+        // Times as the Timeline shows them ("6:20", {"frame": 200}) become seconds of the comp.
+        readout::resolve_time_params(self, id, &mut params)?;
         let resolved = commands::validate_target_refs(self, id, &params)?;
         if let Err(why) = (spec.enabled)(self) {
             // Explicit targets (agents, scripts) don't need a UI selection.
@@ -833,6 +890,8 @@ impl Session {
         effectcraft_project::styles::sync_global_light(&before, &mut p);
         // Essential Properties of precomp layers follow their comps' Essential Graphics.
         effectcraft_project::essential::sync_project(&before, &mut p);
+        // Speech maps follow their voice layers (moved, precomposed, copied: SX1).
+        effectcraft_project::speech::sync_project(&before, &mut p);
         // Another client's claimed composition stays as it is (checked before analyses are queued again).
         if let Some(e) = self.claim_conflict(&before, &p) {
             return Err(e);
@@ -875,6 +934,8 @@ impl Session {
             self.history.abandon_redo(&before);
         }
         self.history.merge_key = merge.map(str::to_string);
+        self.feed.label = Some(label.to_string());
+        self.feed.merge = same;
         self.project = Arc::new(p);
         if removed {
             self.release_unused_footage();
@@ -887,18 +948,50 @@ impl Session {
     }
 
     pub fn bump(&mut self) {
+        self.adopt_moved_state();
         self.freeze_runtime.changed();
         self.revision += 1;
+        self.feed.record(self.revision, self.client.clone(), &self.project, self.epoch, &self.history);
         *self.freeze_runtime.latest_source.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (self.epoch, self.project.clone());
         self.id_floor = self.id_floor.max(self.project.next_id);
         // Back at the saved state (undo, redo, a history jump or a rolled-back batch).
         if Arc::ptr_eq(&self.project, &self.saved_project) {
             self.saved_revision = self.revision;
         }
-        if self.disk_cache.is_some() {
-            self.layer_cache.set_disk_salt(effectcraft_render::disk_cache::footage_salt(&self.project));
-        }
+        self.refresh_disk_salt(false);
         self.events.push(Event::ProjectChanged { revision: self.revision });
+    }
+
+    /// Salt the disk cache's layer keys with the project's footage files
+    /// ([`effectcraft_render::disk_cache::footage_salt`]). Taking it reads the size and time of
+    /// every file, every frame of an image sequence included, so it is taken again only when the
+    /// footage items changed, or with `force` (a project opened, footage reloaded, the disk cache
+    /// attached), not at every edit: with a few large sequences that cost each keystroke in a
+    /// text field over half a second (#1926).
+    pub fn refresh_disk_salt(&mut self, force: bool) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        if self.disk_cache.is_none() {
+            self.disk_salt = None;
+            return None;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (id, it) in &self.project.items {
+            if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
+                id.hash(&mut h);
+                format!("{f:?}").hash(&mut h);
+            }
+        }
+        let footage = h.finish();
+        if let Some((seen, salt)) = self.disk_salt
+            && seen == footage
+            && !force
+        {
+            return Some(salt);
+        }
+        let salt = effectcraft_render::disk_cache::footage_salt(&self.project);
+        self.disk_salt = Some((footage, salt));
+        self.layer_cache.set_disk_salt(salt);
+        Some(salt)
     }
 
     /// Set a comp's Resolution. As in After Effects it is saved with the project (which becomes
@@ -921,16 +1014,20 @@ impl Session {
         if keep.is_empty() {
             return;
         }
+        // (The restored state stays its author's.)
+        let author = self.history.author(&self.project).map(str::to_string);
         let p = Arc::make_mut(&mut self.project);
         for (id, r) in keep {
             if let Some(c) = p.comp_mut(id) {
                 c.resolution = r;
             }
         }
+        self.history.set_author(&self.project, author);
     }
 
     pub fn undo(&mut self) -> bool {
         let Some((label, p)) = self.history.undo.pop() else { return false };
+        self.feed.label = Some(format!("Undo {label}"));
         let cur = std::mem::replace(&mut self.project, p);
         self.keep_view_settings(&cur);
         self.history.redo.push((label, cur));
@@ -942,6 +1039,7 @@ impl Session {
 
     pub fn redo(&mut self) -> bool {
         let Some((label, p)) = self.history.redo.pop() else { return false };
+        self.feed.label = Some(format!("Redo {label}"));
         let cur = std::mem::replace(&mut self.project, p);
         let restored_comp = self.project.comps().find(|(id, _)| cur.comp(**id).is_none()).map(|(id, _)| *id);
         self.keep_view_settings(&cur);
@@ -1357,6 +1455,7 @@ impl Session {
         self.freeze_runtime.bad_versions.clear();
         self.freeze_runtime.reasons.clear();
         self.freeze_runtime.retry_after.clear();
+        self.freeze_runtime.cost.clear();
         self.script_ui.project_epoch = self.script_ui.project_epoch.wrapping_add(1);
         p.fix_next_id();
         upgrade_effects(&mut p);
@@ -1377,6 +1476,8 @@ impl Session {
         // a project (#591). Notify before restoring tabs, including the early-return path.
         self.layer_cache.clear();
         self.events.push(Event::PurgeCaches);
+        // Its files may have changed since they were last stamped.
+        self.disk_salt = None;
         self.history = History::default();
         self.id_floor = 0;
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
@@ -1447,7 +1548,9 @@ impl Session {
 /// (renamed / regrouped / added parameters, reordered popups; see
 /// [`effectcraft_effects::migrate`]), and a project from before
 /// [`effectcraft_project::SCHEMA_EFFECT_SPACE`] into effect space
-/// ([`effectcraft_effects::migrate::to_effect_space`]). Stamps the current schema.
+/// ([`effectcraft_effects::migrate::to_effect_space`]). Effects imported from After Effects as
+/// plain groups before EffectCraft knew them become native effects
+/// ([`effectcraft_aep::plain::native_effect`]). Stamps the current schema.
 pub fn upgrade_effects(p: &mut Project) {
     let to_effect_space = p.schema < effectcraft_project::SCHEMA_EFFECT_SPACE;
     // The layers with an instance to change (any registered effect when moving into effect
@@ -1460,6 +1563,7 @@ pub fn upgrade_effects(p: &mut Project) {
                 effectcraft_project::GroupKind::Effect { effect } => {
                     effectcraft_effects::find(effect).is_some_and(|spec| to_effect_space || !effectcraft_effects::migrate::is_current(spec, g))
                 }
+                effectcraft_project::GroupKind::Plain => effectcraft_aep::plain::is_convertible(g),
                 _ => false,
             });
             if stale {
@@ -1501,6 +1605,9 @@ pub fn upgrade_effects(p: &mut Project) {
             let Some(fx) = l.props.sub_mut("effects") else { continue };
             for n in &mut fx.children {
                 let effectcraft_project::Node::Group(g) = n else { continue };
+                if let Some(native) = effectcraft_aep::plain::native_effect(g, &mut effectcraft_project::build::Ids(&mut next), size) {
+                    *g = native;
+                }
                 let effectcraft_project::GroupKind::Effect { effect } = &g.kind else { continue };
                 if let Some(spec) = effectcraft_effects::find(effect) {
                     effectcraft_effects::migrate::upgrade_instance(spec, g, &mut effectcraft_project::build::Ids(&mut next), size);
@@ -1530,12 +1637,15 @@ pub fn text_families() -> Vec<String> {
     effectcraft_text::families().into_iter().map(|(f, _)| f).collect()
 }
 
-/// The styles a family offers (its own faces, in weight order), for the style menus. A family
-/// that isn't installed offers the usual styles, which resolve to Inter's.
+/// The styles a family offers (its own faces and a variable face's named instances, in weight
+/// order), for the style menus. A PostScript or full name (`SFPro-Regular`, how After Effects
+/// names fonts) offers its family's styles. A family that isn't installed offers the usual
+/// styles, which resolve to Inter's.
 pub fn font_styles(family: &str) -> Vec<String> {
+    let family = effectcraft_text::fonts::family_of(family).unwrap_or_else(|| family.to_string());
     effectcraft_text::families()
         .into_iter()
-        .find(|(f, _)| f.eq_ignore_ascii_case(family))
+        .find(|(f, _)| f.eq_ignore_ascii_case(&family))
         .map(|(_, st)| st)
         .filter(|st| !st.is_empty())
         .unwrap_or_else(|| ["Regular", "Medium", "SemiBold", "Bold", "Italic"].iter().map(|s| s.to_string()).collect())

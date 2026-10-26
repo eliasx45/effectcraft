@@ -55,6 +55,12 @@ fn drag(h: &mut Harness<'_, EffectcraftApp>, from: Pos2, to: Pos2) {
     h.run_steps(2);
 }
 
+/// [`drag`] between two comp points.
+fn drag_comp(h: &mut Harness<'_, EffectcraftApp>, from: [f32; 2], to: [f32; 2]) {
+    let (from, to) = (screen(h, from), screen(h, to));
+    drag(h, from, to);
+}
+
 /// Comp pixel → screen point.
 fn screen(h: &Harness<'_, EffectcraftApp>, p: [f32; 2]) -> Pos2 {
     let c = rect(h, "viewer.comp");
@@ -862,6 +868,256 @@ fn pen_mask_undoes_step_by_step_and_double_click_moves_the_whole_mask() {
     drag(&mut h, from, to);
     let back = mask_path(&h, "Plate");
     assert!(back.vertices.iter().zip(&moved.vertices).all(|(v, c)| near(*v, *c)), "{back:?}");
+}
+
+/// Free Transform Points as in After Effects: a double-click on a path shows a box with its anchor
+/// point in the middle; dragging inside moves the points, the anchor moves the pivot (no edit), a
+/// handle scales from the opposite side (about the anchor with Cmd), just outside rotates about
+/// the anchor and turns the box with the points. Each drag is one undo step. Esc ends it; Cmd+T
+/// with points selected starts it again.
+#[test]
+fn free_transform_box_moves_scales_rotates_about_a_movable_anchor() {
+    let mut h = harness();
+    let plate = layer_id(&h, "Plate");
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [plate]})).unwrap();
+    s.execute("view.snapping", json!({"value": false})).unwrap();
+    s.execute("mask.new", json!({"layer": plate, "vertices": [[200, 100], [400, 100], [400, 260], [200, 260]], "closed": true})).unwrap();
+    h.state_mut().ui.tool = Tool::Selection;
+    h.run_steps(2);
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1.0 && (a[1] - b[1]).abs() < 1.0;
+    let near_pt = |a: Pos2, b: Pos2| a.distance(b) < 2.0;
+    let undo = |h: &mut Harness<'_, EffectcraftApp>| {
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        h.run_steps(2);
+    };
+    // Double-click the top edge: the box, with the anchor point in its centre.
+    let at = screen(&h, [300.0, 100.0]);
+    h.input_mut().events.push(Event::PointerMoved(at));
+    h.step();
+    for pressed in [true, false, true, false] {
+        h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+    }
+    h.run_steps(3);
+    assert!(h.state().ui.viewer.free_transform.is_some(), "double-click starts Free Transform");
+    assert!(near_pt(rect(&h, "viewer.freeTransform.anchor").center(), screen(&h, [300.0, 180.0])), "anchor in the middle");
+    assert!(near_pt(rect(&h, "viewer.freeTransform.handle.2").center(), screen(&h, [400.0, 260.0])));
+    let start = mask_path(&h, "Plate");
+    // Drag inside: everything moves, one undo step.
+    drag_comp(&mut h, [250.0, 150.0], [260.0, 165.0]);
+    let moved = mask_path(&h, "Plate");
+    assert!(moved.vertices.iter().zip(&start.vertices).all(|(v, c)| near(*v, [c[0] + 10.0, c[1] + 15.0])), "{moved:?}");
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Plate"), start, "the whole drag is one undo step");
+    // Drag the right edge's handle: scales from the left edge.
+    drag_comp(&mut h, [400.0, 180.0], [450.0, 180.0]);
+    let wide = mask_path(&h, "Plate");
+    assert!(near(wide.vertices[0], [200.0, 100.0]) && near(wide.vertices[1], [450.0, 100.0]), "{wide:?}");
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Plate"), start);
+    // Cmd-drag it: scales about the anchor (the centre).
+    let cmd = egui::Modifiers::COMMAND;
+    let (from, to) = (screen(&h, [400.0, 180.0]), screen(&h, [450.0, 180.0]));
+    mid_drag(&mut h, from, to, cmd);
+    release(&mut h, to, cmd);
+    h.input_mut().events.push(Event::ModifiersChanged(Default::default()));
+    h.run_steps(2);
+    let both = mask_path(&h, "Plate");
+    assert!(near(both.vertices[0], [150.0, 100.0]) && near(both.vertices[1], [450.0, 100.0]), "{both:?}");
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Plate"), start);
+    // Drag the anchor to the first corner: the pivot moves, the path does not.
+    drag_comp(&mut h, [300.0, 180.0], [200.0, 100.0]);
+    assert_eq!(mask_path(&h, "Plate"), start, "moving the anchor edits nothing");
+    let ft = h.state().ui.viewer.free_transform.clone().unwrap();
+    assert!(ft.anchor[0].abs() < 0.02 && ft.anchor[1].abs() < 0.02, "{ft:?}");
+    // Just outside the right edge: rotate a quarter turn about the anchor (the first corner).
+    drag_comp(&mut h, [410.0, 180.0], [120.0, 310.0]);
+    let turned = mask_path(&h, "Plate");
+    assert!(near(turned.vertices[0], [200.0, 100.0]) && near(turned.vertices[1], [200.0, 300.0]), "{turned:?}");
+    let ft = h.state().ui.viewer.free_transform.clone().unwrap();
+    assert!((ft.angle - 90.0).abs() < 0.5, "the box turns with the points: {ft:?}");
+    // The turned box's handles sit on the turned points.
+    assert!(near_pt(rect(&h, "viewer.freeTransform.anchor").center(), screen(&h, [200.0, 100.0])));
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Plate"), start);
+    // Esc ends it; Cmd+T with the points selected starts it again (not the Type tool).
+    h.input_mut().events.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.run_steps(2);
+    assert!(h.state().ui.viewer.free_transform.is_none());
+    assert!(h.state().auto.find_current("viewer.freeTransform.anchor").is_none());
+    assert!(!h.state().session.state.selected_vertices.is_empty());
+    h.input_mut().events.push(Event::Key { key: egui::Key::T, physical_key: None, pressed: true, repeat: false, modifiers: cmd });
+    h.run_steps(3);
+    assert_eq!(h.state().ui.tool, Tool::Selection, "Cmd+T with points selected is not the Type tool");
+    assert!(h.state().ui.viewer.free_transform.is_some(), "Cmd+T starts Free Transform");
+}
+
+/// Free Transform started with fewer than two points selected (Layer ▸ Mask and Shape Path ▸ Free
+/// Transform Points with the mask selected, or `viewer.freeTransform`) covers the whole path, and
+/// dragging its anchor point moves only the anchor.
+#[test]
+fn free_transform_anchor_drag_with_one_point_selected() {
+    let mut h = harness();
+    let plate = layer_id(&h, "Plate");
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [plate]})).unwrap();
+    s.execute("view.snapping", json!({"value": false})).unwrap();
+    let m = s.execute("mask.new", json!({"layer": plate, "vertices": [[200, 100], [300, 140], [400, 100], [400, 260], [200, 260]], "closed": true})).unwrap()["mask"].as_u64().unwrap();
+    // One point selected (as `mask.new` leaves the last one) still means the whole path.
+    s.execute("mask.selectVertices", json!({"vertices": [{"layer": plate, "mask": m, "index": 4}]})).unwrap();
+    h.state_mut().ui.tool = Tool::Selection;
+    h.run_steps(2);
+    let start = mask_path(&h, "Plate");
+    let ctx = h.ctx.clone();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "viewer.freeTransform", json!({"layer": plate, "path": m})).unwrap();
+    h.run_steps(2);
+    drag_comp(&mut h, [300.0, 180.0], [300.0, 260.0]);
+    let ft = h.state().ui.viewer.free_transform.clone().unwrap();
+    assert!((ft.anchor[0] - 0.5).abs() < 0.02 && (ft.anchor[1] - 1.0).abs() < 0.02, "{ft:?}");
+    assert_eq!(h.state().session.state.selected_vertices.len(), 1, "the anchor drag selects nothing");
+    assert_eq!(mask_path(&h, "Plate"), start);
+    assert!(rect(&h, "viewer.freeTransform.handle.2").center().distance(screen(&h, [400.0, 260.0])) < 2.0, "the box still covers the whole path");
+}
+
+/// A mask can be grabbed by its middle: a double-click inside a rectangle mask (away from its
+/// outline) starts Free Transform Points; dragging inside the box moves the whole mask down in one
+/// undo step; Return ends it without renaming the layer; Cmd+T with only the mask selected in the
+/// Timeline (layer not selected) starts it again and selects the layer so the box shows.
+#[test]
+fn double_click_inside_a_mask_free_transforms_it() {
+    let mut h = harness();
+    let plate = layer_id(&h, "Plate");
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [plate]})).unwrap();
+    s.execute("view.snapping", json!({"value": false})).unwrap();
+    let m = s.execute("mask.new", json!({"layer": plate, "vertices": [[200, 100], [400, 100], [400, 260], [200, 260]], "closed": true})).unwrap()["mask"]
+        .as_u64()
+        .unwrap();
+    s.execute("mask.selectVertices", json!({"vertices": []})).unwrap();
+    h.state_mut().ui.tool = Tool::Selection;
+    h.run_steps(2);
+    let start = mask_path(&h, "Plate");
+    let at = screen(&h, [250.0, 150.0]);
+    h.input_mut().events.push(Event::PointerMoved(at));
+    h.step();
+    for pressed in [true, false, true, false] {
+        h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+    }
+    h.run_steps(3);
+    assert!(h.state().ui.viewer.free_transform.is_some(), "a double-click inside the mask starts Free Transform");
+    assert_eq!(h.state().session.state.selected_vertices.len(), 4);
+    assert_eq!(mask_path(&h, "Plate"), start, "the double-click edits nothing");
+    // Drag inside the box (not on the anchor): the whole mask moves down 40, one undo step.
+    drag_comp(&mut h, [250.0, 150.0], [250.0, 190.0]);
+    let moved = mask_path(&h, "Plate");
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1.0 && (a[1] - b[1]).abs() < 1.0;
+    assert!(moved.vertices.iter().zip(&start.vertices).all(|(v, c)| near(*v, [c[0], c[1] + 40.0])), "{moved:?}");
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    h.run_steps(2);
+    assert_eq!(mask_path(&h, "Plate"), start, "the drag is one undo step");
+    // Return ends Free Transform and does not start renaming the layer.
+    h.input_mut().events.push(Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.run_steps(3);
+    assert!(h.state().ui.viewer.free_transform.is_none(), "Return ends Free Transform");
+    assert!(!h.ctx.egui_wants_keyboard_input(), "Return did not open a rename field");
+    // Only the mask selected in the Timeline: Cmd+T is Free Transform Points, not the Type tool.
+    let st = &mut h.state_mut().session.state;
+    st.selected_layers.clear();
+    st.selected_vertices.clear();
+    st.selected_props = vec![(LayerId(plate), m)];
+    h.input_mut().events.push(Event::Key { key: egui::Key::T, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND });
+    h.run_steps(3);
+    assert_eq!(h.state().ui.tool, Tool::Selection, "Cmd+T with a mask selected is not the Type tool");
+    assert!(h.state().ui.viewer.free_transform.is_some(), "Cmd+T starts Free Transform");
+    assert!(h.state().session.state.selected_layers.contains(&LayerId(plate)), "its layer is selected so the box shows");
+    assert!(h.state().auto.find_current("viewer.freeTransform.anchor").is_some(), "the box is drawn");
+    // Escape ends it.
+    h.input_mut().events.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.run_steps(2);
+    assert!(h.state().ui.viewer.free_transform.is_none());
+}
+
+/// MF3 (Elias's report): a mask larger than its layer, so its outline lies over the layer behind.
+/// A double-click on that outline (or inside the mask but outside the layer's pixels) used to
+/// select the layer behind on its first click, hiding the mask, so the Free Transform box never
+/// showed. Now it shows with all eight handles, corners and edge midpoints as in After Effects;
+/// an edge handle scales on its axis only, from the opposite edge (Cmd: about the anchor point),
+/// each drag one undo step. Tests not run when written (Elias runs them).
+#[test]
+fn free_transform_edge_handles_on_a_mask_outside_its_layer() {
+    let mut h = harness();
+    let bx = layer_id(&h, "Box");
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [bx]})).unwrap();
+    s.execute("view.snapping", json!({"value": false})).unwrap();
+    // Box is 80 × 80 at comp (280, 140)–(360, 220); the mask spans comp (240, 100)–(400, 260).
+    s.execute("mask.new", json!({"layer": bx, "vertices": [[-40, -40], [120, -40], [120, 120], [-40, 120]], "closed": true})).unwrap();
+    s.execute("mask.selectVertices", json!({"vertices": []})).unwrap();
+    h.state_mut().ui.tool = Tool::Selection;
+    h.run_steps(2);
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1.0 && (a[1] - b[1]).abs() < 1.0;
+    let near_pt = |a: Pos2, b: Pos2| a.distance(b) < 2.0;
+    let dbl = |h: &mut Harness<'_, EffectcraftApp>, at: Pos2| {
+        h.input_mut().events.push(Event::PointerMoved(at));
+        h.step();
+        for pressed in [true, false, true, false] {
+            h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        }
+        h.run_steps(3);
+    };
+    let undo = |h: &mut Harness<'_, EffectcraftApp>| {
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        h.run_steps(2);
+    };
+    // Double-click the top edge, above the Box's pixels (over Plate).
+    let top = screen(&h, [320.0, 100.0]);
+    dbl(&mut h, top);
+    assert!(h.state().ui.viewer.free_transform.is_some(), "a double-click on the outline outside the layer starts Free Transform");
+    assert!(h.state().session.state.selected_layers.contains(&LayerId(bx)), "the masked layer stays selected");
+    assert_eq!(h.state().session.state.selected_vertices.len(), 4);
+    // Eight handles: corners 0–3, then the top, right, bottom and left edges' midpoints.
+    for (i, p) in
+        [[240.0, 100.0], [400.0, 100.0], [400.0, 260.0], [240.0, 260.0], [320.0, 100.0], [400.0, 180.0], [320.0, 260.0], [240.0, 180.0]].iter().enumerate()
+    {
+        assert!(near_pt(rect(&h, &format!("viewer.freeTransform.handle.{i}")).center(), screen(&h, *p)), "handle {i}");
+    }
+    let start = mask_path(&h, "Box");
+    // Top edge handle up 40: only y changes, the bottom edge stays.
+    drag_comp(&mut h, [320.0, 100.0], [320.0, 60.0]);
+    let tall = mask_path(&h, "Box");
+    assert!(near(tall.vertices[0], [-40.0, -80.0]) && near(tall.vertices[1], [120.0, -80.0]), "{tall:?}");
+    assert!(near(tall.vertices[2], [120.0, 120.0]) && near(tall.vertices[3], [-40.0, 120.0]), "the bottom edge stays: {tall:?}");
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Box"), start, "the edge drag is one undo step");
+    // Right edge handle right 40: only x changes, from the left edge.
+    drag_comp(&mut h, [400.0, 180.0], [440.0, 180.0]);
+    let wide = mask_path(&h, "Box");
+    assert!(near(wide.vertices[0], [-40.0, -40.0]) && near(wide.vertices[1], [160.0, -40.0]) && near(wide.vertices[2], [160.0, 120.0]), "{wide:?}");
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Box"), start);
+    // Cmd-drag the bottom edge handle down 40: vertical scale ×1.5 about the anchor (centre).
+    let cmd = egui::Modifiers::COMMAND;
+    let (from, to) = (screen(&h, [320.0, 260.0]), screen(&h, [320.0, 300.0]));
+    mid_drag(&mut h, from, to, cmd);
+    release(&mut h, to, cmd);
+    h.input_mut().events.push(Event::ModifiersChanged(Default::default()));
+    h.run_steps(2);
+    let both = mask_path(&h, "Box");
+    assert!(near(both.vertices[0], [-40.0, -80.0]) && near(both.vertices[2], [120.0, 160.0]), "{both:?}");
+    undo(&mut h);
+    assert_eq!(mask_path(&h, "Box"), start);
+    // Esc ends it; a double-click inside the mask but outside the Box's pixels starts it again.
+    h.input_mut().events.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.run_steps(2);
+    assert!(h.state().ui.viewer.free_transform.is_none());
+    h.state_mut().session.execute("mask.selectVertices", json!({"vertices": []})).unwrap();
+    h.run_steps(2);
+    let inside = screen(&h, [255.0, 120.0]);
+    dbl(&mut h, inside);
+    assert!(h.state().ui.viewer.free_transform.is_some(), "a double-click inside the mask outside the layer starts Free Transform");
+    assert!(h.state().session.state.selected_layers.contains(&LayerId(bx)));
+    assert!(h.state().auto.find_current("viewer.freeTransform.handle.6").is_some(), "the box is drawn with its edge handles");
 }
 
 /// #513: clicking away from a mask's path, even on its own layer, deselects the mask's points;

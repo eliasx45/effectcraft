@@ -35,6 +35,8 @@ const PINNED_INVOKE: &[&str] = &[
     "playback.preview.shiftNumpad0",
     "playback.preview.altNumpad0",
     "playback.stop",
+    "playback.faster",
+    "playback.slower",
     "view.fit",
     "view.fitUpTo100",
     "view.nextItem",
@@ -58,6 +60,7 @@ const PINNED_INVOKE: &[&str] = &[
     "flowchart.graph",
     "timeline.search",
     "timeline.graphEditor",
+    "timeline.graph.fit",
     "timeline.switchesModes",
     "timeline.collapseAll",
     "timeline.twirlSelected",
@@ -85,6 +88,19 @@ const PINNED_INVOKE: &[&str] = &[
     "window.panelWindow",
     "view.theme.toggle",
     "project.deleteWithoutConfirmation",
+    "motionLibrary.view",
+    "motionLibrary.apply",
+    "motionLibrary.copyName",
+    "motionLibrary.save",
+    "motionLibrary.folder",
+    "motionLibrary.saveSelection",
+    "motionLibrary.card",
+    "motionLibrary.group",
+    "motionLibrary.importFiles",
+    "motionLibrary.refresh",
+    "motionLibrary.curve",
+    "motionLibrary.tool",
+    "viewer.freeTransform",
 ];
 
 /// The ids `menus::frontend` handled (frontend events of engine commands), in the old match order.
@@ -122,6 +138,7 @@ const PINNED_FRONTEND: &[&str] = &[
     "view.grid",
     "view.snapToGrid",
     "view.layerControls",
+    "view.sharpZoom",
     "view.options",
     "view.panelBackground",
     "view.fullScreen",
@@ -148,6 +165,16 @@ const PINNED_FRONTEND: &[&str] = &[
     "timeline.revealProps",
     "window.maximizeApp",
     "project.deleteWithoutConfirmation",
+    // Batch 1 (menus/speech.rs, lane B).
+    "speech.transcribe",
+    "script.copyRef",
+    "script.board",
+    // The FigCraft link (menus/figcraft.rs).
+    "comp.sendToFigCraft",
+    // Batch 1 (menus/agent_native.rs, lane C).
+    "link.paste",
+    "why.answer",
+    "ml.saveTextPreset",
 ];
 
 fn pinned(stage: Stage) -> &'static [&'static str] {
@@ -178,7 +205,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 137);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 157);
 }
 
 #[test]

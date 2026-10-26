@@ -7,7 +7,7 @@ use effectcraft_geom::Mat3;
 use effectcraft_project::{Comp, ItemId, Layer, LayerId, Project, Quality};
 use effectcraft_time::Tick;
 
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RenderOpts {
     /// Output scale relative to comp pixels (1 = Full, 0.5 = Half…).
@@ -32,12 +32,76 @@ pub struct RenderOpts {
     pub nested_switches: bool,
     /// Realtime Shadows in Draft (Settings ▸ 3D): draft renders (`draft`) still cast shadows.
     pub draft_shadows: bool,
+    /// Sharp zoom (viewer only): a `scale` above 1 is the viewer's magnification, so each layer
+    /// buffer is held within [`SHARP_MAX_PIXELS`] (drawn at a lower scale and magnified past it)
+    /// and nested comps are drawn only where they show. Exports to a larger output leave it off.
+    pub sharp: bool,
+}
+
+/// The `Debug` text keys caches (viewer frames on disk, nested comps): `sharp` shows only when on,
+/// so every other render keeps the text, and the keys, it had before the field.
+impl std::fmt::Debug for RenderOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let RenderOpts { scale, motion_blur, guides, draft, view, backend, roi, proxy, nested_switches, draft_shadows, sharp } = self;
+        let mut d = f.debug_struct("RenderOpts");
+        d.field("scale", scale)
+            .field("motion_blur", motion_blur)
+            .field("guides", guides)
+            .field("draft", draft)
+            .field("view", view)
+            .field("backend", backend)
+            .field("roi", roi)
+            .field("proxy", proxy)
+            .field("nested_switches", nested_switches)
+            .field("draft_shadows", draft_shadows);
+        if *sharp {
+            d.field("sharp", sharp);
+        }
+        d.finish()
+    }
 }
 
 impl RenderOpts {
     /// Whether 3D layers cast shadows in this render.
     pub fn shadows(&self) -> bool {
         !self.draft || self.draft_shadows
+    }
+}
+
+/// Sharp zoom ([`RenderOpts::sharp`]: the viewer's magnified region rendered at the
+/// magnification): the most pixels one layer buffer may take. A source bigger than this at the
+/// output scale is drawn at a lower scale and magnified (still no softer than at 100 %).
+pub const SHARP_MAX_PIXELS: f64 = 16.0e6;
+/// Sharp zoom: the longest side of one layer buffer (the rasterisers stop at 16384).
+const SHARP_MAX_SIDE: f64 = 16000.0;
+
+impl Renderer<'_> {
+    /// This is a sharp-zoom render above comp resolution ([`RenderOpts::sharp`]): the per-buffer
+    /// budget ([`SHARP_MAX_PIXELS`]) applies. Never at or below 100 % nor in exports, so those
+    /// frames are unchanged.
+    pub(crate) fn sharp(&self) -> bool {
+        self.opts.sharp && self.opts.scale > 1.0
+    }
+
+    /// The scale (buffer pixels per layer unit) to draw a `w`×`h` (layer units) buffer at for a
+    /// wanted `scale`: within the sharp-zoom budget, but never under `floor` (nor over `scale`).
+    /// `scale` itself outside sharp zoom.
+    pub(crate) fn sharp_fit(&self, scale: f64, w: f64, h: f64, floor: f64) -> f64 {
+        if !self.sharp() || !(w.is_finite() && h.is_finite()) {
+            return scale;
+        }
+        let (w, h) = (w.abs().max(1.0), h.abs().max(1.0));
+        let cap = (SHARP_MAX_PIXELS / (w * h)).sqrt().min(SHARP_MAX_SIDE / w.max(h));
+        if !cap.is_finite() {
+            return scale;
+        }
+        scale.min(cap.max(floor.min(scale)))
+    }
+
+    /// The scale a `w`×`h` solid's buffer is drawn at: the output scale (within the sharp-zoom
+    /// budget, see [`Self::sharp_fit`]).
+    pub(crate) fn solid_scale(&self, w: u32, h: u32) -> f64 {
+        self.sharp_fit(self.opts.scale, f64::from(w), f64::from(h), 1.0)
     }
 }
 
@@ -53,6 +117,7 @@ impl Default for RenderOpts {
             backend: Backend::Cpu,
             nested_switches: true,
             draft_shadows: true,
+            sharp: false,
             proxy: effectcraft_project::render_queue::ProxyUse::CurrentSettings,
         }
     }
@@ -90,6 +155,8 @@ pub struct Renderer<'a> {
     pub(crate) inherited: Option<Quality>,
     /// Classic 3D depth of field is left to an accelerator ([`three_d::Plane3d::dof`]).
     pub(crate) defer_dof: bool,
+    /// Classic 3D planes an accelerator already made (see [`Renderer::prepare_3d_run_with`]).
+    pub(crate) plane_bufs: Option<&'a three_d::PlaneBufs>,
     /// This renderer draws into the top-level frame's canvas (the top comp, or a collapsed
     /// precomp drawn straight into it): the region of interest's offset applies.
     pub(crate) top: bool,
@@ -106,6 +173,11 @@ pub struct Renderer<'a> {
     /// The size (comp pixels) of the comp whose frame a collapsed precomp's layers are drawn
     /// into; `None` draws into this renderer's own comp (see [`Renderer::raster_scale`]).
     pub(crate) out_comp: Option<(u32, u32)>,
+    /// A nested comp drawn only where its precomp layer can show (see [`crate::clip`]): the
+    /// window of its frame (output pixels at this renderer's scale) the canvas covers, as a
+    /// region of interest does at the top level. Collapsed precomps drawn into this canvas keep
+    /// it; renders one level deeper start whole.
+    pub(crate) window: Option<crate::placement::Window>,
     /// The Layer panel's zoom (layer pixels → screen pixels): Continuously Rasterize layers
     /// (vector footage, text, shapes) are drawn at it instead of at their size in the comp, so
     /// they stay sharp when the panel magnifies them. `None` everywhere else; nested renders
@@ -135,32 +207,89 @@ pub struct LayerTiming {
 /// timed under their own comp too. A 3D run's shared scene composite is split evenly between its
 /// layers. A layer whose content came from the layer cache takes only the lookup; a GPU
 /// compositor's time is the time to prepare and record its work, not the device's own run time.
+/// It also keeps where things ran (RI1): why a layer (or part of it) rendered on the CPU in a
+/// GPU frame ([`Self::cpu`]), and why the whole frame did ([`Self::set_frame_cpu`]). Nothing is
+/// kept (or allocated) for a frame that ran on the GPU throughout.
 #[derive(Debug, Default)]
-pub struct LayerTimes(std::sync::Mutex<std::collections::HashMap<(ItemId, LayerId), f64>>);
+pub struct LayerTimes {
+    ms: std::sync::Mutex<std::collections::HashMap<(ItemId, LayerId), f64>>,
+    cpu: std::sync::Mutex<std::collections::HashMap<(ItemId, LayerId), crate::cpu_why::CpuWhy>>,
+    frame_cpu: std::sync::Mutex<Option<crate::cpu_why::CpuWhy>>,
+}
+
+/// What [`LayerTimes`] kept for a frame.
+#[derive(Clone, Debug, Default)]
+pub struct TakenTimes {
+    /// Each layer's time (ms), by comp and layer.
+    pub ms: std::collections::HashMap<(ItemId, LayerId), f64>,
+    /// The layers that rendered (fully or partly) on the CPU in a GPU frame, and why.
+    pub cpu: std::collections::HashMap<(ItemId, LayerId), crate::cpu_why::CpuWhy>,
+    /// Why the whole frame rendered on the CPU; `None`: the GPU composited it.
+    pub frame_cpu: Option<crate::cpu_why::CpuWhy>,
+}
 
 impl LayerTimes {
+    /// `layer` of `comp` rendered (fully or partly) on the CPU because of `why`. The first
+    /// reason a layer gets on a frame stays.
+    pub fn cpu(&self, comp: ItemId, layer: LayerId, why: crate::cpu_why::CpuWhy) {
+        let mut m = self.cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        m.entry((comp, layer)).or_insert(why);
+    }
+
+    /// Why `layer` of `comp` rendered on the CPU so far, if it did.
+    pub fn cpu_reason(&self, comp: ItemId, layer: LayerId) -> Option<crate::cpu_why::CpuWhy> {
+        self.cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(comp, layer)).copied()
+    }
+
+    /// The whole frame rendered on the CPU because of `why` (replacing an earlier reason: the
+    /// last decision is the one that rendered it).
+    pub fn set_frame_cpu(&self, why: crate::cpu_why::CpuWhy) {
+        *self.frame_cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+    }
+
+    /// [`Self::set_frame_cpu`] unless a reason is already kept (the compositor's own decision
+    /// gives way to the caller's, which knows more: a retired GPU, a retry).
+    pub fn note_frame_cpu(&self, why: crate::cpu_why::CpuWhy) {
+        self.frame_cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(why);
+    }
+
+    /// Why the whole frame rendered on the CPU, if it did.
+    pub fn frame_cpu(&self) -> Option<crate::cpu_why::CpuWhy> {
+        *self.frame_cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Everything kept.
+    pub fn take(self) -> TakenTimes {
+        fn into<T>(m: std::sync::Mutex<T>) -> T {
+            m.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        TakenTimes { ms: into(self.ms), cpu: into(self.cpu), frame_cpu: into(self.frame_cpu) }
+    }
+
     /// Add `ms` to `layer` of `comp`.
     pub fn add(&self, comp: ItemId, layer: LayerId, ms: f64) {
         if !ms.is_finite() || ms < 0.0 {
             return;
         }
-        let mut m = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = self.ms.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *m.entry((comp, layer)).or_insert(0.0) += ms;
     }
 
     /// The time of `layer` of `comp` so far.
     pub fn get(&self, comp: ItemId, layer: LayerId) -> Option<f64> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(comp, layer)).copied()
+        self.ms.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(comp, layer)).copied()
     }
 
-    /// Forget the times taken (a frame rendered again from the start).
+    /// Forget the times taken and where things ran (a frame rendered again from the start).
     pub fn clear(&self) {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.ms.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        *self.frame_cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// The times taken.
     pub fn into_map(self) -> std::collections::HashMap<(ItemId, LayerId), f64> {
-        self.0.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.take().ms
     }
 }
 
@@ -168,11 +297,22 @@ impl<'a> Renderer<'a> {
     /// Run `f` (drawing or producing `layer` of `ctx`'s comp) and add its wall time to the
     /// layer's render time, when this render is timed ([`Self::times`]).
     pub fn timed<T>(&self, ctx: &EvalCtx, layer: &Layer, f: impl FnOnce() -> T) -> T {
+        // What `f` caches belongs to this layer (the Memory panel; a thread-local swap, see
+        // `cache::owner`). Every walk (CPU, GPU, prepass, 3D) draws its layers through here.
+        let _owner = crate::cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let Some(times) = self.times else { return f() };
         let t0 = web_time::Instant::now();
         let out = f();
         times.add(ctx.comp_id, layer.id, t0.elapsed().as_secs_f64() * 1e3);
         out
+    }
+
+    /// `layer` of `ctx`'s comp renders (fully or partly) on the CPU because of `why`, when this
+    /// render is timed (RI1, see [`LayerTimes::cpu`]).
+    pub fn note_cpu(&self, ctx: &EvalCtx, layer: &Layer, why: crate::cpu_why::CpuWhy) {
+        if let Some(times) = self.times {
+            times.cpu(ctx.comp_id, layer.id, why);
+        }
     }
 
     /// [`Self::timed`] for a run of 3D layers drawn as one scene: what `f` timed per layer stays
@@ -210,11 +350,13 @@ impl<'a> Renderer<'a> {
             collapse3d: None,
             inherited: None,
             defer_dof: false,
+            plane_bufs: None,
             top: true,
             through: [None; MAX_THROUGH],
             through_lost: false,
             canvas_origin: [0; 2],
             out_comp: None,
+            window: None,
             layer_view: None,
         }
     }
@@ -264,11 +406,13 @@ impl<'a> Renderer<'a> {
             opacity_mul: 1.0,
             collapse3d: None,
             defer_dof: false,
+            plane_bufs: None,
             top: false,
             through: [None; MAX_THROUGH],
             through_lost: false,
             canvas_origin: [0; 2],
             out_comp: None,
+            window: None,
             layer_view: None,
             ..*self
         }
@@ -298,6 +442,8 @@ impl<'a> Renderer<'a> {
     /// Top-level frames go to the GPU when [`Self::active_accel`] is set and handles them.
     pub fn comp_frame(&self, comp_id: ItemId, t: Tick) -> Image {
         let _frame = self.begin_frame(comp_id);
+        // Text laid out once per layer and time in this frame (see `text::GeomScope`).
+        let _text = crate::text::GeomScope::open(self.project);
         // Classic 3D runs composite on the GPU too (M12.7), so Auto sends 3D comps there as well;
         // Auto renders each comp on whichever compositor measured faster ([`AutoPick`]).
         if self.depth == 0
@@ -316,6 +462,11 @@ impl<'a> Renderer<'a> {
                 if let Some((p, key)) = auto {
                     p.declined(key);
                 }
+                self.note_frame_cpu(crate::cpu_why::GPU_DECLINED_FRAME);
+            } else if auto.is_some_and(|(p, key)| p.stats(key).is_some_and(|s| s.declined)) {
+                self.note_frame_cpu(crate::cpu_why::GPU_DECLINED_COMP);
+            } else {
+                self.note_frame_cpu(crate::cpu_why::CPU_FASTER);
             }
             let t0 = web_time::Instant::now();
             let img = self.comp_frame_cpu(comp_id, t);
@@ -324,7 +475,24 @@ impl<'a> Renderer<'a> {
             }
             return img;
         }
+        if self.depth == 0 {
+            self.note_frame_cpu(if self.freeze.is_some() {
+                crate::cpu_why::FROZEN_PREVIEW
+            } else if self.accel.is_none() {
+                crate::cpu_why::NO_GPU
+            } else {
+                crate::cpu_why::GPU_OFF
+            });
+        }
         self.comp_frame_cpu(comp_id, t)
+    }
+
+    /// The top-level frame renders on the CPU because of `why`, unless the caller already said
+    /// why (RI1, see [`LayerTimes::note_frame_cpu`]).
+    fn note_frame_cpu(&self, why: crate::cpu_why::CpuWhy) {
+        if let Some(times) = self.times {
+            times.note_frame_cpu(why);
+        }
     }
 
     /// Build a preview cache in blending space, before display/output conversion. Call on a
@@ -396,6 +564,7 @@ impl<'a> Renderer<'a> {
     /// [`Self::comp_frame`] on the CPU compositor only.
     pub fn comp_frame_cpu(&self, comp_id: ItemId, t: Tick) -> Image {
         let _frame = self.begin_frame(comp_id);
+        let _text = crate::text::GeomScope::open(self.project);
         let Some(comp) = self.project.comp(comp_id) else { return Image::new(1, 1) };
         let s = self.opts.scale;
         let w = ((comp.width as f64 * s).round() as u32).max(1);

@@ -428,6 +428,18 @@ impl Node {
     }
 }
 
+/// How far a path got ([`PropGroup::resolve_path`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathWalk {
+    /// The segments that named a child, as written (dotted match ids kept whole).
+    pub segs: Vec<String>,
+    /// The child index each of `segs` named, level by level.
+    pub indices: Vec<usize>,
+    /// What was left when a segment named nothing: the failing segment first (the rest of its
+    /// `/`-chunk, dots kept), then the later `/` segments.
+    pub rest: Vec<String>,
+}
+
 /// One step of a property path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Seg {
@@ -446,23 +458,27 @@ fn bare_uid(path: &str) -> Option<Uid> {
 }
 
 pub fn parse_path(s: &str) -> Vec<Seg> {
-    s.split(['/', '.'])
-        .filter(|x| !x.is_empty())
-        .map(|seg| {
-            if let Some(u) = seg.strip_prefix('@').and_then(|u| u.parse().ok()) {
-                Seg::Uid(u)
-            } else if let Some(i) = seg.strip_prefix('#').and_then(|u| u.parse().ok()) {
-                Seg::Index(i)
-            } else if let Some((m, n)) = seg.rsplit_once('#')
-                && let Ok(n) = n.parse()
-            {
-                Seg::Match(m.to_string(), n)
-            } else {
-                Seg::Match(seg.to_string(), 1)
-            }
-        })
-        .collect()
+    s.split(['/', '.']).filter(|x| !x.is_empty()).map(parse_seg).collect()
 }
+
+/// One path segment: `@uid`, `#index`, `match#n` or `match`.
+fn parse_seg(seg: &str) -> Seg {
+    if let Some(u) = seg.strip_prefix('@').and_then(|u| u.parse().ok()) {
+        Seg::Uid(u)
+    } else if let Some(i) = seg.strip_prefix('#').and_then(|u| u.parse().ok()) {
+        Seg::Index(i)
+    } else if let Some((m, n)) = seg.rsplit_once('#')
+        && let Ok(n) = n.parse()
+    {
+        Seg::Match(m.to_string(), n)
+    } else {
+        Seg::Match(seg.to_string(), 1)
+    }
+}
+
+/// Most `.`-separated pieces one segment may join into a dotted match id
+/// (`ec.stylize.deepglow` is 3): bounds the work a hostile path can cause.
+const MAX_DOTTED_PIECES: usize = 16;
 
 impl PropGroup {
     /// An instance in an indexed list (effect, mask, shape item, text animator, tracker): these
@@ -489,25 +505,65 @@ impl PropGroup {
         }
     }
 
-    pub fn node(&self, path: &str) -> Option<&Node> {
-        let segs = parse_path(path);
-        let (last, init) = segs.split_last()?;
-        let mut g = self;
-        for s in init {
-            g = g.children.get(g.child_index(s)?)?.as_group()?;
+    /// Walk `path` from this group: the segments that resolved (each as written, a dotted match
+    /// id such as `ec.stylize.deepglow` kept whole), the child index chain they name, and the
+    /// pieces left over when a segment named nothing (empty when the whole path resolved).
+    ///
+    /// `/` always separates segments; `.` separates them too (`transform.position`) unless the
+    /// dotted text names a child itself: match ids of effects and their params may contain dots,
+    /// and the longest dotted run that names a child wins.
+    pub fn resolve_path(&self, path: &str) -> PathWalk {
+        let mut walk = PathWalk::default();
+        let mut g = Some(self);
+        let chunks: Vec<&str> = path.split('/').filter(|x| !x.is_empty()).collect();
+        for (c, chunk) in chunks.iter().enumerate() {
+            let pieces: Vec<&str> = chunk.split('.').filter(|x| !x.is_empty()).collect();
+            let mut j = 0;
+            while j < pieces.len() {
+                let found = g.and_then(|grp| {
+                    let max = pieces.len().min(j.saturating_add(MAX_DOTTED_PIECES));
+                    (j + 1..=max).rev().find_map(|k| {
+                        let text = pieces.get(j..k)?.join(".");
+                        grp.child_index(&parse_seg(&text)).map(|i| (k, i, text))
+                    })
+                });
+                let Some((k, i, text)) = found else {
+                    walk.rest.push(pieces.get(j..).unwrap_or_default().join("."));
+                    walk.rest.extend(chunks.iter().skip(c + 1).map(|x| x.to_string()));
+                    return walk;
+                };
+                walk.segs.push(text);
+                walk.indices.push(i);
+                g = g.and_then(|grp| grp.children.get(i)).and_then(Node::as_group);
+                j = k;
+            }
         }
-        g.children.get(g.child_index(last)?)
+        walk
+    }
+
+    pub fn node(&self, path: &str) -> Option<&Node> {
+        let walk = self.resolve_path(path);
+        if !walk.rest.is_empty() {
+            return None;
+        }
+        let (last, init) = walk.indices.split_last()?;
+        let mut g = self;
+        for i in init {
+            g = g.children.get(*i)?.as_group()?;
+        }
+        g.children.get(*last)
     }
     pub fn node_mut(&mut self, path: &str) -> Option<&mut Node> {
-        let segs = parse_path(path);
-        let (last, init) = segs.split_last()?;
-        let mut g = self;
-        for s in init {
-            let i = g.child_index(s)?;
-            g = g.children.get_mut(i)?.as_group_mut()?;
+        let walk = self.resolve_path(path);
+        if !walk.rest.is_empty() {
+            return None;
         }
-        let i = g.child_index(last)?;
-        g.children.get_mut(i)
+        let (last, init) = walk.indices.split_last()?;
+        let mut g = self;
+        for i in init {
+            g = g.children.get_mut(*i)?.as_group_mut()?;
+        }
+        g.children.get_mut(*last)
     }
     /// A property by path; a bare `@uid` finds the property anywhere below this group.
     pub fn prop(&self, path: &str) -> Option<&Property> {
@@ -913,5 +969,58 @@ mod ae_behavior_tests {
         assert_eq!(p.keys.len(), 3);
         assert!((p.keys[1].in_ease[0].speed - 75.0).abs() < 1e-8);
         assert!((p.keys[1].out_ease[0].speed - 75.0).abs() < 1e-8);
+    }
+}
+
+#[cfg(test)]
+mod dotted_path_tests {
+    use super::*;
+
+    fn num(uid: Uid, m: &str, name: &str) -> Property {
+        Property::new(uid, m, name, Value::Scalar(1.0))
+    }
+
+    /// A layer root with Transform, then Gaussian Blur and Deep Glow (dotted match ids, a dotted
+    /// param id), then a second Gaussian Blur.
+    fn root() -> PropGroup {
+        let effects = PropGroup::new(10, "effects", "Effects")
+            .with(PropGroup::new(11, "ec.blur.gaussian", "Gaussian Blur").with(num(12, "blurriness", "Blurriness")))
+            .with(PropGroup::new(20, "ec.stylize.deepglow", "Deep Glow (Native)").with(num(21, "PEDG2-0001", "Radius")).with(num(22, "PEDG2.0002", "Exposure")))
+            .with(PropGroup::new(30, "ec.blur.gaussian", "Gaussian Blur 2").with(num(31, "blurriness", "Blurriness")));
+        PropGroup::new(1, "root", "root").with(PropGroup::new(2, "transform", "Transform").with(num(3, "position", "Position"))).with(effects)
+    }
+
+    #[test]
+    fn dotted_match_ids_resolve_as_one_segment() {
+        let r = root();
+        let uid = |p: &str| r.prop(p).map(|p| p.uid);
+        assert_eq!(uid("effects/ec.stylize.deepglow/PEDG2-0001"), Some(21));
+        assert_eq!(uid("effects/ec.stylize.deepglow/PEDG2.0002"), Some(22));
+        assert_eq!(uid("effects.ec.stylize.deepglow.PEDG2.0002"), Some(22));
+        assert_eq!(uid("effects/#2/PEDG2-0001"), Some(21));
+        assert_eq!(uid("effects/Deep Glow (Native)/PEDG2-0001"), Some(21));
+        assert_eq!(uid("effects/ec.blur.gaussian/blurriness"), Some(12));
+        assert_eq!(uid("effects/ec.blur.gaussian#2/blurriness"), Some(31));
+        // `.` still separates segments that are not one match id.
+        assert_eq!(uid("transform.position"), Some(3));
+        assert_eq!(uid("transform/position"), Some(3));
+        assert_eq!(uid("effects/ec.stylize.nope/PEDG2-0001"), None);
+        assert_eq!(r.group("effects/ec.stylize.deepglow").map(|g| g.uid), Some(20));
+        // Every match path round-trips.
+        for u in [3, 12, 21, 22, 31] {
+            let p = r.match_path_of(u).unwrap_or_default();
+            assert_eq!(uid(&p), Some(u), "{p}");
+        }
+        let walk = r.resolve_path("effects/ec.stylize.nope/PEDG2-0001");
+        assert_eq!(walk.segs, vec!["effects".to_string()]);
+        assert_eq!(walk.rest, vec!["ec.stylize.nope".to_string(), "PEDG2-0001".to_string()]);
+    }
+
+    #[test]
+    fn hostile_paths_resolve_to_nothing_quickly() {
+        let r = root();
+        assert!(r.prop(&".".repeat(100_000)).is_none());
+        assert!(r.prop(&"a.".repeat(50_000)).is_none());
+        assert!(r.prop("").is_none());
     }
 }

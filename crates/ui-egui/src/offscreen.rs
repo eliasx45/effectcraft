@@ -196,6 +196,11 @@ fn build(opts: OffscreenOptions, session: Session, renderer: WgpuTestRenderer) -
         .renderer(renderer)
         .build_eframe(move |cc| {
             let mut app = EffectcraftApp::new(session).with_control(rx);
+            // MEM3: no memory polling in this hidden copy; its caches are budgeted once from the
+            // machine's memory (two kernel calls), so they never take what the desktop app needs.
+            app.watch_system = false;
+            app.session.sys_memory = effectcraft_engine::sysinfo::memory();
+            app.session.apply_cache_budgets();
             // CR1: a compositor that fails (out of video memory) is retired and set up again on
             // a new device, as in the desktop app. Its own health check reports it; the
             // harness's device has no handlers to forward.

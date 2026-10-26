@@ -54,7 +54,8 @@ originals until the next Refresh.
 
 | Command | Parameters / result |
 |---|---|
-| `freeze.freeze` | `comp?`, `layers?`, `mode: auto|comp|precomp|selection`, `name?`, `start?`, `end?`, `followCompositionRange?`, `quickDraft?`, `wait?` |
+| `freeze.freeze` | `comp?`, `layers?`, `mode: auto|comp|precomp|selection`, `name?`, `start?`, `end?`, `followCompositionRange?`, `quickDraft?`, `auto?` (also turn Auto on, as `freeze.auto`), `wait?` |
+| `freeze.suggest` | Layers too heavy to play in real time, slowest first: `{candidates:[{comp, layer, name, msPerFrame, frameBudgetMs, ratio, samples, target, freeze}], autoHeavy}`; `freeze` is ready-made `freeze.freeze` params. `dismiss: {comp, layer}` hides one for the session |
 | `freeze.list` | Persisted section intent, cache versions and measurements |
 | `freeze.edit` / `freeze.refresh` | `section`; Refresh also accepts `wait` |
 | `freeze.auto` | `section`, `enabled` |
@@ -66,6 +67,40 @@ originals until the next Refresh.
 | `freeze.settings` | `budgetGiB?`, `retireOld?` |
 | `freeze.cleanup` | Retire eligible versions/abandoned jobs; `retireNow?` bypasses only the ten-hour grace |
 | `freeze.restore` | Restore a retired version by its recorded `directory`; `wait?` |
+
+### Heavy layers (hint and `previews.freezeAutoHeavy`)
+
+The viewer reports each frame's per-layer render times (the Render Time pane's numbers) to the
+engine (`Session::note_layer_costs`). A layer is *heavy* when, over its latest 16 frames (at
+least 8 measured), at least 80% took more than twice the composition's frame time and its
+average does too. A layer inside a precomp that is itself heavy is left out (freezing the precomp
+covers it), as are frozen and dismissed layers. `freeze.suggest` lists them.
+
+The Timeline shows the slowest as a hint above its footer, "Stat Stack renders at 1.8 s/frame —
+Freeze it?" (`timeline.freezeHint`, buttons `timeline.freezeHint.freeze` / `.dismiss`). Freeze runs
+`freeze.freeze` with `auto: true`: the section is one undo step, edits restore the originals and
+Auto re-freezes after eight idle seconds. Nothing freezes without the click unless
+`previews.freezeAutoHeavy` (Preferences ▸ Previews ▸ Freeze Heavy Layers When Idle, off by default) is
+on: then the slowest heavy layer is frozen the same way once editing and playback have been
+idle for eight seconds, one section at a time and each layer once. Only the viewer's own
+(local) frames are measured; frames from a cloud frame server carry another machine's times.
+
+### Heavy footage (automatic proxies)
+
+The same hint place offers a proxy for heavy footage first (`timeline.proxyHint`, buttons
+`.yes` / `.no`): "Smoke is 6K and costs ~46 ms/frame here. Make a 1080p proxy?". A movie used
+by a comp is suggested once when it is at least 1.5× the largest comp using it (either
+dimension), when the hardware decoder refuses it (or it is H.264 beyond 4096×2304), or when its
+layer's measured time stays above the frame budget (8+ frames). Yes (`proxy.autoCreate {item,
+wait?}`) makes an H.264 proxy at that comp's size (aspect kept) in `Proxies/` next to the saved
+project, in the background, and sets it as the item's proxy marked `auto`. No
+(`proxy.dismissSuggestion {item}`) is saved in the project (`proxy_hint_dismissed`).
+`proxy.suggest` lists the candidates.
+
+Automatic proxies are **preview-only**: under Proxy Use ▸ Current Settings they are used only
+by renders through the preview view of the footage (viewer, RAM preview). Render Queue items,
+exports and Save Frame As read the exact view and use the original; only Use All Proxies renders
+with an automatic proxy. Proxies set by hand behave as before.
 
 `wait: true` follows the draft into the full render through the control channel. Jobs
 remain visible through the shared Progress panel and `jobs.list`. Automatic cache

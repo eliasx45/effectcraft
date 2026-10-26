@@ -293,6 +293,9 @@ impl Client {
     pub fn prepare(&self, id: &str) -> Prepared {
         let Some(cat) = self.catalog() else { return Prepared::Failed("the Motion Library has no catalog yet (library.sync)".into()) };
         let Some(card) = cat.card(id) else { return Prepared::Failed(format!("no Motion Library card `{id}`")) };
+        if card.on_mac {
+            return Prepared::Failed(format!("“{}” is on the Mac: apply it in After Effects there (here: Devin Jatho and SceneYard cards)", card.name));
+        }
         let Some(project) = card.project.as_ref() else { return Prepared::Failed(format!("“{}” has no file to apply", card.name)) };
         let blobs = card.apply_blobs();
         let total = blobs.len();

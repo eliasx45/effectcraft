@@ -126,6 +126,24 @@ It uses only After Effects' documented scripting API (`comp.selectedProperties`,
 `KeyframeEase`, `setInterpolationTypeAtKey`, `app.settings`, ScriptUI), so it is also a worked
 example of a keyframe tool.
 
+### Gradient Generator (`extensions/scriptui-panels/Gradient Generator.jsx`)
+
+Window ▸ Gradient Generator.jsx: animated gradient backgrounds in one click. Pick a template, a
+palette, a format (the active comp's size, 16:9, 9:16, 1:1, 4:5 or 4K) and a duration, then
+Generate: it builds a new composition from built-in effects only, and with "Add to the active comp
+as its background" on it also adds that comp to the active comp as its bottom layer.
+
+* Templates: Ribbons and S-Waves (a gradient bar blurred first, then folded by Wave Warp and Warp,
+  so its soft edges turn into ribbons), Liquid (Fractal Noise and Turbulent Displace through
+  Colorama), Bands (a wavy ramp through Colorama), Swirl (4-Color Gradient and Twirl), and two
+  simple ones: Soft Mesh (four drifting 4-Color Gradient points) and Sweep (a turning Gradient Ramp).
+* Everything is driven by expressions from one `Gradient Controls` layer: Palette (a dropdown of
+  the ten palettes, or Custom), Color 1–4 (background, two main colours, highlight; they follow
+  the palette unless it is Custom), Speed, Blur (%), Scale (%), Angle and Seed (another variation
+  of the same look). Colorama's Output Cycle is an expression built from Color 1–4, so palettes
+  switch live from the dropdown.
+* The last choices are kept with `app.settings` (section `Gradient Generator`).
+
 ## Effect plug-ins
 
 EffectCraft loads third-party effects through a small, versioned plug-in API (**API version 1**).

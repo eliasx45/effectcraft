@@ -3,7 +3,7 @@
 //! handles, the path free-transform box and the Mask Feather tool.
 //!
 //! Every edit is an engine command (`mask.*`, `path.freeTransform`, `keys.set`,
-//! `keys.setSpatialTangents`, `prop.set`).
+//! `keys.setSpatialTangents`, `keys.bendSpatialSegment`, `prop.set`).
 
 use effectcraft_engine::geom::{Mat3, vec2 as gv2};
 use effectcraft_engine::keyframe::ShapePath;
@@ -16,6 +16,7 @@ use serde_json::json;
 
 use super::viewer::ViewerMap;
 use crate::EffectcraftApp;
+use crate::state::FreeTransform;
 
 /// A vertex or tangent handle drawn this frame (masks and shape paths alike; `mask` is the path
 /// group's uid).
@@ -116,6 +117,33 @@ pub(crate) fn open_end_at(paths: &[PathInfo], map: &ViewerMap, pos: Pos2, tol: f
         let q = p.m.apply(gv2(v[0], v[1]));
         (map.to_screen([q.x, q.y]).distance(pos) < tol).then_some((p.layer, p.uid))
     })
+}
+
+/// The closed path (mask or shape path) with `pos` inside it (even-odd, as drawn on screen), the
+/// first one listed winning: a double-click there enters Free Transform Points on it.
+pub(crate) fn closed_path_at(paths: &[PathInfo], map: &ViewerMap, pos: Pos2) -> Option<(LayerId, u64)> {
+    paths.iter().filter(|p| p.sp.closed && p.sp.vertices.len() > 2).find(|p| point_in_polygon(pos, &flatten(&p.sp, &p.m, map))).map(|p| (p.layer, p.uid))
+}
+
+/// Even-odd point-in-polygon test; the polygon closes itself (last point back to the first).
+pub(crate) fn point_in_polygon(p: Pos2, poly: &[Pos2]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    for (a, b) in poly.iter().zip(poly.iter().cycle().skip(1)) {
+        if (a.y > p.y) != (b.y > p.y) {
+            let dy = b.y - a.y;
+            if dy.abs() < f32::EPSILON {
+                continue;
+            }
+            let x = a.x + (p.y - a.y) * (b.x - a.x) / dy;
+            if p.x < x {
+                inside = !inside;
+            }
+        }
+    }
+    inside
 }
 
 /// A mask or shape path of a layer by group uid, evaluated at the context time.
@@ -288,6 +316,8 @@ pub(crate) struct MotionSegment {
     pub to: Pos2,
     pub start: Tick,
     pub end: Tick,
+    /// Parent space → comp.
+    pub p2c: Mat3,
 }
 
 pub(crate) fn motion_key_at(hits: &[KeyHit], pos: Pos2) -> Option<KeyHit> {
@@ -318,6 +348,24 @@ const PEN_KEY_R: f32 = 6.0;
 const PEN_TANGENT_R: f32 = 5.0;
 const PEN_PATH_R: f32 = 6.0;
 
+/// The displayed sample interval nearest `pos` (within the path's pick radius), and how far
+/// along it the pointer is.
+fn segment_near(segments: &[MotionSegment], pos: Pos2) -> Option<(&MotionSegment, f32)> {
+    segments
+        .iter()
+        .filter_map(|s| {
+            let delta = s.to - s.from;
+            if delta.length_sq() < 0.001 {
+                return None;
+            }
+            let f = ((pos - s.from).dot(delta) / delta.length_sq()).clamp(0.0, 1.0);
+            let d = pos.distance(s.from + delta * f);
+            (d < PEN_PATH_R).then_some((s, f, d))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(s, f, _)| (s, f))
+}
+
 /// The [`PenTarget`] at `pos`: a key square first, then a tangent handle, then the path line.
 pub(crate) fn pen_target(hits: &[KeyHit], segments: &[MotionSegment], frames: &[PathFrame], pos: Pos2) -> PenTarget {
     let nearest = |tangent: bool, r: f32| {
@@ -332,21 +380,7 @@ pub(crate) fn pen_target(hits: &[KeyHit], segments: &[MotionSegment], frames: &[
     if nearest(true, PEN_TANGENT_R).is_some() {
         return PenTarget::Tangent;
     }
-    // The nearest displayed sample interval, and how far along it the pointer is.
-    let Some((seg, f)) = segments
-        .iter()
-        .filter_map(|s| {
-            let delta = s.to - s.from;
-            if delta.length_sq() < 0.001 {
-                return None;
-            }
-            let f = ((pos - s.from).dot(delta) / delta.length_sq()).clamp(0.0, 1.0);
-            let d = pos.distance(s.from + delta * f);
-            (d < PEN_PATH_R).then_some((s, f, d))
-        })
-        .min_by(|a, b| a.2.total_cmp(&b.2))
-        .map(|(s, f, _)| (s, f))
-    else {
+    let Some((seg, f)) = segment_near(segments, pos) else {
         return PenTarget::None;
     };
     let is_key = |t: Tick| hits.iter().any(|h| h.tangent.is_none() && h.layer == seg.layer && h.prop == seg.prop && h.time == t);
@@ -460,7 +494,7 @@ pub(crate) fn motion_path(
         // Holds jump rather than travelling through the connecting line.
         let held = pos.keys.iter().rev().find(|k| k.time <= start).is_some_and(|k| k.out_interp == effectcraft_engine::keyframe::Interp::Hold);
         if !held {
-            segments.push(MotionSegment { layer: l.id, prop: pos.uid, from, to, start, end });
+            segments.push(MotionSegment { layer: l.id, prop: pos.uid, from, to, start, end, p2c });
         }
     }
     let faint = col.gamma_multiply(0.8);
@@ -509,91 +543,216 @@ pub(crate) fn motion_path(
 
 // ---------------------------------------------------------------- free transform
 
-fn ft_id() -> egui::Id {
-    egui::Id::new("viewer-free-transform")
+/// Enter Free Transform on a path (double-click a path with the Selection tool, Cmd+T with its
+/// points selected, Layer ▸ Mask and Shape Path ▸ Free Transform Points): an upright box with the
+/// anchor point in its centre.
+pub(crate) fn begin_free_transform(app: &mut EffectcraftApp, layer: LayerId, uid: u64) {
+    app.ui.viewer.free_transform = Some(FreeTransform::new(layer.0, uid));
 }
 
-/// Enter Free Transform on a path (double-click a path with the Selection tool).
-pub(crate) fn begin_free_transform(ctx: &egui::Context, layer: LayerId, uid: u64) {
-    ctx.data_mut(|d| d.insert_temp(ft_id(), (layer, uid)));
+pub(crate) fn end_free_transform(app: &mut EffectcraftApp) {
+    app.ui.viewer.free_transform = None;
 }
 
-pub(crate) fn end_free_transform(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.remove::<(LayerId, u64)>(ft_id()));
+/// Turn the box (`angle`, degrees) or move its anchor point (`anchor`, box coordinates).
+pub(crate) fn set_free_transform(app: &mut EffectcraftApp, angle: Option<f64>, anchor: Option<[f64; 2]>) {
+    if let Some(f) = app.ui.viewer.free_transform.as_mut() {
+        if let Some(a) = angle.filter(|a| a.is_finite()) {
+            f.angle = a.rem_euclid(360.0);
+        }
+        if let Some(a) = anchor.filter(|a| a[0].is_finite() && a[1].is_finite()) {
+            f.anchor = a;
+        }
+    }
 }
 
-pub(crate) fn free_transform_target(ctx: &egui::Context) -> Option<(LayerId, u64)> {
-    ctx.data(|d| d.get_temp(ft_id()))
+pub(crate) fn free_transform_target(app: &EffectcraftApp) -> Option<(LayerId, u64)> {
+    app.ui.viewer.free_transform.as_ref().map(|f| (LayerId(f.layer), f.path))
 }
 
-/// The free-transform box: path-space bounds of the transformed vertices, its handles on screen
-/// (corners 0–3, edge midpoints 4–7) and the path → comp matrix.
+/// A 2×3 affine matrix `[a, b, c, d, e, f]`: x' = a·x + c·y + e, y' = b·x + d·y + f (the layout
+/// `path.freeTransform` takes as `matrix`).
+pub(crate) type Affine = [f64; 6];
+
+pub(crate) const AF_ID: Affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+pub(crate) fn af_apply(m: &Affine, p: [f64; 2]) -> [f64; 2] {
+    [m[0] * p[0] + m[2] * p[1] + m[4], m[1] * p[0] + m[3] * p[1] + m[5]]
+}
+
+/// `p ∘ q`: `q` first, then `p`.
+pub(crate) fn af_mul(p: &Affine, q: &Affine) -> Affine {
+    [
+        p[0] * q[0] + p[2] * q[1],
+        p[1] * q[0] + p[3] * q[1],
+        p[0] * q[2] + p[2] * q[3],
+        p[1] * q[2] + p[3] * q[3],
+        p[0] * q[4] + p[2] * q[5] + p[4],
+        p[1] * q[4] + p[3] * q[5] + p[5],
+    ]
+}
+
+pub(crate) fn af_inv(m: &Affine) -> Option<Affine> {
+    let det = m[0] * m[3] - m[2] * m[1];
+    if !det.is_finite() || det.abs() < 1e-12 {
+        return None;
+    }
+    let (a, b, c, d) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
+    Some([a, b, c, d, -(a * m[4] + c * m[5]), -(b * m[4] + d * m[5])])
+}
+
+/// The box of a free transform: the tightest rectangle around the transformed points, turned by
+/// `angle` (degrees, path space), as `uv → path` (`(0, 0)` its first corner, `(1, 1)` the
+/// opposite one). A side thinner than `min_side` path units (points in a line) is widened about
+/// its centre so the handles stay apart.
+pub(crate) fn fit_box(points: &[[f64; 2]], angle: f64, min_side: f64) -> Option<Affine> {
+    let (s, c) = angle.to_radians().sin_cos();
+    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+    for p in points {
+        // Into the box's frame (rotate by -angle).
+        let q = [p[0] * c + p[1] * s, -p[0] * s + p[1] * c];
+        lo = [lo[0].min(q[0]), lo[1].min(q[1])];
+        hi = [hi[0].max(q[0]), hi[1].max(q[1])];
+    }
+    if !(lo[0] <= hi[0] && lo[1] <= hi[1]) {
+        return None;
+    }
+    let min_side = if min_side.is_finite() { min_side.max(1e-3) } else { 1e-3 };
+    for k in 0..2 {
+        if hi[k] - lo[k] < min_side {
+            let mid = (lo[k] + hi[k]) / 2.0;
+            (lo[k], hi[k]) = (mid - min_side / 2.0, mid + min_side / 2.0);
+        }
+    }
+    let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
+    // uv → box frame, then back to path space (rotate by +angle).
+    let rot: Affine = [c, s, -s, c, 0.0, 0.0];
+    Some(af_mul(&rot, &[w, 0.0, 0.0, h, lo[0], lo[1]]))
+}
+
+/// The handles' box coordinates: corners 0–3 (clockwise from the first corner), edge midpoints
+/// 4–7 (top, right, bottom, left).
+pub(crate) const FT_HANDLES: [[f64; 2]; 8] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.0], [1.0, 0.5], [0.5, 1.0], [0.0, 0.5]];
+
+/// The free-transform box this frame: its `uv → path` matrix, the path → comp matrix, handles,
+/// outline and anchor on screen.
 pub(crate) struct FtBox {
     pub layer: LayerId,
     pub uid: u64,
-    pub b: [f64; 4],
+    pub angle: f64,
+    pub anchor_uv: [f64; 2],
+    pub f: Affine,
     pub m: Mat3,
     pub handles: [Pos2; 8],
     pub quad: [Pos2; 4],
+    pub anchor: Pos2,
+}
+
+/// What the pointer is over on the free-transform box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FtPart {
+    Anchor,
+    Handle(usize),
+    Inside,
+    /// Just outside: rotate about the anchor.
+    Rotate,
 }
 
 impl FtBox {
-    /// Path-space position of handle `i`.
-    pub fn handle_local(&self, i: usize) -> [f64; 2] {
-        let [x0, y0, x1, y1] = self.b;
-        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-        [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [cx, y0], [x1, cy], [cx, y1], [x0, cy]][i]
-    }
-    pub fn center(&self) -> [f64; 2] {
-        [(self.b[0] + self.b[2]) / 2.0, (self.b[1] + self.b[3]) / 2.0]
+    pub fn part_at(&self, p: Pos2) -> Option<FtPart> {
+        // The nearest handle square (corner or edge midpoint) wins over the anchor point when
+        // the pointer is nearer to it: on a thin box the edge handles sit close to the anchor.
+        let handle = (0..8).min_by(|a, b| self.handles[*a].distance(p).total_cmp(&self.handles[*b].distance(p))).filter(|i| self.handles[*i].distance(p) < 7.0);
+        if let Some(i) = handle
+            && self.handles[i].distance(p) <= self.anchor.distance(p)
+        {
+            return Some(FtPart::Handle(i));
+        }
+        if self.anchor.distance(p) < 8.0 {
+            return Some(FtPart::Anchor);
+        }
+        if let Some(i) = handle {
+            return Some(FtPart::Handle(i));
+        }
+        if point_in_quad(p, &self.quad) {
+            return Some(FtPart::Inside);
+        }
+        let near = (0..4).any(|i| seg_dist(p, self.quad[i], self.quad[(i + 1) % 4]) < 28.0);
+        near.then_some(FtPart::Rotate)
     }
 }
 
-/// Draw the free-transform box of the target path (if any) and return it for hit tests.
-pub(crate) fn draw_free_transform(
-    app: &mut EffectcraftApp,
-    ctx: &egui::Context,
-    painter: &egui::Painter,
-    map: &ViewerMap,
-    paths: &[PathInfo],
-) -> Option<FtBox> {
-    let (layer, uid) = free_transform_target(ctx)?;
+fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let l2 = ab.length_sq();
+    let t = if l2 > 1e-9 { ((p - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    p.distance(a + ab * t)
+}
+
+/// The points the box covers: the path's selected points, or all of them when fewer than two are
+/// (as `path.freeTransform` transforms).
+fn ft_points(app: &EffectcraftApp, p: &PathInfo) -> Vec<[f64; 2]> {
+    let sel: Vec<usize> = app.session.state.selected_vertices.iter().filter(|v| v.layer == p.layer && v.mask == p.uid).map(|v| v.index).collect();
+    let idx: Vec<usize> = if sel.len() < 2 { (0..p.sp.vertices.len()).collect() } else { sel };
+    idx.iter().filter_map(|i| p.sp.vertices.get(*i).copied()).collect()
+}
+
+/// Draw the free-transform box of the target path (if any) and return it for hit tests: the
+/// outline, eight handles and the anchor point's crosshair, as After Effects draws them.
+pub(crate) fn draw_free_transform(app: &mut EffectcraftApp, painter: &egui::Painter, map: &ViewerMap, paths: &[PathInfo]) -> Option<FtBox> {
+    let st = app.ui.viewer.free_transform.clone()?;
+    let (layer, uid) = (LayerId(st.layer), st.path);
     let Some(p) = paths.iter().find(|p| p.layer == layer && p.uid == uid) else {
-        end_free_transform(ctx);
+        end_free_transform(app);
         return None;
     };
-    let sel: Vec<usize> = app.session.state.selected_vertices.iter().filter(|v| v.layer == layer && v.mask == uid).map(|v| v.index).collect();
-    let idx: Vec<usize> = if sel.len() >= 2 { sel } else { (0..p.sp.vertices.len()).collect() };
-    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
-    for &i in &idx {
-        let Some(v) = p.sp.vertices.get(i) else { continue };
-        lo = [lo[0].min(v[0]), lo[1].min(v[1])];
-        hi = [hi[0].max(v[0]), hi[1].max(v[1])];
-    }
-    if lo[0] > hi[0] {
-        return None;
-    }
-    let b = [lo[0], lo[1], hi[0].max(lo[0] + 1e-3), hi[1].max(lo[1] + 1e-3)];
-    let mut f = FtBox { layer, uid, b, m: p.m, handles: [Pos2::ZERO; 8], quad: [Pos2::ZERO; 4] };
-    for i in 0..8 {
-        let q = f.handle_local(i);
+    // Screen points per path unit, for the thinnest box side (8 points).
+    let o = p.m.apply(gv2(0.0, 0.0));
+    let (ex, ey) = (p.m.apply(gv2(1.0, 0.0)), p.m.apply(gv2(0.0, 1.0)));
+    let ppu = (((ex.x - o.x).hypot(ex.y - o.y) + (ey.x - o.x).hypot(ey.y - o.y)) / 2.0) * map.zoom as f64;
+    let min_side = if ppu > 1e-9 { 8.0 / ppu } else { 1.0 };
+    let f = fit_box(&ft_points(app, p), st.angle, min_side)?;
+    let to_screen = |uv: [f64; 2]| {
+        let q = af_apply(&f, uv);
         let c = p.m.apply(gv2(q[0], q[1]));
-        f.handles[i] = map.to_screen([c.x, c.y]);
+        map.to_screen([c.x, c.y])
+    };
+    let mut handles = [Pos2::ZERO; 8];
+    for (h, uv) in handles.iter_mut().zip(FT_HANDLES) {
+        *h = to_screen(uv);
     }
-    f.quad = [f.handles[0], f.handles[1], f.handles[2], f.handles[3]];
+    let quad = [handles[0], handles[1], handles[2], handles[3]];
+    let anchor = to_screen(st.anchor);
+    let b = FtBox { layer, uid, angle: st.angle, anchor_uv: st.anchor, f, m: p.m, handles, quad, anchor };
     let col = app.tokens.accent;
-    painter.add(egui::Shape::closed_line(f.quad.to_vec(), Stroke::new(1.0, col)));
-    for (i, h) in f.handles.iter().enumerate() {
+    let outline = Stroke::new(1.0, col);
+    painter.add(egui::Shape::closed_line(quad.to_vec(), Stroke::new(3.0, Color32::from_black_alpha(90))));
+    painter.add(egui::Shape::closed_line(quad.to_vec(), outline));
+    for (i, h) in handles.iter().enumerate() {
         let r = Rect::from_center_size(*h, vec2(7.0, 7.0));
         painter.rect_filled(r, 0.0, Color32::WHITE);
-        painter.rect_stroke(r, 0.0, Stroke::new(1.0, col), StrokeKind::Outside);
-        app.auto.add(&format!("viewer.freeTransform.handle.{i}"), r, "Free transform handle");
+        painter.rect_stroke(r, 0.0, outline, StrokeKind::Outside);
+        let label = match i {
+            4 => "Free transform handle (top edge: scale vertically)",
+            5 => "Free transform handle (right edge: scale horizontally)",
+            6 => "Free transform handle (bottom edge: scale vertically)",
+            7 => "Free transform handle (left edge: scale horizontally)",
+            _ => "Free transform handle",
+        };
+        app.auto.add(&format!("viewer.freeTransform.handle.{i}"), r.expand(2.0), label);
     }
-    let c = f.center();
-    let cc = p.m.apply(gv2(c[0], c[1]));
-    let cs = map.to_screen([cc.x, cc.y]);
-    painter.circle_stroke(cs, 4.0, Stroke::new(1.0, col));
-    Some(f)
+    // The anchor point: a circle with a crosshair through it.
+    let shadow = Stroke::new(3.0, Color32::from_black_alpha(110));
+    let line = Stroke::new(1.0, Color32::WHITE);
+    for s in [shadow, line] {
+        painter.circle_stroke(anchor, 5.0, s);
+        painter.line_segment([anchor - vec2(10.0, 0.0), anchor + vec2(10.0, 0.0)], s);
+        painter.line_segment([anchor - vec2(0.0, 10.0), anchor + vec2(0.0, 10.0)], s);
+    }
+    app.auto.add("viewer.freeTransform.anchor", Rect::from_center_size(anchor, vec2(16.0, 16.0)), "Free transform anchor point");
+    let bounds = Rect::from_points(&quad);
+    app.auto.add("viewer.freeTransform.box", bounds, "Free transform box");
+    Some(b)
 }
 
 fn point_in_quad(p: Pos2, q: &[Pos2; 4]) -> bool {
@@ -613,6 +772,81 @@ fn point_in_quad(p: Pos2, q: &[Pos2; 4]) -> bool {
     true
 }
 
+/// A free-transform drag's mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FtMode {
+    Move,
+    /// Scale about `pivot` (box coordinates) along the box's axes `axes` (x, y).
+    Scale {
+        pivot: [f64; 2],
+        axes: [bool; 2],
+    },
+    /// Rotate about the anchor.
+    Rotate,
+    /// Move the anchor point (no edit).
+    Anchor,
+}
+
+/// The whole transform (path space) of a free-transform drag from `press` to `cur` (path
+/// points) on the box `f0` (uv → path) with the anchor at `anchor_uv`, and the box's new angle
+/// change (degrees). `shift` keeps proportions (scale), snaps to 45° (rotate) or to an axis (move).
+pub(crate) fn ft_total(mode: FtMode, f0: &Affine, anchor_uv: [f64; 2], press: [f64; 2], cur: [f64; 2], shift: bool) -> Option<(Affine, f64)> {
+    match mode {
+        FtMode::Anchor => None,
+        FtMode::Move => {
+            let mut d = [cur[0] - press[0], cur[1] - press[1]];
+            if shift {
+                if d[0].abs() >= d[1].abs() {
+                    d[1] = 0.0;
+                } else {
+                    d[0] = 0.0;
+                }
+            }
+            Some(([1.0, 0.0, 0.0, 1.0, d[0], d[1]], 0.0))
+        }
+        FtMode::Scale { pivot, axes } => {
+            let inv = af_inv(f0)?;
+            let (p, c) = (af_apply(&inv, press), af_apply(&inv, cur));
+            let k = |i: usize| {
+                let a = p[i] - pivot[i];
+                if axes[i] && a.abs() > 1e-9 { ((c[i] - pivot[i]) / a).clamp(-100.0, 100.0) } else { 1.0 }
+            };
+            let (mut sx, mut sy) = (k(0), k(1));
+            if shift {
+                // Keep the proportions: the axis that changed most leads.
+                let s = if !axes[1] || (axes[0] && (sx - 1.0).abs() >= (sy - 1.0).abs()) { sx } else { sy };
+                (sx, sy) = (s, s);
+            }
+            let nz = |s: f64| if s.abs() < 1e-3 { 1e-3f64.copysign(s) } else { s };
+            let (sx, sy) = (nz(sx), nz(sy));
+            let s_uv: Affine = [sx, 0.0, 0.0, sy, pivot[0] * (1.0 - sx), pivot[1] * (1.0 - sy)];
+            Some((af_mul(f0, &af_mul(&s_uv, &inv)), 0.0))
+        }
+        FtMode::Rotate => {
+            let a = af_apply(f0, anchor_uv);
+            let a0 = (press[1] - a[1]).atan2(press[0] - a[0]);
+            let a1 = (cur[1] - a[1]).atan2(cur[0] - a[0]);
+            let mut d = (a1 - a0).to_degrees();
+            if shift {
+                d = (d / 45.0).round() * 45.0;
+            }
+            let (s, c) = d.to_radians().sin_cos();
+            let m: Affine = [c, s, -s, c, a[0] - c * a[0] + s * a[1], a[1] - s * a[0] - c * a[1]];
+            Some((m, d))
+        }
+    }
+}
+
+/// The anchor's box coordinates after a scale that flipped the box (a negative factor mirrors
+/// the refitted box, so the anchor's place in it mirrors too).
+pub(crate) fn ft_anchor_after(mode: FtMode, total: &Affine, f0: &Affine, anchor_uv: [f64; 2]) -> [f64; 2] {
+    let FtMode::Scale { .. } = mode else { return anchor_uv };
+    let Some(inv) = af_inv(f0) else { return anchor_uv };
+    // The scale in box coordinates: f0⁻¹ ∘ total ∘ f0 = diag(sx, sy) + offset.
+    let s = af_mul(&inv, &af_mul(total, f0));
+    [if s[0] < 0.0 { 1.0 - anchor_uv[0] } else { anchor_uv[0] }, if s[3] < 0.0 { 1.0 - anchor_uv[1] } else { anchor_uv[1] }]
+}
+
 // ---------------------------------------------------------------- drags
 
 /// Overlay drags owned by this module.
@@ -622,8 +856,12 @@ pub(crate) enum Drag {
     Key { layer: LayerId, prop: u64, time: Tick, start: [f64; 3], press: [f64; 2], inv: Mat3 },
     /// A spatial tangent handle of a motion-path key.
     KeyTangent { layer: LayerId, prop: u64, time: Tick, out: bool, key: [f64; 3], inv: Mat3 },
-    /// Free transform: 0 move, 1 scale (anchor, axes), 2 rotate about `anchor`.
-    Ft { layer: LayerId, path: u64, mode: u8, anchor: [f64; 2], last: [f64; 2], inv: Mat3, axes: [bool; 2] },
+    /// The motion path between two keys, bent through the pointer (`time` inside the segment,
+    /// `u` its Bezier parameter under the press, `last` the parent-space pointer).
+    Segment { layer: LayerId, prop: u64, time: Tick, u: f64, last: [f64; 2], inv: Mat3 },
+    /// Free transform from `press` (path point) on the box `f0` (uv → path) with the box's angle
+    /// and anchor at the press; `applied` is the transform sent so far, `inv` comp → path.
+    Ft { layer: LayerId, path: u64, mode: FtMode, f0: Affine, angle0: f64, anchor0: [f64; 2], press: [f64; 2], applied: Affine, inv: Mat3 },
     /// Mask Feather tool: drag a feather point's radius handle (comp → layer matrix `inv`).
     Feather { layer: LayerId, mask: u64, index: usize, inv: Mat3 },
     /// A guide dragged in the viewer.
@@ -653,29 +891,43 @@ pub(crate) fn begin_key_drag(app: &mut EffectcraftApp, hits: &[KeyHit], press: P
     }
 }
 
-/// Start a free-transform drag on the box: a handle scales about the opposite one (corners both
-/// axes, edges one), inside moves, just outside a corner rotates about the centre.
-pub(crate) fn begin_ft_drag(f: &FtBox, press: Pos2, map: &ViewerMap) -> Option<Drag> {
+/// Start bending the motion path between two keys at `press` (comp point `cpt`): the point of
+/// the path under the press follows the pointer and only the two keys' facing spatial tangents
+/// change; no key is added (a Pen click there adds one, as Add Vertex does in After Effects).
+pub(crate) fn begin_segment_bend(app: &EffectcraftApp, segments: &[MotionSegment], press: Pos2, cpt: [f64; 2]) -> Option<Drag> {
+    let (seg, _) = segment_near(segments, press)?;
+    let inv = seg.p2c.inverse()?;
+    let keys = &app.session.active_comp()?.layer(seg.layer)?.props.find(seg.prop)?.keys;
+    let i = keys.partition_point(|k| k.time <= seg.start).checked_sub(1)?;
+    let p = inv.apply(gv2(cpt[0], cpt[1]));
+    let u = effectcraft_engine::keyframe::spatial_segment_param(keys, i, [p.x, p.y])?;
+    // A time strictly inside the sample interval names the segment exactly.
+    let time = Tick(seg.start.0 / 2 + seg.end.0 / 2);
+    Some(Drag::Segment { layer: seg.layer, prop: seg.prop, time, u, last: [p.x, p.y], inv })
+}
+
+/// Start a free-transform drag on the box (After Effects): the anchor point moves the pivot; a
+/// handle scales about the opposite one (corners both axes, edges one), about the anchor with
+/// Cmd; inside moves; just outside rotates about the anchor.
+pub(crate) fn begin_ft_drag(f: &FtBox, press: Pos2, map: &ViewerMap, cmd: bool) -> Option<Drag> {
     let inv = f.m.inverse()?;
     let c = map.to_comp(press);
     let lp = inv.apply(gv2(c[0], c[1]));
-    let lp = [lp.x, lp.y];
-    if let Some(i) = (0..8).find(|i| f.handles[*i].distance(press) < 7.0) {
-        let opp = [2, 3, 0, 1, 6, 7, 4, 5][i];
-        let axes = match i {
-            4 | 6 => [false, true],
-            5 | 7 => [true, false],
-            _ => [true, true],
-        };
-        return Some(Drag::Ft { layer: f.layer, path: f.uid, mode: 1, anchor: f.handle_local(opp), last: lp, inv, axes });
-    }
-    if point_in_quad(press, &f.quad) {
-        return Some(Drag::Ft { layer: f.layer, path: f.uid, mode: 0, anchor: f.center(), last: lp, inv, axes: [true, true] });
-    }
-    if f.quad.iter().any(|q| q.distance(press) < 24.0) {
-        return Some(Drag::Ft { layer: f.layer, path: f.uid, mode: 2, anchor: f.center(), last: lp, inv, axes: [true, true] });
-    }
-    None
+    let mode = match f.part_at(press)? {
+        FtPart::Anchor => FtMode::Anchor,
+        FtPart::Handle(i) => {
+            let opp = [2, 3, 0, 1, 6, 7, 4, 5].get(i).and_then(|o| FT_HANDLES.get(*o)).copied().unwrap_or([0.5, 0.5]);
+            let axes = match i {
+                4 | 6 => [false, true],
+                5 | 7 => [true, false],
+                _ => [true, true],
+            };
+            FtMode::Scale { pivot: if cmd { f.anchor_uv } else { opp }, axes }
+        }
+        FtPart::Inside => FtMode::Move,
+        FtPart::Rotate => FtMode::Rotate,
+    };
+    Some(Drag::Ft { layer: f.layer, path: f.uid, mode, f0: f.f, angle0: f.angle, anchor0: f.anchor_uv, press: [lp.x, lp.y], applied: AF_ID, inv })
 }
 
 /// Mask Feather tool: press on a feather point's handle to drag it, or on a mask path to add a
@@ -736,37 +988,40 @@ pub(crate) fn update(
             let _ = app.session.execute("keys.setSpatialTangents", q);
             None
         }
-        Drag::Ft { layer, path, mode, anchor, last, inv, axes } => {
+        Drag::Segment { layer, prop, time, u, last, inv } => {
             let p = inv.apply(gv2(cpt[0], cpt[1]));
             let cur = [p.x, p.y];
-            let mut q = json!({"layer": layer.0, "mask": path, "anchor": anchor, "merge": merge});
-            match mode {
-                0 => q["offset"] = json!([cur[0] - last[0], cur[1] - last[1]]),
-                1 => {
-                    let f = |k: usize| {
-                        let a = last[k] - anchor[k];
-                        if axes[k] && a.abs() > 1e-6 { ((cur[k] - anchor[k]) / a).clamp(-50.0, 50.0) } else { 1.0 }
-                    };
-                    let (mut fx, mut fy) = (f(0), f(1));
-                    if mods.shift && axes[0] && axes[1] {
-                        let k = (fx + fy) / 2.0;
-                        (fx, fy) = (k, k);
-                    }
-                    if fx.abs() < 1e-3 || fy.abs() < 1e-3 {
-                        return None;
-                    }
-                    q["scale"] = json!([fx * 100.0, fy * 100.0]);
-                }
-                _ => {
-                    let a0 = (last[1] - anchor[1]).atan2(last[0] - anchor[0]);
-                    let a1 = (cur[1] - anchor[1]).atan2(cur[0] - anchor[0]);
-                    q["rotation"] = json!((a1 - a0).to_degrees());
-                }
-            }
             if cur != last {
-                let _ = app.session.execute("path.freeTransform", q);
+                let q = json!({"layer": layer.0, "prop": prop, "time": time.seconds(), "u": u, "offset": [cur[0] - last[0], cur[1] - last[1]], "merge": merge});
+                if let Err(e) = app.session.execute("keys.bendSpatialSegment", q) {
+                    app.ui.status = e.to_string();
+                    return None;
+                }
             }
-            Some(Drag::Ft { layer, path, mode, anchor, last: cur, inv, axes })
+            Some(Drag::Segment { layer, prop, time, u, last: cur, inv })
+        }
+        Drag::Ft { layer, path, mode, f0, angle0, anchor0, press, applied, inv } => {
+            let p = inv.apply(gv2(cpt[0], cpt[1]));
+            let cur = [p.x, p.y];
+            let same = Drag::Ft { layer, path, mode, f0, angle0, anchor0, press, applied, inv };
+            if mode == FtMode::Anchor {
+                if let Some(fi) = af_inv(&f0) {
+                    let (u0, u1) = (af_apply(&fi, press), af_apply(&fi, cur));
+                    set_free_transform(app, None, Some([anchor0[0] + u1[0] - u0[0], anchor0[1] + u1[1] - u0[1]]));
+                }
+                return Some(same);
+            }
+            let (total, turn) = ft_total(mode, &f0, anchor0, press, cur, mods.shift)?;
+            let delta = af_mul(&total, &af_inv(&applied)?);
+            if delta.iter().zip(AF_ID).any(|(a, b)| (a - b).abs() > 1e-9) {
+                let q = json!({"layer": layer.0, "mask": path, "matrix": delta, "merge": merge});
+                if let Err(e) = app.session.execute("path.freeTransform", q) {
+                    app.ui.status = e.to_string();
+                    return None;
+                }
+            }
+            set_free_transform(app, Some(angle0 + turn), Some(ft_anchor_after(mode, &total, &f0, anchor0)));
+            Some(Drag::Ft { layer, path, mode, f0, angle0, anchor0, press, applied: total, inv })
         }
         Drag::Feather { layer, mask, index, inv } => {
             let p = inv.apply(gv2(cpt[0], cpt[1]));
@@ -785,6 +1040,200 @@ pub(crate) fn update(
     }
 }
 
+// ── Claude's version and suggestion previews (batch 1, CX4 / CX5) ─────────────────────────────
+
+static ALT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh number for another scratch document (its frames never share a key with the document's).
+pub(crate) fn next_alt_epoch() -> u64 {
+    ALT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Frame `t` of comp `cid` in another document (`project`: a suggestion's scratch copy, Claude's
+/// version), rendered like the viewer's own (CPU pixels), keyed apart by `epoch`.
+pub(crate) fn alt_texture(
+    app: &EffectcraftApp,
+    ctx: &egui::Context,
+    project: &std::sync::Arc<effectcraft_engine::project::Project>,
+    epoch: u64,
+    cid: effectcraft_engine::project::ItemId,
+    t: Tick,
+    scale: f64,
+) -> Option<egui::TextureHandle> {
+    use crate::frames::{FrameImage, FrameKey, RenderSource};
+    use std::hash::{Hash, Hasher};
+    let c = project.comp(cid)?;
+    let frame = c.frame_rate.frame_at(t);
+    let opts = app.frame_opts(cid, scale);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (crate::frames::comp_content(project, cid), 0xC1A0_DE00_u64, epoch).hash(&mut h);
+    let key = FrameKey {
+        // The document's revision: the frame queue drops jobs of older revisions.
+        revision: app.session.revision,
+        content: h.finish(),
+        comp: cid.0,
+        frame,
+        scale: (scale * 1000.0).round() as u32,
+        view: app.view_hash(cid),
+        opts: crate::frames::opts_hash(&opts),
+    };
+    let id = egui::Id::new(("agent-compare-tex", epoch));
+    let cached: Option<(FrameKey, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
+    if let Some((k, tex)) = &cached
+        && *k == key
+    {
+        return Some(tex.clone());
+    }
+    // TODO(batch1-verify): RenderSource's other fields (freeze feedback, layer cache) with another project.
+    let src = RenderSource { gpu_display: false, project: project.clone(), ..app.render_source() };
+    app.frames.request_urgent(&src, key, cid, c.frame_rate.tick_of(frame), opts);
+    match app.frames.get(&key) {
+        Some(FrameImage::Cpu(img)) => {
+            let tex = crate::frames::load_fitted(ctx, "agent-compare", (*img).clone(), egui::TextureOptions::LINEAR);
+            ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
+            Some(tex)
+        }
+        _ => {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            cached.map(|(_, tex)| tex)
+        }
+    }
+}
+
+/// The comp's background colour, opaque: an alternative frame (a suggestion, Claude's version) has
+/// alpha where the comp is empty, and drawn straight over the viewer's own frame it let that frame
+/// show through (BUILD2 CX4: both versions on screen at once).
+fn background(project: &effectcraft_engine::project::Project, cid: effectcraft_engine::project::ItemId) -> Color32 {
+    let [r, g, b] = project.comp(cid).map_or([0.0; 3], |c| c.background);
+    let u = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color32::from_rgb(u(r), u(g), u(b))
+}
+
+/// Hides the viewer's own frame under an alternative one.
+fn cover(painter: &egui::Painter, comp_rect: Rect, project: &effectcraft_engine::project::Project, cid: effectcraft_engine::project::ItemId) {
+    painter.rect_filled(comp_rect, 0.0, background(project, cid));
+}
+
+/// The scratch copy for suggestion `id` at the document's revision (made once, then kept).
+fn suggestion_project(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str) -> Option<(std::sync::Arc<effectcraft_engine::project::Project>, u64)> {
+    type Cached = (String, u64, std::sync::Arc<effectcraft_engine::project::Project>, u64);
+    let cid = egui::Id::new("suggestion-preview-project");
+    let rev = app.session.revision;
+    if let Some((i, r, p, e)) = ctx.data(|d| d.get_temp::<Cached>(cid))
+        && i == id
+        && r == rev
+    {
+        return Some((p, e));
+    }
+    match effectcraft_engine::commands::suggestions::preview(&mut app.session, id) {
+        Ok(p) => {
+            let e = next_alt_epoch();
+            ctx.data_mut(|d| d.insert_temp::<Cached>(cid, (id.to_string(), rev, p.clone(), e)));
+            Some((p, e))
+        }
+        Err(e) => {
+            app.ui.status = format!("Can't preview this suggestion: {e}");
+            None
+        }
+    }
+}
+
+/// Over the viewer's frame: a hovered suggestion (its range looping) or, while `\` or the header
+/// button is held, Claude's version; and the corner label saying which one is on screen.
+pub(crate) fn agent_compare(
+    app: &mut EffectcraftApp,
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    comp_rect: Rect,
+    area: Rect,
+    cid: effectcraft_engine::project::ItemId,
+    scale: f64,
+) {
+    let blue = super::suggestions::CLAUDE_BLUE;
+    let green = Color32::from_rgb(0x8f, 0xe0, 0xb4);
+    let mut label: Option<(String, Color32)> = None;
+    // CX4: the hovered suggestion, on a scratch copy, its range looping.
+    if let Some((id, since)) = super::suggestions::hovered(ctx) {
+        let sg = effectcraft_engine::commands::suggestions::list(&app.session).into_iter().find(|s| s.id == id);
+        if let Some(sg) = sg
+            && let Some((proj, epoch)) = suggestion_project(app, ctx, &id)
+        {
+            let now = ctx.input(|i| i.time);
+            let t = match sg.range {
+                Some([a, b]) if b > a => a + (now - since).max(0.0) % (b - a),
+                _ => app.session.time().seconds(),
+            };
+            if let Some(tex) = alt_texture(app, ctx, &proj, epoch, cid, Tick::from_seconds_f64(t), scale) {
+                cover(painter, comp_rect, &proj, cid);
+                painter.image(tex.id(), comp_rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            ctx.request_repaint();
+            label = Some((format!("SUGGESTION {} · ✓ to keep", sg.n), blue));
+        }
+    }
+    // CX5: Claude's version while `\` or the button is held.
+    let claude = effectcraft_engine::commands::suggestions::claude_version(&app.session);
+    if let Some((proj, by)) = &claude {
+        // The button, top right of the viewer: held = Claude's version.
+        let b = Rect::from_min_size(egui::pos2(area.max.x - 196.0, area.min.y + 8.0), vec2(188.0, 22.0));
+        let resp = ui_button_hold(ctx, b);
+        let hot = resp.0;
+        painter.rect_filled(b, 4.0, Color32::from_black_alpha(if hot { 170 } else { 120 }));
+        painter.text(b.center(), egui::Align2::CENTER_CENTER, "Hold: Claude’s version  \\", crate::theme::Tokens::ui(11.0), blue);
+        app.auto.add("viewer.compare.hold", b, "Hold: Claude's version");
+        if resp.1 != super::suggestions::flipped(ctx) && (resp.1 || resp.2) {
+            super::suggestions::set_flipped(ctx, resp.1);
+        }
+        if label.is_none() && super::suggestions::flipped(ctx) && !std::sync::Arc::ptr_eq(proj, &app.session.project) {
+            let e = claude_epoch(ctx, proj);
+            if let Some(tex) = alt_texture(app, ctx, proj, e, cid, app.session.time(), scale) {
+                cover(painter, comp_rect, proj, cid);
+                painter.image(tex.id(), comp_rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            let who = by.as_deref().unwrap_or("Claude");
+            label = Some((format!("CLAUDE’S VERSION · {who}"), blue));
+        } else if label.is_none() && super::suggestions::flipped(ctx) {
+            label = Some(("CLAUDE’S VERSION (no edits since)".into(), blue));
+        }
+    }
+    if label.is_none() && (claude.is_some() || !effectcraft_engine::commands::suggestions::list(&app.session).is_empty()) {
+        label = Some(("YOURS".into(), green));
+    }
+    if let Some((text, color)) = label {
+        let g = painter.layout_no_wrap(text.clone(), crate::theme::Tokens::mono(11.0), color);
+        let r = Rect::from_min_size(comp_rect.min + vec2(8.0, 8.0), g.size() + vec2(16.0, 6.0));
+        painter.rect_filled(r, 4.0, Color32::from_black_alpha(140));
+        painter.galley(r.min + vec2(8.0, 3.0), g, color);
+        app.auto.add("viewer.compare.label", r, &text);
+    }
+}
+
+/// The frame epoch of Claude's version `proj` (one per snapshot).
+fn claude_epoch(ctx: &egui::Context, proj: &std::sync::Arc<effectcraft_engine::project::Project>) -> u64 {
+    let id = egui::Id::new("claude-version-epoch");
+    let ptr = std::sync::Arc::as_ptr(proj) as usize;
+    if let Some((p, e)) = ctx.data(|d| d.get_temp::<(usize, u64)>(id))
+        && p == ptr
+    {
+        return e;
+    }
+    let e = next_alt_epoch();
+    ctx.data_mut(|d| d.insert_temp(id, (ptr, e)));
+    e
+}
+
+/// A press-and-hold area: (hovered, held now, released this frame).
+fn ui_button_hold(ctx: &egui::Context, r: Rect) -> (bool, bool, bool) {
+    let (pos, down, released) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down(), i.pointer.primary_released()));
+    let over = pos.is_some_and(|p| r.contains(p));
+    let id = egui::Id::new("viewer-compare-held");
+    let was: bool = ctx.data(|d| d.get_temp(id)).unwrap_or(false);
+    let held = if was { down } else { down && over && ctx.input(|i| i.pointer.primary_pressed()) };
+    ctx.data_mut(|d| d.insert_temp(id, held));
+    // TODO(batch1-verify): the viewer's own press handling also sees this press (a click-select under the button).
+    (over, held, was && (released || !down))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,6 +1242,136 @@ mod tests {
         let n = vertices.len();
         let sp = ShapePath { vertices, in_tangents: vec![[0.0; 2]; n], out_tangents: vec![[0.0; 2]; n], closed, feather: Vec::new() };
         PathInfo { layer: LayerId(3), uid: 7, m: Mat3::IDENTITY, sp, is_mask: true, feather: Vec::new() }
+    }
+
+    /// The free-transform box fits the points in its own (turned) frame, widens a line of points
+    /// so its handles stay apart, and a scale from a handle maps the grabbed point onto the pointer.
+    #[test]
+    fn free_transform_box_fits_turns_and_scales() {
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        let pts = [[10.0, 20.0], [50.0, 20.0], [50.0, 80.0]];
+        let f = fit_box(&pts, 0.0, 1.0).unwrap();
+        assert!(near(af_apply(&f, [0.0, 0.0]), [10.0, 20.0]) && near(af_apply(&f, [1.0, 1.0]), [50.0, 80.0]));
+        // A vertical line of points: the box gets the minimum width about the line.
+        let line = fit_box(&[[5.0, 0.0], [5.0, 100.0]], 0.0, 8.0).unwrap();
+        assert!(near(af_apply(&line, [0.0, 0.0]), [1.0, 0.0]) && near(af_apply(&line, [1.0, 1.0]), [9.0, 100.0]));
+        // Turned 90°: the box's first corner follows the turn.
+        let t = fit_box(&pts, 90.0, 1.0).unwrap();
+        for p in pts {
+            let uv = af_apply(&af_inv(&t).unwrap(), p);
+            assert!((-1e-9..=1.0 + 1e-9).contains(&uv[0]) && (-1e-9..=1.0 + 1e-9).contains(&uv[1]), "{uv:?}");
+        }
+        assert!(fit_box(&[], 0.0, 1.0).is_none());
+        // Bottom-right handle dragged from (50, 80) to (90, 140), pivot the first corner.
+        let mode = FtMode::Scale { pivot: [0.0, 0.0], axes: [true, true] };
+        let (m, turn) = ft_total(mode, &f, [0.5, 0.5], [50.0, 80.0], [90.0, 140.0], false).unwrap();
+        assert!(near(af_apply(&m, [50.0, 80.0]), [90.0, 140.0]) && near(af_apply(&m, [10.0, 20.0]), [10.0, 20.0]) && turn == 0.0);
+        // Past the pivot: the box flips and the anchor's place in it mirrors.
+        let (m, _) = ft_total(mode, &f, [0.25, 0.5], [50.0, 80.0], [-30.0, 80.0], false).unwrap();
+        assert_eq!(ft_anchor_after(mode, &m, &f, [0.25, 0.5]), [0.75, 0.5]);
+        // Shift on a rotation snaps to 45°.
+        let (_, turn) = ft_total(FtMode::Rotate, &f, [0.5, 0.5], [60.0, 50.0], [30.0, 75.0], true).unwrap();
+        assert_eq!(turn.rem_euclid(45.0), 0.0);
+        assert!(ft_total(FtMode::Anchor, &f, [0.5, 0.5], [0.0; 2], [1.0; 2], false).is_none());
+    }
+
+    /// The path math of a free-transform drag on a 200 × 100 box at (100, 100): a move is the
+    /// pointer's offset (Shift keeps the larger axis), Cmd-scale and rotation pivot on the anchor
+    /// point wherever it was put, and the anchor itself never moves under them.
+    #[test]
+    fn free_transform_moves_scales_and_rotates_about_the_anchor() {
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        let f = fit_box(&[[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], 0.0, 1.0).unwrap();
+        // Move: drag inside by (15, 40).
+        let (m, turn) = ft_total(FtMode::Move, &f, [0.5, 0.5], [150.0, 150.0], [165.0, 190.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [115.0, 140.0]) && turn == 0.0);
+        // Shift-move keeps the larger axis only (here down).
+        let (m, _) = ft_total(FtMode::Move, &f, [0.5, 0.5], [150.0, 150.0], [165.0, 190.0], true).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [100.0, 140.0]), "{m:?}");
+        // Anchor moved to the top-left corner (uv 0, 0); Cmd-drag of the right edge's handle from
+        // x 300 to 500 doubles the width about it.
+        let mode = FtMode::Scale { pivot: [0.0, 0.0], axes: [true, false] };
+        let (m, _) = ft_total(mode, &f, [0.0, 0.0], [300.0, 150.0], [500.0, 150.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [100.0, 100.0]), "the anchor stays put");
+        assert!(near(af_apply(&m, [300.0, 200.0]), [500.0, 200.0]), "{m:?}");
+        // Corner with Shift: proportional about the centre anchor (uv 0.5, 0.5 = (200, 150)).
+        let mode = FtMode::Scale { pivot: [0.5, 0.5], axes: [true, true] };
+        let (m, _) = ft_total(mode, &f, [0.5, 0.5], [300.0, 200.0], [400.0, 210.0], true).unwrap();
+        assert!(near(af_apply(&m, [200.0, 150.0]), [200.0, 150.0]));
+        assert!(near(af_apply(&m, [300.0, 200.0]), [400.0, 250.0]), "both axes ×2: {m:?}");
+        // Rotate a quarter turn about the centre anchor: the top-right corner goes to bottom-right
+        // of the turned box ((300, 100) → (250, 250)), the anchor stays.
+        let (m, turn) = ft_total(FtMode::Rotate, &f, [0.5, 0.5], [400.0, 150.0], [200.0, 350.0], false).unwrap();
+        assert!((turn - 90.0).abs() < 1e-6, "{turn}");
+        assert!(near(af_apply(&m, [200.0, 150.0]), [200.0, 150.0]));
+        assert!(near(af_apply(&m, [300.0, 100.0]), [250.0, 250.0]), "{m:?}");
+        // Rotate about an anchor moved to the bottom-left corner (uv 0, 1 = (100, 200)).
+        let (m, _) = ft_total(FtMode::Rotate, &f, [0.0, 1.0], [200.0, 200.0], [100.0, 300.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 200.0]), [100.0, 200.0]));
+        assert!(near(af_apply(&m, [300.0, 200.0]), [100.0, 400.0]), "{m:?}");
+    }
+
+    /// MF3: the box's edge midpoints are handles like its corners. The pointer on one (also on a
+    /// thin box, where it sits near the anchor point) grabs it before the edge's move / rotate
+    /// zone, and its drag scales on that axis only, from the opposite edge.
+    #[test]
+    fn free_transform_edge_handles_hit_first_and_scale_one_axis() {
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        let ft = |w: f32, h: f32| {
+            let f: Affine = [w as f64, 0.0, 0.0, h as f64, 100.0, 100.0];
+            let mut handles = [Pos2::ZERO; 8];
+            for (hd, uv) in handles.iter_mut().zip(FT_HANDLES) {
+                *hd = Pos2::new(100.0 + uv[0] as f32 * w, 100.0 + uv[1] as f32 * h);
+            }
+            let quad = [handles[0], handles[1], handles[2], handles[3]];
+            let anchor = Pos2::new(100.0 + w / 2.0, 100.0 + h / 2.0);
+            FtBox { layer: LayerId(3), uid: 7, angle: 0.0, anchor_uv: [0.5, 0.5], f, m: Mat3::IDENTITY, handles, quad, anchor }
+        };
+        let b = ft(200.0, 100.0);
+        for (i, p) in [(4, (200.0, 100.0)), (5, (300.0, 150.0)), (6, (200.0, 200.0)), (7, (100.0, 150.0))] {
+            assert_eq!(b.part_at(Pos2::new(p.0, p.1)), Some(FtPart::Handle(i)), "edge handle {i}");
+            // A few points off the square, still on it.
+            assert_eq!(b.part_at(Pos2::new(p.0 + 3.0, p.1 - 3.0)), Some(FtPart::Handle(i)), "edge handle {i}, off centre");
+        }
+        // Along the edge away from the midpoint: not a handle.
+        assert_eq!(b.part_at(Pos2::new(150.0, 98.0)), Some(FtPart::Rotate));
+        assert_eq!(b.part_at(Pos2::new(150.0, 103.0)), Some(FtPart::Inside));
+        // A 10-point-high box: the top and bottom handles lie 5 points from the anchor.
+        let thin = ft(200.0, 10.0);
+        assert_eq!(thin.part_at(Pos2::new(200.0, 100.0)), Some(FtPart::Handle(4)));
+        assert_eq!(thin.part_at(Pos2::new(200.0, 110.0)), Some(FtPart::Handle(6)));
+        assert_eq!(thin.part_at(Pos2::new(200.0, 105.0)), Some(FtPart::Anchor));
+        // Top edge handle dragged up 40 on a 200 × 100 box: y only, about the bottom edge.
+        let f = fit_box(&[[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], 0.0, 1.0).unwrap();
+        let mode = FtMode::Scale { pivot: [0.5, 1.0], axes: [false, true] };
+        let (m, _) = ft_total(mode, &f, [0.5, 0.5], [200.0, 100.0], [230.0, 60.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [100.0, 60.0]) && near(af_apply(&m, [300.0, 200.0]), [300.0, 200.0]), "{m:?}");
+        // Left edge handle dragged left 100: x only, about the right edge.
+        let mode = FtMode::Scale { pivot: [1.0, 0.5], axes: [true, false] };
+        let (m, _) = ft_total(mode, &f, [0.5, 0.5], [100.0, 150.0], [0.0, 190.0], false).unwrap();
+        assert!(near(af_apply(&m, [100.0, 100.0]), [0.0, 100.0]) && near(af_apply(&m, [300.0, 200.0]), [300.0, 200.0]), "{m:?}");
+        // Turned 90°: the box's top edge handle still scales across that (now vertical) edge.
+        let t = fit_box(&[[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], 90.0, 1.0).unwrap();
+        let mode = FtMode::Scale { pivot: [0.5, 1.0], axes: [false, true] };
+        let top = af_apply(&t, [0.5, 0.0]);
+        let (m, _) = ft_total(mode, &t, [0.5, 0.5], top, [top[0] + 50.0, top[1]], false).unwrap();
+        let moved = af_apply(&m, af_apply(&t, [0.0, 0.0]));
+        let fixed = af_apply(&m, af_apply(&t, [0.0, 1.0]));
+        assert!(near(fixed, af_apply(&t, [0.0, 1.0])), "the opposite edge stays: {m:?}");
+        assert!((moved[1] - af_apply(&t, [0.0, 0.0])[1]).abs() < 1e-6, "only across the edge: {m:?}");
+    }
+
+    /// A double-click inside a closed mask finds it (even-odd), not outside it or on an open path.
+    #[test]
+    fn closed_path_at_finds_the_mask_under_the_pointer() {
+        let map = ViewerMap { origin: Pos2::ZERO, zoom: 1.0, comp: [400.0, 400.0], area: Rect::EVERYTHING };
+        let square = info(vec![[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], true);
+        assert_eq!(closed_path_at(std::slice::from_ref(&square), &map, Pos2::new(200.0, 150.0)), Some((LayerId(3), 7)));
+        assert_eq!(closed_path_at(std::slice::from_ref(&square), &map, Pos2::new(350.0, 150.0)), None);
+        assert_eq!(closed_path_at(std::slice::from_ref(&square), &map, Pos2::new(200.0, 50.0)), None);
+        let open = info(vec![[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]], false);
+        assert_eq!(closed_path_at(&[open], &map, Pos2::new(200.0, 150.0)), None);
+        assert!(!point_in_polygon(Pos2::new(1.0, 1.0), &[Pos2::ZERO, Pos2::new(5.0, 5.0)]));
     }
 
     /// #912: clicking the last vertex of an open path with the Pen resumes that path.
@@ -837,6 +1416,7 @@ mod tests {
                 to: egui::pos2(f as f32 * 20.0 + 20.0, 100.0),
                 start: t(f),
                 end: t(f + 1),
+                p2c: Mat3::IDENTITY,
             })
             .collect();
         let at = |x: f32, y: f32| pen_target(&hits, &segments, &frames, egui::pos2(x, y));
@@ -846,5 +1426,20 @@ mod tests {
         assert!(matches!(at(37.0, 100.0), PenTarget::AddFrame(f) if f.time == t(2)), "nearest frame");
         assert!(matches!(at(70.0, 100.0), PenTarget::PathFull), "keys on adjacent frames");
         assert!(matches!(at(40.0, 120.0), PenTarget::None), "off the path");
+    }
+
+    #[test]
+    fn an_alternative_frame_covers_the_viewer_frame_with_the_comp_background() {
+        // BUILD2 CX4/CX5: the suggestion preview and Claude's version were drawn straight over
+        // the viewer's frame, which showed through their empty (transparent) parts.
+        let mut s = effectcraft_engine::Session::default();
+        let r = s.execute("comp.new", serde_json::json!({"name": "C", "width": 64, "height": 64, "frameRate": 30, "duration": 1})).unwrap();
+        let cid = effectcraft_engine::project::ItemId(r["comp"].as_u64().unwrap());
+        let mut p = (*s.project).clone();
+        if let Some(c) = p.comp_mut(cid) {
+            c.background = [1.0, 0.5, 0.0];
+        }
+        assert_eq!(super::background(&p, cid), Color32::from_rgb(255, 128, 0));
+        assert_eq!(super::background(&p, effectcraft_engine::project::ItemId(999_999)), Color32::BLACK, "no comp: black, opaque");
     }
 }

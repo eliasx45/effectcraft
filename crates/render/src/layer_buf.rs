@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 /// A layer's content key, its precomp bookkeeping id and its shape clip window (see
 /// `Renderer::content_cache_key_noted`).
-type ContentKey = (Option<u64>, Option<u64>, Option<Window>);
+type ContentKey = (Option<u64>, Option<u64>, ContentClip);
 
 impl<'a> Renderer<'a> {
     /// Source → masks, clamped/quantised to the project depth. `clip`: only that window of a
@@ -24,6 +24,13 @@ impl<'a> Renderer<'a> {
                 let contents = layer.props.sub("contents")?;
                 let k = self.raster_scale(ctx, layer);
                 self.authored(crate::shapes::render_window(ctx, layer, contents, k, Some([w.x, w.y, w.w, w.h])))
+            }
+            (None, Some(w), LayerSource::Comp { .. }) => self.source_window(ctx, layer, Some(w))?,
+            // Text renders whole (its glyphs are laid out together); the window is kept.
+            (None, Some(w), LayerSource::Text) => {
+                let b = self.source(ctx, layer)?;
+                let img = b.img.crop(i64::from(w.x), i64::from(w.y), w.w, w.h);
+                Buf { img, offset: [b.offset[0] - f64::from(w.x), b.offset[1] - f64::from(w.y)], scale: b.scale }
             }
             (None, ..) => self.source(ctx, layer)?,
         };
@@ -50,6 +57,7 @@ impl<'a> Renderer<'a> {
 
     /// [`Self::layer_buf`] in the blending space (linear with Blend Colors Using 1.0 Gamma).
     pub fn blend_layer_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let (b, k) = self.layer_buf_keyed(ctx, layer)?;
         Some(self.to_blend(b, k))
     }
@@ -72,7 +80,21 @@ impl<'a> Renderer<'a> {
         nb
     }
 
+    /// Whether the layer cache holds [`Self::layer_buf`]'s result for `layer` in memory (drawing
+    /// it from there costs nothing; an accelerator that makes the plane itself skips it then).
+    pub fn layer_buf_in_memory(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        let (Some(c), Some(ck)) = (self.cache, self.content_cache_key(ctx, layer)) else { return false };
+        if !styles::active(ctx, layer) {
+            return c.peek(ck).is_some();
+        }
+        let k = cache::styles_key(ctx, layer, ck);
+        let k = if styles::pass_modes(ctx, layer).is_empty() { k } else { cache::derive(k, 0xf1a7) };
+        c.peek(k).is_some()
+    }
+
     fn layer_buf_keyed(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, Option<u64>)> {
+        // Buffers kept below belong to this layer (the Memory panel, see `cache::owner`).
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let st = self.styled(ctx, layer, None)?;
         if st.passes.is_empty() {
             return Some((st.body, st.key));
@@ -122,12 +144,18 @@ impl<'a> Renderer<'a> {
     /// its values keeps its key) and the existing key-attempt bookkeeping id. Accelerators must
     /// still apply `precomp_source` eligibility before using this key, and admit animated
     /// content ([`Self::resident_precomp_animated`]) only once its key repeats.
-    pub fn resident_precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, u64)> {
+    pub fn resident_precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, u64, ContentClip)> {
         if !matches!(layer.source, LayerSource::Comp { .. }) || self.freeze.is_some() {
             return None;
         }
-        let (key, noted, _) = self.content_cache_key_noted(ctx, layer);
-        Some((key?, noted?))
+        let (key, noted, clip) = self.content_cache_key_noted(ctx, layer);
+        Some((key?, noted?, clip))
+    }
+
+    /// The window of its nested comp a precomp layer drawn uncached renders (see
+    /// [`Self::precomp_clip`]); the whole frame when it is not windowed.
+    pub fn precomp_window(&self, ctx: &EvalCtx, layer: &Layer) -> ContentClip {
+        ContentClip { win: self.precomp_clip(ctx, layer, None), view: None }
     }
 
     /// Whether a precomp's pixels may change from frame to frame (its key then changes with
@@ -136,24 +164,17 @@ impl<'a> Renderer<'a> {
         self.precomp_varies(ctx, layer)
     }
 
-    /// Report a static precomp lookup through the same miss backoff used by CPU content.
-    pub fn resident_precomp_note(&self, id: u64, hit: bool) {
-        if let Some(cache) = self.cache {
-            cache.precomp_note(id, hit);
-        }
-    }
-
     /// [`Self::resident_content_key`] and the window of the layer's buffer that key stands for
     /// (for [`Self::resident_source`]): decided together, once.
     pub fn resident_content(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, ContentClip)> {
         let (key, _, clip) = self.content_cache_key_noted(ctx, layer);
-        Some((key?, ContentClip(clip)))
+        Some((key?, clip))
     }
 
     /// Source and masks rebased into effect space, exactly as the CPU content producer, in the
     /// window `clip` that came with the layer's key ([`Self::resident_content`]).
     pub fn resident_source(&self, ctx: &EvalCtx, layer: &Layer, clip: ContentClip) -> Option<Buf> {
-        let mut buf = self.masked_source(ctx, layer, clip.0)?;
+        let mut buf = self.masked_source(ctx, layer, clip.win)?;
         buf.rebase(crate::fx::fx_origin(ctx, layer, false));
         Some(buf)
     }
@@ -181,20 +202,20 @@ impl<'a> Renderer<'a> {
         Some((key, token))
     }
 
-    /// [`Self::content_cache_key`], and for a precomp layer that was keyed, its id for
-    /// [`cache::LayerCache::precomp_note`] (an animated precomp is keyed only now and then, see
-    /// [`cache::LayerCache::precomp_try`]).
+    /// [`Self::content_cache_key`], and for a precomp layer, its id (a hash of its comp, layer
+    /// and depth). Precomps are keyed on every render: keying one costs far less than drawing
+    /// it again after its key stopped being tried (lab X1, 23 Oct 2026).
     ///
-    /// A shape layer drawn clipped (see [`Self::shape_clip`]) has the window in its key, and
-    /// the window is returned too.
+    /// A shape layer drawn clipped (see [`Self::shape_clip`]) or a precomp layer drawn windowed
+    /// (see [`Self::precomp_clip`]) has the window in its key, and the window is returned too.
     fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> ContentKey {
-        let Some(c) = self.cache else { return (None, None, self.shape_clip(ctx, layer, None)) };
+        if self.cache.is_none() {
+            let win = self.shape_clip(ctx, layer, None).or_else(|| self.precomp_clip(ctx, layer, None));
+            return (None, None, ContentClip { win, view: self.fx_view(ctx, layer, None) });
+        }
         let (src, noted) = match layer.source {
             LayerSource::Comp { .. } => {
                 let id = cache::derive(cache::derive(ctx.comp_id.0, layer.id.0), self.depth as u64);
-                if !c.precomp_try(id) {
-                    return (None, None, None);
-                }
                 (self.precomp_key(ctx, layer), Some(id))
             }
             // Which proxy the footage shows.
@@ -203,16 +224,21 @@ impl<'a> Renderer<'a> {
         };
         let key = cache::layer_key_src(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), src);
         let key = self.content_key(ctx, layer, key);
-        let clip = self.shape_clip(ctx, layer, key);
-        let key = match clip {
+        let win = self.shape_clip(ctx, layer, key).or_else(|| self.precomp_clip(ctx, layer, key));
+        let view = self.fx_view(ctx, layer, key);
+        let key = match win {
             Some(w) => key.map(|k| clip::clipped_key(k, w)),
             None => key,
         };
-        (key, noted, clip)
+        let key = match view {
+            Some(v) => key.map(|k| clip::viewed_key(k, v)),
+            None => key,
+        };
+        (key, noted, ContentClip { win, view })
     }
 
     /// `keyed`: [`Self::content_cache_key_noted`] when the caller has it already (a key is
-    /// computed once per layer and frame: keying a precomp counts towards its miss streak).
+    /// computed once per layer and frame).
     fn content_buf_timed(
         &self,
         ctx: &EvalCtx,
@@ -220,6 +246,7 @@ impl<'a> Renderer<'a> {
         mut timing: Option<&mut LayerTiming>,
         keyed: Option<ContentKey>,
     ) -> Option<(Arc<Buf>, Option<u64>)> {
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let (key, noted, clip) = keyed.unwrap_or_else(|| self.content_cache_key_noted(ctx, layer));
         // An animated precomp's buffer isn't kept for other uses in its frame (see
         // [`cache::LayerCache::insert_once`]): no use waiting for another thread's render of it.
@@ -238,9 +265,6 @@ impl<'a> Renderer<'a> {
                 }),
                 None => None,
             };
-            if let Some(id) = noted {
-                c.precomp_note(id, hit.is_some());
-            }
             if let Some(b) = hit {
                 if let Some(t) = timing.as_deref_mut() {
                     t.cached = true;
@@ -248,10 +272,16 @@ impl<'a> Renderer<'a> {
                 return Some((b, key));
             }
         }
+        // A precomp missed by every cache, with the GPU active: its nested comp renders on the
+        // CPU now (RI1). Noted here, not where the GPU walk hands the layer over, so a precomp
+        // the cache serves isn't tagged.
+        if matches!(layer.source, LayerSource::Comp { .. }) && self.active_accel().is_some() {
+            self.note_cpu(ctx, layer, crate::cpu_why::PRECOMP);
+        }
         let t0 = web_time::Instant::now();
-        let buf = self.masked_source(ctx, layer, clip)?;
+        let buf = self.masked_source(ctx, layer, clip.win)?;
         let t1 = web_time::Instant::now();
-        let (buf, kept) = self.apply_effects_kept(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects));
+        let (buf, kept) = self.apply_effects_kept(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects), clip.view);
         if t0.elapsed() >= std::time::Duration::from_millis(400) {
             log::debug!(
                 target: "effectcraft_stall",
@@ -288,6 +318,8 @@ impl<'a> Renderer<'a> {
     /// what effect `effects` sees. Served from / stored in the layer cache under its own key,
     /// so scrubbing reuses frames rendered for earlier output frames.
     pub fn layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
+        let _profile = crate::profile::span("layer_input");
+        let _owner = cache::OwnerScope::effect(ctx.comp_id.0, layer.id.0, effects);
         let src = match layer.source {
             LayerSource::Comp { .. } if self.cache.is_some() => self.precomp_key(ctx, layer),
             LayerSource::Footage { item } => Some(self.proxy_for(item).is_some() as u64),
@@ -314,6 +346,34 @@ impl<'a> Renderer<'a> {
         Some(buf)
     }
 
+    /// A styled layer for an accelerator that renders its styles itself: the content cropped
+    /// and padded for them, and the styles ([`crate::styles::gpu_prepare`]). `None` leaves the
+    /// layer to [`Self::styled`]: styles the accelerator can't render, a static layer with
+    /// static styles (they are cached and uploaded once), or a frame seen before. Static content
+    /// with animated styles styles here: on the CPU it took about 57 ms a frame for a 1200 × 700
+    /// card in a 1080p comp (`tests_styles_static` in the GPU crate). The first visit of a frame
+    /// leaves a mark in the layer cache; the next one styles it on the CPU and caches the
+    /// result, so scrubbing back over it costs no styling at all.
+    pub fn gpu_styles(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, crate::styles::GpuStyles)> {
+        if self.layer_is_static(ctx, layer) && self.styles_are_static(ctx, layer) {
+            return None;
+        }
+        let (content, ckey) = self.content_buf_timed(ctx, layer, None, None)?;
+        if let (Some(c), Some(k)) = (self.cache, ckey.map(|k| cache::styles_key(ctx, layer, k))) {
+            let mark = cache::derive(k, 0x6e57);
+            if c.peek(k).is_some() || c.peek(mark).is_some() {
+                return None;
+            }
+            if let Some(keep) = self.cache_to_keep() {
+                keep.insert(mark, Arc::new(Buf { img: effectcraft_raster::Image::new(1, 1), offset: [0.0; 2], scale: 1.0 }));
+            }
+        }
+        let size = source_size(self.project, layer);
+        let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
+        let (buf, plan) = crate::styles::gpu_prepare(ctx, layer, &content, layer_size)?;
+        Some((Arc::new(buf), plan))
+    }
+
     /// The layer with its styles: exterior passes and body (cached per pass).
     pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         self.styled_keyed(ctx, layer, timing, None)
@@ -321,6 +381,7 @@ impl<'a> Renderer<'a> {
 
     /// [`Self::styled`] with the content key already computed (see [`Self::content_buf_timed`]).
     fn styled_keyed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>, keyed: Option<ContentKey>) -> Option<StyledLayer> {
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         let (content, ckey) = self.content_buf_timed(ctx, layer, timing.as_deref_mut(), keyed)?;
         if !styles::active(ctx, layer) {
             return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true });
@@ -338,7 +399,9 @@ impl<'a> Renderer<'a> {
         let t0 = web_time::Instant::now();
         let size = source_size(self.project, layer);
         let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-        let st = styles::render(ctx, layer, &content, layer_size);
+        // A text layer with effects is a comp-sized canvas: its styles run on the visible part.
+        let cropped = styles::crop_margin(ctx, layer, content.scale).and_then(|m| crop_visible(&content, m));
+        let st = styles::render(ctx, layer, cropped.as_ref().unwrap_or(&content), layer_size);
         if let Some(t) = timing {
             t.cached = false;
             t.effects.push(("layerStyles".into(), t0.elapsed().as_secs_f64() * 1e3));
@@ -359,6 +422,7 @@ impl<'a> Renderer<'a> {
     /// were converted from aren't touched, so they go cold in the layer cache (packed or evicted
     /// under pressure) instead of being kept hot next to their converted copies.
     pub(crate) fn styled_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
+        let _owner = cache::OwnerScope::layer(ctx.comp_id.0, layer.id.0);
         // The content key, computed once for the lookups below (only linear blending has them).
         let keyed = (self.cache.is_some() && self.pipe.to_blend().is_some()).then(|| self.content_cache_key_noted(ctx, layer));
         if let Some(st) = keyed.and_then(|(ckey, _, _)| self.styled_blend_cached(ctx, layer, ckey?)) {
@@ -383,7 +447,7 @@ impl<'a> Renderer<'a> {
     /// and cached in the blending space alone (no working-space copy cloned and kept next to
     /// it). The same pixels as [`Self::content_buf_timed`] then [`Self::to_blend`].
     fn plain_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>, keyed: Option<ContentKey>) -> Option<StyledLayer> {
-        let (ckey, noted, clip) = keyed.unwrap_or_else(|| self.content_cache_key_noted(ctx, layer));
+        let (ckey, _, clip) = keyed.unwrap_or_else(|| self.content_cache_key_noted(ctx, layer));
         let key = ckey.map(|k| cache::derive(k, 0x1ea7));
         // A resident Processed result is an actual CPU demand here. Reuse it in
         // working space, then convert forward; a Blend texture is never inverted.
@@ -427,9 +491,6 @@ impl<'a> Renderer<'a> {
                 }),
                 None => None,
             };
-            if let Some(id) = noted {
-                c.precomp_note(id, hit.is_some());
-            }
             if let Some(b) = hit {
                 if let Some(t) = timing.as_deref_mut() {
                     t.cached = true;
@@ -437,8 +498,8 @@ impl<'a> Renderer<'a> {
                 return Some(StyledLayer { passes: vec![], content: b.clone(), body: b, key: ckey, ckey, plain: true });
             }
         }
-        let buf = self.masked_source(ctx, layer, clip)?;
-        let mut buf = self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects));
+        let buf = self.masked_source(ctx, layer, clip.win)?;
+        let mut buf = self.apply_effects_kept(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects), clip.view).0;
         if let Some(c) = self.pipe.to_blend() {
             color::convert(&mut buf.img, &c);
         }
@@ -495,6 +556,49 @@ impl<'a> Renderer<'a> {
     }
 }
 
+/// Test switch: run layer styles on the whole content buffer (the reference for the crop).
+pub(crate) static NO_STYLE_CROP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Tests: how many times styles ran on a cropped buffer.
+#[cfg(test)]
+pub(crate) static STYLE_CROPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `buf` cut down to the pixels that aren't fully clear (any channel non-zero) plus `margin`
+/// pixels around them, same pixel grid and place. `None` when that saves little (or nothing
+/// is visible): the buffer is used as it is.
+fn crop_visible(buf: &Buf, margin: u32) -> Option<Buf> {
+    if NO_STYLE_CROP.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let (w, h) = (buf.img.width as usize, buf.img.height as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    use rayon::prelude::*;
+    let (x0, y0, x1, y1) = buf
+        .img
+        .data
+        .par_chunks(w)
+        .enumerate()
+        .filter_map(|(y, row)| {
+            let first = row.iter().position(|p| *p != [0.0; 4])?;
+            let last = row.iter().rposition(|p| *p != [0.0; 4]).unwrap_or(first) + 1;
+            Some((first, y, last, y + 1))
+        })
+        .reduce_with(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))?;
+    let m = margin as usize;
+    let (x0, y0) = (x0.saturating_sub(m), y0.saturating_sub(m));
+    let (x1, y1) = (x1.saturating_add(m).min(w), y1.saturating_add(m).min(h));
+    let (cw, ch) = (x1.checked_sub(x0)?, y1.checked_sub(y0)?);
+    // Worth a copy only when it drops at least a quarter of the pixels.
+    if cw.checked_mul(ch)?.saturating_mul(4) > w.saturating_mul(h).saturating_mul(3) {
+        return None;
+    }
+    let img = buf.img.crop(x0 as i64, y0 as i64, cw as u32, ch as u32);
+    #[cfg(test)]
+    STYLE_CROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(Buf { img, offset: [buf.offset[0] - x0 as f64, buf.offset[1] - y0 as f64], scale: buf.scale })
+}
+
 /// Could anything in `layer`'s comp read its working-space pixels (its content buffer) other
 /// than compositing it: a track matte naming it, an effect's layer parameter (Displacement Map,
 /// Set Matte…) or an expression's `sampleImage`? Errs towards yes: a wrong yes only keeps a
@@ -502,16 +606,30 @@ impl<'a> Renderer<'a> {
 pub(crate) fn working_read(comp: &Comp, layer: &Layer) -> bool {
     comp.layers.iter().any(|l| {
         l.track_matte.as_ref().is_some_and(|m| m.layer == layer.id)
-            || l.effects().is_some_and(names_a_layer)
+            // Its own effects may read it through any layer parameter (an empty one can stand
+            // for the layer itself); another layer's only through one that can name it.
+            || l.effects().is_some_and(|fx| if l.id == layer.id { names_a_layer(fx) } else { names_layer(fx, layer.id.0) })
             || (cache::layer_info(comp, l).expressions && samples_pixels(&l.props))
     })
 }
 
-/// Does a property of `g` take a layer (whatever its value)?
+/// Does a property of `g` take a layer (whatever its value)? Deep Glow's Mask Layer left at None
+/// reads nothing (an empty one doesn't stand for the layer itself there).
 fn names_a_layer(g: &PropGroup) -> bool {
     g.children.iter().any(|c| match c {
+        Node::Prop(p) if p.match_id == "PEDG-0056" => p.value != Value::Layer(None) || !p.keys.is_empty() || p.has_expression(),
         Node::Prop(p) => matches!(p.value, Value::Layer(_)),
         Node::Group(sub) => names_a_layer(sub),
+    })
+}
+
+/// Can a layer parameter of `g` name layer `id`: set to it, or keyframed or driven by an
+/// expression (which may name any layer)? An empty layer parameter (Deep Glow's Mask Layer left
+/// at None) reads nothing.
+fn names_layer(g: &PropGroup, id: u64) -> bool {
+    g.children.iter().any(|c| match c {
+        Node::Prop(p) => matches!(p.value, Value::Layer(_)) && (p.value == Value::Layer(Some(id)) || !p.keys.is_empty() || p.has_expression()),
+        Node::Group(sub) => names_layer(sub, id),
     })
 }
 
@@ -524,9 +642,35 @@ fn samples_pixels(g: &PropGroup) -> bool {
 }
 
 /// The window of a layer's buffer its content key stands for (see [`Renderer::resident_content`]):
-/// the whole buffer, or the part of a shape layer's that can show (see `clip.rs`).
+/// the whole buffer, or the part of a shape layer's or a nested comp's frame that can show (see
+/// `clip.rs`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ContentClip(Option<Window>);
+pub struct ContentClip {
+    win: Option<Window>,
+    /// The part of a text or shape layer's comp-sized effect canvas that can show (effect-space
+    /// layer units, see [`Renderer::fx_view`]); `None` for the whole canvas.
+    view: Option<[f64; 4]>,
+}
+
+impl ContentClip {
+    /// The window `[x, y, w, h]` (buffer pixels), `None` for the whole buffer.
+    pub fn rect(&self) -> Option<[u32; 4]> {
+        self.win.map(|w| [w.x, w.y, w.w, w.h])
+    }
+
+    /// The offset of the buffer holding this window of a whole buffer at offset 0.
+    pub fn offset(&self) -> [f64; 2] {
+        crate::sources::window_offset(self.win)
+    }
+
+    pub(crate) fn window(&self) -> Option<Window> {
+        self.win
+    }
+
+    pub(crate) fn view(&self) -> Option<[f64; 4]> {
+        self.view
+    }
+}
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
 pub struct StyledLayer {
@@ -647,5 +791,12 @@ mod tests {
         sub.children.push(Node::Prop(Property::new(3, "layer", "Layer", Value::Layer(None))));
         fx.children.push(Node::Group(sub));
         assert!(names_a_layer(&fx));
+        // An empty layer parameter (Deep Glow's Mask Layer at None) names no other layer; one
+        // set to a layer names just it.
+        assert!(!names_layer(&fx, 7));
+        let Some(Node::Group(sub)) = fx.children.first_mut() else { panic!("sub") };
+        let Some(Node::Prop(lp)) = sub.children.first_mut() else { panic!("layer") };
+        lp.value = Value::Layer(Some(7));
+        assert!(names_layer(&fx, 7) && !names_layer(&fx, 8));
     }
 }

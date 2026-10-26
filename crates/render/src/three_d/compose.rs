@@ -136,6 +136,54 @@ fn geo(cam: &CameraState, world: Mat4, b: [f64; 4], comp: (f64, f64), scale: f64
     Some(Geo { hinv, depth, world, normal, bbox, cam: *cam })
 }
 
+/// The layer-space rectangle of `layer`'s plane an `out` canvas can show: the canvas corners
+/// inverse-mapped onto the plane at every motion-blur sub-sample (a plane maps the canvas
+/// rectangle to a convex quad while the horizon stays off it). Pixels outside it never reach the
+/// canvas. `None` = not bounded this way: a corner beyond the horizon or the near plane, a
+/// degenerate plane, depth of field (it blurs across the view's edge), or a layer that casts
+/// shadows (seen from a light, not the camera).
+pub(crate) fn plane_view(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Option<[f64; 4]> {
+    let cam = camera_for(r, ctx);
+    if cam.dof.is_some() || Material::of(ctx, layer).casts_shadows != 0 || out.0 == 0 || out.1 == 0 {
+        return None;
+    }
+    let comp = view_size(r, ctx);
+    let s = r.opts.scale;
+    let off = r.out_offset();
+    let outer = r.collapse3d.map_or(Mat4::IDENTITY, |c| c.world);
+    let n = mb_samples(r, ctx, layer);
+    let fd = ctx.comp.frame_duration().seconds();
+    let (angle, phase) = (ctx.comp.shutter_angle / 360.0, ctx.comp.shutter_phase / 360.0);
+    let (ow, oh) = (out.0 as f64, out.1 as f64);
+    let mut r_out = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for i in 0..n.max(1) {
+        let (c, world) = if n <= 1 {
+            (cam, outer * ctx.world_matrix(layer))
+        } else {
+            let f = phase + angle * i as f64 / (n - 1) as f64;
+            let sub = ctx.at(ctx.time + Tick::from_seconds_f64(f * fd));
+            (camera_for(r, &sub), outer * sub.world_matrix(layer))
+        };
+        if c.dof.is_some() {
+            return None;
+        }
+        let proj = Mat4::translate(vec3(-off.0, -off.1, 0.0)) * Mat4::scale(vec3(s, s, 1.0)) * c.projection(comp.0, comp.1);
+        let full = proj * world;
+        let h = full.plane_to_mat3();
+        let col = |j: usize| (h.0[0][j].powi(2) + h.0[1][j].powi(2) + h.0[2][j].powi(2)).sqrt();
+        if h.determinant().abs() <= 1e-10 * col(0) * col(1) * col(2) {
+            return None;
+        }
+        let cv = c.view * world;
+        let g = Geo { hinv: h.inverse()?, depth: [cv.0[2][0], cv.0[2][1], cv.0[2][3]], world, normal: plane_normal(world)?, bbox: [0; 4], cam: c };
+        for (x, y) in [(0.0, 0.0), (ow, 0.0), (ow, oh), (0.0, oh)] {
+            let (u, v, _) = unproject(&g, x, y)?;
+            r_out = [r_out[0].min(u), r_out[1].min(v), r_out[2].max(u), r_out[3].max(v)];
+        }
+    }
+    r_out.iter().all(|v| v.is_finite()).then_some(r_out)
+}
+
 /// Layer-space rectangle covered by a buffer.
 fn buf_bounds(buf: &Buf) -> [f64; 4] {
     let s = buf.scale.max(1e-9);
@@ -199,7 +247,11 @@ fn mb_samples(r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> usize {
 
 /// Prepare a layer (buffer, geometry, material). `None` when it shows nothing.
 pub(crate) fn prepare<'a>(r: &Renderer, ctx: &EvalCtx<'a>, layer: &'a Layer, order: usize, out: (u32, u32), in_run: bool) -> Option<Item<'a>> {
-    let buf = r.blend_layer_buf(ctx, layer)?;
+    let made = r.plane_bufs.and_then(|m| m.get(&plane_key(layer))).cloned();
+    let buf = match made {
+        Some(b) => b,
+        None => r.blend_layer_buf(ctx, layer)?,
+    };
     prepare_with(r, ctx, layer, order, out, in_run, buf, Mat4::IDENTITY)
 }
 
@@ -736,6 +788,17 @@ fn occlusion(c: &Item, p: Vec3, l: &LightState) -> [f32; 3] {
 }
 
 // ------------------------------------------------------------------ accelerator export
+
+/// Planes an accelerator made itself, by [`plane_key`]: buffers with the plane's size, offset
+/// and scale whose pixels live on the device (`Image::data` empty). The geometry only reads
+/// their shape; the accelerator draws its own pixels for them.
+pub type PlaneBufs = std::collections::HashMap<usize, Arc<Buf>>;
+
+/// The key of a layer's plane in [`PlaneBufs`]: the layer itself (layer ids repeat across the
+/// precomps a collapsed 3D run reaches into).
+pub fn plane_key(layer: &Layer) -> usize {
+    layer as *const Layer as usize
+}
 
 /// A Classic 3D run prepared for an accelerator ([`Renderer::prepare_3d_run`]): every plane
 /// with its geometry, material and buffer, ready for the per-pixel depth sort, lighting and

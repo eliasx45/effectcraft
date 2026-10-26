@@ -27,7 +27,7 @@ fn scene(depth: BitDepth, linear: bool) -> (Scene, ItemId, LayerId) {
 fn key(r: &Renderer, comp: ItemId, layer: LayerId, time: Tick) -> Option<u64> {
     let ctx = r.eval_ctx(comp, time)?;
     let layer = ctx.comp.layers.iter().find(|l| l.id == layer)?;
-    r.resident_precomp_key(&ctx, layer).map(|(key, _)| key)
+    r.resident_precomp_key(&ctx, layer).map(|(key, ..)| key)
 }
 
 fn assert_pixels(actual: &effectcraft_raster::Image, expected: &effectcraft_raster::Image, depth: BitDepth) {

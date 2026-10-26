@@ -22,18 +22,23 @@ pub struct ToolDef {
     pub description: &'static str,
     /// Only listed (and usable) with a UI: bridged to the running app, or `mcp --ui` (offscreen).
     pub bridge_only: bool,
-    schema: fn() -> Value,
-    run: fn(&mut Backend, &Value) -> Result<Reply>,
+    pub(crate) schema: fn() -> Value,
+    pub(crate) run: fn(&mut Backend, &Value) -> Result<Reply>,
 }
 
 impl ToolDef {
     /// The JSON Schema of the tool's arguments.
     pub fn input_schema(&self) -> Value {
         let mut schema = (self.schema)();
+        crate::senses::widen_time_schema(&mut schema);
         if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
             for (key, value) in [
                 ("full", full_s("reply")),
                 ("offset", offset_s()),
+                (
+                    "page_token",
+                    json!({"type": "string", "description": "Paging: the `page_token` of the previous page; continues there (offset and the revision it was read at)."}),
+                ),
                 ("limit", limit_s("items or bytes", 100)),
                 ("max_chars", max_chars_s()),
                 (
@@ -41,6 +46,9 @@ impl ToolDef {
                     json!({"type":"integer","minimum":0,"description":"Refuse if the project changed since this revision. Required for continuation of live inspection pages; saved get_result snapshots do not need it."}),
                 ),
             ] {
+                if key == "page_token" && !LIVE_PAGED.contains(&self.name) {
+                    continue;
+                }
                 if key == "expectRevision"
                     && !(READ_ONLY.contains(&self.name)
                         || [
@@ -84,6 +92,26 @@ impl ToolDef {
         })
     }
 
+    /// Rename argument names agents mix up between tools to the ones this tool takes: `query` ↔
+    /// `filter`, `source` / `script` → `code`, and camelCase ↔ snake_case (`maxSide` →
+    /// `max_side`). Only when this tool doesn't take the given name itself and the call doesn't
+    /// already pass the canonical one, so a real unknown argument is still reported.
+    pub fn normalize_args(&self, args: &mut Value) {
+        let Some(m) = args.as_object_mut() else { return };
+        let schema = self.input_schema();
+        let Some(props) = schema.get("properties").and_then(Value::as_object) else { return };
+        let renames: Vec<(String, String)> = m
+            .keys()
+            .filter(|k| k.as_str() != "client" && !props.contains_key(*k))
+            .filter_map(|k| arg_alias(k, props).filter(|c| !m.contains_key(c)).map(|c| (k.clone(), c)))
+            .collect();
+        for (from, to) in renames {
+            if let Some(v) = m.remove(&from) {
+                m.insert(to, v);
+            }
+        }
+    }
+
     /// The first argument this tool doesn't take, as a message naming the accepted ones.
     pub fn unknown_arg(&self, args: &Value) -> Option<String> {
         let Some(m) = args.as_object() else { return Some("arguments must be an object".into()) };
@@ -102,8 +130,45 @@ impl ToolDef {
     }
 }
 
+/// Names agents use for the same argument across tools: (given, canonical).
+const ARG_ALIASES: &[(&str, &str)] =
+    &[("query", "filter"), ("search", "filter"), ("filter", "query"), ("search", "query"), ("source", "code"), ("script", "code"), ("js", "code")];
+
+/// The argument of `props` that `key` stands for: a listed synonym, or the same name in the other
+/// case style (`maxSide` ↔ `max_side`).
+fn arg_alias(key: &str, props: &Map<String, Value>) -> Option<String> {
+    if let Some((_, canonical)) = ARG_ALIASES.iter().find(|(given, canonical)| *given == key && props.contains_key(*canonical)) {
+        return Some((*canonical).to_string());
+    }
+    let snake = key.chars().fold(String::new(), |mut s, c| {
+        if c.is_ascii_uppercase() {
+            s.push('_');
+            s.push(c.to_ascii_lowercase());
+        } else {
+            s.push(c);
+        }
+        s
+    });
+    let mut camel = String::new();
+    let mut upper = false;
+    for c in key.chars() {
+        match c {
+            '_' => upper = true,
+            c if upper => {
+                camel.push(c.to_ascii_uppercase());
+                upper = false;
+            }
+            c => camel.push(c),
+        }
+    }
+    [snake, camel].into_iter().find(|k| k != key && props.contains_key(k))
+}
+
 /// Tools that only read.
 const READ_ONLY: &[&str] = &[
+    "edit_feed",
+    "taste_check",
+    "ease_graph",
     "command_list",
     "list_commands",
     "describe_command",
@@ -118,6 +183,7 @@ const READ_ONLY: &[&str] = &[
     "list_fonts",
     "get_state",
     "ui_inspect",
+    "render_times",
     "ui_elements",
     "get_layout",
     "lint_frame",
@@ -247,7 +313,8 @@ pub fn output_schema(name: &str) -> Option<Value> {
         "command_batch" => object(
             json!({
                 "completed": int, "failed": int,
-                "results": {"type": "array", "items": object(json!({"ok": {"type": "boolean"}, "result": {}, "error": {"type": "string"}}), &["ok"])}
+                "results": {"type": "array", "items": object(json!({"ok": {"type": "boolean"}, "result": {}, "error": {"type": "string"}, "omitted": {"type": "boolean"}}), &["ok"])},
+                "failedSteps": {"type": "array", "items": object(json!({"step": int, "id": {"type": "string"}, "error": {"type": "string"}}), &["step", "error"])}
             }),
             &["completed", "failed", "results"],
         ),
@@ -283,7 +350,11 @@ pub fn output_schema(name: &str) -> Option<Value> {
                     "counts": object(json!({"error": int, "warning": int, "info": int}), &["error", "warning", "info"]),
                     "rules": {"type": "array", "items": {"type": "string"}},
                     "problems": {"type": "array", "items": problem},
-                    "notes": {"type": "array", "items": {"type": "string"}}
+                    "notes": {"type": "array", "items": {"type": "string"}},
+                    "summary": {"type": "boolean", "description": "A summary: `problems` holds only the worst ones (errors first, no info)."},
+                    "byRule": {"type": "object", "description": "Summary: problems per rule, by severity."},
+                    "byLayer": {"type": "array", "items": object(json!({"layer": int, "layerName": {"type": "string"}, "problems": int, "rules": {"type": "array", "items": {"type": "string"}}}), &["layer", "problems", "rules"])},
+                    "total": int, "listed": int
                 }),
                 &["comp", "compName", "times", "truncated", "clean", "counts", "problems"],
             )
@@ -353,8 +424,10 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
     if b.confinement().is_some() && UNCONFINED_ONLY.contains(&name) {
         return Err(Error::BadArgs(format!("`{name}` is not available while file access is confined (--automation-read-root/--automation-write-root)")));
     }
-    let empty = json!({});
-    let args = if args.is_null() { &empty } else { args };
+    let mut normalized = if args.is_null() { json!({}) } else { args.clone() };
+    t.normalize_args(&mut normalized);
+    resume_page(name, &mut normalized)?;
+    let args = &normalized;
     // Validate delivery options before a script/edit can run.
     let delivery_budget = crate::compact::budget(args)?;
     let output_page = crate::compact::Page::from_args(args, 100)?;
@@ -362,8 +435,10 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
         Some(value) => Some(value.as_u64().ok_or_else(|| Error::BadArgs("expectRevision must be a non-negative integer".into()))?),
         None => None,
     };
-    if ["get_comp", "get_layer", "get_property", "get_project", "doc_inspect", "get_field"].contains(&name) && output_page.offset > 0 && expected.is_none() {
-        return Err(Error::BadArgs("live page continuation requires expectRevision from the first reply; or use a retained get_result snapshot".into()));
+    if LIVE_PAGED.contains(&name) && output_page.offset > 0 && expected.is_none() {
+        return Err(Error::BadArgs(
+            "live page continuation needs the first reply's `page_token` (or its `revision` as expectRevision); or use a retained get_result snapshot".into(),
+        ));
     }
     // Generic output options must not leak into raw UI/control arguments.
     let native = (t.schema)();
@@ -379,6 +454,8 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
             }
         }
     }
+    // Timecode / frame times ("6:20", {"frame": 200}) become seconds before a tool checks them.
+    let run_args = crate::senses::resolve_times(b, run_args)?;
     let outer = b.set_expected_revision(expected);
     let result = (t.run)(b, &run_args);
     b.set_expected_revision(outer);
@@ -398,6 +475,8 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
             .and_then(Value::as_str)
             .and_then(effectcraft_engine::commands::find)
             .is_some_and(|c| c.journal || c.id.starts_with("edit.") || c.id == "engine.batch"),
+        // A script's reply carries its own outcome; the session context only when asked.
+        "run_script" => get(args, "context").and_then(Value::as_bool) == Some(true),
         _ => !READ_ONLY.contains(&name),
     };
     if writes
@@ -409,7 +488,42 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
             Err(e) => value["contextWarning"] = json!(format!("operation already finished; could not observe current session: {e}; inspect before retrying")),
         }
     }
+    crate::senses::attach_notices(b, name, &mut reply);
+    if LIVE_PAGED.contains(&name)
+        && let Reply::Json(value) = &mut reply
+    {
+        add_page_token(value);
+    }
     b.finish_reply(name, args, reply)
+}
+
+/// Inspection tools that read the live project page by page: a continuation must come from the
+/// same revision as the first page (else rows shift under the reader).
+const LIVE_PAGED: &[&str] = &["get_comp", "get_layer", "get_property", "get_project", "doc_inspect", "get_field"];
+
+/// A cut live reply gets a `page_token` for its next page: the revision it was read at and the
+/// next offset, so continuing needs nothing else (`expectRevision` comes with it).
+fn add_page_token(value: &mut Value) {
+    let (Some(rev), Some(next)) = (value.get("revision").and_then(Value::as_u64), value.get("next_offset").and_then(Value::as_u64)) else { return };
+    let token = format!("r{rev}o{next}");
+    if let Some(t) = value.get_mut("truncated").filter(|t| t.is_object()) {
+        t["hint"] = json!(format!("call again with page_token={token:?} (offset={next} at revision {rev})"));
+    }
+    value["page_token"] = json!(token);
+}
+
+/// `page_token` ("r<revision>o<offset>") into `offset` and, for live reads, `expectRevision`.
+fn resume_page(name: &str, args: &mut Value) -> Result<()> {
+    let Some(o) = args.as_object_mut() else { return Ok(()) };
+    let Some(token) = o.remove("page_token").filter(|t| !t.is_null()) else { return Ok(()) };
+    let bad = || Error::BadArgs(format!("`page_token` {token} is not one from a reply (r<revision>o<offset>)"));
+    let (rev, offset) = token.as_str().and_then(|t| t.strip_prefix('r')).and_then(|t| t.split_once('o')).ok_or_else(bad)?;
+    let (rev, offset) = (rev.parse::<u64>().map_err(|_| bad())?, offset.parse::<u64>().map_err(|_| bad())?);
+    o.insert("offset".into(), json!(offset));
+    if LIVE_PAGED.contains(&name) {
+        o.entry("expectRevision").or_insert(json!(rev));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ schema fragments
@@ -626,10 +740,21 @@ fn get_state(b: &mut Backend, _: &Value) -> Result<Reply> {
 }
 
 fn run_script(b: &mut Backend, a: &Value) -> Result<Reply> {
-    let code = get(a, "code").and_then(Value::as_str).ok_or_else(|| Error::BadArgs("missing `code` (JavaScript)".into()))?;
+    // `file`: a script file on this machine. Its code runs (unless `code` is given) under its path,
+    // so `#include "x.jsx"` resolves next to it rather than in the project's folder.
+    let file = get(a, "file").and_then(Value::as_str);
+    let code = match (get(a, "code").and_then(Value::as_str), file) {
+        (Some(code), _) => code.to_string(),
+        (None, Some(_)) if b.confinement().is_some() => return Err(Error::BadArgs("`file` is not available while file access is confined".into())),
+        (None, Some(f)) => std::fs::read_to_string(f).map_err(|e| Error::BadArgs(format!("cannot read script file {f}: {e}")))?,
+        (None, None) => return Err(Error::BadArgs("missing `code` (JavaScript) or `file` (a .jsx path)".into())),
+    };
     let mut p = json!({"code": code});
-    if let Some(n) = get(a, "name") {
+    if let Some(n) = get(a, "name").or(file.map(|_| &a["file"])) {
         p["name"] = n.clone();
+    }
+    if let Some(r) = get(a, "rollback") {
+        p["rollback"] = r.clone();
     }
     // A time limit by default, so a runaway loop can't hold the session forever; 0 = none.
     p["timeout"] = get(a, "timeout").cloned().unwrap_or(json!(SCRIPT_TIMEOUT));
@@ -645,7 +770,41 @@ fn get_project(b: &mut Backend, _: &Value) -> Result<Reply> {
 
 fn get_comp(b: &mut Backend, a: &Value) -> Result<Reply> {
     let info = b.exec("comp.info", obj(&[("comp", get(a, "comp"))]))?;
+    if get(a, "summary").and_then(Value::as_bool) == Some(true) {
+        return json_reply(comp_summary(info));
+    }
     json_reply(crate::compact::comp_reply(info, a)?)
+}
+
+/// Layers a `get_comp` summary lists.
+const COMP_SUMMARY_LAYERS: usize = 20;
+
+/// A comp's settings with layer counts (per type, hidden, parented) and only its top layers.
+fn comp_summary(mut info: Value) -> Value {
+    let layers = match info.get_mut("layers").map(Value::take) {
+        Some(Value::Array(v)) => v,
+        _ => Vec::new(),
+    };
+    let mut types: Map<String, Value> = Map::new();
+    for l in &layers {
+        let t = l["type"].as_str().unwrap_or("?").to_string();
+        let n = types.get(&t).and_then(Value::as_u64).unwrap_or(0);
+        types.insert(t, json!(n + 1));
+    }
+    let hidden = layers.iter().filter(|l| l["switches"]["video"] == false).count();
+    let parented = layers.iter().filter(|l| !l["parent"].is_null()).count();
+    info["summary"] = json!(true);
+    info["layerCount"] = json!(layers.len());
+    info["types"] = Value::Object(types);
+    info["hidden"] = json!(hidden);
+    info["parented"] = json!(parented);
+    info["layers"] = layers
+        .iter()
+        .take(COMP_SUMMARY_LAYERS)
+        .map(|l| json!({"index": l["index"], "id": l["id"], "name": l["name"], "type": l["type"], "in": l["in"], "out": l["out"]}))
+        .collect();
+    info["hint"] = json!(format!("summary: counts and the top {COMP_SUMMARY_LAYERS} layers; leave `summary` out for every layer (paged)"));
+    info
 }
 
 /// Flatten a `layer.tree` property tree into `[{path, type, value, keys?, expression?}]`.
@@ -948,7 +1107,24 @@ fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
 fn render_frames(b: &mut Backend, a: &Value) -> Result<Reply> {
     let mut p = render_params(
         a,
-        &["comp", "item", "layer", "times", "count", "start", "end", "cols", "max_side", "labels", "transparent", "region", "overlays", "path", "gif"],
+        &[
+            "comp",
+            "item",
+            "layer",
+            "times",
+            "frames",
+            "count",
+            "start",
+            "end",
+            "cols",
+            "max_side",
+            "labels",
+            "transparent",
+            "region",
+            "overlays",
+            "path",
+            "gif",
+        ],
     );
     p["base64"] = json!(true);
     let mut r = b.exec("render.contactSheet", p)?;
@@ -1208,7 +1384,106 @@ fn lint_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
         ("minTextPx", get(a, "min_text_px")),
         ("minContrast", get(a, "min_contrast")),
     ]);
-    json_reply(b.exec("render.lint", p)?)
+    let mut r = b.exec("render.lint", p)?;
+    // Long lists come as a summary unless asked for in full (`summary: false`).
+    let many = r["problems"].as_array().is_some_and(|v| v.len() > LINT_SUMMARY_OVER);
+    if get(a, "summary").and_then(Value::as_bool).unwrap_or(many) {
+        r = lint_summary(r);
+    }
+    json_reply(r)
+}
+
+/// `lint_frame` answers with a summary by default above this many problems.
+const LINT_SUMMARY_OVER: usize = 40;
+/// Problems and layers a summary lists.
+const SUMMARY_TOP: usize = 10;
+
+/// A lint reply cut to counts per rule and per layer plus the worst problems (errors first, info
+/// left out).
+fn lint_summary(mut r: Value) -> Value {
+    let problems = r.get_mut("problems").map(Value::take).and_then(|v| match v {
+        Value::Array(v) => Some(v),
+        _ => None,
+    });
+    let problems = problems.unwrap_or_default();
+    let rank = |p: &Value| match p["severity"].as_str() {
+        Some("error") => 0,
+        Some("warning") => 1,
+        _ => 2,
+    };
+    let mut by_rule: Map<String, Value> = Map::new();
+    let mut by_layer: Vec<(Value, Value, usize, Vec<String>)> = Vec::new();
+    for p in &problems {
+        let rule = p["rule"].as_str().unwrap_or("?").to_string();
+        let sev = p["severity"].as_str().unwrap_or("info").to_string();
+        let e = by_rule.entry(rule.clone()).or_insert_with(|| json!({}));
+        e[&sev] = json!(e[&sev].as_u64().unwrap_or(0) + 1);
+        if rank(p) < 2 {
+            match by_layer.iter_mut().find(|l| l.0 == p["layer"]) {
+                Some(l) => {
+                    l.2 += 1;
+                    if !l.3.contains(&rule) {
+                        l.3.push(rule);
+                    }
+                }
+                None => by_layer.push((p["layer"].clone(), p["layerName"].clone(), 1, vec![rule])),
+            }
+        }
+    }
+    by_layer.sort_by_key(|l| std::cmp::Reverse(l.2));
+    let mut top: Vec<&Value> = problems.iter().filter(|p| rank(p) < 2).collect();
+    top.sort_by_key(|p| rank(p));
+    r["summary"] = json!(true);
+    r["byRule"] = Value::Object(by_rule);
+    r["byLayer"] = by_layer.iter().take(SUMMARY_TOP).map(|l| json!({"layer": l.0, "layerName": l.1, "problems": l.2, "rules": l.3})).collect();
+    r["problems"] = top.iter().take(SUMMARY_TOP).map(|p| (*p).clone()).collect();
+    r["listed"] = json!(top.len().min(SUMMARY_TOP));
+    r["total"] = json!(problems.len());
+    r["hint"] = json!("summary: the worst problems and counts per rule and layer; `summary: false` lists every problem, `rules` narrows to some rules");
+    r
+}
+
+fn taste_check(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let p = obj(&[
+        ("comp", get(a, "comp")),
+        ("layer", get(a, "layer")),
+        ("layers", get(a, "layers")),
+        ("start", get(a, "start")),
+        ("end", get(a, "end")),
+        ("all", get(a, "all")),
+        ("problemsOnly", get(a, "problems_only")),
+    ]);
+    json_reply(b.exec("taste.check", p)?)
+}
+
+fn ease_graph(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let keep = get(a, "path").and_then(Value::as_str).map(str::to_string);
+    if let (Some(c), Some(p)) = (b.confinement(), &keep) {
+        c.check(p, crate::confine::Access::Write)?;
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out = keep
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("effectcraft-mcp-ease-{}-{n}.png", std::process::id())).to_string_lossy().into_owned());
+    let mut p = obj(&[
+        ("comp", get(a, "comp")),
+        ("layer", get(a, "layer")),
+        ("path", get(a, "property")),
+        ("prop", get(a, "prop")),
+        ("start", get(a, "start")),
+        ("end", get(a, "end")),
+        ("width", get(a, "width")),
+        ("height", get(a, "height")),
+    ]);
+    p["out"] = json!(out);
+    let mut info = b.exec("taste.graph", p)?;
+    let png = std::fs::read(&out).map_err(|e| Error::Other(format!("ease_graph: {e}")))?;
+    if keep.is_none() {
+        let _ = std::fs::remove_file(&out);
+        info["path"] = Value::Null;
+    }
+    Ok(Reply::Image { png, info })
 }
 
 fn get_motion(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -1295,6 +1570,9 @@ fn passthrough(b: &mut Backend, method: &str, a: &Value) -> Result<Reply> {
 fn ui_inspect(b: &mut Backend, a: &Value) -> Result<Reply> {
     passthrough(b, "ui.inspect", a)
 }
+fn render_times(b: &mut Backend, a: &Value) -> Result<Reply> {
+    passthrough(b, "ui.renderTimes", a)
+}
 fn ui_elements(b: &mut Backend, a: &Value) -> Result<Reply> {
     passthrough(b, "ui.elements", a)
 }
@@ -1322,6 +1600,7 @@ fn control(b: &mut Backend, a: &Value) -> Result<Reply> {
 // ------------------------------------------------------------------ the catalogue
 
 static TOOLS: &[ToolDef] = &[
+    crate::senses::EDIT_FEED,
     ToolDef {
         name: "list_commands",
         description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with command_run. The full list is large (~130 KB): narrow with `filter` (e.g. `layer.new`, `keys`, `effect`) or pass `brief: true` for just ids and labels, then describe_command for one command's parameters.",
@@ -1369,16 +1648,19 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "run_script",
-        description: "Run JavaScript with an After Effects-style scripting object model (app, app.project, items.addComp, comp.layers.addSolid/addText/addShape/addNull/addCamera/addLight, layer.property(\"ADBE Transform Group\").property(\"ADBE Position\").setValueAtTime(t, v), Effects.addProperty(\"ADBE Gaussian Blur 2\"), expressions, markers, renderQueue…). Every edit is an undoable engine command; app.beginUndoGroup/endUndoGroup make one undo step. Returns {ok, result (last expression value), output (writeLn/$.writeln/alert text), error: {message, line, column} | null}. Stops after `timeout` seconds (default 300, 0 = no limit) or on MCP notifications/cancelled (an open undo group is rolled back; other edits are kept). File access is limited to the project folder unless the user allows scripts to write files.",
+        description: "Run JavaScript with an After Effects-style scripting object model (app, app.project, items.addComp, comp.layers.addSolid/addText/addShape/addNull/addCamera/addLight, layer.property(\"ADBE Transform Group\").property(\"ADBE Position\").setValueAtTime(t, v), Effects.addProperty(\"ADBE Gaussian Blur 2\"), expressions, markers, renderQueue…). Every edit is an undoable engine command; app.beginUndoGroup/endUndoGroup make one undo step. Returns {ok, result (last expression value), output (writeLn/$.writeln/alert text), error: {message, line, column} | null, rolledBack?, expressionErrors? (expressions the script broke: a missing marker, layer or match name)}. A script that fails or stops (after `timeout` seconds, default 300, 0 = no limit, or on MCP notifications/cancelled) undoes all its edits unless rollback: false. `file` runs a .jsx file (#include resolves next to it). File access is limited to the project folder unless the user allows scripts to write files.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "code": {"type": "string", "description": "JavaScript source, e.g. `var c = app.project.items.addComp(\"Main\", 1920, 1080, 1, 5, 30); c.layers.addText(\"Hi\"); c.numLayers`."},
-                    "name": {"type": "string", "description": "Script name used in error messages (default `script`)."},
-                    "timeout": {"type": "number", "minimum": 0, "description": "Stop the script after this many seconds (default 300; 0 = no limit)."}
+                    "file": {"type": "string", "description": "Path of a .jsx file to run instead of `code` (absolute); `#include` resolves next to it. With `code`, only names the script so its includes resolve there."},
+                    "name": {"type": "string", "description": "Script name used in error messages (default `script`, or `file`)."},
+                    "timeout": {"type": "number", "minimum": 0, "description": "Stop the script after this many seconds (default 300; 0 = no limit)."},
+                    "rollback": {"type": "boolean", "description": "Undo every edit of a script that fails (default true: no half-done state; the reply says rolledBack). false keeps the edits made before the error."},
+                    "context": {"type": "boolean", "description": "Add observedContext (build, project, revision, client) to the reply (default false)."}
                 }),
-                &["code"],
+                &[],
             )
         },
         run: run_script,
@@ -1396,7 +1678,8 @@ static TOOLS: &[ToolDef] = &[
         bridge_only: false,
         schema: || {
             schema(
-                json!({"comp": comp_s(), "full": full_s("layers"), "max_chars": max_chars_s(), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT)}),
+                json!({"comp": comp_s(), "full": full_s("layers"), "max_chars": max_chars_s(), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT),
+                    "summary": {"type": "boolean", "description": "true: the comp's settings, `layerCount`, layers per type (`types`), `hidden` and `parented` counts and only the top 20 layers."}}),
                 &[],
             )
         },
@@ -1585,6 +1868,7 @@ static TOOLS: &[ToolDef] = &[
                     "item": item_s(),
                     "layer": solo_s(),
                     "times": {"type": "array", "items": {"type": "number"}, "description": "Comp times in seconds (at most 64)."},
+                    "frames": {"type": ["array", "object"], "items": {"type": "integer"}, "description": "Comp frame numbers instead of `times`: a list ([190, 195, 200]) or every frame of a range ({\"from\": 190, \"to\": 210, \"every\": 1}, both ends included; at most 64)."},
                     "count": {"type": "integer", "minimum": 1, "description": "Frames spread evenly from `start` to `end` when `times` is not given (default 6, capped at 64)."},
                     "start": {"type": "number", "description": "First time in seconds (default: work area start)."},
                     "end": {"type": "number", "description": "End time in seconds, exclusive (default: work area end)."},
@@ -1623,7 +1907,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "lint_frame",
-        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). Rules: text-too-small (on-screen font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio of text against what is under it under min_contrast, default 3:1), outside-title-safe (text), outside-action-safe, cut-off (partly outside the frame), text-overlap, hidden-visible (switched on but off-screen, transparent or covered), off-beat (keyframes and in points just missing the audio's beat). Returns {clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}; each message says what to fix. Run it before calling a design done.",
+        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). Rules: text-too-small (on-screen font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio of text against what is under it under min_contrast, default 3:1), outside-title-safe (text), outside-action-safe, cut-off (partly outside the frame), text-overlap, hidden-visible (switched on but off-screen, transparent or covered), off-beat (keyframes and in points just missing the audio's beat), off-accent (speed-graph peaks just missing a stressed syllable of the comp's speech map, see speech.import / speech.accents), nested-cut-off (layers inside precomps measured in this comp's frame), text-off-centre (text vs its card/pill, measured at the text's rest pose; `fix` is the prop.set that centres it), exposed-edge (empty frame edges, transition gaps), exit-at-cut (a full-screen cutaway fading out into the comp's end or gone before it: hold to the end and hard-cut), off-taste (eases off Elias's profile, see taste_check). off-accent on keys you made is an error. Returns {clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner?, fix? {command, params}}]}; each message says what to fix. Run it before calling a design done.",
         bridge_only: false,
         schema: || {
             schema(
@@ -1635,7 +1919,8 @@ static TOOLS: &[ToolDef] = &[
                     "step": {"type": "number", "description": "Seconds between range samples (default 0.5)."},
                     "rules": {"type": "array", "items": {"type": "string", "enum": effectcraft_engine::lint::RULES}, "description": "Only these rules (default all)."},
                     "min_text_px": {"type": "number", "description": "Smallest legible font size on screen, comp pixels (default comp height / 30)."},
-                    "min_contrast": {"type": "number", "description": "Smallest acceptable WCAG contrast ratio (default 3)."}
+                    "min_contrast": {"type": "number", "description": "Smallest acceptable WCAG contrast ratio (default 3)."},
+                    "summary": {"type": "boolean", "description": "true: counts per rule (`byRule`) and per layer (`byLayer`, top 10) plus the 10 worst problems instead of every problem. Default: on when there are more than 40 problems; false lists them all."}
                 }),
                 &[],
             )
@@ -1643,8 +1928,50 @@ static TOOLS: &[ToolDef] = &[
         run: lint_frame,
     },
     ToolDef {
+        name: "taste_check",
+        description: "Elias's ease taste check (taste.check): every keyframed move (position, scale, rotation, opacity; `all` for other properties) judged against his ease profile. ✅ approved = one of his approved curves for that move type (entrance, exit, on-screen move, fade-in, fade-out, scale pop); 🟡 close = inside his learned ranges but not an approved curve (the message says how it differs from the nearest, e.g. \"like Expo Out 1, launch softer (out 12 % vs 0.1 %)\"); ❌ off = linear, Easy Ease 33/33, a speed jump at a key, baked one-key-per-frame, or outside his ranges (speed peak position for the move type, peak sharpness for its length, speed cap in % of the frame per frame, frames on the last 10 % of an entrance). A ❌ is `blocking` once its move type has enough approved curves (else warn only). Each non-✅ move carries `fix`: the taste.apply call (command_run) that puts the nearest approved curve on it. Returns {summary {line}, clean, moves: [...]}. Run it over the animated range before handing a comp over; new curves go to taste.propose (⏳ until Elias approves).",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "layer": layer_s(),
+                    "layers": {"type": "array", "items": layer_s(), "description": "Only these layers (default every layer)."},
+                    "start": {"type": "number", "description": "Range start, comp seconds (default the comp's start)."},
+                    "end": {"type": "number", "description": "Range end, comp seconds (default the comp's end)."},
+                    "all": {"type": "boolean", "description": "Also other animated properties (hard fails only)."},
+                    "problems_only": {"type": "boolean", "description": "Leave out the ✅ moves."}
+                }),
+                &[],
+            )
+        },
+        run: taste_check,
+    },
+    ToolDef {
+        name: "ease_graph",
+        description: "A property's value graph with its speed graph under it, as an image (taste.graph): keys marked with their frames, each move's speed curve coloured by its taste verdict (green ✅ approved, amber 🟡 close, red ❌ off) and labelled with its curve. Use it to see an ease without rendering, and to show Elias a move. `path` keeps a copy of the PNG.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "layer": layer_s(),
+                    "property": {"type": "string", "description": "Property path, e.g. transform/position."},
+                    "prop": {"type": "integer", "description": "Property uid instead of `property`."},
+                    "start": {"type": "number", "description": "Range start, comp seconds (default the keys with a margin)."},
+                    "end": {"type": "number", "description": "Range end, comp seconds."},
+                    "width": {"type": "integer", "description": "Image width in px (default 1280)."},
+                    "height": {"type": "integer", "description": "Image height in px (default 720)."},
+                    "path": {"type": "string", "description": "Also save the PNG here."}
+                }),
+                &["layer"],
+            )
+        },
+        run: ease_graph,
+    },
+    ToolDef {
         name: "get_motion",
-        description: "How layers move over a time range, in words and numbers, without rendering (comp.motion / layer.motion): samples each layer's comp-space content box, opacity, scale and rotation (default the whole comp, every frame or coarser so a layer gets at most 600 samples; keyframe times are always sampled) and returns per layer `segments` {kind: enter|exit|move|hold|scale|rotate|fade-in|fade-out, start, end, from, to, direction (move/enter/exit: left, up-right...), edge (enter/exit: the frame edge)}, `offscreen` intervals and a one-sentence `summary` (\"Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s.\"), plus `overlaps` {a, b, start, end, maxFraction} between drawn layers (full-frame backgrounds left out). Times are comp seconds. Use it to check an animation's timing and choreography; render_frames shows the frames.",
+        description: "How layers move over a time range, in words and numbers, without rendering (comp.motion / layer.motion): samples each layer's comp-space content box, opacity, scale and rotation (default the whole comp, every frame or coarser so a layer gets at most 600 samples; keyframe times are always sampled) and returns per layer `segments` {kind: enter|exit|move|hold|scale|rotate|fade-in|fade-out, start, end, from, to, direction (move/enter/exit: left, up-right...), edge (enter/exit: the frame edge)}, `offscreen` intervals and a one-sentence `summary` (\"Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s.\"), plus `overlaps` {a, b, start, end, maxFraction} between drawn layers (full-frame backgrounds left out). Parenting: a layer whose moves come from animated parents lists them in `movedBy` and its summary names the layer to key; a null (or other no-picture layer) that parents layers and is keyed is described by what it moves (`moves`, `describedBy`: \"S1 RIG is a null that moves its 3 layers (…): it flies in from the right 21.65–22.26s\"). Times are comp seconds. Use it to check an animation's timing and choreography; render_frames shows the frames.",
         bridge_only: false,
         schema: || {
             schema(
@@ -1817,6 +2144,13 @@ static TOOLS: &[ToolDef] = &[
         run: ui_inspect,
     },
     ToolDef {
+        name: "render_times",
+        description: "Why was this frame slow? The render times of the frame the viewer shows (the Timeline's Render Time pane): frame {ms, backend: gpu|cpu, reason, frameDurationMs, slow, cpuLayers} and each layer, slowest first, {comp, layer, name, ms, backend: gpu|cpu, reason} (e.g. \"Taper or Wave stroke: the GPU can't draw it\", \"effect X has no GPU version\", \"the GPU ran out of memory\").",
+        bridge_only: true,
+        schema: || schema(json!({}), &[]),
+        run: render_times,
+    },
+    ToolDef {
         name: "ui_elements",
         description: "Interactive elements drawn in the last frame: id, label, rect [x,y,w,h] in points. Stable ids such as `tools.Selection`, `panel.Timeline`, `panel.tab.EffectControls`, `project.item.<id>`, `viewer.comp`, `timeline.layer.<id>.bar`, `timeline.prop.<uid>.stopwatch`, `timeline.cti`, `effects.item.<name>`. Filter with `prefix`.",
         bridge_only: true,
@@ -1882,7 +2216,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "control",
-        description: "Call any control-channel method (docs/control-protocol.md) with its params, e.g. ui.menu.list, ui.menu.invoke {id}, ui.panel.show {panel}, ui.scroll, ui.viewer.locate {x,y}, ui.timeline.locate {layer,time}, ui.playback {action}, ui.resize.",
+        description: "Call any control-channel method (docs/control-protocol.md) with its params, e.g. ui.menu.list, ui.menu.invoke {id}, ui.panel.show {panel}, ui.scroll, ui.viewer.locate {x,y}, ui.timeline.locate {layer,time}, ui.playback {action}, ui.renderTimes, ui.resize.",
         bridge_only: true,
         schema: || schema(json!({"method": {"type": "string"}, "params": {"type": "object", "additionalProperties": true}}), &["method"]),
         run: control,
@@ -1960,11 +2294,11 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "command_batch",
-        description: "Run commands in order, returning each result or error. Stop at the first error by default; stop_on_error: false continues. Each edit has its own undo step; use batch for an atomic undo group.",
+        description: "Run commands in order, returning {completed, failed, results, failedSteps?}: each step's result (big ones shortened to their ids unless verbose) or error. Stop at the first error by default; stop_on_error: false continues. Each edit has its own undo step; use batch for an atomic undo group.",
         bridge_only: false,
         schema: || {
             schema(
-                json!({"steps": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "params": {"type": "object"}}, "required": ["id"], "additionalProperties": false}}, "stop_on_error": {"type": "boolean"}}),
+                json!({"steps": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "params": {"type": "object"}}, "required": ["id"], "additionalProperties": false}}, "stop_on_error": {"type": "boolean"}, "verbose": {"type": "boolean", "description": "Inline every step's full result (default: results over 300 characters keep only their ids, e.g. layer, comp, item)."}}),
                 &["steps"],
             )
         },
@@ -2038,6 +2372,9 @@ fn prefix_field_pointers(value: &mut Value, prefix: &str, depth: usize) {
     }
 }
 
+/// The longest step result `command_batch` inlines without `verbose`.
+const STEP_INLINE_CHARS: usize = 300;
+
 fn command_batch(b: &mut Backend, a: &Value) -> Result<Reply> {
     let input = need(a, "steps")?.as_array().ok_or_else(|| Error::BadArgs("steps must be an array".into()))?;
     if input.len() > 1024 {
@@ -2053,7 +2390,42 @@ fn command_batch(b: &mut Backend, a: &Value) -> Result<Reply> {
         "engine.batch",
         json!({"steps":steps,"atomic":false,"stopOnError":get(a,"stop_on_error").and_then(Value::as_bool).unwrap_or(true),"groupUndo":false}),
     )?;
-    let mut out = json!({"completed":done["completed"],"failed":done["failed"],"results":done["executionResults"]});
+    // Short by default: a step's result is inlined when small; a big one keeps only its ids
+    // (`layer`, `comp`, `item`…) and failed steps are also listed together (`verbose`: all).
+    let verbose = get(a, "verbose").and_then(Value::as_bool) == Some(true);
+    let ids = input.iter().map(|st| get(st, "command").or_else(|| get(st, "id")).cloned().unwrap_or(Value::Null));
+    let mut failed_steps = vec![];
+    let results: Vec<Value> = done["executionResults"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .zip(ids)
+        .enumerate()
+        .map(|(i, (r, id))| {
+            if r["ok"] != true {
+                failed_steps.push(json!({"step": i + 1, "id": id, "error": r["error"]}));
+                return r.clone();
+            }
+            match r.get("result") {
+                Some(v) if !verbose && v.to_string().len() > STEP_INLINE_CHARS => {
+                    let mut short = json!({"ok": true, "omitted": true});
+                    for key in
+                        ["id", "layer", "layers", "comp", "item", "items", "effect", "key", "keys", "path", "name", "index", "time", "warning", "warnings"]
+                    {
+                        if let Some(x) = v.get(key).filter(|x| x.to_string().len() <= STEP_INLINE_CHARS) {
+                            short[key] = x.clone();
+                        }
+                    }
+                    short
+                }
+                _ => r.clone(),
+            }
+        })
+        .collect();
+    let mut out = json!({"completed":done["completed"],"failed":done["failed"],"results":results});
+    if !failed_steps.is_empty() {
+        out["failedSteps"] = json!(failed_steps);
+    }
     for key in ["appliedSteps", "files", "fileCoverage", "untrackedEffectsPossible", "rolledBack", "failedStep"] {
         if let Some(v) = done.get(key) {
             out[key] = v.clone();

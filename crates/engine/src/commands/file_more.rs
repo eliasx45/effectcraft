@@ -524,9 +524,36 @@ fn script_run(s: &mut Session, p: &Value) -> Result<Value> {
         let it = host.clone().unwrap_or_default();
         s.script_interrupt = Some(if limit.is_some() { it.with_limit(limit) } else { it });
     }
-    let r = run_js(s, &code, &name, super::b_p(p, "console").unwrap_or(false));
+    let console = super::b_p(p, "console").unwrap_or(false);
+    // A failed script leaves no half-done edits (`rollback`, default on except in the Script
+    // Console): the project and undo history go back to how they were before it ran.
+    let rollback = super::b_p(p, "rollback").unwrap_or(!console);
+    let (snap, history, epoch) = (s.project.clone(), s.history.clone(), s.epoch);
+    let r = run_js(s, &code, &name, console);
     s.script_interrupt = host;
-    r
+    let mut out = r?;
+    let changed = !std::sync::Arc::ptr_eq(&snap, &s.project);
+    let failed = out.get("error").is_some_and(|e| !e.is_null());
+    if failed && rollback && changed && s.epoch == epoch {
+        s.project = snap;
+        s.history = history;
+        s.sanitize_state();
+        s.bump();
+        out["rolledBack"] = json!(true);
+        // The stop note about kept edits no longer holds.
+        if let Some(text) = out.get("output").and_then(Value::as_str) {
+            let mut lines: Vec<&str> = text.lines().filter(|l| !l.starts_with("Stopped: edits made outside")).collect();
+            lines.push("Rolled back: the script failed, so none of its edits are kept (rollback: false keeps them)");
+            out["output"] = json!(lines.join("\n"));
+        }
+    } else if changed && s.epoch == epoch {
+        // An expression the script broke (a missing marker, layer or match name) is reported, not
+        // left to fall back silently to its raw value.
+        if let Some(errors) = super::expr_tools::new_errors(s, &snap) {
+            out["expressionErrors"] = errors;
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- footage
@@ -1018,7 +1045,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Run Script",
             [],
             None,
-            "{code (JavaScript: app, app.project, CompItem, Layer, Property… like After Effects scripting), name?, console? (Script Console context), timeout? (s: stop the script after this long)} → {ok, result, output, error: {message, line, column} | null}",
+            "{code (JavaScript: app, app.project, CompItem, Layer, Property… like After Effects scripting), name? (a script file's path: #include resolves next to it), console? (Script Console context), timeout? (s: stop the script after this long), rollback? (default true, false in the Script Console: a script that fails undoes all its edits)} → {ok, result, output, error: {message, line, column} | null, rolledBack?: true, expressionErrors?: {count, errors: [{comp, compName, layer, layerName, path, message}]} (expressions the script broke)}",
             always,
             script_run
         ),

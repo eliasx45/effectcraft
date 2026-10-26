@@ -152,6 +152,18 @@ happened in between:
   replaced: the click brings it to the front.
 - **Command line:** `scripts/fork/app.sh` (same thing; `--status` prints `running` / `stale` /
   `ready`, `--build-only` builds without opening).
+- The same build makes the CLI, `target/local/local/effectcraft-cli`, so agents that drive
+  EffectCraft headless (Claude Code, the motion kit) get the current version too. Point
+  `scripts/fork/cli.sh` runs it and rebuilds first when the sources changed (same lock and stamp,
+  so app and CLI build once between them): point agents there (`EFFECTCRAFT_CLI=…/scripts/fork/cli.sh`,
+  or a symlink named `effectcraft-cli` on `PATH`) and they never run a stale CLI.
+- Long-running processes never run the build output itself: `scripts/mcp.sh` (MCP servers) and
+  `scripts/fork/app.sh` (an app opened from the command line) run a frozen copy in
+  `target/local/run/` (`scripts/frozen-exe.sh`: an APFS clone per build, removed once nothing runs
+  it), and `app.sh --build-only` doesn't build while the app runs. A rebuild under a running
+  process left its image mismatching its file: macOS then blocked and malware-scanned every
+  process it started, and seven stale servers froze the Mac (23 Oct 2026). One-shot CLI runs
+  still use the build output.
 - It builds with `[profile.local]` in the root `Cargo.toml` (inherits `release`; `lto = false`,
   `codegen-units = 16`, `incremental = true`) in `target/local`, one build at a time (a lock), so a
   rebuild only recompiles what changed. Exit status 130 means the build was stopped, 1 that it

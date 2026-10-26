@@ -370,6 +370,33 @@ fn toolbar_fill_stroke_kinds_apply_to_selected_shape_layers() {
     assert_eq!(s.execute("shape.fillStroke", json!({"layers": [none]})).unwrap()["fillType"], "solid");
 }
 
+/// Regression: `shape.fillStroke`'s doc advertises `strokeType`, `strokeBlend` and
+/// `strokeOpacity` (as `fillType?/strokeType?`…), but checked execution (CLI, control channel,
+/// MCP) rejected them as unknown parameters because the doc parser read only the first key of an
+/// `a?/b?` pair.
+#[test]
+fn fill_stroke_checked_accepts_stroke_type_blend_and_opacity() {
+    use effectcraft_keyframe::Value as KV;
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+    let sh = s.execute("layer.newShape", json!({"kind": "ellipse", "fill": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+    let r = s
+        .execute_checked(
+            "shape.fillStroke",
+            json!({"layers": [sh], "stroke": "#ffffff", "strokeType": "solid", "strokeWidth": 0.7, "strokeBlend": "multiply", "strokeOpacity": 30}),
+        )
+        .unwrap();
+    assert_eq!((r["strokeType"].as_str(), r["strokeWidth"].as_f64()), (Some("solid"), Some(0.7)), "{r}");
+    let l = s.active_comp().unwrap().layer(effectcraft_project::LayerId(sh)).unwrap().clone();
+    let stroke = l.props.group("contents/group").unwrap().sub("contents").unwrap().groups().find(|g| g.match_id == "stroke").cloned().expect("a stroke");
+    let multiply = effectcraft_color::BlendMode::ALL.iter().position(|m| *m == effectcraft_color::BlendMode::Multiply).unwrap() as u32;
+    assert_eq!((stroke.get("blend").unwrap().value.clone(), stroke.get("opacity").unwrap().value.as_f64()), (KV::Enum(multiply), 30.0));
+    // The fill side's pair too; a typo is still rejected.
+    s.execute_checked("shape.fillStroke", json!({"fillType": "solid", "fillBlend": "normal", "fillOpacity": 50})).unwrap();
+    let e = s.execute_checked("shape.fillStroke", json!({"strokeTyp": "solid"})).unwrap_err().to_string();
+    assert!(e.contains("unknown parameter(s) `strokeTyp`") && e.contains("strokeOpacity"), "{e}");
+}
+
 /// The toolbar's Fill Options / Stroke Options change a selected shape layer's paint kind (#732):
 /// None switches the fill off, a gradient turns the Fill into a Gradient Fill that keeps its
 /// opacity, Solid Color turns it back, and a Stroke kind adds a stroke where there is none.
@@ -590,6 +617,12 @@ fn params_docs_parse() {
     assert_eq!(k("{keys: [{layer, prop, time}], add?}"), ["keys", "add"]);
     assert_eq!(k("{label: Red|Yellow|Aqua|…, layers?}"), ["label", "layers"]);
     assert_eq!(k("{name?, background? [r,g,b]|#hex, open?}"), ["name", "background", "open"]);
+    // `a?/b?` pairs name both keys (they share one description); `/` inside a value doesn't split.
+    assert_eq!(
+        k("{fillType?/strokeType?: none|solid, fillOpacity?/strokeOpacity? %, w?: a/b}"),
+        ["fillType", "strokeType", "fillOpacity", "strokeOpacity", "w"]
+    );
+    assert_eq!(k("{red?/green?/blue?/white?: [x, y], gamma? (1/2.2)}"), ["red", "green", "blue", "white", "gamma"]);
     assert!(k("{}").is_empty());
     assert!(accepted_params("free text").is_none());
     // Every registered command documents its params as a parseable key list.

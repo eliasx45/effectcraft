@@ -51,6 +51,10 @@ pub struct Frame {
     speculate: bool,
     /// What this frame evaluates: an evaluation that needs itself is a cycle.
     pub owner: Option<Owner>,
+    /// Keyframed properties whose `Value` reads are answered inside the run (see
+    /// [`crate::host::Curve`]), added as the evaluator resolves their first `Keys` or
+    /// other-time `Value` read.
+    pub curves: Vec<crate::host::Curve>,
 }
 
 /// One expression evaluation: the property (comp, layer, uid), the comp time and the text.
@@ -77,6 +81,18 @@ impl Frame {
     pub fn answer(&self, req: &Req) -> Option<&Resp> {
         self.memo.get(req).map(|a| &a.resp)
     }
+    /// Whether a curve for the property `req` reads is known already.
+    pub fn has_curve(&self, req: &Req) -> bool {
+        match req {
+            Req::Value { comp, layer, path, .. } | Req::Keys { comp, layer, path } => self.curves.iter().any(|c| c.is(*comp, *layer, path)),
+            _ => false,
+        }
+    }
+    /// The answer to a `Value` read from a known curve, without the evaluator.
+    fn inline(&self, req: &Req) -> Option<Resp> {
+        let Req::Value { comp, layer, path, t, pre } = req else { return None };
+        self.curves.iter().find(|c| c.is(*comp, *layer, path))?.value(*t, *pre)
+    }
     /// Move the answers to `reqs` (each listed once) out of the memo.
     pub fn take_answers(&mut self, reqs: &[Req]) -> Option<Vec<Resp>> {
         reqs.iter().map(|q| self.memo.remove(q).map(|a| a.resp)).collect()
@@ -93,11 +109,20 @@ thread_local! {
     static TOTAL_RUNS: Cell<u64> = const { Cell::new(0) };
     /// Script runs since the outermost evaluation on this thread began (nested ones included).
     pub static RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whether the last run on this thread read the comp time (`time`, or an explicit time
+    /// argument; see the prelude's `__timeRead`).
+    static TIME_READ: Cell<bool> = const { Cell::new(true) };
 }
 
 /// Script runs on this thread so far (each evaluation runs its script one or more times).
 pub fn runs() -> u64 {
     TOTAL_RUNS.with(Cell::get)
+}
+
+/// Whether the last run on this thread read the comp time. Read it right after [`run`]
+/// returns: the next run (a nested evaluation's too) overwrites it. `true` when unknown.
+pub fn time_read() -> bool {
+    TIME_READ.with(Cell::get)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -295,6 +320,16 @@ fn native_host(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
             }
             return Some(to_js(&a.resp, ctx));
         }
+        // A keyframed property read at a new time: answered here, recorded as if the evaluator
+        // had answered it (memoised, and in `used` for the memo and the next prefetch), so the
+        // run goes on with the real value instead of a stand-in.
+        if let Some(resp) = frame.inline(&req) {
+            let v = to_js(&resp, ctx);
+            let run = frame.run;
+            frame.used.push(req.clone());
+            frame.memo.insert(req, Answer { resp, run });
+            return Some(v);
+        }
         let stop = !frame.speculate || frame.misses.len() >= MAX_MISSES;
         let stand_in = (!stop).then(|| to_js(&placeholder(&req), ctx));
         if frame.misses.len() < MAX_MISSES && !frame.misses.contains(&req) {
@@ -395,6 +430,7 @@ impl Runtime {
             }
         });
         TOTAL_RUNS.with(|r| r.set(r.get().saturating_add(1)));
+        TIME_READ.with(|r| r.set(true));
         let args = [
             JsValue::from(b.time),
             to_js(b.value, ctx),
@@ -416,6 +452,10 @@ impl Runtime {
             // Abandoned mid-run: the context is unusable now (see `run`).
             None => return Run::Done(Err(TIMED_OUT.into())),
         };
+        // Anything but a plain `false` counts as read (the memo then keys the result by time).
+        let global = ctx.global_object();
+        let read = !global.get(js_string!("__timeRead"), ctx).is_ok_and(|v| v.as_boolean() == Some(false));
+        TIME_READ.with(|r| r.set(read));
         let pending = FRAMES.with(|f| f.borrow().last().is_some_and(|fr| !fr.misses.is_empty()));
         if pending {
             return Run::Pending;
@@ -721,7 +761,27 @@ pub fn to_value(out: &Out, current: &Value) -> Result<Value, String> {
             }
             _ => return Err("Error: expression result must be a path".into()),
         },
-        Value::Layer(_) | Value::Gradient(_) => current.clone(),
+        // A gradient (text Gradient Fill Colors, shape gradients): `[colour, colour, …]` (evenly
+        // spaced) or `[[position 0..1, colour], …]`, colours as `[r, g, b, a?]` (0..1) or
+        // "#rrggbb", e.g. `[effect("A")("Color"), effect("B")("Color")]`.
+        Value::Gradient(_) => {
+            fn json(o: &Out, depth: usize) -> serde_json::Value {
+                match o {
+                    _ if depth > 8 => serde_json::Value::Null,
+                    Out::Num(x) => serde_json::Number::from_f64(*x).map_or(serde_json::Value::Null, serde_json::Value::Number),
+                    Out::Str(s) => serde_json::Value::String(s.clone()),
+                    Out::Bool(b) => serde_json::Value::Bool(*b),
+                    Out::Arr(v) => serde_json::Value::Array(v.iter().map(|x| json(x, depth + 1)).collect()),
+                    Out::Object(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
+                    _ => serde_json::Value::Null,
+                }
+            }
+            current
+                .coerce_json(&json(out, 0))
+                .filter(|v| matches!(v, Value::Gradient(_)))
+                .ok_or_else(|| "Error: expression result must be a gradient: [colour, colour, …] or [[position, colour], …]".to_string())?
+        }
+        Value::Layer(_) => current.clone(),
     })
 }
 

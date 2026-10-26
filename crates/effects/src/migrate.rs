@@ -44,7 +44,33 @@ pub const PARAM_ID_ALIASES: &[(&str, &str, &str)] = &[
     ("ec.key.innerouter", "additionalBackground", "additionalBackground/background1"),
     // Generate: Radio Waves' growth speed was called Velocity; Velocity now moves the wave.
     ("ec.generate.radiowaves", "velocity", "waveMotion/expansion"),
+    // Stylize: Deep Glow's Exposure is on Deep Glow 2's scale. It was `exposure` on a
+    // half-strength scale (from 18 Oct 2026) and the plug-in's `PEDG-0002` before that.
+    ("ec.stylize.deepglow", "exposure", "glowExposure"),
+    ("ec.stylize.deepglow", "PEDG-0002", "glowExposure"),
 ];
+
+/// Value factors applied once when a parameter is found under an old id ([`PARAM_ID_ALIASES`]),
+/// so the instance keeps its strength: `(effect id, old id, factor)`.
+pub const ALIAS_VALUE_SCALES: &[(&str, &str, f64)] = &[
+    // Deep Glow's half-strength Exposure 2 is Deep Glow 2's 1.
+    ("ec.stylize.deepglow", "exposure", 0.5),
+];
+
+/// Multiply a scalar property's value, keyframes and keyframe speeds by `f`.
+fn scale_scalar(pr: &mut Property, f: f64) {
+    if let Value::Scalar(v) = &mut pr.value {
+        *v *= f;
+    }
+    for k in &mut pr.keys {
+        if let Value::Scalar(v) = &mut k.value {
+            *v *= f;
+        }
+        for e in k.in_ease.as_mut_slice().iter_mut().chain(k.out_ease.as_mut_slice().iter_mut()) {
+            e.speed *= f;
+        }
+    }
+}
 
 /// Popup option labels renamed since they were first saved:
 /// `(effect id, param id, old label, new label)`.
@@ -341,17 +367,24 @@ fn upgrade_full(spec: &EffectSpec, g: &mut PropGroup, ids: &mut Ids, layer_size:
         // before it moved into a twirl-down group.
         let found = prop_at(g, ps.id).is_some();
         if !found {
-            let moved = PARAM_ID_ALIASES.iter().filter(|(e, _, new)| *e == spec.id && *new == ps.id).find_map(|(_, old, _)| take_at(g, old)).or_else(|| {
-                let leaf = ps.id.rsplit('/').next().unwrap_or(ps.id);
-                // Not when the top-level leaf is an old id of another parameter (Radio
-                // Waves' old `velocity` is the new `waveMotion/expansion`).
-                let aliased = PARAM_ID_ALIASES.iter().any(|(e, old, _)| *e == spec.id && *old == leaf);
-                (leaf != ps.id && !aliased && !spec.params.iter().any(|q| q.id == leaf)).then(|| take_prop(g, leaf)).flatten()
-            });
+            let moved = PARAM_ID_ALIASES
+                .iter()
+                .filter(|(e, _, new)| *e == spec.id && *new == ps.id)
+                .find_map(|(_, old, _)| take_at(g, old).map(|pr| (Some(*old), pr)))
+                .or_else(|| {
+                    let leaf = ps.id.rsplit('/').next().unwrap_or(ps.id);
+                    // Not when the top-level leaf is an old id of another parameter (Radio
+                    // Waves' old `velocity` is the new `waveMotion/expansion`).
+                    let aliased = PARAM_ID_ALIASES.iter().any(|(e, old, _)| *e == spec.id && *old == leaf);
+                    (leaf != ps.id && !aliased && !spec.params.iter().any(|q| q.id == leaf)).then(|| take_prop(g, leaf)).flatten().map(|pr| (None, pr))
+                });
             let (path, leaf) = ps.id.rsplit_once('/').map(|(p, l)| (Some(p), l)).unwrap_or((None, ps.id));
             let pr = match moved {
-                Some(mut pr) => {
+                Some((old, mut pr)) => {
                     pr.match_id = leaf.to_string();
+                    if let Some((_, _, f)) = ALIAS_VALUE_SCALES.iter().find(|(e, id, _)| *e == spec.id && Some(*id) == old) {
+                        scale_scalar(&mut pr, *f);
+                    }
                     pr
                 }
                 None => {

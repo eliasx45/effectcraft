@@ -8,7 +8,7 @@ use effectcraft_project::{FeatherFalloff, GroupKind, ItemId, LayerId, LayerSourc
 use serde_json::{Value, json};
 
 use super::layer_menu::target_masks;
-use super::{CommandSpec, b_p, bad, f_p, has_comp, has_layers, layer_mut, layer_p, str_p};
+use super::{CommandSpec, b_p, bad, f_p, has_comp, has_layers, layer_mut, layer_p, merge_p, str_p};
 use crate::{EngineError, Result, Session, VertexRef, cmd};
 
 // ---------------------------------------------------------------- RotoBezier
@@ -307,8 +307,9 @@ fn set_first_vertex(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"first": v.index}))
 }
 
-/// Free Transform Points: scale / rotate / move the selected vertices (or whole masks) about an
-/// anchor (default: the centre of their bounding box), at the current time.
+/// Free Transform Points: scale / rotate / move the selected vertices (or whole masks, when fewer
+/// than two of a path's points are selected) about an anchor (default: the centre of their
+/// bounding box), at the current time.
 fn free_transform(s: &mut Session, p: &Value) -> Result<Value> {
     let scale = match p.get("scale") {
         Some(Value::Number(n)) => {
@@ -324,9 +325,23 @@ fn free_transform(s: &mut Session, p: &Value) -> Result<Value> {
     let off = off.unwrap_or([0.0; 2]);
     let anchor =
         p.get("anchor").and_then(Value::as_array).map(|a| [a.first().and_then(Value::as_f64).unwrap_or(0.0), a.get(1).and_then(Value::as_f64).unwrap_or(0.0)]);
-    if scale == [1.0, 1.0] && rot == 0.0 && off == [0.0, 0.0] {
-        return Err(bad("path.freeTransform", "pass scale (% or [x%, y%]), rotation (deg) and/or offset [dx, dy]; anchor? [x, y]"));
+    // A general 2×3 path-space matrix [a, b, c, d, e, f] (x' = a·x + c·y + e, y' = b·x + d·y + f),
+    // applied after the rest: the viewer's box scales along its own (rotated) axes with it.
+    let matrix: Option<[f64; 6]> = match p.get("matrix") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(a)) if a.len() == 6 => {
+            let mut m = [0.0; 6];
+            for (o, v) in m.iter_mut().zip(a) {
+                *o = v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| bad("path.freeTransform", "matrix: six finite numbers [a, b, c, d, e, f]"))?;
+            }
+            Some(m)
+        }
+        Some(_) => return Err(bad("path.freeTransform", "matrix: six numbers [a, b, c, d, e, f]")),
+    };
+    if scale == [1.0, 1.0] && rot == 0.0 && off == [0.0, 0.0] && matrix.is_none() {
+        return Err(bad("path.freeTransform", "pass scale (% or [x%, y%]), rotation (deg), offset [dx, dy] and/or matrix [a, b, c, d, e, f]; anchor? [x, y]"));
     }
+    let merge = merge_p(p).map(str::to_string);
     let (cid, targets) = masks_for(s, p)?;
     let selected: Vec<VertexRef> = s.state.selected_vertices.clone();
     let t = s.time();
@@ -336,7 +351,15 @@ fn free_transform(s: &mut Session, p: &Value) -> Result<Value> {
         let y = v[1] * scale[1];
         [x * c - y * sn, x * sn + y * c]
     };
-    let n = s.edit("Free Transform Points", None, |proj, _| {
+    let mat = |v: [f64; 2]| match matrix {
+        Some([a, b, c, d, e, f]) => [a * v[0] + c * v[1] + e, b * v[0] + d * v[1] + f],
+        None => v,
+    };
+    let mat_lin = |v: [f64; 2]| match matrix {
+        Some([a, b, c, d, ..]) => [a * v[0] + c * v[1], b * v[0] + d * v[1]],
+        None => v,
+    };
+    let n = s.edit("Free Transform Points", merge.as_deref(), |proj, _| {
         let mut n = 0;
         for (lid, uid) in &targets {
             let l = layer_mut(proj, cid, *lid)?;
@@ -354,29 +377,29 @@ fn free_transform(s: &mut Session, p: &Value) -> Result<Value> {
             let idx: Vec<usize> = {
                 let sel: Vec<usize> =
                     selected.iter().filter(|v| v.layer == *lid && v.mask == *uid).map(|v| v.index).filter(|i| *i < sp.vertices.len()).collect();
-                if sel.is_empty() { (0..sp.vertices.len()).collect() } else { sel }
+                // One point has nothing to scale or turn about: the whole path, as with none.
+                if sel.len() < 2 { (0..sp.vertices.len()).collect() } else { sel }
             };
             if idx.is_empty() {
                 continue;
             }
             let a = anchor.unwrap_or_else(|| {
                 let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
-                for &i in &idx {
-                    let v = sp.vertices[i];
+                for v in idx.iter().filter_map(|&i| sp.vertices.get(i)) {
                     lo = [lo[0].min(v[0]), lo[1].min(v[1])];
                     hi = [hi[0].max(v[0]), hi[1].max(v[1])];
                 }
                 [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]
             });
             for &i in &idx {
-                let v = sp.vertices[i];
+                let Some(v) = sp.vertices.get_mut(i) else { continue };
                 let q = lin([v[0] - a[0], v[1] - a[1]]);
-                sp.vertices[i] = [q[0] + a[0] + off[0], q[1] + a[1] + off[1]];
+                *v = mat([q[0] + a[0] + off[0], q[1] + a[1] + off[1]]);
                 if let Some(tn) = sp.in_tangents.get_mut(i) {
-                    *tn = lin(*tn);
+                    *tn = mat_lin(lin(*tn));
                 }
                 if let Some(tn) = sp.out_tangents.get_mut(i) {
-                    *tn = lin(*tn);
+                    *tn = mat_lin(lin(*tn));
                 }
                 n += 1;
             }
@@ -584,7 +607,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Free Transform Points",
             ["Layer", "Mask and Shape Path"],
             None,
-            "{layer?, mask?, scale?: % | [x%, y%], rotation?: deg, offset?: [dx, dy], anchor?: [x, y]}",
+            "{layer?, mask?, scale?: % | [x%, y%], rotation?: deg, offset?: [dx, dy], anchor?: [x, y], matrix?: [a, b, c, d, e, f]}",
             has_layers,
             free_transform
         ),

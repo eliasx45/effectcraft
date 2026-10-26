@@ -106,6 +106,7 @@ pub const BUNDLED: &[(&str, bool, &str, &str)] = &[
     ("Sort Layers by In Point.jsx", false, "sample", include_str!("../../scripts/Sort Layers by In Point.jsx")),
     ("Layer Tools.jsx", true, "sample", include_str!("../../scripts/ScriptUI Panels/Layer Tools.jsx")),
     ("Ease Presets.jsx", true, "extension", include_str!("../../../../extensions/scriptui-panels/Ease Presets.jsx")),
+    ("Gradient Generator.jsx", true, "extension", include_str!("../../../../extensions/scriptui-panels/Gradient Generator.jsx")),
 ];
 
 /// A script File ▸ Scripts (or the Window menu, for panels) offers.

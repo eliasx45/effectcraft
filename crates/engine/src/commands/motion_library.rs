@@ -38,24 +38,29 @@ fn timeout(p: &Value) -> std::time::Duration {
     std::time::Duration::from_secs_f64(f_p(p, "timeout").filter(|t| t.is_finite() && *t > 0.0).unwrap_or(WAIT).min(3600.0))
 }
 
-/// A card as lists show it.
-pub fn card_summary(c: &Card) -> Value {
+/// A card as lists show it, `local` when this machine has its files (a library folder: it
+/// applies from them, so it isn't "on the Mac" here).
+pub fn card_summary(c: &Card, local: bool) -> Value {
     let description: String = c.description.chars().take(240).collect();
     json!({
         "id": c.id,
         "name": c.name,
         "kind": c.kind,
+        "kindLabel": c.subtitle().split(" · ").next().unwrap_or_default(),
         "category": c.category,
+        "location": if c.location.is_empty() { &c.category } else { &c.location },
         "description": description,
         "duration": c.duration,
         "needsFootage": c.needs_footage(),
+        "onMac": c.on_mac && !local,
+        "local": local,
         "source": "motion",
         "library": "Motion Library",
     })
 }
 
-fn card_detail(c: &Card) -> Value {
-    let mut v = card_summary(c);
+fn card_detail(c: &Card, local: bool) -> Value {
+    let mut v = card_summary(c, local);
     v["description"] = json!(c.description);
     v["comp"] = json!(c.comp);
     v["tags"] = json!(c.tags);
@@ -123,14 +128,15 @@ fn catalog(s: &mut Session, p: &Value) -> Result<Value> {
     let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 500) as usize;
     let offset = p.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let hits = effectcraft_motionlib::search(&cat.cards, query, folder);
-    let folders: Vec<Value> = cat.folder_counts().into_iter().map(|(f, n)| json!({"folder": f, "cards": n})).collect();
+    // In the library's order, with each folder's depth and whether it has an icon.
+    let folders: Vec<Value> = cat.tree().into_iter().map(|r| json!({"folder": r.path, "cards": r.cards, "depth": r.depth, "icon": r.icon.is_some()})).collect();
     Ok(json!({
         "version": client.status().version,
         "name": cat.name,
         "folders": folders,
         "total": hits.len(),
         "offset": offset,
-        "cards": hits.iter().skip(offset).take(limit).map(|c| card_summary(c)).collect::<Vec<_>>(),
+        "cards": hits.iter().skip(offset).take(limit).map(|c| card_summary(c, s.motion_library_local_entry(&c.id).is_some())).collect::<Vec<_>>(),
     }))
 }
 
@@ -139,7 +145,7 @@ fn card(s: &mut Session, p: &Value) -> Result<Value> {
     let id = str_p(p, "id").ok_or_else(|| bad(C, "missing `id`"))?;
     let (_, cat) = catalog_of(s, C, p)?;
     let c = cat.card(id).ok_or_else(|| bad(C, format!("no Motion Library card `{id}`")))?;
-    Ok(card_detail(c))
+    Ok(card_detail(c, s.motion_library_local_entry(id).is_some()))
 }
 
 /// Motion Library hits for `library.search` (best first), when the library is set up.
@@ -150,7 +156,12 @@ pub fn search_hits(s: &Session, query: &str, category: Option<&str>, kind: Optio
         .into_iter()
         .filter(|c| kind.is_none_or(|k| c.kind.eq_ignore_ascii_case(k)))
         .filter(|c| category.is_none_or(|q| c.category.to_lowercase().contains(q)))
-        .map(card_summary)
+        // Insertable cards only: on-the-Mac cards are listed by library.catalog, unless this
+        // machine has their files.
+        .filter_map(|c| {
+            let local = s.motion_library_local_entry(&c.id).is_some();
+            (c.applicable() || local).then(|| card_summary(c, local))
+        })
         .collect()
 }
 
@@ -169,6 +180,13 @@ fn materialize(s: &Session, client: &Client, key: &str, bytes: impl FnOnce() -> 
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "library.apply";
     let id = str_p(p, "id").ok_or_else(|| bad(C, "missing `id` (a Motion Library card id, from library.catalog or library.search)"))?.to_string();
+    // The Mac that keeps the library applies the card's own files: nothing to download, and
+    // its footage stays linked (`remote: true` uses the bucket anyway).
+    if !b_p(p, "remote").unwrap_or(false)
+        && let Some(e) = s.motion_library_local_entry(&id)
+    {
+        return apply_local(s, p, &e);
+    }
     let (client, _) = catalog_of(s, C, p)?;
     #[cfg(not(target_arch = "wasm32"))]
     let prepared = if waits(p) { client.prepare_blocking(&id, timeout(p)) } else { client.prepare(&id) };
@@ -257,13 +275,46 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
                    "missing": !s.services.exists(&ph.path)})
         })
         .collect();
-    r["card"] = card_summary(&card);
+    r["card"] = card_summary(&card, false);
+    r["source"] = json!("remote");
+    super::library::report_problems(s, &snap, &mut r);
     if !needs.is_empty() {
         r["needsFootage"] = json!(needs);
         r["hint"] = json!("Relink each missing item to this video's footage: footage.relink {item, path}");
         s.toast(format!("Applied “{}”: {} footage item{} to relink", card.name, needs.len(), if needs.len() == 1 { "" } else { "s" }));
     }
     Ok(r)
+}
+
+/// `library.reveal`: open the folder holding a card's file on this machine (a library folder).
+fn reveal(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "library.reveal";
+    let id = str_p(p, "id").ok_or_else(|| bad(C, "missing `id` (a Motion Library card id)"))?;
+    let e = s.motion_library_local_entry(id).ok_or_else(|| bad(C, format!("`{id}` has no file on this machine (it comes from the Motion Library bucket)")))?;
+    let url = super::layer_menu::folder_url(&e.file);
+    s.events.push(crate::Event::OpenUrl(url.clone()));
+    Ok(json!({"url": url, "file": e.file}))
+}
+
+/// `library.apply` from a library folder (`library.insert`), one undo step.
+fn apply_local(s: &mut Session, p: &Value, e: &crate::motion_library::LocalEntry) -> Result<Value> {
+    let snap = s.project.clone();
+    let history = s.history.clone();
+    match s.execute("library.insert", p.clone()) {
+        Ok(mut r) => {
+            super::batch::fold(s, &snap, &format!("Apply {}", e.name));
+            r["source"] = json!("local");
+            r["file"] = json!(e.file);
+            Ok(r)
+        }
+        Err(err) => {
+            s.project = snap;
+            s.history = history;
+            s.sanitize_state();
+            s.bump();
+            Err(err)
+        }
+    }
 }
 
 fn configure(s: &mut Session, p: &Value) -> Result<Value> {
@@ -304,6 +355,7 @@ fn publish(s: &mut Session, p: &Value) -> Result<Value> {
             map.iter().filter_map(|(f, mb)| Some((f.clone(), (mb.as_f64().filter(|m| m.is_finite() && *m >= 0.0)? * 1e6) as u64))).collect();
     }
     opts.include_video = b_p(p, "includeVideo").unwrap_or(false);
+    opts.catalog_all = b_p(p, "catalogAll").unwrap_or(false);
     opts.dry_run = b_p(p, "dryRun").unwrap_or(false);
     opts.force = b_p(p, "force").unwrap_or(false);
     let remote = match str_p(p, "remote") {
@@ -328,6 +380,92 @@ fn publish(s: &mut Session, p: &Value) -> Result<Value> {
     }
     v["log"] = json!(log);
     Ok(v)
+}
+
+/// Uploads above this many MB wait for `confirm: true` (Elias's internet is metered).
+const ASK_ABOVE_MB: f64 = 50.0;
+
+/// `library.saveCard`: upload one card from this Mac's library folder to the bucket (the
+/// catalog's own folders and limits; video and big files stay home), in the background. A dry
+/// run first: over `askAboveMB` it stops with `needsConfirm` and the size.
+#[cfg(not(target_arch = "wasm32"))]
+fn save_card(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "library.saveCard";
+    let id = str_p(p, "id").ok_or_else(|| bad(C, "missing `id` (a card in this Mac's library folder)"))?.to_string();
+    let e = s
+        .motion_library_local_entry(&id)
+        .ok_or_else(|| bad(C, format!("`{id}` isn't in a library folder on this machine: cards are saved from the Mac that keeps the library")))?;
+    let cfg = s.motion_library_config();
+    if cfg.remote.is_empty() || cfg.token.is_empty() {
+        return Err(bad(C, "the Motion Library isn't set up for saving here (no remote or token in motion-library.json)"));
+    }
+    let remote = effectcraft_motionlib::remote_for(&cfg.remote, Some(&cfg.token)).map_err(|e| bad(C, e))?;
+    let client = s.motion_library().ok();
+    // The published catalog's settings, so the save changes nothing else.
+    let cat = client.as_ref().and_then(Client::catalog);
+    let folders = cat.as_ref().map(|c| c.folders.clone()).filter(|f| !f.is_empty()).unwrap_or_else(|| vec!["Devin Jatho".into(), "SceneYard".into()]);
+    let mut opts = effectcraft_motionlib::publish::Options::new(&e.folder, folders);
+    opts.ids = vec![id.clone()];
+    opts.catalog_all = cat.as_ref().is_some_and(|c| c.cards.iter().any(|c| c.on_mac));
+    // The Mac publish script's limits (option C): small previews, SceneYard files up to 20 MB.
+    opts.max_preview_bytes = (f_p(p, "maxPreviewMB").filter(|m| m.is_finite() && *m >= 0.0).unwrap_or(2.0) * 1e6) as u64;
+    opts.folder_max_bytes = match p.get("folderMaxMB").and_then(Value::as_object) {
+        Some(map) => map.iter().filter_map(|(f, mb)| Some((f.clone(), (mb.as_f64().filter(|m| m.is_finite() && *m >= 0.0)? * 1e6) as u64))).collect(),
+        None => vec![("SceneYard".into(), 20_000_000)],
+    };
+    let dry = b_p(p, "dryRun").unwrap_or(false);
+    let confirm = b_p(p, "confirm").unwrap_or(false);
+    let ask = f_p(p, "askAboveMB").filter(|m| m.is_finite() && *m >= 0.0).unwrap_or(ASK_ABOVE_MB);
+    let name = e.name.clone();
+    s.spawn_task("librarySave", format!("Saving “{name}” to the library"), b_p(p, "wait").unwrap_or(false), move |ctl| {
+        ctl.message("working out what to upload");
+        let mut plan = opts.clone();
+        plan.dry_run = true;
+        let r = effectcraft_motionlib::publish::publish(remote.as_ref(), &plan, &mut |line| ctl.message(line))?;
+        let mb = r.upload_bytes as f64 / 1e6;
+        // What stays home (video, too large), for this card.
+        let skipped: Vec<Value> = r
+            .skipped
+            .iter()
+            .filter(|k| k.card == name)
+            .map(|k| json!({"file": k.path.rsplit('/').next().unwrap_or(&k.path), "size": k.size, "reason": k.reason}))
+            .collect();
+        let skipped_text = if skipped.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> =
+                skipped.iter().take(3).map(|k| format!("{} ({})", k["file"].as_str().unwrap_or(""), k["reason"].as_str().unwrap_or(""))).collect();
+            format!("; left at home: {}{}", names.join(", "), if skipped.len() > 3 { format!(" and {} more", skipped.len() - 3) } else { String::new() })
+        };
+        let base = json!({"id": id, "name": name, "uploadMB": (mb * 10.0).round() / 10.0, "uploads": r.uploads, "skipped": skipped});
+        if dry || (mb > ask && !confirm) {
+            let mut out = base;
+            out["dryRun"] = json!(dry);
+            out["needsConfirm"] = json!(!dry);
+            out["toast"] = json!(if dry {
+                format!("Saving “{name}” would upload {mb:.1} MB{skipped_text}")
+            } else {
+                format!("“{name}” is {mb:.1} MB to upload: confirm to save it{skipped_text}")
+            });
+            return Ok(Box::new(move |_: &mut Session| Ok(out)) as super::super::jobs::Apply);
+        }
+        ctl.message(format!("uploading {mb:.1} MB"));
+        let done = effectcraft_motionlib::publish::publish(remote.as_ref(), &opts, &mut |line| ctl.message(line))?;
+        // This session sees the saved card right away.
+        if let Some(c) = &client {
+            c.refresh_blocking(std::time::Duration::from_secs(60));
+            c.adopt_update();
+        }
+        let mut out = base;
+        out["version"] = json!(done.version);
+        out["toast"] = json!(format!("Saved “{name}” to the library ({mb:.1} MB uploaded, version {}){skipped_text}", done.version));
+        Ok(Box::new(move |_: &mut Session| Ok(out)) as super::super::jobs::Apply)
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_card(_: &mut Session, _: &Value) -> Result<Value> {
+    Err(bad("library.saveCard", "cards are saved from the Mac that keeps the library"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -365,11 +503,23 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec {
             journal: false,
             ..cmd!(
+                "library.reveal",
+                "Reveal Motion Library Card in Finder",
+                [],
+                None,
+                "{id} → {url, file}: opens the folder of the card's file on this machine",
+                always,
+                reveal
+            )
+        },
+        CommandSpec {
+            journal: false,
+            ..cmd!(
                 "library.apply",
                 "Apply Motion Library Card",
                 [],
                 None,
-                "{id, comp? (default: the open composition; none open = import only), time? (s, default playhead), wait? (default true on desktop: download first; false returns {pending, done, total} until ready), timeout? (s)} — imports the card's project and nests its composition, one undo step → {item, layer, comp, card, import, needsFootage?: [{item, name, path, reason, duration, fps, missing}], hint?}. Relink needsFootage items with footage.relink {item, path}",
+                "{id, comp? (default: the open composition; none open = import only), time? (s, default playhead), wait? (default true on desktop: download first; false returns {pending, done, total} until ready), timeout? (s), remote? (true: from the bucket even when a library folder has the card)} — imports the card's project and nests its composition, one undo step; a card a library folder lists applies from those files (source \"local\") → {item, layer, comp, card, source, import, needsFootage?: [{item, name, path, reason, duration, fps, missing}], hint?}. Relink needsFootage items with footage.relink {item, path}",
                 always,
                 apply
             )
@@ -389,8 +539,20 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "library.publish",
             "Publish Motion Library",
-            "{library (folder with library.json), folders? (default [\"Devin Jatho\", \"SceneYard\"]), maxFileMB? (default 90: the Worker takes uploads up to 100 MB), maxPreviewMB?, folderMaxMB? ({\"SceneYard\": 5}: per-folder file limit), includeVideo? (default false), dryRun?, force? (upload every blob again), remote? (default the configured one)} — desktop: uploads only new files, then the manifest and a bumped version → {version, previous, unchanged, cards, needsFootage, uploads, uploadBytes, blobs, totalBytes, new, changed, removed, skipped, skippedCount, errors, log}",
+            "{library (folder with library.json), folders? (default [\"Devin Jatho\", \"SceneYard\"]), maxFileMB? (default 90: the Worker takes uploads up to 100 MB), maxPreviewMB?, folderMaxMB? ({\"SceneYard\": 5}: per-folder file limit), includeVideo? (default false), catalogAll? (also list every other entry with its thumbnail only: applied on the Mac), dryRun?, force? (upload every blob again), remote? (default the configured one)} — desktop: uploads only new files, then the manifest and a bumped version → {version, previous, unchanged, cards, needsFootage, onMac, uploads, uploadBytes, blobs, totalBytes, new, changed, removed, skipped, skippedCount, errors, log}",
             publish
         ),
+        CommandSpec {
+            journal: false,
+            ..cmd!(
+                "library.saveCard",
+                "Save Card to Motion Library",
+                [],
+                None,
+                "{id (a card in this Mac's library folder), confirm? (upload even above askAboveMB), askAboveMB? (default 50), dryRun?, wait?, maxPreviewMB? (default 2), folderMaxMB? (default {\"SceneYard\": 20})} — desktop, in the background: uploads the card's files (video and big files stay home) and a new catalog version; it stays saved in later publishes → {job}; the job's result: {id, name, uploadMB, uploads, skipped: [{file, size, reason}], needsConfirm?, version?}",
+                always,
+                save_card
+            )
+        },
     ]
 }

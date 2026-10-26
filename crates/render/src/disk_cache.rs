@@ -2,8 +2,10 @@
 //! and layer cache entries kept on disk between sessions, like After Effects' disk cache.
 //!
 //! * Entries are files keyed by a 128-bit content hash (`<folder>/v1/<kind>/<2 hex>/<32 hex>.ecc`):
-//!   frames by the hash of the composition's content (the comp and everything it uses, footage
-//!   files' size and modification time included) plus frame, scale and view; layer buffers by
+//!   frames by their fingerprint ([`print_content`]: what the frame shows at its time, so an
+//!   edit changes the keys of only the frames it changes) or, for a frame without one, the hash
+//!   of the composition's content (the comp and everything it uses, footage files' size and
+//!   modification time included), plus frame, scale and view; layer buffers by
 //!   the layer cache's content key salted with the project's footage fingerprint. A changed
 //!   project therefore never reads stale pixels: its keys simply change.
 //! * Payloads are LZ4-compressed (`lz4_flex`, MIT): frames as 8-bit premultiplied RGBA, layer
@@ -26,7 +28,9 @@
 //!   entry; a missing or damaged file is just a miss. Writes run on a background thread with a
 //!   bounded queue (a full queue drops the write rather than stalling rendering). Frames are
 //!   queued uncompressed (shared with the caller, no copy) and compressed on that thread, so a
-//!   frame worker spends no time on them.
+//!   frame worker spends no time on them. Frames are stored in strips ([`crate::frame_pack`]):
+//!   the RAM preview keeps the same bytes when it compresses its frames and writes them as they
+//!   are ([`DiskCache::put_packed_frame`]); frames in the older single-block layout still read.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -285,6 +289,8 @@ enum Job {
     GuardedLayer(u128, Vec<u8>, WriteGuard),
     /// A frame to encode on the writer thread (key, width, height, 8-bit premultiplied RGBA).
     Frame(u128, u32, u32, FrameBytes),
+    /// A frame compressed already (the RAM preview's bytes, shared: written as they are).
+    Packed(u128, Arc<crate::frame_pack::PackedFrame>),
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -295,6 +301,7 @@ impl Job {
             Job::Write(_, _, p) => p.len(),
             Job::GuardedLayer(_, p, _) => p.capacity(),
             Job::Frame(_, _, _, rgba) => (**rgba).as_ref().len(),
+            Job::Packed(_, p) => p.payload().len(),
         }
     }
 }
@@ -661,24 +668,27 @@ impl DiskCache {
         self.changed();
     }
 
-    fn enqueue(&self, job: Job) {
+    /// Queue a write; `false` when it was dropped (the queue is full).
+    fn enqueue(&self, job: Job) -> bool {
         #[cfg(target_arch = "wasm32")]
         {
             self.run(job);
+            true
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (m, cv) = &*self.queue;
-            let Ok(mut q) = m.lock() else { return };
+            let Ok(mut q) = m.lock() else { return false };
             let bytes = job.bytes();
             if q.full(bytes) || (matches!(&job, Job::GuardedLayer(..)) && bytes > QUEUE_BYTES) || q.jobs.try_reserve(1).is_err() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
-                return;
+                return false;
             }
-            let Some(total) = q.bytes.checked_add(bytes) else { return };
+            let Some(total) = q.bytes.checked_add(bytes) else { return false };
             q.bytes = total;
             q.jobs.push_back(job);
             cv.notify_all();
+            true
         }
     }
 
@@ -693,6 +703,7 @@ impl DiskCache {
                     self.write_now(Kind::Frame, key, &encode_frame(w, h, (*rgba).as_ref()));
                 }
             }
+            Job::Packed(key, packed) => self.write_now(Kind::Frame, key, packed.payload()),
         }
     }
 
@@ -795,6 +806,27 @@ impl DiskCache {
         decode_frame(&p)
     }
 
+    /// A frame as it is stored (compressed, not decoded): what the RAM preview keeps. A frame
+    /// written in the older single-block layout is decoded and compressed into strips.
+    pub fn get_packed_frame(&self, key: u128) -> Option<crate::frame_pack::PackedFrame> {
+        let p = self.read(Kind::Frame, key)?;
+        if crate::frame_pack::is_packed_payload(&p) {
+            return crate::frame_pack::PackedFrame::from_payload(p);
+        }
+        let f = decode_frame(&p)?;
+        crate::frame_pack::PackedFrame::encode(f.width, f.height, &f.rgba)
+    }
+
+    /// Queue a compressed frame for writing (shared, not copied: the same bytes the RAM preview
+    /// keeps). `false` when it was not queued: on disk already, or the write queue is full
+    /// (the frame is then simply not on disk; nothing waits for room).
+    pub fn put_packed_frame(&self, key: u128, packed: Arc<crate::frame_pack::PackedFrame>) -> bool {
+        if self.contains(Kind::Frame, key) {
+            return false;
+        }
+        self.enqueue(Job::Packed(key, packed))
+    }
+
     /// Queue a frame for writing (8-bit premultiplied RGBA, `width * height * 4` bytes). The
     /// pixels are taken as they are (pass an `Arc`-backed wrapper to share them without a copy)
     /// and compressed on the writer thread: the caller returns at once.
@@ -851,6 +883,27 @@ impl DiskCache {
     /// Write a layer buffer synchronously (tests).
     pub fn put_layer_now(&self, key: u128, buf: &Buf) {
         self.write_now(Kind::Layer, key, &encode_layer(buf));
+    }
+
+    /// A decoded still (footage pixels, see [`still_key`]) written by [`DiskCache::put_still`].
+    pub fn get_still(&self, key: u128) -> Option<Image> {
+        self.get_layer(key).map(|b| b.img)
+    }
+
+    /// Queue a decoded still for writing (exact: the floats as they are). The encoding runs on a
+    /// thread of its own, not the caller's (a render waiting for its footage).
+    pub fn put_still(self: &Arc<Self>, key: u128, img: Arc<Image>) {
+        if self.contains(Kind::Layer, key) || self.queue_full() {
+            return;
+        }
+        let dc = self.clone();
+        let spawned = std::thread::Builder::new().name("still to disk".into()).spawn(move || {
+            let bytes = encode_parts(&img, [0.0; 2], 1.0);
+            dc.enqueue(Job::Write(Kind::Layer, key, bytes));
+        });
+        if let Err(e) = spawned {
+            log::debug!("disk cache: still not written ({e})");
+        }
     }
 
     /// A segmentation (chain key, scale) written by [`DiskCache::put_seg`].
@@ -1021,7 +1074,12 @@ fn verify(d: &[u8], kind: Kind) -> Option<&[u8]> {
     (checksum(body) == u64::from_le_bytes(s)).then_some(&body[8..])
 }
 
+/// A frame payload: strips ([`crate::frame_pack`], decoded in parallel and shared with the RAM
+/// preview), or for a frame that can't be cut (empty) the older single LZ4 block.
 fn encode_frame(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    if let Some(p) = crate::frame_pack::PackedFrame::encode(w, h, rgba) {
+        return p.into_payload();
+    }
     let mut out = Vec::with_capacity(rgba.len() / 2 + 16);
     out.extend_from_slice(&w.to_le_bytes());
     out.extend_from_slice(&h.to_le_bytes());
@@ -1030,6 +1088,11 @@ fn encode_frame(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 }
 
 fn decode_frame(p: &[u8]) -> Option<Frame8> {
+    if crate::frame_pack::is_packed_payload(p) {
+        let packed = crate::frame_pack::PackedFrame::from_payload(p.to_vec())?;
+        let rgba = packed.decode(1)?;
+        return Some(Frame8 { width: packed.width(), height: packed.height(), rgba });
+    }
     if p.len() < 8 {
         return None;
     }
@@ -1040,11 +1103,15 @@ fn decode_frame(p: &[u8]) -> Option<Frame8> {
 }
 
 fn encode_layer(b: &Buf) -> Vec<u8> {
-    let (w, h) = (b.img.width, b.img.height);
-    let n = b.img.data.len();
+    encode_parts(&b.img, b.offset, b.scale)
+}
+
+fn encode_parts(img: &Image, offset: [f64; 2], scale: f64) -> Vec<u8> {
+    let (w, h) = (img.width, img.height);
+    let n = img.data.len();
     // Byte planes: all first bytes of every float, then all second bytes… (compresses well).
     let mut planes = vec![0u8; n * 16];
-    for (i, px) in b.img.data.iter().enumerate() {
+    for (i, px) in img.data.iter().enumerate() {
         for c in 0..4 {
             let bytes = px[c].to_le_bytes();
             for (k, byte) in bytes.iter().enumerate() {
@@ -1055,9 +1122,9 @@ fn encode_layer(b: &Buf) -> Vec<u8> {
     let mut out = Vec::with_capacity(planes.len() / 4 + 40);
     out.extend_from_slice(&w.to_le_bytes());
     out.extend_from_slice(&h.to_le_bytes());
-    out.extend_from_slice(&b.offset[0].to_le_bytes());
-    out.extend_from_slice(&b.offset[1].to_le_bytes());
-    out.extend_from_slice(&b.scale.to_le_bytes());
+    out.extend_from_slice(&offset[0].to_le_bytes());
+    out.extend_from_slice(&offset[1].to_le_bytes());
+    out.extend_from_slice(&scale.to_le_bytes());
     out.extend_from_slice(&lz4_flex::compress_prepend_size(&planes));
     out
 }
@@ -1093,6 +1160,28 @@ fn decode_layer(p: &[u8]) -> Option<Buf> {
 
 /// Bump when rendering changes in a way that makes old disk entries wrong.
 const RENDER_VERSION: &str = "effectcraft-render-2";
+
+/// Bump when decoding stills (PNG, JPEG, PSD, SVG, PDF, …) changes their pixels: decoded stills
+/// on disk ([`still_key`]) are named by it.
+const STILL_VERSION: &str = "effectcraft-still-1";
+
+/// Disk key of a decoded still: the decoder version, the file (path, size, modification time:
+/// an edited file gets a new key) and `how` it was decoded (layer, page, alpha and float
+/// interpretation…, as the footage pool keys it). `None` when the file can't be looked at.
+pub fn still_key(path: &str, how: &str) -> Option<u128> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let mut h = Hash128::default();
+    h.write(b"ECSTILL");
+    h.write(STILL_VERSION.as_bytes());
+    h.write_u64(path.len() as u64);
+    h.write(path.as_bytes());
+    h.write_u64(meta.len());
+    h.write_u64(modified.as_secs());
+    h.write_u64(u64::from(modified.subsec_nanos()));
+    h.write(how.as_bytes());
+    Some(h.finish())
+}
 
 /// Feeds formatted text straight into a hash (no intermediate `String`).
 struct HashWriter<'a>(&'a mut Hash128);
@@ -1339,6 +1428,19 @@ pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraf
         }
     }
     h.write_u64(comp.0);
+    h.finish()
+}
+
+/// The per-frame content of a viewer frame named by its fingerprint
+/// (`Renderer::frame_fingerprint`) instead of its comp's [`comp_content_key`]: the fingerprint,
+/// the footage files' identities ([`footage_salt`]: the fingerprint names footage items, not
+/// file contents) and the comp. An edit changes it only for the frames it changes.
+pub fn print_content(print: u64, footage_salt: u64, comp: u64) -> u128 {
+    let mut h = Hash128::default();
+    h.write(b"ECFP");
+    h.write_u64(print);
+    h.write_u64(footage_salt);
+    h.write_u64(comp);
     h.finish()
 }
 

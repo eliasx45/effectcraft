@@ -201,6 +201,13 @@ fn glow_map(s: &str) -> [Option<crate::Curve>; 3] {
     [(); 3].map(|_| parts.next().and_then(crate::Curve::parse))
 }
 
+/// Glow's blur σ along x and y (buffer pixels) for a radius in buffer pixels and the layer units
+/// per comp pixel `cx`, `cy` (`EffectEnv::comp_px`): never under half a pixel.
+pub fn glow_sigmas(radius: f64, cx: f64, cy: f64) -> (f64, f64) {
+    let s = radius * GLOW_SIGMA_PER_RADIUS;
+    ((s * cx).max(0.5), (s * cy).max(0.5))
+}
+
 fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let thr = ctx.params.f("threshold") as f32 / 100.0;
     let radius = ctx.params.f("radius") * b.scale;
@@ -216,9 +223,11 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let ca = ctx.params.color("colorA");
     let cb = ctx.params.color("colorB");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
-    let s = (radius * GLOW_SIGMA_PER_RADIUS).max(0.5);
+    // Glow Radius in comp pixels on a layer whose effects size things there (see `comp_px`).
+    let [cx, cy] = ctx.env.comp_px();
+    let (sx, sy) = glow_sigmas(radius, cx, cy);
     if !ctx.adjustment {
-        b.pad((s * 3.0).ceil() as u32 + 2);
+        b.pad((sx.max(sy) * 3.0).ceil() as u32 + 2);
     }
     // Bright pass: a soft step at the threshold (see `GLOW_KNEE`). A & B Colors and the Arbitrary
     // Map glow by one value per pixel, the luminance or the alpha, coloured after the blur;
@@ -243,7 +252,7 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             *px = [r * a, g * a, bl * a, r.max(g).max(bl) * a];
         }
     });
-    let mut blurred = gaussian_blur(&bright, s * kx, s * ky, false);
+    let mut blurred = gaussian_blur(&bright, sx * kx, sy * ky, false);
     if scalar {
         // The colour follows the blurred glow's strength, so A & B Colors run across the falloff.
         blurred.data.par_iter_mut().for_each(|px| {
@@ -316,11 +325,11 @@ fn deep_glow_to_linear(px: &mut Px, unmult: bool) {
     let a = px[3];
     if unmult {
         for v in px.iter_mut().take(3) {
-            *v = effectcraft_color::srgb_to_linear(v.clamp(0.0, 1.0));
+            *v = dg_decode(v.clamp(0.0, 1.0));
         }
     } else if a > 0.0 {
         for v in px.iter_mut().take(3) {
-            *v = effectcraft_color::srgb_to_linear((*v / a).clamp(0.0, 1.0)) * a;
+            *v = dg_decode((*v / a).clamp(0.0, 1.0)) * a;
         }
     }
 }
@@ -363,6 +372,108 @@ fn bounding_box(img: &Image, nonzero: impl Fn(&Px) -> bool + Sync) -> (Option<(u
         .filter_map(|(y, r)| r.1.map(|(x0, x1)| (x0 as u32, y as u32, x1 as u32, y as u32 + 1)))
         .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)));
     (bbox, rows.into_iter().map(|r| r.0).collect())
+}
+
+/// Deep Glow's Exposure on Deep Glow 2's own scale (the same numbers as in After Effects).
+/// Projects saved with the earlier half-strength scale are halved once on open
+/// ([`crate::migrate::ALIAS_VALUE_SCALES`]).
+pub fn exposure_gain(exposure: f64) -> f32 {
+    exposure.clamp(0.0, 128.0) as f32
+}
+
+/// The linear model's encoding both ways: a plain power (Deep Glow 2's glow falloff and its
+/// coloured halos fit it better than the sRGB curve).
+pub const DEEP_GLOW_GAMMA: f32 = 2.865;
+/// Exposure's power in the linear model.
+pub const DEEP_GLOW_EXPOSURE_POWER: f32 = 1.218;
+
+/// One of Deep Glow's blur passes: its Gaussian sigma (working pixels, before Aspect Ratio),
+/// weight, whether it is blurred at the Downsample size, and the size it is blurred at
+/// otherwise (`shrink` of the working frame; see [`GlowPass::factor`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlowPass {
+    pub sigma: f64,
+    pub weight: f32,
+    pub downsample: bool,
+    pub shrink: f64,
+}
+
+impl GlowPass {
+    /// The fraction of the working frame this pass is blurred at (1 = full size), for the
+    /// effect's Downsample (0.1-1).
+    pub fn factor(&self, downsample: f64) -> f64 {
+        self.shrink * if self.downsample && downsample < 0.999 { downsample } else { 1.0 }
+    }
+}
+
+/// The linear model's size for a pass of `sigma` working pixels: halved until the sigma is under
+/// 8 px there (a soft pass loses nothing visible at the smaller size, and its blur costs a
+/// fraction: Radius 295 on a 1920 × 1080 layer, box passes 26 -> 15 ms on the GPU; within 1.5
+/// levels of the full-size passes on Deep Glow 2's white bar).
+fn glow_shrink(sigma: f64) -> f64 {
+    let mut shrink = 1.0;
+    while sigma * shrink >= 8.0 && shrink > 1.0 / 64.0 {
+        shrink *= 0.5;
+    }
+    shrink
+}
+
+/// Deep Glow's blur passes for a `radius` in working pixels at layer `scale` (shared with the
+/// GPU kernels).
+///
+/// Linear model (Gamma Correction): fitted to Deep Glow 2 in After Effects 2026 (white bar,
+/// square and 2 px line; Radius 25-1000, Exposure 0.04-2; 2.2 levels RMS, 1.4 at Radius 282 /
+/// Exposure 0.04): a 2.16 px pass plus blurs from 4.19 px growing x1.437 up to 0.1227 x Radius,
+/// the widest fading in as Radius grows (those of 24 px and more at the Downsample size, each
+/// blurred at a size where its sigma is under 8 px: [`GlowPass::shrink`]). Radius adds wider levels and leaves the ones by the
+/// edge alone, so the glow next to a shape is as bright at any Radius, as in Deep Glow 2.
+/// Without it, the older display-space profile.
+pub fn deep_glow_passes(radius: f64, scale: f64, linear_model: bool, spread: f32) -> Vec<GlowPass> {
+    if !linear_model {
+        let near = (0.30 - 0.35 * spread).max(0.05);
+        let far = 0.30 + 0.44 * spread;
+        return [(0.035, near * 13.5, false), (0.14, (1.0 - near - far) * 13.5, false), (0.42, far * 13.5, true)]
+            .map(|(sigma, weight, downsample)| GlowPass { sigma: radius * sigma, weight, downsample, shrink: 1.0 })
+            .to_vec();
+    }
+    let (first, ratio) = (4.188 * scale.max(1e-3), 1.437f64);
+    let levels = ((0.1227 * radius).max(first) / first).ln() / ratio.ln();
+    // The working frame's scale past Radius 512 (see `deep_glow`), for each pass's size there.
+    let work_scale = (512.0 / radius).min(1.0);
+    let mut passes = vec![GlowPass { sigma: 2.159 * scale.max(1e-3), weight: 1.107, downsample: false, shrink: 1.0 }];
+    let mut k = 0u32;
+    while f64::from(k) < levels + 1.0 && k < 32 {
+        let fade = (levels + 1.0 - f64::from(k)).min(1.0) as f32;
+        let sigma = first * ratio.powi(k as i32);
+        // Downsample applies to the wide passes (it only softens what is already soft).
+        passes.push(GlowPass {
+            sigma,
+            weight: 0.5479 * (-0.0600 * k as f32).exp() * fade,
+            downsample: sigma >= 24.0 * scale,
+            shrink: glow_shrink(sigma * work_scale),
+        });
+        k += 1;
+    }
+    passes
+}
+
+/// Where the linear model's power curve turns into a straight line to black (linear 1e-5,
+/// display ~4.6/255): the power's infinite slope at 0 would otherwise lift a blur's faintest
+/// tail (linear 1e-6, where the blurs end) into a visible 1-2 level edge.
+pub const DEEP_GLOW_TOE: f32 = 1e-5;
+
+/// The linear model's display -> linear and linear -> display values.
+#[inline]
+fn dg_decode(v: f32) -> f32 {
+    let knee = DEEP_GLOW_TOE.powf(1.0 / DEEP_GLOW_GAMMA);
+    let v = v.max(0.0);
+    if v < knee { v * DEEP_GLOW_TOE / knee } else { v.powf(DEEP_GLOW_GAMMA) }
+}
+#[inline]
+fn dg_encode(v: f32) -> f32 {
+    let knee = DEEP_GLOW_TOE.powf(1.0 / DEEP_GLOW_GAMMA);
+    let v = v.max(0.0);
+    if v < DEEP_GLOW_TOE { v * knee / DEEP_GLOW_TOE } else { v.powf(1.0 / DEEP_GLOW_GAMMA) }
 }
 
 /// Editable, clean-room approximation of Plugin Everything Deep Glow v1. The public product
@@ -421,10 +532,9 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         });
         return b;
     }
-    // Gamma Correction (Auto Detect, on in every SceneYard instance): the glow is built and
-    // composited in linear light. Measured with aerender on a solid pill (Radius 100 / 439,
-    // Exposure 0.3 / 1 / 1.35): three Gaussians of 0.003, 0.03 and 0.12 × Radius weighted
-    // 6.6 / 2.54 / 1.30, scaled by Exposure^0.75. Without it, the older display-space profile.
+    // Gamma Correction (Auto Detect, on by default): the glow is built and composited in
+    // linear light ([`DEEP_GLOW_GAMMA`]), with Deep Glow 2's passes ([`deep_glow_passes`])
+    // scaled by Exposure^[`DEEP_GLOW_EXPOSURE_POWER`]. Without it, the older display-space profile.
     let linear_model = ctx.params.b("PEDG-0043") || ctx.params.b("PEDG-0009");
     let convert = linear_model && !ctx.env.working_linear;
     // With Unmult the glow works on the layer as seen over black (premultiplied values), so a
@@ -453,14 +563,7 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     };
     drop(mask);
     let spread = (ctx.params.f("PEDG-0011") / 100.0).clamp(0.0, 1.0) as f32;
-    let near = (0.30 - 0.35 * spread).max(0.05);
-    let far = 0.30 + 0.44 * spread;
-    // A broad, unnormalised halo keeps thin bright strokes visible far from their source.
-    // In Screen mode the near-core term is not added (AE's Screen render keeps the inside of a
-    // glowing shape near its own colour; its halo outside matches Add).
-    let core = if ctx.params.e("PEDG-0008") == 0 { 3.0 } else { 6.6 };
-    let weights = if linear_model { [core, 2.54, 1.30] } else { [near * 13.5, (1.0 - near - far) * 13.5, far * 13.5] };
-    let sigmas = if linear_model { [0.003, 0.03, 0.12] } else { [0.035, 0.14, 0.42] };
+    let passes = deep_glow_passes(radius, b.scale, linear_model, spread);
     let aspect = ctx.params.f("PEDG-0010").clamp(0.0, 2.0);
     let chroma = if ctx.params.b("PEDG-0013") { ctx.params.f("PEDG-0015").clamp(0.0, 2.0) as f32 } else { 0.0 };
     let downsample = (ctx.params.f("PEDG-0019") / 100.0).clamp(0.1, 1.0);
@@ -475,15 +578,15 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         source
     };
     let (ww, wh) = (work_source.width, work_source.height);
-    let blurred: Vec<Sparse> = sigmas
-        .into_iter()
-        .enumerate()
-        .map(|(step, sigma)| {
-            let (sx, sy) = (radius * work_scale * sigma * aspect, radius * work_scale * sigma * (2.0 - aspect));
-            if step == 2 && downsample < 0.999 {
-                let (w, h) = ((ww as f64 * downsample).round().max(1.0) as u32, (wh as f64 * downsample).round().max(1.0) as u32);
+    let blurred: Vec<Sparse> = passes
+        .iter()
+        .map(|pass| {
+            let (sx, sy) = (pass.sigma * work_scale * aspect, pass.sigma * work_scale * (2.0 - aspect));
+            let f = pass.factor(downsample);
+            if f < 0.999 {
+                let (w, h) = ((ww as f64 * f).round().max(1.0) as u32, (wh as f64 * f).round().max(1.0) as u32);
                 let small = resample_sparse(&work_source, w, h);
-                resample_sparse(&gaussian_blur_sparse(&small, sx * downsample, sy * downsample), ww, wh)
+                resample_sparse(&gaussian_blur_sparse(&small, sx * f, sy * f), ww, wh)
             } else {
                 gaussian_blur_sparse(&work_source, sx, sy)
             }
@@ -504,12 +607,13 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let mut img = Image::new(x1 - x0, y1 - y0);
             img.rows_mut().for_each(|(ry, row)| {
                 let y = y0 + ry as u32;
-                for (step, (part, weight)) in blurred.iter().zip(weights).enumerate() {
+                for (step, (part, weight)) in blurred.iter().zip(passes.iter().map(|p| p.weight)).enumerate() {
                     let (ex, ey) = part.end();
                     if part.img.is_empty() || y < part.y || y >= ey {
                         continue;
                     }
-                    let fringe = [[1.0, 1.0, 1.0 + chroma][step], 1.0, [1.0 + chroma, 1.0, 1.0][step], 1.0];
+                    // Chromatic Aberration: the widest pass redder, the narrowest bluer.
+                    let fringe = [if step + 1 == passes.len() { 1.0 + chroma } else { 1.0 }, 1.0, if step == 0 { 1.0 + chroma } else { 1.0 }, 1.0];
                     let pw = part.img.width as usize;
                     let start = (y - part.y) as usize * pw;
                     let prow = &part.img.data[start..start + pw];
@@ -527,8 +631,8 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     };
     drop(blurred);
     let halo = if work_scale < 1.0 { resample_sparse(&halo, fw, fh) } else { halo };
-    let exposure = ctx.params.f("PEDG-0002").clamp(0.0, 64.0) as f32;
-    let exposure = if linear_model { exposure.powf(0.75) } else { exposure };
+    let exposure = exposure_gain(ctx.params.f("glowExposure"));
+    let exposure = if linear_model { exposure.powf(DEEP_GLOW_EXPOSURE_POWER) } else { exposure };
     let source_opacity = (ctx.params.f("PEDG-0024") / 100.0).clamp(0.0, 1.0) as f32;
     let screen = ctx.params.e("PEDG-0008") == 0;
     let tint = ctx.params.b("PEDG-0037");
@@ -573,11 +677,11 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let a = out[3];
             if unmult {
                 for v in out.iter_mut().take(3) {
-                    *v = effectcraft_color::linear_to_srgb(v.clamp(0.0, 1.0));
+                    *v = dg_encode(v.clamp(0.0, 1.0));
                 }
             } else if a > 0.0 {
                 for v in out.iter_mut().take(3) {
-                    *v = effectcraft_color::linear_to_srgb((*v / a).max(0.0)).min(1.0) * a;
+                    *v = dg_encode((*v / a).max(0.0)).min(1.0) * a;
                 }
             }
         }
@@ -700,10 +804,9 @@ fn deep_glow_reference(ctx: &EffectCtx, mut b: Buf) -> Buf {
         b.img = source;
         return b;
     }
-    // Gamma Correction (Auto Detect, on in every SceneYard instance): the glow is built and
-    // composited in linear light. Measured with aerender on a solid pill (Radius 100 / 439,
-    // Exposure 0.3 / 1 / 1.35): three Gaussians of 0.003, 0.03 and 0.12 × Radius weighted
-    // 6.6 / 2.54 / 1.30, scaled by Exposure^0.75. Without it, the older display-space profile.
+    // Gamma Correction (Auto Detect, on by default): the glow is built and composited in
+    // linear light ([`DEEP_GLOW_GAMMA`]), with Deep Glow 2's passes ([`deep_glow_passes`])
+    // scaled by Exposure^[`DEEP_GLOW_EXPOSURE_POWER`]. Without it, the older display-space profile.
     let linear_model = ctx.params.b("PEDG-0043") || ctx.params.b("PEDG-0009");
     let convert = linear_model && !ctx.env.working_linear;
     // With Unmult the glow works on the layer as seen over black (premultiplied values), so a
@@ -714,11 +817,11 @@ fn deep_glow_reference(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let a = px[3];
             if unmult {
                 for v in px.iter_mut().take(3) {
-                    *v = effectcraft_color::srgb_to_linear(v.clamp(0.0, 1.0));
+                    *v = dg_decode(v.clamp(0.0, 1.0));
                 }
             } else if a > 0.0 {
                 for v in px.iter_mut().take(3) {
-                    *v = effectcraft_color::srgb_to_linear((*v / a).clamp(0.0, 1.0)) * a;
+                    *v = dg_decode((*v / a).clamp(0.0, 1.0)) * a;
                 }
             }
         })
@@ -727,14 +830,7 @@ fn deep_glow_reference(ctx: &EffectCtx, mut b: Buf) -> Buf {
         to_linear(&mut source);
     }
     let spread = (ctx.params.f("PEDG-0011") / 100.0).clamp(0.0, 1.0) as f32;
-    let near = (0.30 - 0.35 * spread).max(0.05);
-    let far = 0.30 + 0.44 * spread;
-    // A broad, unnormalised halo keeps thin bright strokes visible far from their source.
-    // In Screen mode the near-core term is not added (AE's Screen render keeps the inside of a
-    // glowing shape near its own colour; its halo outside matches Add).
-    let core = if ctx.params.e("PEDG-0008") == 0 { 3.0 } else { 6.6 };
-    let weights = if linear_model { [core, 2.54, 1.30] } else { [near * 13.5, (1.0 - near - far) * 13.5, far * 13.5] };
-    let sigmas = if linear_model { [0.003, 0.03, 0.12] } else { [0.035, 0.14, 0.42] };
+    let passes = deep_glow_passes(radius, b.scale, linear_model, spread);
     let aspect = ctx.params.f("PEDG-0010").clamp(0.0, 2.0);
     let chroma = if ctx.params.b("PEDG-0013") { ctx.params.f("PEDG-0015").clamp(0.0, 2.0) as f32 } else { 0.0 };
     let downsample = (ctx.params.f("PEDG-0019") / 100.0).clamp(0.1, 1.0);
@@ -751,31 +847,27 @@ fn deep_glow_reference(ctx: &EffectCtx, mut b: Buf) -> Buf {
         source
     };
     let mut halo = Image::new(work_source.width, work_source.height);
-    for (step, (sigma, weight)) in sigmas.into_iter().zip(weights).enumerate() {
-        let (sx, sy) = (radius * work_scale * sigma * aspect, radius * work_scale * sigma * (2.0 - aspect));
-        let blurred = if step == 2 && downsample < 0.999 {
-            let (w, h) = ((work_source.width as f64 * downsample).round().max(1.0) as u32, (work_source.height as f64 * downsample).round().max(1.0) as u32);
+    for (step, pass) in passes.iter().enumerate() {
+        let weight = pass.weight;
+        let (sx, sy) = (pass.sigma * work_scale * aspect, pass.sigma * work_scale * (2.0 - aspect));
+        let f = pass.factor(downsample);
+        let blurred = if f < 0.999 {
+            let (w, h) = ((work_source.width as f64 * f).round().max(1.0) as u32, (work_source.height as f64 * f).round().max(1.0) as u32);
             let small = resample(&work_source, w, h);
-            resample(&gaussian_blur(&small, sx * downsample, sy * downsample, false), work_source.width, work_source.height)
+            resample(&gaussian_blur(&small, sx * f, sy * f, false), work_source.width, work_source.height)
         } else {
             gaussian_blur(&work_source, sx, sy, false)
         };
         halo.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(out, px)| {
             for c in 0..4 {
-                let fringe = if c == 0 {
-                    [1.0, 1.0, 1.0 + chroma][step]
-                } else if c == 2 {
-                    [1.0 + chroma, 1.0, 1.0][step]
-                } else {
-                    1.0
-                };
+                let fringe = if (c == 0 && step + 1 == passes.len()) || (c == 2 && step == 0) { 1.0 + chroma } else { 1.0 };
                 out[c] += px[c] * weight * fringe;
             }
         });
     }
     let halo = if work_scale < 1.0 { resample(&halo, b.img.width, b.img.height) } else { halo };
-    let exposure = ctx.params.f("PEDG-0002").clamp(0.0, 64.0) as f32;
-    let exposure = if linear_model { exposure.powf(0.75) } else { exposure };
+    let exposure = exposure_gain(ctx.params.f("glowExposure"));
+    let exposure = if linear_model { exposure.powf(DEEP_GLOW_EXPOSURE_POWER) } else { exposure };
     if convert {
         to_linear(&mut b.img);
     }
@@ -815,11 +907,11 @@ fn deep_glow_reference(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let a = px[3];
             if unmult {
                 for v in px.iter_mut().take(3) {
-                    *v = effectcraft_color::linear_to_srgb(v.clamp(0.0, 1.0));
+                    *v = dg_encode(v.clamp(0.0, 1.0));
                 }
             } else if a > 0.0 {
                 for v in px.iter_mut().take(3) {
-                    *v = effectcraft_color::linear_to_srgb((*v / a).max(0.0)).min(1.0) * a;
+                    *v = dg_encode((*v / a).max(0.0)).min(1.0) * a;
                 }
             }
         });
@@ -1111,21 +1203,113 @@ fn noise(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+/// Linear Wipe's feather as After Effects draws it (measured against AE 2026, LW1).
+///
+/// The edge sits at `lo + completion · (hi − lo)` along the wipe direction, where `lo`/`hi`
+/// are the layer rectangle's extreme projections (the feather does not stretch that travel).
+/// Across the edge alpha follows a Gaussian CDF with σ = [`WIPE_SIGMA_PER_FEATHER`] · feather,
+/// cut off and renormalised at ± feather. Where the edge comes within about σ of either end of
+/// the travel AE weakens the wipe toward that end: the transparent side by
+/// `s_lo = 1 − e^(−k·(c − lo)/σ)`, the opaque side by `s_hi = 1 − e^(−k·(hi − c)/σ)` with
+/// k = [`WIPE_END_RATE`], so 0 % leaves the layer whole and 100 % clears it:
+/// `alpha = 1 − s_lo · (1 − s_hi · g)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinearWipe {
+    /// Wipe direction in buffer pixels: d = x·dx + y·dy (angle 90° = left → right).
+    pub dx: f64,
+    pub dy: f64,
+    /// Edge position along d (buffer pixels).
+    pub edge: f64,
+    /// Gaussian σ (buffer pixels); 0 = a hard edge with one pixel of coverage.
+    pub sigma: f64,
+    /// Cut-off of the Gaussian (± feather, buffer pixels).
+    pub reach: f64,
+    /// Φ(−reach/σ), subtracted before renormalising the cut-off Gaussian.
+    pub tail: f64,
+    /// Strength of the wipe toward its start and its end (see the type docs).
+    pub s_lo: f64,
+    pub s_hi: f64,
+}
+
+/// σ of Linear Wipe's Gaussian feather per unit of Feather (≈ 1 / 2.58: ± feather is ± 2.58 σ).
+pub const WIPE_SIGMA_PER_FEATHER: f64 = 0.388;
+/// How fast the wipe reaches full strength away from either end of its travel, per σ.
+pub const WIPE_END_RATE: f64 = 3.4;
+
+/// Standard normal CDF via Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7); the GPU kernel
+/// evaluates the same polynomial.
+pub fn wipe_phi(z: f64) -> f64 {
+    let x = (z / std::f64::consts::SQRT_2).abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    let erf = 1.0 - poly * (-x * x).exp();
+    if z < 0.0 { 0.5 * (1.0 - erf) } else { 0.5 * (1.0 + erf) }
+}
+
+impl LinearWipe {
+    /// The wipe for `completion` (%), `angle` (°) and `feather` (layer px) over a layer of
+    /// `layer_size` layer pixels whose origin sits at `offset` in a buffer of `scale` px per
+    /// layer px (`buffer` is the buffer's size, used when the layer has no size).
+    pub fn plan(completion: f64, angle: f64, feather: f64, layer_size: [f64; 2], offset: [f64; 2], scale: f64, buffer: [f64; 2]) -> LinearWipe {
+        let fin = |v: f64, or: f64| if v.is_finite() { v } else { or };
+        let done = (fin(completion, 0.0) / 100.0).clamp(0.0, 1.0);
+        let ang = fin(angle, 0.0).to_radians();
+        let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+        let (dx, dy) = (ang.sin(), -ang.cos());
+        let (x0, y0, w, h) = if layer_size[0] > 0.0 && layer_size[1] > 0.0 && layer_size.iter().all(|v| v.is_finite()) {
+            (fin(offset[0], 0.0), fin(offset[1], 0.0), layer_size[0] * scale, layer_size[1] * scale)
+        } else {
+            (0.0, 0.0, buffer[0], buffer[1])
+        };
+        let proj = [(x0, y0), (x0 + w, y0), (x0, y0 + h), (x0 + w, y0 + h)].map(|(x, y)| x * dx + y * dy);
+        let lo = proj.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = proj.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let edge = lo + (hi - lo) * done;
+        let reach = (fin(feather, 0.0) * scale).max(0.0);
+        // Under a pixel of feather the edge is hard (one pixel of coverage), as in AE.
+        let sigma = if reach < 1.0 { 0.0 } else { WIPE_SIGMA_PER_FEATHER * reach };
+        let end = |dist: f64| if sigma > 0.0 { 1.0 - (-WIPE_END_RATE * dist.max(0.0) / sigma).exp() } else { 1.0 };
+        let tail = if sigma > 0.0 { wipe_phi(-reach / sigma) } else { 0.0 };
+        // 0 % leaves the layer whole (s_lo = 0) and 100 % clears it, whatever the feather.
+        let (s_lo, s_hi) = if done <= 0.0 {
+            (0.0, 1.0)
+        } else if done >= 1.0 {
+            (1.0, 0.0)
+        } else {
+            (end(edge - lo), end(hi - edge))
+        };
+        LinearWipe { dx, dy, edge, sigma, reach, tail, s_lo, s_hi }
+    }
+    /// Alpha factor at signed distance `t` (buffer px) past the edge (t < 0: wiped side).
+    pub fn factor(&self, t: f64) -> f64 {
+        let g = if self.sigma <= 0.0 {
+            (t + 0.5).clamp(0.0, 1.0)
+        } else if t <= -self.reach {
+            0.0
+        } else if t >= self.reach {
+            1.0
+        } else {
+            ((wipe_phi(t / self.sigma) - self.tail) / (1.0 - 2.0 * self.tail).max(1e-9)).clamp(0.0, 1.0)
+        };
+        (1.0 - self.s_lo * (1.0 - self.s_hi * g)).clamp(0.0, 1.0)
+    }
+}
+
 fn linear_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let done = ctx.params.f("completion") / 100.0;
-    let ang = ctx.params.f("angle").to_radians();
-    let feather = (ctx.params.f("feather") * b.scale).max(0.001);
-    let (w, h) = (b.img.width as f64, b.img.height as f64);
-    // Direction the wipe travels: angle 90° wipes left→right.
-    let (dx, dy) = (ang.sin(), -ang.cos());
-    let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)];
-    let proj: Vec<f64> = corners.iter().map(|(x, y)| x * dx + y * dy).collect();
-    let (lo, hi) = (proj.iter().cloned().fold(f64::INFINITY, f64::min), proj.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
-    let edge = lo - feather + (hi - lo + 2.0 * feather) * done;
+    let wipe = LinearWipe::plan(
+        ctx.params.f("completion"),
+        ctx.params.f("angle"),
+        ctx.params.f("feather"),
+        ctx.layer_size,
+        b.offset,
+        b.scale,
+        [b.img.width as f64, b.img.height as f64],
+    );
     b.img.rows_mut().for_each(|(y, row)| {
+        let yd = (y as f64 + 0.5) * wipe.dy;
         for (x, px) in row.iter_mut().enumerate() {
-            let d = (x as f64 + 0.5) * dx + (y as f64 + 0.5) * dy;
-            let k = ((d - edge) / feather + 0.5).clamp(0.0, 1.0) as f32;
+            let t = (x as f64 + 0.5) * wipe.dx - wipe.edge + yd;
+            let k = wipe.factor(t) as f32;
             for c in px.iter_mut() {
                 *c *= k;
             }
@@ -1265,7 +1449,7 @@ pub fn specs() -> Vec<EffectSpec> {
             "Stylize",
             vec![
                 p("PEDG-0001", "Radius", num(116.0), slider(0.0, 2000.0, 0.0, 500.0, 0)),
-                p("PEDG-0002", "Exposure", num(1.0), slider(0.0, 64.0, 0.0, 4.0, 2)),
+                p("glowExposure", "Exposure", num(0.04), slider(0.0, 128.0, 0.0, 4.0, 3)),
                 p("PEDG-0004", "Threshold", num(0.0), slider(0.0, 1600.0, 0.0, 100.0, 0)),
                 p("PEDG-0005", "Threshold Smooth", num(0.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
                 p("PEDG-0008", "Blend Mode", Value::Enum(0), popup(&["Screen", "Add"])),
@@ -1403,7 +1587,60 @@ pub fn specs() -> Vec<EffectSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EffectEnv, run_fx};
+    use crate::{EffectEnv, Params, run_fx};
+
+    /// Linear Wipe's feather against After Effects 2026 (LW1): alpha along y = 540 of a
+    /// 1920 × 1080 layer, read from AE's own frames. `S10 Shade L`: completion 50.598, angle
+    /// 270, feather 866.34 (AE values / 217, its 85 % opacity); footage: completion 25, angle 90,
+    /// feather 400 (layer x); a 400 px layer at 1 %, feather 40, where AE weakens the wipe
+    /// near its start. The old linear ramp was off by up to 40 levels.
+    #[test]
+    fn linear_wipe_matches_after_effects_profile() {
+        let alpha_row = |w: u32, vals: &[(&str, Value)]| {
+            let out = run_fx("ec.transition.linearwipe", vals, effectcraft_raster::Image::filled(w, 2, [1.0; 4]), 0.0, EffectEnv::default());
+            (0..w as i64).map(|x| out.img.get(x, 1)[3] as f64).collect::<Vec<_>>()
+        };
+        let n = Value::Scalar;
+        let shade = alpha_row(1920, &[("completion", n(50.59765625)), ("angle", n(270.0)), ("feather", n(866.3411458333335))]);
+        for (x, ae) in [(0, 217.0), (300, 213.0), (600, 186.0), (960, 106.0), (1200, 49.0), (1500, 9.0), (1800, 0.0)] {
+            let got = shade[x] * 217.0;
+            assert!((got - ae).abs() <= 1.5, "shade x {x}: {got:.2} vs AE {ae}");
+        }
+        let foot = alpha_row(1920, &[("completion", n(25.0)), ("angle", n(90.0)), ("feather", n(400.0))]);
+        for (x, ae) in [(0, 0.0), (120, 1.0), (300, 30.0), (480, 128.0), (660, 225.0), (900, 255.0), (1919, 255.0)] {
+            let got = foot[x] * 255.0;
+            assert!((got - ae).abs() <= 1.5, "footage x {x}: {got:.2} vs AE {ae}");
+        }
+        let start = alpha_row(400, &[("completion", n(1.0)), ("angle", n(90.0)), ("feather", n(40.0))]);
+        for (x, ae) in [(0, 168.0), (8, 198.0), (20, 235.0), (40, 254.0)] {
+            let got = start[x] * 255.0;
+            assert!((got - ae).abs() <= 2.0, "1 % x {x}: {got:.2} vs AE {ae}");
+        }
+        // 0 % leaves the layer whole and 100 % clears it, even with a feather wider than it.
+        let whole = alpha_row(400, &[("completion", n(0.0)), ("angle", n(90.0)), ("feather", n(1000.0))]);
+        let clear = alpha_row(400, &[("completion", n(100.0)), ("angle", n(90.0)), ("feather", n(1000.0))]);
+        assert!(whole.iter().all(|a| *a == 1.0) && clear.iter().all(|a| *a == 0.0));
+    }
+
+    /// The wipe travels across the layer's own rectangle, not the effect buffer: a buffer
+    /// padded by an earlier effect (layer origin at x = 300) keeps its transparent margin
+    /// transparent and puts the footage case's half-way point at layer x 480, as AE does.
+    #[test]
+    fn linear_wipe_stays_inside_the_layer_of_a_padded_buffer() {
+        let params = Params {
+            values: [("completion", 25.0), ("angle", 90.0), ("feather", 400.0)].into_iter().map(|(k, v)| (k.to_string(), Value::Scalar(v))).collect(),
+        };
+        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [1920.0, 2.0], seed: 1, adjustment: false, env: EffectEnv::default() };
+        let mut img = effectcraft_raster::Image::new(2520, 2);
+        for x in 300..2220 {
+            img.set(x, 1, [1.0; 4]);
+        }
+        let out = linear_wipe(&ctx, Buf { img, offset: [300.0, 0.0], scale: 1.0 });
+        let a = |x: i64| out.img.get(x, 1)[3] as f64;
+        assert!((0..300).chain(2220..2520).all(|x| a(x) == 0.0), "alpha outside the layer");
+        assert!((a(300 + 480) * 255.0 - 128.0).abs() <= 1.5, "{}", a(780) * 255.0);
+        assert!((a(300 + 900) * 255.0 - 255.0).abs() <= 1.0);
+    }
 
     /// A bright square on mid grey.
     fn scene() -> effectcraft_raster::Image {
@@ -1592,22 +1829,29 @@ mod tests {
     /// Glow Radius 100, Exposure 1, Add, gamma correction on): the glow lifts the inside to
     /// about (253, 162, 204) and reaches 116 / 63 / 28 (red) at 4 / 12 / 22 px outside.
     #[test]
-    fn deep_glow_matches_ae_on_a_solid_bar() {
-        let mut img = Image::new(600, 300);
-        for y in 0..300 {
-            for x in 200..416 {
-                img.set(x, y, [0.553, 0.2, 0.25, 1.0]);
+    fn deep_glow_matches_deep_glow_2_on_a_white_bar() {
+        // After Effects 2026, Deep Glow 2 defaults (Screen, Unmult, Auto Detect Gamma) on a
+        // 200 x 24 white bar over black, 8 bpc: the values below its bottom edge, d px out.
+        let mut img = Image::new(640, 360);
+        for y in 168..192 {
+            for x in 220..420 {
+                img.set(x, y, [1.0; 4]);
             }
         }
-        let set =
-            [("PEDG-0001", num(100.0)), ("PEDG-0002", num(1.0)), ("PEDG-0008", Value::Enum(1)), ("PEDG-0055", num(2.0)), ("PEDG-0031", Value::Bool(false))];
-        let o = run_fx("ec.stylize.deepglow", &set, img, 0.0, EffectEnv::default());
-        let px = |x: i64| o.img.get(x + o.offset[0] as i64, 150 + o.offset[1] as i64);
-        let inside = px(300);
-        assert!((inside[1] * 255.0 - 162.0).abs() < 12.0, "{inside:?}");
-        for (d, ae) in [(4, 116.0), (12, 63.0), (22, 28.0)] {
-            let v = px(415 + d)[0] * 255.0;
-            assert!((v - ae).abs() < 15.0, "{d} px out: {v} vs AE {ae}");
+        let cases: [(f64, f64, [f32; 6]); 3] = [
+            (282.0, 0.04, [78.0, 65.0, 56.0, 45.0, 32.0, 15.0]),
+            (100.0, 0.5, [191.0, 182.0, 126.0, 74.0, 24.0, 0.0]),
+            (25.0, 1.0, [232.0, 205.0, 63.0, 10.0, 0.0, 0.0]),
+        ];
+        for (radius, exposure, ae) in cases {
+            let set = [("PEDG-0001", num(radius)), ("glowExposure", num(exposure)), ("PEDG-0031", Value::Bool(false))];
+            let o = run_fx("ec.stylize.deepglow", &set, img.clone(), 0.0, EffectEnv::default());
+            for (d, want) in [0, 1, 7, 15, 31, 63].into_iter().zip(ae) {
+                let v = o.img.get(320 + o.offset[0] as i64, 192 + d + o.offset[1] as i64)[0] * 255.0;
+                eprintln!("ZZ r{radius} d{d}: {v:.1} vs {want}");
+                // The old v1 fit put a hot ring at the edge (Radius 282 / Exposure 0.04: 131 vs 78).
+                assert!((v - want).abs() < 24.0, "Radius {radius} Exposure {exposure}, {d} px out: {v} vs AE {want}");
+            }
         }
     }
 
@@ -1621,14 +1865,16 @@ mod tests {
         let pixel = |b: &Buf, x: i64, y: i64| b.img.get(x + b.offset[0] as i64, y + b.offset[1] as i64);
         assert!(pixel(&base, 11, 8)[0] > 0.0, "radius must create a halo");
         assert!(pixel(&base, 11, 8)[0] > pixel(&base, 11, 8)[1], "halo keeps source hue");
-        let brighter = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(2.0))]);
+        let brighter = run(&[("PEDG-0001", num(8.0)), ("glowExposure", num(4.0))]);
         assert!(pixel(&brighter, 11, 8)[0] > pixel(&base, 11, 8)[0], "exposure must brighten halo");
         let cut = run(&[("PEDG-0001", num(8.0)), ("PEDG-0004", num(200.0))]);
         assert_eq!(pixel(&cut, 11, 8)[0], 0.0, "threshold must remove dim sources");
         let source = run(&[("PEDG-0001", num(8.0)), ("PEDG-0023", Value::Enum(0))]);
         assert_eq!(pixel(&source, 11, 8)[0], 0.0, "input view must omit halo");
-        let lower_quality = run(&[("PEDG-0001", num(8.0)), ("PEDG-0019", num(75.0))]);
-        assert_ne!(pixel(&lower_quality, 11, 8), pixel(&base, 11, 8), "Downsample must change the broad halo");
+        // Downsample blurs the wide passes (24 px and more) at its size.
+        let wide = run(&[("PEDG-0001", num(400.0))]);
+        let lower_quality = run(&[("PEDG-0001", num(400.0)), ("PEDG-0019", num(75.0))]);
+        assert_ne!(pixel(&lower_quality, 40, 8), pixel(&wide, 40, 8), "Downsample must change the broad halo");
         let clipped = run(&[("PEDG-0001", num(8.0)), ("PEDG-0055", Value::Enum(0))]);
         assert_eq!(clipped.offset, [0.0, 0.0], "edge mode 0 keeps layer bounds");
         let compatible = run(&[("PEDG-0001", num(8.0)), ("PEDG-0084", Value::Enum(1))]);
@@ -1643,10 +1889,10 @@ mod tests {
         let dim_run = |mode| run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0008", native(mode))], dim.clone(), 0.0, EffectEnv::default());
         let (dim_add, dim_screen) = (dim_run(2), dim_run(1));
         assert!(pixel(&dim_add, 8, 8)[0] > pixel(&dim_screen, 8, 8)[0], "AE Blend Mode 2 (Add) lifts the source more than Screen");
-        let low_auto = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37))]);
-        let low_linear = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37)), ("PEDG-0043", Value::Bool(false))]);
+        let low_auto = run(&[("PEDG-0001", num(8.0)), ("glowExposure", num(0.74))]);
+        let low_linear = run(&[("PEDG-0001", num(8.0)), ("glowExposure", num(0.74)), ("PEDG-0043", Value::Bool(false))]);
         assert_ne!(pixel(&low_auto, 11, 8), pixel(&low_linear, 11, 8), "gamma correction changes the glow model");
-        let low_manual = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37)), ("PEDG-0043", Value::Bool(false)), ("PEDG-0009", Value::Bool(true))]);
+        let low_manual = run(&[("PEDG-0001", num(8.0)), ("glowExposure", num(0.74)), ("PEDG-0043", Value::Bool(false)), ("PEDG-0009", Value::Bool(true))]);
         assert_eq!(pixel(&low_auto, 11, 8), pixel(&low_manual, 11, 8), "manual gamma can replace auto detection");
         let tint = [("PEDG-0001", num(8.0)), ("PEDG-0037", Value::Bool(true)), ("PEDG-0038", Value::Color([0.8, 0.2, 0.5, 1.0]))];
         let standard = run(&[tint[0].clone(), tint[1].clone(), tint[2].clone(), ("PEDG-0039", native(1))]);
@@ -1690,7 +1936,7 @@ mod tests {
         }
         let set = [
             ("PEDG-0001", num(100.0)),
-            ("PEDG-0002", num(0.4)),
+            ("glowExposure", num(0.8)),
             ("PEDG-0008", Value::Enum(0)),
             ("PEDG-0025", Value::Bool(true)),
             ("PEDG-0031", Value::Bool(false)),
@@ -1733,7 +1979,7 @@ mod tests {
         let spec = crate::find("ec.stylize.deepglow");
         let mut params =
             crate::Params { values: spec.map(|s| s.params.iter().map(|p| (p.id.to_string(), crate::default_value(p, size))).collect()).unwrap_or_default() };
-        for (k, v) in [("PEDG-0001", num(150.0)), ("PEDG-0002", num(0.01))].iter().chain(vals) {
+        for (k, v) in [("PEDG-0001", num(150.0)), ("glowExposure", num(0.02))].iter().chain(vals) {
             assert!(params.values.contains_key(*k), "unknown param {k}");
             params.values.insert(k.to_string(), v.clone());
         }
@@ -1760,8 +2006,10 @@ mod tests {
     /// Edge Behaviour 1) at Full and Quarter resolution, and with the other options.
     #[test]
     fn deep_glow_matches_full_frame_reference() {
-        // Float rounding only (box sums restart per crop), far under one 8-bit level.
-        const TOLERANCE: f32 = 1e-4;
+        // Float rounding, and the faintest tail past where the cropped blurs end (linear
+        // ~1e-6, which the linear model's curve shows brighter than sRGB would): under half an
+        // 8-bit level.
+        const TOLERANCE: f32 = 2e-3;
         for scale in [1.0, 0.25] {
             let d = deep_glow_diff(&[], &ring_frame(scale), scale, EffectEnv::default());
             println!("scale {scale}: max abs diff {d:e}");
@@ -1770,11 +2018,11 @@ mod tests {
         let small = ring_frame(0.3);
         let options: [&[(&str, Value)]; 11] = [
             &[("PEDG-0025", Value::Bool(false))],
-            &[("PEDG-0031", Value::Bool(false)), ("PEDG-0008", Value::Enum(1)), ("PEDG-0002", num(1.5))],
+            &[("PEDG-0031", Value::Bool(false)), ("PEDG-0008", Value::Enum(1)), ("glowExposure", num(3.0))],
             &[("PEDG-0043", Value::Bool(false))],
             &[("PEDG-0019", num(30.0)), ("PEDG-0010", num(0.4))],
             &[("PEDG-0019", num(100.0)), ("PEDG-0013", Value::Bool(true))],
-            &[("PEDG-0001", num(1500.0)), ("PEDG-0002", num(1.0))],
+            &[("PEDG-0001", num(1500.0)), ("glowExposure", num(2.0))],
             &[("PEDG-0004", num(60.0)), ("PEDG-0005", num(20.0))],
             &[("PEDG-0037", Value::Bool(true)), ("PEDG-0039", Value::Enum(2)), ("PEDG-0024", num(40.0))],
             &[("PEDG-0055", num(0.0))],
@@ -1837,7 +2085,13 @@ mod tests {
     fn deep_glow_renders_radius_above_512() {
         let mut impulse = Image::new(9, 9);
         impulse.set(4, 4, [1.0; 4]);
-        let wide = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(1603.0)), ("PEDG-0031", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
+        let wide = run_fx(
+            "ec.stylize.deepglow",
+            &[("PEDG-0001", num(1603.0)), ("glowExposure", num(2.0)), ("PEDG-0031", Value::Bool(false))],
+            impulse,
+            0.0,
+            EffectEnv::default(),
+        );
         assert_eq!(wide.offset, [1603.0; 2]);
         assert_eq!(wide.img.width, 3215);
         // The widest Gaussian's three boxes reach ~3.6 sigma (~580 px here); past that the

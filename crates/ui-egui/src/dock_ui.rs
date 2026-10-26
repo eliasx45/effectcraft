@@ -153,9 +153,16 @@ impl EffectcraftApp {
         }
     }
 
-    /// Toggle the maximized panel (`p`, or none).
+    /// Whether the maximized panel is in `p`'s panel group (maximizing fills the area with the
+    /// whole group, tabs included).
+    pub fn group_maximized(&self, p: PanelKind) -> bool {
+        self.ui.maximized.is_some_and(|m| m == p || self.ui.dock.group_of(m).is_some_and(|(g, _)| g.contains(&p)))
+    }
+
+    /// Toggle the maximized panel group (`p`'s group, or none).
     pub fn toggle_maximize(&mut self, p: PanelKind) {
-        self.ui.maximized = if self.ui.maximized == Some(p) || !self.ui.dock.contains(p) { None } else { Some(p) };
+        self.ui.maximized_solo = false;
+        self.ui.maximized = if self.group_maximized(p) || !self.ui.dock.contains(p) { None } else { Some(p) };
     }
 
     /// The document a panel shows as a tab of its own: the Timeline's active comp.
@@ -282,7 +289,15 @@ impl EffectcraftApp {
         // The maximized panel fills the area; the tree is kept as it is.
         let maximized = self.ui.maximized.filter(|m| self.ui.dock.contains(*m));
         let mut dock = match maximized {
-            Some(m) => DockNode::Tabs { panels: vec![m], active: 0, small: self.ui.dock.small_tabs(m).unwrap_or(false) },
+            Some(m) => {
+                // The whole panel group fills the area, its tabs too, so the other panels of the
+                // group stay one click away; the group's shown tab is the maximized panel.
+                let (panels, active) = self.ui.dock.group_of(m).filter(|_| !self.ui.maximized_solo).unwrap_or((vec![m], 0));
+                if let Some(shown) = panels.get(active).copied().filter(|q| *q != m) {
+                    self.ui.maximized = Some(shown);
+                }
+                DockNode::Tabs { panels, active, small: self.ui.dock.small_tabs(m).unwrap_or(false) }
+            }
             None => std::mem::replace(&mut self.ui.dock, DockNode::Tabs { panels: vec![], active: 0, small: false }),
         };
         let mut groups = Vec::new();
@@ -401,6 +416,9 @@ impl EffectcraftApp {
                 }
                 DockAction::CloseDoc(_, id) => {
                     let _ = crate::menus::invoke(self, &ctx, "comp.close", serde_json::json!({"comp": id}));
+                }
+                DockAction::MoveDoc(_, id, before) => {
+                    let _ = crate::menus::invoke(self, &ctx, "comp.moveTab", serde_json::json!({"comp": id, "before": before}));
                 }
             }
         }

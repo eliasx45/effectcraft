@@ -24,8 +24,8 @@ pub struct Summary {
     pub peaks: Vec<[f32; 4]>,
 }
 
-/// Summaries by footage item (`None` while computing).
-#[derive(Default)]
+/// Summaries by footage item (`None` while computing). Clones share the summaries.
+#[derive(Clone, Default)]
 pub struct Cache {
     map: Arc<Mutex<HashMap<u64, Option<Arc<Summary>>>>>,
 }
@@ -41,15 +41,20 @@ pub fn audio_item(project: &Project, l: &Layer) -> Option<ItemId> {
 
 /// The summary for `item`, starting its computation on first request.
 pub fn summary(app: &EffectcraftApp, ctx: &egui::Context, item: ItemId) -> Option<Arc<Summary>> {
-    let mut m = app.waveforms.map.lock().ok()?;
+    summary_in(&app.waveforms, &app.session, ctx, item)
+}
+
+/// [`summary`] from `waveforms` for `session`'s footage (EMBED4: any host keeps its own cache).
+pub fn summary_in(waveforms: &Cache, session: &effectcraft_engine::Session, ctx: &egui::Context, item: ItemId) -> Option<Arc<Summary>> {
+    let mut m = waveforms.map.lock().ok()?;
     if let Some(s) = m.get(&item.0) {
         return s.clone();
     }
-    let ItemKind::Footage(f) = &app.session.project.item(item)?.kind else { return None };
+    let ItemKind::Footage(f) = &session.project.item(item)?.kind else { return None };
     m.insert(item.0, None);
-    let (f, footage, map, ctx) = (f.clone(), app.session.footage.clone(), app.waveforms.map.clone(), ctx.clone());
+    let (f, footage, map, ctx) = (f.clone(), session.footage.clone(), waveforms.map.clone(), ctx.clone());
     // Settings ▸ Disk ▸ Database and Cache Folder: summaries are kept on disk between sessions.
-    let cache = app.session.media_cache_folder();
+    let cache = session.media_cache_folder();
     std::thread::Builder::new()
         .name("ec-waveform".into())
         .spawn(move || {

@@ -230,13 +230,15 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!(ids.len()))
 }
 
-fn clear_clipboards(s: &mut Session) {
+/// Empty every clipboard: whatever is copied next is the only thing Paste pastes.
+pub(crate) fn clear_clipboards(s: &mut Session) {
     s.state.clipboard.clear();
     s.state.key_clipboard.clear();
     s.state.effect_clipboard.clear();
     s.state.contents_clipboard.clear();
     s.state.link_clipboard = None;
     s.state.value_clipboard.clear();
+    s.state.graph_clipboard = Default::default();
     s.state.clip_is_keys = false;
 }
 
@@ -520,6 +522,10 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(clip) = s.state.link_clipboard.clone() {
         return paste_links(s, clip);
+    }
+    // Keyframes copied, other keyframes selected: Paste puts the copied graph on them.
+    if super::anim::graph_paste_applies(s) && p.get("layers").is_none() {
+        return s.execute("keys.pasteGraph", json!({}));
     }
     if !s.state.value_clipboard.is_empty() {
         return paste_properties(s, p);

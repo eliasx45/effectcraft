@@ -55,6 +55,8 @@ pub(crate) fn scene() -> Scene {
         let mut ins = Scene { p: std::mem::take(&mut s.p), cid: inner_id, comp: inner };
         let mut l = ins.footage(50, 30);
         ins.effect(&mut l, "ec.blur.fastbox", &[("radius", n(3.0))]);
+        // Not a blur alone, so the chain stays on the GPU (a lone blur runs on the CPU).
+        ins.effect(&mut l, "ec.color.levels", &[("gamma", n(1.1))]);
         ins.push(l);
         s.p = ins.p;
     }

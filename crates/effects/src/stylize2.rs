@@ -8,7 +8,9 @@ use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
 use crate::noise::fbm;
-use crate::util::{Plane, gauss_plane, guided_filter, hash1, join, layer_rect, lerp3, lerp4, morph_frac, premul, smoothstep, split, unpremul};
+use crate::util::{
+    Plane, gauss_plane, gauss_plane_edges, guided_filter, hash1, join, layer_rect, lerp3, lerp4, morph_frac, premul, smoothstep, split, unpremul,
+};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -140,13 +142,30 @@ fn cartoon(ctx: &EffectCtx, mut b: Buf) -> Buf {
 
 // ---- Roughen Edges ----
 
+/// Noise slices per Evolution revolution: After Effects' edge is half new ~60° on and fully new
+/// by ~150°.
+const ROUGHEN_EVO_SLICES: f32 = 2.8;
+
+/// `fbm` blended linearly between Evolution slices (rescaled to keep its spread), so Evolution
+/// changes the edge at a steady speed: `fbm`'s faded z left the first degrees near each slice
+/// (0° included) almost still.
+fn evo_fbm(nx: f32, ny: f32, evo: f32, seed: u32, oct: f32) -> f32 {
+    let z = evo * ROUGHEN_EVO_SLICES;
+    let z0 = z.floor();
+    let t = z - z0;
+    let (a, b) = (fbm(nx, ny, z0, seed, oct) - 0.5, fbm(nx, ny, z0 + 1.0, seed, oct) - 0.5);
+    0.5 + (a * (1.0 - t) + b * t) / ((1.0 - t) * (1.0 - t) + t * t).sqrt()
+}
+
 fn roughen_edges(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let kind = ctx.params.e("edgeType");
     let ec = ctx.params.color("edgeColor");
     let border = ctx.params.f("border") * b.scale;
     let sharp = ctx.params.f("edgeSharpness").max(0.01) as f32;
-    let infl = ctx.params.f("fractalInfluence") as f32;
-    let scale = (ctx.params.f("scale") * b.scale * 0.1).max(0.5) as f32;
+    // Matched to After Effects 2026 (a masked rectangle, defaults, Border 30, Scale 300, Sharpness 5):
+    // its roughness is ~2.4x finer, pushes ~1.4x further and cuts ~2x harder than our first fit.
+    let infl = ctx.params.f("fractalInfluence") as f32 * 1.4;
+    let scale = (ctx.params.f("scale") * b.scale * 0.042).max(0.5) as f32;
     let (ox, oy) = b.to_px(ctx.params.v2("offset"));
     let oct = ctx.params.f("complexity") as f32;
     let evo = ctx.params.f("evolution") as f32 / 360.0;
@@ -174,7 +193,9 @@ fn roughen_edges(ctx: &EffectCtx, mut b: Buf) -> Buf {
         _ => (1.0, 1.0, 1.0, false),
     };
     let alpha = Plane::alpha(&b.img);
-    let d = if border > 0.05 { gauss_plane(&alpha, border * 0.5, border * 0.5) } else { alpha };
+    // Outside the layer counts as transparent, so a layer that fills its bounds (a solid,
+    // footage) roughens at its edges as in After Effects.
+    let d = if border > 0.05 { gauss_plane_edges(&alpha, border * 0.5, border * 0.5, false) } else { alpha };
     let extra = if kind == 4 || kind == 5 { 1.0 } else { 0.0 };
     let seed = ctx.seed ^ 0x40f1 ^ (ctx.params.f("evolutionOptions/randomSeed").round() as i64 as u32).wrapping_mul(0x9e37_79b9);
     b.img.rows_mut().for_each(|(y, row)| {
@@ -184,12 +205,12 @@ fn roughen_edges(ctx: &EffectCtx, mut b: Buf) -> Buf {
             }
             let dv = d.get(x, y);
             let (nx, ny) = ((x as f32 + 0.5 - ox as f32) / (scale * sx) * fm, (y as f32 + 0.5 - oy as f32) / (scale * sy) * fm);
-            let mut n = fbm(nx, ny, evo, seed, oct + extra);
+            let mut n = evo_fbm(nx, ny, evo, seed, oct + extra);
             if let Some(c) = cycle {
-                n += (fbm(nx, ny, evo - c, seed, oct + extra) - n) * evo_w;
+                n += (evo_fbm(nx, ny, evo - c, seed, oct + extra) - n) * evo_w;
             }
             let s = dv - 0.5 + (n - 0.5) * infl * im * 0.5;
-            let m = (s * sharp * sm * 4.0 + 0.5).clamp(0.0, 1.0);
+            let m = (s * sharp * sm * 8.0 + 0.5).clamp(0.0, 1.0);
             let (mut c, a) = unpremul(*px);
             if colored {
                 let band = 1.0 - smoothstep(0.5, 0.9, dv + (n - 0.5) * infl * 0.5);
@@ -427,6 +448,32 @@ pub fn motion_tile_growth(extra: f64, scale: f64) -> u32 {
     (extra * 0.5 * scale).round().clamp(0.0, 8192.0) as u32
 }
 
+/// A layer's Motion Tile output buffer: (width, height, offset of the layer's origin in it), for
+/// a `lw`×`lh` layer tiled out to `ow`×`oh` layer units at `scale` buffer pixels per unit, from a
+/// source buffer whose layer origin is at `src_off`. The output grows by whole pixels on each
+/// side, so its pixel grid stays on the source's: a fractional growth (Output Height 133.44% of
+/// 1080) resampled every pixel half a pixel off and blended the layer's edge row with the
+/// transparency outside it, a seam where the tiles meet.
+pub fn motion_tile_frame(lw: f64, lh: f64, ow: f64, oh: f64, scale: f64, src_off: [f64; 2]) -> (u32, u32, [f64; 2]) {
+    let axis = |l: f64, o: f64, off: f64| {
+        let grow = ((o - l) * 0.5 * scale).round().clamp(-16384.0, 16384.0);
+        let frac = if off.is_finite() { off - off.floor() } else { 0.0 };
+        let n = (2.0 * grow + l * scale + frac).round().clamp(1.0, 65536.0) as u32;
+        (n, grow + frac)
+    };
+    let (nw, ox) = axis(lw, ow, src_off[0]);
+    let (nh, oy) = axis(lh, oh, src_off[1]);
+    (nw, nh, [ox, oy])
+}
+
+/// Where Motion Tile reads a point `f` (0..1) across a layer `len` buffer pixels long, whose
+/// origin is at `off` in the source buffer: clamped to the layer's edge pixel centres, so a
+/// tile's edge never mixes in the transparency outside the layer.
+#[inline]
+pub fn motion_tile_sample(f: f64, len: f64, off: f64) -> f64 {
+    (f * len).clamp(0.5, (len - 0.5).max(0.5)) + off
+}
+
 fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
     let s = b.scale;
     let (lw, lh) = (ctx.layer_size[0], ctx.layer_size[1]);
@@ -448,7 +495,7 @@ fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
         let (ex, ey) = (motion_tile_growth(ow - lw, s), motion_tile_growth(oh - lh, s));
         (b.img.width.saturating_add(2 * ex), b.img.height.saturating_add(2 * ey), [b.offset[0] + ex as f64, b.offset[1] + ey as f64])
     } else {
-        ((ow * s).round().max(1.0) as u32, (oh * s).round().max(1.0) as u32, [(ow - lw) * 0.5 * s, (oh - lh) * 0.5 * s])
+        motion_tile_frame(lw, lh, ow, oh, s, b.offset)
     };
     let mut out = Image::new(nw, nh);
     let src = &b.img;
@@ -473,7 +520,7 @@ fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
                     fy = 1.0 - fy;
                 }
             }
-            *px = src.sample_bilinear(fx * lw * s + b.offset[0], fy * lh * s + b.offset[1]);
+            *px = src.sample_bilinear(motion_tile_sample(fx, lw * s, b.offset[0]), motion_tile_sample(fy, lh * s, b.offset[1]));
         }
     });
     Buf { img: out, offset: noff, scale: s }
@@ -860,6 +907,39 @@ mod tests {
         assert!(out.img.data.iter().zip(img.data.iter()).all(|(o, i)| o[3] <= i[3] + 1e-6));
         assert!(out.img.data.iter().zip(img.data.iter()).any(|(o, i)| o[3] < i[3] - 0.1));
         assert!((out.img.get(16, 16)[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn roughen_cuts_a_layer_that_fills_its_bounds() {
+        // A solid fills its buffer: outside the buffer counts as transparent (AE roughens it),
+        // where repeated edges left it untouched.
+        let mut img = Image::new(48, 32);
+        for y in 0..32 {
+            for x in 0..48 {
+                img.set(x, y, [1.0, 1.0, 1.0, 1.0]);
+            }
+        }
+        let out = run_at("ec.stylize.roughenedges", &[], img, 0.0).img;
+        let edge: f32 = (0..48).map(|x| out.get(x, 0)[3]).sum::<f32>() / 48.0;
+        assert!(edge < 0.9, "top row alpha {edge}");
+        assert!((out.get(24, 16)[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn roughen_evolution_moves_at_after_effects_speed() {
+        // AE: 30° changes the edge ~25% as much as 720°, 90° ~70%. A faded slice per
+        // revolution gave 6% and 22%.
+        let mut img = Image::new(96, 64);
+        for y in 16..48 {
+            for x in 16..80 {
+                img.set(x, y, [1.0, 1.0, 1.0, 1.0]);
+            }
+        }
+        let at = |deg: f64| run_at("ec.stylize.roughenedges", &[("evolution", num(deg))], img.clone(), 0.0).img;
+        let diff = |a: &Image, b: &Image| a.data.iter().zip(&b.data).map(|(p, q)| (p[3] - q[3]).abs()).sum::<f32>();
+        let base = at(0.0);
+        let (d30, d90, d720) = (diff(&base, &at(30.0)), diff(&base, &at(90.0)), diff(&base, &at(720.0)));
+        assert!(d30 > d720 * 0.12 && d90 > d720 * 0.45, "30° {d30}, 90° {d90}, 720° {d720}");
     }
 
     #[test]

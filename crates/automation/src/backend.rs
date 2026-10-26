@@ -23,6 +23,9 @@ pub struct Backend {
     /// command it runs carries this `client`, so it gets its own selection, active comp and time
     /// and can claim comps (docs/agents.md, "Several agents at once"). `None` = the user's cursor.
     client: Option<String>,
+    /// The current tool call named its `client` itself (not the server's default): only then is
+    /// a retained result of another client refused ([`Backend::saved_result`]).
+    client_named: bool,
     /// File access confined to folders (`--automation-read-root` / `--automation-write-root`).
     confinement: Option<Confinement>,
     expected_revision: Option<u64>,
@@ -51,7 +54,15 @@ pub struct Frame {
 
 impl Backend {
     pub fn headless(session: Session) -> Self {
-        Backend { kind: Kind::Headless(Box::new(session)), client: None, confinement: None, expected_revision: None, results: Default::default(), port: None }
+        Backend {
+            kind: Kind::Headless(Box::new(session)),
+            client: None,
+            client_named: false,
+            confinement: None,
+            expected_revision: None,
+            results: Default::default(),
+            port: None,
+        }
     }
 
     /// Bridge to the app's control channel at `addr` (`9877` or `127.0.0.1:9877`).
@@ -59,6 +70,7 @@ impl Backend {
         Ok(Backend {
             kind: Kind::Bridge(Box::new(BridgeClient::new(addr)?)),
             client: None,
+            client_named: false,
             confinement: None,
             expected_revision: None,
             results: Default::default(),
@@ -80,7 +92,15 @@ impl Backend {
 
     /// Drive an app through any control transport (e.g. an offscreen UI in this process).
     pub fn transport(t: impl ControlTransport + 'static) -> Self {
-        Backend { kind: Kind::Bridge(Box::new(t)), client: None, confinement: None, expected_revision: None, results: Default::default(), port: None }
+        Backend {
+            kind: Kind::Bridge(Box::new(t)),
+            client: None,
+            client_named: false,
+            confinement: None,
+            expected_revision: None,
+            results: Default::default(),
+            port: None,
+        }
     }
 
     /// Guard every engine call of a convenience tool. Atomic edits put all writes in one call.
@@ -101,7 +121,13 @@ impl Backend {
     }
 
     pub(crate) fn saved_result(&self, args: &Value) -> Result<Value> {
-        self.results.fetch(args, self.client.as_deref())
+        self.results.fetch(args, self.client.as_deref(), self.client_named)
+    }
+
+    /// Mark the current tool call as naming its own `client` (see `client_named`). Returns the
+    /// previous mark.
+    pub(crate) fn set_client_named(&mut self, named: bool) -> bool {
+        std::mem::replace(&mut self.client_named, named)
     }
 
     /// A clearly labelled observation after a write, not a substitute for its own receipt.

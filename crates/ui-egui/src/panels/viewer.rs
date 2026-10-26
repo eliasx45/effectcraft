@@ -405,6 +405,89 @@ fn project_segment(pc: &effectcraft_engine::geom::Mat4, a: effectcraft_engine::g
     s.iter().flatten().all(|v| v.is_finite()).then_some(s)
 }
 
+/// `content_bounds` of the layers the viewer draws, remembered while one document snapshot is
+/// drawn (EXPR-PERF5). A selected text layer's box used to lay the text out and run every
+/// animator selector's expressions, per unit, on the UI thread on every repaint (and again for
+/// each hit test). Entries are pure functions of the snapshot (held alive by the paint, so its
+/// address names its contents), the comp time, the expression host and the font set; the memo is
+/// only consulted inside a [`BoundsScope`] and for the snapshot that scope was opened with.
+#[derive(Default)]
+struct BoundsMemo {
+    /// The snapshot the open scope draws (address), `None` outside a scope.
+    active: Option<usize>,
+    /// (snapshot address, document revision, font revision) the entries belong to.
+    stamp: Option<(usize, u64, u64)>,
+    map: std::collections::HashMap<BoundsKey, Option<[f64; 4]>>,
+}
+
+/// (comp id, layer id, comp time, expression host address, footage address).
+type BoundsKey = (u64, u64, i64, usize, usize);
+
+/// Entries kept at most (looped playback over a few hundred frames of a few selected layers).
+const MAX_BOUNDS: usize = 8192;
+
+thread_local! {
+    static BOUNDS: std::cell::RefCell<BoundsMemo> = std::cell::RefCell::new(BoundsMemo::default());
+}
+
+/// While alive, [`layer_quad`] and [`layer_outline`] remember bounds for `project` (see
+/// [`BoundsMemo`]).
+pub(crate) struct BoundsScope;
+
+impl BoundsScope {
+    /// `project` must stay unchanged while the scope is open (the paint's own snapshot `Arc`);
+    /// `revision` is the session's document revision.
+    pub(crate) fn open(project: &effectcraft_engine::project::Project, revision: u64) -> BoundsScope {
+        let addr = project as *const effectcraft_engine::project::Project as usize;
+        // TODO(batch1-verify): an edit that changes the project in place without bumping the
+        // session revision would leave boxes stale until the time or revision changes.
+        let stamp = (addr, revision, effectcraft_engine::text::fonts::revision());
+        BOUNDS.with(|b| {
+            let mut b = b.borrow_mut();
+            if b.stamp != Some(stamp) {
+                b.map.clear();
+                b.stamp = Some(stamp);
+            }
+            b.active = Some(addr);
+        });
+        BoundsScope
+    }
+}
+
+impl Drop for BoundsScope {
+    fn drop(&mut self) {
+        BOUNDS.with(|b| b.borrow_mut().active = None);
+    }
+}
+
+/// `content_bounds(ctx, layer)`, from the memo when the open scope draws `ctx`'s snapshot and
+/// `ctx.comp` / `layer` are that snapshot's own (not stand-in copies).
+fn bounds(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 4]> {
+    let addr = ctx.project as *const effectcraft_engine::project::Project as usize;
+    let own = ctx.project.comp(ctx.comp_id).is_some_and(|c| std::ptr::eq(c, ctx.comp)) && ctx.comp.layer(layer.id).is_some_and(|l| std::ptr::eq(l, layer));
+    let fonts = effectcraft_engine::text::fonts::revision();
+    let usable = own && BOUNDS.with(|b| b.borrow().active == Some(addr) && b.borrow().stamp.is_some_and(|s| s.0 == addr && s.2 == fonts));
+    if !usable {
+        return effectcraft_engine::render::content_bounds(ctx, layer);
+    }
+    let expr = ctx.expr.map_or(0, |e| std::ptr::from_ref(e).cast::<()>() as usize);
+    let footage = ctx.footage.map_or(0, |f| std::ptr::from_ref(f).cast::<()>() as usize);
+    let key: BoundsKey = (ctx.comp_id.0, layer.id.0, ctx.time.0, expr, footage);
+    if let Some(b) = BOUNDS.with(|b| b.borrow().map.get(&key).copied()) {
+        return b;
+    }
+    // Computed outside the borrow: expressions may draw on other code that reads the memo.
+    let b = effectcraft_engine::render::content_bounds(ctx, layer);
+    BOUNDS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.map.len() >= MAX_BOUNDS {
+            m.map.clear();
+        }
+        m.map.insert(key, b);
+    });
+    b
+}
+
 /// The content box corners (layer pixels) of `layer`.
 fn box_corners(b: [f64; 4]) -> [[f64; 2]; 4] {
     [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
@@ -413,7 +496,7 @@ fn box_corners(b: [f64; 4]) -> [[f64; 2]; 4] {
 /// Layer → comp matrix and its bounds quad (in comp pixels). None for a 3D layer reaching to or
 /// behind the camera (its quad would flip; [`layer_outline`] draws the part in front).
 pub(crate) fn layer_quad(ctx: &EvalCtx, layer: &Layer) -> Option<(Mat3, [[f64; 2]; 4], [f64; 4])> {
-    let b = effectcraft_engine::render::content_bounds(ctx, layer)?;
+    let b = bounds(ctx, layer)?;
     let (m, _) = l2c(ctx, layer);
     let corners = box_corners(b);
     if corners.iter().any(|p| homogeneous(&m, *p)[2] < NEAR_W) {
@@ -428,7 +511,7 @@ pub(crate) fn layer_quad(ctx: &EvalCtx, layer: &Layer) -> Option<(Mat3, [[f64; 2
 
 /// The outline of a layer's content box in comp pixels, clipped at the camera's near plane.
 pub(crate) fn layer_outline(ctx: &EvalCtx, layer: &Layer) -> Vec<[f64; 2]> {
-    let Some(b) = effectcraft_engine::render::content_bounds(ctx, layer) else { return vec![] };
+    let Some(b) = bounds(ctx, layer) else { return vec![] };
     project_clipped(&l2c(ctx, layer).0, &box_corners(b))
 }
 
@@ -973,8 +1056,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Frame.
     let scale = app.viewer_scale(zoom, ppp);
     if !app.playback.playing {
-        // Queue the frame on screen before any prefetch.
-        app.request_frame_urgent(cid, comp.frame_rate.frame_at(app.session.time()), scale);
+        // Queue the frame on screen before any prefetch (exact: not a draft of the cloud's stream).
+        app.request_frame_exact(cid, comp.frame_rate.frame_at(app.session.time()), scale);
     }
     crate::tick_playback(app, &ctx, scale);
     let time = app.session.time();
@@ -989,8 +1072,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         // A CPU frame goes up again when the magnification calls for another factor.
         let minify = minify_factor(app.session.prefs.viewer_zoom_smooth(), scale, (zoom * ppp) as f64);
         let refit = !app.viewer_on_gpu() && app.viewer_tex.as_ref().is_some_and(|(_, _, m)| *m != minify);
-        if stale || refit {
-            show_frame(app, &ctx, k, img, minify);
+        // A GPU frame goes up again when the zoom (or the pref) asks for another FSR size (UP1).
+        let screen = f64::from(zoom * ppp);
+        let resize = app.viewer_on_gpu() && matches!(img, crate::frames::FrameImage::Gpu(_)) && app.viewer_fsr.asked != fsr_target(app, &k, &img, screen);
+        if stale || refit || resize {
+            show_frame(app, &ctx, k, img, minify, screen);
         } else if let Some((_, s)) = app.viewer_shown.as_mut() {
             // The same frame at a later revision (an edit elsewhere, an undo): it shows that one.
             // A GPU frame's texture key follows, or the viewer stops counting it as shown.
@@ -1009,8 +1095,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let snap_project = app.session.project.clone();
     let snap_expr = app.session.expr.clone();
     let ectx = EvalCtx { project: &snap_project, comp_id: cid, comp: &comp, time, expr: snap_expr.as_deref(), footage: None };
+    // Layer boxes are measured once per snapshot, time and layer (see `BoundsMemo`).
+    let _bounds = BoundsScope::open(&snap_project, app.session.revision);
     // The frame (or snapshot) through Show Channel and exposure; ROI frames cover the region.
     vt::draw_frame(app, &ctx, &painter, comp_rect, cid, &ectx);
+    // Above 100 %: the visible region at the magnification over it, once rendered.
+    crate::sharp_zoom::show(app, &ctx, &painter, &map, cid, &comp, &key);
+    // Batch 1 lane C (CX4, CX5): a hovered suggestion or Claude's version over the frame.
+    ov::agent_compare(app, &ctx, &painter, comp_rect, area, cid, scale);
     if app.ui.viewer.extended.is_some() {
         // The comp frame outlined over the extended render.
         painter.rect_stroke(comp_rect, 0.0, Stroke::new(1.0, Color32::from_gray(150)), StrokeKind::Outside);
@@ -1114,7 +1206,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.data_mut(|d| d.remove::<(LayerId, u64)>(pen_id()));
     }
     if finish || app.ui.tool != Tool::Selection {
-        ov::end_free_transform(&ctx);
+        ov::end_free_transform(app);
     }
     if app.layer_controls_visible() {
         // Settings ▸ General ▸ Path Point and Handle Size; Appearance ▸ Use Label Color for
@@ -1287,6 +1379,22 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.auto.add("viewer.warpBanner", r, &text);
     }
 
+    // Adaptive Resolution While Playing (and a scrub's coarse frames): the frame on screen is
+    // below full quality. Paused, the full frame replaces it and the badge goes.
+    if (app.playback.playing && app.playback.res.is_none()) || app.scrubbing() {
+        let full = (app.viewer_res().scale(zoom, ppp) * 1000.0).round() as u32;
+        let shown = app.viewer_shown.as_ref().filter(|(_, k)| k.comp == cid.0).map(|(_, k)| k.scale);
+        if let Some(label) = shown.and_then(|s| crate::playback_budget::draft_label(full, s)) {
+            let text = format!("Draft · {label}");
+            let galley = painter.layout_no_wrap(text.clone(), Tokens::medium(11.0), Color32::WHITE);
+            let size = galley.size() + vec2(12.0, 6.0);
+            let r = Rect::from_min_size(pos2(area.max.x - size.x - 8.0, area.min.y + 8.0), size);
+            painter.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(0xb0, 0x6a, 0x10, 0xe0));
+            painter.galley(r.min + vec2(6.0, 3.0), galley, Color32::WHITE);
+            app.auto.add("viewer.draftBadge", r, &text);
+        }
+    }
+
     // Footage that can't be decoded (no decoder for its codec / profile): say why on the layer
     // instead of leaving a black picture (#886).
     let mut notices = 0;
@@ -1312,7 +1420,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 
     // Free transform box of a path (double-click a path with the Selection tool).
-    let ft = ov::draw_free_transform(app, &ctx, &painter, &map, &paths);
+    let ft = ov::draw_free_transform(app, &painter, &map, &paths);
 
     // Cameras and lights (wireframes) and the 3D view name.
     if comp.has_3d() {
@@ -1489,6 +1597,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 Some(_) => egui::CursorIcon::Move,
                 None => egui::CursorIcon::Crosshair,
             },
+            Tool::Selection if ft.as_ref().and_then(|f| f.part_at(hp)).is_some() => match ft.as_ref().and_then(|f| f.part_at(hp)) {
+                Some(ov::FtPart::Handle(i)) => ft.as_ref().map(|f| handle_cursor(&f.quad, i)).unwrap_or(egui::CursorIcon::Move),
+                Some(ov::FtPart::Rotate) => {
+                    crate::local_assets::cursor(&ctx, "rotate", [1, 1]);
+                    egui::CursorIcon::Alias
+                }
+                _ => egui::CursorIcon::Move,
+            },
             _ => {
                 if super::tracker::hit_at(&track_hits, hp).is_some() || key_hits.iter().any(|h| h.pos.distance(hp) < 6.0) {
                     egui::CursorIcon::Move
@@ -1574,8 +1690,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             _ if app.ui.viewer.roi_draw => Some(Gesture::Overlay(ov::Drag::Roi { start: map.to_comp(press), keep: [None, None] })),
             // A region of interest handle: resize it from the opposite corner / edge.
             _ if roi_drag(app, &map, comp_rect, zoom, press).is_some() => roi_drag(app, &map, comp_rect, zoom, press).map(Gesture::Overlay),
-            Tool::Selection if ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).is_some() => {
-                ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).map(Gesture::Overlay)
+            Tool::Selection if ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map, mods.command)).is_some() => {
+                ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map, mods.command)).map(Gesture::Overlay)
             }
             Tool::PenConvert | Tool::Pen | Tool::Selection if (tool == Tool::PenConvert || mods.alt) && ov::motion_key_at(&key_hits, press).is_some() => {
                 ov::motion_key_at(&key_hits, press).and_then(|h| {
@@ -1588,6 +1704,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if matches!(ov::pen_target(&key_hits, &motion_segments, &motion_frames, press), ov::PenTarget::Key(_) | ov::PenTarget::Tangent) =>
             {
                 ov::begin_key_drag(app, &key_hits, press, map.to_comp(press), mods.shift).map(Gesture::Overlay)
+            }
+            // Pen or Convert Vertex drag on the motion path between two keys: bend it through the
+            // pointer by those keys' spatial tangents, adding no key (a click adds one).
+            Tool::Pen | Tool::PenConvert
+                if matches!(ov::pen_target(&key_hits, &motion_segments, &motion_frames, press), ov::PenTarget::AddFrame(_) | ov::PenTarget::PathFull) =>
+            {
+                ov::begin_segment_bend(app, &motion_segments, press, map.to_comp(press)).map(Gesture::Overlay)
             }
             Tool::Selection if key_hits.iter().any(|h| h.pos.distance(press) < 6.0) => {
                 ov::begin_key_drag(app, &key_hits, press, map.to_comp(press), mods.shift).map(Gesture::Overlay)
@@ -2065,6 +2188,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && let Some(pos) = resp.interact_pointer_pos()
     {
         let cpt = map.to_comp(pos);
+        // MF3: the path under a Selection click, remembered for a double-click there. The first
+        // click of a double-click inside a mask but outside its layer's pixels selects the layer
+        // behind, whose paths are not drawn, so the double-click would no longer find the mask.
+        if app.ui.tool == Tool::Selection
+            && ft.is_none()
+            && let Some((l, m)) =
+                vertex_at(pos, false).map(|h| (h.layer, h.mask)).or_else(|| ov::segment_at(&paths, &map, pos, 6.0).map(|s| (s.0, s.1))).or_else(|| {
+                    ov::closed_path_at(&paths, &map, pos).filter(|(l, _)| !comp.layer(*l).is_some_and(|ly| matches!(ly.source, LayerSource::Comp { .. })))
+                })
+            && let Some(n) = paths.iter().find(|p| p.layer == l && p.uid == m).map(|p| p.sp.vertices.len())
+        {
+            let now = ui.input(|i| i.time);
+            ui.data_mut(|d| d.insert_temp(path_click_id(), PathClick { layer: l, path: m, vertices: n, pos, time: now }));
+        }
         match app.ui.tool {
             Tool::Zoom => {
                 let k = if mods.alt { 0.5 } else { 2.0 };
@@ -2131,10 +2268,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let _ = app.session.execute("mask.convertVertex", json!({"layer": h.layer.0, "mask": h.mask, "index": h.index}));
                 }
             }
-            Tool::Selection if ft.is_some() && ft.as_ref().and_then(|f| ov::begin_ft_drag(f, pos, &map)).is_none() => {
+            Tool::Selection if ft.as_ref().is_some_and(|f| f.part_at(pos).is_none()) => {
                 // Clicking away from the free-transform box ends it.
-                ov::end_free_transform(&ctx);
+                ov::end_free_transform(app);
             }
+            // A click on the box (no drag) keeps it.
+            Tool::Selection if ft.is_some() => {}
             Tool::ObjectMatte => super::object_matte_tool::apply(app, &ectx, &map, pos, None, mods.shift),
             t if t.puppet_kind().is_some() => {
                 if let Some((h, _)) = super::puppet_tool::hit(&pin_hits, pos) {
@@ -2160,6 +2299,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let _ = app.session.execute("mask.selectVertices", json!({"vertices": [me], "add": mods.shift, "toggle": mods.shift}));
                 }
             }
+            // MF3: a click on a mask or shape path's outline keeps its layer selected, also where
+            // the outline lies outside the layer's pixels over another layer (a mask larger than
+            // its solid): picking the layer behind hid the path, so a double-click on the
+            // outline never started Free Transform Points.
+            Tool::Selection if !mods.shift && ov::segment_at(&paths, &map, pos, 6.0).is_some() => {}
             // The Roto Brush paints in the Layer panel only: select as usual and say so.
             rt if rt.roto_kind(false).is_some() => {
                 if pick(app, &ectx, cpt, mods.shift).is_none() {
@@ -2182,16 +2326,43 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && !text_owns
         && app.ui.tool == Tool::Selection
         && let Some(pos) = resp.interact_pointer_pos()
+        && ft.as_ref().is_some_and(|f| f.part_at(pos).is_some())
+    {
+        // A double-click on the free-transform box keeps it (its first click may have moved it).
+    } else if resp.double_clicked()
+        && !text_owns
+        && app.ui.tool == Tool::Selection
+        && let Some(pos) = resp.interact_pointer_pos()
         && let Some((l, m)) = vertex_at(pos, false).map(|h| (h.layer, h.mask)).or_else(|| ov::segment_at(&paths, &map, pos, 6.0).map(|s| (s.0, s.1)))
     {
         // Double-click a path: all its points selected in a free-transform box (Layer ▸ Mask and
         // Shape Path ▸ Free Transform Points), so dragging any of them, or inside the box, moves
         // the whole path (After Effects).
-        if let Some(p) = paths.iter().find(|p| p.layer == l && p.uid == m) {
-            let all: Vec<serde_json::Value> = (0..p.sp.vertices.len()).map(|index| json!({"layer": l.0, "mask": m, "index": index})).collect();
-            let _ = app.session.execute("mask.selectVertices", json!({"vertices": all}));
-        }
-        ov::begin_free_transform(&ctx, l, m);
+        free_transform_whole_path(app, &paths, l, m);
+    } else if resp.double_clicked()
+        && !text_owns
+        && app.ui.tool == Tool::Selection
+        && let Some(pos) = resp.interact_pointer_pos()
+        && let Some((l, m)) = ov::closed_path_at(&paths, &map, pos)
+        && !comp.layer(l).is_some_and(|ly| matches!(ly.source, LayerSource::Comp { .. }))
+    {
+        // Double-click inside a closed mask (or shape path) of a selected layer: the same box, so
+        // a mask can be found by its middle, not only by its outline. A precomp keeps its
+        // double-click (open it).
+        free_transform_whole_path(app, &paths, l, m);
+    } else if resp.double_clicked()
+        && !text_owns
+        && app.ui.tool == Tool::Selection
+        && let Some(pos) = resp.interact_pointer_pos()
+        && let Some(pc) = recent_path_click(ui, pos)
+    {
+        // MF3: the double-click's first click selected another layer (the point lies outside the
+        // masked layer's pixels), so its paths are gone this frame: select the layer again and
+        // free-transform the path the first click was on.
+        let _ = app.session.execute("layer.select", json!({"layers": [pc.layer.0]}));
+        let all: Vec<serde_json::Value> = (0..pc.vertices).map(|index| json!({"layer": pc.layer.0, "mask": pc.path, "index": index})).collect();
+        let _ = app.session.execute("mask.selectVertices", json!({"vertices": all}));
+        ov::begin_free_transform(app, pc.layer, pc.path);
     } else if resp.double_clicked()
         && !text_owns
         && !app.ui.tool.is_pen()
@@ -2242,6 +2413,42 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if err_h > 0.0 {
         super::expr_bar::draw(app, ui, err_bar, cid);
     }
+}
+
+/// The path a Selection click was on (MF3), for a double-click whose first click changed the
+/// layer selection.
+#[derive(Clone, Copy)]
+struct PathClick {
+    layer: LayerId,
+    path: u64,
+    vertices: usize,
+    pos: Pos2,
+    time: f64,
+}
+
+fn path_click_id() -> egui::Id {
+    egui::Id::new("viewer-path-click")
+}
+
+/// The path clicked just before (within a double-click's time, near `pos`), taken once.
+fn recent_path_click(ui: &egui::Ui, pos: Pos2) -> Option<PathClick> {
+    let now = ui.input(|i| i.time);
+    let pc = ui.data_mut(|d| {
+        let pc = d.get_temp::<PathClick>(path_click_id());
+        d.remove::<PathClick>(path_click_id());
+        pc
+    })?;
+    (pc.pos.distance(pos) < 8.0 && (now - pc.time).abs() < 1.0).then_some(pc)
+}
+
+/// Free Transform Points on a whole path (double-click its outline or inside it): all its points
+/// selected, so dragging any of them, or inside the box, moves the whole path.
+fn free_transform_whole_path(app: &mut EffectcraftApp, paths: &[ov::PathInfo], l: LayerId, m: u64) {
+    if let Some(p) = paths.iter().find(|p| p.layer == l && p.uid == m) {
+        let all: Vec<serde_json::Value> = (0..p.sp.vertices.len()).map(|index| json!({"layer": l.0, "mask": m, "index": index})).collect();
+        let _ = app.session.execute("mask.selectVertices", json!({"vertices": all}));
+    }
+    ov::begin_free_transform(app, l, m);
 }
 
 /// Parent-space position change per comp pixel of drag (x and y) for a layer: 2D layers map
@@ -2745,7 +2952,7 @@ fn create_shape(app: &mut EffectcraftApp, tool: Tool, a: [f64; 2], b: [f64; 2], 
     }
     // Into the selected shape layer's Contents as a new group (as in After Effects), else a new
     // shape layer; painted with the Tools bar's Fill and Stroke.
-    if let Err(e) = app.session.execute("shape.newShape", json!({"kind": kind, "size": [w, h], "position": [cx, cy]})) {
+    if let Err(e) = app.session.execute("shape.newShape", json!({"kind": kind, "size": [w, h], "position": [cx, cy], "addToSelected": true})) {
         app.ui.status = e.to_string();
     }
 }
@@ -2888,14 +3095,26 @@ fn rect_of(map: &ViewerMap, r: Option<[f64; 4]>) -> Rect {
     Rect::from_min_max(map.to_screen([x, y]), map.to_screen([x + w, y + h]))
 }
 
+/// UP1: the size the FSR1 pass upscales GPU frame `img` (key `key`) to at `screen` physical pixels
+/// per comp pixel (`None`: drawn as it is; see [`crate::fsr_upscale::target_size`]).
+fn fsr_target(app: &EffectcraftApp, key: &crate::frames::FrameKey, img: &crate::frames::FrameImage, screen: f64) -> Option<[u32; 2]> {
+    let crate::frames::FrameImage::Gpu(f) = img else { return None };
+    let rs = app.wgpu.as_ref()?;
+    let on = app.session.prefs.previews.upscale_low_res;
+    crate::fsr_upscale::target_size(on, [f.width, f.height], f64::from(key.scale) / 1000.0, screen, rs.device.limits().max_texture_dimension_2d)
+}
+
 /// Put a rendered frame on screen: CPU pixels go into an egui texture, averaged down by `minify`
 /// (see [`minify_factor`]); GPU frames are drawn straight from their wgpu texture (registered with
-/// egui-wgpu, no readback).
-fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames::FrameKey, img: crate::frames::FrameImage, minify: usize) {
+/// egui-wgpu, no readback), through the FSR1 upscale when they are below Full and magnified
+/// (`screen`: physical pixels per comp pixel, UP1).
+fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames::FrameKey, img: crate::frames::FrameImage, minify: usize, screen: f64) {
     use crate::frames::FrameImage;
     // Settings ▸ Previews ▸ Viewer Zoom Quality.
     let smooth = app.session.prefs.viewer_zoom_smooth();
     let opts = zoom_texture_options(smooth);
+    let asked = fsr_target(app, &key, &img, screen);
+    app.viewer_fsr.asked = asked;
     match img {
         FrameImage::Cpu(img) => {
             // Frames wider or taller than the GPU's texture limit go up averaged down too (#201).
@@ -2914,14 +3133,20 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
         }
         FrameImage::Gpu(f) => {
             let Some(rs) = &app.wgpu else { return };
-            let view = f.texture.create_view(&Default::default());
+            // UP1: below Full and magnified, the FSR1 upscale at the size on screen; else the
+            // frame itself, magnified as blocks (#882).
+            let upscaled = asked.and_then(|size| app.viewer_fsr.run(&rs.adapter, &rs.device, &rs.queue, &f.texture, size));
+            let (view, sampler) = match upscaled {
+                Some(view) => (view, crate::fsr_upscale::sampler()),
+                None => (f.texture.create_view(&Default::default()), zoom_sampler(smooth)),
+            };
             let mut ren = rs.renderer.write();
             let id = match &app.viewer_native {
                 Some((id, _, _)) => {
-                    ren.update_egui_texture_from_wgpu_texture_with_sampler_options(&rs.device, &view, zoom_sampler(smooth), *id);
+                    ren.update_egui_texture_from_wgpu_texture_with_sampler_options(&rs.device, &view, sampler, *id);
                     *id
                 }
-                None => ren.register_native_texture_with_sampler_options(&rs.device, &view, zoom_sampler(smooth)),
+                None => ren.register_native_texture_with_sampler_options(&rs.device, &view, sampler),
             };
             drop(ren);
             app.viewer_native = Some((id, key, f));
@@ -2936,6 +3161,51 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
 mod tests {
     use super::*;
     use effectcraft_engine::geom::{Mat4, vec3};
+
+    /// EXPR-PERF5: layer boxes are measured once per snapshot, time and layer while the viewer
+    /// draws, never for a stand-in copy, another snapshot or outside a paint, and the answers
+    /// are `content_bounds`'.
+    #[test]
+    fn layer_boxes_are_remembered_only_for_the_drawn_snapshot() {
+        use effectcraft_engine::project::{ItemKind, Project, Solid, build};
+        let mut p = Project::default();
+        let comp = Comp::new(200, 100, Default::default(), Tick::from_seconds_f64(10.0));
+        let cid = p.add_item("Main", effectcraft_engine::color::Label::Red, None, ItemKind::Comp(comp.clone().into()));
+        let sid =
+            p.add_item("S", effectcraft_engine::color::Label::Red, None, ItemKind::Solid(Solid { color: [1.0; 3], width: 30, height: 20, pixel_aspect: 1.0 }));
+        let l = build::layer(&mut p, &comp, "S", LayerSource::Solid { item: sid }, (30, 20), None);
+        let lid = l.id;
+        p.comp_mut(cid).unwrap().layers = vec![l].into();
+        let entries = || BOUNDS.with(|b| b.borrow().map.len());
+        let c = p.comp(cid).unwrap();
+        let layer = c.layer(lid).unwrap();
+        let ctx = EvalCtx::new(&p, cid, c, Tick::from_seconds_f64(0.5));
+        let want = effectcraft_engine::render::content_bounds(&ctx, layer);
+        assert_eq!(want, Some([0.0, 0.0, 30.0, 20.0]));
+        {
+            let _scope = BoundsScope::open(&p, 7);
+            assert_eq!(bounds(&ctx, layer), want);
+            assert_eq!(entries(), 1);
+            assert_eq!(bounds(&ctx, layer), want);
+            assert_eq!(entries(), 1, "the second call is a hit");
+            // A stand-in copy of the comp (or the layer) is measured, not remembered.
+            let copy = c.clone();
+            let cctx = EvalCtx::new(&p, cid, &copy, Tick::from_seconds_f64(0.5));
+            assert_eq!(bounds(&cctx, copy.layer(lid).unwrap()), want);
+            assert_eq!(entries(), 1);
+            // Another time is another entry.
+            assert_eq!(bounds(&ctx.at(Tick::from_seconds_f64(0.6)), layer), want);
+            assert_eq!(entries(), 2);
+        }
+        // Outside a paint nothing is remembered.
+        assert_eq!(bounds(&ctx.at(Tick::from_seconds_f64(0.7)), layer), want);
+        assert_eq!(entries(), 2);
+        // The same snapshot and revision keep the entries; a new revision drops them.
+        drop(BoundsScope::open(&p, 7));
+        assert_eq!(entries(), 2);
+        drop(BoundsScope::open(&p, 8));
+        assert_eq!(entries(), 0);
+    }
 
     /// #1544: Shift-clicking with the Pen keeps the new segment horizontal, vertical or diagonal.
     #[test]

@@ -171,6 +171,44 @@ mod tests {
         assert!(e.contains("did you mean `Gaussian Blur`"), "{e}");
     }
 
+    /// Keys selected on Deep Glow (Native), effect #2 after Gaussian Blur: the path `keys.info`
+    /// gives for them, and the match path with the dotted match id, both work with `prop.get`.
+    #[test]
+    fn selected_keys_on_a_second_dotted_effect_resolve() {
+        let mut s = crate::Session::default();
+        s.execute("comp.new", json!({"name": "C", "width": 100, "height": 100})).unwrap();
+        let l = s.execute("layer.newSolid", json!({})).unwrap()["layer"].as_u64().unwrap();
+        s.execute_checked("effect.apply", json!({"layers": [l], "effect": "Gaussian Blur"})).unwrap();
+        // One effect: its dotted match id resolves.
+        s.execute_checked("prop.get", json!({"layer": l, "path": "effects/ec.blur.gaussian/blurriness"})).unwrap();
+        s.execute_checked("effect.apply", json!({"layers": [l], "effect": "ec.stylize.deepglow"})).unwrap();
+        let mut keys = vec![];
+        for param in ["PEDG-0001", "glowExposure"] {
+            for (t, v) in [(0.0, 1.0), (1.0, 2.0)] {
+                s.execute_checked("prop.addKey", json!({"layer": l, "path": format!("effects/#2/{param}"), "time": t, "value": v})).unwrap();
+            }
+            let uid = s.execute_checked("prop.get", json!({"layer": l, "path": format!("effects/#2/{param}")})).unwrap()["uid"].clone();
+            keys.extend([json!({"layer": l, "prop": uid, "time": 0.0}), json!({"layer": l, "prop": uid, "time": 1.0})]);
+        }
+        s.execute_checked("keys.select", json!({"keys": keys})).unwrap();
+        let info = s.execute_checked("keys.info", json!({})).unwrap();
+        let info = info.as_array().unwrap();
+        assert_eq!(info.len(), 4, "{info:?}");
+        for k in info {
+            assert!(k["path"].as_str().unwrap().starts_with("effects/#2/"), "{k}");
+            assert_eq!(k["matchPath"].as_str().unwrap().split('/').nth(1), Some("ec.stylize.deepglow"), "{k}");
+            for key in ["path", "matchPath"] {
+                let r = s.execute_checked("prop.get", json!({"layer": l, "path": k[key]}));
+                assert!(r.is_ok(), "{key} {}: {r:?}", k[key]);
+            }
+        }
+        s.execute_checked("prop.get", json!({"layer": l, "path": "effects/ec.stylize.deepglow/PEDG-0001"})).unwrap();
+        s.execute_checked("prop.get", json!({"layer": l, "path": "effects/Deep Glow (Native)/exposure"})).unwrap();
+        // A dotted id that names nothing is reported whole.
+        let e = s.execute_checked("prop.get", json!({"layer": l, "path": "effects/ec.stylize.nope/exposure"})).unwrap_err().to_string();
+        assert!(e.contains("has no `ec.stylize.nope`") && e.contains("#2 (Deep Glow (Native))"), "{e}");
+    }
+
     #[test]
     fn mutations_return_what_changed() {
         let mut s = crate::Session::default();

@@ -30,7 +30,7 @@
 //! effectcraft-cli mcp [--autosave] [--bridge [PORT] | --ui] [--all-tools] [--client NAME]  MCP server on stdio
 //! effectcraft-cli figma-bridge [--port 7789] [--control 9877] local endpoint for the Figma plug-in
 //! effectcraft-cli mirror USER@HOST [--ssh-port P] [--identity KEY] [--project F.ecproj | --bridge 9877]
-//!     [--font-dir DIR] [--remote-cli PATH] [--dry-run] [--all] [--verify-hash] [--retime] [--watch SECS]
+//!     [--font-dir DIR] [--remote-cli PATH] [--dry-run] [--all] [--verify-hash] [--no-retime] [--watch SECS]
 //!     copy the media and fonts a project reads to a cloud render machine (same absolute paths), then preflight there
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
@@ -52,9 +52,11 @@
 use std::io::Write;
 
 mod asset_guard;
+mod auto_proxy;
 mod drive;
 mod figma_bridge;
 mod frame_serve;
+mod library_pull;
 mod mirror;
 #[cfg(feature = "ui")]
 mod offscreen_ui;
@@ -171,7 +173,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
       [--jpeg-quality Q] [--n N] [--duration SECS]
                                            measure a frame server: round trips, scrub latency, a soak of
                                            random requests
-  stream-bench [F.ecproj | --demo] [--comp C] [--start SECS] [--n FRAMES] [--gpu] [--scale S] [--render-only]
+  stream-bench [F.ecproj | --demo] [--comp C] [--start SECS] [--n FRAMES] [--gpu] [--scale S] [--render-only] [--proxies]
                                            render consecutive frames of a comp and time the playback
                                            stream's H.264 chunk encoding (sizes, threads, bitrate)
   stream-test --frames HOST:PORT [--token T] [F.ecproj | --demo] [--comp C] [--start SECS] [--duration SECS]
@@ -182,8 +184,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
   mirror USER@HOST [--ssh-port P] [--identity KEY] [--project F.ecproj | --bridge 9877] [--font-dir DIR]
-         [--remote-cli PATH] [--env-file PATH] [--dry-run] [--all] [--verify-hash] [--retime] [--watch SECS]
+         [--remote-cli PATH] [--env-file PATH] [--dry-run] [--all] [--verify-hash] [--no-retime] [--watch SECS]
                                            media + fonts to a cloud render machine (same paths), then cloud.preflight there
+  library-pull --jobs FILE.json             on the cloud machine: Motion Library files from the library's Worker (read token)
 options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge PORT   --json   --gpu
          --frame-threads N  render at most N frames at once (viewer frame pool, export batches;
                             default one per core, 2-16; also EFFECTCRAFT_FRAME_THREADS)
@@ -210,6 +213,8 @@ const VALUED: &[&str] = &[
     "--save-as",
     "--filter",
     "--time",
+    "--times",
+    "--disk-cache",
     "--frame",
     "--comp",
     "--max-side",
@@ -275,6 +280,7 @@ const VALUED: &[&str] = &[
 const FLAGS: &[&str] = &[
     "--rt-profile",
     "--rt-warm",
+    "--rt-checksum",
     "--hw-prores",
     "--rt-drag",
     "--rt-warmup",
@@ -285,6 +291,7 @@ const FLAGS: &[&str] = &[
     "--gpu",
     "--fixed",
     "--render-only",
+    "--proxies",
     "--list",
     "--schemas",
     "--enabled",
@@ -296,6 +303,7 @@ const FLAGS: &[&str] = &[
     "--ops",
     "--small",
     "--adv3d",
+    "--layers",
     "--autosave",
     "--all-tools",
     "--ui",
@@ -306,6 +314,7 @@ const FLAGS: &[&str] = &[
     "--all",
     "--verify-hash",
     "--retime",
+    "--no-retime",
 ];
 
 struct Args {
@@ -325,7 +334,11 @@ impl Args {
                     Some((k, v)) => (k.to_string(), Some(v.to_string())),
                     None => (a, None),
                 };
-                if VALUED.contains(&k.as_str()) {
+                // An option that is a flag in one command and takes a value in another (`bench
+                // --gpu --layers` vs `bench --ops --layers N`) is the flag when no value follows:
+                // `--layers --time 40` must not take `--time` as the value and drop the 40.
+                let bare_flag = FLAGS.contains(&k.as_str()) && inline.is_none() && it.peek().is_none_or(|n| n.starts_with("--"));
+                if VALUED.contains(&k.as_str()) && !bare_flag {
                     // `--bridge` / `--control` without a port: the app's default control port.
                     let port_default = matches!(k.as_str(), "--bridge" | "--control") && inline.is_none() && it.peek().is_none_or(|n| n.starts_with("--"));
                     let v = if port_default { Some(default_control_port()) } else { inline.or_else(|| it.next()) };
@@ -1020,6 +1033,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         "stream-test" => stream_cli::test(args)?,
         "mirror" => mirror::run(args, json_out)?,
         "drive-pull" => drive::run(args)?,
+        "library-pull" => library_pull::run(args)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())
@@ -1295,6 +1309,9 @@ fn bench_cmd(args: &Args) -> Result<(), Failure> {
         return rt_bench::run(&s, args);
         #[cfg(not(feature = "profile"))]
         return Err(Failure::Error("--rt-profile requires a CLI built with --features profile".into()));
+    }
+    if let Some(dir) = args.opt("--disk-cache") {
+        return bench_disk(&s, args, dir);
     }
     if args.flag("--gpu") {
         return bench_gpu(&s, args);
@@ -1617,6 +1634,73 @@ fn adv3d_bench_comp(p: &mut effectcraft_engine::project::Project) -> Option<Item
 /// unchanged layers: compositing cost); "viewer" is the GPU display path without readback;
 /// "auto" is Backend::Auto (Mercury GPU Acceleration) choosing per comp from measured times,
 /// warm; "up/dn MB" are the GPU's uploads / readbacks per warm GPU frame.
+/// `bench --disk-cache DIR [--gpu] [--times 30,54,…]`: the active comp's frames at each time
+/// with a layer cache kept on disk in DIR, as the app's: the first visit (from what DIR holds:
+/// nothing the first run, the layer results of the run before after a restart), then warm
+/// (median of `--n`); a checksum of the first visit's pixels and whether they equal a render
+/// without any cache. Run it twice for cold vs after a restart.
+fn bench_disk(s: &Session, args: &Args, dir: &str) -> Result<(), Failure> {
+    use effectcraft_render::Backend;
+    use effectcraft_render::disk_cache::{self, DiskCache};
+    let gpu = if args.flag("--gpu") {
+        Some(effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?)
+    } else {
+        None
+    };
+    let cid = s.active_comp_id().ok_or_else(|| Failure::Error("no composition".into()))?;
+    let n = args.num("--n")?.unwrap_or(5.0).max(1.0) as usize;
+    let scale = args.num("--scale")?.unwrap_or(1.0);
+    let times: Vec<f64> = match args.opt("--times") {
+        Some(v) => {
+            v.split(',').map(|t| t.trim().parse::<f64>().map_err(|_| Failure::Error(format!("--times: not a number: {t}")))).collect::<Result<_, _>>()?
+        }
+        None => vec![args.num("--time")?.unwrap_or(3.0)],
+    };
+    let mut project = (*s.project).clone();
+    project.settings.gpu_acceleration = gpu.is_some();
+    let project = &project;
+    let dc = DiskCache::open(dir, 20 << 30).map_err(|e| Failure::Error(format!("--disk-cache: {e}")))?;
+    let cache = LayerCache::default();
+    cache.set_disk(Some((dc.clone(), disk_cache::footage_salt(project))));
+    // Stills slow to decode persist there too, as in the app.
+    s.footage.set_still_cache(Some(dc.clone()));
+    let backend = if gpu.is_some() { Backend::Gpu } else { Backend::Cpu };
+    let render = |t: Tick, cache: Option<&LayerCache>| {
+        let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend, ..Default::default() });
+        r.expr = s.expr.as_deref();
+        r.cache = cache;
+        r.accel = gpu.as_ref().map(|g| g as &dyn effectcraft_render::Accelerator);
+        r.comp_frame(cid, t)
+    };
+    let checksum = |img: &effectcraft_render::Image| {
+        let mut h = disk_cache::Hash128::default();
+        for p in &img.data {
+            for c in p {
+                h.write_u64(u64::from(c.to_bits()));
+            }
+        }
+        h.finish() as u64
+    };
+    note!("bench --disk-cache {dir} ({}), scale {scale}: first visit, warm (median of {n}) ms/frame", if gpu.is_some() { "GPU" } else { "CPU" });
+    for secs in times {
+        let t = Tick::from_seconds_f64(secs);
+        let t0 = std::time::Instant::now();
+        let first = render(t, Some(&cache));
+        let first_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let warm = time_ms(n, || {
+            std::hint::black_box(render(t, Some(&cache)));
+        });
+        let exact = render(t, None);
+        let same = first.width == exact.width && first.height == exact.height && first.data == exact.data;
+        note!("  {secs:>7.2} s  first {first_ms:9.1}  warm {warm:8.1}  pixels {:016x} {}", checksum(&first), if same { "= uncached" } else { "≠ UNCACHED" });
+    }
+    if let Some(g) = &gpu {
+        g.wait();
+    }
+    dc.flush();
+    Ok(())
+}
+
 fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     use effectcraft_render::Backend;
     let gpu = effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?;
@@ -1676,7 +1760,10 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 std::hint::black_box(mk(Backend::Cpu, Some(&cache)));
             });
             let gcache = LayerCache::default();
-            // Traffic in steady state: after the frame that fills the layer cache.
+            // Traffic in steady state: after the frame that fills the layer cache and the one
+            // that keeps repeated content resident (`time_ms` renders once more untimed, inside
+            // the counted window, so steady state is reached before it).
+            std::hint::black_box(mk(Backend::Gpu, Some(&gcache)));
             std::hint::black_box(mk(Backend::Gpu, Some(&gcache)));
             let t0 = gpu.context().transfer_stats();
             let gpu_warm = time_ms(n, || {
@@ -1720,6 +1807,98 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
             note!(
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
+            // `--layers`: per-layer GPU times of a frame with an empty layer cache (after an edit),
+            // twice: the first pass also pays first-use costs (pipelines, pools), the second not.
+            if args.flag("--layers") {
+                for pass in ["first", "again"] {
+                    let times = effectcraft_render::LayerTimes::default();
+                    let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+                    r.expr = s.expr.as_deref();
+                    // A fresh cache: static layers take their cached-layer path, rendered now.
+                    let fresh = LayerCache::default();
+                    r.cache = Some(&fresh);
+                    r.accel = Some(&gpu);
+                    r.times = Some(&times);
+                    let t0 = std::time::Instant::now();
+                    std::hint::black_box(gpu.render_display(&r, cid, t));
+                    gpu.wait();
+                    note!("  layers, empty cache ({pass}): {:.2} ms/frame", t0.elapsed().as_secs_f64() * 1e3);
+                    let mut rows: Vec<(f64, String)> = times
+                        .into_map()
+                        .into_iter()
+                        .map(|((c, l), ms)| {
+                            let lname = project.comp(c).and_then(|cc| cc.layers.iter().find(|x| x.id == l)).map(|x| x.name.clone()).unwrap_or_default();
+                            (ms, lname)
+                        })
+                        .collect();
+                    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    for (ms, lname) in rows.iter().take(8) {
+                        note!("    {lname:<28} {ms:8.2} ms");
+                    }
+                }
+                // Playing: the frames after `t` with one cache kept between them (what playback
+                // pays per frame once a layer is cached): mean per layer over 8 frames.
+                // The app sizes its layer cache from the machine's memory (8 GB on 64 GB):
+                // EFFECTCRAFT_BENCH_CACHE_MB measures with that budget (default 1 GB).
+                let mb = std::env::var("EFFECTCRAFT_BENCH_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024);
+                let playing = LayerCache::new(mb.saturating_mul(1 << 20));
+                let step = comp.frame_rate.frame_duration();
+                let frames = 8;
+                let mut sum = std::collections::HashMap::new();
+                let mut total = 0.0;
+                for i in 0..=frames {
+                    let times = effectcraft_render::LayerTimes::default();
+                    let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+                    r.expr = s.expr.as_deref();
+                    r.cache = Some(&playing);
+                    r.accel = Some(&gpu);
+                    r.times = Some(&times);
+                    let at = Tick(t.0.saturating_add(step.0.saturating_mul(i)));
+                    // Built with `--features profile`: the first counted frame's stages (inclusive CPU
+                    // spans and GPU passes), summed by name.
+                    #[cfg(feature = "profile")]
+                    if i == 1 {
+                        effectcraft_render::profile::start();
+                    }
+                    let t0 = std::time::Instant::now();
+                    std::hint::black_box(gpu.render_display(&r, cid, at));
+                    gpu.wait();
+                    #[cfg(feature = "profile")]
+                    if i == 1 {
+                        let (events, _) = effectcraft_render::profile::finish();
+                        let mut stages: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
+                        for e in &events {
+                            let s = stages.entry(format!("{}:{}", e.cat, e.name)).or_default();
+                            s.0 += 1;
+                            s.1 += e.dur / 1000.0;
+                        }
+                        let mut stages: Vec<_> = stages.into_iter().collect();
+                        stages.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+                        for (name, (calls, ms)) in stages.iter().take(40) {
+                            note!("    stage {name:<40} {ms:9.2} ms {calls:>6} calls");
+                        }
+                    }
+                    // Frame 0 fills the cache.
+                    if i > 0 {
+                        total += t0.elapsed().as_secs_f64() * 1e3;
+                        for (k, ms) in times.into_map() {
+                            *sum.entry(k).or_insert(0.0) += ms;
+                        }
+                    }
+                }
+                note!("  layers, playing ({frames} frames after t, warm cache): {:.2} ms/frame", total / frames as f64);
+                let mut rows: Vec<(f64, String)> = sum
+                    .into_iter()
+                    .map(|((c, l), ms)| {
+                        let lname = project.comp(c).and_then(|cc| cc.layers.iter().find(|x| x.id == l)).map(|x| x.name.clone()).unwrap_or_default();
+                        (ms / frames as f64, lname)
+                    })
+                    .collect();
+                rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+                for (ms, lname) in rows.iter().take(8) {
+                    note!("    {lname:<28} {ms:8.2} ms");
+                }
+            }
         }
     }
     Ok(())
@@ -1756,6 +1935,20 @@ mod tests {
         let a = parse(&["render", "t.ecproj", "--comp=Main", "--work-area", "--out", "x.mp4", "--json"]).unwrap();
         assert_eq!((a.project.as_deref(), a.opt("--comp"), a.opt("--out")), (Some("t.ecproj"), Some("Main"), Some("x.mp4")));
         assert!(a.flag("--work-area") && a.flag("--json"));
+    }
+
+    /// `--layers` is a flag for `bench --gpu` and takes a number for `bench --ops`: followed by
+    /// another option it is the flag, so `--time 40` keeps its 40 (it used to become the value
+    /// of `--layers`, and the bench silently ran at its default time).
+    #[test]
+    fn a_flag_that_can_take_a_value_does_not_swallow_the_next_option() {
+        let a = parse(&["bench", "p.ecproj", "--gpu", "--layers", "--time", "40"]).unwrap();
+        assert!(a.flag("--layers"));
+        assert_eq!(a.num("--time").unwrap(), Some(40.0));
+        let a = parse(&["bench", "--ops", "--layers", "500"]).unwrap();
+        assert_eq!(a.num("--layers").unwrap(), Some(500.0));
+        let a = parse(&["bench", "p.ecproj", "--time", "3", "--layers"]).unwrap();
+        assert!(a.flag("--layers"));
     }
 
     /// `--bridge` without a port uses the app's control port (`EFFECTCRAFT_CONTROL_PORT`, else 9877).

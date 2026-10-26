@@ -506,12 +506,19 @@ pub(crate) fn comp_reply(mut info: Value, a: &Value) -> Result<Value> {
     Ok(info)
 }
 
-/// One `prop.get` keyframe, compact: time (layer s), value (exact), `compTime` only when it
-/// differs from `time`, `in`/`out` only when not Linear, and any warning.
+/// One `prop.get` keyframe, compact: time (layer s), its comp timecode `tc` and `frame`, value
+/// (exact), `compTime` only when it differs from `time`, `in`/`out` only when not Linear and then
+/// the `ease` readout (speed and influence per side), `continuous` (false = split handles) and
+/// `autoBezier` when set, and any warning.
 fn key_row(k: &Value) -> Value {
     let mut o = Map::new();
     if let Some(t) = k.get("time") {
         o.insert("time".into(), t.clone());
+    }
+    for f in ["tc", "frame"] {
+        if let Some(v) = k.get(f) {
+            o.insert(f.into(), v.clone());
+        }
     }
     if let Some(ct) = k.get("compTime").filter(|ct| k.get("time").is_none_or(|t| t != *ct)) {
         o.insert("compTime".into(), ct.clone());
@@ -522,6 +529,16 @@ fn key_row(k: &Value) -> Value {
     for i in ["in", "out"] {
         if let Some(v) = k.get(i).filter(|v| v.as_str() != Some("Linear")) {
             o.insert(i.into(), v.clone());
+        }
+    }
+    if o.contains_key("in") || o.contains_key("out") {
+        for f in ["ease", "continuous"] {
+            if let Some(v) = k.get(f) {
+                o.insert(f.into(), v.clone());
+            }
+        }
+        if let Some(v) = k.get("autoBezier").filter(|v| v.as_bool() == Some(true)) {
+            o.insert("autoBezier".into(), v.clone());
         }
     }
     if let Some(w) = k.get("warning") {

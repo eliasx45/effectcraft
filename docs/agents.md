@@ -135,14 +135,14 @@ requires it. Retained `get_result` snapshots do not rerun edits or need a live r
 | `command_list {filter?, enabled_only?, schemas?, brief?}` | Discover command ids, their param docs (and, with `schemas`, a JSON Schema each), and whether each can run now. The full list is ~130 KB: `brief: true` returns only `{id, label}` (~40 KB), then `describe_command` for one command. |
 | `describe_command {command \| id}` | One command in full: label, menu, shortcut, params doc, JSON `schema`, enabled / `why`. |
 | `command_run {id, params?}` | Run any command (undoable). Unknown parameter keys are rejected with the accepted list. |
-| `command_batch {steps, stop_on_error?}` | Run commands in order with per-step results; each edit has its own undo step. |
+| `command_batch {steps, stop_on_error?, verbose?}` | Run commands in order with per-step results (over 300 characters only their ids unless `verbose`) and `failedSteps`; each edit has its own undo step. |
 | `get_state` | Editor state (active comp, time, selections, tool) plus `app`: version, command and effect counts, export formats, parity summary. |
-| `run_script {code, name?, timeout?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. Stops after `timeout` seconds (default 300, `0` = none) or on `notifications/cancelled`. |
-| `doc_inspect` / `get_comp {comp?, full?, offset?, limit?, max_chars?}` | Project overview (items, active comp, time, selection, undo stack) with the active composition; one comp's settings, `layerCount` and layers. Layers are compact rows (index, id, name, type, in, out, plus only non-defaults: start, stretch, parent, trackMatte, blendMode, switch tags such as `hidden`, `3d`, `solo`), paged (default 200 a call; `next_offset` null when done, `truncated` when cut). `full: true` gives every field (`comp.info`). |
-| `get_layer {layer, comp?, time?, depth?, flat?, full?, offset?, limit?, max_chars?}` | A layer's property tree (`depth` limits how many group levels expand). Every node has a `path`. `flat: true` lists the leaves, paged (default 150; `total`, `returned`, `next_offset`); a big tree carries a `hint`. |
+| `run_script {code \| file, name?, timeout?, rollback?, context?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…), or a `.jsx` `file` (`#include` resolves next to it). Returns `{ok, result, output, error: {message, line, column}, rolledBack?, expressionErrors?}`; edits are undoable, and a script that fails undoes them all unless `rollback: false`. Stops after `timeout` seconds (default 300, `0` = none) or on `notifications/cancelled`. `context: true` adds `observedContext`. |
+| `doc_inspect` / `get_comp {comp?, full?, offset?, limit?, page_token?, summary?, max_chars?}` | Project overview (items, active comp, time, selection, undo stack) with the active composition; one comp's settings, `layerCount` and layers. Layers are compact rows (index, id, name, type, in, out, plus only non-defaults: start, stretch, parent, trackMatte, blendMode, switch tags such as `hidden`, `3d`, `solo`), paged (default 200 a call; `next_offset` null when done, `truncated` when cut). `full: true` gives every field (`comp.info`). A cut page carries `page_token`: pass it back for the next page (it pins the revision, no `expectRevision` needed). `summary: true`: settings, layers per type, hidden/parented counts and the top 20 layers. |
+| `get_layer {layer, comp?, time?, depth?, flat?, full?, offset?, limit?, page_token?, max_chars?}` | A layer's property tree (`depth` limits how many group levels expand). Every node has a `path`. `flat: true` lists the leaves, paged (default 150; `total`, `returned`, `next_offset`); a big tree carries a `hint`. |
 | `get_result {result_id, pointer?, mode?, offset?, limit?, max_chars?}` | Recover an immutable retained result by array page or exact JSON chunks, without rerunning its operation. |
-| `get_field {source, pointer, comp?, layer?, path?, time?, depth?, flat?, offset?, limit?, max_chars?}` | Exact JSON field chunks for an omitted inspection field. Pin comp/time from the original reply; concatenate `text` via byte `next_offset`, then parse JSON. |
-| `get_property {layer, path, comp?, time?, full?, offset?, limit?, max_chars?}` | A leaf property's value at a time, keyframes and expression. Keyframes are compact (`in`/`out` omitted when Linear, exact values) and paged (default 100; `keyCount`, `next_offset`); `full: true` for every key field. Group paths (for example `geometryOptions`) contain children: inspect them with `get_layer`, then query a leaf such as `geometryOptions/extrusionDepth`. |
+| `get_field {source, pointer, comp?, layer?, path?, time?, depth?, flat?, offset?, limit?, page_token?, max_chars?}` | Exact JSON field chunks for an omitted inspection field. Pin comp/time from the original reply; concatenate `text` via byte `next_offset`, then parse JSON. |
+| `get_property {layer, path, comp?, time?, full?, offset?, limit?, page_token?, max_chars?}` | A leaf property's value at a time, keyframes and expression. Keyframes are compact (`in`/`out` omitted when Linear, exact values) and paged (default 100; `keyCount`, `next_offset`); `full: true` for every key field. Group paths (for example `geometryOptions`) contain children: inspect them with `get_layer`, then query a leaf such as `geometryOptions/extrusionDepth`. |
 | `set_property {layer, path, value?, time?, timeBase?, expression?, comp?}` | Sets a static value. With `time` it sets a keyframe (`timeBase: "comp"` for comp seconds); with `expression` it sets an expression. |
 | `add_keyframe {layer, path, time+value \| keys:[...], timeBase?, interpolation?, comp?}` | Adds keys (layer seconds, or comp seconds with `timeBase: "comp"`), then optionally applies linear/bezier/hold/easyEase. |
 | `list_effects {filter?, brief?}` | Effect ids, names, categories, GPU / 32-bpc support and parameters (id, name, default, a slider's valid `range`, a popup's `options`). `brief: true` returns only `{id, name}` (~19 KB instead of ~360 KB). |
@@ -153,7 +153,7 @@ requires it. Retained `get_result` snapshots do not rerun edits or need a live r
 | `get_layout {comp?, time?, layers?, pixels?, overlaps?}` | Where layers are on screen at a time, without rendering (`layer.bounds`): `visible` (and `why` not), comp-space `bounds` [x,y,w,h], `corners`, `center`, `anchorInComp`, `onScreen` (0-1) and the layer-space `source` rect, after parenting and (3D) the active camera. `pixels` adds the drawn pixels' bounds (effects included); `overlaps` lists overlapping visible layers. |
 | `get_motion {comp?, layer? \| layers?, start?, end?, step?}` | How layers move over a time range, without rendering (`comp.motion` / `layer.motion`): per layer `segments` (enter, exit, move, hold, scale, rotate, fade-in, fade-out with times, from / to, direction, edge), `offscreen` intervals and a one-sentence `summary`, plus `overlaps` between drawn layers. See [Motion summary](#motion-summary). |
 | `analyze_audio {comp?, start?, end?, layer?, silence_db?, min_silence?, true_peak?, waveform?, width?, height?, path?}` | Measure the audio mix (`audio.analyze`): peak / true peak dBFS, RMS, integrated LUFS (BS.1770), clipped samples, silent ranges, per-channel stats; `waveform` returns a waveform image. No audio gives `hasAudio: false`. |
-| `lint_frame {comp?, time?, start?, end?, step?, rules?, min_text_px?, min_contrast?}` | Design lint (`render.lint`): plain-language design problems at one time or over a range, each with a fix hint: text too small or low-contrast, outside title / action safe, cut off, overlapping text, layers switched on but not seen, keyframes just off the music's beat. Returns `{clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}`. See [Design lint](#design-lint). |
+| `lint_frame {comp?, time?, start?, end?, step?, rules?, min_text_px?, min_contrast?, summary?}` | Design lint (`render.lint`): plain-language design problems at one time or over a range, each with a fix hint (over 40 problems, or `summary: true`: counts per rule and layer plus the 10 worst; `summary: false` lists all): text too small or low-contrast, outside title / action safe, cut off, overlapping text, layers switched on but not seen, keyframes just off the music's beat. Returns `{clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}`. See [Design lint](#design-lint). |
 | `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
 | `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `open_project {path \| demo \| new, discard?}` / `save_project {path?}` | Open and save files. |
@@ -162,7 +162,7 @@ requires it. Retained `get_result` snapshots do not rerun edits or need a live r
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
 | `batch {steps: [{command, params}], label?, atomic?}` | Several commands in one call and one undo step (`engine.batch`); `"$N.key"` in a param is step N's result (`"$1.layer"`). A failing step rolls the batch back and names the step. |
-| *(UI: `--ui` or `--bridge`)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the app window (offscreen with `--ui`, the live one with `--bridge`). |
+| *(UI: `--ui` or `--bridge`)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `render_times`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the app window (offscreen with `--ui`, the live one with `--bridge`). |
 | *(hidden aliases)* `list_commands {filter?, enabled_only?, schemas?, brief?}`, `execute_command {command \| id, params?}`, `get_project`, `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Older names of `command_list`, `command_run`, `doc_inspect` (its `project`) and `render_preview`. Callable, but not in `tools/list` unless the server runs with `mcp --all-tools`. |
 
 Layers are referenced by id (from `get_comp`), `"#n"` (1-based index from the top) or name. Comps are
@@ -262,6 +262,12 @@ Two things follow:
   dropped when another project is opened, and the control channel releases a client's claims when the
   last connection that used that `client` closes (keep one connection open, as the MCP bridge does).
   Without `client`, `comp.release` needs `force: true` (the user overriding a claim).
+
+### Seeing what the editor sees: timecode, eases, who changed what
+- **Timecode.** Key and playhead times carry `tc`, the Timeline's timecode in short form (`6:20` = 6 s 20 frames, `1:02:15` = 1 min 2 s 15 frames), and the comp `frame` next to seconds. Every time parameter (`time`, `times`, `start`, `end`, `duration`, … and `keys: [{time}]`) also takes `"6:20"`, `"0:00:06:20"`, `"200f"` or `{"frame": 200}`; plain numbers stay seconds. `render_frames` / `render.contactSheet` take `frames: [190, 200]` or `frames: {from, to, every}`.
+- **Eases.** `get_property` keys show `ease` in words (`in bezier 0/s 33.33% · out bezier 0/s 75%`, per dimension when they differ), `continuous` (false = split handles) and `autoBezier`; `full: true` gives `inEase` / `outEase` as `[{speed, influence %}]` per dimension, as the Graph Editor reads them.
+- **Who changed what.** `edit_feed` (engine `history.feed`) lists changes since a revision, each with `by` (`user`, or the agent / script client; `who` is `you` for your own) and lines such as `Card › Opacity: key @ 6:20 40 → 60`. Any other tool reply carries a one-time `notice` when the user or another agent changed the project since your last call, or `projectChanged` when another project was opened (engine `agent.notices`).
+- **One-call context.** `context.packet` returns the selection with its keys (timecode, value, eases, neighbours), related layers (`layer.related`) and the recent feed, plus a short `text`.
 
 ### Undo with several people in one project
 
@@ -388,6 +394,38 @@ and lists what is wrong, in words an agent can act on. Run it before calling a d
   envelope, tempo by autocorrelation, beats by dynamic programming); with a single `time` only the
   key moments on that frame are checked. Without audio, or without a clear beat, a `notes` entry
   says it was skipped.
+- `off-accent` (warning, only when the comp has a speech map): a keyframed property's speed-graph
+  peak (the fastest moment between two eased keyframes; linear segments have none; keyframes only,
+  no expressions) within `accentWindow` frames (default 4) of a stressed syllable's accent that
+  misses it by more than one frame. The accent is `accentLead` frames (default 1) before the
+  stressed vowel, never before the syllable's onset: Elias's hand-timed peak on "CONtent" sits at
+  the k burst + 2 frames = the vowel − 1 frame. The message names the word, the onset, the vowel
+  and the time to move the peak to.
+
+### Speech maps (timing peaks to stressed syllables)
+
+1. `scripts/fork/speech-map MEDIA --start S --dur S --fps 29.97 --out map.json`: ElevenLabs Scribe
+   text (`scribe-words`), Montreal Forced Aligner phones with stress digits, then a forward
+   acoustic snap of each word-initial and stressed onset (0.15 frames median against hand labels;
+   `~/Developer/lab/S1-speech-timing/REPORT.md`). Times are media seconds + `--offset`.
+2. `speech.import {path, layer?}` stores it on the comp (undoable, saved with the project). With
+   `layer` (the voice footage) media time is mapped through the layer's start and stretch, and
+   words outside its in/out are dropped; without it the times are taken as comp seconds.
+3. `speech.get {stressed: true, start?, end?}` lists accents (`onset`, `vowel`, `accent`,
+   `accentFrame`): where to put a speed-graph peak. `speech.accents {layer?, start?, end?}` lists
+   every speed peak with its nearest accent and `offsetFrames` (negative = early); `hit` is
+   within one frame. `render.lint {rules: ["off-accent"]}` flags the near misses.
+4. `speech.clear` removes the map.
+5. `keys.alignPeak {layer, path | paths, speech: "content" | frame | time, mode?, graph?}` moves a
+   keyframed move so its speed-graph peak (the same finder as `off-accent`) lands on the target,
+   ±0.5 frame, in one undo step. Modes: `shift` (default, both keys, duration kept), `stretch-in` /
+   `stretch-out` (keep the second / first key), `ease` (keys stay, influences change). `graph` is one
+   of Devin's five (`fast-in`, `quick-launch`, `smooth-emphasis`, `slow-launch`, `fast-out`;
+   `keys.peakGraphs` lists them with their peak positions), `keep`, or a custom
+   `{out: {speed, influence}, in: {…}}`; without it, the graph peaking where the target falls is
+   picked. Keys in a precomp: `comp` is the layer's comp, `targetComp` the comp of the frame or
+   speech map (found automatically for speech), `via` the precomp layers when nested twice. Keys
+   land on whole frames unless that misses by more than half a target frame (`onFrames: false`).
 
 Geometry is the `get_layout` geometry (track-matte sources and adjustment layers are skipped);
 only `low-contrast` renders, at most 480 px on the long side, once per sample time that shows text.
@@ -420,6 +458,7 @@ Short recipes; every step is one tool call.
 | Open an After Effects project | `command_run file.importAep {"path":"x.aep"}` (needs Python with py-aep while converting; [packaging/aep/README.md](../packaging/aep/README.md)); the result is a native project |
 | Merge another EffectCraft project | `command_run file.importProject {"path":"other.ecproj"}` → `{folder, items, comps, rootComps, primaryComp, missingMedia, warnings}` (into a folder named after the file) |
 | Reuse motion from a library | `command_run library.search {"query":"lower third"}` → `command_run library.insert {"id":"<id>","time":2}` ([libraries.md](libraries.md)) |
+| Reuse a library comp, adapted | `command_run comp.recipe {"comp":"Lower Third"}` → read and edit the recipe → `command_run comp.fromRecipe {"recipe":{…}}` ([Reuse a library comp](#reuse-a-library-comp-recipes)) |
 | Save | `save_project {"path":"out.ecproj"}` |
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
@@ -465,6 +504,70 @@ scale and rotation; nothing is rendered, so it is cheap.
   fraction; layers covering the whole frame (backgrounds) are left out.
 - Cameras, lights, nulls, hidden (Video off) and content-less layers are listed with no segments
   and a `summary` saying why.
+
+### Reuse a library comp (recipes)
+
+A finished comp from a Motion Library can be inserted whole (`library.insert`), but an agent asked
+to *reuse* it (new colours, another text, a different size) needs to know how it is made. The
+`.ecproj` holds every default (43 KB for three shape layers); a **recipe** holds only what was
+authored, in a form that reads well and rebuilds the comp exactly:
+
+1. `command_run comp.recipe {"comp": "Main"}` (or `library.get` → `file.importProject` → the
+   comp; `path` writes the recipe to a file, `layers` picks some layers, `includeDefaults`
+   lists every property).
+2. Read it, change what the brief asks for (values, text, colours, timing, layers).
+3. `command_run comp.fromRecipe {"recipe": {…}}` (or `{"path": "r.json"}`, `name?`) builds a new
+   comp, its precomps first, as one undo step, and opens it. Check it with `render_preview` or
+   `render_compare` against the original.
+
+```json
+{"format": "effectcraft-recipe", "version": 1,
+ "comp": {"name": "Main", "width": 1920, "height": 1080, "frameRate": 29.97, "duration": 2.002},
+ "layers": [
+  {"name": "Circle", "type": "shape",
+   "contents": [{"kind": "group", "name": "Ellipse 1", "contents": [{"kind": "ellipse"}, {"kind": "stroke"}, {"kind": "gfill"}]}],
+   "styles": ["innerShadow"],
+   "props": {
+    "contents/group/contents/ellipse/size": [600, 600],
+    "contents/group/contents/stroke/width": 0.7,
+    "contents/group/contents/gfill/type": "Radial",
+    "contents/group/contents/gfill/colors": {"colors": [[0, [0.6235, 0.9098, 1, 1]], [1, [0.102, 0.1216, 0.4196, 1]]], "opacities": [[0, 1], [1, 1]]},
+    "layerStyles/innerShadow/size": 70,
+    "transform/position": [610, 540],
+    "transform/scale": {"keys": [{"time": 0, "value": [0, 0], "in": "easy", "out": "easy"},
+                                 {"time": 0.2669, "value": [115, 115], "in": "easy", "out": "easy"}]}}}]}
+```
+
+- **Layers** are listed top first. `type` is `shape`, `solid` (`color`, `size`), `text`
+  (`text`: what differs from a new text layer's Source Text, or just a string), `null`, `camera`,
+  `light` (`light`: Spot…), `primitive`, `footage` / `model` (`file`, `footage`: the item's
+  interpretation) or `precomp` (`comp`: a name from `precomps`, the nested comps' own recipes).
+  Timing (`start`, `in`, `out`, seconds), `parent` and `trackMatte` (`{layer, kind}`, layers by
+  name or `"#n"`, the n-th layer of the recipe), `blendMode`, `switches` and other layer
+  settings appear only when they differ from a new layer's.
+- **Structure** comes before values, in order: `contents` (shape items by kind: `group` with
+  its own `contents`, `rect`, `ellipse`, `star`, `polygon`, `path`, `fill`, `stroke`, `gfill`,
+  `gstroke`, `trim`, `repeater`, `round`, `offset`, `pucker`, `twist`, `zigzag`, `wiggle`, `merge`),
+  `effects` (`{effect: "ec.blur.gaussian"}`, then `effects/#1/…` paths), `masks` (`{mode?,
+  inverted?…}`), `styles` (layer style ids) and text `animators` (`{props: [position, opacity…],
+  selectors?}`). `name` / `enabled` appear when they aren't the default.
+- **`props`** holds only the properties whose value differs from a freshly made item of the same
+  kind, by path (the paths of `effectcraft-cli props` / `get_layer {"flat":true}`). A value is a
+  number, an array (2D layers leave out a default z; colours leave out alpha 1), a popup's option
+  name (`"Radial"`), a gradient, a path or a layer reference. An animated property is `{keys:
+  [{time, value, in?, out?}]}` with layer-time seconds and `in` / `out` easing `easy`, `hold`,
+  `bezier` or `[[speed, influence]…]` (linear when absent); an expression adds `expr`. `groups`
+  holds renamed or switched-off property groups by path.
+- Numbers are rounded to 4 decimals; times are exact (a time that lands on a frame is written to
+  4 decimals and read back as that frame). A rebuilt comp renders like the original within one
+  8-bit level, and `comp.recipe` of it is the same recipe.
+- What the menus' factories can't build (a stroke with extra dashes, a plug-in effect that isn't
+  installed, a tracker…) is a `raw` entry: the property group as stored. What can't come back at
+  all is listed in `unsupported` (`{comp, layer?, what, why}`): a footage file that isn't on this
+  machine (the layer comes back offline), a footage proxy, Essential Graphics and Essential
+  Properties overrides (they point at property uids), parents, mattes and layer parameters that
+  point at layers left out with `layers`.
+- Mistakes in a hand-written recipe are errors that name the layer and path and change nothing.
 
 ### Pitfalls
 

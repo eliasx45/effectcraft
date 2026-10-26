@@ -4,7 +4,8 @@
 //! `commands/lint_cmds.rs`; the rules are here.
 //!
 //! The rules ([`RULES`]), checked at each sample time on the comp's own layers (precomps are
-//! one layer each; track-matte sources and adjustment layers are skipped):
+//! one layer each, except for the nested rules; track-matte sources and adjustment layers are
+//! skipped):
 //! - `text-too-small`: the smallest drawn character's font size in comp pixels (the em size
 //!   carried through the character's animator transform, the layer's transform, its parents and
 //!   the camera: what a "72 px" font becomes on screen; cap height is about 70 % of it) is below
@@ -21,6 +22,24 @@
 //!   info for other layers. Layers that cover the whole frame (backgrounds) are skipped.
 //! - `text-overlap`: two visible text layers' boxes overlap by more than 2 % of the smaller one
 //!   (warning; `other` is the second layer).
+//! - `text-off-centre`: a text layer sits in a card (the smallest drawn non-text layer below it
+//!   whose box holds the text's, not a full-frame background) and its glyph box's centre is more
+//!   than 1.5 px off the card's centre, measured along the card's own axes: vertically when the
+//!   card is at most 3 text heights tall (a pill or one-line card), horizontally when the text
+//!   is centre-justified. Warning; `other` is the card. A text whose layer or parents are keyed
+//!   is measured at its rest pose ([`rest_poses`]: the latest keyframe where nothing of it moves
+//!   and it is fully visible), not mid-pop. The message gives the move in the layer's own
+//!   Position units and, for one text with a static Position, [`Finding::fix`] is the `prop.set`.
+//! - `nested-cut-off` ([`lint_nested`]): a layer inside a precomp, measured in this comp's frame
+//!   through the precomp layers' transforms, is partly outside this comp's frame, or partly
+//!   outside its precomp's frame (which clips it unless Collapse Transformations is on).
+//!   Warning for text, info for other layers; the nested layer is [`Finding::inner`]. Text
+//!   inside precomps also gets `text-too-small` and `outside-title-safe`, measured the same way.
+//! - `exposed-edge`: with the comp rendered (only at times its layers' boxes claim 90 % of the
+//!   frame, so overlay comps are skipped), an empty strip of at least 1 px along a frame edge
+//!   while at most a quarter of the frame is empty (a full-screen shot scaled or shaken off the
+//!   frame), or 1 % or more of the frame empty between two fully covered samples (a gap in a
+//!   transition). Warning, on the layer meant to fill the frame.
 //! - `hidden-visible`: a layer with its Video switch on, inside its in/out range, that shows
 //!   nothing: opacity 0, entirely outside the frame, or entirely covered by an opaque layer above
 //!   it (simple cases only: a solid, or footage whose alpha is ignored, at 100 % opacity, Normal
@@ -28,18 +47,48 @@
 //! - `off-beat`: with audio, a key moment (a transform or opacity keyframe, or a layer's in
 //!   point after the comp start) within half a beat of a beat that misses it by more than one
 //!   frame. Beats come from [`detect_beats`] on the comp's audio mix. Warning.
+//! - `off-accent`: with a speech map (`speech.import`), a keyframed property's speed-graph peak
+//!   ([`speed_peaks_deep`]: also inside precomps) within a few frames (default 4) of a stressed syllable's accent
+//!   ([`accent_time`]: one frame before its vowel, never before its onset) that misses it by
+//!   more than one frame. Warning; an error when the agent linting made those keys (its undo
+//!   steps changed that property), so its own off-accent moves block a handover.
+//! - `exit-at-cut` ([`exit_tail`], [`exit_at_cut`]): the comp's end, from every frame of its
+//!   last 300 frames. In a full-screen cutaway (its layers over the base shot, the footage with sound
+//!   at the bottom, cover the frame), layers fading, scaling or moving out into the last 2
+//!   frames, or everything gone before the end while the comp runs on: warning ("hold to the
+//!   end and hard-cut"). In an overlay comp only leaving early is noted (info).
+//! - `off-taste`: a keyframed move of this comp's layers whose ease is off Elias's profile
+//!   ([`crate::taste`]: linear, Easy Ease, a speed jump, baked keys, or outside his learned
+//!   ranges). Error when its move type has enough approved curves to block a handover, else
+//!   warning; a move in his range that isn't one of his approved curves is info. Precomps are
+//!   not searched (check them with `taste.check` on the precomp).
 
-use effectcraft_geom::vec2;
+use effectcraft_geom::{Mat3, vec2};
 use effectcraft_project::{AlphaMode, Comp, ItemId, ItemKind, Layer, LayerId, LayerSource, Project};
 use effectcraft_raster::Image;
-use effectcraft_render::EvalCtx;
+use effectcraft_render::{EvalCtx, Renderer};
 use effectcraft_time::Tick;
 
 use crate::layout;
+use crate::precomp_time::{self, Hop};
 
 /// Every rule id, in report order.
-pub const RULES: [&str; 8] =
-    ["text-too-small", "low-contrast", "outside-title-safe", "outside-action-safe", "cut-off", "text-overlap", "hidden-visible", "off-beat"];
+pub const RULES: [&str; 14] = [
+    "text-too-small",
+    "low-contrast",
+    "outside-title-safe",
+    "outside-action-safe",
+    "cut-off",
+    "nested-cut-off",
+    "text-overlap",
+    "text-off-centre",
+    "hidden-visible",
+    "exposed-edge",
+    "off-beat",
+    "off-accent",
+    "off-taste",
+    "exit-at-cut",
+];
 
 /// Most sample times one lint looks at; longer ranges are thinned evenly (`truncated`).
 pub const MAX_SAMPLES: usize = 120;
@@ -77,9 +126,25 @@ pub struct Finding {
     pub rule: &'static str,
     pub severity: Severity,
     pub layer: LayerId,
-    /// The second layer of a pair rule (`text-overlap`, the cover of `hidden-visible`).
+    /// The second layer of a pair rule (`text-overlap`, the cover of `hidden-visible`, the card of
+    /// `text-off-centre`).
     pub other: Option<LayerId>,
+    /// The layer inside a precomp the finding is about (`layer` is then the precomp layer of
+    /// the linted comp that shows it).
+    pub inner: Option<Inner>,
     pub message: String,
+    /// The command call that fixes it (`{command, params}`), when one does (`text-off-centre`).
+    pub fix: Option<serde_json::Value>,
+}
+
+/// A layer inside a precomp, measured in the linted comp's frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Inner {
+    /// The comp the layer is in (the innermost precomp).
+    pub comp: ItemId,
+    pub layer: LayerId,
+    /// "Phone › Screen › Box": the precomp layers down to the layer.
+    pub path: String,
 }
 
 /// What a lint checks and its thresholds.
@@ -207,9 +272,23 @@ struct TextLook {
     color: Option<[f64; 4]>,
 }
 
-fn text_look(ctx: &EvalCtx, l: &Layer) -> Option<TextLook> {
+/// A point of `ctx`'s comp in the linted comp: through `outer`, the precomp layers' layer → comp
+/// matrices from the innermost out (empty when `ctx` is the linted comp itself).
+fn through(outer: &[Mat3], p: [f64; 2]) -> ([f64; 2], bool) {
+    outer.iter().fold((p, true), |(q, ok), m| {
+        let (r, ok2) = layout::to_comp(m, q);
+        (r, ok && ok2)
+    })
+}
+
+fn text_look(ctx: &EvalCtx, l: &Layer, outer: &[Mat3]) -> Option<TextLook> {
     let geom = effectcraft_render::text::text_geom(ctx, l)?;
     let (m, _) = ctx.layer_to_comp(l);
+    let to_linted = |p: [f64; 2]| {
+        let (q, ok) = layout::to_comp(&m, p);
+        let (r, ok2) = through(outer, q);
+        (r, ok && ok2)
+    };
     let (mut px, mut size) = (f64::INFINITY, 0.0);
     let (mut fill, mut nf, mut stroke, mut ns) = ([0.0f64; 4], 0usize, [0.0f64; 4], 0usize);
     for g in &geom.glyphs {
@@ -222,7 +301,7 @@ fn text_look(ctx: &EvalCtx, l: &Layer) -> Option<TextLook> {
         let em = style.size * style.v_scale / 100.0;
         let m2 = g.m2();
         let (a, b) = (m2.apply(vec2(0.0, 0.0)), m2.apply(vec2(0.0, em)));
-        let ((a, oka), (b, okb)) = (layout::to_comp(&m, [a.x, a.y]), layout::to_comp(&m, [b.x, b.y]));
+        let ((a, oka), (b, okb)) = (to_linted([a.x, a.y]), to_linted([b.x, b.y]));
         let d = (b[0] - a[0]).hypot(b[1] - a[1]);
         if oka && okb && d.is_finite() && d < px {
             px = d;
@@ -322,7 +401,155 @@ fn opaque_cover(ctx: &EvalCtx, l: &Layer) -> bool {
         && ctx.opacity(l) >= 1.0 - 1e-6
 }
 
-/// Every enabled rule (except `off-beat`, which looks at the whole span) at the context time.
+/// Text off its card's centre by more than this (comp pixels) is flagged.
+const CENTRE_TOL: f64 = 1.5;
+/// Vertical centring is checked when the card is at most this many times the text's height
+/// (a pill or a one-line card; text in a tall card is usually placed on purpose).
+const CENTRE_HEIGHTS: f64 = 3.0;
+
+/// How far the centre of the text's points (the corners of one or more text boxes) is from
+/// the card quad's centre along the card's own axes (`[right, down]` in comp pixels, so rotated
+/// cards work), for each axis that is checked: down when the card is at most
+/// [`CENTRE_HEIGHTS`] times the text's height, right when the text is centre-justified. `None`
+/// when nothing checked is off by more than [`CENTRE_TOL`].
+fn off_centre(text: &[[f64; 2]], card: &[[f64; 2]; 4], check_h: bool) -> Option<[Option<f64>; 2]> {
+    let sub = |a: [f64; 2], b: [f64; 2]| [a[0] - b[0], a[1] - b[1]];
+    let dot = |a: [f64; 2], b: [f64; 2]| a[0] * b[0] + a[1] * b[1];
+    let (u, v) = (sub(card[1], card[0]), sub(card[3], card[0]));
+    let (lu, lv) = (dot(u, u).sqrt(), dot(v, v).sqrt());
+    if lu <= 1e-6 || lv <= 1e-6 || text.is_empty() {
+        return None;
+    }
+    // The text's extent along an axis from the card's first corner: (centre, length).
+    let along = |axis: [f64; 2], len: f64| {
+        let axis = [axis[0] / len, axis[1] / len];
+        let (lo, hi) = text.iter().map(|p| dot(sub(*p, card[0]), axis)).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)));
+        ((lo + hi) / 2.0 - len / 2.0, hi - lo)
+    };
+    let ((dx, _), (dy, h)) = (along(u, lu), along(v, lv));
+    let check_v = lv <= h * CENTRE_HEIGHTS;
+    let pick = |on: bool, x: f64| (on && x.is_finite() && x.abs() > CENTRE_TOL).then_some(x);
+    let off = [pick(check_h, dx), pick(check_v, dy)];
+    (off[0].is_some() || off[1].is_some()).then_some(off)
+}
+
+/// "“Price” is 5.5 px below and 2.0 px right of the centre of its card “Pill”: …".
+fn off_centre_message(text: &str, several: bool, card: &str, off: [Option<f64>; 2]) -> String {
+    let parts: Vec<(String, String)> = [
+        off[1].map(|y| {
+            (format!("{:.1} px {}", y.abs(), if y > 0.0 { "below" } else { "above" }), format!("{:.1} px {}", y.abs(), if y > 0.0 { "up" } else { "down" }))
+        }),
+        off[0].map(|x| {
+            (
+                format!("{:.1} px {} of", x.abs(), if x > 0.0 { "right" } else { "left" }),
+                format!("{:.1} px {}", x.abs(), if x > 0.0 { "left" } else { "right" }),
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let is: Vec<&str> = parts.iter().map(|p| p.0.as_str()).collect();
+    let fix: Vec<&str> = parts.iter().map(|p| p.1.as_str()).collect();
+    let (verb, them) = if several { ("are", "them") } else { ("is", text) };
+    format!(
+        "{text} {verb} {} the centre of {} card {card} (measured on the drawn glyphs, along the card's own axes): move {them} {} so {} centred in the card.",
+        is.join(" and "),
+        if several { "their" } else { "its" },
+        fix.join(" and "),
+        if several { "they sit" } else { "it sits" }
+    )
+}
+
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// The Position change that centres the text layer `l` in its card (`off` from [`off_centre`],
+/// along the card quad's axes), in `l`'s own Position units: its parent's layer space, or comp
+/// pixels without a parent. (Position now, Position after); `None` for 3D layers, a keyed or
+/// expression-driven Position, or a parent that can't be inverted.
+fn centre_move(ctx: &EvalCtx, l: &Layer, card: &[[f64; 2]; 4], off: [Option<f64>; 2]) -> Option<([f64; 3], [f64; 3])> {
+    let tr = l.transform()?;
+    let pos = l.props.prop("transform/position")?;
+    if l.is_3d() || !pos.keys.is_empty() || pos.expr.is_some() {
+        return None;
+    }
+    let unit = |a: [f64; 2], b: [f64; 2]| {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let n = d[0].hypot(d[1]);
+        (n > 1e-9).then(|| [d[0] / n, d[1] / n])
+    };
+    let (u, v) = (unit(card[0], card[1])?, unit(card[0], card[3])?);
+    let (dx, dy) = (off[0].unwrap_or(0.0), off[1].unwrap_or(0.0));
+    let shift = [-(dx * u[0] + dy * v[0]), -(dx * u[1] + dy * v[1])];
+    let local = match l.parent.and_then(|p| ctx.comp.layer(p)) {
+        None => shift,
+        Some(p) if p.is_3d() => return None,
+        Some(p) => {
+            let q = ctx.layer_to_comp(p).0.inverse()?.apply_vec(vec2(shift[0], shift[1]));
+            [q.x, q.y]
+        }
+    };
+    if !local[0].is_finite() || !local[1].is_finite() {
+        return None;
+    }
+    let now = ctx.v3(l, tr, "position", [0.0; 3]);
+    Some((now, [now[0] + local[0], now[1] + local[1], now[2]]))
+}
+
+/// Most rest-pose candidates [`rest_poses`] returns.
+const MAX_REST: usize = 32;
+
+/// Times (comp, latest first) at which `l` sits in a rest pose: keyframe times of the layer and
+/// its parents (every keyed property, text animators too) at which nothing of them is moving,
+/// i.e. every keyed property holds the same value for two frames before or two frames after.
+/// Clamped into the layer's in/out. Empty when nothing of the chain is keyed (the pose never
+/// changes). `text-off-centre` measures a text at the first of these where it is fully visible,
+/// so a pop or slide in progress isn't measured.
+pub fn rest_poses(comp: &Comp, l: &Layer) -> Vec<Tick> {
+    let fd = comp.frame_rate.frame_duration();
+    let mut chain = vec![l];
+    let mut cur = l.parent;
+    while let Some(p) = cur.and_then(|id| comp.layer(id)) {
+        if chain.len() > 64 || chain.iter().any(|c| c.id == p.id) {
+            break;
+        }
+        chain.push(p);
+        cur = p.parent;
+    }
+    let mut props: Vec<(&Layer, &effectcraft_project::Property)> = vec![];
+    let mut times: Vec<Tick> = vec![];
+    for c in &chain {
+        c.props.walk("", &mut |_, p| {
+            if p.keys.len() >= 2 {
+                times.extend(p.keys.iter().map(|k| c.comp_time(k.time)));
+                props.push((c, p));
+            }
+        });
+    }
+    if props.is_empty() {
+        return vec![];
+    }
+    let last = (l.out_point - fd).max(l.in_point);
+    let mut times: Vec<Tick> = times.into_iter().map(|t| t.clamp(l.in_point, last)).collect();
+    times.sort();
+    times.dedup();
+    let same = |a: &effectcraft_keyframe::Value, b: &effectcraft_keyframe::Value| {
+        let (a, b) = (a.components(), b.components());
+        a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 1e-6 * (1.0 + x.abs().max(y.abs())))
+    };
+    let two = fd + fd;
+    let still = |t: Tick, after: bool| {
+        props.iter().all(|(c, p)| {
+            let (a, b) = (c.layer_time(t), c.layer_time(if after { t + two } else { t - two }));
+            same(&p.value_at(a), &p.value_at(b))
+        })
+    };
+    times.into_iter().rev().filter(|t| still(*t, true) || still(*t, false)).take(MAX_REST).collect()
+}
+
+/// Every enabled rule (except `off-beat` and `off-accent`, which look at the whole span) at the context time.
 /// `backdrop` (the comp without text) is needed for `low-contrast`.
 pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Vec<Finding> {
     let comp = ctx.comp;
@@ -331,7 +558,7 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
     let mattes: Vec<LayerId> = comp.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
     let mut out = vec![];
     let mut push = |rule: &'static str, severity: Severity, l: &Layer, other: Option<LayerId>, message: String| {
-        out.push(Finding { rule, severity, layer: l.id, other, message });
+        out.push(Finding { rule, severity, layer: l.id, other, inner: None, message, fix: None });
     };
     let mut placed: Vec<Placed> = vec![];
     for l in &comp.layers {
@@ -407,7 +634,7 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
             );
         }
         if p.text {
-            let look = if set.on("text-too-small") || set.on("low-contrast") { text_look(ctx, l) } else { None };
+            let look = if set.on("text-too-small") || set.on("low-contrast") { text_look(ctx, l, &[]) } else { None };
             if set.on("text-too-small")
                 && let Some(t) = &look
                 && t.px < set.min_text_px
@@ -503,6 +730,68 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
             );
         }
     }
+    // (pushed after the closure's last use: they carry a fix)
+    let mut off_card = vec![];
+    if set.on("text-off-centre") {
+        let texts: Vec<(usize, &Placed)> = placed.iter().enumerate().filter(|(_, p)| p.text && p.on_screen > EPS).collect();
+        // The card of a text: the smallest drawn layer below it whose box holds the text's.
+        let card_of = |i: usize, p: &Placed| {
+            placed
+                .iter()
+                .enumerate()
+                .skip(i + 1)
+                .filter(|(_, c)| !c.text && !c.full_frame && c.area > p.area && layout::overlap_area(&p.corners, &c.corners) >= p.area * (1.0 - EPS))
+                .min_by(|a, b| a.1.area.total_cmp(&b.1.area))
+                .map(|(j, _)| j)
+        };
+        let cards: Vec<Option<usize>> = texts.iter().map(|(i, p)| card_of(*i, p)).collect();
+        let mut done: Vec<usize> = vec![];
+        for (k, card) in cards.iter().enumerate() {
+            let Some(card) = *card else { continue };
+            if done.contains(&card) {
+                continue;
+            }
+            done.push(card);
+            let Some(c) = placed.get(card) else { continue };
+            // Every text on the card is placed as one block (a name over a role).
+            let group: Vec<&Placed> = texts.iter().zip(&cards).skip(k).filter(|(_, cc)| **cc == Some(card)).map(|(t, _)| t.1).collect();
+            let centred = |p: &Placed| {
+                effectcraft_render::text::text_geom(ctx, p.layer)
+                    .is_some_and(|g| matches!(g.doc.justify, effectcraft_keyframe::Justify::Center | effectcraft_keyframe::Justify::JustifyLastCenter))
+            };
+            let pts: Vec<[f64; 2]> = group.iter().flat_map(|p| p.corners).collect();
+            let Some(off) = off_centre(&pts, &c.corners, group.iter().all(|p| centred(p))) else { continue };
+            let Some(first) = group.first() else { continue };
+            let subject = match group.as_slice() {
+                [one] => name(one.layer),
+                more => format!("{} (together)", more.iter().map(|p| name(p.layer)).collect::<Vec<_>>().join(" and ")),
+            };
+            let mut message = off_centre_message(&subject, group.len() > 1, &name(c.layer), off);
+            let mut fix = None;
+            if let [one] = group.as_slice()
+                && let Some((now, to)) = centre_move(ctx, one.layer, &c.corners, off)
+            {
+                let units = match one.layer.parent.and_then(|p| comp.layer(p)) {
+                    Some(p) => format!("in {}'s layer space", name(p)),
+                    None => "comp pixels".into(),
+                };
+                let v = |p: [f64; 3]| format!("[{}, {}]", round2(p[0]), round2(p[1]));
+                message.push_str(&format!(" In its own Position units ({units}): {} → {} (the `fix`).", v(now), v(to)));
+                fix = Some(
+                    serde_json::json!({"command": "prop.set", "params": {"layer": one.layer.id.0, "path": "transform/position", "value": to.map(round2)}}),
+                );
+            }
+            off_card.push(Finding {
+                rule: "text-off-centre",
+                severity: Severity::Warning,
+                layer: first.layer.id,
+                other: Some(c.layer.id),
+                inner: None,
+                message,
+                fix,
+            });
+        }
+    }
     if set.on("text-overlap") {
         let texts: Vec<&Placed> = placed.iter().filter(|p| p.text && p.on_screen > EPS).collect();
         for (i, a) in texts.iter().enumerate() {
@@ -526,6 +815,512 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
             }
         }
     }
+    out.extend(off_card);
+    out
+}
+
+/// How many precomps deep [`lint_nested`] looks (a precomp in a precomp in a precomp…).
+pub const MAX_NEST: usize = 4;
+
+/// Layers inside the comp's precomps, measured in the linted comp's frame (agents that look
+/// inside a precomp measure in the precomp's frame and miss what its layer's scale, position
+/// and edge do to it): `nested-cut-off` (part of the layer is outside the linted comp's frame,
+/// or outside the precomp's own frame, which clips it unless Collapse Transformations is on),
+/// and `text-too-small` and `outside-title-safe` for text inside precomps. Up to
+/// [`MAX_NEST`] levels deep. Findings name the precomp layer of the linted comp as `layer` and
+/// the nested layer as [`Finding::inner`].
+pub fn lint_nested(r: &Renderer, ctx: &EvalCtx, set: &Settings) -> Vec<Finding> {
+    let mut out = vec![];
+    if !(set.on("nested-cut-off") || set.on("text-too-small") || set.on("outside-title-safe")) {
+        return out;
+    }
+    let comp = ctx.comp;
+    let mattes: Vec<LayerId> = comp.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
+    for l in &comp.layers {
+        let LayerSource::Comp { item } = l.source else { continue };
+        if mattes.contains(&l.id) || l.switches.adjustment || !layout::visibility(ctx, l).0 {
+            continue;
+        }
+        let (m, _) = ctx.layer_to_comp(l);
+        let walk = Walk { r, set, top: l, w: comp.width as f64, h: comp.height as f64 };
+        walk.precomp(ctx, l, item, &[m], &l.name, 1, &mut out);
+    }
+    out
+}
+
+struct Walk<'a, 'r> {
+    r: &'a Renderer<'r>,
+    set: &'a Settings,
+    /// The precomp layer of the linted comp the walk is under.
+    top: &'a Layer,
+    /// The linted comp's size.
+    w: f64,
+    h: f64,
+}
+
+impl Walk<'_, '_> {
+    /// The layers of `item`, shown by `host` (a layer of `outer_ctx`'s comp); `chain` maps
+    /// `item`'s pixels into the linted comp (innermost first), `path` names the precomp layers.
+    #[allow(clippy::too_many_arguments)]
+    fn precomp(&self, outer_ctx: &EvalCtx, host: &Layer, item: ItemId, chain: &[Mat3], path: &str, depth: usize, out: &mut Vec<Finding>) {
+        let Some(nctx) = self.r.eval_ctx(item, outer_ctx.nested_time(host)) else { return };
+        let nc = nctx.comp;
+        let (nw, nh) = (nc.width as f64, nc.height as f64);
+        let nframe = [[0.0, 0.0], [nw, 0.0], [nw, nh], [0.0, nh]];
+        let mattes: Vec<LayerId> = nc.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
+        let title = safe_rect(self.w, self.h, self.set.title_safe);
+        for il in &nc.layers {
+            if mattes.contains(&il.id) || il.switches.adjustment || !has_picture(nctx.project, il) || !layout::visibility(&nctx, il).0 {
+                continue;
+            }
+            let here = format!("{path} › {}", il.name);
+            if let LayerSource::Comp { item: deeper } = il.source {
+                if depth < MAX_NEST {
+                    let (m, _) = nctx.layer_to_comp(il);
+                    let mut next = Vec::with_capacity(chain.len() + 1);
+                    next.push(m);
+                    next.extend_from_slice(chain);
+                    self.precomp(&nctx, il, deeper, &next, &here, depth + 1, out);
+                }
+                continue;
+            }
+            let Some(g) = layout::layer_geometry(&nctx, il).filter(|g| g.projected) else { continue };
+            let inner_area = layout::polygon_area(&g.corners);
+            // Backgrounds of the precomp (they fill its frame) are its frame, not content.
+            if inner_area <= 1e-9 || layout::overlap_area(&g.corners, &nframe) >= nw * nh * (1.0 - EPS) {
+                continue;
+            }
+            let mut ok = true;
+            let corners = g.corners.map(|p| {
+                let (q, k) = through(chain, p);
+                ok &= k;
+                q
+            });
+            let area = layout::polygon_area(&corners);
+            if !ok || area <= 1e-9 {
+                continue;
+            }
+            let text = matches!(il.source, LayerSource::Text);
+            let inner = Inner { comp: item, layer: il.id, path: here.clone() };
+            let shown = format!("“{here}”");
+            let mut push = |rule: &'static str, severity: Severity, message: String| {
+                out.push(Finding { rule, severity, layer: self.top.id, other: None, inner: Some(inner.clone()), message, fix: None });
+            };
+            let in_precomp = inside_share(&g.corners, inner_area, [0.0, 0.0, nw, nh]);
+            if in_precomp <= EPS && !host.switches.collapse {
+                continue;
+            }
+            if self.set.on("nested-cut-off") {
+                let on_screen = layout::on_screen_fraction(&corners, self.w, self.h);
+                if !host.switches.collapse && in_precomp < 1.0 - EPS {
+                    push(
+                        "nested-cut-off",
+                        if text { Severity::Warning } else { Severity::Info },
+                        format!(
+                            "{shown} is cut off by the edge of the precomp “{}” ({}×{}): {:.0}% of it is outside that comp's frame, which clips it here. Move it inside the precomp's frame, make the precomp bigger, or switch on Collapse Transformations on “{}”.",
+                            nc_name(nctx.project, item),
+                            nc.width,
+                            nc.height,
+                            (1.0 - in_precomp) * 100.0,
+                            host.name
+                        ),
+                    );
+                } else if on_screen > EPS && on_screen < 1.0 - EPS {
+                    let b = layout::aabb(&corners);
+                    push(
+                        "nested-cut-off",
+                        if text { Severity::Warning } else { Severity::Info },
+                        format!(
+                            "{shown} (inside the precomp “{}”) is cut off by the {} of this comp: {:.0}% of it is outside the frame once the precomp layer's position and scale are applied, though it looks whole inside the precomp. Move or scale it (or the precomp layer) so it is inside the frame{}.",
+                            self.top.name,
+                            edges(b, self.w, self.h),
+                            (1.0 - on_screen) * 100.0,
+                            if text { "" } else { " if it should be seen whole" }
+                        ),
+                    );
+                }
+            }
+            if !text {
+                continue;
+            }
+            if self.set.on("text-too-small")
+                && let Some(t) = text_look(&nctx, il, chain)
+                && t.px < self.set.min_text_px
+            {
+                let severity = if t.px < self.set.min_text_px / 2.0 { Severity::Error } else { Severity::Warning };
+                push(
+                    "text-too-small",
+                    severity,
+                    format!(
+                        "{shown}'s smallest characters are {:.1} px on screen in this comp (font size {:.0} inside the precomp, made smaller by the precomp layers' scale), below the {:.0} px minimum for legible text in a {} px tall frame{}: increase the font size or the precomp layer's scale.",
+                        t.px,
+                        t.size,
+                        self.set.min_text_px,
+                        self.h,
+                        if severity == Severity::Error { " (less than half of it)" } else { "" }
+                    ),
+                );
+            }
+            if self.set.on("outside-title-safe")
+                && layout::on_screen_fraction(&corners, self.w, self.h) > EPS
+                && inside_share(&corners, area, title) < 1.0 - EPS
+            {
+                push(
+                    "outside-title-safe",
+                    Severity::Warning,
+                    format!(
+                        "{shown} (inside the precomp “{}”) reaches {} past this comp's title-safe area ({}% of the frame per side): move it inward or make it smaller.",
+                        self.top.name,
+                        overshoot(layout::aabb(&corners), title),
+                        self.set.title_safe / 2.0
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn nc_name(project: &Project, item: ItemId) -> String {
+    project.item(item).map(|i| i.name.clone()).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------- exposed-edge
+
+/// A pixel with less alpha than this shows what is behind the comp (its background).
+const COVER_ALPHA: f32 = 0.5;
+/// A frame line (row or column) at an edge counts as empty when at least this share of it is.
+const STRIP_SHARE: f64 = 0.5;
+/// A frame counts as covered with at most this share of it empty.
+const COVERED: f64 = 0.001;
+/// An edge strip is only an "exposed edge" when at most this share of the frame is empty (the
+/// rest is covered: a full-screen shot that doesn't quite fill the frame).
+const MOSTLY_COVERED: f64 = 0.25;
+/// A transition gap: at least this share of the frame empty between two covered samples.
+const GAP_SHARE: f64 = 0.01;
+/// Layer boxes must claim this share of the frame before a sample is rendered for
+/// `exposed-edge` (overlay comps that never fill the frame are skipped).
+pub const CLAIM_SHARE: f64 = 0.9;
+
+/// How much of a rendered frame is covered.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Coverage {
+    /// Share (0–1) of the frame's pixels that show the background.
+    pub empty: f64,
+    /// Depth (comp pixels) of the empty strip along the left, right, top and bottom edges.
+    pub strips: [f64; 4],
+}
+
+/// [`Coverage`] of a render (`img`, premultiplied, at `scale` × comp pixels).
+pub fn coverage(img: &Image, scale: f64) -> Coverage {
+    let (w, h) = (img.width as usize, img.height as usize);
+    if w == 0 || h == 0 || scale <= 0.0 {
+        return Coverage::default();
+    }
+    let empty_at = |x: usize, y: usize| img.data.get(y * w + x).is_none_or(|p| p[3] < COVER_ALPHA);
+    let n = img.data.iter().filter(|p| p[3] < COVER_ALPHA).count();
+    let row = |y: usize| (0..w).filter(|&x| empty_at(x, y)).count() as f64 >= w as f64 * STRIP_SHARE;
+    let col = |x: usize| (0..h).filter(|&y| empty_at(x, y)).count() as f64 >= h as f64 * STRIP_SHARE;
+    let depth = |lines: &mut dyn Iterator<Item = bool>| lines.take_while(|e| *e).count() as f64 / scale;
+    Coverage {
+        empty: n as f64 / (w * h) as f64,
+        strips: [depth(&mut (0..w).map(col)), depth(&mut (0..w).rev().map(col)), depth(&mut (0..h).map(row)), depth(&mut (0..h).rev().map(row))],
+    }
+}
+
+/// The share (0–1, capped) of the frame the drawn layers' boxes claim at the context time, and
+/// the layer claiming most of it (the shot meant to fill the frame). Whether the frame is
+/// certainly covered (an opaque solid or alpha-less footage over all of it) comes third: no
+/// render is needed then.
+pub fn frame_claim(ctx: &EvalCtx) -> (f64, Option<LayerId>, bool) {
+    let comp = ctx.comp;
+    let (w, h) = (comp.width as f64, comp.height as f64);
+    let frame = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+    let (mut sum, mut best, mut covered) = (0.0, None::<(LayerId, f64)>, false);
+    let mattes: Vec<LayerId> = comp.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
+    for l in &comp.layers {
+        if mattes.contains(&l.id) || l.switches.adjustment || !has_picture(ctx.project, l) || !layout::visibility(ctx, l).0 {
+            continue;
+        }
+        let Some(g) = layout::layer_geometry(ctx, l).filter(|g| g.projected) else { continue };
+        let a = layout::overlap_area(&g.corners, &frame);
+        sum += a;
+        if best.is_none_or(|(_, b)| a > b) {
+            best = Some((l.id, a));
+        }
+        covered |= a >= w * h * (1.0 - EPS) && opaque_cover(ctx, l);
+    }
+    let area = (w * h).max(1e-9);
+    ((sum / area).min(1.0), best.map(|b| b.0), covered)
+}
+
+/// "a 12 px strip along the bottom edge and 3 px along the left edge".
+fn strips_text(s: [f64; 4]) -> String {
+    let parts: Vec<String> =
+        s.iter().zip(["left", "right", "top", "bottom"]).filter(|(d, _)| **d >= 1.0).map(|(d, side)| format!("{d:.0} px along the {side} edge")).collect();
+    parts.join(" and ")
+}
+
+/// `exposed-edge` findings from the coverage of rendered samples (`(time, coverage, the layer
+/// meant to fill the frame)`, in time order): an empty strip along a frame edge while the rest
+/// is covered, and frames with part of the picture empty between two covered samples (a gap in
+/// a transition).
+pub fn exposed_edges(comp: &Comp, samples: &[(Tick, Coverage, LayerId)]) -> Vec<(Tick, Finding)> {
+    let mut out = vec![];
+    let finding = |layer: LayerId, other: Option<LayerId>, message: String| Finding {
+        rule: "exposed-edge",
+        severity: Severity::Warning,
+        layer,
+        other,
+        inner: None,
+        message,
+        fix: None,
+    };
+    for (i, (t, c, lid)) in samples.iter().enumerate() {
+        let Some(l) = comp.layer(*lid) else { continue };
+        if c.strips.iter().any(|d| *d >= 1.0) && c.empty <= MOSTLY_COVERED {
+            out.push((
+                *t,
+                finding(
+                    l.id,
+                    None,
+                    format!(
+                        "The frame is not fully covered: a {} shows the comp's background (nothing is drawn there) while {} fills the rest. Scale or move {} so it covers the whole frame, or put a full-frame layer under it.",
+                        strips_text(c.strips),
+                        name(l),
+                        name(l)
+                    ),
+                ),
+            ));
+            continue;
+        }
+        // A gap between two covered samples: reported on the shot going out, with the one
+        // coming in as `other`, so one transition is one problem.
+        let covered = |s: &&(Tick, Coverage, LayerId)| s.1.empty <= COVERED;
+        let before = samples.get(..i).and_then(|b| b.iter().rev().find(covered));
+        let after = samples.get(i + 1..).and_then(|a| a.iter().find(covered));
+        let (Some(b), Some(a)) = (before, after) else { continue };
+        let (Some(out_l), Some(in_l)) = (comp.layer(b.2), comp.layer(a.2)) else { continue };
+        if c.empty < GAP_SHARE {
+            continue;
+        }
+        let shots = if out_l.id == in_l.id { name(out_l) } else { format!("{} and {}", name(out_l), name(in_l)) };
+        out.push((
+            *t,
+            finding(
+                out_l.id,
+                (in_l.id != out_l.id).then_some(in_l.id),
+                format!(
+                    "{:.0}% of the frame shows the comp's background at {:.3} s, between {:.3} s and {:.3} s where the frame is fully covered: a gap in the transition. Overlap {shots} (or extend one of them) so something covers every frame.",
+                    c.empty * 100.0,
+                    t.seconds(),
+                    b.0.seconds(),
+                    a.0.seconds()
+                ),
+            ),
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------- exit-at-cut
+
+/// Frames before the comp's last frame within which an exit counts as ending on the cut.
+const CUT_FRAMES: usize = 2;
+/// Most frames `exit-at-cut` looks at (the comp's last ones).
+pub const MAX_TAIL_FRAMES: usize = 300;
+/// A layer showing at most this share of its peak presence has left.
+const GONE_SHARE: f64 = 0.02;
+/// A layer still showing this share of its peak on the last frame hasn't left (a settle after
+/// an overshoot, a slow drift).
+const STAYS_SHARE: f64 = 0.7;
+/// A layer at this share of its peak is fully in (its exit starts after the last such frame).
+const FULL_SHARE: f64 = 0.95;
+/// Seconds before the content's last frame searched for the moment everything is in.
+const FULL_WINDOW: f64 = 3.0;
+/// A render is a full-screen picture when this share of its pixels is (nearly) opaque.
+pub const FULL_SCREEN_SHARE: f64 = 0.99;
+/// Alpha a pixel needs to count as opaque for [`FULL_SCREEN_SHARE`].
+const OPAQUE_ALPHA: f32 = 0.98;
+
+/// How a comp's layers leave towards its end ([`exit_tail`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tail {
+    /// The shot under the graphics: the bottom-most drawn layer when it is footage with sound
+    /// that runs the whole comp (the talking head the edit cuts back to). Left out of the rest.
+    pub base: Option<LayerId>,
+    /// When everything over `base` is in (render it without `base` to tell a full-screen
+    /// cutaway, its own background over the footage, from an overlay).
+    pub reference: Tick,
+    /// Layers fading, scaling or moving out into the comp's last frames: (layer, its last fully
+    /// visible frame, the frame it is gone or the last frame), top of the stack first.
+    pub at_cut: Vec<(LayerId, Tick, Tick)>,
+    /// Everything over `base` gone before the end: (the last layer to leave, the first frame
+    /// nothing of them shows).
+    pub early: Option<(LayerId, Tick)>,
+    /// The comp's last frame.
+    pub last: Tick,
+}
+
+/// How much of a layer shows: its on-screen box area (comp pixels) × its opacity (0 when it
+/// isn't drawn).
+fn presence(ctx: &EvalCtx, l: &Layer) -> f64 {
+    if !layout::visibility(ctx, l).0 {
+        return 0.0;
+    }
+    let Some(g) = layout::layer_geometry(ctx, l).filter(|g| g.projected) else { return 0.0 };
+    let (w, h) = (ctx.comp.width as f64, ctx.comp.height as f64);
+    let a = ctx.opacity(l).clamp(0.0, 1.0) * layout::overlap_area(&g.corners, &[[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]]);
+    if a.is_finite() { a } else { 0.0 }
+}
+
+/// [`Tail`] of `cid` from every frame of its last [`MAX_TAIL_FRAMES`] (layer boxes and
+/// opacity; nothing is rendered). `None` without frames or drawn layers over the base shot.
+pub fn exit_tail(r: &Renderer, cid: ItemId) -> Option<Tail> {
+    let comp = r.project.comp(cid)?;
+    let fd = comp.frame_rate.frame_duration();
+    if fd.0 <= 0 || comp.duration.0 <= 0 {
+        return None;
+    }
+    let n = usize::try_from(comp.duration.0.saturating_add(fd.0 - 1) / fd.0).ok()?;
+    let frame = |k: usize| Tick(fd.0.saturating_mul(k as i64));
+    let mattes: Vec<LayerId> = comp.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
+    let drawn: Vec<(usize, &Layer)> = comp
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| !mattes.contains(&l.id) && !l.switches.adjustment && l.switches.video && !l.switches.guide && has_picture(r.project, l))
+        .collect();
+    let base = drawn.last().filter(|(_, l)| {
+        let sound = match &l.source {
+            LayerSource::Footage { item } => matches!(r.project.item(*item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if f.has_audio && f.has_video),
+            _ => false,
+        };
+        sound && l.in_point <= Tick::ZERO && l.out_point >= comp.duration - fd
+    });
+    let over: Vec<&Layer> = drawn.iter().filter(|(i, _)| base.is_none_or(|(b, _)| i < b)).map(|(_, l)| *l).collect();
+    let first = n.saturating_sub(MAX_TAIL_FRAMES);
+    if over.is_empty() || n == 0 {
+        return None;
+    }
+    let mut pres = vec![Vec::with_capacity(n - first); over.len()];
+    for k in first..n {
+        let ctx = r.eval_ctx(cid, frame(k))?;
+        for (row, l) in pres.iter_mut().zip(&over) {
+            row.push(presence(&ctx, l));
+        }
+    }
+    let end = n - first - 1;
+    let peak: Vec<f64> = pres.iter().map(|row| row.iter().copied().fold(0.0, f64::max)).collect();
+    // The last frame each layer shows on.
+    let last_seen: Vec<Option<usize>> =
+        pres.iter().zip(&peak).map(|(row, pk)| if *pk > 1e-9 { row.iter().rposition(|v| *v > GONE_SHARE * pk) } else { None }).collect();
+    let (who, e) = last_seen.iter().enumerate().filter_map(|(i, s)| s.map(|s| (i, s))).max_by_key(|(_, s)| *s)?;
+    let early = (e + CUT_FRAMES < end).then(|| (over.get(who).map(|l| l.id), frame(first + e + 1)));
+    let early = early.and_then(|(l, t)| Some((l?, t)));
+    let mut at_cut = vec![];
+    for ((row, pk), l) in pres.iter().zip(&peak).zip(&over) {
+        let Some(&at_end) = row.get(end) else { continue };
+        if *pk <= 1e-9 || at_end >= STAYS_SHARE * pk {
+            continue;
+        }
+        let Some(i0) = row.iter().rposition(|v| *v >= FULL_SHARE * pk) else { continue };
+        let i1 = (i0 + 1..=end).find(|&i| row.get(i).is_some_and(|v| *v <= GONE_SHARE * pk)).unwrap_or(end);
+        // Gradual (two frames or more: a one-frame drop is a cut) and ending on the cut.
+        if i1 + CUT_FRAMES >= end && i1 >= i0 + 2 {
+            at_cut.push((l.id, frame(first + i0), frame(first + i1)));
+        }
+    }
+    // The frame everything is most fully in, shortly before the content's last frame.
+    let window = (FULL_WINDOW / fd.seconds().max(1e-9)) as usize;
+    let fill = |i: usize| pres.iter().zip(&peak).map(|(row, pk)| if *pk > 1e-9 { row.get(i).copied().unwrap_or(0.0) / pk } else { 0.0 }).sum::<f64>();
+    let reference = (e.saturating_sub(window)..=e).max_by(|a, b| fill(*a).total_cmp(&fill(*b)).then(a.cmp(b))).unwrap_or(e);
+    Some(Tail { base: base.map(|(_, l)| l.id), reference: frame(first + reference), at_cut, early, last: frame(first + end) })
+}
+
+/// `project` with layer `lid` of `comp` switched off (what is drawn over it).
+pub fn without_layer(project: &Project, comp: ItemId, lid: LayerId) -> Option<Project> {
+    let mut p = project.clone();
+    p.comp_mut(comp)?.layers.iter_mut().find(|l| l.id == lid)?.switches.video = false;
+    Some(p)
+}
+
+/// Share (0–1) of a render's pixels that are (nearly) opaque.
+pub fn opaque_share(img: &Image) -> f64 {
+    let n = img.data.len();
+    if n == 0 {
+        return 0.0;
+    }
+    img.data.iter().filter(|p| p[3] >= OPAQUE_ALPHA).count() as f64 / n as f64
+}
+
+/// `exit-at-cut` findings from a [`Tail`]; `full_screen`: the comp is a full-screen cutaway at
+/// `tail.reference` (its layers over the base shot cover the frame). A full-screen cutaway holds
+/// to its last frame and hard-cuts back to the footage: an exit into the cut is a warning, and so
+/// is everything leaving early while the comp runs on. In an overlay comp an exit into the end is
+/// right (overlays fade out over ~8 frames), so only leaving early is noted (info: the tail may
+/// be footage on purpose).
+pub fn exit_at_cut(comp: &Comp, tail: &Tail, full_screen: bool) -> Vec<(Tick, Finding)> {
+    let fd = comp.frame_rate.frame_duration();
+    let f = |t: Tick| if fd.0 > 0 { t.0 / fd.0 } else { 0 };
+    let base = tail.base.and_then(|b| comp.layer(b)).map_or_else(|| "the comp's background".to_string(), name);
+    let mut out = vec![];
+    let finding = |layer: LayerId, severity: Severity, message: String| Finding {
+        rule: "exit-at-cut",
+        severity,
+        layer,
+        other: tail.base,
+        inner: None,
+        message,
+        fix: None,
+    };
+    if full_screen && let (Some(top), Some(bottom)) = (tail.at_cut.first(), tail.at_cut.last()) {
+        let names: Vec<String> = tail.at_cut.iter().take(4).filter_map(|(l, _, _)| comp.layer(*l).map(name)).collect();
+        let more = tail.at_cut.len().saturating_sub(names.len());
+        let start = tail.at_cut.iter().map(|x| x.1).min().unwrap_or(top.1);
+        let stop = tail.at_cut.iter().map(|x| x.2).max().unwrap_or(top.2);
+        out.push((
+            start,
+            finding(
+                bottom.0,
+                Severity::Warning,
+                format!(
+                    "{}{} {} out from frame {} to {} ({:.3}–{:.3} s), into the comp's last frame ({}), where it cuts back to {base}. This is a full-screen cutaway (its own background over the footage): hold to the end and hard-cut, with no exit (overlays fade out, full-screen cutaways don't).",
+                    names.join(", "),
+                    if more > 0 { format!(" and {more} more") } else { String::new() },
+                    if tail.at_cut.len() == 1 { "fades or moves" } else { "fade or move" },
+                    f(start),
+                    f(stop),
+                    start.seconds(),
+                    stop.seconds(),
+                    f(tail.last)
+                ),
+            ),
+        ));
+    }
+    if let Some((l, gone)) = tail.early
+        && let Some(layer) = comp.layer(l)
+    {
+        let left = f(tail.last) - f(gone) + 1;
+        let message = if full_screen {
+            format!(
+                "Everything over {base} is gone from frame {} ({:.3} s, {} last to leave) but the comp runs {left} more frames, to frame {}: the full-screen cutaway ends early. Hold to the end and hard-cut, or trim the comp to frame {}.",
+                f(gone),
+                gone.seconds(),
+                name(layer),
+                f(tail.last),
+                f(gone)
+            )
+        } else {
+            format!(
+                "Everything over {base} is gone from frame {} ({:.3} s, {} last to leave) but the comp runs {left} more frames, to frame {}. If the graphics should stay until the comp cuts back to the footage, hold to the end and hard-cut (an overlay fades out over ~8 frames ending on the last frame), or trim the comp.",
+                f(gone),
+                gone.seconds(),
+                name(layer),
+                f(tail.last)
+            )
+        };
+        out.push((gone, finding(l, if full_screen { Severity::Warning } else { Severity::Info }, message)));
+    }
     out
 }
 
@@ -540,12 +1335,18 @@ pub struct Problem {
 }
 
 /// Merge occurrences of the same (rule, layer, other) across sample times into one problem
-/// (`off-beat` findings stay one per key moment). The worst occurrence's severity and message
+/// (`off-beat` and `off-accent` findings stay one per key moment / peak). The worst occurrence's severity and message
 /// win. Sorted errors first, then by time, rule and layer.
 pub fn merge(occurrences: Vec<(Tick, Finding)>) -> Vec<Problem> {
     let mut out: Vec<Problem> = vec![];
     for (t, f) in occurrences {
-        let same = |p: &Problem| p.finding.rule == f.rule && p.finding.layer == f.layer && p.finding.other == f.other && (f.rule != "off-beat" || p.time == t);
+        let same = |p: &Problem| {
+            p.finding.rule == f.rule
+                && p.finding.layer == f.layer
+                && p.finding.other == f.other
+                && p.finding.inner.as_ref().map(|i| (i.comp, i.layer)) == f.inner.as_ref().map(|i| (i.comp, i.layer))
+                && (!matches!(f.rule, "off-beat" | "off-accent" | "off-taste" | "exit-at-cut") || p.time == t)
+        };
         match out.iter_mut().find(|p| same(p)) {
             Some(p) => {
                 p.time = p.time.min(t);
@@ -678,6 +1479,7 @@ pub fn off_beat(comp: &Comp, moments: &[KeyMoment], beats: &[f64], fps: f64) -> 
                 severity: Severity::Warning,
                 layer: l.id,
                 other: None,
+                inner: None,
                 message: format!(
                     "{}'s {} at {:.3} s is {frames} frames {} the beat at {:.3} s (beats every {:.3} s, about {:.0} BPM): move it to {:.3} s to land on the beat.",
                     name(l),
@@ -689,6 +1491,7 @@ pub fn off_beat(comp: &Comp, moments: &[KeyMoment], beats: &[f64], fps: f64) -> 
                     60.0 / interval.max(1e-9),
                     beat
                 ),
+                fix: None,
             },
         ));
     }
@@ -804,4 +1607,304 @@ pub fn detect_beats(mono: &[f32], rate: u32) -> Vec<f64> {
     beats.reverse();
     let half = period / 2.0;
     beats.into_iter().filter(|&b| b as f64 >= first as f64 - half && b as f64 <= last as f64 + half).map(|b| b as f64 * hop_s).collect()
+}
+
+// ---------------------------------------------------------------- off-accent
+
+/// Samples per keyframe segment when looking for its speed peak (then refined).
+const PEAK_SAMPLES: usize = 48;
+/// A segment whose speed varies by less than this share of its top speed is flat (linear): no peak.
+const FLAT_SHARE: f64 = 0.05;
+/// Most speed peaks one lint collects.
+pub const MAX_PEAKS: usize = 20_000;
+/// Default: frames before the stressed vowel's onset where a peak lands on the accent (Elias's
+/// hand-timed peak on "CONtent" in 10-10 MAIN: the k burst + 2 frames = the vowel − 1 frame).
+pub const DEFAULT_ACCENT_LEAD: f64 = 1.0;
+/// Default: a peak this many frames or fewer from an accent (but more than one off) is a near miss.
+pub const DEFAULT_ACCENT_WINDOW: f64 = 4.0;
+
+/// A speed-graph peak: where a keyframed property moves fastest between two keyframes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeedPeak {
+    pub layer: LayerId,
+    /// The property's uid path inside the layer (`@3/@7`).
+    pub path: String,
+    /// The property's name ("Scale", "Position").
+    pub property: String,
+    /// Comp seconds.
+    pub time: f64,
+    /// Top speed (property units per second; the length of the velocity for several dimensions).
+    pub speed: f64,
+    /// The comp `layer` is in when it sits in a precomp ([`speed_peaks_deep`]); `None`: the
+    /// comp searched.
+    pub comp: Option<ItemId>,
+    /// The precomp layers from the comp searched down to `comp`, outermost first (empty when
+    /// `comp` is `None`). `time` is mapped through them.
+    pub via: Vec<Hop>,
+}
+
+/// Where a peak lands on a stressed syllable: `lead` frames before its vowel, never before its
+/// onset (comp seconds).
+pub fn accent_time(s: &effectcraft_project::speech::Syllable, fps: f64, lead: f64) -> f64 {
+    let (t, v) = (s.t.seconds(), s.vowel.seconds());
+    if fps.is_finite() && fps > 0.0 { (v - lead / fps).max(t) } else { t }
+}
+
+/// The speed-graph peak of the keyframe segment `i` → `i + 1` of `keys`: (layer seconds, top
+/// speed), refined to well under a millisecond. `None` for a hold, equal values, keys out of
+/// order or a linear (flat-speed) segment. [`speed_peaks`] and `keys.alignPeak` both use it.
+pub fn segment_peak(keys: &[effectcraft_keyframe::Keyframe], i: usize, spatial: bool) -> Option<(f64, f64)> {
+    let (a, b) = (keys.get(i)?, keys.get(i.checked_add(1)?)?);
+    if a.out_interp == effectcraft_keyframe::Interp::Hold || a.value == b.value || b.time <= a.time {
+        return None;
+    }
+    let speed = |lt: f64| {
+        let v = effectcraft_keyframe::speed(keys, Tick::from_seconds_f64(lt), spatial);
+        if v.is_finite() { v } else { 0.0 }
+    };
+    let (t0, t1) = (a.time.seconds(), b.time.seconds());
+    let dt = (t1 - t0) / PEAK_SAMPLES as f64;
+    let at = |i: f64| t0 + (i + 0.5) * dt;
+    let (mut best, mut top, mut low) = (0usize, f64::MIN, f64::MAX);
+    for i in 0..PEAK_SAMPLES {
+        let v = speed(at(i as f64));
+        if v > top {
+            (best, top) = (i, v);
+        }
+        low = low.min(v);
+    }
+    if top <= 1e-9 || top - low < FLAT_SHARE * top {
+        return None;
+    }
+    // Golden-section refine around the best sample (the speed is unimodal there).
+    let (mut lo, mut hi) = (at(best as f64 - 1.0).max(t0), at(best as f64 + 1.0).min(t1));
+    for _ in 0..24 {
+        let m1 = hi - (hi - lo) * 0.618_034;
+        let m2 = lo + (hi - lo) * 0.618_034;
+        if speed(m1) < speed(m2) { lo = m1 } else { hi = m2 }
+    }
+    let lt = (lo + hi) / 2.0;
+    Some((lt, speed(lt).max(top)))
+}
+
+/// Speed-graph peaks of every keyframed property of `comp`'s layers in `start..=end` (comp
+/// seconds): for each pair of neighbouring keyframes with different values and no hold between
+/// them, the time of the highest speed (keyframes only; expressions are not evaluated), when it
+/// falls inside the layer's in/out. Linear segments (constant speed) have no peak. Sorted by time.
+pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
+    let mut out: Vec<SpeedPeak> = vec![];
+    for l in &comp.layers {
+        l.props.walk("", &mut |path, p| {
+            if p.keys.len() < 2 || out.len() >= MAX_PEAKS {
+                return;
+            }
+            for (i, pair) in p.keys.windows(2).enumerate() {
+                let [a, b] = pair else { continue };
+                let (a_t, b_t) = (l.comp_time(a.time).seconds(), l.comp_time(b.time).seconds());
+                if a_t.max(b_t) < start - 1e-9 || a_t.min(b_t) > end + 1e-9 {
+                    continue;
+                }
+                let Some((lt, top)) = segment_peak(&p.keys, i, p.spatial) else { continue };
+                let time = l.comp_time(Tick::from_seconds_f64(lt)).seconds();
+                // Outside the layer's in/out nothing shows, so the peak can't be seen.
+                let shown = time >= l.in_point.seconds() - 1e-9 && time <= l.out_point.seconds() + 1e-9;
+                if !shown || time < start - 1e-9 || time > end + 1e-9 {
+                    continue;
+                }
+                if out.iter().any(|q| q.layer == l.id && q.path == path && (q.time - time).abs() < 1e-6) {
+                    continue;
+                }
+                out.push(SpeedPeak { layer: l.id, path: path.to_string(), property: p.name.clone(), time, speed: top, comp: None, via: vec![] });
+            }
+        });
+    }
+    out.sort_by(|a, b| a.time.total_cmp(&b.time));
+    out
+}
+
+/// Most precomp layers [`speed_peaks_deep`] looks into.
+const MAX_PRECOMP_VISITS: usize = 4096;
+
+/// Speed peaks of a comp and of everything nested in it ([`speed_peaks_deep`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeepPeaks {
+    pub peaks: Vec<SpeedPeak>,
+    /// Why some precomps were not searched (time-remapped precomp layers).
+    pub skipped: Vec<String>,
+}
+
+/// [`speed_peaks`] of `cid`'s own layers and of the layers in its precomps, at most
+/// [`precomp_time::MAX_DEPTH`] deep, each peak's time mapped up through every precomp layer's
+/// start and stretch to `cid`'s seconds. A nested peak is kept only when every precomp layer on
+/// the way shows it (inside its in/out, and inside its comp's duration). Time-remapped precomp
+/// layers are not searched (see `skipped`). Sorted by time.
+pub fn speed_peaks_deep(project: &Project, cid: ItemId, start: f64, end: f64) -> DeepPeaks {
+    let Some(comp) = project.comp(cid) else { return DeepPeaks::default() };
+    let mut out = DeepPeaks { peaks: speed_peaks(comp, start, end), skipped: vec![] };
+    let mut budget = MAX_PRECOMP_VISITS;
+    nested_peaks(project, (cid, comp), (start, end), &mut vec![], &mut vec![cid], &mut out, &mut budget);
+    out.peaks.sort_by(|a, b| a.time.total_cmp(&b.time));
+    out.peaks.truncate(MAX_PEAKS);
+    out
+}
+
+/// Peaks inside the precomp layers of `at` whose shown part overlaps `lo..=hi` (`at`'s seconds).
+fn nested_peaks(
+    project: &Project,
+    at: (ItemId, &Comp),
+    (lo, hi): (f64, f64),
+    chain: &mut Vec<Hop>,
+    comps: &mut Vec<ItemId>,
+    out: &mut DeepPeaks,
+    budget: &mut usize,
+) {
+    if chain.len() >= precomp_time::MAX_DEPTH {
+        return;
+    }
+    for l in &at.1.layers {
+        let LayerSource::Comp { item } = l.source else { continue };
+        if comps.contains(&item) || out.peaks.len() >= MAX_PEAKS || *budget == 0 {
+            continue;
+        }
+        let Some(inner) = project.comp(item) else { continue };
+        // The part of the window this precomp layer shows.
+        let (a, b) = (lo.max(l.in_point.seconds()), hi.min(l.out_point.seconds()));
+        if a > b + 1e-9 {
+            continue;
+        }
+        let h = match precomp_time::hop(at.0, l) {
+            Ok(h) => h,
+            Err(why) => {
+                if !out.skipped.contains(&why) {
+                    out.skipped.push(why);
+                }
+                continue;
+            }
+        };
+        *budget = budget.saturating_sub(1);
+        let one = [h];
+        let (x, y) = (precomp_time::down(&one, a), precomp_time::down(&one, b));
+        let (x, y) = (x.min(y).max(0.0), x.max(y).min(inner.duration.seconds()));
+        if x.is_nan() || y.is_nan() || x > y + 1e-9 {
+            continue;
+        }
+        chain.push(h);
+        comps.push(item);
+        for mut pk in speed_peaks(inner, x, y) {
+            pk.time = precomp_time::up(chain, pk.time);
+            (pk.comp, pk.via) = (Some(item), chain.clone());
+            out.peaks.push(pk);
+        }
+        nested_peaks(project, (item, inner), (x, y), chain, comps, out, budget);
+        chain.pop();
+        comps.pop();
+    }
+}
+
+/// A peak matched to the nearest accent (a stressed syllable's [`accent_time`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccentMatch<'a> {
+    pub peak: SpeedPeak,
+    pub word: &'a effectcraft_project::speech::SpeechWord,
+    pub syllable: effectcraft_project::speech::Syllable,
+    /// The accent time (comp seconds).
+    pub target: f64,
+    /// Peak − target, in frames (negative: the peak is early).
+    pub offset_frames: f64,
+}
+
+/// Each peak with its nearest accent in `map` (`None` without stressed syllables).
+pub fn match_accents<'a>(peaks: Vec<SpeedPeak>, map: &'a effectcraft_project::speech::SpeechMap, fps: f64, lead: f64) -> Vec<AccentMatch<'a>> {
+    let stressed = map.stressed();
+    let targets: Vec<f64> = stressed.iter().map(|(_, s)| accent_time(s, fps, lead)).collect();
+    let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
+    peaks
+        .into_iter()
+        .filter_map(|peak| {
+            let i = targets.partition_point(|t| *t < peak.time);
+            let near = [i.checked_sub(1), Some(i)]
+                .into_iter()
+                .flatten()
+                .filter_map(|j| Some((j, *targets.get(j)?)))
+                .min_by(|a, b| (a.1 - peak.time).abs().total_cmp(&(b.1 - peak.time).abs()))?;
+            let (word, syllable) = *stressed.get(near.0)?;
+            Some(AccentMatch { offset_frames: (peak.time - near.1) * fps, target: near.1, word, syllable: *syllable, peak })
+        })
+        .collect()
+}
+
+/// `off-accent` findings with their times: speed-graph peaks ([`speed_peaks_deep`] of `cid`, so
+/// moves inside precomps count) within `window` frames of an accent (a stressed syllable's onset,
+/// `lead` frames before its vowel) that miss it by more than one frame. A nested peak's finding is
+/// on the precomp layer in `cid`; its message names the nested layer and the `keys.alignPeak`
+/// call that fixes it. Also returns why some precomps were not searched.
+pub fn off_accent(
+    project: &Project,
+    cid: ItemId,
+    map: &effectcraft_project::speech::SpeechMap,
+    start: f64,
+    end: f64,
+    fps: f64,
+    lead: f64,
+    window: f64,
+    own: &dyn Fn(ItemId, LayerId, &str) -> bool,
+) -> (Vec<(Tick, Finding)>, Vec<String>) {
+    let mut out = vec![];
+    let Some(comp) = project.comp(cid) else { return (out, vec![]) };
+    if fps.is_nan() || fps <= 0.0 {
+        return (out, vec![]);
+    }
+    let deep = speed_peaks_deep(project, cid, start, end);
+    for m in match_accents(deep.peaks, map, fps, lead) {
+        let d = m.offset_frames;
+        if d.abs() <= 1.0 + 1e-6 || d.abs() > window + 1e-6 {
+            continue;
+        }
+        // The layer in `cid` the finding is on: the peak's own, or the outermost precomp layer.
+        let top = m.peak.via.first().map_or(m.peak.layer, |h| h.layer);
+        let Some(shown) = comp.layer(top) else { continue };
+        let inner = m.peak.comp.and_then(|c| project.comp(c));
+        let Some(l) = inner.map_or(Some(shown), |c| c.layer(m.peak.layer)) else { continue };
+        let frames = if (d.abs() - d.abs().round()).abs() < 0.05 { format!("{:.0}", d.abs().round()) } else { format!("{:.1}", d.abs()) };
+        let (where_, call) = match m.peak.comp {
+            None => (String::new(), format!("layer: {}, path: \"{}\"", l.id.0, m.peak.path)),
+            Some(c) => {
+                let names: Vec<String> = m.peak.via.iter().map(|h| project.comp(h.comp).and_then(|x| x.layer(h.layer)).map(name).unwrap_or_default()).collect();
+                let via: Vec<String> = m.peak.via.iter().map(|h| h.layer.0.to_string()).collect();
+                (
+                    format!(" (in precomp {}, via {})", project.item(c).map(|i| format!("\"{}\"", i.name)).unwrap_or_default(), names.join(" → ")),
+                    format!("comp: {}, layer: {}, path: \"{}\", targetComp: {}, via: [{}]", c.0, l.id.0, m.peak.path, cid.0, via.join(", ")),
+                )
+            }
+        };
+        let mine = own(m.peak.comp.unwrap_or(cid), m.peak.layer, &m.peak.path);
+        out.push((
+            Tick::from_seconds_f64(m.peak.time),
+            Finding {
+                rule: "off-accent",
+                severity: if mine { Severity::Error } else { Severity::Warning },
+                layer: shown.id,
+                other: None,
+                inner: None,
+                message: format!(
+                    "{}'s {} speed peak{where_} at {:.3} s (frame {:.1}) is {frames} frames {} the stressed syllable of \"{}\" (onset {:.3} s, vowel {:.3} s; accent at {:.3} s, frame {:.0}): move the peak by {:+.0} frames, to {:.3} s, to land on the accent (keys.alignPeak {{{call}, frame: {:.0}}}).",
+                    name(l),
+                    m.peak.property,
+                    m.peak.time,
+                    m.peak.time * fps,
+                    if d > 0.0 { "after" } else { "before" },
+                    m.word.word,
+                    m.syllable.t.seconds(),
+                    m.syllable.vowel.seconds(),
+                    m.target,
+                    (m.target * fps).round(),
+                    -d.round(),
+                    m.target,
+                    (m.target * fps).round()
+                ) + if mine { " You keyed this move: fix it before handover (an error, not a warning, for keys you made)." } else { "" },
+                fix: None,
+            },
+        ));
+    }
+    (out, deep.skipped)
 }

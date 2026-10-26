@@ -16,29 +16,29 @@ fn instance_key(root: ItemId, path: &[u64]) -> Vec<u64> {
     std::iter::once(root.0).chain(path.iter().copied()).collect()
 }
 
-pub(super) fn expander(app: &mut EffectcraftApp, ui: &mut egui::Ui, root: ItemId, path: &[u64], layer: &Layer, rect: Rect) {
+pub(super) fn expander(app: &mut dyn TimelineHost, ui: &mut egui::Ui, root: ItemId, path: &[u64], layer: &Layer, rect: Rect) {
     if !matches!(layer.source, LayerSource::Comp { .. }) {
         return;
     }
     let mut child_path = path.to_vec();
     child_path.push(layer.id.0);
     let key = instance_key(root, &child_path);
-    let open = app.ui.timeline.inline_precomps.contains(&key);
-    let resp = widgets::twirl(ui, rect, open, egui::Id::new(("inline-precomp", &key)), &app.tokens)
+    let open = app.ui().timeline.inline_precomps.contains(&key);
+    let resp = widgets::twirl(ui, rect, open, tl_id(("inline-precomp", &key)), &app.tokens())
         .on_hover_text(tr("Expand this composition's layers inline (edits affect every instance)"));
-    app.auto.add(&format!("timeline.inline.{}.expand", key.iter().map(u64::to_string).collect::<Vec<_>>().join(".")), rect, "Expand nested composition");
+    app.auto_mut().add(&format!("timeline.inline.{}.expand", key.iter().map(u64::to_string).collect::<Vec<_>>().join(".")), rect, "Expand nested composition");
     if resp.clicked() {
         if open {
-            app.ui.timeline.inline_precomps.remove(&key);
-        } else if let Err(e) = inline_comp::context(&app.session, root, &child_path, app.session.time_of(root)) {
-            app.ui.status = e.to_string();
+            app.ui_mut().timeline.inline_precomps.remove(&key);
+        } else if let Err(e) = inline_comp::context(app.session(), root, &child_path, app.session().time_of(root)) {
+            app.ui_mut().status = e.to_string();
         } else {
-            app.ui.timeline.inline_precomps.insert(key);
+            app.ui_mut().timeline.inline_precomps.insert(key);
         }
     }
 }
 
-pub(super) fn expand(app: &EffectcraftApp, root: ItemId, rows: Vec<Row>) -> Vec<Row> {
+pub(super) fn expand(app: &dyn TimelineHost, root: ItemId, rows: Vec<Row>) -> Vec<Row> {
     let mut out = Vec::with_capacity(rows.len());
     // Repeated instances share row structure within this pass, but keep their own time/path.
     let mut sources = std::collections::BTreeMap::new();
@@ -54,12 +54,12 @@ pub(super) fn expand(app: &EffectcraftApp, root: ItemId, rows: Vec<Row>) -> Vec<
     out
 }
 
-fn append(app: &EffectcraftApp, root: ItemId, path: &[u64], out: &mut Vec<Row>, sources: &mut std::collections::BTreeMap<ItemId, std::sync::Arc<Vec<Row>>>) {
-    if out.len() >= MAX_ROWS || !app.ui.timeline.inline_precomps.contains(&instance_key(root, path)) {
+fn append(app: &dyn TimelineHost, root: ItemId, path: &[u64], out: &mut Vec<Row>, sources: &mut std::collections::BTreeMap<ItemId, std::sync::Arc<Vec<Row>>>) {
+    if out.len() >= MAX_ROWS || !app.ui().timeline.inline_precomps.contains(&instance_key(root, path)) {
         return;
     }
-    let Ok(context) = inline_comp::context(&app.session, root, path, app.session.time_of(root)) else { return };
-    let Some(comp) = app.session.project.comp(context.comp) else { return };
+    let Ok(context) = inline_comp::context(app.session(), root, path, app.session().time_of(root)) else { return };
+    let Some(comp) = app.session().project.comp(context.comp) else { return };
     let rows = sources.entry(context.comp).or_insert_with(|| std::sync::Arc::new(build_rows(app, comp))).clone();
     let mut i = 0;
     while let Some(row) = rows.get(i) {
@@ -101,7 +101,7 @@ fn toggle(set: &mut std::collections::BTreeSet<u64>, id: u64) {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn show(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     n: &InlineRow,
     r: Rect,
@@ -112,19 +112,21 @@ pub(super) fn show(
     right_clip: Rect,
     actions: &mut Vec<(String, serde_json::Value)>,
 ) {
-    let Some(comp) = app.session.project.comp_arc(n.context.comp) else { return };
+    let Some(comp) = app.session().project.comp_arc(n.context.comp) else { return };
     let Some(layer) = super::super::layer_arc(&comp, n.row.layer) else { return };
     if !crate::widgets::any_menu_open(ui.ctx())
         && !egui::Popup::is_any_open(ui.ctx())
         && ui.input(|i| {
             i.pointer.any_pressed()
-                && i.pointer.interact_pos().is_some_and(|p| r.intersect(left_clip.union(right_clip)).contains(p) && (!graph_on || p.x < right_clip.min.x))
+                && crate::layer_pointer::Lp::panel(ui.ctx())
+                    .pos(i.pointer.interact_pos())
+                    .is_some_and(|p| r.intersect(left_clip.union(right_clip)).contains(p) && (!graph_on || p.x < right_clip.min.x))
         })
     {
         focus(app, n.root, &n.path);
     }
-    let t = app.tokens;
-    let sel = app.session.state.comp_selections.get(&n.context.comp).cloned().unwrap_or_default();
+    let t = app.tokens();
+    let sel = app.session().state.comp_selections.get(&n.context.comp).cloned().unwrap_or_default();
     let selected = sel.layers.contains(&layer.id);
     let locked = layer.switches.locked || n.context.locked;
     let cy = r.center().y;
@@ -138,7 +140,7 @@ pub(super) fn show(
         [pos2(cw.name + 14.0 * n.path.len() as f32, r.min.y), pos2(cw.name + 14.0 * n.path.len() as f32, r.max.y)],
         Stroke::new(1.0, t.accent.gamma_multiply(0.5)),
     );
-    let id = egui::Id::new((
+    let id = tl_id((
         &prefix,
         match n.row.kind {
             RowKind::Prop { uid } | RowKind::Group { uid, .. } => uid,
@@ -151,7 +153,7 @@ pub(super) fn show(
         RowKind::Group { uid, .. } => format!("{prefix}.group.{uid}.row"),
         _ => format!("{prefix}.row"),
     };
-    app.auto.add(&row_auto, r.intersect(left_clip), &layer.name);
+    app.auto_mut().add(&row_auto, r.intersect(left_clip), &layer.name);
     match &n.row.kind {
         RowKind::Layer => {
             for (i, (icon, name, on)) in [
@@ -164,28 +166,28 @@ pub(super) fn show(
             .enumerate()
             {
                 let br = Rect::from_center_size(pos2(cw.av + 10.0 + i as f32 * 18.0, cy), vec2(15.0, 15.0));
-                if !Vis::of(&app.ui.timeline).av {
+                if !Vis::of(&app.ui().timeline).av {
                     continue;
                 }
                 icons::paint(&lp, br, icon, if on { t.text } else { t.text_faint });
-                app.auto.add(&format!("{prefix}.{name}"), br, name);
+                app.auto_mut().add(&format!("{prefix}.{name}"), br, name);
                 if ui.interact(br, id.with(name), Sense::click()).clicked() && (!locked || name == "lock") && !n.context.locked {
                     local.push(("layer.setSwitch".into(), json!({"layers":[layer.id.0],"switch":name,"value":!on})));
                 }
             }
             let tw = Rect::from_center_size(pos2(indent, cy), vec2(14.0, 14.0));
-            if widgets::twirl(ui, tw, app.ui.timeline.open_layers.contains(&layer.id.0), id.with("props"), &t).clicked() {
-                toggle(&mut app.ui.timeline.open_layers, layer.id.0);
+            if widgets::twirl(ui, tw, app.ui().timeline.open_layers.contains(&layer.id.0), id.with("props"), &t).clicked() {
+                toggle(&mut app.ui_mut().timeline.open_layers, layer.id.0);
             }
-            app.auto.add(&format!("{prefix}.twirl"), tw, "Layer properties");
+            app.auto_mut().add(&format!("{prefix}.twirl"), tw, "Layer properties");
             expander(app, ui, n.root, &n.path, &layer, Rect::from_center_size(pos2(indent + 16.0, cy), vec2(14.0, 14.0)));
             let nr = Rect::from_min_max(pos2(indent + 28.0, r.min.y), pos2(cw.name_end - 4.0, r.max.y));
             let response = ui.interact(nr, id.with("name"), Sense::click()).on_hover_text(format!(
                 "{} • shared source layers; edits affect every instance",
-                app.session.project.item(n.context.comp).map(|item| item.name.as_str()).unwrap_or("Source")
+                app.session().project.item(n.context.comp).map(|item| item.name.as_str()).unwrap_or("Source")
             ));
             widgets::text_fit(&lp, pos2(nr.min.x, cy), Align2::LEFT_CENTER, &layer.name, Tokens::ui(12.0), nr.width(), t.text);
-            app.auto.add(&format!("{prefix}.name"), nr, &layer.name);
+            app.auto_mut().add(&format!("{prefix}.name"), nr, &layer.name);
             if response.clicked() && !locked {
                 local.push(("layer.select".into(), json!({"layers":[layer.id.0],"toggle":ui.input(|i|i.modifiers.command || i.modifiers.shift)})));
             }
@@ -226,7 +228,7 @@ pub(super) fn show(
                     gp.rect_filled(bar, 2.0, bar_color(t.label(layer.label), selected));
                     ui.set_clip_rect(right_clip);
                     let resp = ui.interact(bar, id.with("bar"), Sense::click_and_drag());
-                    app.auto.add(&format!("{prefix}.bar"), bar, "Move nested layer");
+                    app.auto_mut().add(&format!("{prefix}.bar"), bar, "Move nested layer");
                     if resp.drag_started() {
                         ui.ctx().data_mut(|d| d.insert_temp(id.with("bar-origin"), layer.start_time.seconds()));
                     }
@@ -255,14 +257,14 @@ pub(super) fn show(
         RowKind::Group { uid, name, open, has_children, .. } => {
             let tw = Rect::from_center_size(pos2(indent, cy), vec2(14.0, 14.0));
             if *has_children && widgets::twirl(ui, tw, *open, id.with("group"), &t).clicked() {
-                toggle(&mut app.ui.timeline.open_groups, *uid);
+                toggle(&mut app.ui_mut().timeline.open_groups, *uid);
             }
-            app.auto.add(&format!("{prefix}.group.{uid}.twirl"), tw, "Expand property group");
+            app.auto_mut().add(&format!("{prefix}.group.{uid}.twirl"), tw, "Expand property group");
             lp.text(pos2(indent + 12.0, cy), Align2::LEFT_CENTER, name, Tokens::ui(12.0), t.text);
             if let Some(g) = layer.props.find_group(*uid).filter(|g| g.is_instance()) {
                 let eye = Rect::from_center_size(pos2(cw.av + 10.0, cy), vec2(15.0, 15.0));
                 icons::paint(&lp, eye, Icon::Eye, if g.enabled { t.text } else { t.text_faint });
-                app.auto.add(&format!("{prefix}.group.{uid}.eye"), eye, "Enable group");
+                app.auto_mut().add(&format!("{prefix}.group.{uid}.eye"), eye, "Enable group");
                 if ui.interact(eye, id.with("eye"), Sense::click()).clicked() && !locked {
                     local.push(("prop.setGroupEnabled".into(), json!({"layer":layer.id.0,"prop":uid,"value":!g.enabled})));
                 }
@@ -270,22 +272,23 @@ pub(super) fn show(
         }
         RowKind::Prop { uid } => {
             let Some(prop) = layer.props.find(*uid) else { return };
-            let project = app.session.project.clone();
-            let expr = app.session.expr.clone();
+            let project = app.session().project.clone();
+            let expr = app.session().expr.clone();
             let mut eval = EvalCtx::new(&project, n.context.comp, &comp, n.context.time);
             eval.expr = expr.as_deref();
             let value = eval.value(&layer, prop);
+            let raw = prop.value_at(layer.layer_time(eval.time));
             let sw = Rect::from_center_size(pos2(indent, cy), vec2(15.0, 15.0));
             if !prop.static_only {
                 icons::paint(&lp, sw, Icon::Stopwatch, if prop.is_animated() { t.hot_text } else { t.text_dim });
-                app.auto.add(&format!("{prefix}.prop.{uid}.stopwatch"), sw, "Toggle animation at nested source time");
+                app.auto_mut().add(&format!("{prefix}.prop.{uid}.stopwatch"), sw, "Toggle animation at nested source time");
                 if ui.interact(sw, id.with("stopwatch"), Sense::click()).clicked() && !locked {
                     local.push(("prop.toggleAnimation".into(), json!({"layer":layer.id.0,"prop":uid})));
                 }
                 let key = Rect::from_center_size(pos2(cw.av + 30.0, cy), vec2(14.0, 14.0));
                 let at_key = effectcraft_engine::keyframe::key_at(&prop.keys, layer.layer_time(n.context.time)).is_some();
                 icons::paint(&lp, key, Icon::Keyframe, if at_key { t.hot_text } else { t.text_dim });
-                app.auto.add(&format!("{prefix}.prop.{uid}.addKey"), key, "Add/remove source keyframe");
+                app.auto_mut().add(&format!("{prefix}.prop.{uid}.addKey"), key, "Add/remove source keyframe");
                 if ui.interact(key, id.with("add-key"), Sense::click()).clicked() && !locked {
                     local.push(("prop.toggleKey".into(), json!({"layer":layer.id.0,"prop":uid})));
                 }
@@ -301,7 +304,7 @@ pub(super) fn show(
                 if sel.props.contains(&(layer.id, *uid)) { t.hot_text } else { t.text },
             );
             let name_response = ui.interact(nr, id.with("name"), Sense::click());
-            app.auto.add(&format!("{prefix}.prop.{uid}.name"), nr, &prop.name);
+            app.auto_mut().add(&format!("{prefix}.prop.{uid}.name"), nr, &prop.name);
             if name_response.clicked() && !locked {
                 local.push(("prop.select".into(), json!({"layer":layer.id.0,"prop":uid,"add":ui.input(|i|i.modifiers.shift)})));
             }
@@ -316,12 +319,12 @@ pub(super) fn show(
                     let mut text =
                         ui.ctx().data(|d| d.get_temp::<String>(buffer)).unwrap_or_else(|| prop.expr.as_ref().map(|e| e.text.clone()).unwrap_or_default());
                     let response = ui.add_enabled(!locked, egui::TextEdit::multiline(&mut text).desired_width(320.0).desired_rows(3));
-                    app.auto.add(&format!("{prefix}.prop.{uid}.expression"), response.rect, "Expression");
+                    app.auto_mut().add(&format!("{prefix}.prop.{uid}.expression"), response.rect, "Expression");
                     if response.changed() {
                         ui.ctx().data_mut(|d| d.insert_temp(buffer, text.clone()));
                     }
                     let apply = ui.add_enabled(!locked, egui::Button::new(tr("Apply expression")));
-                    app.auto.add(&format!("{prefix}.prop.{uid}.applyExpression"), apply.rect, "Apply expression");
+                    app.auto_mut().add(&format!("{prefix}.prop.{uid}.applyExpression"), apply.rect, "Apply expression");
                     if apply.clicked() {
                         local.push(("prop.setExpression".into(), json!({"layer":layer.id.0,"prop":uid,"expression":text})));
                         ui.ctx().data_mut(|d| d.remove::<String>(buffer));
@@ -335,15 +338,15 @@ pub(super) fn show(
                     let mut text = value.to_json().as_str().unwrap_or_default().to_string();
                     let rr = Rect::from_min_size(pos2(at.x, at.y - 9.0), vec2(160.0, 18.0));
                     let response = ui.put(rr, egui::TextEdit::singleline(&mut text).id(id.with("text")));
-                    app.auto.add(&format!("{prefix}.prop.{uid}.value"), response.rect, "Edit source text");
+                    app.auto_mut().add(&format!("{prefix}.prop.{uid}.value"), response.rect, "Edit source text");
                     if response.changed() {
                         local.push(("prop.set".into(), json!({"layer":layer.id.0,"prop":uid,"value":text,"merge":format!("text-{uid}")})));
                     }
                     if response.lost_focus() {
-                        app.session.history.merge_key = None;
+                        app.session_mut().history.merge_key = None;
                     }
                 } else {
-                    value_editor(app, ui, &lp, &layer, prop, &value, at, Some(&instance_key(n.root, &n.path)), &mut local);
+                    value_editor(app, ui, &lp, &layer, prop, &value, &raw, at, Some(&instance_key(n.root, &n.path)), &mut local);
                 }
             });
             if !graph_on {
@@ -364,8 +367,8 @@ pub(super) fn show(
         if id == "prop.editGradient" {
             params["comp"] = json!(n.context.comp.0);
             let scope = crate::state::InlineScope { root: n.root.0, path: n.path.clone(), time: Some(n.context.time) };
-            if let Err(error) = with_scope(app, &scope, |app| super::super::gradient_editor::open(app, &params)).and_then(|result| result) {
-                app.ui.status = error;
+            if let Err(error) = with_scope(app, &scope, |app| app.request_dialog(DialogRequest::Gradient(params.clone()))).and_then(|result| result) {
+                app.ui_mut().status = error;
             }
             continue;
         }
@@ -375,7 +378,7 @@ pub(super) fn show(
 
 #[allow(clippy::too_many_arguments)]
 fn draw_keys(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     n: &InlineRow,
     layer: &Layer,
@@ -388,8 +391,8 @@ fn draw_keys(
     let Some((offset, scale)) = n.context.affine else { return };
     ui.set_clip_rect(clip);
     let p = ui.painter().with_clip_rect(clip);
-    let t = app.tokens;
-    let selected = app.session.state.comp_selections.get(&n.context.comp).map(|s| s.keys.clone()).unwrap_or_default();
+    let t = app.tokens();
+    let selected = app.session().state.comp_selections.get(&n.context.comp).map(|s| s.keys.clone()).unwrap_or_default();
     for (index, k) in prop.keys.iter().enumerate() {
         let root_time = offset + scale * layer.comp_time(k.time).seconds();
         let center = pos2(tm.x(root_time), r.center().y);
@@ -399,7 +402,7 @@ fn draw_keys(
         let kr = effectcraft_engine::KeyRef { layer: layer.id, prop: prop.uid, time: k.time };
         let rect = Rect::from_center_size(center, vec2(12.0, 14.0));
         icons::paint(&p, rect, Icon::Keyframe, if selected.contains(&kr) { t.keyframe_selected } else { t.text_dim });
-        let id = egui::Id::new(("inline-key", n.root.0, &n.path, prop.uid, index));
+        let id = tl_id(("inline-key", n.root.0, &n.path, prop.uid, index));
         let resp =
             ui.interact(rect, id, Sense::click_and_drag()).on_hover_text(format!("Source {:.3}s; parent {:.3}s", layer.comp_time(k.time).seconds(), root_time));
         let auto = format!(
@@ -408,7 +411,7 @@ fn draw_keys(
             layer.id.0,
             prop.uid
         );
-        app.auto.add(&auto, rect, "Source keyframe");
+        app.auto_mut().add(&auto, rect, "Source keyframe");
         let select = json!({"keys":[{"layer":layer.id.0,"prop":prop.uid,"time":k.time.seconds()}],"selectProperties":true});
         if layer.switches.locked || n.context.locked {
             continue;
@@ -419,13 +422,13 @@ fn draw_keys(
             actions.push(("keys.select".into(), args));
         }
         if resp.double_clicked() {
-            app.session.set_time(Tick::from_seconds_f64(root_time));
+            app.session_mut().set_time(Tick::from_seconds_f64(root_time));
         }
         if resp.drag_started() {
             ui.ctx().data_mut(|d| d.insert_temp(id.with("key-applied"), 0.0_f64));
         }
         if resp.dragged()
-            && let Some(total) = app.session.project.comp(n.context.comp).and_then(|c| snapped_drag(resp.drag_delta().x, tm.pps, scale, c.frame_rate))
+            && let Some(total) = app.session().project.comp(n.context.comp).and_then(|c| snapped_drag(resp.drag_delta().x, tm.pps, scale, c.frame_rate))
         {
             let applied = ui.ctx().data(|d| d.get_temp::<f64>(id.with("key-applied"))).unwrap_or(0.0);
             if total != applied {
@@ -434,7 +437,7 @@ fn draw_keys(
             }
         }
         if resp.drag_stopped() {
-            app.session.history.merge_key = None;
+            app.session_mut().history.merge_key = None;
         }
         resp.context_menu(|ui| {
             for (label, command) in [("Easy ease", "keys.easyEase"), ("Hold", "keys.toggleHold"), ("Delete keyframe", "keys.delete")] {
@@ -456,33 +459,34 @@ fn snapped_drag(pixels: f32, pps: f64, scale: f64, rate: effectcraft_engine::tim
     seconds.is_finite().then(|| rate.snap_nearest(Tick::from_seconds_f64(seconds)).seconds())
 }
 
-fn focus(app: &mut EffectcraftApp, root: ItemId, path: &[u64]) {
-    if app.ui.timeline.inline_parent_selection.is_none() {
-        let state = &mut app.session.state;
-        app.ui.timeline.inline_parent_text_edit = state.text_edit.take();
-        app.ui.timeline.inline_parent_selection = Some(effectcraft_engine::CompSelection {
+fn focus(app: &mut dyn TimelineHost, root: ItemId, path: &[u64]) {
+    if app.ui().timeline.inline_parent_selection.is_none() {
+        let parts = app.parts();
+        let state = &mut parts.session.state;
+        parts.ui.timeline.inline_parent_text_edit = state.text_edit.take();
+        parts.ui.timeline.inline_parent_selection = Some(effectcraft_engine::CompSelection {
             layers: std::mem::take(&mut state.selected_layers),
             props: std::mem::take(&mut state.selected_props),
             keys: std::mem::take(&mut state.selected_keys),
             vertices: std::mem::take(&mut state.selected_vertices),
         });
     }
-    app.ui.timeline.inline_focus = Some(instance_key(root, path));
+    app.ui_mut().timeline.inline_focus = Some(instance_key(root, path));
 }
 
-pub(super) fn clear_focus(app: &mut EffectcraftApp) {
-    let text_edit = app.ui.timeline.inline_parent_text_edit.take();
-    let root = app.ui.timeline.inline_focus.take().and_then(|p| p.first().copied()).map(ItemId);
-    let Some(mut selection) = app.ui.timeline.inline_parent_selection.take() else { return };
+pub(super) fn clear_focus(app: &mut dyn TimelineHost) {
+    let text_edit = app.ui_mut().timeline.inline_parent_text_edit.take();
+    let root = app.ui_mut().timeline.inline_focus.take().and_then(|p| p.first().copied()).map(ItemId);
+    let Some(mut selection) = app.ui_mut().timeline.inline_parent_selection.take() else { return };
     let Some(root) = root else { return };
-    let Some(comp) = app.session.project.comp(root) else { return };
+    let Some(comp) = app.session().project.comp(root) else { return };
     let text_edit = text_edit.filter(|edit| comp.layer(edit.layer).is_some_and(|layer| matches!(layer.source, LayerSource::Text)));
     selection.layers.retain(|id| comp.layer(*id).is_some());
     selection.props.retain(|(id, uid)| comp.layer(*id).is_some_and(|l| l.props.find(*uid).is_some() || l.props.find_group(*uid).is_some()));
     selection.keys.retain(|k| comp.layer(k.layer).and_then(|l| l.props.find(k.prop)).is_some_and(|p| p.keys.iter().any(|key| key.time == k.time)));
     selection.vertices.retain(|v| comp.layer(v.layer).and_then(|l| l.props.find_group(v.mask)).is_some());
-    if app.session.active_comp_id() == Some(root) {
-        let state = &mut app.session.state;
+    if app.session().active_comp_id() == Some(root) {
+        let state = &mut app.session_mut().state;
         if state.text_edit.is_none() {
             state.text_edit = text_edit;
         }
@@ -493,18 +497,18 @@ pub(super) fn clear_focus(app: &mut EffectcraftApp) {
             state.selected_vertices = selection.vertices;
         }
     } else {
-        app.session.state.comp_selections.insert(root, selection);
+        app.session_mut().state.comp_selections.insert(root, selection);
     }
 }
 
 /// The focused instance; explicit outer-comp targets must not be captured.
-fn current_scope(app: &EffectcraftApp) -> Option<crate::state::InlineScope> {
-    if app.ui.focused != crate::dock::PanelKind::Timeline {
+fn current_scope(app: &dyn TimelineHost) -> Option<crate::state::InlineScope> {
+    if app.ui().focused != crate::dock::PanelKind::Timeline {
         return None;
     }
-    let focus = app.ui.timeline.inline_focus.as_ref()?;
+    let focus = app.ui().timeline.inline_focus.as_ref()?;
     let (&root, path) = focus.split_first()?;
-    (Some(root) == app.session.active_comp_id().map(|id| id.0)).then(|| crate::state::InlineScope { root, path: path.to_vec(), time: None })
+    (Some(root) == app.session().active_comp_id().map(|id| id.0)).then(|| crate::state::InlineScope { root, path: path.to_vec(), time: None })
 }
 
 fn scoped_params(scope: &crate::state::InlineScope, id: &str, params: serde_json::Value) -> serde_json::Value {
@@ -516,44 +520,44 @@ fn scoped_params(scope: &crate::state::InlineScope, id: &str, params: serde_json
 }
 
 /// Keep UI dialogs, rich-clipboard dispatch and graph gestures in the same source cursor.
-pub(super) fn with_scope<R>(app: &mut EffectcraftApp, scope: &crate::state::InlineScope, run: impl FnOnce(&mut EffectcraftApp) -> R) -> Result<R, String> {
+pub(super) fn with_scope<H: TimelineHost + ?Sized, R>(app: &mut H, scope: &crate::state::InlineScope, run: impl FnOnce(&mut H) -> R) -> Result<R, String> {
     let mut context =
-        inline_comp::context(&app.session, ItemId(scope.root), &scope.path, app.session.time_of(ItemId(scope.root))).map_err(|e| e.to_string())?;
+        inline_comp::context(app.session(), ItemId(scope.root), &scope.path, app.session().time_of(ItemId(scope.root))).map_err(|e| e.to_string())?;
     if let Some(time) = scope.time {
         context.time = time;
     }
-    let previous = app.session.state.active_comp;
-    let old_time = app.session.state.times.get(&context.comp).copied();
-    let track = app.session.state.current_track;
-    let text = app.session.state.text_edit.take();
-    let dispatch = app.ui.timeline.inline_dispatch.replace(scope.clone());
-    let old_dialog = app.dialog;
-    app.session.activate_comp(context.comp);
-    app.session.state.times.insert(context.comp, context.time);
+    let previous = app.session().state.active_comp;
+    let old_time = app.session().state.times.get(&context.comp).copied();
+    let track = app.session().state.current_track;
+    let text = app.session_mut().state.text_edit.take();
+    let dispatch = app.ui_mut().timeline.inline_dispatch.replace(scope.clone());
+    let old_dialog = app.dialog();
+    app.session_mut().activate_comp(context.comp);
+    app.session_mut().state.times.insert(context.comp, context.time);
     let result = effectcraft_engine::guard::guarded("inline source UI", || Ok(run(app))).map_err(|error| error.to_string());
-    if old_dialog.is_none() && app.dialog.is_some() {
-        app.ui.timeline.inline_dialog = Some(crate::state::InlineScope { time: Some(context.time), ..scope.clone() });
+    if old_dialog.is_none() && app.dialog().is_some() {
+        app.ui_mut().timeline.inline_dialog = Some(crate::state::InlineScope { time: Some(context.time), ..scope.clone() });
     }
     match previous {
-        Some(id) => app.session.activate_comp(id),
-        None => app.session.activate_comp_none(),
+        Some(id) => app.session_mut().activate_comp(id),
+        None => app.session_mut().activate_comp_none(),
     }
     match old_time {
         Some(time) => {
-            app.session.state.times.insert(context.comp, time);
+            app.session_mut().state.times.insert(context.comp, time);
         }
         None => {
-            app.session.state.times.remove(&context.comp);
+            app.session_mut().state.times.remove(&context.comp);
         }
     }
-    app.session.state.current_track = track;
-    app.session.state.text_edit = text;
-    app.ui.timeline.inline_dispatch = dispatch;
+    app.session_mut().state.current_track = track;
+    app.session_mut().state.text_edit = text;
+    app.ui_mut().timeline.inline_dispatch = dispatch;
     result
 }
 
-pub(super) fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: &serde_json::Value) -> Option<Result<serde_json::Value, String>> {
-    if app.ui.timeline.inline_dispatch.is_some() || id == "comp.inlineEdit" {
+pub(super) fn invoke(app: &mut dyn TimelineHost, ctx: &egui::Context, id: &str, params: &serde_json::Value) -> Option<Result<serde_json::Value, String>> {
+    if app.ui().timeline.inline_dispatch.is_some() || id == "comp.inlineEdit" {
         return None;
     }
     let scope = current_scope(app)?;
@@ -562,43 +566,45 @@ pub(super) fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, pa
     }
     if matches!(id, "time.nextKey" | "time.previousKey") {
         let navigation = (|| {
-            let context = inline_comp::context(&app.session, ItemId(scope.root), &scope.path, app.session.time_of(ItemId(scope.root)))
+            let context = inline_comp::context(app.session(), ItemId(scope.root), &scope.path, app.session().time_of(ItemId(scope.root)))
                 .map_err(|error| error.to_string())?;
             let Some((offset, scale)) = context.affine else {
                 return Err(tr("Use the parent ruler to scrub a time-remapped instance; source keys remain editable.").into());
             };
             let source_time = with_scope(app, &scope, |app| {
                 let mut params = params.clone();
-                if app.ui.timeline.graph_editor
-                    && let Some(comp) = app.session.active_comp_arc()
+                if app.ui().timeline.graph_editor
+                    && let Some(comp) = app.session().active_comp_arc()
                 {
                     params["visible"] = json!(
                         super::super::graph::shown_props(app, &comp).iter().map(|(layer, prop)| json!({"layer":layer.0,"prop":prop})).collect::<Vec<_>>()
                     );
                 }
-                crate::menus::invoke(app, ctx, id, params).map(|_| app.session.time())
+                app.invoke(ctx, id, params).map(|_| app.session().time())
             })??;
             let target = offset + scale * source_time.seconds();
             if !target.is_finite() {
                 return Err(tr("Invalid nested keyframe time").into());
             }
-            crate::menus::run_engine(app, ctx, "time.set", json!({"time":target}))
+            app.run_engine(ctx, "time.set", json!({"time":target}))
         })();
         return Some(navigation);
     }
     let source_ui = id.starts_with("timeline.reveal") || id.starts_with("timeline.keyAt") || id == "anim.reveal";
     let source_graph_zoom =
-        app.ui.timeline.graph_editor && matches!(id, "timeline.zoomIn" | "timeline.zoomOut" | "timeline.zoomFit" | "timeline.zoomFrameToggle");
+        app.ui().timeline.graph_editor && matches!(id, "timeline.zoomIn" | "timeline.zoomOut" | "timeline.zoomFit" | "timeline.zoomFrameToggle");
     if inline_comp::supported(id) || source_ui || source_graph_zoom {
         return Some(
             with_scope(app, &scope, |app| {
                 let view = source_graph_zoom.then(|| take_graph_view(app));
                 if source_graph_zoom {
-                    load_graph_view(app, app.session.active_comp_id().map(|c| c.0).unwrap_or(0));
+                    let comp = app.session().active_comp_id().map(|c| c.0).unwrap_or(0);
+                    load_graph_view(app, comp);
                 }
-                let result = crate::menus::invoke(app, ctx, id, params.clone());
+                let result = app.invoke(ctx, id, params.clone());
                 if let Some(view) = view {
-                    store_graph_view(app, app.session.active_comp_id().map(|c| c.0).unwrap_or(0));
+                    let comp = app.session().active_comp_id().map(|c| c.0).unwrap_or(0);
+                    store_graph_view(app, comp);
                     put_graph_view(app, view);
                 }
                 result
@@ -620,19 +626,19 @@ pub(super) fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, pa
     None
 }
 
-pub(super) fn engine_target(app: &EffectcraftApp, id: &str, params: &serde_json::Value) -> Option<serde_json::Value> {
-    let scope = app.ui.timeline.inline_dispatch.as_ref()?;
+pub(super) fn engine_target(app: &dyn TimelineHost, id: &str, params: &serde_json::Value) -> Option<serde_json::Value> {
+    let scope = app.ui().timeline.inline_dispatch.as_ref()?;
     inline_comp::supported(id).then(|| scoped_params(scope, id, params.clone()))
 }
 
 pub(super) fn enabled(app: &EffectcraftApp, id: &str) -> Option<bool> {
-    if app.ui.timeline.inline_dispatch.is_some() {
+    if app.ui().timeline.inline_dispatch.is_some() {
         return None;
     }
     let scope = current_scope(app)?;
-    let context = inline_comp::context(&app.session, ItemId(scope.root), &scope.path, app.session.time_of(ItemId(scope.root))).ok()?;
-    let selection = app.session.state.comp_selections.get(&context.comp).cloned().unwrap_or_default();
-    let st = &app.session.state;
+    let context = inline_comp::context(app.session(), ItemId(scope.root), &scope.path, app.session().time_of(ItemId(scope.root))).ok()?;
+    let selection = app.session().state.comp_selections.get(&context.comp).cloned().unwrap_or_default();
+    let st = &app.session().state;
     let selected = match id {
         "edit.clear" | "edit.copy" | "edit.cut" | "edit.copyWithPropertyLinks" | "edit.copyWithRelativePropertyLinks" | "edit.copyExpressionOnly" => {
             !selection.layers.is_empty() || !selection.props.is_empty() || !selection.keys.is_empty()
@@ -656,7 +662,7 @@ pub(super) fn enabled(app: &EffectcraftApp, id: &str) -> Option<bool> {
                     .is_some_and(|text| effectcraft_engine::figma::clipboard::is_clipboard_text(&text) || effectcraft_engine::vector::is_svg_text(&text))
         }
         "keys.paste" => !st.key_clipboard.is_empty(),
-        "edit.selectAll" => app.session.project.comp(context.comp).is_some_and(|c| !c.layers.is_empty()),
+        "edit.selectAll" => app.session().project.comp(context.comp).is_some_and(|c| !c.layers.is_empty()),
         "edit.deselectAll" => !selection.layers.is_empty() || !selection.props.is_empty() || !selection.keys.is_empty(),
         "prop.reset" => !selection.props.is_empty(),
         _ => return None,
@@ -664,25 +670,25 @@ pub(super) fn enabled(app: &EffectcraftApp, id: &str) -> Option<bool> {
     Some(selected && !context.locked)
 }
 
-fn take_graph_view(app: &EffectcraftApp) -> crate::state::InlineGraphView {
-    let tl = &app.ui.timeline;
+fn take_graph_view(app: &dyn TimelineHost) -> crate::state::InlineGraphView {
+    let tl = &app.ui().timeline;
     crate::state::InlineGraphView { start: tl.start, pps: tl.pps, range: tl.graph_range, before_fit: tl.before_fit, auto_zoom: tl.graph_auto_zoom }
 }
-fn put_graph_view(app: &mut EffectcraftApp, view: crate::state::InlineGraphView) {
-    let tl = &mut app.ui.timeline;
+fn put_graph_view(app: &mut dyn TimelineHost, view: crate::state::InlineGraphView) {
+    let tl = &mut app.ui_mut().timeline;
     tl.start = view.start;
     tl.pps = view.pps;
     tl.graph_range = view.range;
     tl.before_fit = view.before_fit;
     tl.graph_auto_zoom = view.auto_zoom;
 }
-fn load_graph_view(app: &mut EffectcraftApp, comp: u64) {
-    let view = app.ui.timeline.inline_graph_views.get(&comp).cloned().unwrap_or(crate::state::InlineGraphView { auto_zoom: true, ..Default::default() });
+fn load_graph_view(app: &mut dyn TimelineHost, comp: u64) {
+    let view = app.ui().timeline.inline_graph_views.get(&comp).cloned().unwrap_or(crate::state::InlineGraphView { auto_zoom: true, ..Default::default() });
     put_graph_view(app, view);
 }
-fn store_graph_view(app: &mut EffectcraftApp, comp: u64) {
+fn store_graph_view(app: &mut dyn TimelineHost, comp: u64) {
     let view = take_graph_view(app);
-    app.ui.timeline.inline_graph_views.insert(comp, view);
+    app.ui_mut().timeline.inline_graph_views.insert(comp, view);
 }
 
 pub(super) struct GraphLayout {
@@ -693,82 +699,82 @@ pub(super) struct GraphLayout {
     source: u64,
 }
 
-pub(super) fn finish_graph(app: &mut EffectcraftApp, layout: GraphLayout) {
+pub(super) fn finish_graph(app: &mut dyn TimelineHost, layout: GraphLayout) {
     store_graph_view(app, layout.source);
     put_graph_view(app, layout.restore);
 }
 
 /// The parent ruler continues to scrub the parent. Source curves have their own labelled
 /// source-time ruler, so reverse stretch/remapping never inverts key edits or mislabels speed.
-pub(super) fn show_graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, area: Rect) -> Option<GraphLayout> {
+pub(super) fn show_graph(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, area: Rect) -> Option<GraphLayout> {
     let scope = current_scope(app)?;
-    let context = match inline_comp::context(&app.session, ItemId(scope.root), &scope.path, app.session.time_of(ItemId(scope.root))) {
+    let context = match inline_comp::context(app.session(), ItemId(scope.root), &scope.path, app.session().time_of(ItemId(scope.root))) {
         Ok(context) => context,
         Err(error) => {
-            app.ui.status = error.to_string();
+            app.ui_mut().status = error.to_string();
             return None;
         }
     };
-    let comp = app.session.project.comp_arc(context.comp)?;
+    let comp = app.session().project.comp_arc(context.comp)?;
     let restore = take_graph_view(app);
     load_graph_view(app, context.comp.0);
-    if app.ui.timeline.inline_graph_active != Some(context.comp.0) {
+    if app.ui().timeline.inline_graph_active != Some(context.comp.0) {
         super::super::graph::reset_context(ui.ctx());
-        app.session.history.merge_key = None;
-        app.ui.timeline.inline_graph_active = Some(context.comp.0);
+        app.session_mut().history.merge_key = None;
+        app.ui_mut().timeline.inline_graph_active = Some(context.comp.0);
     }
     let fit = fit_pps(area.width(), &comp);
-    let tm = TMap { x0: area.min.x, start: app.ui.timeline.start, pps: app.ui.timeline.pps.unwrap_or(fit) };
+    let tm = TMap { x0: area.min.x, start: app.ui().timeline.start, pps: app.ui().timeline.pps.unwrap_or(fit) };
     let caption = Rect::from_min_max(area.min, pos2(area.max.x, area.min.y + 22.0));
     let ruler = Rect::from_min_max(pos2(area.min.x, caption.max.y), pos2(area.max.x, caption.max.y + 20.0));
     let graph = Rect::from_min_max(pos2(area.min.x, ruler.max.y), area.max);
-    let label = app.session.project.item(context.comp).map(|item| item.name.as_str()).unwrap_or("Source");
+    let label = app.session().project.item(context.comp).map(|item| item.name.as_str()).unwrap_or("Source");
     let title = crate::i18n::tr_args("Source graph: {} · {} s", &[&label, &format!("{:.3}", context.time.seconds())]);
-    p.rect_filled(caption, 0.0, app.tokens.panel_bg);
-    p.text(caption.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, &title, Tokens::ui(11.5), app.tokens.accent);
-    app.auto.add("timeline.inlineGraph.source", caption, &title);
-    p.rect_filled(ruler, 0.0, app.tokens.tl_ruler_bg);
+    p.rect_filled(caption, 0.0, app.tokens().panel_bg);
+    p.text(caption.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, &title, Tokens::ui(11.5), app.tokens().accent);
+    app.auto_mut().add("timeline.inlineGraph.source", caption, &title);
+    p.rect_filled(ruler, 0.0, app.tokens().tl_ruler_bg);
     for i in 0..=8 {
         let x = ruler.min.x + ruler.width() * i as f32 / 8.0;
         let seconds = tm.t(x);
-        p.line_segment([pos2(x, ruler.max.y - 5.0), pos2(x, ruler.max.y)], Stroke::new(1.0, app.tokens.text_faint));
-        p.text(pos2(x + 3.0, ruler.min.y + 8.0), Align2::LEFT_CENTER, format!("{seconds:.2}s"), Tokens::ui(10.0), app.tokens.text_dim);
+        p.line_segment([pos2(x, ruler.max.y - 5.0), pos2(x, ruler.max.y)], Stroke::new(1.0, app.tokens().text_faint));
+        p.text(pos2(x + 3.0, ruler.min.y + 8.0), Align2::LEFT_CENTER, format!("{seconds:.2}s"), Tokens::ui(10.0), app.tokens().text_dim);
     }
-    let response = ui.interact(ruler, egui::Id::new("inline-graph-ruler"), Sense::click_and_drag());
-    app.auto.add("timeline.inlineGraph.ruler", ruler, &format!("{},{}", tm.start, tm.pps));
+    let response = ui.interact(ruler, tl_id("inline-graph-ruler"), Sense::click_and_drag());
+    app.auto_mut().add("timeline.inlineGraph.ruler", ruler, &format!("{},{}", tm.start, tm.pps));
     if (response.clicked() || response.dragged())
         && let Some(pointer) = response.interact_pointer_pos()
     {
         if let Some((offset, scale)) = context.affine {
             let source = comp.frame_rate.snap_nearest(Tick::from_seconds_f64(tm.t(pointer.x)));
-            app.session.set_time(Tick::from_seconds_f64(offset + scale * source.seconds()));
+            app.session_mut().set_time(Tick::from_seconds_f64(offset + scale * source.seconds()));
         } else {
-            app.ui.status = tr("Use the parent ruler to scrub a time-remapped instance; source keys remain editable.").into();
+            app.ui_mut().status = tr("Use the parent ruler to scrub a time-remapped instance; source keys remain editable.").into();
         }
     }
     let result = with_scope(app, &scope, |app| {
-        let project = app.session.project.clone();
-        let expr = app.session.expr.clone();
+        let project = app.session().project.clone();
+        let expr = app.session().expr.clone();
         let mut eval = EvalCtx::new(&project, context.comp, &comp, context.time);
         eval.expr = expr.as_deref();
         let mut actions = vec![];
         super::super::graph::show(app, ui, p, &comp, &eval, tm, graph, &mut actions);
         for (id, params) in actions {
             if id == "__endMerge" {
-                app.session.history.merge_key = None;
+                app.session_mut().history.merge_key = None;
                 continue;
             }
-            if let Err(error) = crate::menus::invoke(app, ui.ctx(), &id, params) {
-                app.ui.status = error;
+            if let Err(error) = app.invoke(ui.ctx(), &id, params) {
+                app.ui_mut().status = error;
             }
         }
     });
     if let Err(error) = result {
-        app.ui.status = error;
+        app.ui_mut().status = error;
     }
     let x = tm.x(context.time.seconds());
     if x.is_finite() && x >= area.min.x && x <= area.max.x {
-        p.line_segment([pos2(x, ruler.min.y), pos2(x, graph.max.y - 28.0)], Stroke::new(1.0, app.tokens.cti));
+        p.line_segment([pos2(x, ruler.min.y), pos2(x, graph.max.y - 28.0)], Stroke::new(1.0, app.tokens().cti));
     }
     Some(GraphLayout { comp, time: context.time, tm, restore, source: context.comp.0 })
 }

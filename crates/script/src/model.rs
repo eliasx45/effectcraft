@@ -51,13 +51,7 @@ pub fn query(s: &mut Session, kind: &str, a: &J) -> R {
             let i = u(a, "index").unwrap_or(0) as usize;
             Ok(effectcraft_engine::command_specs().get(i.wrapping_sub(1)).map(|c| json!(c.id)).unwrap_or(J::Null))
         }
-        "exprError" => {
-            let code = a.get("code").and_then(J::as_str).unwrap_or("");
-            Ok(match s.expr_check {
-                Some(check) => json!(check(code).err().unwrap_or_default()),
-                None => json!(""),
-            })
-        }
+        "exprError" => expr_error(s, a),
         "labels" => Ok(json!(Label::ALL.iter().map(|l| l.name()).collect::<Vec<_>>())),
         "effects" => Ok(json!(
             effectcraft_engine::effects::all()
@@ -439,8 +433,36 @@ fn alias(k: &str) -> Option<&'static str> {
 const NESTED_CHILD_DEPTH: u8 = 3;
 
 /// The child of `g` that a string key names. The direct children are searched first, then the
-/// groups nested below them, up to `depth` levels.
+/// groups nested below them level by level, up to `depth` levels: the shallowest match wins, so
+/// a shape layer's `property("Position")` is its Transform ▸ Position (one level down), not a
+/// shape group's Transform ▸ Position under Contents (three levels down), as in After Effects.
 fn find_child<'a>(l: &'a Layer, g: &'a PropGroup, k: &str, depth: u8) -> Option<&'a Node> {
+    let mut level: Vec<&'a PropGroup> = vec![g];
+    for d in 0..=depth {
+        if let Some(n) = level.iter().find_map(|grp| find_direct_child(l, grp, k)) {
+            return Some(n);
+        }
+        if d == depth {
+            break;
+        }
+        level = level
+            .iter()
+            .flat_map(|grp| grp.children.iter())
+            .filter_map(|n| match n {
+                Node::Group(sub) => Some(sub),
+                Node::Prop(_) => None,
+            })
+            .collect();
+        if level.is_empty() {
+            break;
+        }
+    }
+    None
+}
+
+/// The direct child of `g` that a string key names (match name, display name, match id, any
+/// case, loose spelling, AE alias, in that order).
+fn find_direct_child<'a>(l: &'a Layer, g: &'a PropGroup, k: &str) -> Option<&'a Node> {
     let chain_of = |n: &Node| -> String {
         let mut ch = if g.uid == l.props.uid { vec![] } else { chain(l, g.uid).unwrap_or_default() };
         ch.push(n);
@@ -455,15 +477,6 @@ fn find_child<'a>(l: &'a Layer, g: &'a PropGroup, k: &str, depth: u8) -> Option<
         .or_else(|| g.children.iter().find(|n| n.name().eq_ignore_ascii_case(k)))
         .or_else(|| g.children.iter().find(|n| loose(n.name()) == lk || loose(n.match_id()) == lk))
         .or_else(|| alias(&lk).and_then(|m| g.children.iter().find(|n| n.match_id() == m)))
-        .or_else(|| {
-            if depth == 0 {
-                return None;
-            }
-            g.children.iter().find_map(|n| match n {
-                Node::Group(sub) => find_child(l, sub, k, depth - 1),
-                Node::Prop(_) => None,
-            })
-        })
 }
 
 fn child(s: &Session, a: &J) -> R {
@@ -491,6 +504,9 @@ fn js_value(c: &Comp, v: &KV) -> J {
         KV::Layer(l) => json!(l.and_then(|id| c.index_of(LayerId(id))).unwrap_or(0)),
         KV::Path(p) => json!({"vertices": p.vertices, "inTangents": p.in_tangents, "outTangents": p.out_tangents, "closed": p.closed}),
         KV::Text(d) => text_json(d),
+        // `{colors: [[position, [r, g, b, a]], …], opacities: [[position, alpha], …]}` (0..1), the
+        // shape `setValue` takes back (it also takes `[colour, …]` or `[[position, colour], …]`).
+        KV::Gradient(g) => serde_json::to_value(&**g).unwrap_or(J::Null),
         v => v.to_json(),
     }
 }
@@ -521,6 +537,28 @@ fn value(s: &Session, a: &J) -> R {
     ctx.footage = Some(s.footage.as_ref());
     let v = ctx.value(l, p);
     Ok(js_value(c, &v))
+}
+
+/// `Property.expressionError`: the error the property's enabled expression raises at the comp's
+/// current time (a missing marker, layer or property is an error, not a silent raw value), else
+/// the syntax error of `code` (a disabled expression), else "".
+fn expr_error(s: &Session, a: &J) -> R {
+    let code = a.get("code").and_then(J::as_str).unwrap_or("");
+    if let Ok((cid, c, l)) = layer_of(s, a)
+        && let Some(p) = u(a, "prop").and_then(|uid| l.props.find(uid))
+        && p.has_expression()
+        && let Some(host) = s.expr.as_deref()
+    {
+        let t = s.time_of(cid);
+        let mut ctx = EvalCtx::new(&s.project, cid, c, t);
+        ctx.expr = Some(host);
+        ctx.footage = Some(s.footage.as_ref());
+        return Ok(json!(host.eval(&ctx, l, p, &p.value_at(l.layer_time(t))).err().unwrap_or_default()));
+    }
+    Ok(match s.expr_check {
+        Some(check) => json!(check(code).err().unwrap_or_default()),
+        None => json!(""),
+    })
 }
 
 fn interp(i: Interp) -> &'static str {
@@ -766,6 +804,8 @@ fn text_animator_property(name: &str) -> Option<&'static str> {
         ("ADBE Text Character Offset", "characterOffset"),
         ("ADBE Text Character Replace", "characterValue"),
         ("ADBE Text Blur", "blur"),
+        // EffectCraft extension: After Effects has no gradient text animator.
+        ("EC Text Gradient Fill", "gradientFill"),
     ];
     if let Some((_, k)) = AE.iter().find(|(m, _)| m.eq_ignore_ascii_case(name)) {
         return Some(k);

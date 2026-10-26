@@ -68,6 +68,7 @@ pub fn atomic_supported(id: &str) -> bool {
         "keys.velocity",
         "keys.copy",
         "keys.paste",
+        "keys.pasteGraph",
         "keys.selectAll",
         "keys.nudge",
         "keys.nudgeForward",
@@ -79,6 +80,7 @@ pub fn atomic_supported(id: &str) -> bool {
         "keys.selectPrevious",
         "keys.selectFollowing",
         "keys.setEase",
+        "keys.setEaseSelected",
         "keys.timeReverse",
         "effect.apply",
         "effect.applyLast",
@@ -138,6 +140,14 @@ pub fn atomic_supported(id: &str) -> bool {
         "markers.delete",
         "markers.convert",
         "layer.updateMarkersFromSource",
+        // Batch 1 (checked in the integration pass: one `Session::edit`, no nested commands, no
+        // files, prefs or network).
+        "graph.apply",
+        "layer.fadeExit",
+        "layer.fastIn",
+        "layer.cascade",
+        "card.make",
+        "card.style",
     ];
     const CURSOR: &[&str] = &[
         "time.set",
@@ -155,6 +165,8 @@ pub fn atomic_supported(id: &str) -> bool {
         "time.nextKey",
         "time.previousKey",
         "time.go",
+        // Batch 1: only the playhead moves (`go: false` changes nothing).
+        "speech.find",
     ];
     const INSPECTION: &[&str] = &[
         "prop.get",
@@ -162,6 +174,10 @@ pub fn atomic_supported(id: &str) -> bool {
         "comp.info",
         "layer.tree",
         "editor.state",
+        "context.packet",
+        "layer.related",
+        "history.feed",
+        "agent.notices",
         "keys.info",
         "effect.list",
         "effect.plugins.list",
@@ -172,6 +188,11 @@ pub fn atomic_supported(id: &str) -> bool {
         "markers.nested",
         "command.list",
         "command.describe",
+        // Batch 1 queries (read the document only).
+        "layer.words",
+        "script.get",
+        "card.styles",
+        "graph.links",
     ];
     DOCUMENT.contains(&id) || CURSOR.contains(&id) || INSPECTION.contains(&id)
 }
@@ -225,6 +246,26 @@ mod tests {
             "layer.futureExport",
             "prop.futureScript",
             "layer.setText",
+            // Batch 1: nested library commands, prefs, files, process state or the app's frontend.
+            "word.apply",
+            "text.apply",
+            "script.load",
+            "script.copyRef",
+            "script.board",
+            "speech.transcribe",
+            "graph.copy",
+            "graph.paste",
+            "graph.save",
+            "graph.relinkUpdate",
+            "card.saveStyle",
+            "link.paste",
+            "suggestion.propose",
+            "suggestion.accept",
+            "agent.snapshot",
+            "why.answer",
+            "ml.saveTextPreset",
+            // Sends to another app (FigCraft).
+            "comp.sendToFigCraft",
         ] {
             assert!(!atomic_supported(id), "{id}");
         }

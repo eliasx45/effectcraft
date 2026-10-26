@@ -31,7 +31,7 @@ fn kept_mip_chains_and_batched_passes_match_rebuilding_per_frame() {
             let mut e = Enc::with_resident(&g.ctx, cache.gpu_owner());
             e.reuse = reuse;
             let img = crate::walk::render(&mut e, &r, scene.cid, Tick::ZERO).unwrap();
-            let pixels = e.download(&img).unwrap();
+            let pixels = e.download_px(&img).unwrap();
             e.publish_native();
             (pixels, e.mips.passes)
         })

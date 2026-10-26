@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use effectcraft_automation::frame_cache::FrameCache;
 use effectcraft_automation::frame_server::{self, CpuRender, FrameConfig, FrameHandle, FrameRender, RenderJob, Rendered};
 use effectcraft_engine::remote::{FrameMsg, FrameReply, Mirror};
 use effectcraft_engine::remote_encode::{self, Codec, Want};
@@ -224,6 +225,55 @@ pub(crate) fn cache_budget() -> usize {
     std::env::var("EFFECTCRAFT_FRAME_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1024).saturating_mul(1 << 20)
 }
 
+/// The frame cache (CR8): `EFFECTCRAFT_SERVER_FRAMES_MB` of RAM (cloud.sh sets it from
+/// tune-machine's preview share; else [`default_frames_mb`]), spilling to a disk cache of
+/// `EFFECTCRAFT_SERVER_FRAMES_DISK_GB` (0 or unset: none) in `EFFECTCRAFT_SERVER_FRAMES_DIR`
+/// (else the default disk cache folder's `server-frames`).
+pub(crate) fn frame_cache(log: &frame_server::LogFn) -> Arc<FrameCache> {
+    let env_num = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let ram = env_num("EFFECTCRAFT_SERVER_FRAMES_MB").unwrap_or_else(default_frames_mb).saturating_mul(1 << 20);
+    let disk_gb = env_num("EFFECTCRAFT_SERVER_FRAMES_DISK_GB").unwrap_or(0);
+    let disk = (disk_gb > 0)
+        .then(|| {
+            let dir = std::env::var_os("EFFECTCRAFT_SERVER_FRAMES_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| effectcraft_render::disk_cache::default_folder().join("server-frames"));
+            match effectcraft_render::disk_cache::DiskCache::open(&dir, disk_gb.saturating_mul(1 << 30)) {
+                Ok(d) => {
+                    log(&format!("frame cache on disk: {} ({disk_gb} GB)", dir.display()));
+                    Some(d)
+                }
+                Err(e) => {
+                    log(&format!("frame cache on disk: cannot open {} ({e}); RAM only", dir.display()));
+                    None
+                }
+            }
+        })
+        .flatten();
+    Arc::new(FrameCache::new(usize::try_from(ram).unwrap_or(usize::MAX), disk))
+}
+
+/// The frame cache's RAM without a setting: Elias's rule for every RAM cache together (85 % of
+/// what this machine may use: the smaller of the rental's allotment `EFFECTCRAFT_RAM_GB` (decimal
+/// GB), the cgroup limit and the machine's RAM), less 8 GiB for the process and the layer cache;
+/// 4096 MiB where none can be read. Without ec-tune it doesn't know the desktop app's caches:
+/// cloud.sh passes ec-tune's share instead.
+fn default_frames_mb() -> u64 {
+    let read = |p: &str| std::fs::read_to_string(p).ok();
+    let limit = ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]
+        .iter()
+        .filter_map(|p| read(p)?.trim().parse::<u64>().ok())
+        .find(|v| *v > 0 && *v < 1 << 60);
+    let total = read("/proc/meminfo")
+        .and_then(|m| m.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()))
+        .map(|kb| kb.saturating_mul(1024));
+    let allot =
+        std::env::var("EFFECTCRAFT_RAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|g| g.is_finite() && *g > 0.0).map(|g| (g * 1e9) as u64);
+    let Some(ram) = limit.into_iter().chain(total).chain(allot).min() else { return 4096 };
+    let mb = (ram / 100).saturating_mul(85) >> 20;
+    mb.saturating_sub(8192).saturating_sub(cache_budget() as u64 >> 20).max(1024)
+}
+
 /// Frame workers: 8, capped by `--frame-threads` / `EFFECTCRAFT_FRAME_THREADS` (CR1's
 /// [`effectcraft_render::concurrency`]).
 pub(crate) fn threads() -> usize {
@@ -258,6 +308,8 @@ pub fn start(args: &Args, port: u16, gpu: Option<Arc<Gpu>>, control_port: Arc<On
     }
     let render = renderer(&s, gpu, threads, &log);
     // Never colour bars or Inter from the cloud: frames fail while footage or fonts are missing (CR7).
+    // Half-size proxies of big clips, made here (PERF-PROXY); the guard checks the replica's own project.
+    let render = crate::auto_proxy::wrap(render, log.clone());
     let render = crate::asset_guard::wrap(render, log.clone());
     let (token, stored) = frame_server::frame_token(effectcraft_host::config_dir().as_deref(), args.opt("--token")).map_err(Failure::Error)?;
     let control: frame_server::ControlFn = Arc::new(move |method: &str, params: Value| match control_port.get() {
@@ -265,14 +317,20 @@ pub fn start(args: &Args, port: u16, gpu: Option<Arc<Gpu>>, control_port: Arc<On
         None => json!({"ok": false, "error": "the host is still starting"}),
     });
     let gpu_name = render.gpu_name();
-    let handle = frame_server::spawn(FrameConfig { port, token, threads, render, cache, preload: preload.map(Arc::new), control: Some(control), log })
+    let frames = frame_cache(&log);
+    let frames_mb = frames.stats().ram_budget >> 20;
+    let handle = frame_server::spawn(FrameConfig { port, token, threads, render, cache, frames, preload: preload.map(Arc::new), control: Some(control), log })
         .map_err(|e| Failure::Error(format!("--frames: {e}")))?;
     let where_ = stored.map(|p| format!("token in {}", p.display())).unwrap_or_else(|| "token from --token / EFFECTCRAFT_FRAME_TOKEN".into());
     let on = match &gpu_name {
         Some(g) => format!("{g}, {} at once on the GPU", gpu_slots(threads)),
         None => "the CPU".into(),
     };
-    println!("EffectCraft frames on 127.0.0.1:{} ({where_}; {threads} workers on {on}; layer cache {} MiB)", handle.port, cache_budget() >> 20);
+    println!(
+        "EffectCraft frames on 127.0.0.1:{} ({where_}; {threads} workers on {on}; layer cache {} MiB; frame cache {frames_mb} MiB)",
+        handle.port,
+        cache_budget() >> 20
+    );
     Ok(handle)
 }
 

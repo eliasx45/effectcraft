@@ -291,6 +291,17 @@ pub(crate) struct DialogAnswer {
     pub paths: Vec<String>,
 }
 
+/// A sound to hear while the pointer is over its Motion Library card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundHover {
+    /// The card's id (the same key keeps playing; another restarts).
+    pub key: String,
+    /// The audio file on this machine (the library folder's, or the bucket's cached copy).
+    pub path: String,
+    /// SFX preview volume, linear 0–1.
+    pub gain: f32,
+}
+
 /// Host hooks provided by the native app (file pickers etc.).
 #[derive(Default)]
 pub struct Hooks {
@@ -300,6 +311,11 @@ pub struct Hooks {
     pub pick_files: Option<Box<dyn Fn(&[&str]) -> Vec<String>>>,
     pub pick_save: Option<Box<dyn Fn(&str) -> Option<String>>>,
     pub pick_open_project: Option<Box<dyn Fn() -> Option<String>>>,
+    /// The OS cursor in physical screen pixels, given the window's native pixels per point
+    /// (macOS reports points and scales them by it). winit reports no pointer while files are
+    /// dragged in from the Finder, so a drop is placed where this says it landed
+    /// ([`os_drop::drop_pointer`]); without it, where egui last saw the pointer in the window.
+    pub cursor_screen_position: Option<Box<dyn Fn(f32) -> Option<(i32, i32)>>>,
     /// Opens the audio output for preview playback (the desktop app uses cpal).
     pub audio_device: Option<audio::AudioDeviceFactory>,
     /// Lists audio output devices (Settings ▸ Audio).
@@ -398,7 +414,14 @@ pub struct Playback {
     /// Every frame shown since the preview started (UI seconds, frame), for `ui.inspect`'s
     /// frame-interval percentiles; capped at [`SHOWN_LOG_MAX`].
     pub log: Vec<(f64, i64)>,
+    /// Play Faster (FilmCraft's Shuttle Right): ×2, ×4 or ×8 the preview's rate, its sound
+    /// compressed in time at the same pitch (`audio::Stretch`); 0 = normal speed. The plan's rate and frame step are multiplied, so as many frames a second
+    /// show as at normal speed.
+    pub speed: u32,
 }
+
+/// Play Faster's top speed (×8, as FilmCraft's Shuttle Right).
+const MAX_PLAY_SPEED: u32 = 8;
 
 /// Frames [`Playback::log`] keeps (about 9 minutes at 30 fps).
 const SHOWN_LOG_MAX: usize = 16_384;
@@ -455,6 +478,10 @@ impl Playback {
 pub struct EffectcraftApp {
     pub session: Session,
     pub ui: UiState,
+    /// Read the system's and the process's memory every few seconds (cache budgets, the memory
+    /// chip). Off in the hidden copies `effectcraft-cli mcp --ui` runs (MEM3): they read the
+    /// machine's memory once when they start.
+    pub watch_system: bool,
     workspace_store: workspace_state::WorkspaceStore,
     pub tokens: Tokens,
     pub auto: automation::Registry,
@@ -492,9 +519,15 @@ pub struct EffectcraftApp {
     /// The cloud server's token and when it was read (at most every few seconds).
     #[cfg(not(target_arch = "wasm32"))]
     cloud_token: (f64, String),
+    /// CR6b: a cloud preview's playback from the server's H.264 stream.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) cloud_play: cloud_stream::CloudPlayback,
     /// When the user last did something (input or an edit): Cache Frames When Idle waits for
     /// a second of quiet. (time, project revision then)
     last_activity: (f64, u64),
+    /// Cache Frames When Idle waits for memory ([`idle_cache::memory_wait`]), and when it last
+    /// said so.
+    idle_memory_wait: (bool, f64),
     /// When the project last changed, and its revision then (see [`Self::editing`]).
     last_edit: (f64, u64),
     /// Edit → viewer frame latency, for `ui.inspect`'s `latency`.
@@ -503,10 +536,14 @@ pub struct EffectcraftApp {
     /// Texture of the last CPU frame shown in the viewer, the key it came from and the factor it
     /// was averaged down by for the magnification (`panels::viewer::minify_factor`).
     pub(crate) viewer_tex: Option<(egui::TextureHandle, FrameKey, usize)>,
+    /// View ▸ Sharp Zoom: the visible region rendered at the magnification above 100 %.
+    pub(crate) sharp_zoom: sharp_zoom::SharpZoom,
     /// The frames the other (passive) Composition viewers show, by viewer id.
     pub(crate) passive_tex: std::collections::HashMap<u32, (FrameKey, panels::viewers::PassiveTexture)>,
     /// The last GPU frame shown: its egui texture id (registered with egui-wgpu), key and texture.
     pub(crate) viewer_native: Option<(egui::TextureId, FrameKey, Arc<effectcraft_gpu::DisplayFrame>)>,
+    /// UP1: the FSR1 upscale of low-resolution GPU frames shown magnified (`fsr_upscale`).
+    pub(crate) viewer_fsr: fsr_upscale::Upscaler,
     /// The texture the viewer draws and its frame key (CPU or GPU frame).
     pub(crate) viewer_shown: Option<(egui::TextureId, FrameKey)>,
     /// Last displayed image (Info panel colour, eyedroppers, histograms). GPU frames fill it on
@@ -556,6 +593,10 @@ pub struct EffectcraftApp {
     pub audio: Option<audio::AudioPlayback>,
     /// Audio scrubbing's open output (Ctrl/Cmd-drag the current time, `playback.scrubAudio`).
     pub scrub: Option<audio::AudioScrub>,
+    /// Hover-to-hear in the Motion Library: its open output (see [`audio::SoundPreview`]).
+    pub sound_preview: Option<audio::SoundPreview>,
+    /// The Sound card under the pointer this frame (the panel sets it; each frame takes it).
+    pub sound_hover: Option<SoundHover>,
     /// Audio panel VU meters.
     pub meter: audio::Meter,
     /// Waveform peak summaries per footage item (see `panels::waveform`).
@@ -586,6 +627,9 @@ pub struct EffectcraftApp {
     /// The Timeline column layout last kept in the settings store (see
     /// [`panels::timeline_columns::store_layout`]).
     pub(crate) timeline_layout_saved: Option<panels::timeline_columns::ColumnLayout>,
+    /// The Motion Library display settings last written to the settings store
+    /// ([`panels::motion_library::store_display`]).
+    pub(crate) motion_library_saved: Option<panels::motion_library::ViewState>,
 }
 
 /// The saved workspaces in the settings store ([`effectcraft_engine::config::ConfigStore`]).
@@ -606,6 +650,7 @@ impl EffectcraftApp {
         ui.timeline.graph_mode = session.prefs.graph_type.clone();
         let workspace_store = workspace_state::WorkspaceStore::load(session.config.as_deref(), &mut ui);
         EffectcraftApp {
+            watch_system: true,
             session,
             ui,
             workspace_store,
@@ -636,14 +681,19 @@ impl EffectcraftApp {
             cloud: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cloud_token: (f64::NEG_INFINITY, String::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud_play: Default::default(),
             last_ui_time: 0.0,
             last_activity: (0.0, 0),
+            idle_memory_wait: (false, f64::NEG_INFINITY),
             last_edit: (0.0, 0),
             latency: Default::default(),
             toast: None,
             viewer_tex: None,
+            sharp_zoom: Default::default(),
             passive_tex: std::collections::HashMap::new(),
             viewer_native: None,
+            viewer_fsr: Default::default(),
             viewer_shown: None,
             viewer_image: None,
             viewer_readback: Default::default(),
@@ -673,6 +723,8 @@ impl EffectcraftApp {
             integrated_titlebar: false,
             audio: None,
             scrub: None,
+            sound_preview: None,
+            sound_hover: None,
             meter: Default::default(),
             expression_diagnostics: Default::default(),
             waveforms: Default::default(),
@@ -687,14 +739,23 @@ impl EffectcraftApp {
             template_thumbs: Default::default(),
             template_list: None,
             timeline_layout_saved: None,
+            motion_library_saved: None,
         }
         .with_ui_commands()
         .with_timeline_layout()
+        .with_memory_map()
+    }
+
+    /// Lend the RAM preview to the engine's memory map (Window ▸ Memory, `memory.stats`).
+    fn with_memory_map(mut self) -> Self {
+        panels::memory_panel::install(&mut self);
+        self
     }
 
     /// The Timeline column layout (columns shown, order, widths, splitter) of the last session.
     fn with_timeline_layout(mut self) -> Self {
         panels::timeline_columns::load_layout(&mut self);
+        panels::motion_library::load_display(&mut self);
         self
     }
 
@@ -751,14 +812,21 @@ impl EffectcraftApp {
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         ctx.set_zoom_factor(p.appearance.ui_scale as f32 / 100.0);
         self.ui.cache_when_idle = p.previews.cache_frames_when_idle;
+        self.frames.set_idle_threads(frames::idle_threads(effectcraft_engine::sysinfo::cpu_cores(), p.memory.idle_cache_cores));
         self.ui.viewer.fast_preview = p.previews.fast_previews;
         let budgets = p.cache_budgets(self.session.sys_memory);
-        self.frames.set_budget(budgets.preview);
+        // Compress first: the budget then counts compressed bytes (`frames::codec`).
+        self.frames.set_compress(p.memory.preview_compress, p.memory.preview_raw_window);
+        // Share One Budget Between the Caches: the RAM preview may grow to its limit in the
+        // shared budget and joins it beside the engine's layer and footage caches.
+        self.frames.set_budget(budgets.limit(effectcraft_render::cache::shared::ShareKind::Preview));
+        self.frames.share(budgets.shared.is_some().then_some(&self.session.cache_share));
         if self.zero_copy.active && self.zero_copy.unified {
             self.frames.set_gpu_budget(budgets.preview);
         }
         if let Some(g) = &self.gpu {
             g.context().set_cache_budget(budgets.layer);
+            g.context().set_half_intermediates(p.previews.half_float_effects);
         }
     }
 
@@ -879,7 +947,7 @@ impl EffectcraftApp {
     /// Show panel `p` (opening it in its usual place if it is closed), bring it to the front and
     /// give it the focus: Window ▸ <panel>.
     pub fn show_panel(&mut self, p: PanelKind) {
-        if !self.ui.floating.iter().any(|f| f.panels.contains(&p)) && self.ui.maximized.is_some_and(|m| m != p) {
+        if !self.ui.floating.iter().any(|f| f.panels.contains(&p)) && self.ui.maximized.is_some_and(|m| m != p) && !self.group_maximized(p) {
             self.ui.maximized = None;
         }
         if let Some(f) = self.ui.floating.iter().find(|f| f.panels.contains(&p)) {
@@ -1222,6 +1290,8 @@ impl EffectcraftApp {
                 }
                 if replacing {
                     self.frames.revive_gpu();
+                } else {
+                    self.frames.gpu_arrived();
                 }
                 // RT10e: frames stay textures when the compositor is on egui's device.
                 self.zero_copy.active = shares_window_device(&g, &rs.device) && !cfg!(target_arch = "wasm32");
@@ -1236,6 +1306,7 @@ impl EffectcraftApp {
                 }
                 log::info!("GPU compositor: {}", effectcraft_engine::render::Accelerator::name(&g));
                 g.context().set_cache_budget(self.session.prefs.cache_budgets(self.session.sys_memory).layer);
+                g.context().set_half_intermediates(self.session.prefs.previews.half_float_effects);
                 self.session.accel = Some(Arc::new(g.clone()));
                 self.gpu = Some(g);
                 #[cfg(not(target_arch = "wasm32"))]
@@ -1452,23 +1523,28 @@ impl EffectcraftApp {
         let res = self.viewer_res();
         let full = res.scale(zoom, ppp);
         // Native Auto playback measures actual render service times, never cache hits, and
-        // ladders Full → Half → Quarter while frames miss their deadline (see playback_budget).
+        // ladders Full → Half → Third → Quarter while frames miss their deadline (see
+        // playback_budget): Settings ▸ Previews ▸ Adaptive Resolution While Playing, or Fast
+        // Previews ▸ Adaptive Resolution.
         let adaptive = self.playback.playing
             && !self.playback.caching
             && res.is_auto()
-            && self.session.state.viewer.fast_previews == effectcraft_engine::commands::viewer_cmds::FastPreviews::AdaptiveResolution
+            && (self.session.prefs.previews.adaptive_playback
+                || self.session.state.viewer.fast_previews == effectcraft_engine::commands::viewer_cmds::FastPreviews::AdaptiveResolution)
             && !self.ui.viewer.interacting
             && !self.ui.viewer.property_interacting
             && !self.frames.remote_active()
             && self.playback.fps.is_finite()
             && self.playback.fps > 0.0;
         let half = full.min((full * 0.5).max(self.session.prefs.adaptive_limit()));
+        let third = full.min((full / 3.0).max(self.session.prefs.adaptive_limit()));
         let quarter = full.min((full * 0.25).max(self.session.prefs.adaptive_limit()));
         let config = self.session.active_comp_id().filter(|_| adaptive).map(|comp| {
             let step = self.playback.plan.map_or(1, |p| p.step).max(1) as f64;
             crate::playback_budget::Config {
                 full: self.frame_series(comp, full),
                 half: self.frame_series(comp, half),
+                third: self.frame_series(comp, third),
                 quarter: self.frame_series(comp, quarter),
                 budget_ms: 1000.0 * step / self.playback.fps,
                 gpu_context: self.gpu.as_ref().map_or(0, |g| std::ptr::from_ref(g.context()) as usize),
@@ -1478,6 +1554,7 @@ impl EffectcraftApp {
         match self.frames.adapt_playback(config) {
             0 => {}
             1 => return half,
+            2 => return third,
             _ => return quarter,
         }
         if self.scrubbing() {
@@ -1562,9 +1639,25 @@ impl EffectcraftApp {
         self.request_frame_with(comp, frame, scale, false);
     }
 
+    /// Request a frame for Cache Frames When Idle ([`Frames::request_idle`]).
+    fn request_frame_idle(&self, comp: ItemId, frame: i64, scale: f64) {
+        let Some(c) = self.session.project.comp(comp) else { return };
+        let key = self.frame_key(comp, frame, scale);
+        let opts = self.frame_opts(comp, scale);
+        self.frames.request_idle(&self.render_source(), key, comp, c.frame_rate.tick_of(frame), opts);
+    }
+
     /// Request the frame on screen: rendered before any queued prefetch.
     pub fn request_frame_urgent(&self, comp: ItemId, frame: i64, scale: f64) {
         self.request_frame_with(comp, frame, scale, true);
+    }
+
+    /// Request the paused viewer's frame: also over a draft of the cloud's stream (CR6c).
+    pub fn request_frame_exact(&self, comp: ItemId, frame: i64, scale: f64) {
+        let Some(c) = self.session.project.comp(comp) else { return };
+        let key = self.frame_key(comp, frame, scale);
+        let opts = self.frame_opts(comp, scale);
+        self.frames.request_exact(&self.render_source(), key, comp, c.frame_rate.tick_of(frame), opts);
     }
 
     /// Render options of viewer frames of `comp` at `scale`.
@@ -1581,6 +1674,7 @@ impl EffectcraftApp {
             backend: effectcraft_engine::render::Backend::Auto,
             nested_switches: self.session.prefs.general.switches_affect_nested_comps,
             draft_shadows: self.session.prefs.three_d.realtime_shadows,
+            sharp: false,
             proxy: Default::default(),
         }
     }
@@ -1618,6 +1712,7 @@ impl EffectcraftApp {
         let viewer = panels::viewers::active_panel(self);
         if preset.full_screen && self.ui.dock.contains(viewer) {
             self.ui.maximized = Some(viewer);
+            self.ui.maximized_solo = true;
         }
         self.playback = Playback {
             playing: true,
@@ -1640,6 +1735,7 @@ impl EffectcraftApp {
             shown_at: Default::default(),
             observed: now,
             log: Vec::new(),
+            speed: 0,
         };
         if !self.playback.caching {
             if plan.video {
@@ -1651,12 +1747,74 @@ impl EffectcraftApp {
         }
     }
 
+    /// Play Faster (FilmCraft's Shuttle Right, Shift+E in the Elias keymap): plays at ×2 (from
+    /// the current time when stopped), each further press doubles the speed up to ×8. Stopping
+    /// or [`Self::play_slower`] back to ×1 returns to normal speed.
+    pub fn play_faster(&mut self, now: f64) {
+        if !self.playback.playing {
+            self.play(now);
+        }
+        if !self.playback.playing {
+            return;
+        }
+        // At speed the preview starts at once: no Cache Before Playback.
+        self.playback.caching = false;
+        let speed = self.playback.speed.max(1).saturating_mul(2).min(MAX_PLAY_SPEED);
+        self.set_play_speed(now, speed);
+    }
+
+    /// Play Slower: halves Play Faster's speed, down to normal speed (with sound again). Whether
+    /// a fast preview was playing.
+    pub fn play_slower(&mut self, now: f64) -> bool {
+        if !self.playback.playing || self.playback.speed < 2 {
+            return false;
+        }
+        self.set_play_speed(now, self.playback.speed / 2);
+        true
+    }
+
+    /// Play on from the current frame at `speed` × the preview's rate (1 = normal).
+    fn set_play_speed(&mut self, now: f64, speed: u32) {
+        let Some(mut pl) = self.playback.plan else { return };
+        let (old, new) = (self.playback.speed.max(1), speed.clamp(1, MAX_PLAY_SPEED));
+        if old == new {
+            return;
+        }
+        // Powers of two: the rate comes back exactly at ×1 (the sound needs the comp's rate).
+        pl.fps = pl.fps / f64::from(old) * f64::from(new);
+        pl.step = (pl.step / i64::from(old)).max(1).saturating_mul(i64::from(new));
+        let cur = if pl.video {
+            self.session.active_comp().map_or(pl.first, |c| c.frame_rate.frame_at(self.session.time()))
+        } else {
+            self.playback.audio_frame.unwrap_or(pl.first)
+        };
+        self.playback.plan = Some(pl);
+        self.playback.fps = pl.fps;
+        self.playback.speed = if new > 1 { new } else { 0 };
+        self.playback.start_wall = now;
+        self.playback.start_frame = cur;
+        self.playback.waiting = false;
+        self.playback.shown_at.clear();
+        // The sound starts over at the new speed (same pitch) once the frames ahead are cached.
+        self.audio = None;
+        self.playback.preroll = None;
+        let sound = self.audio_plays();
+        self.playback.audio_held = sound && pl.video;
+        if sound && !pl.video {
+            self.start_audio(self.session.active_comp().map(|c| c.frame_rate.tick_of(cur)).unwrap_or_default());
+        }
+        let msg = if new > 1 { format!("Playing at {new}×") } else { "Playing at normal speed".to_string() };
+        self.toast = Some((msg, now));
+    }
+
     /// The preview includes audio at the comp's frame rate and the comp has something audible.
     fn audio_plays(&self) -> bool {
         let (Some(pl), Some(cid)) = (self.playback.plan, self.session.active_comp_id()) else { return false };
         let Some(c) = self.session.project.comp(cid) else { return false };
-        // A preview at another frame rate plays slower or faster than real time: silent.
-        pl.audio && (pl.fps - c.frame_rate.as_f64()).abs() <= 0.01 && effectcraft_engine::render::audio::comp_has_audio(&self.session.project, cid)
+        // A preview at another frame rate plays slower or faster than real time: silent. Play
+        // Faster's rate is the speed times the preview's (its sound keeps its pitch).
+        let speed = f64::from(self.playback.speed.max(1));
+        pl.audio && (pl.fps / speed - c.frame_rate.as_f64()).abs() <= 0.01 && effectcraft_engine::render::audio::comp_has_audio(&self.session.project, cid)
     }
 
     /// Start audio preview from comp time `t` when [`Self::audio_plays`] and an output device
@@ -1670,7 +1828,7 @@ impl EffectcraftApp {
         // Held while rendering caught up (same preview): play on, without reopening the device.
         if let Some(mut a) = held.filter(|a| {
             let span = audio::PlaySpan::new(t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, a.rate);
-            a.held() && a.comp == cid && (a.span.wa, a.span.wb, a.span.looping) == (span.wa, span.wb, span.looping)
+            a.held() && a.comp == cid && a.speed == self.playback.speed.max(1) && (a.span.wa, a.span.wb, a.span.looping) == (span.wa, span.wb, span.looping)
         }) {
             a.resume(t);
             self.audio = Some(a);
@@ -1679,7 +1837,8 @@ impl EffectcraftApp {
         let out = audio::AudioOutput::from_prefs(&self.session.prefs);
         let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
         let mix = self.session.prefs.audio.preview_sample_rate;
-        match audio::AudioPlayback::start(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix) {
+        let speed = self.playback.speed.max(1);
+        match audio::AudioPlayback::start_at_speed(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix, speed) {
             Ok(a) => self.audio = Some(a),
             Err(e) => log::warn!("audio preview: {e}"),
         }
@@ -1709,12 +1868,56 @@ impl EffectcraftApp {
         }
     }
 
+    /// Hover-to-hear, once a frame: play the Sound card the Motion Library's pointer is over
+    /// ([`Self::sound_hover`]), stop when it leaves. Silent while the Timeline plays or scrubs
+    /// audio (the comp's sound comes first); an idle output closes after two seconds.
+    fn tick_sound_preview(&mut self, ctx: &egui::Context, now: f64) {
+        let want = self.sound_hover.take().filter(|_| !self.playback.playing && self.scrub.is_none());
+        let Some(want) = want else {
+            if let Some(sp) = &mut self.sound_preview {
+                sp.stop();
+                sp.pump();
+                if now - sp.last_used > 2.0 {
+                    self.sound_preview = None;
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            }
+            return;
+        };
+        if self.sound_preview.is_none() {
+            let out = audio::AudioOutput::from_prefs(&self.session.prefs);
+            let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
+            match audio::SoundPreview::open(dev, now) {
+                Ok(sp) => self.sound_preview = Some(sp),
+                Err(e) => {
+                    log::warn!("sound preview: {e}");
+                    return;
+                }
+            }
+        }
+        let Some(sp) = &mut self.sound_preview else { return };
+        sp.set_gain(want.gain);
+        if sp.playing() != Some(want.key.as_str()) && sp.failed().as_deref() != Some(want.key.as_str()) {
+            let path = want.path;
+            sp.play(&want.key, Box::new(move |rate| audio::decode_sound_file(&path, rate)), true, now);
+        }
+        sp.last_used = now;
+        sp.pump();
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     #[track_caller]
     pub fn stop(&mut self) {
         let was = std::mem::replace(&mut self.playback.playing, false);
         self.frames.set_playhead(None);
         #[cfg(not(target_arch = "wasm32"))]
         self.frames.warm_ahead(None);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let shown = self.viewer_shown.as_ref().map(|(_, k)| *k);
+            self.cloud_play.stop(&self.frames, shown, self.session.revision);
+        }
         self.audio = None;
         self.playback.caching = false;
         if !was {
@@ -1724,6 +1927,7 @@ impl EffectcraftApp {
         log::info!("preview stopped at {:.3} s after {} frames (from {})", self.session.time().seconds(), self.playback.shown, std::panic::Location::caller());
         if let Some(m) = self.playback.restore_max.take() {
             self.ui.maximized = m;
+            self.ui.maximized_solo = false;
         }
         let Some(pl) = self.playback.plan else { return };
         let move_time = self.session.prefs.preview.get(self.playback.shortcut).move_time_to_preview_time;
@@ -1856,13 +2060,18 @@ impl EffectcraftApp {
         };
         let ahead = ahead.min(self.frames_that_fit(&c, scale));
         let series = self.frame_series(cid, scale);
+        // CR6b: a cloud preview plays from the server's stream; nothing renders or is asked for
+        // here meanwhile (the stream's first chunk is the pre-roll).
+        let streamed = self.tick_cloud_stream(ctx, &c, series, cur, scale, now);
+        let ahead = if streamed { i64::from(effectcraft_engine::remote_stream::DEFAULT_CHUNK_FRAMES).min(self.frames_that_fit(&c, scale)) } else { ahead };
         // The preview's position orders prefetch and eviction (#595); set before counting the
         // frames in flight, as it drops queued frames the preview no longer reaches.
         let playhead = plan.filter(|p| p.video).map(|p| frames::Playhead { series, cur, start: p.start, end: p.end, step: p.step, looping: p.looping });
         self.frames.set_playhead(playhead);
-        // The layers that enter a few seconds ahead have their sources made in the background.
+        // The layers that enter a few seconds ahead have their sources made in the background
+        // (not for a cloud stream: nothing renders here then).
         #[cfg(not(target_arch = "wasm32"))]
-        self.frames.warm_ahead(plan.filter(|p| p.video && !self.playback.caching).map(|p| frames::warmup::Ahead {
+        self.frames.warm_ahead(plan.filter(|p| p.video && !self.playback.caching && !streamed).map(|p| frames::warmup::Ahead {
             src: self.render_source(),
             comp: cid,
             opts: self.frame_opts(cid, scale),
@@ -1929,26 +2138,34 @@ impl EffectcraftApp {
         }
         let step = plan.map_or(1, |p| p.step);
         // Never further ahead than the RAM preview holds: those frames would evict the ones the
-        // preview shows first, or be evicted before it gets there (#595).
-        let window = (ahead * 3).min(self.frames_that_fit(&c, scale) - 1);
-        for k in 0..window {
-            if queued >= ahead as usize || !video {
+        // preview shows first, or be evicted before it gets there (#595). The window starts at the
+        // first uncached frame ahead: after a loop or a restart the frames just ahead are cached,
+        // and a window from the playhead left the workers idle until it came near the end of the
+        // cached run. It stays ahead × 3 frames wide: workers spread over the whole preview render
+        // frames with different layers at once (on the GPU, an atlas each: #1812).
+        let fit_ahead = self.frames_that_fit(&c, scale) - 1;
+        let frame = |k: i64| match plan {
+            Some(p) => p.frame_after(cur, k),
+            None => {
+                let f = cur + k;
+                Some(if f > wb { wa + (f - wb - 1).rem_euclid((wb - wa + 1).max(1)) } else { f })
+            }
+        };
+        let cached = self.frames.cached_frames(&series);
+        let uncached = |f: i64| cached.binary_search(&f).is_err();
+        let first = match plan.filter(|_| self.playback.playing) {
+            Some(p) => (0..fit_ahead.min((p.end - p.start) / p.step.max(1) + 1))
+                .map_while(|k| frame(k).map(|f| (k, f)))
+                .find(|&(_, f)| uncached(f))
+                .map_or(0, |(k, _)| k),
+            None => 0,
+        };
+        for k in first..(first + ahead * 3).min(fit_ahead) {
+            if queued >= ahead as usize || !video || streamed {
                 break;
             }
-            let f = match plan {
-                Some(p) => match p.frame_after(cur, k) {
-                    Some(f) => f,
-                    None => break,
-                },
-                None => {
-                    let mut f = cur + k;
-                    if f > wb {
-                        f = wa + (f - wb - 1).rem_euclid((wb - wa + 1).max(1));
-                    }
-                    f
-                }
-            };
-            if !self.frames.is_cached(&FrameKey { frame: f, ..series }) {
+            let Some(f) = frame(k) else { break };
+            if uncached(f) {
                 self.request_frame(cid, f, scale);
                 queued += 1;
             }
@@ -2002,7 +2219,7 @@ impl EffectcraftApp {
             self.playback.waiting = true;
             self.playback.start_wall = now;
             self.playback.start_frame = cur;
-            if !self.frames.is_cached(&FrameKey { frame: cur, ..series }) {
+            if !streamed && !self.frames.is_cached(&FrameKey { frame: cur, ..series }) {
                 self.request_frame_urgent(cid, cur, scale);
             }
             // Each finished frame wakes the UI (`Frames::release`); this is only the fallback.
@@ -2049,9 +2266,10 @@ impl EffectcraftApp {
                 return;
             }
             // Wake when the audible sample reaches the next frame (not at the display's refresh
-            // rate): a 24 fps preview rebuilds the UI 24 times a second, not 120.
+            // rate): a 24 fps preview rebuilds the UI 24 times a second, not 120. Play Faster's
+            // sound covers that much comp time `speed` × sooner.
             let next = fr.tick_of(target.saturating_add(step.max(1))).seconds();
-            ctx.request_repaint_after(until_next_frame(next - audio::sample_time(audible, a.rate).seconds()));
+            ctx.request_repaint_after(until_next_frame((next - audio::sample_time(audible, a.rate).seconds()) / f64::from(a.speed.max(1))));
             return;
         }
         let elapsed = now - self.playback.start_wall;
@@ -2098,7 +2316,7 @@ impl EffectcraftApp {
             let next = plan.and_then(|p| p.frame_after(cur, 1)).unwrap_or(if cur + 1 > wb { wa } else { cur + 1 });
             if self.frames.is_cached(&FrameKey { frame: next, ..series }) {
                 self.session.set_time(fr.tick_of(next));
-            } else {
+            } else if !streamed {
                 // The frame playback waits for renders before any prefetch (the prefetch window
                 // can be full of frames further on, or of other comps').
                 self.request_frame_urgent(cid, next, scale);
@@ -2110,6 +2328,48 @@ impl EffectcraftApp {
             return;
         }
         ctx.request_repaint_after(until_next_frame(next_due));
+    }
+
+    /// CR6b: while a cloud preview plays, its frames come from the server's playback stream
+    /// ([`cloud_stream`]): start, feed and stop it, and publish its frames into the RAM cache.
+    /// Whether the stream delivers this preview's frames (nothing renders or is asked for here).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tick_cloud_stream(&mut self, ctx: &egui::Context, c: &Arc<effectcraft_engine::project::Comp>, series: FrameKey, cur: i64, scale: f64, now: f64) -> bool {
+        let plan = self.playback.plan.filter(|p| self.playback.playing && p.video && !self.playback.caching);
+        let enabled = std::env::var("EFFECTCRAFT_CLOUD_STREAM").map_or(true, |v| v != "0");
+        let Some(cid) = self.session.active_comp_id() else { return false };
+        if plan.is_none() && !self.cloud_play.active() {
+            return false;
+        }
+        let project = self.session.freeze_preview_project();
+        let p = cloud_stream::PlayNow {
+            playing: plan.is_some() && enabled && self.frames.remote_active(),
+            now,
+            comp: cid,
+            rate: c.frame_rate,
+            project: &project,
+            revision: self.session.revision,
+            series,
+            opts: self.frame_opts(cid, scale),
+            cur,
+            start: plan.map_or(cur, |p| p.start),
+            end: plan.map_or(cur, |p| p.end),
+            looping: plan.is_some_and(|p| p.looping),
+            waiting: self.playback.waiting,
+            fit: self.frames_that_fit(c, scale),
+            disk: self.session.disk_cache.clone(),
+        };
+        let client = self.cloud.client().cloned();
+        let t = self.cloud_play.tick(client.as_ref(), &p, &self.frames, Some(ctx));
+        if let Some(note) = t.note {
+            self.ui.status = note;
+        }
+        t.streamed
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn tick_cloud_stream(&mut self, _: &egui::Context, _: &Arc<effectcraft_engine::project::Comp>, _: FrameKey, _: i64, _: f64, _: f64) -> bool {
+        false
     }
 
     /// While the project keeps changing (an edit within [`EDIT_QUIET`] seconds), how long until
@@ -2124,7 +2384,9 @@ impl EffectcraftApp {
 
     /// Composition ▸ Preview ▸ Cache Frames When Idle: after a second without input or edits,
     /// render the preview range's frames (from the current time on, then from its start) in the
-    /// background, a few at a time, until it is cached or the RAM preview budget is full.
+    /// background, one at a time on a few low-priority threads (`frames::idle`), until it is
+    /// cached or the RAM preview budget is full (then into the disk cache). It waits while the
+    /// system is short of memory ([`idle_cache::memory_wait`]).
     fn cache_when_idle(&mut self, ctx: &egui::Context, comp: &effectcraft_engine::project::Comp, series: &FrameKey, now: f64, (wa, wb): (i64, i64)) {
         // Moving the pointer over the window isn't activity (After Effects keeps caching):
         // clicks, keys, wheel and drags are.
@@ -2151,8 +2413,19 @@ impl EffectcraftApp {
             return;
         }
         let cur = comp.frame_rate.frame_at(self.session.time()).clamp(wa, wb);
+        // The cloud (CR8): its server renders the frames into its own cache, nothing downloads.
+        if self.cache_on_server(ctx, comp, series, (wa, wb), cur) {
+            return;
+        }
+        let remote = cfg!(target_arch = "wasm32") || self.frames.remote_active();
+        if !remote && self.idle_waits_for_memory(now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+            return;
+        }
         let fit = self.frames_that_fit(comp, series.scale as f64 / 1000.0).min(n);
-        let slots = (self.frames_parallelism() / 2).max(1);
+        // Rendered elsewhere (the cloud, the browser's workers), nothing here slows down; here,
+        // one frame at a time on the idle threads, and one queued behind it.
+        let slots = if remote { (self.frames_parallelism() / 2).max(1) } else { self.frames.idle_slots() };
         let mut queued = self.frames.inflight();
         let scale = series.scale as f64 / 1000.0;
         let mut pending = false;
@@ -2166,7 +2439,7 @@ impl EffectcraftApp {
             if queued >= slots {
                 break;
             }
-            self.request_frame(ItemId(series.comp), f, scale);
+            self.request_frame_idle(ItemId(series.comp), f, scale);
             queued += 1;
         }
         // The RAM preview is full: keep going into the disk cache (the blue bar), as After
@@ -2176,6 +2449,51 @@ impl EffectcraftApp {
         }
         if pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Whether Cache Frames When Idle waits for memory now ([`idle_cache::memory_wait`]); says
+    /// so in a toast when it starts waiting (at most every five minutes).
+    fn idle_waits_for_memory(&mut self, now: f64) -> bool {
+        let why = idle_cache::memory_wait(self.session.sys_memory, self.session.memory_watch.pressure(), self.session.prefs.memory.ram_reserved_gb);
+        let (waiting, told) = self.idle_memory_wait;
+        if let Some(why) = why
+            && !waiting
+        {
+            log::info!("Cache Frames When Idle: paused, {why}");
+            if now - told > 300.0 {
+                self.session.toast(format!("Cache Frames When Idle paused: {why}"));
+                self.idle_memory_wait.1 = now;
+            }
+        } else if why.is_none() && waiting {
+            log::info!("Cache Frames When Idle: memory freed up, caching again");
+        }
+        self.idle_memory_wait.0 = why.is_some();
+        why.is_some()
+    }
+
+    /// [`Self::cache_when_idle`] with the cloud renderer: ask its server to cache the work area
+    /// from `cur`, then the rest of the comp, in its own frame cache. Whether the cloud took it
+    /// (or will once its link is ready): then nothing is cached here.
+    fn cache_on_server(&self, ctx: &egui::Context, comp: &effectcraft_engine::project::Comp, series: &FrameKey, (wa, wb): (i64, i64), cur: i64) -> bool {
+        let last = comp.frame_rate.frame_at(comp.duration).saturating_sub(1).max(wb);
+        let ranges: Vec<(i64, i64)> = [(cur, wb), (wa, cur - 1), (wb + 1, last), (0, wa - 1)].into_iter().filter(|(a, b)| a <= b).collect();
+        let cid = ItemId(series.comp);
+        let opts = self.frame_opts(cid, series.scale as f64 / 1000.0);
+        match self.frames.precache_remote(&self.render_source(), series, cid, opts, ranges) {
+            None => false,
+            Some(sent) => {
+                // Not sent yet (the content key is on its way), or the server is still caching:
+                // look again (the cache bar follows its reports).
+                #[cfg(not(target_arch = "wasm32"))]
+                let busy = self.cloud.status().and_then(|s| s.server_cache).is_none_or(|c| c.done < c.total);
+                #[cfg(target_arch = "wasm32")]
+                let busy = false;
+                if !sent || busy {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(if sent { 1000 } else { 200 }));
+                }
+                true
+            }
         }
     }
 
@@ -2232,8 +2550,9 @@ impl EffectcraftApp {
 
     fn frames_that_fit(&self, comp: &effectcraft_engine::project::Comp, scale: f64) -> i64 {
         let side = |n: u32| (n as f64 * scale).ceil().max(1.0);
-        let frame = side(comp.width) * side(comp.height) * 4.0;
-        ((self.frames.budget() as f64 * 0.9 / frame) as i64).max(1)
+        // Compressed frames take less (the ratio measured on the cached ones).
+        let frame = self.frames.frame_bytes(side(comp.width) * side(comp.height) * 4.0).max(1.0);
+        ((self.frames.plan_budget() as f64 * 0.9 / frame) as i64).max(1)
     }
 
     fn frames_parallelism(&self) -> usize {
@@ -2424,12 +2743,25 @@ impl EffectcraftApp {
 
     // ---------------------------------------------------------------- frame
 
+    /// RI1: a slow viewer frame that rendered (in part) on the CPU says so once in a toast
+    /// (`frames::times::RenderTimes::notice_slow_cpu`), when no other toast is showing.
+    fn show_cpu_notice(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if self.toast.as_ref().is_some_and(|(_, at)| now - at < 4.0) {
+            return;
+        }
+        if let Some(n) = self.frames.times.take_cpu_notice() {
+            self.toast = Some((n.message(), now));
+            ctx.request_repaint();
+        }
+    }
+
     fn handle_events(&mut self, ctx: &egui::Context) {
         for ev in self.session.drain_events() {
             match ev {
                 effectcraft_engine::Event::OpenComp(c) => {
+                    // (The Timeline puts back the comp's own zoom: `TimelineState::comp_views`.)
                     panels::viewers::on_open_comp(self, c);
-                    self.ui.timeline.pps = None;
                 }
                 effectcraft_engine::Event::Toast { message, .. } => self.toast = Some((message, ctx.input(|i| i.time))),
                 effectcraft_engine::Event::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
@@ -2460,14 +2792,18 @@ impl EffectcraftApp {
         if self.playback.playing || ctx.input(|i| !i.events.is_empty()) {
             self.session.freeze_runtime.activity();
         }
+        freeze_hint::feed(self, &ctx);
         self.session.poll_freeze();
         if self.session.project.freeze.sections.iter().any(|s| s.auto && s.enabled) {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        } else if self.session.prefs.previews.freeze_auto_heavy {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         self.scrub_preview.tick(ctx.input(|i| i.time), self.session.active_comp_id().map(|id| id.0), self.session.revision);
         if let Some(wait) = self.scrub_preview.remaining() {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
+        self.tick_sound_preview(&ctx, ctx.input(|i| i.time));
         self.apply_gpu_failure(&ctx);
         self.run_dialog_answers();
         self.auto.begin_frame();
@@ -2516,6 +2852,7 @@ impl EffectcraftApp {
         self.run_script_tasks(&ctx);
         self.apply_prefs(&ctx);
         self.handle_events(&ctx);
+        self.show_cpu_notice(&ctx);
         panels::unsaved::on_close_requested(self, &ctx);
         let title = panels::unsaved::window_title(self);
         if title != self.window_title {
@@ -2525,6 +2862,7 @@ impl EffectcraftApp {
         self.tick_autosave(&ctx);
         prefs_live::frame(self, &ctx);
         panels::timeline_columns::store_layout(self, &ctx);
+        panels::motion_library::store_display(self, &ctx);
         if let Some(rx) = self.command_inbox.take() {
             while let Ok(id) = rx.try_recv() {
                 if let Err(e) = menus::invoke(self, &ctx, &id, json!({})) {
@@ -2548,6 +2886,10 @@ impl EffectcraftApp {
                 }
             });
         }
+        // Batch 1 (AX2/AX4): a held G / A opens the Graph / Layer wheel; a tap keeps its shortcut.
+        panels::timeline::wheels::hold_keys(self, &ctx);
+        // Batch 1 lane C: ⌘V with an Instagram link opens the paste wheel (CX2).
+        panels::cards::before_shortcuts(self, &ctx);
         menus::handle_shortcuts(self, &ctx);
         if !ctx.input(|i| i.pointer.primary_down()) {
             self.ui.viewer.property_interacting = false;
@@ -2581,6 +2923,16 @@ impl EffectcraftApp {
         panels::dialogs::show(self, &ctx);
         panels::figma_pair::show(self, &ctx);
         panels::fx_console::show(self, &ctx);
+        // Batch 1 wheels (AX1): drawn above the panels, then their slices registered.
+        wheel::paint(&ctx);
+        wheel::register_automation(&ctx, &mut self.auto);
+        // Batch 1 lane C: card / paste wheel picks, link fetches (CX1, CX2).
+        panels::cards::frame(self, &ctx);
+        // Batch 1 lane B: finished transcriptions are imported (SX2).
+        transcribe::poll(self, &ctx);
+        // Send to FigCraft: toast the sends that finished.
+        figcraft_link::poll(self, &ctx);
+        panels::timeline::wheels::take_picks(self, &ctx);
         panels::scriptui_view::sync_panels(self);
         panels::scriptui_view::show_windows(self, &ctx);
         panels::learn::coach(self, &ctx);
@@ -2619,6 +2971,12 @@ impl EffectcraftApp {
             let t = &self.tokens;
             let galley = ui.painter().layout_no_wrap(m.clone(), Tokens::ui(12.0), t.text);
             let r = egui::Rect::from_min_size(egui::pos2(full.min.x + 16.0, full.max.y - 44.0 - lift), galley.size() + egui::vec2(24.0, 14.0));
+            let rows: Vec<egui::Rect> = panels::suggestions::TOAST_CLEAR_OF
+                .iter()
+                .filter_map(|id| self.auto.find(id).filter(|e| e.window.is_none()))
+                .map(|e| egui::Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3])))
+                .collect();
+            let r = panels::suggestions::toast_clear_of(r, &rows);
             ui.painter().rect_filled(r, 6.0, t.panel_bg);
             ui.painter().rect_stroke(r, 6.0, egui::Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
             ui.painter().galley(r.min + egui::vec2(12.0, 7.0), galley, t.text);
@@ -3169,7 +3527,10 @@ mod playback_budget_tests {
         let mut app = app();
         slow(&app);
         assert_eq!(app.viewer_scale(1.0, 1.0), 0.5);
-        // Half still misses the deadline: Quarter, shown as "(Quarter)" by the popup.
+        // Half still misses the deadline: Third, then Quarter, shown as "(Quarter)" by the popup.
+        render(&app, 50.0);
+        assert!((app.viewer_scale(1.0, 1.0) - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(crate::panels::viewer_tools::resolution_label(state::Resolution::Auto, 1.0 / 3.0), "(Third)");
         render(&app, 40.0);
         assert_eq!(app.viewer_scale(1.0, 1.0), 0.25);
         assert_eq!(crate::panels::viewer_tools::resolution_label(state::Resolution::Auto, 0.25), "(Quarter)");
@@ -3186,11 +3547,37 @@ mod playback_budget_tests {
         slow(&app);
         assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         app.playback.res = None;
+        // Settings ▸ Previews ▸ Adaptive Resolution While Playing off: only Fast Previews ▸
+        // Adaptive Resolution adapts.
+        app.session.prefs.previews.adaptive_playback = false;
         for mode in [FastPreviews::Off, FastPreviews::Draft, FastPreviews::FastDraft, FastPreviews::Wireframe] {
             app.session.state.viewer.fast_previews = mode;
             slow(&app);
             assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         }
+    }
+
+    /// Adaptive Resolution While Playing (on by default) drafts slow playback in any Fast
+    /// Previews mode, and the paused viewer asks for full quality again.
+    #[test]
+    fn adaptive_playback_pref_drafts_in_every_mode_and_pause_restores_full() {
+        assert!(Session::default().prefs.previews.adaptive_playback, "on by default");
+        for mode in [FastPreviews::Off, FastPreviews::Draft, FastPreviews::Wireframe] {
+            let mut app = app();
+            app.session.state.viewer.fast_previews = mode;
+            assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
+            slow(&app);
+            assert_eq!(app.viewer_scale(1.0, 1.0), 0.5, "{mode:?}");
+            app.playback.playing = false;
+            assert_eq!(app.viewer_scale(1.0, 1.0), 1.0, "paused: full quality");
+            app.playback.playing = true;
+            assert_eq!(app.viewer_scale(1.0, 1.0), 1.0, "a new playback starts at full");
+        }
+        let mut app = app();
+        app.session.execute("view.adaptivePlayback", json!({"on": false})).unwrap();
+        app.session.state.viewer.fast_previews = FastPreviews::Off;
+        slow(&app);
+        assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
     }
     /// A4: after a ladder rung change the old rung's queued prefetch no longer counts as the
     /// new rung's frames in flight (it held playback at every Full ↔ Half switch): it is dropped.

@@ -116,12 +116,27 @@ fn private_reuse() -> bool {
     *ON.get_or_init(|| std::env::var("EFFECTCRAFT_PRIVATE_REUSE").as_deref() != Ok("0"))
 }
 
+/// `EFFECTCRAFT_HALF_FX=1` / `=0` forces half-float effect intermediates on or off for display
+/// renders (benches, A/B), whatever [`GpuContext::set_half_intermediates`] is given.
+fn half_env() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("EFFECTCRAFT_HALF_FX").as_deref() {
+        Ok("1") | Ok("on") => Some(true),
+        Ok("0") | Ok("off") => Some(false),
+        _ => None,
+    })
+}
+
 impl GpuImage {
     /// Mark the image as readable by other encoders (it is going into a cache): once dropped,
     /// its texture waits for every encoder open then before it is reused.
     pub(crate) fn share(&self) {
         if let Some(l) = &self._lease {
-            l.shared.store(true, std::sync::atomic::Ordering::Release);
+            let was_shared = l.shared.swap(true, std::sync::atomic::Ordering::AcqRel);
+            // Handed to a cache: no longer scratch (the cache's GPU slots count it from now on).
+            if !was_shared && let Some(m) = l.scratch {
+                m.sub(l.pooled.bytes() as u64);
+            }
         }
     }
 
@@ -153,6 +168,8 @@ struct Lease {
     shared: std::sync::atomic::AtomicBool,
     /// Where it was taken (see [`VramReport::peak_sites`]).
     site: &'static std::panic::Location<'static>,
+    /// Counted as effect scratch ([`effect_scratch`]) while not shared: working images only.
+    scratch: Option<&'static ScratchMeter>,
 }
 
 /// A pooled working texture with its default view, made once with the texture and reused with
@@ -174,8 +191,9 @@ impl Pooled {
     fn bytes(&self) -> usize {
         tex_bytes(&self.texture)
     }
-    fn size(&self) -> (u32, u32) {
-        (self.texture.width(), self.texture.height())
+    /// The pool key: size and format (8 bpc code and float textures never alias).
+    fn size(&self) -> PoolKey {
+        (self.texture.width(), self.texture.height(), self.texture.format())
     }
 }
 
@@ -189,6 +207,11 @@ impl Drop for Lease {
     fn drop(&mut self) {
         self.meter.sub(self.pooled.bytes(), self.site);
         use std::sync::atomic::Ordering::Acquire;
+        if let Some(m) = self.scratch
+            && !self.shared.load(Acquire)
+        {
+            m.sub(self.pooled.bytes() as u64);
+        }
         // A working image only its own `Enc` ever recorded (never cached) waits for that `Enc`'s
         // open encoder alone, not for every encoder open anywhere (other frames in flight).
         let private = self.cell.as_ref().filter(|_| !self.shared.load(Acquire) && private_reuse()).map(|c| c.load(Acquire));
@@ -262,6 +285,59 @@ impl Meter {
     }
 }
 
+/// Bytes of GPU working images (effect intermediates: blur passes, glow parts, style planes,
+/// per-frame scratch) handed out and not yet given back or handed to a cache, for every
+/// [`GpuContext`] in the process, with the high-water mark since [`ScratchMeter::reset_peak`].
+/// Two relaxed atomics, updated when a working image is taken, shared or dropped: the memory
+/// map (Window ▸ Memory, `memory.stats`) reads them through [`ScratchMeter::live_counter`] /
+/// [`ScratchMeter::peak_counter`] without walking anything. A subset of [`VramReport::leased`].
+#[derive(Debug, Default)]
+pub struct ScratchMeter {
+    live: Arc<std::sync::atomic::AtomicU64>,
+    peak: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ScratchMeter {
+    pub(crate) fn add(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = self.live.fetch_add(bytes, Relaxed).saturating_add(bytes);
+        self.peak.fetch_max(now, Relaxed);
+    }
+    pub(crate) fn sub(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // A compare-exchange loop: `fetch_update` is deprecated (Rust 1.99) and its replacement,
+        // `try_update`, is newer than the workspace's rust-version.
+        let mut c = self.live.load(Relaxed);
+        while let Err(now) = self.live.compare_exchange_weak(c, c.saturating_sub(bytes), Relaxed, Relaxed) {
+            c = now;
+        }
+    }
+    /// (bytes now, most since [`ScratchMeter::reset_peak`]).
+    pub fn bytes(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.live.load(Relaxed), self.peak.load(Relaxed))
+    }
+    /// Start a new high-water mark from what is handed out now.
+    pub fn reset_peak(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.peak.store(self.live.load(Relaxed), Relaxed);
+    }
+    /// The live byte counter itself (read it with a relaxed load; never store into it).
+    pub fn live_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.live.clone()
+    }
+    /// The high-water mark counter itself (see [`ScratchMeter::live_counter`]).
+    pub fn peak_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.peak.clone()
+    }
+}
+
+/// The process's effect scratch meter (see [`ScratchMeter`]).
+pub fn effect_scratch() -> &'static ScratchMeter {
+    static METER: std::sync::OnceLock<ScratchMeter> = std::sync::OnceLock::new();
+    METER.get_or_init(ScratchMeter::default)
+}
+
 /// Where the device's memory is, by what holds it (see [`GpuContext::vram_report`]).
 #[derive(Clone, Debug, Default)]
 pub struct VramReport {
@@ -300,7 +376,7 @@ pub struct VramReport {
 /// it was released has been submitted (or dropped).
 #[derive(Default)]
 pub(crate) struct Pool {
-    free: HashMap<(u32, u32), Vec<Pooled>>,
+    free: HashMap<PoolKey, Vec<Pooled>>,
     /// (texture, encoder it waits for, private): a shared texture waits for the newest encoder
     /// open at its release (and every older one); a private one for its own `Enc`'s encoder.
     released: Vec<(Pooled, u64, bool)>,
@@ -315,7 +391,7 @@ pub(crate) struct Pool {
     hits: u64,
     misses: u64,
     /// When each free size was last released or reused (a counter, see [`Pool::evict_stalest`]).
-    last_used: HashMap<(u32, u32), u64>,
+    last_used: HashMap<PoolKey, u64>,
     tick: u64,
 }
 
@@ -503,8 +579,11 @@ fn pack_codes<T: Copy + Default + Send>(data: &[[f32; 4]], levels: f32, conv: im
 }
 
 fn tex_bytes(t: &wgpu::Texture) -> usize {
-    (t.width() as usize).saturating_mul(t.height() as usize).saturating_mul(16)
+    (t.width() as usize).saturating_mul(t.height() as usize).saturating_mul(t.format().block_copy_size(None).unwrap_or(16) as usize)
 }
+
+/// A pooled texture's size and format.
+type PoolKey = (u32, u32, wgpu::TextureFormat);
 
 impl Pool {
     fn budget(&self) -> usize {
@@ -520,7 +599,7 @@ impl Pool {
     /// used longest ago (never of size `keep`, the incoming one's). A full pool used to drop
     /// the incoming texture instead, keeping stale sizes: at Full resolution a frame's working
     /// set outgrew the budget and every frame allocated its canvases anew (RT10b).
-    fn make_room(&mut self, bytes: usize, keep: (u32, u32)) {
+    fn make_room(&mut self, bytes: usize, keep: PoolKey) {
         if bytes > self.budget() {
             return;
         }
@@ -528,7 +607,7 @@ impl Pool {
     }
 
     /// Drop one free texture of the stalest size other than `keep`; `false` when there is none.
-    fn evict_stalest(&mut self, keep: (u32, u32)) -> bool {
+    fn evict_stalest(&mut self, keep: PoolKey) -> bool {
         let Some(key) = self.free.keys().filter(|k| **k != keep).min_by_key(|k| self.last_used.get(k).copied().unwrap_or(0)).copied() else {
             return false;
         };
@@ -542,7 +621,7 @@ impl Pool {
         true
     }
 
-    fn touch(&mut self, key: (u32, u32)) {
+    fn touch(&mut self, key: PoolKey) {
         self.tick = self.tick.saturating_add(1);
         self.last_used.insert(key, self.tick);
     }
@@ -607,28 +686,36 @@ impl Pool {
     /// A last CPU lease released within the sole open encoder can be reused by
     /// later commands in that encoder, and so can a private one (see [`Pool::release`]) with
     /// other encoders open. Separate encoders retain the submit barrier.
+    #[cfg(test)]
     fn take_for_encoder(&mut self, w: u32, h: u32, encoder: Option<u64>) -> Option<Pooled> {
+        self.take_format(w, h, FORMAT, encoder)
+    }
+
+    /// [`Pool::take_for_encoder`] of a texture in `format`.
+    fn take_format(&mut self, w: u32, h: u32, format: wgpu::TextureFormat, encoder: Option<u64>) -> Option<Pooled> {
         let sole = self.open.len() == 1;
         if let Some(id) = encoder.filter(|id| *id != 0)
             && TEXTURE_REUSE.load(std::sync::atomic::Ordering::Relaxed)
             && self.open.contains(&id)
-            && let Some(index) = self.released.iter().position(|(texture, owner, private)| *owner == id && (sole || *private) && texture.size() == (w, h))
+            && let Some(index) =
+                self.released.iter().position(|(texture, owner, private)| *owner == id && (sole || *private) && texture.size() == (w, h, format))
         {
             let (texture, _, _) = self.released.swap_remove(index);
             self.released_bytes = self.released_bytes.saturating_sub(texture.bytes());
             self.hits = self.hits.saturating_add(1);
             return Some(texture);
         }
-        self.take(w, h)
+        self.take(w, h, format)
     }
 
-    fn take(&mut self, w: u32, h: u32) -> Option<Pooled> {
-        let t = self.free.get_mut(&(w, h)).and_then(Vec::pop);
-        if self.free.get(&(w, h)).is_some_and(Vec::is_empty) {
-            self.free.remove(&(w, h));
-            self.last_used.remove(&(w, h));
+    fn take(&mut self, w: u32, h: u32, format: wgpu::TextureFormat) -> Option<Pooled> {
+        let key = (w, h, format);
+        let t = self.free.get_mut(&key).and_then(Vec::pop);
+        if self.free.get(&key).is_some_and(Vec::is_empty) {
+            self.free.remove(&key);
+            self.last_used.remove(&key);
         } else if t.is_some() {
-            self.touch((w, h));
+            self.touch(key);
         }
         match &t {
             Some(t) => {
@@ -641,15 +728,16 @@ impl Pool {
                 // smaller preview size. Evict only a free size that cannot coexist
                 // with the requested texture at all. Preserve useful mixed smaller
                 // sizes when their collective occupancy reaches the budget.
-                let required = (w as usize).saturating_mul(h as usize).saturating_mul(16);
+                let px = |f: wgpu::TextureFormat| f.block_copy_size(None).unwrap_or(16) as usize;
+                let required = (w as usize).saturating_mul(h as usize).saturating_mul(px(format));
                 let budget = self.budget.unwrap_or(POOL_BUDGET);
                 if required <= budget {
                     while self.bytes.saturating_add(self.released_bytes).saturating_add(required) > budget {
                         let Some(key) = self
                             .free
                             .keys()
-                            .filter(|(w, h)| (*w as usize).saturating_mul(*h as usize).saturating_mul(16).saturating_add(required) > budget)
-                            .max_by_key(|(w, h)| u64::from(*w) * u64::from(*h))
+                            .filter(|(w, h, f)| (*w as usize).saturating_mul(*h as usize).saturating_mul(px(*f)).saturating_add(required) > budget)
+                            .max_by_key(|(w, h, f)| (*w as usize).saturating_mul(*h as usize).saturating_mul(px(*f)))
                             .copied()
                         else {
                             break;
@@ -752,6 +840,21 @@ pub(crate) struct NativeImage {
     pub scale: f64,
 }
 
+/// A layer image the compositor places, f32 or 8 bpc codes, with its placement (a retained
+/// Processed image, an uploaded layer buffer).
+#[derive(Clone)]
+pub(crate) struct SourceImage {
+    pub img: crate::codes::Pixels,
+    pub offset: [f64; 2],
+    pub scale: f64,
+}
+
+impl From<NativeImage> for SourceImage {
+    fn from(n: NativeImage) -> SourceImage {
+        SourceImage { img: n.img.into(), offset: n.offset, scale: n.scale }
+    }
+}
+
 /// A layer buffer's texture ([`GpuContext::upload_buf_owned`]).
 pub(crate) enum Uploaded {
     Image(GpuImage),
@@ -764,12 +867,23 @@ pub(crate) enum Uploaded {
 /// four times over instead of evicting itself every frame.
 #[derive(Clone)]
 pub(crate) struct PackedImage {
-    codes: wgpu::Texture,
-    view: wgpu::TextureView,
-    width: u32,
-    height: u32,
+    codes: crate::codes::CodeImage,
     offset: [f64; 2],
     scale: f64,
+}
+
+impl PackedImage {
+    fn source(&self) -> SourceImage {
+        SourceImage { img: crate::codes::Pixels::Codes(self.codes.clone()), offset: self.offset, scale: self.scale }
+    }
+}
+
+/// A texture of codes made outside the pool, as a [`crate::codes::CodeImage`] accounted at its bytes.
+fn code_image(texture: wgpu::Texture, generation: &effectcraft_render::allocation::GpuGeneration) -> Option<crate::codes::CodeImage> {
+    let (width, height) = (texture.width(), texture.height());
+    let view = texture.create_view(&Default::default());
+    let allocation = Some(effectcraft_render::allocation::GpuAllocation::of_bytes(tex_bytes(&texture), generation.clone()));
+    crate::codes::CodeImage::wrap(GpuImage { allocation, texture, width, height, view, _lease: None, levels: Some(LEVELS_8) })
 }
 #[derive(Clone)]
 struct NativeUpload {
@@ -883,7 +997,9 @@ pub struct GpuContext {
     /// The display texture's next mip level from the one above (`display.wgsl` `mip`).
     display_mip: wgpu::ComputePipeline,
     /// A 1 × 1 image bound where a kernel reads no image.
-    dummy: GpuImage,
+    pub(crate) dummy: GpuImage,
+    /// The kernels that read and write 8 bpc codes (`None`: f32 only, see [`crate::codes`]).
+    pub(crate) codes: Option<crate::codes::Bank>,
     dummy_buf: wgpu::Buffer,
     /// Bytes between the [`Params`] blocks of a uniform ring ([`Enc::dispatch_ext`]).
     uniform_stride: u64,
@@ -908,6 +1024,14 @@ pub struct GpuContext {
     unpack8: std::sync::OnceLock<wgpu::Buffer>,
     /// Advanced 3D render pipelines (built on first use).
     pub(crate) adv3d: std::sync::OnceLock<Result<crate::adv3d::Pipes, String>>,
+    /// Mask feather pipelines (built on first use, see [`crate::masks_gpu`]).
+    pub(crate) masks: std::sync::OnceLock<Result<crate::masks_gpu::Pipes, String>>,
+    /// Half-float effect kernels (built on first use, see [`crate::half`]).
+    half: std::sync::OnceLock<Result<crate::half::Bank, String>>,
+    /// Viewer display renders keep effect intermediates as RGBA16F ([`GpuContext::set_half_intermediates`]).
+    half_on: std::sync::atomic::AtomicBool,
+    /// The device is Metal (kernels built for its fast math, see `box_h_serial`).
+    metal: bool,
     pub(crate) static_pipeline_count: std::sync::atomic::AtomicU64,
     /// The adapter can run the Advanced 3D rasteriser (`adv3d::raster_unsupported`); without
     /// it Advanced 3D scenes render on the CPU.
@@ -920,7 +1044,7 @@ pub struct GpuContext {
     readbacks: Arc<crate::readback::Readbacks>,
 }
 
-fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -933,13 +1057,48 @@ fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format, view_dimension: wgpu::TextureViewDimension::D2 },
         count: None,
     }
+}
+
+/// The compositor's kernel source: every `shaders/*.wgsl` the kernels' module is built from
+/// (also the half kernels' source, see [`crate::half`]).
+pub(crate) fn kernel_source() -> String {
+    [
+        include_str!("shaders/common.wgsl"),
+        include_str!("shaders/kernels.wgsl"),
+        include_str!("shaders/classic3d.wgsl"),
+        include_str!("shaders/fx_color.wgsl"),
+        include_str!("shaders/fx_distort.wgsl"),
+        include_str!("shaders/fx_generate.wgsl"),
+        include_str!("shaders/fx_key.wgsl"),
+        include_str!("shaders/fx_stylize.wgsl"),
+        include_str!("shaders/fx_noise.wgsl"),
+        include_str!("shaders/fx_tone.wgsl"),
+        include_str!("shaders/fx_warp.wgsl"),
+        include_str!("shaders/fx_extra.wgsl"),
+        include_str!("shaders/fx_depth.wgsl"),
+        include_str!("shaders/fx_lut.wgsl"),
+        include_str!("shaders/fx_sim.wgsl"),
+        include_str!("shaders/fx_particles.wgsl"),
+        include_str!("shaders/fx_vr.wgsl"),
+        include_str!("shaders/fx_light.wgsl"),
+        include_str!("shaders/fx_transition.wgsl"),
+        include_str!("shaders/fx_text.wgsl"),
+        include_str!("shaders/fx_time.wgsl"),
+        include_str!("shaders/fx_pixel2.wgsl"),
+        include_str!("shaders/fx_gen2.wgsl"),
+        include_str!("shaders/fx_deepglow.wgsl"),
+        include_str!("shaders/fx_shadowstudio.wgsl"),
+        include_str!("shaders/fx_styles.wgsl"),
+        include_str!("shaders/sky.wgsl"),
+    ]
+    .concat()
 }
 
 /// Counts a render out of [`GpuContext::enter_render`]'s in-flight count.
@@ -1030,6 +1189,18 @@ pub(crate) fn buffer_init(device: &wgpu::Device, queue: &wgpu::Queue, label: Opt
     buffer
 }
 
+/// The descriptor for a device the compositor owns: `MemoryUsage` so freed textures give their
+/// allocator blocks back instead of a few long-lived objects pinning large ones.
+pub(crate) fn device_descriptor(required_limits: wgpu::Limits, required_features: wgpu::Features) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
+        label: Some("effectcraft gpu"),
+        required_limits,
+        required_features,
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        ..Default::default()
+    }
+}
+
 impl GpuContext {
     /// [`buffer_init`] on this context's device.
     pub(crate) fn buffer_init(&self, label: Option<&str>, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -1077,34 +1248,7 @@ impl GpuContext {
         if let Some(why) = &adv3d_unsupported {
             log::info!("gpu {name}: Advanced 3D renders on the CPU ({why})");
         }
-        let src = [
-            include_str!("shaders/common.wgsl"),
-            include_str!("shaders/kernels.wgsl"),
-            include_str!("shaders/classic3d.wgsl"),
-            include_str!("shaders/fx_color.wgsl"),
-            include_str!("shaders/fx_distort.wgsl"),
-            include_str!("shaders/fx_generate.wgsl"),
-            include_str!("shaders/fx_key.wgsl"),
-            include_str!("shaders/fx_stylize.wgsl"),
-            include_str!("shaders/fx_noise.wgsl"),
-            include_str!("shaders/fx_tone.wgsl"),
-            include_str!("shaders/fx_warp.wgsl"),
-            include_str!("shaders/fx_extra.wgsl"),
-            include_str!("shaders/fx_depth.wgsl"),
-            include_str!("shaders/fx_lut.wgsl"),
-            include_str!("shaders/fx_sim.wgsl"),
-            include_str!("shaders/fx_particles.wgsl"),
-            include_str!("shaders/fx_vr.wgsl"),
-            include_str!("shaders/fx_light.wgsl"),
-            include_str!("shaders/fx_transition.wgsl"),
-            include_str!("shaders/fx_text.wgsl"),
-            include_str!("shaders/fx_time.wgsl"),
-            include_str!("shaders/fx_pixel2.wgsl"),
-            include_str!("shaders/fx_gen2.wgsl"),
-            include_str!("shaders/fx_deepglow.wgsl"),
-            include_str!("shaders/sky.wgsl"),
-        ]
-        .concat();
+        let src = kernel_source();
         let compile_start = web_time::Instant::now();
         let module = init_resource(&device, "kernels shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("effectcraft kernels"), source: wgpu::ShaderSource::Wgsl(src.into()) })
@@ -1211,6 +1355,8 @@ impl GpuContext {
             .chain(crate::fx_pixel2::KERNELS)
             .chain(crate::fx_gen2::KERNELS)
             .chain(crate::fx_deepglow::KERNELS)
+            .chain(crate::fx_shadowstudio::KERNELS)
+            .chain(crate::fx_styles::KERNELS)
         {
             match build(e, &layout) {
                 Ok(p) => {
@@ -1293,6 +1439,10 @@ impl GpuContext {
             }
         };
         let static_pipeline_count = std::sync::atomic::AtomicU64::new(pipelines.len() as u64 + 2 + if yuv.is_some() { 3 } else { 0 });
+        let codes = match crate::codes::enabled() {
+            true => crate::codes::Bank::new(adapter, &device, &queue).map_err(|why| log::info!("gpu {name}: 8 bpc images stay f32 ({why})")).ok(),
+            false => None,
+        };
         Ok(GpuContext {
             generation,
             device,
@@ -1311,6 +1461,7 @@ impl GpuContext {
             display,
             display_mip,
             dummy,
+            codes,
             dummy_buf,
             uniform_stride,
             uniforms: Default::default(),
@@ -1337,6 +1488,10 @@ impl GpuContext {
             zeros: Default::default(),
             unpack8: Default::default(),
             adv3d: std::sync::OnceLock::new(),
+            masks: std::sync::OnceLock::new(),
+            half: std::sync::OnceLock::new(),
+            half_on: std::sync::atomic::AtomicBool::new(half_env().unwrap_or(false)),
+            metal,
             static_pipeline_count,
             adv3d_raster: adv3d_unsupported.is_none(),
             particles: Default::default(),
@@ -1701,15 +1856,8 @@ impl GpuContext {
             max_buffer_size: limits.max_buffer_size,
             ..wgpu::Limits::default()
         };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("effectcraft gpu"),
-                required_limits,
-                required_features: profile_features(adapter.features()),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| format!("no device: {e}"))?;
+        let (device, queue) =
+            adapter.request_device(&device_descriptor(required_limits, profile_features(adapter.features()))).await.map_err(|e| format!("no device: {e}"))?;
         let context = GpuContext::new(adapter, device, queue)?;
         // This path owns the device; install handlers only after construction succeeds.
         crate::readback::install(&context.device, &context.readbacks);
@@ -1763,14 +1911,26 @@ impl GpuContext {
     }
 
     fn texture(&self, w: u32, h: u32) -> wgpu::Texture {
-        self.transfers.count_made(u64::from(w.max(1)).saturating_mul(u64::from(h.max(1))).saturating_mul(16));
+        self.texture_format(w, h, FORMAT)
+    }
+
+    /// A new working texture in `format` (f32, or 8 bpc codes: see [`crate::codes`]).
+    fn texture_format(&self, w: u32, h: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
+        let px = u64::from(format.block_copy_size(None).unwrap_or(16));
+        self.transfers.count_made(u64::from(w.max(1)).saturating_mul(u64::from(h.max(1))).saturating_mul(px));
         self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("working image"),
+            label: Some(if format == FORMAT {
+                "working image"
+            } else if format == crate::half::FORMAT {
+                "working half image"
+            } else {
+                "working 8 bpc codes"
+            }),
             size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         })
@@ -1780,6 +1940,20 @@ impl GpuContext {
     /// one is zeroed.
     #[track_caller]
     fn pooled_for_encoder(&self, w: u32, h: u32, encoder: Option<u64>, cell: Option<Arc<std::sync::atomic::AtomicU64>>) -> (GpuImage, bool) {
+        self.pooled_format(w, h, FORMAT, encoder, cell)
+    }
+
+    /// [`GpuContext::pooled_for_encoder`] in `format`. Only [`crate::codes`] asks for another
+    /// format than [`FORMAT`] and wraps the image so no float kernel can bind it.
+    #[track_caller]
+    pub(crate) fn pooled_format(
+        &self,
+        w: u32,
+        h: u32,
+        format: wgpu::TextureFormat,
+        encoder: Option<u64>,
+        cell: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> (GpuImage, bool) {
         let made_for = encoder;
         #[cfg(feature = "profile")]
         let encoder = {
@@ -1788,7 +1962,7 @@ impl GpuContext {
         };
 
         let (w, h) = (w.max(1), h.max(1));
-        let reused = self.pool.lock().ok().and_then(|mut p| p.take_for_encoder(w, h, encoder));
+        let reused = self.pool.lock().ok().and_then(|mut p| p.take_format(w, h, format, encoder));
         let was_reused = reused.is_some();
         #[cfg(feature = "profile")]
         if !was_reused {
@@ -1796,13 +1970,30 @@ impl GpuContext {
             let site = format!("{}:{}", at.file().rsplit('/').next().unwrap_or(at.file()), at.line());
             *MISS_SITES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry((site, w, h)).or_default() += 1;
         }
-        let pooled = reused.unwrap_or_else(|| Pooled::from(self.texture(w, h)));
+        let pooled = reused.unwrap_or_else(|| Pooled::from(self.texture_format(w, h, format)));
         let (texture, view) = (pooled.texture.clone(), pooled.view.clone());
         let site = std::panic::Location::caller();
         self.leased.add(pooled.bytes(), site);
-        let lease =
-            Arc::new(Lease { pooled, pool: Arc::downgrade(&self.pool), encoder: made_for, meter: self.leased.clone(), site, cell, shared: Default::default() });
-        let allocation = effectcraft_render::allocation::GpuAllocation::rgba_f32(w, h, self.generation.clone());
+        // Working images (taken by an `Enc`) are effect scratch until shared or dropped.
+        let scratch = cell.is_some().then(effect_scratch);
+        if let Some(m) = scratch {
+            m.add(pooled.bytes() as u64);
+        }
+        let lease = Arc::new(Lease {
+            pooled,
+            pool: Arc::downgrade(&self.pool),
+            encoder: made_for,
+            meter: self.leased.clone(),
+            site,
+            cell,
+            shared: Default::default(),
+            scratch,
+        });
+        let allocation = if format == FORMAT {
+            effectcraft_render::allocation::GpuAllocation::rgba_f32(w, h, self.generation.clone())
+        } else {
+            Some(effectcraft_render::allocation::GpuAllocation::of_bytes(tex_bytes(&texture), self.generation.clone()))
+        };
         (GpuImage { allocation, texture, width: w, height: h, view, _lease: Some(lease), levels: None }, was_reused)
     }
 
@@ -1892,6 +2083,39 @@ impl GpuContext {
         if let Ok(mut s) = self.leased.sites.lock() {
             s.at_peak = s.live.clone();
         }
+    }
+
+    /// Bytes of pooled textures handed out now and the most since [`GpuContext::reset_vram_peak`]
+    /// (working images, uploads, retained results): the scratch high-water mark the effect
+    /// bench reports (`examples/effect_buffers.rs`). Cheaper than [`GpuContext::vram_report`].
+    pub fn leased_bytes(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.leased.live.load(Relaxed), self.leased.peak.load(Relaxed))
+    }
+
+    /// Viewer display renders ([`crate::Gpu::render_display`]) keep effect intermediates (blur
+    /// passes, glow parts, layer style planes, the bevel height profile) as RGBA16F, half the
+    /// bytes (Settings ▸ Previews ▸ Half-float effect buffers). Effect outputs, exports and
+    /// every other render stay RGBA f32. `EFFECTCRAFT_HALF_FX=0/1` overrides it.
+    pub fn set_half_intermediates(&self, on: bool) {
+        let on = half_env().unwrap_or(on);
+        self.half_on.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// See [`GpuContext::set_half_intermediates`].
+    pub fn half_intermediates(&self) -> bool {
+        self.half_on.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The half kernels, built on first use (`None`: they could not be built; f32 it is).
+    pub(crate) fn half_bank(&self) -> Option<&crate::half::Bank> {
+        self.half
+            .get_or_init(|| {
+                crate::half::Bank::new(&self.device, &kernel_source(), self.metal)
+                    .inspect_err(|why| log::info!("gpu {}: effect buffers stay f32 ({why})", self.name))
+            })
+            .as_ref()
+            .ok()
     }
 
     /// A `COPY_DST | TEXTURE_BINDING` texture for uploaded samples: a free one of this size and
@@ -1986,8 +2210,42 @@ impl GpuContext {
         None
     }
 
+    /// Upload a CPU image for the compositor walk: its codes when it is on the 8 bpc grid (and
+    /// the codes kernels exist), else as [`GpuContext::upload_image`].
+    pub(crate) fn upload_image_px(&self, img: &Image) -> Option<crate::codes::Pixels> {
+        if let Some(c) = self.upload_codes8(img) {
+            return Some(crate::codes::Pixels::Codes(c));
+        }
+        self.upload_image(img).map(crate::codes::Pixels::Float)
+    }
+
+    /// A CPU image on the 8 bpc grid uploaded as its codes into a pooled codes image (no float
+    /// copy: [`crate::codes`]); `None` off the grid, without the codes bank, or not fitting.
+    fn upload_codes8(&self, img: &Image) -> Option<crate::codes::CodeImage> {
+        self.codes.as_ref()?;
+        if !self.fits(img.width, img.height) {
+            return None;
+        }
+        let _profile = effectcraft_render::profile::span("upload");
+        let codes = pack_codes(&img.data, LEVELS_8, |k| k as u8)?;
+        let (g, _) = self.pooled_format(img.width, img.height, crate::codes::FORMAT, None, None);
+        let row = img.width.checked_mul(4)?;
+        let bytes: &[u8] = bytemuck::cast_slice(&codes);
+        if (row as usize).checked_mul(img.height as usize) != Some(bytes.len()) {
+            return None;
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &g.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(img.height) },
+            wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+        );
+        self.transfers.count(true, bytes.len());
+        crate::codes::CodeImage::wrap(g)
+    }
+
     /// The uniform `unpack.wgsl` reads for the 8 bpc grid (made once).
-    fn unpack8_scale(&self) -> &wgpu::Buffer {
+    pub(crate) fn unpack8_scale(&self) -> &wgpu::Buffer {
         self.unpack8.get_or_init(|| {
             let scale = [(1.0 / LEVELS_8).to_bits(), 0, 0, 0];
             self.buffer_init(Some("unpack scale"), bytemuck::cast_slice(&scale), wgpu::BufferUsages::UNIFORM)
@@ -2085,15 +2343,26 @@ impl GpuContext {
                 }
             }
         }
+        // 8 bpc layers stay codes: the compositor samples them as they are (see `crate::codes`).
+        if let Some(codes) = self.upload_codes8(&buf.img) {
+            let packed = PackedImage { codes, offset: buf.offset, scale: buf.scale };
+            if let Some(owner) = owner
+                && packed_retention()
+                && let Some(allocation) = packed.codes.allocation().cloned()
+            {
+                packed.codes.share();
+                self.leased.publish_bytes("upload packed", packed.codes.bytes() as u64);
+                self.register_payload(buf, Arc::new(packed.clone()), allocation, owner, &epoch);
+            }
+            return Some(Uploaded::Packed(packed));
+        }
         let keep = owner.is_some() && packed_retention();
         let (img, codes) = self.upload_image_keeping(&buf.img, keep)?;
         if let Some(owner) = owner {
-            match codes {
+            match codes.and_then(|c| code_image(c, &self.generation)) {
                 Some(codes) => {
-                    let (width, height) = (img.width, img.height);
-                    let view = codes.create_view(&Default::default());
-                    let packed = PackedImage { codes, view, width, height, offset: buf.offset, scale: buf.scale };
-                    let bytes = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+                    let packed = PackedImage { codes, offset: buf.offset, scale: buf.scale };
+                    let bytes = packed.codes.bytes();
                     self.leased.publish_bytes("upload packed", bytes as u64);
                     let allocation = effectcraft_render::allocation::GpuAllocation::of_bytes(bytes, self.generation.clone());
                     self.register_payload(buf, Arc::new(packed), allocation, owner, &epoch);
@@ -2437,10 +2706,8 @@ impl effectcraft_render::cache::ResidentReadback for LazyReadback {
         if let Some(packed) = slot.payload::<PackedImage>() {
             // The codes back as the floats `unpack` gives (and the CPU's packing reads as).
             return crate::Gpu::within_context(&ctx, || {
-                let codes = Enc::new(&ctx).read_texture(&packed.codes, packed.width, packed.height, 4)?;
-                let inv = 1.0 / LEVELS_8;
-                let data = codes.as_chunks::<4>().0.iter().map(|k| k.map(|k| f32::from(k) * inv)).collect();
-                Some(Buf { img: Image { width: packed.width, height: packed.height, data }, offset: packed.offset, scale: packed.scale })
+                let img = Enc::new(&ctx).download_codes(&packed.codes)?;
+                Some(Buf { img, offset: packed.offset, scale: packed.scale })
             })
             .ok()
             .flatten();
@@ -2493,6 +2760,9 @@ pub(crate) struct Enc<'g> {
     /// The pool id of the open command encoder (0: none), shared with the leases of the
     /// working images this `Enc` takes (see [`Pool::release`]).
     cell: Arc<std::sync::atomic::AtomicU64>,
+    /// Effects may keep their intermediates as RGBA16F ([`Enc::half_for`]): a viewer display
+    /// render with [`GpuContext::set_half_intermediates`] on. Off everywhere else.
+    pub(crate) half: bool,
 }
 
 /// Submitted encoder ids an [`Enc`] remembers for [`Enc::owns`] (older ones lose in-place).
@@ -2553,15 +2823,19 @@ impl<'g> Enc<'g> {
     pub(crate) fn can_retain_resident(&self) -> bool {
         self.readback.is_some() && self.owner.as_ref().is_some_and(GpuOwner::valid) && self.g.deferred.is_none()
     }
-    /// A retained image (a packed one expanded into a working image of this encoder).
-    pub(crate) fn resident(&mut self, key: u64, stage: GpuStage) -> Option<NativeImage> {
+    /// A retained image: f32, or the codes of a packed one (sampled as they are where the
+    /// codes kernels exist, else expanded into a working image of this encoder).
+    pub(crate) fn resident(&mut self, key: u64, stage: GpuStage) -> Option<SourceImage> {
         let slot = self.owner.as_ref()?.resident_in(key, stage, Some(&self.g.generation))?;
         if let Some(image) = slot.payload::<NativeImage>() {
-            return Some(image.clone());
+            return Some(image.clone().into());
         }
         let packed = slot.payload::<PackedImage>()?.clone();
         drop(slot);
-        self.unpack(&packed)
+        if self.g.codes.is_some() {
+            return Some(packed.source());
+        }
+        self.unpack(&packed).map(SourceImage::from)
     }
 
     /// Whether [`Enc::resident`] has an image for `key` (without expanding a packed one).
@@ -2605,31 +2879,42 @@ impl<'g> Enc<'g> {
         if self.take_missing() {
             return None;
         }
-        Some(PackedImage { codes, view, width: w, height: h, offset: image.offset, scale: image.scale })
+        drop(view);
+        Some(PackedImage { codes: code_image(codes, &self.g.generation)?, offset: image.offset, scale: image.scale })
     }
 
-    /// A [`PackedImage`] expanded into a working image of this encoder (the identical floats).
-    fn unpack(&mut self, p: &PackedImage) -> Option<NativeImage> {
+    /// Codes decoded into a working image of this encoder: the floats `unpack.wgsl` gives (the
+    /// CPU's `k as f32 * (1.0 / 255.0)`), recorded after the commands that wrote the codes.
+    fn unpack_codes(&mut self, c: &crate::codes::CodeImage) -> Option<GpuImage> {
         let yuv = self.g.yuv.as_ref()?;
-        let mut out = self.scratch(p.width, p.height);
+        let mut out = self.scratch(c.width(), c.height());
         let bg = self.g.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("unpack retained"),
+            label: Some("decode 8 bpc codes"),
             layout: &yuv.unpack_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&out.view) },
-                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&p.view) },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(c.view()) },
                 wgpu::BindGroupEntry { binding: 9, resource: self.g.unpack8_scale().as_entire_binding() },
             ],
         });
         let pipe = yuv.unpack.clone();
-        self.custom_pixels("unpack_retained", &pipe, &bg, (p.width, p.height));
+        self.custom_pixels("unpack_retained", &pipe, &bg, (c.width(), c.height()));
         out.levels = Some(LEVELS_8);
-        Some(NativeImage { img: out, offset: p.offset, scale: p.scale })
+        Some(out)
+    }
+
+    /// A [`PackedImage`] expanded into a working image of this encoder (the identical floats).
+    fn unpack(&mut self, p: &PackedImage) -> Option<NativeImage> {
+        let img = match self.g.codes {
+            Some(_) => crate::codes::decode(self, &p.codes)?,
+            None => self.unpack_codes(&p.codes)?,
+        };
+        Some(NativeImage { img, offset: p.offset, scale: p.scale })
     }
     pub(crate) fn keep_resident(
         &mut self,
         key: u64,
-        image: NativeImage,
+        image: SourceImage,
         flight: effectcraft_render::cache::FlightGuard,
         intent: Option<effectcraft_render::disk_cache::LayerWriteIntent>,
     ) {
@@ -2637,12 +2922,27 @@ impl<'g> Enc<'g> {
         if self.g.deferred.is_some() || self.resident_pending.len() >= 256 || self.epoch.strong_count() == 0 {
             return;
         }
+        let image = match image.img {
+            // Already codes (an 8 bpc upload, a codes canvas): kept as they are, no packing pass.
+            crate::codes::Pixels::Codes(codes) => {
+                let Some(allocation) = codes.allocation().cloned() else { return };
+                codes.share();
+                self.g.leased.publish_bytes("resident packed", codes.bytes() as u64);
+                let packed = PackedImage { codes, offset: image.offset, scale: image.scale };
+                let Ok(pending) = owner.prepare(Arc::new(packed), allocation, GpuStage::Processed, self.g.retained_cap()) else { return };
+                if self.resident_pending.try_reserve(1).is_ok() {
+                    self.resident_pending.push((pending.with_content(key, self.readback.clone()).with_persistence(intent), flight));
+                }
+                return;
+            }
+            crate::codes::Pixels::Float(img) => NativeImage { img, offset: image.offset, scale: image.scale },
+        };
         let Some(allocation) = image.img.allocation.clone() else { return };
         // On the 8 bpc grid: kept as codes, a quarter of the bytes (the float image stays this
         // frame's working image).
         let prepared = match self.pack(&image) {
             Some(packed) => {
-                let bytes = (packed.width as usize).saturating_mul(packed.height as usize).saturating_mul(4);
+                let bytes = packed.codes.bytes();
                 self.g.leased.publish_bytes("resident packed", bytes as u64);
                 let allocation = effectcraft_render::allocation::GpuAllocation::of_bytes(bytes, self.g.generation.clone());
                 owner.prepare(Arc::new(packed), allocation, GpuStage::Processed, self.g.retained_cap())
@@ -2680,6 +2980,7 @@ impl<'g> Enc<'g> {
             submitted_ids: Vec::new(),
             opened: None,
             cell: Default::default(),
+            half: false,
             #[cfg(feature = "profile")]
             timestamps: None,
         }
@@ -2689,6 +2990,21 @@ impl<'g> Enc<'g> {
     /// that failed to build): its output is wrong, and the effect must render on the CPU.
     pub(crate) fn take_missing(&mut self) -> bool {
         std::mem::take(&mut self.missing)
+    }
+
+    /// A pass this encoder needed could not be recorded (see [`Enc::take_missing`]).
+    pub(crate) fn mark_missing(&mut self) {
+        self.missing = true;
+    }
+
+    /// A new pooled codes image for a kernel that writes every pixel of it (see [`Enc::scratch`]).
+    #[track_caller]
+    pub(crate) fn scratch_codes(&mut self, w: u32, h: u32) -> Option<crate::codes::CodeImage> {
+        self.g.codes.as_ref()?;
+        self.open_encoder();
+        let owner = self.enc.as_ref().map(|(_, id)| *id);
+        let (img, _) = self.g.pooled_format(w, h, crate::codes::FORMAT, owner, Some(self.cell.clone()));
+        crate::codes::CodeImage::wrap(img)
     }
 
     /// The command encoder, for anything but a dispatch: ends the open compute pass first, so
@@ -2752,6 +3068,45 @@ impl<'g> Enc<'g> {
         img
     }
 
+    /// Whether this render's effect intermediates written by `kernels` may be RGBA16F: half
+    /// working images are on for this `Enc` ([`Enc::half`]) and every one of `kernels` has a
+    /// half variant ([`crate::half::KERNELS`]). An effect asks once, then passes the answer to
+    /// [`Enc::scratch_as`] / [`Enc::image_as`] for the images only its own kernels read.
+    pub(crate) fn half_for(&self, kernels: &[&str]) -> bool {
+        self.half && self.g.half_bank().is_some_and(|b| b.has_all(kernels))
+    }
+
+    /// [`Enc::scratch`] as RGBA16F when `half` (see [`Enc::half_for`]; only kernels in
+    /// [`crate::half::KERNELS`] may write it, and it must never leave the effect that took it).
+    #[track_caller]
+    pub(crate) fn scratch_as(&mut self, w: u32, h: u32, half: bool) -> GpuImage {
+        if !half {
+            return self.scratch(w, h);
+        }
+        self.open_encoder();
+        let owner = self.enc.as_ref().map(|(_, id)| *id);
+        let (img, _) = self.g.pooled_format(w, h, crate::half::FORMAT, owner, Some(self.cell.clone()));
+        if cfg!(test) {
+            self.fill(&img, f32::NAN);
+        }
+        img
+    }
+
+    /// [`Enc::image`] (zeroed) as RGBA16F when `half` (see [`Enc::scratch_as`]).
+    #[track_caller]
+    pub(crate) fn image_as(&mut self, w: u32, h: u32, half: bool) -> GpuImage {
+        if !half {
+            return self.image(w, h);
+        }
+        self.open_encoder();
+        let owner = self.enc.as_ref().map(|(_, id)| *id);
+        let (img, reused) = self.g.pooled_format(w, h, crate::half::FORMAT, owner, Some(self.cell.clone()));
+        if reused {
+            self.fill(&img, 0.0);
+        }
+        img
+    }
+
     /// A transparent image to read from (shared per size; never written).
     pub fn zeros(&self, w: u32, h: u32) -> GpuImage {
         let (w, h) = (w.max(1), h.max(1));
@@ -2810,6 +3165,17 @@ impl<'g> Enc<'g> {
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
         let g = self.g;
+        if out.texture.format() == crate::half::FORMAT {
+            // A half working image (`Enc::scratch_as`): the kernel's half variant writes it.
+            let Some((bank, pipe)) = g.half_bank().and_then(|b| Some((b, b.get(entry)?))).filter(|_| ext.is_none()) else {
+                log::error!("gpu: no half kernel {entry}");
+                self.missing = true;
+                return;
+            };
+            let views = [&src.view, aux.map_or(&g.dummy.view, |a| &a.view), &out.view];
+            self.dispatch_views(entry, pipe, &bank.bgl, p, views, data, groups, None, None);
+            return;
+        }
         let Some(pipe) = g.pipelines.get(entry) else {
             if !g.unavailable.iter().any(|(e, _)| *e == entry) {
                 log::error!("gpu: no kernel {entry}");
@@ -2834,6 +3200,27 @@ impl<'g> Enc<'g> {
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
         let g = self.g;
+        let views = [&src.view, aux.map_or(&g.dummy.view, |a| &a.view), &out.view];
+        self.dispatch_views(entry, pipe, &g.bgl, p, views, data, groups, ext, None);
+    }
+
+    /// Record a dispatch of `pipe` (bind group layout `layout`: the kernels' one, or a
+    /// [`crate::codes`] variant's, which adds the decode table `lut` at binding 6) reading the
+    /// views `[src, aux]` and writing `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_views(
+        &mut self,
+        entry: &str,
+        pipe: &wgpu::ComputePipeline,
+        layout: &wgpu::BindGroupLayout,
+        p: &Params,
+        [src, aux, out]: [&wgpu::TextureView; 3],
+        data: Option<&wgpu::Buffer>,
+        groups: (u32, u32),
+        ext: Option<[&wgpu::Buffer; 4]>,
+        lut: Option<&wgpu::Buffer>,
+    ) {
+        let g = self.g;
         if self.pending >= RING_SLOTS {
             self.submit();
         }
@@ -2853,20 +3240,20 @@ impl<'g> Enc<'g> {
             })
         });
         g.queue.write_buffer(ring, offset, &p.bytes());
-        let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &g.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: ring, offset, size: wgpu::BufferSize::new(PARAMS_SIZE) }),
-                },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&src.view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(aux.map_or(&g.dummy.view, |a| &a.view)) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&out.view) },
-                wgpu::BindGroupEntry { binding: 4, resource: data.unwrap_or(&g.dummy_buf).as_entire_binding() },
-            ],
-        });
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: ring, offset, size: wgpu::BufferSize::new(PARAMS_SIZE) }),
+            },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(aux) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(out) },
+            wgpu::BindGroupEntry { binding: 4, resource: data.unwrap_or(&g.dummy_buf).as_entire_binding() },
+        ];
+        if let Some(lut) = lut {
+            entries.push(wgpu::BindGroupEntry { binding: 6, resource: lut.as_entire_binding() });
+        }
+        let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries });
         let bg_ext = ext.map(|b| {
             g.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -2982,6 +3369,26 @@ impl<'g> Enc<'g> {
         img._lease.as_ref().is_some_and(|l| mine(l.encoder) && Arc::strong_count(l) == 1 && Arc::weak_count(l) == 0) && !self.g.mips.is_sealed(img)
     }
 
+    /// [`Enc::owns`] of f32 or codes.
+    pub(crate) fn owns_px(&self, img: &crate::codes::Pixels) -> bool {
+        match img {
+            crate::codes::Pixels::Float(g) => self.owns(g),
+            crate::codes::Pixels::Codes(c) => c.owned_by(self),
+        }
+    }
+
+    /// Copy the `w` × `h` region of texture `src` at (`x`, `y`) to the top-left of `out` (the
+    /// same format: f32 to f32, codes to codes).
+    pub(crate) fn copy_texture_region(&mut self, src: &wgpu::Texture, out: &wgpu::Texture, x: u32, y: u32, w: u32, h: u32) {
+        self.timed("copy", |enc| {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: src, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: out, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            )
+        });
+    }
+
     /// Whether the kernel `entry` built on this device.
     pub(crate) fn has_kernel(&self, entry: &str) -> bool {
         self.g.pipelines.contains_key(entry)
@@ -3011,6 +3418,24 @@ impl<'g> Enc<'g> {
         let out = self.scratch(w, h);
         self.copy_region(src, &out, x, y, w, h);
         out
+    }
+
+    /// Copy the `w` × `h` region of `src` at (`x`, `y`) into `out` at (`dx`, `dy`) (the caller
+    /// checks that both lie inside their images).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn copy_region_to(&mut self, src: &GpuImage, out: &GpuImage, x: u32, y: u32, w: u32, h: u32, dx: u32, dy: u32) {
+        self.timed("copy", |enc| {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &out.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: dx, y: dy, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            )
+        });
     }
 
     /// Copy the `w` × `h` region of `src` at (`x`, `y`) to the top-left of `out`.
@@ -3087,10 +3512,21 @@ impl<'g> Enc<'g> {
         }
         crate::mips::publish(self);
     }
+    /// A layer buffer's texture as floats (for float-only consumers: effects, 3D).
     pub(crate) fn upload_buf(&mut self, buf: &Arc<Buf>) -> Option<GpuImage> {
         match self.g.upload_buf_owned(buf, self.owner.as_ref())? {
             Uploaded::Image(img) => Some(img),
             Uploaded::Packed(packed) => self.unpack(&packed).map(|n| n.img),
+        }
+    }
+
+    /// A layer buffer's texture for the compositor: 8 bpc codes stay codes where the codes
+    /// kernels exist ([`crate::codes`]).
+    pub(crate) fn upload_pixels(&mut self, buf: &Arc<Buf>) -> Option<crate::codes::Pixels> {
+        match self.g.upload_buf_owned(buf, self.owner.as_ref())? {
+            Uploaded::Image(img) => Some(img.into()),
+            Uploaded::Packed(packed) if self.g.codes.is_some() => Some(crate::codes::Pixels::Codes(packed.codes)),
+            Uploaded::Packed(packed) => self.unpack(&packed).map(|n| n.img.into()),
         }
     }
     pub(crate) fn keep(&self, img: GpuImage) -> Option<u64> {
@@ -3193,6 +3629,18 @@ impl<'g> Enc<'g> {
             return None;
         }
         Some(Image { width: img.width, height: img.height, data })
+    }
+
+    /// 8 bpc codes read back as the floats they stand for (4 bytes a pixel over the bus,
+    /// decoded with the CPU's own table).
+    pub(crate) fn download_codes(&mut self, c: &crate::codes::CodeImage) -> Option<Image> {
+        let (w, h) = (c.width(), c.height());
+        let codes = self.read_texture(c.texture(), w, h, 4)?;
+        let table = crate::codes::decode_table();
+        let mut data: Vec<[f32; 4]> = Vec::new();
+        data.try_reserve_exact((w as usize).saturating_mul(h as usize)).ok()?;
+        data.extend(codes.as_chunks::<4>().0.iter().map(|k| k.map(|k| table[usize::from(k)])));
+        (data.len() == (w as usize).saturating_mul(h as usize)).then_some(Image { width: w, height: h, data })
     }
 
     /// Tightly packed texel bytes of a texture (`bpp` bytes per pixel).
@@ -3381,15 +3829,50 @@ impl<'g> Enc<'g> {
         self.g.buffer_init(Some("data"), &bytes, wgpu::BufferUsages::STORAGE)
     }
 
+    /// [`Enc::download`] of f32 or codes (codes come back as their floats, 4 bytes a pixel).
+    pub(crate) fn download_px(&mut self, img: &crate::codes::Pixels) -> Option<Image> {
+        match img {
+            crate::codes::Pixels::Float(g) => self.download(g),
+            crate::codes::Pixels::Codes(c) => self.download_codes(c),
+        }
+    }
+
+    /// [`Enc::display`] of f32 or codes (level 0 decodes the codes: the same RGBA8).
+    pub(crate) fn display_px(&mut self, img: &crate::codes::Pixels) -> Option<wgpu::Texture> {
+        match img {
+            crate::codes::Pixels::Float(g) => Some(self.display(g)),
+            crate::codes::Pixels::Codes(c) => match crate::codes::display_parts(self.g) {
+                Some(parts) => Some(self.display_from(c.view(), c.width(), c.height(), Some(parts))),
+                None => {
+                    let f = img.float(self)?;
+                    Some(self.display(&f))
+                }
+            },
+        }
+    }
+
     /// Convert to the viewer's premultiplied RGBA8 texture (egui-wgpu's native texture format),
     /// with a full mip chain so the viewer minifies it without aliasing (#417).
     pub fn display(&mut self, img: &GpuImage) -> wgpu::Texture {
+        self.display_from(&img.view, img.width, img.height, None)
+    }
+
+    /// [`Enc::display`] of the image `view` (`width` × `height`); `codes`: it holds 8 bpc codes,
+    /// and level 0 runs the codes `display` pass (pipeline, layout, decode table).
+    fn display_from(
+        &mut self,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        codes: Option<(&wgpu::ComputePipeline, &wgpu::BindGroupLayout, &wgpu::Buffer)>,
+    ) -> wgpu::Texture {
         let g = self.g;
-        let levels = mip_levels(img.width, img.height);
-        g.transfers.count_made(u64::from(img.width).saturating_mul(u64::from(img.height)).saturating_mul(4).saturating_mul(4) / 3);
+        let img = (width, height);
+        let levels = mip_levels(img.0, img.1);
+        g.transfers.count_made(u64::from(img.0).saturating_mul(u64::from(img.1)).saturating_mul(4).saturating_mul(4) / 3);
         let tex = g.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("viewer frame"),
-            size: wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: img.0, height: img.1, depth_or_array_layers: 1 },
             mip_level_count: levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -3399,9 +3882,9 @@ impl<'g> Enc<'g> {
         });
         let level = |l: u32| tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: l, mip_level_count: Some(1), ..Default::default() });
         // Level 0 from the frame, then each level the 2 × 2 mean of the one above.
-        let mut steps = vec![(&g.display, img.view.clone(), level(0), img.width, img.height)];
+        let mut steps = vec![(&g.display, view.clone(), level(0), img.0, img.1)];
         for l in 1..levels {
-            steps.push((&g.display_mip, level(l - 1), level(l), (img.width >> l).max(1), (img.height >> l).max(1)));
+            steps.push((&g.display_mip, level(l - 1), level(l), (img.0 >> l).max(1), (img.1 >> l).max(1)));
         }
         #[cfg(feature = "profile")]
         let mut batch = self.timestamps.take().or_else(|| crate::timestamps::Batch::new(g));
@@ -3412,14 +3895,31 @@ impl<'g> Enc<'g> {
             let timestamp_writes = batch.as_mut().and_then(|b| b.mark(entry));
             #[cfg(not(feature = "profile"))]
             let timestamp_writes = None;
-            let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &g.display_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(dst) },
-                ],
-            });
+            let (pipeline, bg) = match codes.filter(|_| step == 0) {
+                Some((pipe, layout, lut)) => (
+                    pipe,
+                    g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("display codes"),
+                        layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(dst) },
+                            wgpu::BindGroupEntry { binding: 6, resource: lut.as_entire_binding() },
+                        ],
+                    }),
+                ),
+                None => (
+                    *pipeline,
+                    g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &g.display_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(dst) },
+                        ],
+                    }),
+                ),
+            };
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bg, &[]);
@@ -3436,6 +3936,29 @@ impl<'g> Enc<'g> {
 /// Mip levels of a full chain for a `w × h` texture (down to 1 × 1).
 pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
     u32::BITS - w.max(h).max(1).leading_zeros()
+}
+
+#[cfg(test)]
+mod scratch_meter_tests {
+    use super::ScratchMeter;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn scratch_meter_tracks_live_and_peak_through_its_shared_counters() {
+        let m = ScratchMeter::default();
+        let (live, peak) = (m.live_counter(), m.peak_counter());
+        m.add(100);
+        m.add(50);
+        m.sub(100);
+        assert_eq!(m.bytes(), (50, 150));
+        assert_eq!((live.load(Relaxed), peak.load(Relaxed)), (50, 150));
+        // Never below zero (a double give-back must not wrap).
+        m.sub(80);
+        assert_eq!(m.bytes(), (0, 150));
+        m.reset_peak();
+        m.add(10);
+        assert_eq!(m.bytes(), (10, 10));
+    }
 }
 
 #[cfg(test)]
@@ -3493,12 +4016,12 @@ mod upload_budget_tests {
         pool.release(g.ctx.texture(8, 8), Some(mine));
         pool.release(g.ctx.texture(8, 8), None);
         pool.close(mine);
-        assert_eq!(pool.free.get(&(8, 8)).map(Vec::len), Some(1), "free once its own encoder is submitted");
+        assert_eq!(pool.free.get(&(8, 8, FORMAT)).map(Vec::len), Some(1), "free once its own encoder is submitted");
         assert_eq!(pool.released.len(), 1, "the shared one still waits for the other frame");
         pool.release(g.ctx.texture(8, 8), Some(0));
-        assert_eq!(pool.free.get(&(8, 8)).map(Vec::len), Some(2), "no encoder of its own open: free at once");
+        assert_eq!(pool.free.get(&(8, 8, FORMAT)).map(Vec::len), Some(2), "no encoder of its own open: free at once");
         pool.close(other);
-        assert_eq!(pool.free.get(&(8, 8)).map(Vec::len), Some(3));
+        assert_eq!(pool.free.get(&(8, 8, FORMAT)).map(Vec::len), Some(3));
         assert_eq!(pool.released_bytes, 0);
     }
 
@@ -3592,21 +4115,21 @@ mod upload_budget_tests {
         let mut pool = Pool::default();
         pool.set_budget(8 * 8 * 16);
         pool.release(g.ctx.texture(8, 8), None);
-        assert!(pool.take(4, 4).is_none());
+        assert!(pool.take(4, 4, FORMAT).is_none());
         assert_eq!(pool.bytes, 0, "large free texture makes room for new size");
         let encoder = pool.open();
         pool.release(g.ctx.texture(4, 4), None);
         assert_eq!(pool.released.len(), 1);
-        assert!(pool.take(4, 4).is_none(), "unsubmitted texture is not reused");
+        assert!(pool.take(4, 4, FORMAT).is_none(), "unsubmitted texture is not reused");
         assert_eq!(pool.released.len(), 1, "pending resources are not evicted");
         pool.close(encoder);
-        assert!(pool.take(4, 4).is_some(), "new preview size now reuses its allocation");
+        assert!(pool.take(4, 4, FORMAT).is_some(), "new preview size now reuses its allocation");
         pool.release(g.ctx.texture(4, 4), None);
         pool.release(g.ctx.texture(4, 4), None);
         pool.release(g.ctx.texture(4, 4), None);
-        assert!(pool.take(6, 4).is_none());
+        assert!(pool.take(6, 4, FORMAT).is_none());
         assert_eq!(pool.bytes, 3 * 4 * 4 * 16, "collective pressure preserves useful smaller sizes");
-        assert_eq!(pool.free.get(&(4, 4)).map(Vec::len), Some(3));
+        assert_eq!(pool.free.get(&(4, 4, FORMAT)).map(Vec::len), Some(3));
     }
 
     /// A full pool makes room for a released texture by dropping the size used longest ago,
@@ -3620,17 +4143,17 @@ mod upload_budget_tests {
         pool.release(g.ctx.texture(2, 2), None);
         pool.release(g.ctx.texture(8, 8), None);
         // 4×4 is the stalest once 2×2 is reused and released again.
-        let t = pool.take(2, 2);
+        let t = pool.take(2, 2, FORMAT);
         assert!(t.is_some());
         pool.release(t.into_iter().next().map(|p| p.texture).unwrap(), None);
         pool.release(g.ctx.texture(8, 8), None);
-        assert_eq!(pool.free.get(&(8, 8)).map(Vec::len), Some(2), "the released texture is kept");
-        assert!(!pool.free.contains_key(&(4, 4)), "the stalest size made room");
+        assert_eq!(pool.free.get(&(8, 8, FORMAT)).map(Vec::len), Some(2), "the released texture is kept");
+        assert!(!pool.free.contains_key(&(4, 4, FORMAT)), "the stalest size made room");
         assert!(pool.bytes <= 2 * 8 * 8 * 16);
         // An oversized texture never empties the pool.
         pool.release(g.ctx.texture(16, 16), None);
-        assert_eq!(pool.free.get(&(8, 8)).map(Vec::len), Some(2));
-        assert!(!pool.free.contains_key(&(16, 16)));
+        assert_eq!(pool.free.get(&(8, 8, FORMAT)).map(Vec::len), Some(2));
+        assert!(!pool.free.contains_key(&(16, 16, FORMAT)));
     }
 
     #[test]
@@ -4074,7 +4597,8 @@ mod upload_budget_tests {
         match (&first, &alias) {
             (Uploaded::Image(first), Uploaded::Image(alias)) => assert!(Arc::ptr_eq(first.allocation.as_ref().unwrap(), alias.allocation.as_ref().unwrap())),
             (Uploaded::Image(_), Uploaded::Packed(_)) => assert!(g.yuv.is_some()),
-            _ => panic!("a fresh upload hands back its float image"),
+            (Uploaded::Packed(_), Uploaded::Packed(_)) => assert!(g.codes.is_some()),
+            _ => panic!("a fresh upload hands back its float image (its codes with the codes kernels)"),
         }
         assert_eq!(g.transfer_stats().uploads, uploads);
         assert_eq!(g.image(0, 0).allocation.as_ref().unwrap().bytes(), 16);

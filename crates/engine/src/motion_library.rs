@@ -16,6 +16,7 @@ use effectcraft_motionlib::{Client, DirStore, MemStore, Store};
 use serde::{Deserialize, Serialize};
 
 use crate::Session;
+pub use crate::commands::library::{LocalEntry, LocalIndex};
 
 /// The settings file (in the session's config store).
 pub const CONFIG: &str = "motion-library.json";
@@ -130,5 +131,18 @@ impl Session {
         let client = Client::new(remote, store);
         self.motion_library.set(Some(client.clone()));
         Ok(client)
+    }
+}
+
+impl Session {
+    /// The configured library folders' entries by id: Motion Library cards found here apply and
+    /// preview from the local files (the Mac that keeps the library).
+    pub fn motion_library_local(&self) -> Arc<LocalIndex> {
+        crate::commands::library::local_entries(self)
+    }
+
+    /// The local entry for card `id` whose file is there.
+    pub fn motion_library_local_entry(&self, id: &str) -> Option<LocalEntry> {
+        self.motion_library_local().get(id).filter(|e| !e.file.is_empty() && self.services.exists(&e.file)).cloned()
     }
 }

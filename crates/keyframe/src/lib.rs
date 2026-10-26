@@ -10,7 +10,9 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod spatial_bend;
 mod spatial_insert;
+pub use spatial_bend::{bend_spatial_segment, spatial_segment_param};
 pub use spatial_insert::insert_spatial;
 
 pub mod text_doc;
@@ -242,6 +244,11 @@ pub struct Keyframe {
     pub spatial_continuous: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub roving: bool,
+    /// Spatial auto-Bezier with After Effects' exact tangents, set on keys imported from an .aep:
+    /// a key next to a coincident key keeps its full Catmull-Rom tangent there (the path loops
+    /// between the two), instead of EffectCraft's still point. See [`auto_spatial`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ae_spatial: bool,
     /// Keyframe color label: index into the label list (0 = None).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub label: u8,
@@ -284,6 +291,7 @@ impl Keyframe {
             spatial_auto: true,
             spatial_continuous: false,
             roving: false,
+            ae_spatial: false,
             label: 0,
         }
     }
@@ -520,18 +528,37 @@ fn v3(v: &Value) -> [f64; 3] {
     v.as_vec3()
 }
 
+/// Two key values closer than this (half a pixel) sit at the same spot (an auto-Bezier still
+/// point): keys that read the same in the Timeline but differ by a rounding error (417.917 and
+/// 417.9) must not swing the layer out and back along AE's tangents between them.
+const COINCIDENT: f64 = 0.5;
+
 /// Auto-Bezier spatial tangents for key `i`, as After Effects computes them (Catmull-Rom): the out
 /// tangent is a sixth of the way from the previous key to the next, the in tangent its mirror, and
 /// key times play no part. An end key uses its one neighbour, so the path leaves the first key
 /// and enters the last one toward the neighbouring key instead of with no tangent.
+///
+/// Unlike After Effects, the side that faces a neighbour at the same spot gets no tangent, so the
+/// layer holds still between two keys with one value instead of looping out and back (AE drifts
+/// there). Keys imported from an .aep (`ae_spatial`) keep AE's exact rule.
 fn auto_spatial(keys: &[Keyframe], i: usize) -> ([f64; 3], [f64; 3]) {
-    if i >= keys.len() || keys.len() < 2 {
+    let (Some(key), Some(last)) = (keys.get(i), keys.len().checked_sub(1)) else { return ([0.0; 3], [0.0; 3]) };
+    if last == 0 {
         return ([0.0; 3], [0.0; 3]);
     }
-    let a = v3(&keys[i.saturating_sub(1)].value);
-    let c = v3(&keys[(i + 1).min(keys.len() - 1)].value);
+    let (Some(prev), Some(next)) = (keys.get(i.saturating_sub(1)), keys.get(i.saturating_add(1).min(last))) else {
+        return ([0.0; 3], [0.0; 3]);
+    };
+    let (a, b, c) = (v3(&prev.value), v3(&key.value), v3(&next.value));
     let tout = [(c[0] - a[0]) / 6.0, (c[1] - a[1]) / 6.0, (c[2] - a[2]) / 6.0];
-    ([-tout[0], -tout[1], -tout[2]], tout)
+    let tin = tout.map(|v| -v);
+    if key.ae_spatial {
+        return (tin, tout);
+    }
+    let same = |p: [f64; 3]| ((p[0] - b[0]).powi(2) + (p[1] - b[1]).powi(2) + (p[2] - b[2]).powi(2)).sqrt() < COINCIDENT;
+    let tin = if i > 0 && same(a) { [0.0; 3] } else { tin };
+    let tout = if i < last && same(c) { [0.0; 3] } else { tout };
+    (tin, tout)
 }
 
 /// Effective spatial tangents of key `i` (auto or stored).
@@ -909,6 +936,7 @@ pub fn set_key(keys: &mut Vec<Keyframe>, key: Keyframe) -> usize {
             k.spatial_auto = old.spatial_auto;
             k.spatial_continuous = old.spatial_continuous;
             k.roving = old.roving;
+            k.ae_spatial = old.ae_spatial;
             k.label = old.label;
             keys[i] = k;
             i
@@ -1031,8 +1059,9 @@ mod tests {
         v.clear();
         assert!(v.is_empty());
         assert_eq!(format!("{:?}", Eases::splat(e(1.0), 1)), format!("{:?}", vec![e(1.0)]));
-        // Two (in/out) inline sides cost what the boxed `Value` saved: a keyframe does not grow.
-        assert!(std::mem::size_of::<Value>() <= 40 && std::mem::size_of::<Keyframe>() <= 216);
+        // Two (in/out) inline sides cost what the boxed `Value` saved: a keyframe does not grow
+        // (216 bytes then; `ae_spatial`, a ninth one-byte flag, took it to the next 8 bytes).
+        assert!(std::mem::size_of::<Value>() <= 40 && std::mem::size_of::<Keyframe>() <= 224);
     }
 
     /// Every `Value` variant and keyframes with 0–4 eases per side, as saved before `Value` boxed
@@ -1500,6 +1529,58 @@ mod tests {
         let still = [[5.0, 5.0], [9.0, 1.0], [5.0, 5.0]].iter().enumerate().map(|(i, &v)| Keyframe::new(s(i as f64), Value::Vec2(v))).collect::<Vec<_>>();
         assert_eq!(spatial_tangents(&still, 1), ([0.0; 3], [0.0; 3]));
         assert_eq!(spatial_tangents(&still[..1], 0), ([0.0; 3], [0.0; 3]));
+    }
+
+    #[test]
+    fn spatial_auto_bezier_holds_still_between_coincident_keys() {
+        // Elias's 10-10 Edit Position keys: two keys at the same spot drifted ~140 px left
+        // between them under AE's rule. Now the sides facing each other have no tangent.
+        let p = [[2540.0, 540.0, 0.0], [480.0, 540.0, 0.0], [480.0, 540.0, 0.0], [480.0, 433.8, 0.0]];
+        let mut keys: Vec<Keyframe> = p.iter().enumerate().map(|(i, v)| Keyframe::new(s(i as f64), Value::Vec2([v[0], v[1]]))).collect();
+        let sixth = |a: [f64; 3], b: [f64; 3]| [(b[0] - a[0]) / 6.0, (b[1] - a[1]) / 6.0, (b[2] - a[2]) / 6.0];
+        let neg = |v: [f64; 3]| v.map(|x| -x);
+        assert_eq!(spatial_tangents(&keys, 1), (neg(sixth(p[0], p[2])), [0.0; 3]));
+        assert_eq!(spatial_tangents(&keys, 2), ([0.0; 3], sixth(p[1], p[3])));
+        // End keys keep the AE rule.
+        assert_eq!(spatial_tangents(&keys, 0).1, sixth(p[0], p[1]));
+        assert_eq!(spatial_tangents(&keys, 3).0, neg(sixth(p[2], p[3])));
+        for n in 0..=20 {
+            let v = evaluate(&keys, s(1.0 + n as f64 / 20.0), true).unwrap().as_vec3();
+            assert!((v[0] - 480.0).abs() < 1e-9 && (v[1] - 540.0).abs() < 1e-9, "t {n}: {v:?}");
+        }
+        assert!(spatial_segment_length(&keys, 1).abs() < 1e-12);
+        // The other segments still move (and end on their keys), handles stay finite.
+        assert!(spatial_segment_length(&keys, 0) > 2000.0 && spatial_segment_length(&keys, 2) > 100.0);
+        for i in 0..keys.len() {
+            let (tin, tout) = spatial_handles(&keys, i);
+            assert!(tin.iter().chain(&tout).all(|x| x.is_finite()), "key {i}");
+        }
+        for k in &mut keys {
+            k.auto_bezier = true;
+            k.in_interp = Interp::Bezier;
+            k.out_interp = Interp::Bezier;
+        }
+        let v = evaluate(&keys, s(1.5), true).unwrap().as_vec3();
+        assert!((v[0] - 480.0).abs() < 1e-9 && (v[1] - 540.0).abs() < 1e-9, "{v:?}");
+        // Keys imported from an .aep keep AE's exact tangents: the path loops between them.
+        for k in &mut keys {
+            k.ae_spatial = true;
+        }
+        assert_eq!(spatial_tangents(&keys, 1).1, sixth(p[0], p[2]));
+        let v = evaluate(&keys, s(1.5), true).unwrap().as_vec3();
+        assert!(v[0] < 400.0, "AE drifts left between coincident keys: {v:?}");
+    }
+
+    #[test]
+    fn spatial_auto_bezier_holds_still_between_keys_a_rounding_error_apart() {
+        // Elias's Tyson CTRL • Player Position: keys at 417.917 and 417.9 both read 417.9 in the
+        // Timeline, yet the layer swung ~26 px right and up between them.
+        let p = [[960.0, 587.6484375], [960.0, 417.9171875], [960.0, 417.9], [560.0, 445.8]];
+        let keys: Vec<Keyframe> = p.iter().enumerate().map(|(i, v)| Keyframe::new(s(i as f64), Value::Vec2(*v))).collect();
+        for n in 0..=20 {
+            let v = evaluate(&keys, s(1.0 + n as f64 / 20.0), true).unwrap().as_vec3();
+            assert!((v[0] - 960.0).abs() < 1e-9 && (v[1] - 417.9).abs() < 0.02, "t {n}: {v:?}");
+        }
     }
 
     #[test]

@@ -112,7 +112,7 @@ pub fn entries(app: &EffectcraftApp, panel: PanelKind, doc: Option<u64>) -> Vec<
         children: vec![
             item("closePanelGroup", tr("Close Panel Group"), "window.closePanelGroup", p.clone(), true),
             item("floatPanelGroup", tr("Undock Panel Group"), "window.floatPanelGroup", p.clone(), !floating && group.len() < docked),
-            check("maximizePanel", tr("Maximize Panel Group"), "window.maximizePanel", p.clone(), !floating, app.ui.maximized == Some(panel)),
+            check("maximizePanel", tr("Maximize Panel Group"), "window.maximizePanel", p.clone(), !floating, app.group_maximized(panel)),
             Entry::Separator,
             check("stackPanelGroup", tr("Stacked Panel Group"), "window.stackPanelGroup", p.clone(), !floating, app.ui.dock.is_stacked(panel)),
             check(

@@ -6,7 +6,7 @@
 //! ▸ match names). Properties without a documented equivalent keep our own match id
 //! (`perChar3d`, `ec.blur.bilateral`), which `property()` and `addProperty()` accept too.
 
-use effectcraft_project::{LayerSource, Node};
+use crate::{LayerSource, Node};
 
 /// Match name of a layer (its root property group).
 pub fn layer(source: &LayerSource) -> &'static str {
@@ -412,6 +412,50 @@ pub const EFFECTS: &[(&str, &str)] = &[
     ("ec.utility.applylut", "ADBE Apply Color LUT2"),
     ("ec.utility.cineon", "ADBE Cineon Converter2"),
     ("ec.utility.growbounds", "ADBE Grow Bounds"),
+    // Effects After Effects projects name by these match names (crates/aep), so scripts can add
+    // them by the same names.
+    ("ec.blur.cccross", "CS CrossBlur"),
+    ("ec.blur.ccradial", "CC Radial Blur"),
+    ("ec.blur.ccradialfast", "CC Radial Fast Blur"),
+    ("ec.channel.cccomposite", "CS Composite"),
+    ("ec.channel.removecolormatting", "ADBE Remove Color Matting"),
+    ("ec.color.cctoner", "CC Toner"),
+    ("ec.distort.bezierwarp", "ADBE BEZMESH"),
+    ("ec.distort.ccbender", "CC Bender"),
+    ("ec.distort.ccbendit", "CC Bend It"),
+    ("ec.distort.ccblobbylize", "CC Blobbylize"),
+    ("ec.distort.ccgriddler", "CC Griddler"),
+    ("ec.distort.cclens", "CC Lens"),
+    ("ec.distort.ccpageturn", "CC Page Turn"),
+    ("ec.distort.upscale", "ADBE Upscale"),
+    ("ec.distort.warp", "ADBE WRPMESH"),
+    ("ec.generate.cclightburst", "CC Light Burst 2.5"),
+    ("ec.generate.cclightrays", "CC Light Rays"),
+    ("ec.generate.cclightsweep", "CC Light Sweep"),
+    ("ec.keying.keylight", "Keylight 906"),
+    ("ec.matte.rotobrush", "ADBE Samurai"),
+    ("ec.obsolete.basic3d", "ADBE Basic 3D"),
+    ("ec.obsolete.gaussianlegacy", "ADBE Gaussian Blur"),
+    ("ec.perspective.cccylinder", "CC Cylinder"),
+    ("ec.perspective.ccsphere", "CC Sphere"),
+    ("ec.perspective.ccspotlight", "CC Spotlight"),
+    ("ec.perspective.shadowstudio2", "PESS2"),
+    ("ec.perspective.shadowstudio3", "PESS3"),
+    ("ec.sim.ccballaction", "CC Ball Action"),
+    ("ec.sim.ccmrmercury", "CC Mr. Mercury"),
+    ("ec.sim.ccparticlesystems2", "CC Particle Systems II"),
+    ("ec.sim.ccparticleworld", "CC Particle World"),
+    ("ec.sim.ccpixelpolly", "CC Pixel Polly"),
+    ("ec.sim.ccrainfall", "CSRainfall"),
+    ("ec.sim.ccstarburst", "CC Star Burst"),
+    ("ec.sim.particleplayground", "ADBE Playgnd"),
+    ("ec.stylize.ccblockload", "CS BlockLoad"),
+    ("ec.stylize.ccglass", "CC Glass"),
+    ("ec.stylize.ccvignette", "CS Vignette"),
+    ("ec.stylize.deepglow", "PEDG"),
+    ("ec.vr.chromaticaberrations", "Mettle SkyBox Chromatic Aberrat"),
+    ("ec.vr.digitalglitch", "Mettle SkyBox Digital Glitch"),
+    ("ec.vr.glow", "Mettle SkyBox Glow"),
 ];
 
 fn find<'a>(t: &'a [(&str, &'a str)], k: &str) -> Option<&'a str> {
@@ -469,6 +513,12 @@ const PARAM_NUMBERS: &[(&str, &str, usize)] = &[
     ("ec.generate.fill", "invert", 6),
     ("ec.generate.fill", "allMasks", 7),
 ];
+
+/// The number of `param` in its effect's AE parameter match names (`<effect>-0007`) when it is
+/// not numbered in display order ([`PARAM_NUMBERS`]).
+pub fn param_number(effect_id: &str, param: &str) -> Option<usize> {
+    PARAM_NUMBERS.iter().find(|(fx, p, _)| *fx == effect_id && *p == param).map(|(_, _, n)| *n)
+}
 
 /// Match name of the node at the end of `chain` (layer root's children → … → node). `effect`
 /// params are numbered `<effect match name>-0001…` in parameter order, like After Effects.
@@ -562,7 +612,7 @@ mod tests {
 
     #[test]
     fn text_range_selector_names() {
-        let n = |m: &str| Node::from(effectcraft_project::PropGroup::new(1, m, m));
+        let n = |m: &str| Node::from(crate::PropGroup::new(1, m, m));
         let (text, animators, animator, selectors, range, start, end, offset) =
             (n("text"), n("animators"), n("animator"), n("selectors"), n("rangeSelector"), n("start"), n("end"), n("offset"));
         assert_eq!(node(&[&text, &animators, &animator, &selectors, &range]), "ADBE Text Selector");

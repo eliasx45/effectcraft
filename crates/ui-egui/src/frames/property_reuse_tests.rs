@@ -64,7 +64,7 @@ fn transform_reuse_actual_pixels_cache_variants_accounting_and_undo() {
                 assert_eq!(frames.is_cached(&key), retained, "{path} {frame} {scale}");
                 if retained {
                     let cache = frames.cache.lock().unwrap();
-                    let FrameImage::Cpu(actual) = cache.map.get(&key).unwrap() else { panic!("CPU fixture") };
+                    let FrameImage::Cpu(actual) = cache.map.get(&key).unwrap().image().unwrap() else { panic!("CPU fixture") };
                     assert_eq!(actual.pixels, expected.pixels);
                 } else {
                     assert_ne!(render(&before, id, frame, scale).pixels, expected.pixels);
@@ -210,7 +210,7 @@ fn transform_reuse_real_1080_cache_benchmark() {
                     let mut images = Vec::new();
                     for frame in &requested {
                         let key = frame_key(content, 2, id, *frame, scale);
-                        let hit = frames.cache.lock().unwrap().map.get(&key).cloned();
+                        let hit = frames.cache.lock().unwrap().map.get(&key).and_then(|s| s.image().cloned());
                         let image = if let Some(FrameImage::Cpu(image)) = hit {
                             image
                         } else {
@@ -289,7 +289,7 @@ fn mask_reuse_actual_pixels_cache_variants_accounting_and_undo() {
                 assert_eq!(frames.is_cached(&key), retained, "{path} {frame} {scale}");
                 if retained {
                     let cache = frames.cache.lock().unwrap();
-                    let FrameImage::Cpu(actual) = cache.map.get(&key).unwrap() else { panic!("CPU fixture") };
+                    let FrameImage::Cpu(actual) = cache.map.get(&key).unwrap().image().unwrap() else { panic!("CPU fixture") };
                     assert_eq!(actual.pixels, expected.pixels, "{path} {frame} {scale}");
                 } else {
                     assert_ne!(render(&before, id, frame, scale).pixels, expected.pixels, "{path} {frame} {scale}");

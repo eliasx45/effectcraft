@@ -247,3 +247,59 @@ fn default_step_is_coarser_for_long_comps() {
     assert_eq!(crate::motion::fmt_secs(2.5), "2.5");
     assert_eq!(crate::motion::fmt_secs(1.0), "1");
 }
+
+/// Lab G1 (20-08 "10 Everything Is Copy"): a rig null carries the keys; get_motion said "null
+/// layer: no picture" for it and never told the agent the child's move came from the null.
+#[test]
+fn a_rig_null_is_described_by_what_it_moves_and_children_name_it() {
+    let mut s = comp();
+    let rig = s.execute("layer.newNull", json!({"name": "Row RIG"})).unwrap()["layer"].as_u64().unwrap();
+    let card = solid(&mut s, "Row card", 60, 30);
+    let text = solid(&mut s, "Row text", 40, 10);
+    s.execute("layer.setParent", json!({"layers": [card, text], "parent": rig})).unwrap();
+    key(&mut s, rig, "transform/position", 1.0, json!([-200.0, 90.0]));
+    key(&mut s, rig, "transform/position", 2.0, json!([160.0, 90.0]));
+    let n = motion_of(&mut s, rig);
+    let summary = n["summary"].as_str().unwrap();
+    assert!(
+        summary.starts_with("Row RIG is a null that moves its 2 layers (") && summary.contains("Row card") && summary.contains("(its keys are on this layer)"),
+        "{summary}"
+    );
+    assert!(summary.contains("flies in from the left"), "{summary}");
+    assert!(!segs(&n, "enter").is_empty(), "{n:#}");
+    assert_eq!(n["moves"].as_array().unwrap().len(), 2, "{n:#}");
+    assert!(n["describedBy"]["layer"] == card || n["describedBy"]["layer"] == text, "{n:#}");
+    // The child names the rig as the layer to key.
+    let c = motion_of(&mut s, card);
+    assert_eq!(c["movedBy"][0]["layer"], rig, "{c:#}");
+    let cs = c["summary"].as_str().unwrap();
+    assert!(cs.contains("flies in from the left") && cs.contains("key “Row RIG”"), "{cs}");
+    // A null without keys still says it has no picture, and that it parents layers.
+    let still = s.execute("layer.newNull", json!({"name": "Still"})).unwrap()["layer"].as_u64().unwrap();
+    let t2 = solid(&mut s, "Kid", 20, 20);
+    s.execute("layer.setParent", json!({"layers": [t2], "parent": still})).unwrap();
+    let m = motion_of(&mut s, still);
+    assert!(m["summary"].as_str().unwrap().contains("no picture") && m["summary"].as_str().unwrap().contains("parents 1 layer"), "{m:#}");
+    assert!(motion_of(&mut s, t2).get("movedBy").is_none());
+}
+
+/// Probe on a saved project (not part of the suite): `MOTION_PROJECT=… MOTION_COMP=… MOTION_LAYERS=a|b cargo test -p
+/// effectcraft-engine --lib tests_motion::real_rig -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn real_rig() {
+    let (Ok(path), Ok(comp)) = (std::env::var("MOTION_PROJECT"), std::env::var("MOTION_COMP")) else { return };
+    let mut s = Session::default();
+    s.execute("file.open", json!({"path": path})).unwrap();
+    let names = std::env::var("MOTION_LAYERS").unwrap_or_default();
+    for n in names.split('|') {
+        let r = s.execute("layer.motion", json!({"comp": comp, "layer": n})).unwrap();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({"summary": r["layers"][0]["summary"], "movedBy": r["layers"][0]["movedBy"], "describedBy": r["layers"][0]["describedBy"]})
+            )
+            .unwrap()
+        );
+    }
+}

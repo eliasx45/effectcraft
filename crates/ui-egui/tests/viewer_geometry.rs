@@ -100,6 +100,8 @@ fn compact_control_row_scrolls_and_preserves_interactions() {
     let timecode = rect(&h, "viewer.timecode");
     let row = rect(&h, "viewer.controls");
     assert!(timecode.left() >= row.left() && timecode.right() <= row.right(), "last viewer control must scroll into view: {timecode:?}");
+    // The row is longer than the end-scrolled view (the Preview On dropdown): scroll back to each control.
+    scroll_to(&mut h, "viewer.resetExposure");
     let exposure = rect(&h, "viewer.resetExposure");
     assert!(exposure.left() >= row.left() && exposure.right() <= row.right());
     h.state_mut().session.execute("view.exposure", json!({"stops":2.0})).unwrap();
@@ -113,6 +115,7 @@ fn compact_control_row_scrolls_and_preserves_interactions() {
     h.run_steps(3);
     assert_eq!(h.state().session.state.viewer.exposure, 0.0, "a scrolled control must still run its original command");
 
+    scroll_to(&mut h, "viewer.exposure");
     let exposure = rect(&h, "viewer.exposure").center();
     h.event(Event::PointerMoved(exposure));
     h.event(Event::PointerButton { pos: exposure, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
@@ -141,7 +144,28 @@ fn compact_control_row_scrolls_and_preserves_interactions() {
     assert_eq!(h.state().session.state.viewer.fast_previews.id(), "adaptive", "a scrolled dropdown must retain its menu command");
 }
 
+/// Wheel-scroll the control row until `id` is fully inside it.
+fn scroll_to(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
+    let row = rect(h, "viewer.controls");
+    h.event(Event::PointerMoved(row.center()));
+    for _ in 0..60 {
+        let control = rect(h, id);
+        let dx = if control.left() < row.left() {
+            row.left() - control.left() + 8.0
+        } else if control.right() > row.right() {
+            row.right() - control.right() - 8.0
+        } else {
+            return;
+        };
+        h.event(Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(dx, 0.0), modifiers: Default::default(), phase: egui::TouchPhase::Move });
+        h.run_steps(5);
+    }
+}
+
 fn click_control(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
+    if !id.contains("Item.") {
+        scroll_to(h, id);
+    }
     let control = rect(h, id);
     let point = control.center();
     let row = rect(h, "viewer.controls");

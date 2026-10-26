@@ -5,6 +5,7 @@ use effectcraft_effects::{Buf, EffectCtx};
 use effectcraft_raster::Sampling;
 use effectcraft_render::FxStep;
 
+use crate::codes::{self, Pixels};
 use crate::context::{Enc, GpuImage, Params};
 use crate::ops;
 
@@ -41,6 +42,51 @@ impl GBuf {
         self.offset[0] += pad as f64;
         self.offset[1] += pad as f64;
         Some(())
+    }
+}
+
+/// An effect's input buffer whose image may still be 8 bpc codes (see `codes`): the effects
+/// with kernels reading codes ([`apply_px`]) take it as it is, any other decodes it first.
+pub(crate) struct PBuf {
+    pub img: Pixels,
+    pub offset: [f64; 2],
+    pub scale: f64,
+}
+
+impl From<GBuf> for PBuf {
+    fn from(b: GBuf) -> PBuf {
+        PBuf { img: b.img.into(), offset: b.offset, scale: b.scale }
+    }
+}
+
+impl PBuf {
+    /// [`GBuf::pad`] (codes stay codes).
+    fn pad(&mut self, e: &mut Enc, pad: u32) -> Option<()> {
+        if pad == 0 {
+            return Some(());
+        }
+        match &self.img {
+            Pixels::Float(img) => {
+                let mut b = GBuf { img: img.clone(), offset: self.offset, scale: self.scale };
+                b.pad(e, pad)?;
+                *self = b.into();
+            }
+            Pixels::Codes(c) => {
+                self.img = Pixels::Codes(codes::pad(e, c, pad)?);
+                self.offset[0] += pad as f64;
+                self.offset[1] += pad as f64;
+            }
+        }
+        Some(())
+    }
+
+    /// The buffer with its image as floats (codes decoded).
+    pub fn float(self, e: &mut Enc) -> Option<GBuf> {
+        Some(GBuf { img: self.img.float(e)?, offset: self.offset, scale: self.scale })
+    }
+
+    fn with(&self, img: GpuImage) -> GBuf {
+        GBuf { img, offset: self.offset, scale: self.scale }
     }
 }
 
@@ -93,41 +139,77 @@ fn readback_buf(r: crate::deferred::Readback) -> Option<Buf> {
 
 /// An effect stack running on a GPU-resident image (adjustment layers): GPU chains stay on
 /// the device; CPU effects read the image back, run, and upload the result.
+/// The image may be 8 bpc codes: the first effects read them where their kernels can.
 pub(crate) struct GpuFx<'e, 'g> {
     e: &'e mut Enc<'g>,
-    b: Option<GBuf>,
+    b: Option<PBuf>,
     levels: Option<f32>,
 }
 
 impl<'e, 'g> GpuFx<'e, 'g> {
-    pub fn new(e: &'e mut Enc<'g>, img: GpuImage, offset: [f64; 2], scale: f64, levels: Option<f32>) -> Self {
-        GpuFx { e, b: Some(GBuf { img, offset, scale }), levels }
+    pub fn new(e: &'e mut Enc<'g>, img: impl Into<Pixels>, offset: [f64; 2], scale: f64, levels: Option<f32>) -> Self {
+        GpuFx { e, b: Some(PBuf { img: img.into(), offset, scale }), levels }
     }
 
     /// The result: (image, offset, scale); `None` when a step failed.
     pub fn finish(self) -> Option<(GpuImage, [f64; 2], f64)> {
-        self.b.map(|b| (b.img, b.offset, b.scale))
+        let b = self.b?.float(self.e)?;
+        Some((b.img, b.offset, b.scale))
+    }
+
+    /// The image as floats (codes decoded); `None` (and no image) when that failed.
+    fn float(&mut self) -> Option<GBuf> {
+        let b = self.b.take()?.float(self.e)?;
+        self.b = Some(PBuf { img: b.img.clone().into(), offset: b.offset, scale: b.scale });
+        Some(b)
     }
 }
 
 impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
         let Some(b) = &self.b else { return false };
-        let cur = GBuf { img: b.img.clone(), offset: b.offset, scale: b.scale };
-        let Some(cur) = apply_chain(self.e, steps, cur, self.levels) else { return false };
+        let cur = PBuf { img: b.img.clone(), offset: b.offset, scale: b.scale };
+        let Some(cur) = apply_chain_px(self.e, steps, cur, self.levels) else { return false };
         self.b = Some(cur);
         true
     }
 
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
         let Some(b) = self.b.take() else { return };
-        let Some(img) = self.e.download(&b.img) else { return };
+        // Codes read back as 4 bytes a pixel, decoded with the same table.
+        let Some(img) = self.e.download_px(&b.img) else { return };
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
-        self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
+        self.b = self.e.g.upload_image(&out.img).map(|img| PBuf { img: img.into(), offset: out.offset, scale: out.scale });
     }
-    fn effect_canvas(&mut self, size: [f64; 2]) {
+    fn extent(&self) -> Option<([u32; 2], [f64; 2], f64)> {
+        self.b.as_ref().map(|b| ([b.img.width(), b.img.height()], b.offset, b.scale))
+    }
+    /// Kept on the device, in the resident layer cache (budgeted like the layers there).
+    fn keep(&mut self, key: u64, cache: &effectcraft_render::cache::LayerCache, flight: Option<effectcraft_render::cache::FlightGuard>) {
         let Some(b) = &self.b else { return };
-        let Some(([width, height], pad)) = effectcraft_render::effect_canvas_extent([b.img.width, b.img.height], b.offset, b.scale, size) else {
+        if !self.e.can_retain_resident() {
+            return;
+        }
+        // The claim taken before the run (`Renderer::run_effect_stack`), else one now.
+        let flight = match flight {
+            Some(f) => f,
+            None => match cache.claim_gpu(key) {
+                effectcraft_render::cache::Claim::Owner(f) => f,
+                _ => return,
+            },
+        };
+        let image = crate::context::SourceImage { img: b.img.clone(), offset: b.offset, scale: b.scale };
+        self.e.keep_resident(key, image, flight, None);
+    }
+    fn restore(&mut self, key: u64, _cache: &effectcraft_render::cache::LayerCache) -> bool {
+        let Some(image) = self.e.resident(key, effectcraft_render::cache::GpuStage::Processed) else { return false };
+        self.b = Some(PBuf { img: image.img, offset: image.offset, scale: image.scale });
+        true
+    }
+
+    fn effect_canvas_in(&mut self, from: [f64; 2], to: [f64; 2]) {
+        let Some(b) = self.float() else { return };
+        let Some(([width, height], pad)) = effectcraft_render::effect_canvas_extent_in([b.img.width, b.img.height], b.offset, b.scale, from, to) else {
             return;
         };
         // Failure keeps the existing whole-layer CPU fallback contract; never submit an
@@ -149,7 +231,7 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
             self.b = None;
             return;
         }
-        self.b = Some(GBuf { img: out, offset: [b.offset[0] + f64::from(pad[0]), b.offset[1] + f64::from(pad[1])], scale: b.scale });
+        self.b = Some(PBuf { img: out.into(), offset: [b.offset[0] + f64::from(pad[0]), b.offset[1] + f64::from(pad[1])], scale: b.scale });
     }
 
     fn shift(&mut self, d: [f64; 2]) {
@@ -192,22 +274,91 @@ pub(crate) fn apply_chain(e: &mut Enc, chain: &[FxStep], mut b: GBuf, levels: Op
     Some(b)
 }
 
+/// [`apply_chain`] on a buffer that may be 8 bpc codes: while it is, each effect whose kernels
+/// read codes ([`apply_px`]) runs on them directly (no decoded copy); the first other effect
+/// decodes it and the rest of the chain runs as [`apply_chain`].
+pub(crate) fn apply_chain_px(e: &mut Enc, chain: &[FxStep], mut b: PBuf, levels: Option<f32>) -> Option<PBuf> {
+    if !b.img.is_codes() {
+        let b = b.float(e)?;
+        return apply_chain(e, chain, b, levels).map(Into::into);
+    }
+    e.take_missing();
+    let mut remaining = chain;
+    while let Some((step, rest)) = remaining.split_first() {
+        if !b.img.is_codes() || !reads_codes(step.spec.id) {
+            break;
+        }
+        b = apply_px(e, step.spec.id, &step.ctx, b)?;
+        if e.take_missing() {
+            return None;
+        }
+        if let Some(l) = levels {
+            b.img = match b.img {
+                Pixels::Float(img) => Pixels::Float(ops::quantize(e, &img, l)),
+                // Codes are on the 8 bpc grid already (`ops::quantize` keeps them as they are).
+                codes @ Pixels::Codes(_) if l == codes::LEVELS => codes,
+                codes => {
+                    let f = codes.float(e)?;
+                    Pixels::Float(ops::quantize(e, &f, l))
+                }
+            };
+        }
+        if e.take_missing() {
+            return None;
+        }
+        remaining = rest;
+    }
+    if remaining.is_empty() {
+        return Some(b);
+    }
+    let b = b.float(e)?;
+    apply_chain(e, remaining, b, levels).map(Into::into)
+}
+
+/// Effects with kernels reading 8 bpc codes (see [`apply_px`]); none of them is fused
+/// (`fusion`), so [`apply_chain`] would run each through [`apply`] too.
+fn reads_codes(id: &str) -> bool {
+    matches!(
+        id,
+        "ec.blur.gaussian" | "ec.blur.fastbox" | "ec.perspective.dropshadow" | "ec.color.huesaturation" | "ec.generate.fill" | "ec.generate.gradientramp"
+    )
+}
+
+/// [`apply`] on a buffer that may be codes: the [`reads_codes`] effects as [`apply`] runs them,
+/// their first kernels reading the codes.
+fn apply_px(e: &mut Enc, id: &str, ctx: &EffectCtx, b: PBuf) -> Option<PBuf> {
+    if !effectcraft_effects::catalog::gpu_supported(id, ctx) {
+        return None;
+    }
+    match id {
+        "ec.blur.gaussian" => gaussian_px(e, ctx, b),
+        "ec.blur.fastbox" => box_blur_px(e, ctx, b),
+        "ec.perspective.dropshadow" => drop_shadow_px(e, ctx, b).map(Into::into),
+        "ec.color.huesaturation" if !effectcraft_effects::huesat_ranges_identity(ctx) => crate::fx_tone::hue_saturation(e, ctx, b).map(Into::into),
+        "ec.color.huesaturation" | "ec.generate.fill" | "ec.generate.gradientramp" => pointwise_px(e, id, ctx, b).map(Into::into),
+        _ => {
+            let b = b.float(e)?;
+            apply(e, id, ctx, b).map(Into::into)
+        }
+    }
+}
+
 fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     // Controls the kernels do not implement render on the CPU.
     if !effectcraft_effects::catalog::gpu_supported(id, ctx) {
         return None;
     }
     match id {
-        "ec.blur.gaussian" => gaussian(e, ctx, b),
-        "ec.blur.fastbox" => box_blur(e, ctx, b),
+        "ec.blur.gaussian" => gaussian_px(e, ctx, b.into())?.float(e),
+        "ec.blur.fastbox" => box_blur_px(e, ctx, b.into())?.float(e),
         "ec.blur.directional" => directional(e, ctx, b),
         "ec.stylize.glow" if crate::fx_stylize::glow_extra(ctx) => crate::fx_stylize::glow(e, ctx, b),
         "ec.distort.transform" if crate::fx_stylize::transform_blur(ctx) => crate::fx_stylize::transform(e, ctx, b),
         "ec.stylize.glow" => glow(e, ctx, b),
-        "ec.perspective.dropshadow" => drop_shadow(e, ctx, b),
+        "ec.perspective.dropshadow" => drop_shadow_px(e, ctx, b.into()),
         "ec.distort.transform" => transform(e, ctx, b),
         "ec.color.curves" => curves(e, ctx, b),
-        "ec.color.huesaturation" if !effectcraft_effects::huesat_ranges_identity(ctx) => crate::fx_tone::hue_saturation(e, ctx, b),
+        "ec.color.huesaturation" if !effectcraft_effects::huesat_ranges_identity(ctx) => crate::fx_tone::hue_saturation(e, ctx, b.into()),
         "ec.color.levels" if !effectcraft_effects::levels_channels_identity(ctx) => crate::fx_tone::levels(e, ctx, b),
         "ec.channel.invert" if (4..=11).contains(&ctx.params.e("channel")) => crate::fx_tone::invert(e, ctx, b),
         "ec.noise.fractal" if crate::fx_noise::fractal_extra(ctx) => crate::fx_noise::fractal(e, ctx, b, false),
@@ -233,7 +384,8 @@ fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         _ if crate::fx_pixel2::IDS.contains(&id) => crate::fx_pixel2::apply(e, id, ctx, b),
         _ if crate::fx_gen2::IDS.contains(&id) => crate::fx_gen2::apply(e, id, ctx, b),
         _ if crate::fx_deepglow::IDS.contains(&id) => crate::fx_deepglow::apply(e, id, ctx, b),
-        _ => pointwise(e, id, ctx, b),
+        _ if crate::fx_shadowstudio::IDS.contains(&id) => crate::fx_shadowstudio::apply(e, id, ctx, b),
+        _ => pointwise_px(e, id, ctx, b.into()),
     }
 }
 
@@ -262,18 +414,90 @@ pub(crate) fn box_passes(e: &mut Enc, img: &GpuImage, rx: &[usize], ry: &[usize]
 
 /// [`box_passes`] with the horizontal passes run by kernel `h` (the tests' reference kernel).
 pub(crate) fn box_passes_with(e: &mut Enc, h: &str, img: &GpuImage, rx: &[usize], ry: &[usize], repeat: bool) -> GpuImage {
-    let mut cur = img.clone();
-    let passes = rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0);
-    for (vertical, r) in passes {
+    box_passes_owned(e, h, img.clone(), rx, ry, repeat, Precision::F32)
+}
+
+/// What a blur writes: RGBA f32 throughout, or RGBA16F intermediates (see [`crate::half`]) with
+/// an f32 result (`HalfPasses`, for a result that leaves the effect) or a half one too
+/// (`Half`, for a result only the effect's own half-capable kernels read).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Precision {
+    F32,
+    HalfPasses,
+    Half,
+}
+
+impl Precision {
+    /// `Half` / `HalfPasses` when the render allows half images for the blur kernels (and
+    /// `also`), else `F32`.
+    pub(crate) fn pick(e: &Enc, also: &[&str], result_half: bool) -> Precision {
+        let kernels: &[&str] = &["box_h", "box_v", "fill"];
+        if !e.half_for(kernels) || !e.half_for(also) {
+            Precision::F32
+        } else if result_half {
+            Precision::Half
+        } else {
+            Precision::HalfPasses
+        }
+    }
+}
+
+/// [`box_passes_with`] taking the input by value: each pass's input goes back to the texture
+/// pool as soon as the pass is recorded (the encoder keeps it alive for the GPU), so a blur
+/// holds at most two working images however many passes it runs (the caller's input too only
+/// while someone else still holds it). `precision` picks the passes' and the result's format.
+pub(crate) fn box_passes_owned(e: &mut Enc, h: &str, img: GpuImage, rx: &[usize], ry: &[usize], repeat: bool, precision: Precision) -> GpuImage {
+    let mut cur = img;
+    let passes: Vec<(bool, usize)> = rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0).collect();
+    let last = passes.len().saturating_sub(1);
+    for (i, (vertical, r)) in passes.into_iter().enumerate() {
         let block = if vertical { (4 * r).clamp(32, 256) } else { 256 } as u32;
         let (lines, n) = if vertical { (cur.width, cur.height) } else { (cur.height, cur.width) };
         let mut p = Params::default();
         p.u[0] = [r as u32, repeat as u32, block, 0];
-        let out = e.scratch(cur.width, cur.height);
+        let half = match precision {
+            Precision::F32 => false,
+            Precision::HalfPasses => i < last,
+            Precision::Half => true,
+        };
+        let out = e.scratch_as(cur.width, cur.height, half);
         e.dispatch(if vertical { "box_v" } else { h }, &p, &cur, None, &out, None, (lines.div_ceil(64), n.div_ceil(block)));
         cur = out;
     }
     cur
+}
+
+/// [`gaussian_blur`] taking the input by value, in `precision` (see [`box_passes_owned`]).
+pub(crate) fn gaussian_blur_owned(e: &mut Enc, img: GpuImage, sx: f64, sy: f64, repeat: bool, precision: Precision) -> GpuImage {
+    let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
+    let ry = if sy > 0.05 { box_radii(sy, 3) } else { vec![] };
+    box_passes_owned(e, "box_h", img, &rx, &ry, repeat, precision)
+}
+
+/// [`box_passes`] from an image that may be 8 bpc codes: the first pass reads the codes, the
+/// rest run as [`box_passes_owned`] in `precision` (no passes: the image as it is). Takes the
+/// image by value, so it goes back to the pool once the first pass has read it.
+pub(crate) fn box_passes_px(e: &mut Enc, img: Pixels, rx: &[usize], ry: &[usize], repeat: bool, precision: Precision) -> Pixels {
+    let img = match img {
+        Pixels::Float(f) => return box_passes_owned(e, "box_h", f, rx, ry, repeat, precision).into(),
+        codes => codes,
+    };
+    let first = match rx.iter().position(|&r| r > 0) {
+        Some(i) => rx.get(i).zip(rx.get(i + 1..)).map(|(&r, rest)| (false, r, rest, ry)),
+        None => ry.iter().position(|&r| r > 0).and_then(|j| ry.get(j).zip(ry.get(j + 1..))).map(|(&r, rest)| (true, r, &[][..], rest)),
+    };
+    let Some((vertical, r, rx, ry)) = first else { return img };
+    // The pass as `box_passes_with` runs it.
+    let (w, h) = img.size();
+    let block = if vertical { (4 * r).clamp(32, 256) } else { 256 } as u32;
+    let (lines, n) = if vertical { (w, h) } else { (h, w) };
+    let mut p = Params::default();
+    p.u[0] = [r as u32, repeat as u32, block, 0];
+    let out = e.scratch(w, h);
+    codes::dispatch(e, if vertical { "box_v" } else { "box_h" }, &p, &img, None, &out.clone().into(), None, (lines.div_ceil(64), n.div_ceil(block)));
+    drop(img);
+    // `out` by value: it goes back to the pool once the next pass has read it.
+    box_passes_owned(e, "box_h", out, rx, ry, repeat, precision).into()
 }
 
 /// raster::gaussian_blur (3 box passes per axis).
@@ -281,6 +505,20 @@ pub(crate) fn gaussian_blur(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repea
     let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
     let ry = if sy > 0.05 { box_radii(sy, 3) } else { vec![] };
     box_passes(e, img, &rx, &ry, repeat)
+}
+
+/// [`gaussian_blur`] from an image that may be codes ([`box_passes_px`]).
+fn gaussian_blur_px(e: &mut Enc, img: Pixels, sx: f64, sy: f64, repeat: bool, precision: Precision) -> Pixels {
+    let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
+    let ry = if sy > 0.05 { box_radii(sy, 3) } else { vec![] };
+    box_passes_px(e, img, &rx, &ry, repeat, precision)
+}
+
+/// `b`'s image, taken out for a step that consumes it (a shared transparent 1 × 1 stands in
+/// until the result goes back): the step can then return it to the pool as soon as it has
+/// read it, instead of the buffer holding it to the end.
+fn take_img(e: &Enc, b: &mut PBuf) -> Pixels {
+    std::mem::replace(&mut b.img, Pixels::Float(e.zeros(1, 1)))
 }
 
 fn dims_xy(dim: u32) -> (f64, f64) {
@@ -293,7 +531,7 @@ fn dims_xy(dim: u32) -> (f64, f64) {
 
 /// Gaussian Blur (as `effectcraft_effects`' CPU one: σ from [`effectcraft_effects::gaussian_sigma`],
 /// comp pixels on a layer whose effects run in comp space).
-fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+fn gaussian_px(e: &mut Enc, ctx: &EffectCtx, mut b: PBuf) -> Option<PBuf> {
     let s = effectcraft_effects::gaussian_sigma(ctx.params.f("blurriness")) * b.scale;
     if s <= 0.0 {
         return Some(b);
@@ -305,11 +543,16 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if !repeat && !ctx.adjustment {
         b.pad(e, (sx.max(sy) * 3.0).ceil().min(1.0e5) as u32)?;
     }
-    b.img = gaussian_blur(e, &b.img, sx, sy, repeat || ctx.adjustment);
+    // The blur owns its input (the padded copy goes back to the pool after the first pass):
+    // one full-size image fewer at its peak. The passes may be half floats on a display
+    // render (see `crate::half`); the result is f32.
+    let precision = Precision::pick(e, &[], false);
+    let img = take_img(e, &mut b);
+    b.img = gaussian_blur_px(e, img, sx, sy, repeat || ctx.adjustment, precision);
     Some(b)
 }
 
-fn box_blur(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+fn box_blur_px(e: &mut Enc, ctx: &EffectCtx, mut b: PBuf) -> Option<PBuf> {
     let r = ctx.params.f("radius").max(0.0) * b.scale;
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
     let [cx, cy] = ctx.env.comp_px();
@@ -323,7 +566,11 @@ fn box_blur(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if !repeat && !ctx.adjustment {
         b.pad(e, (rx.max(ry) * it) as u32 + 1)?;
     }
-    b.img = box_passes(e, &b.img, &vec![rx; it], &vec![ry; it], repeat || ctx.adjustment);
+    // Half-float passes round once each: past 3 iterations (6+ passes per axis) the rounding
+    // could add up to a visible step, so long chains keep f32.
+    let precision = if it <= 3 { Precision::pick(e, &[], false) } else { Precision::F32 };
+    let img = take_img(e, &mut b);
+    b.img = box_passes_px(e, img, &vec![rx; it], &vec![ry; it], repeat || ctx.adjustment, precision);
     Some(b)
 }
 
@@ -355,16 +602,21 @@ fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let intensity = ctx.params.f("intensity") as f32;
     let use_colors = ctx.params.e("colors") == 1;
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
-    let s = (radius * effectcraft_effects::GLOW_SIGMA_PER_RADIUS).max(0.5);
+    let [cx, cy] = ctx.env.comp_px();
+    let (sx, sy) = effectcraft_effects::glow_sigmas(radius, cx, cy);
     if !ctx.adjustment {
-        b.pad(e, (s * 3.0).ceil() as u32 + 2)?;
+        b.pad(e, (sx.max(sy) * 3.0).ceil() as u32 + 2)?;
     }
     let p = glow_params(ctx);
-    let bright = e.image(b.img.width, b.img.height);
+    // The bright pass, its blur and colouring are read only here: half floats on a display
+    // render (see `crate::half`); `glow_combine` writes the f32 result.
+    let half = Precision::pick(e, &["glow_bright", "glow_ab"], true) == Precision::Half;
+    let bright = e.image_as(b.img.width, b.img.height, half);
     e.pixels("glow_bright", &p, &b.img, None, &bright, None);
-    let mut blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    // The blur owns `bright`: it goes back to the pool after the first pass.
+    let mut blurred = gaussian_blur_owned(e, bright, sx * kx, sy * ky, false, if half { Precision::Half } else { Precision::F32 });
     if use_colors {
-        let coloured = e.image(b.img.width, b.img.height);
+        let coloured = e.image_as(b.img.width, b.img.height, half);
         e.pixels("glow_ab", &p, &blurred, None, &coloured, None);
         blurred = coloured;
     }
@@ -392,7 +644,7 @@ pub(crate) fn glow_params(ctx: &EffectCtx) -> Params {
     p
 }
 
-fn drop_shadow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+fn drop_shadow_px(e: &mut Enc, ctx: &EffectCtx, mut b: PBuf) -> Option<GBuf> {
     let color = ctx.params.color("color");
     let opacity = ctx.params.f("opacity") as f32 / 100.0;
     let dir = ctx.params.f("direction").to_radians();
@@ -407,18 +659,18 @@ fn drop_shadow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let mut p = Params::default();
     p.f[0] = color;
     p.f[1] = [opacity, dx as f32, dy as f32, 0.0];
-    let mut sh = e.image(b.img.width, b.img.height);
-    e.pixels("shadow_make", &p, &b.img, None, &sh, None);
+    let (w, h) = b.img.size();
+    let mut sh = e.image(w, h);
+    codes::pixels(e, "shadow_make", &p, &b.img, None, &sh.clone().into(), None);
     if soft > 0.0 {
         sh = gaussian_blur(e, &sh, soft / 2.0, soft / 2.0, false);
     }
     if !only {
-        let out = e.scratch(b.img.width, b.img.height);
-        e.pixels("shadow_combine", &Params::default(), &sh, Some(&b.img), &out, None);
+        let out = e.scratch(w, h);
+        codes::pixels(e, "shadow_combine", &Params::default(), &sh.into(), Some(&b.img), &out.clone().into(), None);
         sh = out;
     }
-    b.img = sh;
-    Some(b)
+    Some(b.with(sh))
 }
 
 fn transform(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
@@ -593,11 +845,11 @@ pub(crate) fn pointwise_params(id: &str, ctx: &EffectCtx, offset: [f64; 2], scal
     Some(p)
 }
 
-fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+fn pointwise_px(e: &mut Enc, id: &str, ctx: &EffectCtx, b: PBuf) -> Option<GBuf> {
     let p = pointwise_params(id, ctx, b.offset, b.scale)?;
-    let out = e.scratch(b.img.width, b.img.height);
-    e.pixels("pointwise", &p, &b.img, None, &out, None);
-    Some(GBuf { img: out, ..b })
+    let out = e.scratch(b.img.width(), b.img.height());
+    codes::pixels(e, "pointwise", &p, &b.img, None, &out.clone().into(), None);
+    Some(b.with(out))
 }
 
 #[cfg(test)]
@@ -646,7 +898,7 @@ mod keep_tests {
             .within_memory(|| {
                 let mut enc = crate::context::Enc::with_owner(&g.ctx, cache.gpu_owner());
                 let image = crate::walk::render(&mut enc, &r, s.cid, Tick::ZERO).unwrap();
-                let result = enc.download(&image).unwrap();
+                let result = enc.download_px(&image).unwrap();
                 enc.publish_native();
                 result
             })
@@ -730,9 +982,9 @@ mod keep_tests {
                         .within_memory(|| {
                             let mut enc = crate::context::Enc::with_owner(&g.ctx, None);
                             let img = crate::walk::render(&mut enc, &legacy, s.cid, Tick::ZERO).unwrap();
-                            let texture = enc.display(&img);
+                            let texture = enc.display_px(&img).unwrap();
                             enc.submit();
-                            crate::DisplayFrame { texture, width: img.width, height: img.height }
+                            crate::DisplayFrame { texture, width: img.width(), height: img.height() }
                         })
                         .unwrap();
                     assert_eq!(actual, g.read_display(&expected_display).unwrap(), "display fidelity {depth:?}/{linear}/{scale}");
@@ -786,9 +1038,9 @@ mod keep_tests {
                 .within_memory(|| {
                     let mut enc = crate::context::Enc::with_owner(&g.ctx, None);
                     let img = crate::walk::render(&mut enc, &legacy, s.cid, Tick::ZERO).unwrap();
-                    let texture = enc.display(&img);
+                    let texture = enc.display_px(&img).unwrap();
                     enc.submit();
-                    crate::DisplayFrame { texture, width: img.width, height: img.height }
+                    crate::DisplayFrame { texture, width: img.width(), height: img.height() }
                 })
                 .unwrap();
             assert_eq!(actual, g.read_display(&expected).unwrap(), "CPU-boundary fidelity, budget {budget}");

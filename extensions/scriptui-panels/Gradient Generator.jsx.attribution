@@ -1,0 +1,7 @@
+asset:        Gradient Generator.jsx
+title:        EffectCraft bundled ScriptUI panel (Gradient Generator), its templates and palettes
+author:       EffectCraft contributors
+source:       original work
+license:      MIT OR Apache-2.0
+added:        2026-10-22 by EffectCraft contributors
+notes:        Written from scratch for EffectCraft against After Effects' documented scripting behaviour (Scripting Guide). The effect stacks are built only from built-in effects; templates, values and palettes are our own, not taken from any commercial template or script.

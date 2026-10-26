@@ -2451,8 +2451,8 @@ fn script_cancel_stops_an_endless_loop() {
     let m = io.reply();
     assert!(started.elapsed() < std::time::Duration::from_secs(2), "cancel took {:?}", started.elapsed());
     assert_eq!(m["id"], 3, "no response for the cancelled script or the cancelled queued request: {m}");
-    // edits outside an undo group are kept
-    assert!(Stdio::json(&m).to_string().contains("Kept"), "{m}");
+    // a stopped script undoes its edits (rollback, the default)
+    assert!(!Stdio::json(&m).to_string().contains("Kept"), "{m}");
     io.call(5, "run_script", json!({"code": "1 + 1"}), None);
     let m = io.reply();
     assert_eq!(m["id"], 5, "{m}");
@@ -2480,8 +2480,11 @@ fn script_timeout_rolls_back_an_open_undo_group() {
     assert!(r["output"].as_str().unwrap().contains("rolled back"), "{r}");
     assert!(!call_json(&mut s, "get_project", json!({})).to_string().contains("Doomed"));
     // an endless loop calling the object model, outside an undo group
-    let (content, error) =
-        call(&mut s, "run_script", json!({"code": "app.project.items.addComp('Kept', 64, 64, 1, 1, 25); for (;;) { app.project.numItems; }", "timeout": 0.3}));
+    let (content, error) = call(
+        &mut s,
+        "run_script",
+        json!({"code": "app.project.items.addComp('Kept', 64, 64, 1, 1, 25); for (;;) { app.project.numItems; }", "timeout": 0.3, "rollback": false}),
+    );
     assert!(error);
     let r: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(r["ok"], false, "{r}");

@@ -47,7 +47,13 @@ fn project() -> (Arc<Project>, ItemId) {
 
 fn streams() -> (Streams, Receiver<(Down, Vec<u8>)>) {
     let (tx, rx) = channel();
-    let host = Arc::new(StreamHost { render: Arc::new(Fake), cache: Arc::new(LayerCache::new(16 << 20)), log: Arc::new(|_: &str| {}), render_threads: 3 });
+    let host = Arc::new(StreamHost {
+        render: Arc::new(Fake),
+        cache: Arc::new(LayerCache::new(16 << 20)),
+        frames: Arc::new(crate::frame_cache::FrameCache::new(64 << 20, None)),
+        log: Arc::new(|_: &str| {}),
+        render_threads: 3,
+    });
     (Streams::new(host, tx, 1), rx)
 }
 
@@ -67,6 +73,7 @@ fn start(comp: ItemId, from: f64, to: f64, revision: u64, adaptive: bool) -> Str
         ahead_secs: 10.0,
         adaptive,
         max_size: None,
+        cache: None,
     }
 }
 
@@ -204,7 +211,13 @@ impl FrameRender for Broken {
 fn a_frame_that_cannot_render_ends_the_stream_once() {
     let (p, comp) = project();
     let (tx, rx) = channel();
-    let host = Arc::new(StreamHost { render: Arc::new(Broken), cache: Arc::new(LayerCache::new(16 << 20)), log: Arc::new(|_: &str| {}), render_threads: 3 });
+    let host = Arc::new(StreamHost {
+        render: Arc::new(Broken),
+        cache: Arc::new(LayerCache::new(16 << 20)),
+        frames: Arc::new(crate::frame_cache::FrameCache::new(64 << 20, None)),
+        log: Arc::new(|_: &str| {}),
+        render_threads: 3,
+    });
     let mut s = Streams::new(host, tx, 1);
     s.synced(Some((1, p)));
     s.message(start(comp, 0.0, 2.0, 1, true));
@@ -217,4 +230,69 @@ fn a_frame_that_cannot_render_ends_the_stream_once() {
         .filter(|(d, _)| matches!(d, Down::Reply { reply: FrameReply::Stream(StreamReply::Failed { .. } | StreamReply::Chunk { .. }), .. }))
         .collect();
     assert!(more.is_empty(), "{} more replies", more.len());
+}
+
+/// A renderer bug: every frame panics.
+struct Panics;
+
+impl FrameRender for Panics {
+    fn render(&self, _job: &RenderJob<'_>) -> Result<(Rendered, bool), String> {
+        panic!("synthetic renderer bug")
+    }
+}
+
+/// Edit audit, 18 Oct: a panicking render ended its worker thread, so a stream whose workers all
+/// panicked kept its chunks in flight forever (17 Oct: chunks 17–22 at 14.5 s) and the app waited.
+/// Now the stream fails once with the reason, as for any frame that can't render.
+#[test]
+fn a_renderer_panic_fails_the_stream_instead_of_leaving_chunks_in_flight() {
+    let (p, comp) = project();
+    let (tx, rx) = channel();
+    let host = Arc::new(StreamHost {
+        render: Arc::new(Panics),
+        cache: Arc::new(LayerCache::new(16 << 20)),
+        frames: Arc::new(crate::frame_cache::FrameCache::new(64 << 20, None)),
+        log: Arc::new(|_: &str| {}),
+        render_threads: 3,
+    });
+    let mut s = Streams::new(host, tx, 1);
+    s.synced(Some((1, p)));
+    s.message(start(comp, 0.0, 2.0, 1, true));
+    let got = collect(&rx, |r| matches!(r, StreamReply::Failed { .. }));
+    assert!(
+        matches!(&got.last().unwrap().0, StreamReply::Failed { error, .. } if error.contains("panicked") && error.contains("synthetic renderer bug")),
+        "{:?}",
+        got.last()
+    );
+}
+
+/// Edit audit, 18 Oct: chunks whose frames the frame cache holds (CR8) go out at full size from
+/// the first one: no quarter/half warm-up copy and its upgrade after (a replay or a jump into
+/// frames the server has).
+#[test]
+fn cached_frames_stream_at_full_size_from_the_first_chunk() {
+    let (p, comp) = project();
+    let (mut s, rx) = streams();
+    s.synced(Some((1, p)));
+    let series = effectcraft_engine::remote::CacheSeries::new(0xabc, 1000, 0);
+    // The server holds frames 0–29 (the first two chunks) at full size.
+    let frames = s.host.frames.clone();
+    for f in 0..30 {
+        frames.put(series.key(f).unwrap(), 64, 36, Arc::new([10u8, 128, 128, 255].repeat(64 * 36)));
+    }
+    let mut msg = start(comp, 0.0, 3.0, 1, true);
+    if let StreamMsg::Start { cache, .. } = &mut msg {
+        *cache = Some(series);
+    }
+    s.message(msg);
+    let got = collect(&rx, |r| matches!(r, StreamReply::End { .. }));
+    let first_copies: std::collections::BTreeMap<i64, f32> = got.iter().fold(Default::default(), |mut m, (r, _)| {
+        if let StreamReply::Chunk { first, scale, .. } = r {
+            m.entry(*first).or_insert(*scale);
+        }
+        m
+    });
+    assert_eq!(first_copies.get(&0), Some(&1.0), "{first_copies:?}");
+    assert_eq!(first_copies.get(&15), Some(&1.0), "{first_copies:?}");
+    assert!(first_copies.get(&30).is_some_and(|s| *s < 1.0), "uncached frames still warm up below full size: {first_copies:?}");
 }

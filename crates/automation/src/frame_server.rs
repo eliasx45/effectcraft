@@ -14,6 +14,13 @@
 //!   ([`effectcraft_engine::remote_encode`]).
 //! - Logs (through [`FrameConfig::log`]): render ms, encode ms, bytes and queue depth per frame.
 //!
+//! - Frame cache (CR8, [`crate::frame_cache`]): a request that names its frame key (`disk`) is
+//!   answered from the server's frame cache when it holds the frame (encode only), and every
+//!   frame rendered for a key is kept there. [`FrameMsg::Precache`] (the app's Cache Frames When
+//!   Idle) renders a plan's frames into the cache at the lowest priority, at most
+//!   [`precache_threads`] at once and not while the connection plays a stream, sends no pixels,
+//!   and reports what the cache holds as ranges ([`FrameReply::Cached`]) about once a second.
+//!
 //! The listener binds loopback only (v1 is reached through an SSH tunnel) and every connection
 //! starts with the token ([`Up::Hello`]); wrong tokens lock out for a while, as the Figma bridge's
 //! pairing codes do. A connection that drops loses nothing: its queued frames are dropped and the
@@ -28,7 +35,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use effectcraft_engine::project::{ItemId, Project};
-use effectcraft_engine::remote::{FrameMsg, FrameReply, FrameServer};
+use effectcraft_engine::remote::{FrameMsg, FrameReply, FrameServer, Precache, frame_ranges};
 use effectcraft_engine::remote_encode::{self, Codec, Want};
 use effectcraft_engine::remote_wire::{Down, MAX_HELLO, MAX_PART, Up, VERSION, read_frame, write_frame};
 use effectcraft_engine::render::{Backend, ExprHost, FootageSource, Image, LayerCache, LayerTimes, NoFootage, RenderOpts, Renderer};
@@ -37,6 +44,7 @@ use serde_json::{Value, json};
 
 use crate::control_wire::{self, lock};
 use crate::figma_bridge::{new_code, same_code};
+use crate::frame_cache::FrameCache;
 use crate::frame_stream::{StreamHost, Streams};
 
 /// The token file in the config directory (mode 0600).
@@ -50,6 +58,16 @@ const LOCKOUT: Duration = Duration::from_secs(60);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Lossless refines kept per connection (the newest; older ones are dropped).
 const MAX_REFINES: usize = 2;
+/// How often a running precache plan reports what is cached.
+const REPORT_EVERY: Duration = Duration::from_secs(1);
+/// Most frames a precache plan names (a 10-minute comp at 120 fps).
+const MAX_PLAN_FRAMES: usize = 100_000;
+
+/// Precache frames rendering at once: `EFFECTCRAFT_PRECACHE_THREADS`, else 2 (the viewer's
+/// frames and playback keep the rest of the workers and the GPU), at most `threads`.
+pub fn precache_threads(threads: usize) -> usize {
+    std::env::var("EFFECTCRAFT_PRECACHE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2).clamp(1, threads.max(1))
+}
 
 /// One frame to render.
 pub struct RenderJob<'a> {
@@ -81,6 +99,16 @@ pub trait FrameRender: Send + Sync {
     }
     /// Get ready to render `comp` around `time` (compile what its frames need), before a stream.
     fn warm(&self, _project: &Project, _comp: ItemId, _time: Tick) {}
+}
+
+/// [`FrameRender::render`] with a panic turned into an error: a renderer bug fails its frame
+/// instead of ending the worker thread (a stream whose render threads all ended kept its chunks
+/// in flight forever and the app's playback waited on them, 17 Oct).
+pub(crate) fn render_guarded(render: &dyn FrameRender, job: &RenderJob<'_>) -> Result<(Rendered, bool), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render.render(job))).unwrap_or_else(|panic| {
+        let why = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
+        Err(format!("the renderer panicked{}", if why.is_empty() { String::new() } else { format!(": {why}") }))
+    })
 }
 
 /// Frames on the CPU.
@@ -115,6 +143,8 @@ pub struct FrameConfig {
     pub render: Arc<dyn FrameRender>,
     /// The layer cache the workers share.
     pub cache: Arc<LayerCache>,
+    /// Finished frames by their keys (CR8).
+    pub frames: Arc<FrameCache>,
     /// A project the server opened at start (JSON): every connection's replica starts with it
     /// at revision 0, so a client can render without sending its own.
     pub preload: Option<Arc<String>>,
@@ -176,11 +206,13 @@ pub fn spawn(config: FrameConfig) -> Result<FrameHandle, String> {
     let port = listener.local_addr().map(|a| a.port()).map_err(|e| e.to_string())?;
     let stop = Arc::new(AtomicBool::new(false));
     let sched = Arc::new(Sched::default());
+    lock(&sched.q).precache_cap = precache_threads(config.threads);
     let shared = Arc::new(Shared {
         token: config.token,
         threads: config.threads.max(1),
         render: config.render,
         cache: config.cache,
+        frames: config.frames,
         preload: config.preload,
         control: config.control,
         log: config.log,
@@ -207,6 +239,7 @@ struct Shared {
     threads: usize,
     render: Arc<dyn FrameRender>,
     cache: Arc<LayerCache>,
+    frames: Arc<FrameCache>,
     preload: Option<Arc<String>>,
     control: Option<ControlFn>,
     log: LogFn,
@@ -264,10 +297,37 @@ struct Job {
     time: Tick,
     opts: RenderOpts,
     want: Want,
+    /// The frame's key in the frame cache (the request's `disk`).
+    key: Option<u128>,
     out: Out,
     /// The connection's replica revision now.
     current: Arc<AtomicU64>,
     queued: Instant,
+}
+
+/// A connection's precache plan ([`FrameMsg::Precache`]).
+struct Plan {
+    conn: u64,
+    precache: Arc<Precache>,
+    project: Arc<Project>,
+    /// Every frame of the plan, in order, and the next one to look at.
+    frames: Arc<Vec<i64>>,
+    next: usize,
+    /// Its frames rendering now.
+    running: usize,
+    out: Out,
+    current: Arc<AtomicU64>,
+    last_report: Instant,
+}
+
+/// One frame of a plan to render into the cache.
+struct PrecacheJob {
+    conn: u64,
+    precache: Arc<Precache>,
+    project: Arc<Project>,
+    frame: i64,
+    key: u128,
+    current: Arc<AtomicU64>,
 }
 
 /// A frame sent lossy, kept to send losslessly once the server is idle.
@@ -278,7 +338,7 @@ struct Refine {
     reply: FrameReply,
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
+    rgba: Arc<Vec<u8>>,
     out: Out,
     current: Arc<AtomicU64>,
 }
@@ -293,6 +353,12 @@ struct Queue {
     cancelled: HashSet<(u64, u64)>,
     seq: u64,
     stop: bool,
+    /// Precache plans (one per connection), the frames of them rendering, connections playing
+    /// a stream (their plans wait), and how many precache frames may render at once.
+    plans: Vec<Plan>,
+    precaching: usize,
+    paused: HashSet<u64>,
+    precache_cap: usize,
 }
 
 #[derive(Default)]
@@ -304,6 +370,7 @@ struct Sched {
 enum Work {
     Render(Box<Job>),
     Refine(Refine),
+    Precache(PrecacheJob),
 }
 
 impl Sched {
@@ -335,6 +402,101 @@ impl Sched {
         q.jobs.retain(|j| j.conn != conn);
         q.refines.retain(|r| r.conn != conn);
         q.cancelled.retain(|(c, _)| *c != conn);
+        q.plans.retain(|p| p.conn != conn);
+        q.paused.remove(&conn);
+    }
+
+    /// A connection's new precache plan (replaces its old one).
+    fn plan(&self, plan: Plan) {
+        let mut q = lock(&self.q);
+        q.plans.retain(|p| p.conn != plan.conn);
+        q.plans.push(plan);
+        drop(q);
+        self.cv.notify_all();
+    }
+
+    /// A precache frame finished: a plan with nothing left reports for the last time.
+    fn precache_done(&self, job: &PrecacheJob, frames: &FrameCache) {
+        let mut q = lock(&self.q);
+        q.precaching = q.precaching.saturating_sub(1);
+        if let Some(i) = q.plans.iter().position(|p| Arc::ptr_eq(&p.precache, &job.precache))
+            && let Some(plan) = q.plans.get_mut(i)
+        {
+            plan.running = plan.running.saturating_sub(1);
+            if plan.running == 0 && plan.next >= plan.frames.len() {
+                report(plan, frames);
+                q.plans.swap_remove(i);
+            }
+        }
+        drop(q);
+        self.cv.notify_one();
+    }
+
+    /// A connection plays a stream (`true`): its precache plan waits meanwhile.
+    fn pause(&self, conn: u64, paused: bool) {
+        let mut q = lock(&self.q);
+        let changed = if paused { q.paused.insert(conn) } else { q.paused.remove(&conn) };
+        drop(q);
+        if changed && !paused {
+            self.cv.notify_all();
+        }
+    }
+
+    /// The next precache frame (not cached yet) of a plan that may run, sending the plans'
+    /// reports on the way. Called with the queue locked.
+    fn next_precache(q: &mut Queue, frames: &FrameCache) -> Option<PrecacheJob> {
+        if q.precaching >= q.precache_cap {
+            return None;
+        }
+        let mut i = 0;
+        while i < q.plans.len() {
+            let paused = q.plans.get(i).is_some_and(|p| q.paused.contains(&p.conn));
+            let Some(plan) = q.plans.get_mut(i) else { break };
+            if paused {
+                i += 1;
+                continue;
+            }
+            // An edit since the plan: the app sends a new one for the new content.
+            if plan.current.load(Ordering::Acquire) != plan.precache.revision {
+                q.plans.swap_remove(i);
+                continue;
+            }
+            // Cached frames are skipped here (a few at a time: the lock is held).
+            let mut looked = 0;
+            while let Some(&frame) = plan.frames.get(plan.next) {
+                plan.next += 1;
+                let Some(key) = plan.precache.key(frame) else { continue };
+                if frames.contains(key) {
+                    looked += 1;
+                    if looked > 256 {
+                        break;
+                    }
+                    continue;
+                }
+                if plan.last_report.elapsed() >= REPORT_EVERY {
+                    plan.last_report = Instant::now();
+                    report(plan, frames);
+                }
+                plan.running += 1;
+                q.precaching += 1;
+                return Some(PrecacheJob {
+                    conn: plan.conn,
+                    precache: Arc::clone(&plan.precache),
+                    project: Arc::clone(&plan.project),
+                    frame,
+                    key,
+                    current: Arc::clone(&plan.current),
+                });
+            }
+            if plan.next >= plan.frames.len() && plan.running == 0 {
+                // Done: the last report says so.
+                report(plan, frames);
+                q.plans.swap_remove(i);
+                continue;
+            }
+            i += 1;
+        }
+        None
     }
 
     fn refine(&self, r: Refine) {
@@ -354,8 +516,9 @@ impl Sched {
         self.cv.notify_one();
     }
 
-    /// The next work: the newest urgent request, else the oldest prefetch, else a refine.
-    fn next(&self) -> Option<(Work, usize)> {
+    /// The next work: the newest urgent request, else the oldest prefetch, else a refine, else
+    /// a precache frame.
+    fn next(&self, frames: &FrameCache) -> Option<(Work, usize)> {
         let mut q = lock(&self.q);
         loop {
             if q.stop {
@@ -373,7 +536,12 @@ impl Sched {
                 q.running.insert((r.conn, r.id));
                 return Some((Work::Refine(r), 0));
             }
-            q = self.cv.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(p) = Self::next_precache(&mut q, frames) {
+                return Some((Work::Precache(p), 0));
+            }
+            // Plans paused by a stream are looked at again now and then.
+            let (g, _) = self.cv.wait_timeout(q, Duration::from_millis(500)).unwrap_or_else(std::sync::PoisonError::into_inner);
+            q = g;
         }
     }
 
@@ -386,7 +554,7 @@ impl Sched {
 }
 
 fn worker(sched: &Sched, shared: &Shared) {
-    while let Some((work, depth)) = sched.next() {
+    while let Some((work, depth)) = sched.next(&shared.frames) {
         match work {
             Work::Render(job) => {
                 let (conn, id) = (job.conn, job.id);
@@ -406,7 +574,68 @@ fn worker(sched: &Sched, shared: &Shared) {
                     let _ = out.send((down, payload));
                 }
             }
+            Work::Precache(p) => {
+                precache(&p, shared);
+                sched.precache_done(&p, &shared.frames);
+            }
         }
+    }
+}
+
+/// Render one frame of a plan into the frame cache.
+fn precache(p: &PrecacheJob, shared: &Shared) {
+    if p.current.load(Ordering::Acquire) != p.precache.revision {
+        return;
+    }
+    let Some(comp) = p.project.comp(p.precache.comp) else { return };
+    let time = comp.frame_rate.tick_of(p.frame);
+    let t0 = Instant::now();
+    match render_guarded(
+        shared.render.as_ref(),
+        &RenderJob { project: &p.project, comp: p.precache.comp, time, opts: *p.precache.opts, cache: &shared.cache, times: None },
+    ) {
+        Ok((frame, gpu)) => {
+            let (w, h, rgba) = rgba8(frame);
+            shared.frames.put(p.key, w, h, Arc::new(rgba));
+            shared.log(&format!(
+                "precache {}/{} frame {} {w}×{h} {} render {:.1} ms",
+                p.conn,
+                p.precache.comp.0,
+                p.frame,
+                if gpu { "gpu" } else { "cpu" },
+                ms(t0.elapsed())
+            ));
+        }
+        Err(e) => shared.log(&format!("precache {}/{} frame {}: {e}", p.conn, p.precache.comp.0, p.frame)),
+    }
+}
+
+/// Tell the app which of a plan's frames the cache holds.
+fn report(plan: &Plan, frames: &FrameCache) {
+    let pc = &plan.precache;
+    let mut cached: Vec<i64> = plan.frames.iter().copied().filter(|f| pc.key(*f).is_some_and(|k| frames.contains(k))).collect();
+    cached.sort_unstable();
+    cached.dedup();
+    let st = frames.stats();
+    let reply = FrameReply::Cached {
+        comp: pc.comp,
+        series: pc.series.clone(),
+        done: cached.len() as u64,
+        total: plan.frames.len() as u64,
+        ranges: frame_ranges(cached),
+        frames: st.frames,
+        ram_bytes: st.ram_bytes,
+        ram_budget: st.ram_budget,
+        disk_bytes: st.disk_bytes,
+    };
+    let _ = plan.out.send((Down::Reply { reply, pixels: None }, vec![]));
+}
+
+/// A rendered frame as premultiplied RGBA8.
+fn rgba8(frame: Rendered) -> (u32, u32, Vec<u8>) {
+    match frame {
+        Rendered::Image(img) => (img.width, img.height, remote_encode::rgba8_premultiplied_par(&img)),
+        Rendered::Rgba8 { width, height, bytes } => (width, height, bytes),
     }
 }
 
@@ -422,7 +651,7 @@ fn ms(d: Duration) -> f64 {
 
 /// Render, check the revision again, encode.
 fn render_job(job: Job, depth: usize, sched: &Sched, shared: &Shared) -> Option<Send3> {
-    let Job { conn, id, revision, project, comp, time, opts, want, out, current, queued, .. } = job;
+    let Job { conn, id, revision, project, comp, time, opts, want, key, out, current, queued, .. } = job;
     let stale = |now: u64| format!("the replica is at {now}, the request at {revision}");
     if current.load(Ordering::Acquire) != revision {
         return failed(&out, id, stale(current.load(Ordering::Acquire)), true);
@@ -430,27 +659,40 @@ fn render_job(job: Job, depth: usize, sched: &Sched, shared: &Shared) -> Option<
     let wait = queued.elapsed();
     let t0 = Instant::now();
     let times = LayerTimes::default();
-    let rendered = shared.render.render(&RenderJob { project: &project, comp, time, opts, cache: &shared.cache, times: Some(&times) });
-    let (frame, gpu) = match rendered {
-        Ok(r) => r,
-        Err(e) => {
-            shared.log(&format!("frame {conn}/{id}: {e}"));
-            return failed(&out, id, e, false);
+    // From the frame cache when it holds the frame (CR8): encode only.
+    let hit = key.and_then(|k| shared.frames.get(k));
+    let from_cache = hit.is_some();
+    let (width, height, rgba, gpu, render_ms, convert_ms) = match hit {
+        Some(f) => (f.width, f.height, f.rgba, false, 0.0, 0.0),
+        None => {
+            let rendered =
+                render_guarded(shared.render.as_ref(), &RenderJob { project: &project, comp, time, opts, cache: &shared.cache, times: Some(&times) });
+            let (frame, gpu) = match rendered {
+                Ok(r) => r,
+                Err(e) => {
+                    shared.log(&format!("frame {conn}/{id}: {e}"));
+                    return failed(&out, id, e, false);
+                }
+            };
+            let render_ms = ms(t0.elapsed());
+            if current.load(Ordering::Acquire) != revision {
+                return failed(&out, id, stale(current.load(Ordering::Acquire)), true);
+            }
+            let t1 = Instant::now();
+            let (width, height, rgba) = rgba8(frame);
+            let rgba = Arc::new(rgba);
+            if let Some(k) = key {
+                shared.frames.put(k, width, height, Arc::clone(&rgba));
+            }
+            (width, height, rgba, gpu, render_ms, ms(t1.elapsed()))
         }
     };
-    let render_ms = ms(t0.elapsed());
-    if current.load(Ordering::Acquire) != revision {
-        return failed(&out, id, stale(current.load(Ordering::Acquire)), true);
-    }
-    let t1 = Instant::now();
-    let (width, height, rgba) = match frame {
-        Rendered::Image(img) => (img.width, img.height, remote_encode::rgba8_premultiplied_par(&img)),
-        Rendered::Rgba8 { width, height, bytes } => (width, height, bytes),
-    };
-    let convert_ms = ms(t1.elapsed());
     let t1 = Instant::now();
     let (w, h, rgba) = match want.max_size {
-        Some(max) => remote_encode::fit(rgba, width, height, max),
+        Some(max) => {
+            let (w, h, v) = remote_encode::fit(rgba.as_ref().clone(), width, height, max);
+            (w, h, Arc::new(v))
+        }
         None => (width, height, rgba),
     };
     let (pixels, payload) = match remote_encode::encode(&rgba, w, h, want.codec, want.quality) {
@@ -461,7 +703,13 @@ fn render_job(job: Job, depth: usize, sched: &Sched, shared: &Shared) -> Option<
     shared.log(&format!(
         "frame {conn}/{id} rev {revision} {w}×{h}{} {} render {render_ms:.1} ms convert {convert_ms:.1} ms encode {encode_ms:.1} ms {:?} {} KB wait {:.1} ms queue {depth}",
         if (w, h) != (width, height) { format!(" (of {width}×{height})") } else { String::new() },
-        if gpu { "gpu" } else { "cpu" },
+        if from_cache {
+            "cached"
+        } else if gpu {
+            "gpu"
+        } else {
+            "cpu"
+        },
         pixels.codec,
         payload.len() / 1024,
         ms(wait),
@@ -533,7 +781,13 @@ fn connection(stream: TcpStream, sched: &Arc<Sched>, shared: &Arc<Shared>) {
     shared.log(&format!("connection {conn} from {peer} ({client})"));
     let (out, out_rx) = channel::<(Down, Vec<u8>)>();
     let mut streams = Streams::new(
-        Arc::new(StreamHost { render: shared.render.clone(), cache: shared.cache.clone(), log: shared.log.clone(), render_threads: shared.threads }),
+        Arc::new(StreamHost {
+            render: shared.render.clone(),
+            cache: shared.cache.clone(),
+            frames: shared.frames.clone(),
+            log: shared.log.clone(),
+            render_threads: shared.threads,
+        }),
         out.clone(),
         conn,
     );
@@ -573,7 +827,10 @@ fn connection(stream: TcpStream, sched: &Arc<Sched>, shared: &Arc<Shared>) {
                     let _ = out.send((Down::Control { id, reply: json!({"ok": false, "error": "cannot start the request"}) }, vec![]));
                 }
             }
-            Up::Msg { msg: FrameMsg::Stream(m), .. } => streams.message(m),
+            Up::Msg { msg: FrameMsg::Stream(m), .. } => {
+                streams.message(m);
+                sched.pause(conn, streams.playing());
+            }
             Up::Msg { msg, want, urgent } => {
                 let synced = matches!(msg, FrameMsg::Project { .. } | FrameMsg::Patch(_));
                 message(conn, msg, want, urgent, &mut replica, &current, &out, sched, shared);
@@ -596,7 +853,7 @@ fn connection(stream: TcpStream, sched: &Arc<Sched>, shared: &Arc<Shared>) {
 #[allow(clippy::too_many_arguments)]
 fn message(conn: u64, msg: FrameMsg, want: Want, urgent: bool, replica: &mut FrameServer, current: &Arc<AtomicU64>, out: &Out, sched: &Sched, shared: &Shared) {
     match msg {
-        FrameMsg::Render { id, revision, comp, time, opts, .. } => {
+        FrameMsg::Render { id, revision, comp, time, opts, disk, .. } => {
             let fail = |error: String, stale: bool| {
                 let _ = out.send((Down::Reply { reply: FrameReply::Failed { id, error, stale }, pixels: None }, vec![]));
             };
@@ -618,6 +875,7 @@ fn message(conn: u64, msg: FrameMsg, want: Want, urgent: bool, replica: &mut Fra
                 time,
                 opts: *opts,
                 want,
+                key: disk.as_deref().and_then(|k| u128::from_str_radix(k, 16).ok()),
                 out: out.clone(),
                 current: Arc::clone(current),
                 queued: Instant::now(),
@@ -627,7 +885,35 @@ fn message(conn: u64, msg: FrameMsg, want: Want, urgent: bool, replica: &mut Fra
                 shared.log(&format!("connection {conn}: {depth} frames queued"));
             }
         }
-        FrameMsg::Purge => shared.cache.clear(),
+        FrameMsg::Purge => {
+            shared.cache.clear();
+            shared.frames.clear();
+        }
+        FrameMsg::Precache(p) => {
+            if replica.revision() != Some(p.revision) {
+                return shared.log(&format!("connection {conn}: precache for revision {}, the replica is at {:?}", p.revision, replica.revision()));
+            }
+            let Some(project) = replica.project().cloned() else { return };
+            let Some(c) = project.comp(p.comp) else { return };
+            let last = c.frame_rate.frame_at(c.duration).saturating_sub(1).max(0);
+            let mut seen = HashSet::new();
+            let frames: Vec<i64> = p.ranges.iter().flat_map(|&(a, b)| a.max(0)..=b.min(last)).filter(|f| seen.insert(*f)).take(MAX_PLAN_FRAMES).collect();
+            shared.log(&format!("connection {conn}: precache comp {} {} frames at {}‰", p.comp.0, frames.len(), p.series.scale));
+            let plan = Plan {
+                conn,
+                precache: Arc::new(p),
+                project,
+                frames: Arc::new(frames),
+                next: 0,
+                running: 0,
+                out: out.clone(),
+                current: Arc::clone(current),
+                last_report: Instant::now(),
+            };
+            // What is cached already shows at once (after a restart of the app, say).
+            report(&plan, &shared.frames);
+            sched.plan(plan);
+        }
         sync => {
             let t0 = Instant::now();
             let kind = match &sync {

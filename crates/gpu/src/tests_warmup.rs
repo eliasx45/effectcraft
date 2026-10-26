@@ -177,7 +177,9 @@ fn source_free_planner_matches_runtime_runs_and_bounds_work() {
     let mut scene = Scene::new(BitDepth::Bpc8);
     let mut layer = scene.footage(16, 16);
     for id in ["ec.color.tint", "ec.audio.backwards", "ec.blur.gaussian", "ec.color.exposure", "ec.color.tint"] {
-        scene.effect(&mut layer, id, &[]);
+        // A blur that blurs: a Gaussian Blur at 0 is skipped as an identity.
+        let blur = [("blurriness", effectcraft_keyframe::Value::Scalar(2.0))];
+        scene.effect(&mut layer, id, if id == "ec.blur.gaussian" { &blur } else { &[] });
     }
     if let Some(effectcraft_project::Node::Group(g)) = layer.props.sub_mut("effects").unwrap().children.last_mut() {
         g.enabled = false;

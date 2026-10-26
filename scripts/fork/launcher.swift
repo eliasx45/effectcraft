@@ -120,7 +120,10 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.arguments = [script, "--build-only"]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        p.terminationHandler = { [weak self] _ in DispatchQueue.main.async { self?.buildEnded() } }
+        p.terminationHandler = { [weak self] proc in
+            let status = proc.terminationStatus
+            DispatchQueue.main.async { self?.buildEnded(status: status) }
+        }
         do {
             try p.run()
         } catch {
@@ -134,14 +137,16 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    func buildEnded() {
+    func buildEnded(status: Int32) {
         timer?.invalidate()
         build = nil
         if stopping {
             NSApp.terminate(nil)
             return
         }
-        if run(["--status"]) == "stale" {
+        // The build's own exit status, not `--status`: sources changed while it ran (an agent
+        // merging) leave it "stale" although the app built fine, which showed a false failure.
+        if status != 0 {
             fail("The EffectCraft build failed.")
             return
         }
