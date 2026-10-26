@@ -47,6 +47,8 @@ egui_kittest = { workspace = true, features = ["eframe", "wgpu"], optional = tru
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # CR6b: decoding the cloud playback stream's H.264 chunks.
 effectcraft-media = { workspace = true }
+# EMBED5b: a hosted Timeline reads the person's shortcuts from EffectCraft's settings folder.
+effectcraft-host = { workspace = true }
 pollster = { workspace = true }
 sys-locale = { workspace = true }
 

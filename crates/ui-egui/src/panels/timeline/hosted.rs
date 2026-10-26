@@ -76,6 +76,10 @@ pub fn installed(session: &Session) -> bool {
 /// The person's own EffectCraft shortcut presets (the active one included), read from
 /// EffectCraft's settings folder (`shortcuts.json`); `None` without one. Read only.
 pub fn user_keymaps() -> Option<effectcraft_engine::shortcuts::Keymaps> {
+    // The browser has no settings folder.
+    #[cfg(target_arch = "wasm32")]
+    return None;
+    #[cfg(not(target_arch = "wasm32"))]
     let path = effectcraft_host::config_dir()?.join(effectcraft_engine::shortcuts::SHORTCUTS_FILE);
     let meta = std::fs::metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > MAX_SHORTCUTS_BYTES {
@@ -205,8 +209,12 @@ fn recall(ctx: &egui::Context) -> Option<(String, f64)> {
 
 fn remember(ctx: &egui::Context, last: Option<(String, f64)>) {
     ctx.data_mut(|d| match last {
-        Some(l) => d.insert_temp(reveal_memory(), l),
-        None => d.remove::<(String, f64)>(reveal_memory()),
+        Some(l) => {
+            d.insert_temp(reveal_memory(), l);
+        }
+        None => {
+            d.remove::<(String, f64)>(reveal_memory());
+        }
     });
 }
 
