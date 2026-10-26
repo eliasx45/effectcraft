@@ -6,6 +6,7 @@
 //! meanwhile are kept), OK keeps them (one undo step per control drag).
 
 use crate::i18n::tr;
+use effectcraft_engine::Session;
 use effectcraft_engine::keyframe::Value as KV;
 use effectcraft_engine::project::styles::{BLENDING, GROUP, STYLES};
 use effectcraft_engine::project::{ItemId, Layer, LayerId, Node, ParamUi, Project, Property};
@@ -39,9 +40,9 @@ impl std::fmt::Debug for Checkpoint {
     }
 }
 
-fn checkpoint(app: &mut EffectcraftApp, layer: Option<LayerId>) -> Checkpoint {
-    app.session.history.merge_key = None;
-    Checkpoint { project: app.session.project.clone(), history: app.session.history.clone(), comp: app.session.active_comp_id(), layer }
+fn checkpoint(s: &mut Session, layer: Option<LayerId>) -> Checkpoint {
+    s.history.merge_key = None;
+    Checkpoint { project: s.project.clone(), history: s.history.clone(), comp: s.active_comp_id(), layer }
 }
 
 /// The Layer Styles group of `layer` and its place among the layer's top-level groups.
@@ -75,44 +76,72 @@ fn put_styles(p: &mut Project, comp: ItemId, layer: LayerId, saved: Option<&(usi
 /// Open the dialog on the first selected (or given) layer, showing `style` (a style id;
 /// Blending Options when none).
 pub fn open(app: &mut EffectcraftApp, params: &Value) -> Result<(), String> {
-    let comp = app.session.active_comp().ok_or("no composition is open")?;
+    app.dialog_state.layer_style = open_in(&mut app.session, params)?;
+    app.dialog = Some(Dialog::LayerStyles);
+    Ok(())
+}
+
+/// The dialog's state for the first selected (or given) layer of `s`'s open comp, showing
+/// `style`, with the checkpoint Cancel goes back to (a host's dialog too, EMBED12).
+pub fn open_in(s: &mut Session, params: &Value) -> Result<LayerStyleState, String> {
+    let comp = s.active_comp().ok_or("no composition is open")?;
     let layer = params
         .get("layer")
         .and_then(Value::as_u64)
-        .or_else(|| app.session.state.selected_layers.first().map(|l| l.0))
+        .or_else(|| s.state.selected_layers.first().map(|l| l.0))
         .filter(|l| comp.layer(LayerId(*l)).is_some())
         .ok_or("select a layer first")?;
     let style = params.get("style").and_then(Value::as_str).unwrap_or(BLENDING).to_string();
     if style != BLENDING && !STYLES.iter().any(|s| s.0 == style) {
         return Err(format!("unknown layer style `{style}`"));
     }
-    let checkpoint = checkpoint(app, Some(LayerId(layer)));
-    app.dialog_state.layer_style = LayerStyleState { layer, selected: style, undo_mark: app.session.history.undo.len(), checkpoint: Some(checkpoint) };
-    app.dialog = Some(Dialog::LayerStyles);
-    Ok(())
+    let checkpoint = checkpoint(s, Some(LayerId(layer)));
+    Ok(LayerStyleState { layer, selected: style, undo_mark: s.history.undo.len(), checkpoint: Some(checkpoint) })
 }
 
 /// Menu routing: choosing one of the Layer ▸ Layer Styles ▸ <style> items (no parameters) adds
 /// the style as usual and opens the dialog on it.
 pub fn route(app: &mut EffectcraftApp, id: &str, params: &Value) -> Result<bool, String> {
-    let Some(style) = id.strip_prefix("layer.style.").filter(|s| STYLES.iter().any(|x| x.0 == *s)) else { return Ok(false) };
-    if !params.as_object().is_none_or(|m| m.is_empty()) {
-        return Ok(false);
-    }
-    let mark = app.session.history.undo.len();
-    let target = app.session.state.selected_layers.first().copied();
-    let checkpoint = checkpoint(app, target);
-    app.session.execute(id, json!({})).map_err(|e| e.to_string())?;
-    open(app, &json!({"style": style}))?;
-    // Cancel also removes the style just added.
-    app.dialog_state.layer_style.undo_mark = mark;
-    app.dialog_state.layer_style.checkpoint = Some(checkpoint);
+    let Some(r) = route_in(&mut app.session, id, params) else { return Ok(false) };
+    app.dialog_state.layer_style = r?;
+    app.dialog = Some(Dialog::LayerStyles);
     Ok(true)
 }
 
-fn layer(app: &EffectcraftApp) -> Option<std::sync::Arc<Layer>> {
-    super::layer_arc(app.session.active_comp()?, LayerId(app.dialog_state.layer_style.layer))
+/// [`route`] for `s` (a host's dialog too, EMBED12): `None` when `id` / `params` isn't a Layer
+/// Styles ▸ <style> menu choice; else the style is added and the dialog's state returned, whose
+/// Cancel also removes it.
+pub fn route_in(s: &mut Session, id: &str, params: &Value) -> Option<Result<LayerStyleState, String>> {
+    let style = id.strip_prefix("layer.style.").filter(|s| STYLES.iter().any(|x| x.0 == *s))?;
+    if !params.as_object().is_none_or(|m| m.is_empty()) {
+        return None;
+    }
+    let mark = s.history.undo.len();
+    let target = s.state.selected_layers.first().copied();
+    let checkpoint = checkpoint(s, target);
+    if let Err(e) = s.execute(id, json!({})) {
+        return Some(Err(e.to_string()));
+    }
+    Some(open_in(s, &json!({"style": style})).map(|mut st| {
+        // Cancel also removes the style just added.
+        st.undo_mark = mark;
+        st.checkpoint = Some(checkpoint);
+        st
+    }))
 }
+
+fn layer(s: &Session, st: &LayerStyleState) -> Option<std::sync::Arc<Layer>> {
+    super::layer_arc(s.active_comp()?, LayerId(st.layer))
+}
+
+/// The dialog's title ("Layer Style — <layer>"); `None` when its layer is gone (the dialog
+/// closes).
+pub fn title(s: &Session, st: &LayerStyleState) -> Option<String> {
+    layer(s, st).map(|l| format!("Layer Style — {}", l.name))
+}
+
+/// The dialog's window size.
+pub const SIZE: egui::Vec2 = vec2(720.0, 520.0);
 
 /// One control row for a property. Returns the new value when it changed.
 fn control(ui: &mut egui::Ui, p: &Property, v: &KV) -> Option<Value> {
@@ -160,30 +189,64 @@ fn control(ui: &mut egui::Ui, p: &Property, v: &KV) -> Option<Value> {
 }
 
 pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
-    let Some(l) = layer(app) else {
+    let Some(title) = title(&app.session, &app.dialog_state.layer_style) else {
         app.dialog = None;
         return;
     };
-    let lid = l.id.0;
-    let styles = l.layer_styles().cloned();
-    let sel = app.dialog_state.layer_style.selected.clone();
-    let time = app.session.time();
-    let lt = l.layer_time(time);
     let mut actions: Vec<(String, Value)> = Vec::new();
     let mut close: Option<bool> = None;
-    super::dialogs::modal_fit(ctx, &format!("Layer Style — {}", l.name), vec2(720.0, 520.0), t, |ui, height| {
+    // Taken for the frame, not cloned: its checkpoint holds the project and history.
+    let mut st = std::mem::take(&mut app.dialog_state.layer_style);
+    let (session, auto) = (&app.session, &mut app.auto);
+    super::dialogs::modal_fit(ctx, &title, SIZE, t, |ui, height| {
+        (close, actions) = draw(ui, height, session, &mut st, auto);
+    });
+    app.dialog_state.layer_style = st;
+    for (id, p) in actions {
+        if let Err(e) = app.session.execute(&id, p) {
+            app.ui.status = e.to_string();
+        }
+    }
+    match close {
+        Some(true) => finish(app, true),
+        Some(false) => finish(app, false),
+        None => {}
+    }
+}
+
+/// The dialog's contents in a body of `height` (as `dialogs::modal_fit` gives): the style list,
+/// the selected style's controls and OK / Cancel at the bottom, for `st`'s layer in `s`'s open
+/// comp, in any `ui` (EffectCraft's modal or a host's window, EMBED12). Returns OK (`Some(true)`)
+/// or Cancel (`Some(false)`) and the edits to run, in order (`layer.style.add` / `toggle`,
+/// `prop.set` with a merge key per control, so a drag is one undo step), which the caller runs on
+/// its session; then [`finish_in`] on OK or Cancel.
+pub fn draw(
+    ui: &mut egui::Ui,
+    height: f32,
+    s: &Session,
+    st: &mut LayerStyleState,
+    auto: &mut crate::automation::Registry,
+) -> (Option<bool>, Vec<(String, Value)>) {
+    let mut actions: Vec<(String, Value)> = Vec::new();
+    let mut close: Option<bool> = None;
+    let Some(l) = layer(s, st) else { return (Some(false), actions) };
+    let lid = l.id.0;
+    let styles = l.layer_styles().cloned();
+    let sel = st.selected.clone();
+    let lt = l.layer_time(s.time());
+    {
         // OK and Cancel stay at the bottom, in view; the list and the style's controls scroll
         // above them (#1062).
         let (mut body, body_h) = super::dialogs::above_footer(ui, height, |foot| {
             foot.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let ok = ui.button(tr("OK"));
-                    app.auto.add("dialog.layerStyle.ok", ok.rect, "OK");
+                    auto.add("dialog.layerStyle.ok", ok.rect, "OK");
                     if ok.clicked() {
                         close = Some(true);
                     }
                     let cancel = ui.button(tr("Cancel"));
-                    app.auto.add("dialog.layerStyle.cancel", cancel.rect, "Cancel");
+                    auto.add("dialog.layerStyle.cancel", cancel.rect, "Cancel");
                     if cancel.clicked() {
                         close = Some(false);
                     }
@@ -215,10 +278,10 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                             }
                             let r = ui.selectable_label(sel == id, name);
                             if r.clicked() {
-                                app.dialog_state.layer_style.selected = id.to_string();
+                                st.selected = id.to_string();
                             }
                             let rect = r.rect;
-                            app.auto.add(&format!("dialog.layerStyle.list.{id}"), rect, name);
+                            auto.add(&format!("dialog.layerStyle.list.{id}"), rect, name);
                         });
                     }
                 });
@@ -228,7 +291,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             ui.vertical(|ui| {
                 let name = if sel == BLENDING { "Blending Options" } else { STYLES.iter().find(|s| s.0 == sel).map(|s| s.1).unwrap_or("") };
                 let head = ui.label(egui::RichText::new(name).font(Tokens::semibold(13.0)));
-                app.auto.add("dialog.layerStyle.page", head.rect, &sel);
+                auto.add("dialog.layerStyle.page", head.rect, &sel);
                 ui.add_space(6.0);
                 let Some(g) = styles.as_ref().and_then(|s| s.sub(&sel)) else {
                     ui.label(egui::RichText::new(tr("Not applied: tick it in the list to add it.")).weak());
@@ -259,25 +322,16 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                                     ));
                                 }
                                 let path = g.match_path_of(p.uid).unwrap_or_default();
-                                app.auto.add(&format!("dialog.layerStyle.prop.{sel}/{path}"), lbl.rect, &p.name);
-                                app.auto.add(&format!("dialog.layerStyle.value.{sel}/{path}"), edit.response.rect, &p.name);
+                                auto.add(&format!("dialog.layerStyle.prop.{sel}/{path}"), lbl.rect, &p.name);
+                                auto.add(&format!("dialog.layerStyle.value.{sel}/{path}"), edit.response.rect, &p.name);
                                 ui.end_row();
                             });
                         });
                     });
             });
         }
-    });
-    for (id, p) in actions {
-        if let Err(e) = app.session.execute(&id, p) {
-            app.ui.status = e.to_string();
-        }
     }
-    match close {
-        Some(true) => finish(app, true),
-        Some(false) => finish(app, false),
-        None => {}
-    }
+    (close, actions)
 }
 
 /// Show another entry of the list (`blendingOptions` or a style id).
@@ -290,38 +344,47 @@ pub fn select(app: &mut EffectcraftApp, style: &str) {
 /// when another driver (an agent, a script) edited the project meanwhile, only the layer's
 /// styles are restored, as one undoable step, and the other edits stay.
 pub fn finish(app: &mut EffectcraftApp, ok: bool) {
-    if let Some(checkpoint) = app.dialog_state.layer_style.checkpoint.take()
-        && !ok
-    {
-        cancel(app, checkpoint);
+    if let Err(e) = finish_in(&mut app.session, &mut app.dialog_state.layer_style, ok) {
+        app.ui.status = e;
     }
-    app.session.history.merge_key = None;
     app.dialog = None;
 }
 
-fn cancel(app: &mut EffectcraftApp, checkpoint: Checkpoint) {
-    if std::sync::Arc::ptr_eq(&app.session.project, &checkpoint.project) {
-        app.session.history = checkpoint.history;
-        return;
+/// [`finish`] on `s` for a host's dialog (EMBED12): OK keeps the edits, Cancel puts the layer's
+/// styles back as they were when `st` opened.
+pub fn finish_in(s: &mut Session, st: &mut LayerStyleState, ok: bool) -> Result<(), String> {
+    let mut r = Ok(());
+    if let Some(checkpoint) = st.checkpoint.take()
+        && !ok
+    {
+        r = cancel(s, checkpoint);
     }
-    let (Some(comp), Some(layer)) = (checkpoint.comp, checkpoint.layer) else { return };
+    s.history.merge_key = None;
+    r
+}
+
+fn cancel(s: &mut Session, checkpoint: Checkpoint) -> Result<(), String> {
+    if std::sync::Arc::ptr_eq(&s.project, &checkpoint.project) {
+        s.history = checkpoint.history;
+        return Ok(());
+    }
+    let (Some(comp), Some(layer)) = (checkpoint.comp, checkpoint.layer) else { return Ok(()) };
     let saved = styles_of(&checkpoint.project, comp, layer);
     // Only the dialog's layer styles changed: back to the checkpoint, history included.
-    let mut only_styles = (*app.session.project).clone();
+    let mut only_styles = (*s.project).clone();
     put_styles(&mut only_styles, comp, layer, saved.as_ref());
     only_styles.next_id = checkpoint.project.next_id;
     if only_styles.same_content(&checkpoint.project) {
-        app.session.project = checkpoint.project;
-        app.session.history = checkpoint.history;
-        app.session.sanitize_state();
-        app.session.bump();
-        return;
+        s.project = checkpoint.project;
+        s.history = checkpoint.history;
+        s.sanitize_state();
+        s.bump();
+        return Ok(());
     }
-    let r = app.session.edit("Cancel Layer Style", None, |p, _| {
+    s.edit("Cancel Layer Style", None, |p, _| {
         put_styles(p, comp, layer, saved.as_ref());
         Ok(())
-    });
-    if let Err(e) = r {
-        app.ui.status = e.to_string();
-    }
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }

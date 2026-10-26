@@ -16,6 +16,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED8 | Composition viewer tools | `panels::viewer_hosted`: Rotation, Pan Behind, shape/mask tools, Pen (masks and shape paths, vertex tools), path vertex/tangent drags and the Type tool over a comp picture the host draws, with their keys |
 | EMBED9 | Project panel | Draws against `TimelineHost`; New Comp and the footage menu go through the host when there is no app |
 | EMBED10 | Pre-compose, Interpret Footage dialogs | `precomp::{draft_for, draw}` and `forms::{build_form, draw_form}`: a host shows EffectCraft's own dialogs from its session and runs their command |
+| EMBED12 | Solid, Light, Camera, Layer Settings, Time Stretch, Layer Style dialogs | `hosted_dialogs::{open, draw, command, finish}`: a host shows EffectCraft's layer dialogs from its session and runs their command |
 
 ## The host interface (EMBED1)
 
@@ -296,3 +297,16 @@ All additive; nothing a host implements or calls was renamed or removed.
   them). Replace Footage needs no dialog code: a host picks the file and runs `file.replaceFootage
   {item, path}`. Tests: `precomp::tests::a_host_gets_the_precompose_draft_from_its_session`,
   `forms::tests::interpret_footage_builds_from_the_session_for_a_host`.
+- EMBED12: the layer dialogs a host shows itself (FigCraft's cards). `panels::hosted_dialogs::{open(session,
+  id, params, last_solid_color) -> Option<Result<Hosted>>, title, size, draw(ui, hosted, session,
+  tokens, height, registry) -> Step, enter_is_ok, command, finish}`: the dialog EffectCraft's menus
+  open for `app.solidSettings` / `layer.newSolid`, `layer.newLight`, `layer.newCamera`,
+  `layer.settings` (Solid, Camera, Light or Null Settings by layer kind), `layer.cameraSettings` /
+  `layer.lightSettings`, `layer.timeStretch`, `layer.style.options` and Layer Styles ▸ <style>
+  without their settings, its contents in any `ui`, the command OK runs and the Layer Style dialog's
+  Cancel. The pieces it uses are EffectCraft's own dialogs, which now draw through them:
+  `dialogs::{SolidDraft, new_solid_draft, layer_solid_draft, draw_solid, solid_size}`,
+  `dialogs_3d::{camera_draft, light_draft, draw_camera, draw_light, camera_command, light_command}`,
+  `key_dialogs::{stretch_draft, draw_time_stretch, stretch_params}`,
+  `layer_styles_dialog::{open_in, route_in, title, draw, finish_in}`. Behaviour in EffectCraft's app
+  is unchanged. Test: `hosted_dialogs::tests::a_host_gets_each_layer_dialog_from_its_session`.

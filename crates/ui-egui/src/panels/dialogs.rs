@@ -95,30 +95,16 @@ pub fn open_comp_settings_for(app: &mut EffectcraftApp, cid: ItemId) -> Result<(
 }
 
 pub fn open_new_solid(app: &mut EffectcraftApp) -> Result<(), String> {
-    let c = app.session.active_comp().ok_or("no composition is open")?;
-    let n = app.session.project.items.values().filter(|i| matches!(i.kind, effectcraft_engine::project::ItemKind::Solid(_))).count() + 1;
-    let d = &mut app.dialog_state;
-    d.solid_name = format!("Solid {n}");
-    d.solid_size = [c.width, c.height];
-    d.solid_pixel_aspect = c.pixel_aspect;
-    d.solid_layer = None;
-    if d.solid_color == [0.0; 3] {
-        d.solid_color = [0.2, 0.45, 0.85];
-    }
+    let d = new_solid_draft(&app.session, app.dialog_state.solid_color)?;
+    set_solid_draft(&mut app.dialog_state, d);
     app.dialog = Some(Dialog::SolidSettings);
     Ok(())
 }
 
 /// Layer ▸ Layer Settings on a solid or adjustment layer: Solid Settings on its solid.
 fn open_solid_settings(app: &mut EffectcraftApp, layer: u64, item: ItemId) -> Result<(), String> {
-    let s = &app.session;
-    let it = s.project.item(item).ok_or("the layer's solid is missing")?;
-    let ItemKind::Solid(so) = &it.kind else { return Err("not a solid".into()) };
-    let users = s.project.comps().flat_map(|(_, c)| &c.layers).filter(|l| l.source == LayerSource::Solid { item }).count();
-    let name = s.active_comp().and_then(|c| c.layer(LayerId(layer))).map(|l| l.name.clone()).unwrap_or_else(|| it.name.clone());
-    let d = &mut app.dialog_state;
-    (d.solid_name, d.solid_color, d.solid_size, d.solid_pixel_aspect) = (name, so.color, [so.width, so.height], so.pixel_aspect);
-    (d.solid_layer, d.solid_shared, d.solid_affect_all) = (Some(layer), users > 1, false);
+    let d = layer_solid_draft(&app.session, layer, item)?;
+    set_solid_draft(&mut app.dialog_state, d);
     app.dialog = Some(Dialog::SolidSettings);
     Ok(())
 }
@@ -443,110 +429,101 @@ pub(crate) fn ui_enter(ctx: &egui::Context) -> bool {
     !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
+/// Solid Settings' values: a new solid (Layer ▸ New ▸ Solid…) or a layer's solid (Layer
+/// Settings). EffectCraft keeps them in [`DialogState`]; a host keeps its own (EMBED12).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SolidDraft {
+    pub name: String,
+    pub color: [f32; 3],
+    pub size: [u32; 2],
+    pub pixel_aspect: f64,
+    /// Solid Settings edits this layer's solid (Layer ▸ Layer Settings) instead of making one.
+    pub layer: Option<u64>,
+    /// Other layers use the edited solid too.
+    pub shared: bool,
+    /// "Affect all layers that use this solid" (off: the layer gets its own copy).
+    pub affect_all: bool,
+}
+
+impl SolidDraft {
+    /// The command OK runs: `layer.settings` on the layer, else `layer.newSolid`.
+    pub fn command(&self) -> &'static str {
+        if self.layer.is_some() { "layer.settings" } else { "layer.newSolid" }
+    }
+
+    /// Its parameters.
+    pub fn params(&self) -> Value {
+        let mut p = json!({
+            "name": self.name, "color": self.color, "width": self.size[0], "height": self.size[1], "pixelAspect": self.pixel_aspect,
+        });
+        if let Some(l) = self.layer {
+            p["layer"] = json!(l);
+            p["affectAll"] = json!(self.affect_all || !self.shared);
+        }
+        p
+    }
+}
+
+/// New Solid's draft in `s`'s open comp: Solid N, the comp's size and pixel aspect, `last_color`
+/// (the colour used last; a first solid gets EffectCraft's blue).
+pub fn new_solid_draft(s: &effectcraft_engine::Session, last_color: [f32; 3]) -> Result<SolidDraft, String> {
+    let c = s.active_comp().ok_or("no composition is open")?;
+    let n = s.project.items.values().filter(|i| matches!(i.kind, ItemKind::Solid(_))).count() + 1;
+    let color = if last_color == [0.0; 3] { [0.2, 0.45, 0.85] } else { last_color };
+    Ok(SolidDraft { name: format!("Solid {n}"), color, size: [c.width, c.height], pixel_aspect: c.pixel_aspect, layer: None, shared: false, affect_all: false })
+}
+
+/// Layer Settings' draft for solid (or adjustment) layer `layer` of `s`'s open comp, whose solid
+/// is `item`.
+pub fn layer_solid_draft(s: &effectcraft_engine::Session, layer: u64, item: ItemId) -> Result<SolidDraft, String> {
+    let it = s.project.item(item).ok_or("the layer's solid is missing")?;
+    let ItemKind::Solid(so) = &it.kind else { return Err("not a solid".into()) };
+    let users = s.project.comps().flat_map(|(_, c)| &c.layers).filter(|l| l.source == LayerSource::Solid { item }).count();
+    let name = s.active_comp().and_then(|c| c.layer(LayerId(layer))).map(|l| l.name.clone()).unwrap_or_else(|| it.name.clone());
+    Ok(SolidDraft {
+        name,
+        color: so.color,
+        size: [so.width, so.height],
+        pixel_aspect: so.pixel_aspect,
+        layer: Some(layer),
+        shared: users > 1,
+        affect_all: false,
+    })
+}
+
+fn solid_draft(d: &DialogState) -> SolidDraft {
+    SolidDraft {
+        name: d.solid_name.clone(),
+        color: d.solid_color,
+        size: d.solid_size,
+        pixel_aspect: d.solid_pixel_aspect,
+        layer: d.solid_layer,
+        shared: d.solid_shared,
+        affect_all: d.solid_affect_all,
+    }
+}
+
+fn set_solid_draft(d: &mut DialogState, s: SolidDraft) {
+    (d.solid_name, d.solid_color, d.solid_size, d.solid_pixel_aspect) = (s.name, s.color, s.size, s.pixel_aspect);
+    (d.solid_layer, d.solid_shared, d.solid_affect_all) = (s.layer, s.shared, s.affect_all);
+}
+
+/// Solid Settings' window size.
+pub fn solid_size(d: &SolidDraft) -> egui::Vec2 {
+    vec2(480.0, if d.layer.is_some() { 430.0 } else { 390.0 })
+}
+
 /// Solid Settings: a new solid (Layer ▸ New ▸ Solid…) or the layer's solid (Layer Settings).
 fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
-    let (mut close, mut ok) = (false, false);
-    let ds = &app.dialog_state;
-    let (mut name, mut color, mut size, mut par, mut affect_all) =
-        (ds.solid_name.clone(), ds.solid_color, ds.solid_size, ds.solid_pixel_aspect, ds.solid_affect_all);
-    let (editing, shared) = (ds.solid_layer, ds.solid_shared);
+    let mut d = solid_draft(&app.dialog_state);
     let comp_size = app.session.active_comp().map(|c| (c.width, c.height)).unwrap_or((1920, 1080));
-    let lock_id = egui::Id::new("solid-lock-aspect");
-    let mut lock = ctx.data(|m| m.get_temp::<bool>(lock_id)).unwrap_or(true);
+    let mut a = super::precomp::Answer::default();
     let auto = &mut app.auto;
-    modal(ctx, "Solid Settings", vec2(480.0, if editing.is_some() { 430.0 } else { 390.0 }), t, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(tr("Name:"));
-            let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
-            crate::widgets::focus_on_open(ui.ctx(), &r, &name);
-            auto.add("dialog.solid.name", r.rect, "Name");
-        });
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new(tr("Size")).strong());
-        egui::Grid::new("solid-grid").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
-            let (ow, oh) = (size[0], size[1]);
-            ui.label(tr("Width:"));
-            ui.horizontal(|ui| {
-                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut size[0]).range(1..=30000).suffix(" px")));
-                auto.add("dialog.solid.width", r.rect, "Width");
-                let r = ui.checkbox(&mut lock, tr_args("Lock Aspect Ratio to {}", &[&(super::comp_settings::aspect_label(ow as f64, oh as f64))]));
-                auto.add("dialog.solid.lockAspect", r.rect, "Lock Aspect Ratio");
-            });
-            ui.end_row();
-            ui.label(tr("Height:"));
-            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut size[1]).range(1..=30000).suffix(" px")));
-            auto.add("dialog.solid.height", r.rect, "Height");
-            ui.end_row();
-            if lock && ow > 0 && oh > 0 {
-                if size[0] != ow {
-                    size[1] = ((size[0] as f64) * oh as f64 / ow as f64).round().max(1.0) as u32;
-                } else if size[1] != oh {
-                    size[0] = ((size[1] as f64) * ow as f64 / oh as f64).round().max(1.0) as u32;
-                }
-            }
-            ui.label(tr("Pixel Aspect Ratio:"));
-            let cur = super::comp_settings::PIXEL_ASPECTS
-                .iter()
-                .find(|(_, v)| (v - par).abs() < 1e-3)
-                .map(|p| p.0.to_string())
-                .unwrap_or_else(|| format!("{par:.2}"));
-            let r = egui::ComboBox::from_id_salt("solid-par").width(240.0).selected_text(cur).show_ui(ui, |ui| {
-                for (label, v) in super::comp_settings::PIXEL_ASPECTS {
-                    if ui.selectable_label((v - par).abs() < 1e-3, *label).clicked() {
-                        par = *v;
-                    }
-                }
-            });
-            auto.add("dialog.solid.pixelAspect", r.response.rect, "Pixel Aspect Ratio");
-            ui.end_row();
-        });
-        let pct = |a: u32, b: u32| 100.0 * a as f64 / b.max(1) as f64;
-        ui.label(
-            egui::RichText::new(format!(
-                "Width: {:.1}% of comp\nHeight: {:.1}% of comp\nFrame Aspect Ratio: {}",
-                pct(size[0], comp_size.0),
-                pct(size[1], comp_size.1),
-                super::comp_settings::aspect_label(size[0] as f64 * par, size[1] as f64)
-            ))
-            .color(Color32::GRAY),
-        );
-        ui.add_space(4.0);
-        let r = ui.button(tr("Make Comp Size"));
-        auto.add("dialog.solid.makeCompSize", r.rect, "Make Comp Size");
-        if r.clicked() {
-            size = [comp_size.0, comp_size.1];
-        }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(tr("Color:"));
-            let r = crate::widgets::srgb_color_button(ui, &mut color);
-            auto.add("dialog.solid.color", r.rect, "Color");
-        });
-        if editing.is_some() {
-            ui.add_space(8.0);
-            let r = ui
-                .add_enabled(shared, egui::Checkbox::new(&mut affect_all, tr("Affect all layers that use this solid")))
-                .on_disabled_hover_text(tr("Only this layer uses this solid."));
-            auto.add("dialog.solid.affectAll", r.rect, "Affect all layers that use this solid");
-            if shared && !affect_all {
-                ui.label(egui::RichText::new(tr("This change will create a new solid for this layer.")).color(t.text_dim).size(11.0));
-            }
-        }
-        ui.add_space(14.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
-            auto.add("dialog.solid.ok", r.rect, "OK");
-            ok = r.clicked();
-            let r = ui.button(tr("Cancel"));
-            auto.add("dialog.solid.cancel", r.rect, "Cancel");
-            close = r.clicked();
-        });
-    });
-    ctx.data_mut(|m| m.insert_temp(lock_id, lock));
-    let ds = &mut app.dialog_state;
-    (ds.solid_name, ds.solid_color, ds.solid_size, ds.solid_pixel_aspect, ds.solid_affect_all) = (name, color, size, par, affect_all);
-    if ok || ui_enter(ctx) {
-        if let Err(e) = app.session.execute(solid_command(ds), solid_params(ds)) {
+    modal(ctx, "Solid Settings", solid_size(&d), t, |ui| a = draw_solid(ui, &mut d, comp_size, t, auto));
+    let mut close = a.cancel;
+    set_solid_draft(&mut app.dialog_state, d.clone());
+    if a.ok || ui_enter(ctx) {
+        if let Err(e) = app.session.execute(d.command(), d.params()) {
             app.ui.status = e.to_string();
         }
         close = true;
@@ -556,21 +533,112 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     }
 }
 
-/// The command Solid Settings' OK runs.
+/// Solid Settings' contents (name, size, Lock Aspect Ratio, pixel aspect, Make Comp Size, colour,
+/// Affect all layers…, OK / Cancel) in any `ui`: EffectCraft's modal, or a host's window
+/// (EMBED12). `comp_size`: the open comp's (Make Comp Size, the percentages). Enter is the
+/// caller's (EffectCraft: `ui_enter`).
+pub fn draw_solid(ui: &mut egui::Ui, d: &mut SolidDraft, comp_size: (u32, u32), t: &Tokens, auto: &mut crate::automation::Registry) -> super::precomp::Answer {
+    let (mut close, mut ok) = (false, false);
+    let lock_id = egui::Id::new("solid-lock-aspect");
+    let mut lock = ui.ctx().data(|m| m.get_temp::<bool>(lock_id)).unwrap_or(true);
+    let (editing, shared) = (d.layer, d.shared);
+    let SolidDraft { name, color, size, pixel_aspect: par, affect_all, .. } = d;
+    ui.horizontal(|ui| {
+        ui.label(tr("Name:"));
+        let r = ui.add(egui::TextEdit::singleline(name).desired_width(320.0));
+        crate::widgets::focus_on_open(ui.ctx(), &r, name);
+        auto.add("dialog.solid.name", r.rect, "Name");
+    });
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(tr("Size")).strong());
+    egui::Grid::new("solid-grid").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
+        let (ow, oh) = (size[0], size[1]);
+        ui.label(tr("Width:"));
+        ui.horizontal(|ui| {
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut size[0]).range(1..=30000).suffix(" px")));
+            auto.add("dialog.solid.width", r.rect, "Width");
+            let r = ui.checkbox(&mut lock, tr_args("Lock Aspect Ratio to {}", &[&(super::comp_settings::aspect_label(ow as f64, oh as f64))]));
+            auto.add("dialog.solid.lockAspect", r.rect, "Lock Aspect Ratio");
+        });
+        ui.end_row();
+        ui.label(tr("Height:"));
+        let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut size[1]).range(1..=30000).suffix(" px")));
+        auto.add("dialog.solid.height", r.rect, "Height");
+        ui.end_row();
+        if lock && ow > 0 && oh > 0 {
+            if size[0] != ow {
+                size[1] = ((size[0] as f64) * oh as f64 / ow as f64).round().max(1.0) as u32;
+            } else if size[1] != oh {
+                size[0] = ((size[1] as f64) * ow as f64 / oh as f64).round().max(1.0) as u32;
+            }
+        }
+        ui.label(tr("Pixel Aspect Ratio:"));
+        let cur =
+            super::comp_settings::PIXEL_ASPECTS.iter().find(|(_, v)| (v - *par).abs() < 1e-3).map(|p| p.0.to_string()).unwrap_or_else(|| format!("{par:.2}"));
+        let r = egui::ComboBox::from_id_salt("solid-par").width(240.0).selected_text(cur).show_ui(ui, |ui| {
+            for (label, v) in super::comp_settings::PIXEL_ASPECTS {
+                if ui.selectable_label((v - *par).abs() < 1e-3, *label).clicked() {
+                    *par = *v;
+                }
+            }
+        });
+        auto.add("dialog.solid.pixelAspect", r.response.rect, "Pixel Aspect Ratio");
+        ui.end_row();
+    });
+    let pct = |a: u32, b: u32| 100.0 * a as f64 / b.max(1) as f64;
+    ui.label(
+        egui::RichText::new(format!(
+            "Width: {:.1}% of comp\nHeight: {:.1}% of comp\nFrame Aspect Ratio: {}",
+            pct(size[0], comp_size.0),
+            pct(size[1], comp_size.1),
+            super::comp_settings::aspect_label(size[0] as f64 * *par, size[1] as f64)
+        ))
+        .color(Color32::GRAY),
+    );
+    ui.add_space(4.0);
+    let r = ui.button(tr("Make Comp Size"));
+    auto.add("dialog.solid.makeCompSize", r.rect, "Make Comp Size");
+    if r.clicked() {
+        *size = [comp_size.0, comp_size.1];
+    }
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(tr("Color:"));
+        let r = crate::widgets::srgb_color_button(ui, color);
+        auto.add("dialog.solid.color", r.rect, "Color");
+    });
+    if editing.is_some() {
+        ui.add_space(8.0);
+        let r = ui
+            .add_enabled(shared, egui::Checkbox::new(affect_all, tr("Affect all layers that use this solid")))
+            .on_disabled_hover_text(tr("Only this layer uses this solid."));
+        auto.add("dialog.solid.affectAll", r.rect, "Affect all layers that use this solid");
+        if shared && !*affect_all {
+            ui.label(egui::RichText::new(tr("This change will create a new solid for this layer.")).color(t.text_dim).size(11.0));
+        }
+    }
+    ui.add_space(14.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
+        auto.add("dialog.solid.ok", r.rect, "OK");
+        ok = r.clicked();
+        let r = ui.button(tr("Cancel"));
+        auto.add("dialog.solid.cancel", r.rect, "Cancel");
+        close = r.clicked();
+    });
+    ui.ctx().data_mut(|m| m.insert_temp(lock_id, lock));
+    super::precomp::Answer { ok, cancel: close }
+}
+
+#[cfg(test)]
 fn solid_command(d: &DialogState) -> &'static str {
     if d.solid_layer.is_some() { "layer.settings" } else { "layer.newSolid" }
 }
 
 /// Its parameters.
+#[cfg(test)]
 fn solid_params(d: &DialogState) -> Value {
-    let mut p = json!({
-        "name": d.solid_name, "color": d.solid_color, "width": d.solid_size[0], "height": d.solid_size[1], "pixelAspect": d.solid_pixel_aspect,
-    });
-    if let Some(l) = d.solid_layer {
-        p["layer"] = json!(l);
-        p["affectAll"] = json!(d.solid_affect_all || !d.solid_shared);
-    }
-    p
+    solid_draft(d).params()
 }
 
 /// ⌘⇧P: fuzzy search over every command (engine + UI) and effect.

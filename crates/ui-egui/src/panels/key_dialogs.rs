@@ -5,6 +5,7 @@ use crate::i18n::tr;
 use egui::{Color32, vec2};
 use serde_json::{Value, json};
 
+use crate::automation::Registry;
 use crate::theme::Tokens;
 use crate::{Dialog, EffectcraftApp};
 
@@ -103,31 +104,37 @@ pub fn open_interpolation(app: &mut EffectcraftApp) -> Result<(), String> {
 
 /// Layer ▸ Time ▸ Time Stretch…
 pub fn open_time_stretch(app: &mut EffectcraftApp) -> Result<(), String> {
-    let lid = *app.session.state.selected_layers.first().ok_or("select a layer first")?;
-    let l = app.session.active_comp().and_then(|c| c.layer(lid)).ok_or("no layer")?;
-    let dur = (l.out_point - l.in_point).seconds();
-    app.dialog_state.stretch = StretchDraft { percent: l.stretch, duration: dur, hold: 0, orig_duration: dur, orig_percent: l.stretch };
+    app.dialog_state.stretch = stretch_draft(&app.session)?;
     app.dialog = Some(Dialog::TimeStretch);
     Ok(())
 }
 
-fn buttons(ui: &mut egui::Ui, app: &mut EffectcraftApp, t: &Tokens, prefix: &str) -> (bool, bool) {
+/// Time Stretch's draft for the first selected layer of `s`'s open comp (a host's dialog too,
+/// EMBED12).
+pub fn stretch_draft(s: &effectcraft_engine::Session) -> Result<StretchDraft, String> {
+    let lid = *s.state.selected_layers.first().ok_or("select a layer first")?;
+    let l = s.active_comp().and_then(|c| c.layer(lid)).ok_or("no layer")?;
+    let dur = (l.out_point - l.in_point).seconds();
+    Ok(StretchDraft { percent: l.stretch, duration: dur, hold: 0, orig_duration: dur, orig_percent: l.stretch })
+}
+
+fn buttons(ui: &mut egui::Ui, auto: &mut Registry, t: &Tokens, prefix: &str) -> (bool, bool) {
     let (mut ok, mut cancel) = (false, false);
     ui.add_space(14.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
-        app.auto.add(&format!("{prefix}.ok"), r.rect, "OK");
+        auto.add(&format!("{prefix}.ok"), r.rect, "OK");
         ok = r.clicked();
         let r = ui.button(tr("Cancel"));
-        app.auto.add(&format!("{prefix}.cancel"), r.rect, "Cancel");
+        auto.add(&format!("{prefix}.cancel"), r.rect, "Cancel");
         cancel = r.clicked();
     });
     (ok, cancel)
 }
 
-fn drag(ui: &mut egui::Ui, app: &mut EffectcraftApp, id: &str, v: &mut f64, speed: f64, range: std::ops::RangeInclusive<f64>, suffix: &str, enabled: bool) {
+fn drag(ui: &mut egui::Ui, auto: &mut Registry, id: &str, v: &mut f64, speed: f64, range: std::ops::RangeInclusive<f64>, suffix: &str, enabled: bool) {
     let r = ui.add_enabled(enabled, crate::widgets::drag_value(egui::DragValue::new(v).speed(speed).range(range).max_decimals(2).suffix(suffix)));
-    app.auto.add(id, r.rect, id);
+    auto.add(id, r.rect, id);
 }
 
 pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
@@ -147,13 +154,13 @@ pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                     ui.horizontal(|ui| {
                         ui.label(tr("Speed:"));
                         let v = if out { &mut d.out_speed[dim] } else { &mut d.in_speed[dim] };
-                        drag(ui, app, &format!("dialog.velocity.{side}Speed.{dim}"), v, 1.0, -1e7..=1e7, "", enabled);
+                        drag(ui, &mut app.auto, &format!("dialog.velocity.{side}Speed.{dim}"), v, 1.0, -1e7..=1e7, "", enabled);
                         ui.label(egui::RichText::new(&d.units).color(t.text_dim));
                     });
                     ui.horizontal(|ui| {
                         ui.label(tr("Influence:"));
                         let v = if out { &mut d.out_inf[dim] } else { &mut d.in_inf[dim] };
-                        drag(ui, app, &format!("dialog.velocity.{side}Influence.{dim}"), v, 0.2, 0.1..=100.0, " %", enabled);
+                        drag(ui, &mut app.auto, &format!("dialog.velocity.{side}Influence.{dim}"), v, 0.2, 0.1..=100.0, " %", enabled);
                     });
                     ui.end_row();
                 }
@@ -165,7 +172,7 @@ pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         if d.continuous {
             d.out_speed = d.in_speed.clone();
         }
-        (ok, cancel) = buttons(ui, app, t, "dialog.velocity");
+        (ok, cancel) = buttons(ui, &mut app.auto, t, "dialog.velocity");
     });
     app.dialog_state.velocity = d.clone();
     if ok || super::dialogs::ui_enter(ctx) {
@@ -188,7 +195,7 @@ pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     }
 }
 
-fn combo(ui: &mut egui::Ui, app: &mut EffectcraftApp, id: &str, sel: &mut usize, opts: &[&str], enabled: bool) {
+fn combo(ui: &mut egui::Ui, auto: &mut Registry, id: &str, sel: &mut usize, opts: &[&str], enabled: bool) {
     ui.add_enabled_ui(enabled, |ui| {
         // The options are the English source strings; the automation id and label stay English.
         let r = egui::ComboBox::from_id_salt(id).width(200.0).selected_text(tr(opts[*sel])).show_ui(ui, |ui| {
@@ -196,7 +203,7 @@ fn combo(ui: &mut egui::Ui, app: &mut EffectcraftApp, id: &str, sel: &mut usize,
                 ui.selectable_value(sel, i, tr(o));
             }
         });
-        app.auto.add(id, r.response.rect, id);
+        auto.add(id, r.response.rect, id);
     });
 }
 
@@ -206,18 +213,18 @@ pub fn interpolation(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) 
     super::dialogs::modal(ctx, "Keyframe Interpolation", vec2(440.0, 250.0), t, |ui| {
         egui::Grid::new("interp-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
             ui.label(tr("Temporal Interpolation:"));
-            combo(ui, app, "dialog.interpolation.temporal", &mut d.temporal, &TEMPORAL.map(|x| x.0), true);
+            combo(ui, &mut app.auto, "dialog.interpolation.temporal", &mut d.temporal, &TEMPORAL.map(|x| x.0), true);
             ui.end_row();
             ui.label(tr("Spatial Interpolation:"));
-            combo(ui, app, "dialog.interpolation.spatial", &mut d.spatial, &SPATIAL.map(|x| x.0), d.has_spatial);
+            combo(ui, &mut app.auto, "dialog.interpolation.spatial", &mut d.spatial, &SPATIAL.map(|x| x.0), d.has_spatial);
             ui.end_row();
             ui.label(tr("Roving:"));
-            combo(ui, app, "dialog.interpolation.roving", &mut d.roving, &ROVING, d.has_spatial);
+            combo(ui, &mut app.auto, "dialog.interpolation.roving", &mut d.roving, &ROVING, d.has_spatial);
             ui.end_row();
         });
         ui.add_space(6.0);
         ui.label(egui::RichText::new(format!("{} keyframe{} selected", d.count, if d.count == 1 { "" } else { "s" })).color(t.text_dim));
-        (ok, cancel) = buttons(ui, app, t, "dialog.interpolation");
+        (ok, cancel) = buttons(ui, &mut app.auto, t, "dialog.interpolation");
     });
     app.dialog_state.interp = d.clone();
     if ok || super::dialogs::ui_enter(ctx) {
@@ -245,40 +252,13 @@ pub fn interpolation(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) 
 
 pub fn time_stretch(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut d = app.dialog_state.stretch.clone();
-    let (mut ok, mut cancel) = (false, false);
-    super::dialogs::modal(ctx, "Time Stretch", vec2(420.0, 300.0), t, |ui| {
-        ui.label(egui::RichText::new(tr("Stretch")).font(Tokens::medium(12.5)));
-        egui::Grid::new("stretch-grid").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
-            ui.label(tr("Original Duration:"));
-            ui.label(format!("{:.2} s", d.orig_duration));
-            ui.end_row();
-            ui.label(tr("Stretch Factor:"));
-            let before = d.percent;
-            drag(ui, app, "dialog.timeStretch.percent", &mut d.percent, 0.5, -10000.0..=10000.0, " %", true);
-            if (before - d.percent).abs() > 1e-9 && d.orig_percent.abs() > 1e-9 {
-                d.duration = d.orig_duration * d.percent.abs() / d.orig_percent.abs();
-            }
-            ui.end_row();
-            ui.label(tr("New Duration:"));
-            let before = d.duration;
-            drag(ui, app, "dialog.timeStretch.duration", &mut d.duration, 0.05, 0.01..=100000.0, " s", true);
-            if (before - d.duration).abs() > 1e-9 && d.orig_duration > 1e-9 {
-                d.percent = d.orig_percent.signum() * d.orig_percent.abs() * d.duration / d.orig_duration;
-            }
-            ui.end_row();
-        });
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new(tr("Hold In Place")).font(Tokens::medium(12.5)));
-        for (i, l) in ["Layer In-point", "Current Frame", "Layer Out-point"].into_iter().enumerate() {
-            let r = ui.radio_value(&mut d.hold, i, l);
-            app.auto.add(&format!("dialog.timeStretch.hold.{i}"), r.rect, l);
-        }
-        (ok, cancel) = buttons(ui, app, t, "dialog.timeStretch");
-    });
+    let mut a = super::precomp::Answer::default();
+    let auto = &mut app.auto;
+    super::dialogs::modal(ctx, "Time Stretch", STRETCH_SIZE, t, |ui| a = draw_time_stretch(ui, &mut d, t, auto));
+    let mut cancel = a.cancel;
     app.dialog_state.stretch = d.clone();
-    if ok || super::dialogs::ui_enter(ctx) {
-        let hold = ["in", "current", "out"][d.hold.min(2)];
-        if let Err(e) = app.session.execute("layer.timeStretch", json!({"percent": d.percent, "hold": hold})) {
+    if a.ok || super::dialogs::ui_enter(ctx) {
+        if let Err(e) = app.session.execute("layer.timeStretch", stretch_params(&d)) {
             app.ui.status = e.to_string();
         }
         cancel = true;
@@ -286,4 +266,46 @@ pub fn time_stretch(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     if cancel {
         app.dialog = None;
     }
+}
+
+/// Time Stretch's window size.
+pub const STRETCH_SIZE: egui::Vec2 = vec2(420.0, 300.0);
+
+/// Time Stretch's contents (Stretch Factor, New Duration, Hold In Place, OK / Cancel) in any
+/// `ui`: EffectCraft's modal or a host's window (EMBED12). Enter is the caller's.
+pub fn draw_time_stretch(ui: &mut egui::Ui, d: &mut StretchDraft, t: &Tokens, auto: &mut Registry) -> super::precomp::Answer {
+    ui.label(egui::RichText::new(tr("Stretch")).font(Tokens::medium(12.5)));
+    egui::Grid::new("stretch-grid").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
+        ui.label(tr("Original Duration:"));
+        ui.label(format!("{:.2} s", d.orig_duration));
+        ui.end_row();
+        ui.label(tr("Stretch Factor:"));
+        let before = d.percent;
+        drag(ui, auto, "dialog.timeStretch.percent", &mut d.percent, 0.5, -10000.0..=10000.0, " %", true);
+        if (before - d.percent).abs() > 1e-9 && d.orig_percent.abs() > 1e-9 {
+            d.duration = d.orig_duration * d.percent.abs() / d.orig_percent.abs();
+        }
+        ui.end_row();
+        ui.label(tr("New Duration:"));
+        let before = d.duration;
+        drag(ui, auto, "dialog.timeStretch.duration", &mut d.duration, 0.05, 0.01..=100000.0, " s", true);
+        if (before - d.duration).abs() > 1e-9 && d.orig_duration > 1e-9 {
+            d.percent = d.orig_percent.signum() * d.orig_percent.abs() * d.duration / d.orig_duration;
+        }
+        ui.end_row();
+    });
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(tr("Hold In Place")).font(Tokens::medium(12.5)));
+    for (i, l) in ["Layer In-point", "Current Frame", "Layer Out-point"].into_iter().enumerate() {
+        let r = ui.radio_value(&mut d.hold, i, l);
+        auto.add(&format!("dialog.timeStretch.hold.{i}"), r.rect, l);
+    }
+    let (ok, cancel) = buttons(ui, auto, t, "dialog.timeStretch");
+    super::precomp::Answer { ok, cancel }
+}
+
+/// The parameters of OK's `layer.timeStretch` (on the selected layers).
+pub fn stretch_params(d: &StretchDraft) -> Value {
+    let hold = ["in", "current", "out"][d.hold.min(2)];
+    json!({"percent": d.percent, "hold": hold})
 }
