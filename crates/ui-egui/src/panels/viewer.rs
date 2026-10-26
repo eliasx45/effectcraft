@@ -60,6 +60,11 @@ pub(crate) fn move_path_vertices(app: &mut EffectcraftApp, ctx: &egui::Context, 
             Some(camera) if layer.is_3d() => three_d::layer_to_view(&ectx, layer, &camera),
             _ => ectx.layer_to_comp(layer).0,
         };
+        // Paths move with the Transform effects the layer's children follow, as the viewer
+        // draws them (see `box_l2c`).
+        if let Some(f) = ectx.follow_fx_2d(layer) {
+            matrix = matrix * f;
+        }
         if group.match_id == "path" {
             matrix = matrix * effectcraft_engine::render::shapes::item_matrix(&ectx, layer, uid).ok_or("shape transform unavailable")?;
         }
@@ -2800,14 +2805,14 @@ fn pen_press(
     let layer = target.and_then(|id| ectx.comp.layer(id));
     let (lid, uid, inv) = match layer {
         Some(l) if !matches!(l.source, LayerSource::Shape) || app.session.state.shape_tool.creates_mask => {
-            let Some(inv) = l2c(ectx, l).0.inverse() else { return };
+            let Some(inv) = box_l2c(ectx, l).inverse() else { return };
             let lp = inv.apply(gv2(c[0], c[1]));
             let Ok(v) = app.session.execute("mask.new", json!({"layer": l.id.0, "vertices": [[lp.x, lp.y]]})) else { return };
             let Some(mask) = v["mask"].as_u64() else { return };
             (l.id, mask, inv)
         }
         Some(l) => {
-            let Some(inv) = l2c(ectx, l).0.inverse() else { return };
+            let Some(inv) = box_l2c(ectx, l).inverse() else { return };
             let lp = inv.apply(gv2(c[0], c[1]));
             let r = app.session.execute("shape.newPath", json!({"layer": l.id.0, "vertices": [[lp.x, lp.y]], "space": "layer"}));
             let Some(path) = r.ok().and_then(|v| v["path"].as_u64()) else { return };
@@ -3042,7 +3047,7 @@ fn create_shape(app: &mut EffectcraftApp, tool: Tool, a: [f64; 2], b: [f64; 2], 
                 expr: None,
                 footage: None,
             };
-            let inv = l2c(&ectx, &l).0.inverse().unwrap_or(Mat3::IDENTITY);
+            let inv = box_l2c(&ectx, &l).inverse().unwrap_or(Mat3::IDENTITY);
             let p0 = inv.apply(gv2(cx - w / 2.0, cy - h / 2.0));
             let p1 = inv.apply(gv2(cx + w / 2.0, cy + h / 2.0));
             let rect = [p0.x.min(p1.x), p0.y.min(p1.y), (p1.x - p0.x).abs(), (p1.y - p0.y).abs()];
@@ -3294,6 +3299,15 @@ mod tests {
         s.execute("prop.set", json!({"layer": id, "path": "transform/rotation", "value": 30.0})).unwrap();
         s.execute("prop.set", json!({"layer": id, "path": "transform/position", "value": g.turned(30.0)})).unwrap();
         assert!(near(centre(&s).0, c0), "turned in place: {:?}", centre(&s).0);
+        // A mask is drawn (and edited) where the effect put the pixels: its layer-pixel corner
+        // (0, 0) lands on the box's top-left corner, 200 px right of the layer's.
+        s.execute("prop.set", json!({"layer": id, "path": "transform/rotation", "value": 0.0})).unwrap();
+        s.execute("prop.set", json!({"layer": id, "path": "transform/position", "value": [320.0, 180.0, 0.0]})).unwrap();
+        let uid = s.execute("mask.new", json!({"layer": id, "vertices": [[0.0, 0.0]]})).unwrap()["mask"].as_u64().unwrap();
+        let ctx = EvalCtx::new(&s.project, s.active_comp_id().unwrap(), s.active_comp().unwrap(), s.time());
+        let m = ov::path_of(&ctx, LayerId(id), uid).unwrap().m;
+        let c = m.apply(gv2(0.0, 0.0));
+        assert!(near([c.x, c.y], [470.0, 130.0]), "mask corner: {c:?}");
     }
 
     /// EXPR-PERF5: layer boxes are measured once per snapshot, time and layer while the viewer

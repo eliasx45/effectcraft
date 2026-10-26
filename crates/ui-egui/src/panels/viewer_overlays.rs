@@ -151,7 +151,7 @@ pub(crate) fn path_of(ectx: &EvalCtx, layer: LayerId, uid: u64) -> Option<PathIn
     let l = ectx.comp.layer(layer)?;
     let g = l.props.find_group(uid)?;
     let sp = g.get("path").map(|pr| ectx.value(l, pr)).and_then(|v| v.as_path().cloned())?;
-    let (m, _) = super::viewer::l2c(ectx, l);
+    let m = super::viewer::box_l2c(ectx, l);
     let is_mask = matches!(g.kind, GroupKind::Mask { .. });
     let m = if is_mask { m } else { m * effectcraft_engine::render::shapes::item_matrix(ectx, l, uid).unwrap_or(Mat3::IDENTITY) };
     Some(PathInfo { layer, uid, m, sp, is_mask, feather: Vec::new() })
@@ -192,7 +192,8 @@ pub(crate) fn draw_paths(
     marks: &mut Vec<VertexMark>,
     paths: &mut Vec<PathInfo>,
 ) {
-    let (m, _) = super::viewer::l2c(ectx, l);
+    // Masks and shape paths move with the Transform effects the layer's children follow.
+    let m = super::viewer::box_l2c(ectx, l);
     let mut list: Vec<(u64, String, ShapePath, Mat3, Color32, bool, bool)> = vec![];
     if let Some(masks) = l.masks() {
         for g in masks.groups() {

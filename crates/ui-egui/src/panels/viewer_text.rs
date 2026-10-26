@@ -112,7 +112,8 @@ fn edited(app: &EffectcraftApp, ectx: &EvalCtx, lid: LayerId) -> Option<Edited> 
     }
     let doc = layer_doc(&app.session, lid)?;
     let lay = layout_doc(&doc);
-    let m = super::viewer::l2c(ectx, &layer).0;
+    // The text sits where the Transform effects its children follow put it.
+    let m = super::viewer::box_l2c(ectx, &layer);
     let inv = m.inverse()?;
     let carets = effectcraft_engine::render::text::caret_maps(ectx, &layer, lay.chars);
     Some(Edited { layer, doc, lay, m, inv, carets })

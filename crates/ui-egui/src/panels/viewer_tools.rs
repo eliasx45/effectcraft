@@ -101,7 +101,7 @@ pub(crate) fn draw_snap(ctx: &egui::Context, painter: &egui::Painter, map: &View
             && let Some(layer) = ectx.comp.layer(l)
             && let Some(b) = effectcraft_engine::render::content_bounds(ectx, layer)
         {
-            let (m, _) = ectx.layer_to_comp(layer);
+            let m = super::viewer::box_l2c(ectx, layer);
             let q: Vec<Pos2> = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
                 .iter()
                 .map(|p| {
@@ -376,7 +376,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
         let map = ViewerMap { origin: comp_rect.min, zoom, comp: [ectx.comp.width as f32, ectx.comp.height as f32], area: comp_rect };
         for l in ectx.comp.layers.iter().filter(|l| l.is_active_at(ectx.time) && l.has_video()) {
             let Some(b) = effectcraft_engine::render::content_bounds(ectx, l) else { continue };
-            let (m, _) = super::viewer::l2c(ectx, l);
+            let m = super::viewer::box_l2c(ectx, l);
             let q: Vec<Pos2> = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
                 .iter()
                 .map(|p| {
