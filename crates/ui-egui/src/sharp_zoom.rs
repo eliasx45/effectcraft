@@ -77,7 +77,14 @@ pub struct SharpZoom {
 
 /// Render the region `opts.roi` of `comp` at `t` at `opts.scale`, sharp (see [`sharp_opts`]): the
 /// tile's pixels.
-pub fn render_tile(project: &effectcraft_engine::project::Project, footage: &dyn FootageSource, expr: Option<&dyn ExprHost>, comp: ItemId, t: Tick, opts: RenderOpts) -> egui::ColorImage {
+pub fn render_tile(
+    project: &effectcraft_engine::project::Project,
+    footage: &dyn FootageSource,
+    expr: Option<&dyn ExprHost>,
+    comp: ItemId,
+    t: Tick,
+    opts: RenderOpts,
+) -> egui::ColorImage {
     let mut r = Renderer::new(project, footage, opts);
     r.expr = expr;
     crate::frames::to_color_image(&r.comp_frame(comp, t))
@@ -100,8 +107,10 @@ pub(crate) fn wanted(app: &EffectcraftApp, ctx: &egui::Context, map: &ViewerMap,
     let ppp = ctx.pixels_per_point();
     let m = f64::from(map.zoom * ppp);
     let v = &app.session.state.viewer;
-    let plain = v.channel == effectcraft_engine::viewer::Channel::Rgb && v.exposure == 0.0 && effectcraft_engine::viewer::DisplayColor::of(&app.session).is_none();
-    if !m.is_finite() || m <= 1.0 + 1e-3
+    let plain =
+        v.channel == effectcraft_engine::viewer::Channel::Rgb && v.exposure == 0.0 && effectcraft_engine::viewer::DisplayColor::of(&app.session).is_none();
+    if !m.is_finite()
+        || m <= 1.0 + 1e-3
         || app.viewer_res().factor().is_some_and(|n| n != 1)
         || app.playback.playing
         || app.scrubbing()
@@ -200,15 +209,7 @@ struct Source {
 pub(crate) fn show(app: &mut EffectcraftApp, ctx: &egui::Context, painter: &egui::Painter, map: &ViewerMap, cid: ItemId, comp: &Comp, key: &FrameKey) {
     app.sharp_zoom.collect(ctx);
     let Some((scale, region)) = wanted(app, ctx, map, comp) else { return };
-    let want = TileKey {
-        comp: cid.0,
-        content: key.content,
-        frame: key.frame,
-        view: key.view,
-        opts: key.opts,
-        scale: (scale * 1000.0).round() as u32,
-        region,
-    };
+    let want = TileKey { comp: cid.0, content: key.content, frame: key.frame, view: key.view, opts: key.opts, scale: (scale * 1000.0).round() as u32, region };
     #[cfg(not(target_arch = "wasm32"))]
     {
         let sz = &app.sharp_zoom;

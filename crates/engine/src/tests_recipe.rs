@@ -29,10 +29,13 @@ fn eased_keys(s: &mut Session, comp: u64, l: u64, path: &str, keys: &[(f64, KV)]
     let fr = s.project.comp(ItemId(comp)).unwrap().frame_rate;
     s.edit("keys", None, |proj, _| {
         let p = proj.comp_mut(ItemId(comp)).unwrap().layer_mut(LayerId(l)).unwrap().props.prop_mut(path).unwrap();
-        p.keys = keys.into_iter().map(|mut k| {
-            k.time = fr.snap_nearest(k.time);
-            k
-        }).collect();
+        p.keys = keys
+            .into_iter()
+            .map(|mut k| {
+                k.time = fr.snap_nearest(k.time);
+                k
+            })
+            .collect();
         Ok(())
     })
     .unwrap();
@@ -75,7 +78,13 @@ fn round_trip(s: &mut Session, comp: u64, times: &[f64]) -> Value {
 #[test]
 fn shape_with_gradient_stroke_style_and_keys() {
     let (mut s, c) = session();
-    let l = layer(&s.execute("layer.newShape", json!({"kind": "ellipse", "name": "Circle", "size": [120, 120], "fill": "#3a7bff", "stroke": "#ffffff", "strokeWidth": 0.7})).unwrap());
+    let l = layer(
+        &s.execute(
+            "layer.newShape",
+            json!({"kind": "ellipse", "name": "Circle", "size": [120, 120], "fill": "#3a7bff", "stroke": "#ffffff", "strokeWidth": 0.7}),
+        )
+        .unwrap(),
+    );
     // A radial gradient fill next to the stroke.
     let gf = s.execute("layer.addShapeItem", json!({"layer": l, "kind": "gfill", "group": "contents/#1"})).unwrap();
     let gpath = gf["path"].as_str().unwrap().to_string();
@@ -86,7 +95,13 @@ fn shape_with_gradient_stroke_style_and_keys() {
     set(&mut s, l, "layerStyles/innerShadow/size", json!(12));
     set(&mut s, l, "layerStyles/innerShadow/color", json!([0.03, 0.04, 0.2, 1]));
     set(&mut s, l, "transform/position", json!([110, 90]));
-    eased_keys(&mut s, c, l, "transform/scale", &[(0.0, KV::Vec3([0.0, 0.0, 100.0])), (0.2669, KV::Vec3([115.0, 115.0, 100.0])), (0.5339, KV::Vec3([100.0, 100.0, 100.0]))]);
+    eased_keys(
+        &mut s,
+        c,
+        l,
+        "transform/scale",
+        &[(0.0, KV::Vec3([0.0, 0.0, 100.0])), (0.2669, KV::Vec3([115.0, 115.0, 100.0])), (0.5339, KV::Vec3([100.0, 100.0, 100.0]))],
+    );
     eased_keys(&mut s, c, l, "transform/opacity", &[(0.0, KV::Scalar(0.0)), (0.1335, KV::Scalar(100.0))]);
     let r = round_trip(&mut s, c, &[0.0, 0.1, 0.3, 1.0]);
     // Compact, readable, and only what was authored.
@@ -216,10 +231,17 @@ fn hand_written_recipe_builds() {
     assert_eq!(back["comp"]["background"], json!([0.1, 0.1, 0.1]));
     // Mistakes are errors that name the layer and the path, and change nothing.
     let before = s.project.items.len();
-    let bad = json!({"comp": {"name": "X", "width": 100, "height": 100, "duration": 1}, "layers": [{"name": "L", "type": "shape", "props": {"transform/nope": 1}}]});
+    let bad =
+        json!({"comp": {"name": "X", "width": 100, "height": 100, "duration": 1}, "layers": [{"name": "L", "type": "shape", "props": {"transform/nope": 1}}]});
     let e = s.execute("comp.fromRecipe", json!({"recipe": bad})).unwrap_err().to_string();
     assert!(e.contains("`L`") && e.contains("transform/nope"), "{e}");
-    let e = s.execute("comp.fromRecipe", json!({"recipe": {"comp": {"name": "X", "width": 100, "height": 100, "duration": 1}, "layers": [{"name": "L", "type": "blob"}]}})).unwrap_err().to_string();
+    let e = s
+        .execute(
+            "comp.fromRecipe",
+            json!({"recipe": {"comp": {"name": "X", "width": 100, "height": 100, "duration": 1}, "layers": [{"name": "L", "type": "blob"}]}}),
+        )
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("unknown type"), "{e}");
     assert_eq!(s.project.items.len(), before);
 }
@@ -261,7 +283,10 @@ fn junk_recipes_are_errors_not_crashes() {
 #[test]
 fn what_the_factories_cant_build_is_kept_raw() {
     let (mut s, c) = session();
-    let l = layer(&s.execute("layer.newShape", json!({"kind": "rect", "name": "Dashed", "size": [200, 100], "stroke": "#ffffff", "strokeWidth": 6, "fillType": "none"})).unwrap());
+    let l = layer(
+        &s.execute("layer.newShape", json!({"kind": "rect", "name": "Dashed", "size": [200, 100], "stroke": "#ffffff", "strokeWidth": 6, "fillType": "none"}))
+            .unwrap(),
+    );
     set(&mut s, l, "contents/#1/contents/stroke/dashes/dash", json!(20));
     // The Dashes "+" button adds a second Dash/Gap pair the stroke factory doesn't make.
     s.edit("dash", None, |proj, _| {

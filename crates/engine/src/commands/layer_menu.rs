@@ -869,7 +869,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("layer.mask.lock", "Locked", ["Layer", "Mask"], None, "{layer?, mask?, value?}", has_masks, mask_lock),
         cmd!("layer.mask.unlockAll", "Unlock All Masks", ["Layer", "Mask"], None, "{layers?}", has_masks, mask_unlock_all),
         cmd!("layer.mask.lockOthers", "Lock Other Masks", ["Layer", "Mask"], None, "{layer?, mask?}", has_masks, mask_lock_others),
-        cmd!("layer.addMarker", "Add Marker", ["Layer", "Markers"], None, "{layers?, time?, comment?} → null, or with no layers {time}; a marker already at that time is replaced and reported (replaced, warning)", has_comp, add_marker),
+        cmd!(
+            "layer.addMarker",
+            "Add Marker",
+            ["Layer", "Markers"],
+            None,
+            "{layers?, time?, comment?} → null, or with no layers {time}; a marker already at that time is replaced and reported (replaced, warning)",
+            has_comp,
+            add_marker
+        ),
         cmd!("layer.markersLock", "Lock Markers", ["Layer", "Markers"], None, "{layers?, value?}", has_layers, markers_lock),
         cmd!("layer.deleteAllMarkers", "Delete All Markers", ["Layer", "Markers"], None, "{layers?}", has_markers, delete_all_markers),
         cmd!("layer.trackMatte", "Track Matte", [], None, "{layers?, op: none|alpha|alphaInverted|luma|lumaInverted|above|below}", has_layers, track_matte_op),

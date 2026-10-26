@@ -317,6 +317,43 @@ pub fn transform_effect_matrix(pr: &crate::Params, anchor: (f64, f64), pos: (f64
         * Mat3::translate(vec2(-anchor.0, -anchor.1))
 }
 
+/// A "Children Follow" checkbox of the Transform effect: `default` when the instance predates it.
+fn follow_on(pr: &crate::Params, id: &str, default: bool) -> bool {
+    pr.values.get(id).map_or(default, Value::as_bool)
+}
+
+/// What a Transform effect passes on to its layer's children (Children Follow, not in After
+/// Effects): the parts of its matrix they follow, in the same pixels as `anchor` / `pos`, and the
+/// opacity factor they inherit. Position off keeps the effect's scale, rotation and skew about its
+/// Anchor Point. `None` when Children Follow is off.
+pub fn transform_follow(pr: &crate::Params, anchor: (f64, f64), pos: (f64, f64)) -> Option<(Mat3, f64)> {
+    if !follow_on(pr, "follow", true) {
+        return None;
+    }
+    let pos = if follow_on(pr, "followPosition", true) { pos } else { anchor };
+    let (sw, sh) = if follow_on(pr, "followScale", true) {
+        let sh = pr.f("scaleHeight");
+        (if pr.b("uniform") { sh } else { pr.f("scaleWidth") }, sh)
+    } else {
+        (100.0, 100.0)
+    };
+    let rotation = if follow_on(pr, "followRotation", true) { pr.f("rotation") } else { 0.0 };
+    let skew = if follow_on(pr, "followSkew", false) { pr.f("skew") } else { 0.0 };
+    let m = Mat3::translate(vec2(pos.0, pos.1))
+        * Mat3::skew_deg(-skew, pr.f("skewAxis") + 90.0)
+        * Mat3::rotate_deg(rotation)
+        * Mat3::scale(vec2(sw / 100.0, sh / 100.0))
+        * Mat3::translate(vec2(-anchor.0, -anchor.1));
+    let opacity = if follow_on(pr, "followOpacity", false) { (pr.f("opacity") / 100.0).clamp(0.0, 1.0) } else { 1.0 };
+    Some((m, opacity))
+}
+
+/// Whether the children that follow a Transform effect get its motion blur too (Children Get
+/// Motion Blur).
+pub fn transform_follow_blur(pr: &crate::Params) -> bool {
+    follow_on(pr, "follow", true) && follow_on(pr, "followBlur", true)
+}
+
 pub fn transform_extent(adjustment: bool, size: (u32, u32), ms: &[Mat3]) -> (i64, i64, u32, u32) {
     // An adjustment layer works on the comp below in place.
     if adjustment {
@@ -514,6 +551,15 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("useCompositionShutterAngle", "Use Composition's Shutter Angle", Value::Bool(true), ParamUi::Checkbox),
                 p("shutterAngle", "Shutter Angle", num(0.0), slider(0.0, 720.0, 0.0, 360.0, 1)),
                 p("sampling", "Sampling", Value::Enum(0), popup(&["Bilinear", "Bicubic"])),
+                // Not in After Effects: the layer's children follow the effect (see
+                // `transform_follow`).
+                p("follow", "Children Follow", Value::Bool(true), ParamUi::Checkbox),
+                p("followPosition", "Children Follow Position", Value::Bool(true), ParamUi::Checkbox),
+                p("followScale", "Children Follow Scale", Value::Bool(true), ParamUi::Checkbox),
+                p("followRotation", "Children Follow Rotation", Value::Bool(true), ParamUi::Checkbox),
+                p("followSkew", "Children Follow Skew", Value::Bool(false), ParamUi::Checkbox),
+                p("followOpacity", "Children Follow Opacity", Value::Bool(false), ParamUi::Checkbox),
+                p("followBlur", "Children Get Motion Blur", Value::Bool(true), ParamUi::Checkbox),
             ],
             transform,
         ),

@@ -330,6 +330,14 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("comp.moveTab", "Move Timeline Tab", [], None, "{comp, before?: id (end without)}", has_comp, move_tab),
         cmd!("comp.workArea", "Set Work Area", [], None, "{start?, end?, set?: begin|end (at CTI)}", has_comp, work_area),
         cmd!("comp.setSwitch", "Composition Switch", [], None, "{switch: hideShy|motionBlur|frameBlending|draft3d, value?}", has_comp, comp_switch),
-        cmd!("comp.addMarker", "Add Marker", [], Some("Num*"), "{time?, comment?} → {time, replaced?: {comment, time}, warning?} (a marker already at that time is replaced)", has_comp, add_marker),
+        cmd!(
+            "comp.addMarker",
+            "Add Marker",
+            [],
+            Some("Num*"),
+            "{time?, comment?} → {time, replaced?: {comment, time}, warning?} (a marker already at that time is replaced)",
+            has_comp,
+            add_marker
+        ),
     ]
 }

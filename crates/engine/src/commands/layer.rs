@@ -4,8 +4,8 @@ use effectcraft_color::{BlendMode, Label};
 use effectcraft_keyframe::{Justify, TextDoc, Value as KV};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{
-    Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Node, ParamUi, Project, PropGroup, Quality, Solid, TrackMatte,
-    limits,
+    Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Node, ParamUi, Project, PropGroup, Quality, Solid,
+    TrackMatte, limits,
 };
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
@@ -884,8 +884,16 @@ pub(crate) fn parent_fixes(s: &Session, cid: ItemId, ids: &[LayerId], parent: Op
     let Some(comp) = s.project.comp(cid) else { return vec![] };
     let ectx =
         effectcraft_render::EvalCtx { project: &s.project, comp_id: cid, comp, time: s.time(), expr: s.expr.as_deref(), footage: Some(s.footage.as_ref()) };
+    // The space a parent's children live in includes the Transform effects they follow.
+    let follow = |l: &effectcraft_project::Layer| ectx.follow_fx(l).map_or(effectcraft_geom::Mat4::IDENTITY, |f| f.0);
     let space = |id: Option<LayerId>| -> effectcraft_geom::Mat3 {
-        id.and_then(|i| comp.layer(i)).filter(|l| !l.is_3d()).map(|l| ectx.layer_to_comp(l).0).unwrap_or(effectcraft_geom::Mat3::IDENTITY)
+        id.and_then(|i| comp.layer(i))
+            .filter(|l| !l.is_3d())
+            .map(|l| {
+                let f = follow(l).0;
+                ectx.layer_to_comp(l).0 * effectcraft_geom::Mat3([[f[0][0], f[0][1], f[0][3]], [f[1][0], f[1][1], f[1][3]], [0.0, 0.0, 1.0]])
+            })
+            .unwrap_or(effectcraft_geom::Mat3::IDENTITY)
     };
     let decompose = |m: &effectcraft_geom::Mat3| {
         let a = m.0;
@@ -918,6 +926,7 @@ pub(crate) fn parent_fixes(s: &Session, cid: ItemId, ids: &[LayerId], parent: Op
                 * effectcraft_geom::Mat4::translate(anchor)
                 * effectcraft_geom::Mat4::scale(effectcraft_geom::vec3(1.0 / par, 1.0, 1.0))
                 * effectcraft_geom::Mat4::translate(-anchor)
+                * follow(layer)
         })
     };
     if let Some(inv) = space_3d(parent).inverse().filter(|m| m.0.iter().flatten().all(|v| v.is_finite())) {

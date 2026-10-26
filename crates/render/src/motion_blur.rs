@@ -54,10 +54,65 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// Whether a layer moves within the shutter: its own motion blur, or that of a collapsed
-    /// precomp layer it is drawn through.
+    /// Whether a layer moves within the shutter: its own motion blur, that of a collapsed
+    /// precomp layer it is drawn through, or a parent's Transform effect it follows with Children
+    /// Get Motion Blur (see [`Self::follow_shutter`]).
     pub(crate) fn blurred(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
-        self.mb_on(ctx, layer) || (!self.through_lost && self.links().any(|l| l.blur))
+        self.mb_on(ctx, layer) || (!self.through_lost && self.links().any(|l| l.blur)) || self.follow_shutter(ctx, layer).is_some()
+    }
+
+    /// The shutter a layer's sub-samples spread over: the comp's (see [`Self::shutter`]) when it
+    /// or a collapsed precomp above it is motion blurred, else that of the parents' Transform
+    /// effect it follows.
+    pub(crate) fn layer_shutter(&self, ctx: &EvalCtx, layer: &Layer) -> Shutter {
+        if self.mb_on(ctx, layer) || (!self.through_lost && self.links().any(|l| l.blur)) {
+            return self.shutter(ctx);
+        }
+        self.follow_shutter(ctx, layer).unwrap_or_else(|| self.shutter(ctx))
+    }
+
+    /// The shutter of the nearest parent's Transform effect that the layer follows with Children
+    /// Get Motion Blur, as that effect blurs its own layer (`effectcraft_effects::transform_shutter`):
+    /// the comp's when Use Composition's Shutter Angle is on and the parent is motion blurred,
+    /// else its Shutter Angle centred on the frame, 16 samples. A 2D child's buffer is then drawn
+    /// once and placed at each sub-sample, as the effect warps its parent's pixels.
+    pub(crate) fn follow_shutter(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Shutter> {
+        let mut cur = layer.parent;
+        let mut guard = 0;
+        while let Some(pid) = cur {
+            guard += 1;
+            let p = ctx.layer(pid).filter(|_| guard <= 64)?;
+            if p.switches.effects
+                && !p.switches.adjustment
+                && let Some(fx) = p.effects()
+            {
+                for g in fx
+                    .groups()
+                    .filter(|g| g.enabled && matches!(&g.kind, effectcraft_project::GroupKind::Effect { effect } if effect == "ec.distort.transform"))
+                {
+                    let pr = effectcraft_effects::flatten_params(g, &mut |q| ctx.value(p, q));
+                    if !effectcraft_effects::transform_follow_blur(&pr) {
+                        continue;
+                    }
+                    let frame = ctx.comp.frame_duration().seconds();
+                    let (angle, phase, n) = if pr.b("useCompositionShutterAngle") {
+                        if !self.mb_on(ctx, p) {
+                            continue;
+                        }
+                        (ctx.comp.shutter_angle, ctx.comp.shutter_phase, ctx.comp.motion_blur_samples)
+                    } else {
+                        let a = pr.f("shutterAngle").clamp(0.0, 720.0);
+                        (a, -a * 0.5, 16)
+                    };
+                    if angle > 0.0 {
+                        let n = n.clamp(2, 64);
+                        return Some(Shutter { angle: angle / 360.0, phase: phase / 360.0, frame, samples: n, limit: n.max(16) });
+                    }
+                }
+            }
+            cur = p.parent;
+        }
+        None
     }
 
     /// The collapsed precomps' matrix (nested comp → the frame's comp) and the nested comp's time
@@ -80,12 +135,18 @@ impl<'a> Renderer<'a> {
     /// layer moves if it is motion blurred, the collapsed precomps above it if theirs are.
     pub(crate) fn buf_matrix_at(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, dt: f64, mo: &MotionMemo) -> Mat3 {
         let l2c = mo.at(dt, || {
+            let own = self.mb_on(ctx, layer);
             if self.through_lost || self.links().next().is_none() {
-                return self.comp_matrix(&ctx.at(ctx.time + Tick::from_seconds_f64(dt)), layer);
+                let at = ctx.at(ctx.time + Tick::from_seconds_f64(dt));
+                if own {
+                    return self.comp_matrix(&at, layer);
+                }
+                // Only the followed Transform effects of its parents move it.
+                let (l2c, _) = ctx.layer_to_comp_fx(layer, &at);
+                return self.outer.map_or(l2c, |o| o * l2c);
             }
             let (outer, t) = self.outer_at(ctx, dt);
-            let lctx = if self.mb_on(ctx, layer) { ctx.at(t) } else { *ctx };
-            let (l2c, _) = lctx.layer_to_comp(layer);
+            let (l2c, _) = if own { ctx.at(t).layer_to_comp(layer) } else { ctx.layer_to_comp_fx(layer, &ctx.at(t)) };
             outer.map_or(l2c, |o| o * l2c)
         });
         self.place_matrix(l2c, buf)
@@ -174,14 +235,14 @@ impl<'a> Renderer<'a> {
         if self.opts.draft {
             return 4;
         }
-        let sh = self.shutter(ctx);
+        let sh = self.layer_shutter(ctx, layer);
         adaptive_samples(travel, sh.samples, sh.limit)
     }
 
     /// Largest distance (output pixels) a corner of the layer buffer moves during the shutter,
     /// measured along the path at a few points.
     fn shutter_travel(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, mo: &MotionMemo) -> f64 {
-        let sh = self.shutter(ctx);
+        let sh = self.layer_shutter(ctx, layer);
         let (w, h) = (buf.img.width as f64, buf.img.height as f64);
         let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h), (w * 0.5, h * 0.5)];
         const PROBES: usize = 8;

@@ -381,7 +381,10 @@ fn fill_stroke_checked_accepts_stroke_type_blend_and_opacity() {
     s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
     let sh = s.execute("layer.newShape", json!({"kind": "ellipse", "fill": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
     let r = s
-        .execute_checked("shape.fillStroke", json!({"layers": [sh], "stroke": "#ffffff", "strokeType": "solid", "strokeWidth": 0.7, "strokeBlend": "multiply", "strokeOpacity": 30}))
+        .execute_checked(
+            "shape.fillStroke",
+            json!({"layers": [sh], "stroke": "#ffffff", "strokeType": "solid", "strokeWidth": 0.7, "strokeBlend": "multiply", "strokeOpacity": 30}),
+        )
         .unwrap();
     assert_eq!((r["strokeType"].as_str(), r["strokeWidth"].as_f64()), (Some("solid"), Some(0.7)), "{r}");
     let l = s.active_comp().unwrap().layer(effectcraft_project::LayerId(sh)).unwrap().clone();
@@ -615,7 +618,10 @@ fn params_docs_parse() {
     assert_eq!(k("{label: Red|Yellow|Aqua|…, layers?}"), ["label", "layers"]);
     assert_eq!(k("{name?, background? [r,g,b]|#hex, open?}"), ["name", "background", "open"]);
     // `a?/b?` pairs name both keys (they share one description); `/` inside a value doesn't split.
-    assert_eq!(k("{fillType?/strokeType?: none|solid, fillOpacity?/strokeOpacity? %, w?: a/b}"), ["fillType", "strokeType", "fillOpacity", "strokeOpacity", "w"]);
+    assert_eq!(
+        k("{fillType?/strokeType?: none|solid, fillOpacity?/strokeOpacity? %, w?: a/b}"),
+        ["fillType", "strokeType", "fillOpacity", "strokeOpacity", "w"]
+    );
     assert_eq!(k("{red?/green?/blue?/white?: [x, y], gamma? (1/2.2)}"), ["red", "green", "blue", "white", "gamma"]);
     assert!(k("{}").is_empty());
     assert!(accepted_params("free text").is_none());

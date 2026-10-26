@@ -1366,3 +1366,66 @@ fn a_selected_layer_reading_the_comp_scene_invalidates_its_owner() {
     let (a, b) = (particles_x(&here), particles_x(&panned));
     assert!(b < a - 20.0, "the blended particles follow the camera: {a} -> {b}");
 }
+
+// ------------------------------------------------------------------- Transform effect: children
+
+/// A 20×20 red parent at comp (50, 50) whose Transform effect moves it 100 px right, and a 10×10
+/// green child at the parent's centre (on top).
+fn follow_scene(vals: &[(&str, Value)]) -> (Project, ItemId) {
+    let (mut p, cid, comp) = setup();
+    let mut parent = solid(&mut p, &comp, [1.0, 0.0, 0.0], 20, 20);
+    parent.props.prop_mut("transform/position").unwrap().value = Value::Vec3([50.0, 50.0, 0.0]);
+    let mut at = vec![("anchor", Value::Vec2([10.0, 10.0])), ("position", Value::Vec2([110.0, 10.0]))];
+    at.extend(vals.iter().cloned());
+    add_effect(&mut p, &mut parent, "ec.distort.transform", [20.0, 20.0], &at);
+    let mut child = solid(&mut p, &comp, [0.0, 1.0, 0.0], 10, 10);
+    child.props.prop_mut("transform/position").unwrap().value = Value::Vec3([10.0, 10.0, 0.0]);
+    child.parent = Some(parent.id);
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(child);
+    c.layers.push(parent);
+    (p, cid)
+}
+
+/// Children Follow (on by default, unlike After Effects): a child moves with its parent's
+/// Transform effect as with the parent's own Position; turned off, it stays behind.
+#[test]
+fn children_follow_the_parents_transform_effect() {
+    let (p, cid) = follow_scene(&[]);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    assert!(img.get(150, 50)[1] > 0.9, "child moved with the effect: {:?}", img.get(150, 50));
+    assert!(img.get(50, 50)[3] < 0.1, "{:?}", img.get(50, 50));
+    let (p, cid) = follow_scene(&[("follow", Value::Bool(false))]);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    assert!(img.get(50, 50)[1] > 0.9, "child stays without Children Follow: {:?}", img.get(50, 50));
+    assert!(img.get(150, 50)[0] > 0.9, "the parent still moves: {:?}", img.get(150, 50));
+}
+
+/// Children Follow Opacity is off by default (as parenting); on, the child fades with the
+/// effect's Opacity. Children Get Motion Blur gives the child the effect's shutter.
+#[test]
+fn children_follow_opacity_and_blur_only_when_asked() {
+    fn ctx_of(p: &Project, cid: ItemId) -> (crate::EvalCtx<'_>, effectcraft_project::Layer) {
+        let comp = p.comp(cid).unwrap();
+        (crate::EvalCtx { project: p, comp_id: cid, comp, time: Tick::ZERO, expr: None, footage: None }, comp.layers[0].clone())
+    }
+    let (p, cid) = follow_scene(&[("opacity", Value::Scalar(50.0))]);
+    let (ctx, child) = ctx_of(&p, cid);
+    assert_eq!(ctx.opacity(&child), 1.0);
+    let (p, cid) = follow_scene(&[("opacity", Value::Scalar(50.0)), ("followOpacity", Value::Bool(true))]);
+    let (ctx, child) = ctx_of(&p, cid);
+    assert!((ctx.opacity(&child) - 0.5).abs() < 1e-9);
+
+    let blur = [("useCompositionShutterAngle", Value::Bool(false)), ("shutterAngle", Value::Scalar(180.0))];
+    let (p, cid) = follow_scene(&blur);
+    let (ctx, child) = ctx_of(&p, cid);
+    let r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+    assert!(r.follow_shutter(&ctx, &child).is_some());
+    assert!(r.blurred(&ctx, &child));
+    let mut off = blur.to_vec();
+    off.push(("followBlur", Value::Bool(false)));
+    let (p, cid) = follow_scene(&off);
+    let (ctx, child) = ctx_of(&p, cid);
+    let r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+    assert!(r.follow_shutter(&ctx, &child).is_none());
+}

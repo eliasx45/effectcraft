@@ -212,6 +212,53 @@ impl<'a> EvalCtx<'a> {
         m
     }
 
+    /// [`Self::world_matrix`] with the parents' followed Transform effects (see
+    /// [`Self::follow_fx`]) evaluated in `fx` instead (the same comp at another time): a child
+    /// whose own motion blur is off still moves with them across their shutter.
+    pub fn world_matrix_fx(&self, layer: &Layer, fx: &EvalCtx) -> Mat4 {
+        let mut m = self.local_matrix_par(layer, self.par_ratio(layer));
+        let mut cur = layer.parent;
+        let mut guard = 0;
+        while let Some(pid) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(p) = self.comp.layer(pid) else { break };
+            let follow = fx.follow_fx(p).map_or(Mat4::IDENTITY, |f| f.0);
+            m = self.local_matrix(p) * follow * m;
+            cur = p.parent;
+        }
+        m
+    }
+
+    /// The layer's Transform effects that its children follow (Children Follow, see
+    /// `effectcraft_effects::transform_follow`), in stack order, as one layer-space matrix, and
+    /// the opacity factor they pass on. `None` when no enabled Transform effect passes anything.
+    pub fn follow_fx(&self, layer: &Layer) -> Option<(Mat4, f64)> {
+        if !layer.switches.effects || layer.switches.adjustment {
+            return None;
+        }
+        let fx = layer.effects()?;
+        let is_transform =
+            |g: &&PropGroup| g.enabled && matches!(&g.kind, effectcraft_project::GroupKind::Effect { effect } if effect == "ec.distort.transform");
+        if !fx.groups().any(|g| is_transform(&g)) {
+            return None;
+        }
+        // Effect points are measured from the effect space's corner (see `effect_bounds`).
+        let o = self.effect_bounds(layer).1;
+        let mut out: Option<(Mat4, f64)> = None;
+        for g in fx.groups().filter(is_transform) {
+            let pr = effectcraft_effects::flatten_params(g, &mut |p| self.value(layer, p));
+            let [a, q] = [pr.v2("anchor"), pr.v2("position")];
+            let Some((m, op)) = effectcraft_effects::transform_follow(&pr, (a[0] + o[0], a[1] + o[1]), (q[0] + o[0], q[1] + o[1])) else { continue };
+            let (prev, prev_op) = out.unwrap_or((Mat4::IDENTITY, 1.0));
+            // Later effects transform the earlier ones' result.
+            out = Some((Mat4::from_mat3_affine(&m) * prev, prev_op * op));
+        }
+        out
+    }
+
     /// A parent's local matrix and its own parent (memoised inside [`with_transform_memo`]).
     fn parent_local(&self, pid: LayerId) -> Option<(Mat4, Option<LayerId>)> {
         let key = memo::key(self, pid);
@@ -221,15 +268,29 @@ impl<'a> EvalCtx<'a> {
             return Some(hit);
         }
         let p = key.as_ref().and_then(|k| memo::find(self, k)).unwrap_or_else(|| self.comp.layer(pid))?;
-        let v = (self.local_matrix(p), p.parent);
+        // Children follow the parent's Transform effects too (Children Follow).
+        let follow = self.follow_fx(p).map_or(Mat4::IDENTITY, |f| f.0);
+        let v = (self.local_matrix(p) * follow, p.parent);
         if let Some(k) = key {
             memo::put(k, v);
         }
         Some(v)
     }
 
+    /// The layer's Opacity, times that of the parents' Transform effects it follows (Children
+    /// Follow Opacity).
     pub fn opacity(&self, layer: &Layer) -> f64 {
-        layer.transform().map(|tr| self.f(layer, tr, "opacity", 100.0)).unwrap_or(100.0) / 100.0
+        let own = layer.transform().map(|tr| self.f(layer, tr, "opacity", 100.0)).unwrap_or(100.0) / 100.0;
+        let mut k = 1.0;
+        let mut cur = layer.parent;
+        let mut guard = 0;
+        while let Some(pid) = cur {
+            guard += 1;
+            let Some(p) = self.comp.layer(pid).filter(|_| guard <= 64) else { break };
+            k *= self.follow_fx(p).map_or(1.0, |f| f.1);
+            cur = p.parent;
+        }
+        own * k
     }
 
     /// The comp's active camera at this time: (view-projection to comp pixels, eye, zoom).
@@ -241,7 +302,16 @@ impl<'a> EvalCtx<'a> {
     /// Layer space → comp pixel space as a 2D projective matrix, plus camera-space depth of the
     /// layer's anchor (for 3D sorting). 2D layers ignore the camera.
     pub fn layer_to_comp(&self, layer: &Layer) -> (Mat3, f64) {
-        let world = self.world_matrix(layer);
+        self.layer_to_comp_of(layer, self.world_matrix(layer))
+    }
+
+    /// [`Self::layer_to_comp`] with the parents' followed Transform effects evaluated in `fx`
+    /// (see [`Self::world_matrix_fx`]).
+    pub fn layer_to_comp_fx(&self, layer: &Layer, fx: &EvalCtx) -> (Mat3, f64) {
+        self.layer_to_comp_of(layer, self.world_matrix_fx(layer, fx))
+    }
+
+    fn layer_to_comp_of(&self, layer: &Layer, world: Mat4) -> (Mat3, f64) {
         if layer.is_3d() {
             let (cam, _, _) = self.camera();
             let full = cam * world;

@@ -127,7 +127,7 @@ impl<'a> Renderer<'a> {
         if samples <= 1 {
             return Placement { matrices: vec![self.buf_matrix(ctx, layer, buf, mo)], sampling, seed };
         }
-        let sh = self.shutter(ctx);
+        let sh = self.layer_shutter(ctx, layer);
         let matrices = (0..samples).map(|i| self.buf_matrix_at(ctx, layer, buf, sh.offset(i, samples), mo)).collect();
         Placement { matrices, sampling, seed }
     }

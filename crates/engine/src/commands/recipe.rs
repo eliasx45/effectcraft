@@ -401,7 +401,8 @@ fn path_enc(p: &ShapePath) -> J {
     let mut j = rounded(&to_json(p));
     if let J::Object(o) = &mut j {
         for k in ["in_tangents", "out_tangents"] {
-            let zero = o.get(k).and_then(J::as_array).is_some_and(|a| a.iter().all(|t| t.as_array().is_some_and(|t| t.iter().all(|x| x.as_f64() == Some(0.0)))));
+            let zero =
+                o.get(k).and_then(J::as_array).is_some_and(|a| a.iter().all(|t| t.as_array().is_some_and(|t| t.iter().all(|x| x.as_f64() == Some(0.0)))));
             if zero {
                 o.remove(k);
             }
@@ -607,7 +608,8 @@ fn dec_key(j: &J, base: &Property, dec: &Dec) -> R<Keyframe> {
     k.out_interp = out_interp;
     k.in_ease = in_ease;
     k.out_ease = out_ease;
-    let extra: Map<String, J> = o.iter().filter(|(key, _)| !matches!(key.as_str(), "time" | "value" | "in" | "out")).map(|(a, b)| (a.clone(), b.clone())).collect();
+    let extra: Map<String, J> =
+        o.iter().filter(|(key, _)| !matches!(key.as_str(), "time" | "value" | "in" | "out")).map(|(a, b)| (a.clone(), b.clone())).collect();
     if !extra.is_empty() {
         let mut kj = to_json(&k);
         merge_json(&mut kj, &J::Object(extra));
@@ -708,8 +710,11 @@ fn entry_kind(e: &Map<String, J>, list: List) -> Option<&str> {
     e.get(if list == List::Effects { "effect" } else { "kind" }).and_then(J::as_str)
 }
 
-const SELECTORS: &[(&str, &str, &str)] =
-    &[("range", "rangeSelector", "Range Selector"), ("wiggly", "wigglySelector", "Wiggly Selector"), ("expression", "expressionSelector", "Expression Selector")];
+const SELECTORS: &[(&str, &str, &str)] = &[
+    ("range", "rangeSelector", "Range Selector"),
+    ("wiggly", "wigglySelector", "Wiggly Selector"),
+    ("expression", "expressionSelector", "Expression Selector"),
+];
 
 /// Text animator property kinds (`layer.addTextAnimator` kinds) of an animator's properties,
 /// in order; companions (Skew Axis, Tracking Type…) come with their kind.
@@ -1006,7 +1011,12 @@ fn assemble(proj: &mut Project, comp: &Comp, source: LayerSource, spec: &Map<Str
     let cx = BuildCx { gl: &comp.global_light, layer_size: effectcraft_render::effect_bounds(proj, comp, &l).0 };
     let mut ids = Ids(&mut proj.next_id);
     let what = |k: &str| format!("a {} layer has no {k}", type_name(&l.source));
-    for (key, list, path) in [("contents", List::Shape, "contents"), ("effects", List::Effects, "effects"), ("masks", List::Masks, "masks"), ("animators", List::Animators, "text/animators")] {
+    for (key, list, path) in [
+        ("contents", List::Shape, "contents"),
+        ("effects", List::Effects, "effects"),
+        ("masks", List::Masks, "masks"),
+        ("animators", List::Animators, "text/animators"),
+    ] {
         if let Some(entries) = spec.get(key) {
             let built = build_list(list, entries, &mut ids, &cx, 0).map_err(|e| format!("{key}: {e}"))?;
             let g = l.props.group_mut(path).ok_or_else(|| what(key))?;
@@ -1170,7 +1180,8 @@ fn apply_meta(l: &mut Layer, spec: &Map<String, J>, dec: &Dec) -> R<()> {
             J::Null => None,
             v => {
                 let layer = dec.layer(v.get("layer").unwrap_or(&J::Null)).map_err(|e| format!("trackMatte: {e}"))?;
-                let kind = v.get("kind").map(|k| serde_json::from_value(k.clone())).transpose().map_err(|e| format!("bad trackMatte kind: {e}"))?.unwrap_or_default();
+                let kind =
+                    v.get("kind").map(|k| serde_json::from_value(k.clone())).transpose().map_err(|e| format!("bad trackMatte kind: {e}"))?.unwrap_or_default();
                 layer.filter(|m| *m != l.id).map(|layer| TrackMatte { layer, kind })
             }
         };
@@ -1359,7 +1370,12 @@ impl Extract<'_> {
                     spec.insert("footage".into(), d);
                 }
                 if !std::path::Path::new(&f.path).exists() {
-                    self.unsupported(comp_name, Some(&l.name), "footage file", &format!("{} isn't on this machine: the rebuilt layer is offline until it is relinked", f.path));
+                    self.unsupported(
+                        comp_name,
+                        Some(&l.name),
+                        "footage file",
+                        &format!("{} isn't on this machine: the rebuilt layer is offline until it is relinked", f.path),
+                    );
                 }
                 if it.proxy.is_some() {
                     self.unsupported(comp_name, Some(&l.name), "proxy", "the footage's proxy isn't part of a recipe");
@@ -1375,7 +1391,12 @@ impl Extract<'_> {
         let bare = assemble(&mut self.scratch, comp, source.clone(), &spec)?;
         // The lists, each item checked by building it again.
         let cx = BuildCx { gl: &comp.global_light, layer_size: effectcraft_render::effect_bounds(self.project, comp, l).0 };
-        for (key, list, path) in [("contents", List::Shape, "contents"), ("effects", List::Effects, "effects"), ("masks", List::Masks, "masks"), ("animators", List::Animators, "text/animators")] {
+        for (key, list, path) in [
+            ("contents", List::Shape, "contents"),
+            ("effects", List::Effects, "effects"),
+            ("masks", List::Masks, "masks"),
+            ("animators", List::Animators, "text/animators"),
+        ] {
             if let (Some(g), Some(_)) = (l.props.group(path), bare.props.group(path))
                 && !g.children.is_empty()
             {
@@ -1437,7 +1458,8 @@ fn reconcile(orig: &PropGroup, skel: &PropGroup) -> (Vec<String>, Vec<J>) {
     let mut used = vec![false; skel.children.len()];
     let mut extra = vec![];
     for (i, o) in orig.children.iter().enumerate() {
-        let hit = skel.children.iter().enumerate().position(|(j, s)| !used.get(j).copied().unwrap_or(true) && s.match_id() == o.match_id() && same_shape(s, o, 1));
+        let hit =
+            skel.children.iter().enumerate().position(|(j, s)| !used.get(j).copied().unwrap_or(true) && s.match_id() == o.match_id() && same_shape(s, o, 1));
         match hit.and_then(|j| used.get_mut(j)) {
             Some(u) => *u = true,
             None => extra.push(json!({"at": i, "raw": raw_json(o)})),
@@ -1523,7 +1545,12 @@ fn make_source(proj: &mut Project, spec: &Map<String, J>, comp: &Comp, precomps:
             let dim = |i: usize| limits::size(size.get(i).copied().unwrap_or(1.0).max(1.0) as u64);
             let pixel_aspect = spec.get("pixelAspect").and_then(J::as_f64).filter(|x| x.is_finite() && *x > 0.0).map_or(1.0, limits::pixel_aspect);
             let folder = proj.folder_named("Solids").unwrap_or_else(|| proj.add_item("Solids", Label::Yellow, None, ItemKind::Folder));
-            let item = proj.add_item(name, Label::Red, Some(folder), ItemKind::Solid(Solid { color: [g(0), g(1), g(2)], width: dim(0), height: dim(1), pixel_aspect }));
+            let item = proj.add_item(
+                name,
+                Label::Red,
+                Some(folder),
+                ItemKind::Solid(Solid { color: [g(0), g(1), g(2)], width: dim(0), height: dim(1), pixel_aspect }),
+            );
             LayerSource::Solid { item }
         }
         "footage" | "model" => {
@@ -1616,9 +1643,7 @@ fn recipe_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let only = match p.get("layers") {
         None | Some(J::Null) => None,
-        Some(J::Array(a)) => {
-            Some(a.iter().map(|v| resolve_layer(comp, v).ok_or_else(|| bad(CMD_RECIPE, super::no_layer(v)))).collect::<Result<Vec<_>>>()?)
-        }
+        Some(J::Array(a)) => Some(a.iter().map(|v| resolve_layer(comp, v).ok_or_else(|| bad(CMD_RECIPE, super::no_layer(v)))).collect::<Result<Vec<_>>>()?),
         Some(_) => return Err(bad(CMD_RECIPE, "`layers` must be an array of layer references")),
     };
     let all = b_p(p, "includeDefaults").unwrap_or(false);
@@ -1627,7 +1652,9 @@ fn recipe_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         let text = serde_json::to_string_pretty(&r).map_err(|e| bad(CMD_RECIPE, e.to_string()))?;
         s.services.write_file(path, text.as_bytes()).map_err(|e| bad(CMD_RECIPE, format!("cannot write {path}: {e}")))?;
         let bytes = r.to_string().len();
-        return Ok(json!({"path": path, "bytes": bytes, "layers": r["layers"].as_array().map_or(0, Vec::len), "unsupported": r.get("unsupported").cloned().unwrap_or(json!([]))}));
+        return Ok(
+            json!({"path": path, "bytes": bytes, "layers": r["layers"].as_array().map_or(0, Vec::len), "unsupported": r.get("unsupported").cloned().unwrap_or(json!([]))}),
+        );
     }
     Ok(r)
 }
