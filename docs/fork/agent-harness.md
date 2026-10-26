@@ -22,15 +22,19 @@ the history at the end of this file.
 | D8 | **Don't embed Claude Code in the app now.** Build the two gains without embedding: *pins* (frame, region or range sent to the agent) and a *companion panel* (Claude Code turns linked to their revisions). Revisit embedding only if the agent ships to other users | 26 Oct |
 | D9 | **Real projects stay local.** Handover tasks built from Elias's projects never go into git or anything the agent can read | 26 Oct |
 
+| D10 | **Build C and B in parallel** after the baseline (E0), both on the policy core (P1), which comes first since both need it | 26 Oct |
+| D11 | **Models to compare:** Opus and Sonnet, plus one non-Claude model through an Anthropic-compatible endpoint. Not Haiku for now | 26 Oct |
+| D12 | **North star: Elias's edits after handover.** Fewer property changes he makes to a comp an agent handed over = better. Exam pass^3, cost and minutes are secondary | 26 Oct |
+| D13 | **Small eval runs to start:** a handful of tasks × 3 trials per driver and model, then decide whether to scale to the full exam | 26 Oct |
+
 ### Open questions (ask Elias)
 
 | # | Question | Why it matters |
 |---|---|---|
-| Q1 | How much of the subscription limit may one eval run use, and what's the monthly API cap for B? | 21 tasks × 3 trials ≈ 63 sessions per driver |
-| Q2 | Which models to compare: Opus only, or Opus / Sonnet / Haiku, plus a non-Claude model? | Sets the size of E0 and of every comparison |
-| Q3 | Where do the `ec-handover-snap` snapshots live, and may they become local eval tasks? | E3, the best ground truth we have |
-| Q4 | Is "Elias's edits after handover" the north star, or is it time saved, or something else? | Decides what "better" means for every comparison |
-| Q5 | Which driver first after E0: C (days) or B (weeks)? Recommended: C first, B right after, so there's a baseline to beat | Order of work |
+| Q1 | The monthly API cap for B and for the non-Claude model's key | Sets how often B and M1 can run |
+| Q3 | Where do the `ec-handover-snap` snapshots live, and may they become local eval tasks? | E3 and D12: the north star is measured from them |
+| Q6 | Which non-Claude model (Kimi, or another with an Anthropic-compatible endpoint)? | M1 |
+| Q7 | Which handful of tasks for the first small runs? Suggested: `easy-ease`, `lower-third`, `logo-fly-in`, `parenting`, `fix-layout` (ease, layout, rig, repair) | D13 |
 
 ## 1. What agentloop is, briefly
 
@@ -309,8 +313,9 @@ Tests use recorded traces, no model.
 - A non-Claude model by pointing C at an Anthropic-compatible endpoint (`ANTHROPIC_BASE_URL`,
   e.g. Kimi, with its own key). Same loop, so it's a fair test.
 
-**Order:** E0 → E1 → P1 → C1–C4 → U1 → B1–B5 → U2 → E2–E5, with M1 whenever a comparison is
-wanted.
+**Order (D10):** E0 → E1 → P1, then **C1–C4 and B1–B5 in parallel**, then U1, U2 and E2–E5;
+M1 (D11: Opus, Sonnet, one non-Claude model) with every comparison. Runs stay small (D13) until a
+difference shows.
 
 ## 6. How agentloop's hooks map to EffectCraft
 
@@ -397,3 +402,4 @@ likely the cleaner product.
 |---|---|
 | 26 Oct | First version: map, gaps, evals primer, routes A/B/C, plan |
 | 26 Oct | Decisions D1–D9 and open questions; plan reworked for both drivers on one policy core; terms (§7); embedding analysis (§8) |
+| 26 Oct | D10–D13 from Elias's answers (parallel drivers, models, north star, small runs); open questions Q1, Q3, Q6, Q7 |
