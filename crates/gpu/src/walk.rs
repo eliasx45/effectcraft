@@ -339,10 +339,6 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
-    if matches!(layer.source, effectcraft_project::LayerSource::Comp { .. }) {
-        // Its nested comp renders on the CPU path (RI1).
-        r.note_cpu(ctx, layer, effectcraft_render::cpu_why::PRECOMP);
-    }
     if let Some(done) = draw_yuv_footage(e, r, ctx, layer, canvas, opacity) {
         return done;
     }

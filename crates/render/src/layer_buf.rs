@@ -272,6 +272,12 @@ impl<'a> Renderer<'a> {
                 return Some((b, key));
             }
         }
+        // A precomp missed by every cache, with the GPU active: its nested comp renders on the
+        // CPU now (RI1). Noted here, not where the GPU walk hands the layer over, so a precomp
+        // the cache serves isn't tagged.
+        if matches!(layer.source, LayerSource::Comp { .. }) && self.active_accel().is_some() {
+            self.note_cpu(ctx, layer, crate::cpu_why::PRECOMP);
+        }
         let t0 = web_time::Instant::now();
         let buf = self.masked_source(ctx, layer, clip.win)?;
         let t1 = web_time::Instant::now();

@@ -281,3 +281,33 @@ fn masks_the_gpu_cannot_draw_decline() {
     let plain = shape_layer(&mut s, "Plain", [100.0, 100.0], [1.0; 4]);
     assert!(effectcraft_render::masks::gpu_plan::gpu_eligible(&plain), "no masks");
 }
+
+/// RI1: a precomp layer the GPU walk hands to the CPU path (a masked precomp) is tagged "CPU"
+/// on the frame its nested comp renders there, and not on the next frame, which the layer cache
+/// serves (before, it was tagged whenever the walk handed it over, cached or not).
+#[test]
+fn a_precomp_is_tagged_cpu_only_when_its_nested_comp_renders_there() {
+    let Some(g) = tests::gpu() else { return };
+    let mut s = scene(BitDepth::Bpc8);
+    let inner = Comp::new(120, 80, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let inner_id = s.p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+    let solid = s.solid([0.3, 0.6, 0.9], 120, 80);
+    s.p.comp_mut(inner_id).unwrap().layers = vec![solid].into();
+    let mut pre = build::layer(&mut s.p, &s.comp, "Inner", LayerSource::Comp { item: inner_id }, (120, 80), None);
+    let m = mask(&mut s, ShapePath::rect([0.0, 0.0], 100.0, 60.0), MaskMode::Add, [0.0, 0.0], false, false, 100.0, 0.0);
+    push_masks(&mut pre, vec![m]);
+    let pid = pre.id;
+    s.push(pre);
+    let cache = LayerCache::new(256 << 20);
+    let tagged = |t: f64| {
+        let times = effectcraft_render::LayerTimes::default();
+        let mut r = Renderer::new(&s.p, &tests::Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(g as &dyn Accelerator);
+        r.cache = Some(&cache);
+        r.times = Some(&times);
+        g.render(&r, s.cid, Tick::from_seconds_f64(t)).expect("the GPU renders the frame");
+        times.cpu_reason(s.cid, pid).is_some()
+    };
+    assert!(tagged(0.1), "the nested comp rendered on the CPU: tagged");
+    assert!(!tagged(0.2), "the cache served the static precomp: not tagged");
+}
