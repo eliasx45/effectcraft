@@ -185,15 +185,21 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         self.b.as_ref().map(|b| ([b.img.width(), b.img.height()], b.offset, b.scale))
     }
     /// Kept on the device, in the resident layer cache (budgeted like the layers there).
-    fn keep(&mut self, key: u64, cache: &effectcraft_render::cache::LayerCache) {
+    fn keep(&mut self, key: u64, cache: &effectcraft_render::cache::LayerCache, flight: Option<effectcraft_render::cache::FlightGuard>) {
         let Some(b) = &self.b else { return };
         if !self.e.can_retain_resident() {
             return;
         }
-        if let effectcraft_render::cache::Claim::Owner(flight) = cache.claim_gpu(key) {
-            let image = crate::context::SourceImage { img: b.img.clone(), offset: b.offset, scale: b.scale };
-            self.e.keep_resident(key, image, flight, None);
-        }
+        // The claim taken before the run (`Renderer::run_effect_stack`), else one now.
+        let flight = match flight {
+            Some(f) => f,
+            None => match cache.claim_gpu(key) {
+                effectcraft_render::cache::Claim::Owner(f) => f,
+                _ => return,
+            },
+        };
+        let image = crate::context::SourceImage { img: b.img.clone(), offset: b.offset, scale: b.scale };
+        self.e.keep_resident(key, image, flight, None);
     }
     fn restore(&mut self, key: u64, _cache: &effectcraft_render::cache::LayerCache) -> bool {
         let Some(image) = self.e.resident(key, effectcraft_render::cache::GpuStage::Processed) else { return false };

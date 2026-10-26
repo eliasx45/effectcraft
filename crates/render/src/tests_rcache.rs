@@ -608,3 +608,53 @@ fn linear_blending_keys_a_layer_once_per_frame() {
     p.settings.blend_linear = true;
     assert_eq!(evaluations(&p), gamma, "linear blending keys the layer once, as gamma blending does");
 }
+
+/// Frames rendered at once share one render of a layer's static first effects (a Deep Glow
+/// under a moving Transform effect, `Renderer::static_prefix`): the first claims it, the others
+/// wait for it and restore it, as many renders as one frame after another, and the same pixels.
+#[test]
+fn concurrent_frames_render_static_first_effects_once() {
+    fn effect(p: &mut Project, l: &mut Layer, id: &str, values: &[(&str, Value)]) {
+        let spec = effectcraft_effects::find(id).unwrap();
+        let mut next = p.next_id;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [40.0, 30.0]);
+        p.next_id = next;
+        for (k, v) in values {
+            g.prop_mut(k).unwrap().value = v.clone();
+        }
+        l.props.sub_mut("effects").unwrap().children.push(g.into());
+    }
+    let mut p = project();
+    let (cid, c) = comp(&mut p, "Card");
+    let mut l = solid(&mut p, &c, [0.25, 0.55, 1.0]);
+    effect(&mut p, &mut l, "ec.stylize.deepglow", &[("PEDG-0001", Value::Scalar(12.0))]);
+    effect(&mut p, &mut l, "ec.distort.transform", &[("useCompositionShutterAngle", Value::Bool(false)), ("shutterAngle", Value::Scalar(360.0))]);
+    l.props.prop_mut("effects/#2/position").unwrap().keys =
+        vec![Keyframe::new(Tick::ZERO, Value::Vec2([10.0, 15.0])), Keyframe::new(s(1.0), Value::Vec2([60.0, 15.0]))];
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let times: Vec<f64> = (0..4).map(|k| 0.2 + k as f64 / 30.0).collect();
+    // One frame after another: the glow renders on the first and is restored on the next.
+    let one_by_one = LayerCache::default();
+    for &t in &times {
+        frame(&p, cid, t, &NoFootage, None, Some(&one_by_one));
+    }
+    let cache = LayerCache::default();
+    let barrier = std::sync::Barrier::new(times.len());
+    let imgs: Vec<Image> = std::thread::scope(|sc| {
+        let hs: Vec<_> = times
+            .iter()
+            .map(|&t| {
+                let (p, cache, barrier) = (&p, &cache, &barrier);
+                sc.spawn(move || {
+                    barrier.wait();
+                    frame(p, cid, t, &NoFootage, None, Some(cache))
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(cache.inserts(), one_by_one.inserts(), "frames at once rendered the glow as often as one by one");
+    for (img, &t) in imgs.iter().zip(&times) {
+        assert_same(img, &frame(&p, cid, t, &NoFootage, None, None), &format!("frame at {t}"));
+    }
+}

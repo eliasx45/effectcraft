@@ -157,8 +157,10 @@ pub trait FxTarget {
     /// Move the buffer's effect coordinates: subtract `d` (buffer px) from its offset.
     fn shift(&mut self, d: [f64; 2]);
     /// Keep the buffer as it is now (the result of the stack's static first effects, see
-    /// `Renderer::static_prefix`) under `key` in `cache`. Default: not kept.
-    fn keep(&mut self, _key: u64, _cache: &crate::cache::LayerCache) {}
+    /// `Renderer::static_prefix`) under `key` in `cache`. `flight` is this render's claim on
+    /// `key` ([`crate::cache::LayerCache::claim_gpu`]): dropping it, once the buffer is kept or
+    /// not, wakes the frames waiting for it. Default: not kept.
+    fn keep(&mut self, _key: u64, _cache: &crate::cache::LayerCache, _flight: Option<crate::cache::FlightGuard>) {}
     /// Replace the buffer with the one kept under `key`; `false` (the buffer unchanged) when
     /// none is.
     fn restore(&mut self, _key: u64, _cache: &crate::cache::LayerCache) -> bool {
