@@ -616,6 +616,8 @@ pub struct Session {
     /// is, settings that guard what scripts may do can't change (see
     /// [`prefs::Scripting::same_permissions`]).
     pub script_calls: ScriptCalls,
+    /// The current state as last seen (who made it survives writes outside the history).
+    pub seen_state: history::SeenState,
     /// The Motion Library (cards in a remote bucket, cached locally): made on first use from
     /// `motion-library.json` or the environment, or set by the host (the web app's fetch).
     pub motion_library: motion_library::Handle,
@@ -762,6 +764,7 @@ impl Default for Session {
             disk_salt: None,
             footage_scan: None,
             script_calls: ScriptCalls::default(),
+            seen_state: Default::default(),
         }
     }
 }
@@ -805,6 +808,7 @@ impl Session {
 
     fn execute_inner(&mut self, id: &str, mut params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        self.adopt_moved_state();
         // Times as the Timeline shows them ("6:20", {"frame": 200}) become seconds of the comp.
         readout::resolve_time_params(self, id, &mut params)?;
         let resolved = commands::validate_target_refs(self, id, &params)?;
@@ -944,6 +948,7 @@ impl Session {
     }
 
     pub fn bump(&mut self) {
+        self.adopt_moved_state();
         self.freeze_runtime.changed();
         self.revision += 1;
         self.feed.record(self.revision, self.client.clone(), &self.project, self.epoch, &self.history);
@@ -1009,12 +1014,15 @@ impl Session {
         if keep.is_empty() {
             return;
         }
+        // (The restored state stays its author's.)
+        let author = self.history.author(&self.project).map(str::to_string);
         let p = Arc::make_mut(&mut self.project);
         for (id, r) in keep {
             if let Some(c) = p.comp_mut(id) {
                 c.resolution = r;
             }
         }
+        self.history.set_author(&self.project, author);
     }
 
     pub fn undo(&mut self) -> bool {

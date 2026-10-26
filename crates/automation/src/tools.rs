@@ -35,6 +35,10 @@ impl ToolDef {
             for (key, value) in [
                 ("full", full_s("reply")),
                 ("offset", offset_s()),
+                (
+                    "page_token",
+                    json!({"type": "string", "description": "Paging: the `page_token` of the previous page; continues there (offset and the revision it was read at)."}),
+                ),
                 ("limit", limit_s("items or bytes", 100)),
                 ("max_chars", max_chars_s()),
                 (
@@ -42,6 +46,9 @@ impl ToolDef {
                     json!({"type":"integer","minimum":0,"description":"Refuse if the project changed since this revision. Required for continuation of live inspection pages; saved get_result snapshots do not need it."}),
                 ),
             ] {
+                if key == "page_token" && !LIVE_PAGED.contains(&self.name) {
+                    continue;
+                }
                 if key == "expectRevision"
                     && !(READ_ONLY.contains(&self.name)
                         || [
@@ -343,7 +350,11 @@ pub fn output_schema(name: &str) -> Option<Value> {
                     "counts": object(json!({"error": int, "warning": int, "info": int}), &["error", "warning", "info"]),
                     "rules": {"type": "array", "items": {"type": "string"}},
                     "problems": {"type": "array", "items": problem},
-                    "notes": {"type": "array", "items": {"type": "string"}}
+                    "notes": {"type": "array", "items": {"type": "string"}},
+                    "summary": {"type": "boolean", "description": "A summary: `problems` holds only the worst ones (errors first, no info)."},
+                    "byRule": {"type": "object", "description": "Summary: problems per rule, by severity."},
+                    "byLayer": {"type": "array", "items": object(json!({"layer": int, "layerName": {"type": "string"}, "problems": int, "rules": {"type": "array", "items": {"type": "string"}}}), &["layer", "problems", "rules"])},
+                    "total": int, "listed": int
                 }),
                 &["comp", "compName", "times", "truncated", "clean", "counts", "problems"],
             )
@@ -415,6 +426,7 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
     }
     let mut normalized = if args.is_null() { json!({}) } else { args.clone() };
     t.normalize_args(&mut normalized);
+    resume_page(name, &mut normalized)?;
     let args = &normalized;
     // Validate delivery options before a script/edit can run.
     let delivery_budget = crate::compact::budget(args)?;
@@ -423,8 +435,10 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
         Some(value) => Some(value.as_u64().ok_or_else(|| Error::BadArgs("expectRevision must be a non-negative integer".into()))?),
         None => None,
     };
-    if ["get_comp", "get_layer", "get_property", "get_project", "doc_inspect", "get_field"].contains(&name) && output_page.offset > 0 && expected.is_none() {
-        return Err(Error::BadArgs("live page continuation requires expectRevision from the first reply; or use a retained get_result snapshot".into()));
+    if LIVE_PAGED.contains(&name) && output_page.offset > 0 && expected.is_none() {
+        return Err(Error::BadArgs(
+            "live page continuation needs the first reply's `page_token` (or its `revision` as expectRevision); or use a retained get_result snapshot".into(),
+        ));
     }
     // Generic output options must not leak into raw UI/control arguments.
     let native = (t.schema)();
@@ -475,7 +489,41 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
         }
     }
     crate::senses::attach_notices(b, name, &mut reply);
+    if LIVE_PAGED.contains(&name)
+        && let Reply::Json(value) = &mut reply
+    {
+        add_page_token(value);
+    }
     b.finish_reply(name, args, reply)
+}
+
+/// Inspection tools that read the live project page by page: a continuation must come from the
+/// same revision as the first page (else rows shift under the reader).
+const LIVE_PAGED: &[&str] = &["get_comp", "get_layer", "get_property", "get_project", "doc_inspect", "get_field"];
+
+/// A cut live reply gets a `page_token` for its next page: the revision it was read at and the
+/// next offset, so continuing needs nothing else (`expectRevision` comes with it).
+fn add_page_token(value: &mut Value) {
+    let (Some(rev), Some(next)) = (value.get("revision").and_then(Value::as_u64), value.get("next_offset").and_then(Value::as_u64)) else { return };
+    let token = format!("r{rev}o{next}");
+    if let Some(t) = value.get_mut("truncated").filter(|t| t.is_object()) {
+        t["hint"] = json!(format!("call again with page_token={token:?} (offset={next} at revision {rev})"));
+    }
+    value["page_token"] = json!(token);
+}
+
+/// `page_token` ("r<revision>o<offset>") into `offset` and, for live reads, `expectRevision`.
+fn resume_page(name: &str, args: &mut Value) -> Result<()> {
+    let Some(o) = args.as_object_mut() else { return Ok(()) };
+    let Some(token) = o.remove("page_token").filter(|t| !t.is_null()) else { return Ok(()) };
+    let bad = || Error::BadArgs(format!("`page_token` {token} is not one from a reply (r<revision>o<offset>)"));
+    let (rev, offset) = token.as_str().and_then(|t| t.strip_prefix('r')).and_then(|t| t.split_once('o')).ok_or_else(bad)?;
+    let (rev, offset) = (rev.parse::<u64>().map_err(|_| bad())?, offset.parse::<u64>().map_err(|_| bad())?);
+    o.insert("offset".into(), json!(offset));
+    if LIVE_PAGED.contains(&name) {
+        o.entry("expectRevision").or_insert(json!(rev));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ schema fragments
@@ -722,7 +770,41 @@ fn get_project(b: &mut Backend, _: &Value) -> Result<Reply> {
 
 fn get_comp(b: &mut Backend, a: &Value) -> Result<Reply> {
     let info = b.exec("comp.info", obj(&[("comp", get(a, "comp"))]))?;
+    if get(a, "summary").and_then(Value::as_bool) == Some(true) {
+        return json_reply(comp_summary(info));
+    }
     json_reply(crate::compact::comp_reply(info, a)?)
+}
+
+/// Layers a `get_comp` summary lists.
+const COMP_SUMMARY_LAYERS: usize = 20;
+
+/// A comp's settings with layer counts (per type, hidden, parented) and only its top layers.
+fn comp_summary(mut info: Value) -> Value {
+    let layers = match info.get_mut("layers").map(Value::take) {
+        Some(Value::Array(v)) => v,
+        _ => Vec::new(),
+    };
+    let mut types: Map<String, Value> = Map::new();
+    for l in &layers {
+        let t = l["type"].as_str().unwrap_or("?").to_string();
+        let n = types.get(&t).and_then(Value::as_u64).unwrap_or(0);
+        types.insert(t, json!(n + 1));
+    }
+    let hidden = layers.iter().filter(|l| l["switches"]["video"] == false).count();
+    let parented = layers.iter().filter(|l| !l["parent"].is_null()).count();
+    info["summary"] = json!(true);
+    info["layerCount"] = json!(layers.len());
+    info["types"] = Value::Object(types);
+    info["hidden"] = json!(hidden);
+    info["parented"] = json!(parented);
+    info["layers"] = layers
+        .iter()
+        .take(COMP_SUMMARY_LAYERS)
+        .map(|l| json!({"index": l["index"], "id": l["id"], "name": l["name"], "type": l["type"], "in": l["in"], "out": l["out"]}))
+        .collect();
+    info["hint"] = json!(format!("summary: counts and the top {COMP_SUMMARY_LAYERS} layers; leave `summary` out for every layer (paged)"));
+    info
 }
 
 /// Flatten a `layer.tree` property tree into `[{path, type, value, keys?, expression?}]`.
@@ -1302,7 +1384,63 @@ fn lint_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
         ("minTextPx", get(a, "min_text_px")),
         ("minContrast", get(a, "min_contrast")),
     ]);
-    json_reply(b.exec("render.lint", p)?)
+    let mut r = b.exec("render.lint", p)?;
+    // Long lists come as a summary unless asked for in full (`summary: false`).
+    let many = r["problems"].as_array().is_some_and(|v| v.len() > LINT_SUMMARY_OVER);
+    if get(a, "summary").and_then(Value::as_bool).unwrap_or(many) {
+        r = lint_summary(r);
+    }
+    json_reply(r)
+}
+
+/// `lint_frame` answers with a summary by default above this many problems.
+const LINT_SUMMARY_OVER: usize = 40;
+/// Problems and layers a summary lists.
+const SUMMARY_TOP: usize = 10;
+
+/// A lint reply cut to counts per rule and per layer plus the worst problems (errors first, info
+/// left out).
+fn lint_summary(mut r: Value) -> Value {
+    let problems = r.get_mut("problems").map(Value::take).and_then(|v| match v {
+        Value::Array(v) => Some(v),
+        _ => None,
+    });
+    let problems = problems.unwrap_or_default();
+    let rank = |p: &Value| match p["severity"].as_str() {
+        Some("error") => 0,
+        Some("warning") => 1,
+        _ => 2,
+    };
+    let mut by_rule: Map<String, Value> = Map::new();
+    let mut by_layer: Vec<(Value, Value, usize, Vec<String>)> = Vec::new();
+    for p in &problems {
+        let rule = p["rule"].as_str().unwrap_or("?").to_string();
+        let sev = p["severity"].as_str().unwrap_or("info").to_string();
+        let e = by_rule.entry(rule.clone()).or_insert_with(|| json!({}));
+        e[&sev] = json!(e[&sev].as_u64().unwrap_or(0) + 1);
+        if rank(p) < 2 {
+            match by_layer.iter_mut().find(|l| l.0 == p["layer"]) {
+                Some(l) => {
+                    l.2 += 1;
+                    if !l.3.contains(&rule) {
+                        l.3.push(rule);
+                    }
+                }
+                None => by_layer.push((p["layer"].clone(), p["layerName"].clone(), 1, vec![rule])),
+            }
+        }
+    }
+    by_layer.sort_by_key(|l| std::cmp::Reverse(l.2));
+    let mut top: Vec<&Value> = problems.iter().filter(|p| rank(p) < 2).collect();
+    top.sort_by_key(|p| rank(p));
+    r["summary"] = json!(true);
+    r["byRule"] = Value::Object(by_rule);
+    r["byLayer"] = by_layer.iter().take(SUMMARY_TOP).map(|l| json!({"layer": l.0, "layerName": l.1, "problems": l.2, "rules": l.3})).collect();
+    r["problems"] = top.iter().take(SUMMARY_TOP).map(|p| (*p).clone()).collect();
+    r["listed"] = json!(top.len().min(SUMMARY_TOP));
+    r["total"] = json!(problems.len());
+    r["hint"] = json!("summary: the worst problems and counts per rule and layer; `summary: false` lists every problem, `rules` narrows to some rules");
+    r
 }
 
 fn taste_check(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -1540,7 +1678,8 @@ static TOOLS: &[ToolDef] = &[
         bridge_only: false,
         schema: || {
             schema(
-                json!({"comp": comp_s(), "full": full_s("layers"), "max_chars": max_chars_s(), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT)}),
+                json!({"comp": comp_s(), "full": full_s("layers"), "max_chars": max_chars_s(), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT),
+                    "summary": {"type": "boolean", "description": "true: the comp's settings, `layerCount`, layers per type (`types`), `hidden` and `parented` counts and only the top 20 layers."}}),
                 &[],
             )
         },
@@ -1780,7 +1919,8 @@ static TOOLS: &[ToolDef] = &[
                     "step": {"type": "number", "description": "Seconds between range samples (default 0.5)."},
                     "rules": {"type": "array", "items": {"type": "string", "enum": effectcraft_engine::lint::RULES}, "description": "Only these rules (default all)."},
                     "min_text_px": {"type": "number", "description": "Smallest legible font size on screen, comp pixels (default comp height / 30)."},
-                    "min_contrast": {"type": "number", "description": "Smallest acceptable WCAG contrast ratio (default 3)."}
+                    "min_contrast": {"type": "number", "description": "Smallest acceptable WCAG contrast ratio (default 3)."},
+                    "summary": {"type": "boolean", "description": "true: counts per rule (`byRule`) and per layer (`byLayer`, top 10) plus the 10 worst problems instead of every problem. Default: on when there are more than 40 problems; false lists them all."}
                 }),
                 &[],
             )

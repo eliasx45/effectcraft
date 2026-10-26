@@ -62,7 +62,11 @@ row of `index`, `id`, `name`, `type`, `in`, `out` plus only what isn't the defau
 Lists are paged with `offset` / `limit` (defaults: 200 layers, 100 keyframes for `get_property`,
 150 properties for `get_layer {flat: true}`). Every paged reply carries its total (`layerCount`,
 `keyCount`, `total`), `returned` and `next_offset` (null when nothing follows); a cut list also
-carries `truncated: {returned, total, next_offset, hint}`. `get_property` keys are
+carries `truncated: {returned, total, next_offset, hint}`. A cut live read (`get_comp`, `get_layer`,
+`get_property`, `doc_inspect`, `get_field`) also carries `page_token` (`r<revision>o<offset>`): pass
+it back as `page_token` to get the next page at the same revision, with no `expectRevision`.
+`get_comp {summary: true}` gives the settings, `layerCount`, layers per type, hidden and parented
+counts and only the top 20 layers. `get_property` keys are
 `{time, value, compTime?, in?, out?}` (interpolation omitted when Linear, values rounded to 4
 decimals). A `get_layer` tree over 8,000 characters carries a `hint` to use the flat list.
 `full: true` (on `get_comp`, `doc_inspect`, `get_property`) returns the long form unchanged.
@@ -145,7 +149,7 @@ CLI, scripts (`app.run`) and the control channel get the same.
 | Tool | Command | Result |
 | --- | --- | --- |
 | `get_layout` | `layer.bounds` | Per layer: `visible` + `why`, comp-space `bounds`, `corners`, `center`, `anchorInComp`, `onScreen`, `source`; optional `pixelBounds` and `overlaps` |
-| `lint_frame` | `render.lint` | Design problems at a time or over a range (`clean`, `counts`, `problems` with rule, severity, layer, time..until and a fix hint); rules in [agents.md](agents.md#design-lint) |
+| `lint_frame` | `render.lint` | Design problems at a time or over a range (`clean`, `counts`, `problems` with rule, severity, layer, time..until and a fix hint); over 40 problems (or `summary: true`) a summary: `byRule`, `byLayer` (top 10) and the 10 worst problems, `summary: false` for all; rules in [agents.md](agents.md#design-lint) |
 | `get_motion` | `comp.motion` / `layer.motion` | Per layer over a time range: `segments` (enter, exit, move, hold, scale, rotate, fade-in, fade-out), `offscreen` intervals, a `summary` sentence; `overlaps` between drawn layers ([agents.md](agents.md#motion-summary)) |
 | `analyze_audio` | `audio.analyze` | Peak, true peak, RMS, integrated LUFS, clipped samples, silences, channels; optional waveform |
 
@@ -317,7 +321,8 @@ use numeric IDs, canonical property paths or `@uid` to address a specific object
 `rolled_back: true`. A transport error is not proof of rollback: inspect before retrying.
 
 Pass `expectRevision` from an inspection to a convenience edit or command tool. Live read
-continuations (`offset > 0`) require that revision; a changed project is an error. Field
+continuations (`offset > 0`) require that revision (or the `page_token`, which carries it); a
+changed project is an error. Field
 retrieval also pins the original composition and time. `command_batch` uses a single engine
 call with non-atomic step receipts, preserving its separate undo steps and `stop_on_error`
 behavior. Atomic `batch` preflights every step against an explicit allowlist; use

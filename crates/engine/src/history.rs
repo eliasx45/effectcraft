@@ -298,6 +298,13 @@ impl History {
         }
     }
 
+    /// The working line's shape (lengths and last states of undo / redo, branch count): a write
+    /// that changes the project but not this made no step ([`Session::adopt_moved_state`]).
+    pub(crate) fn shape(&self) -> [usize; 5] {
+        let last = |v: &[(String, Arc<Project>)]| v.last().map_or(0, |(_, p)| key(p));
+        [self.undo.len(), last(&self.undo), self.redo.len(), last(&self.redo), self.branches.len()]
+    }
+
     /// Whether own-step undo is done with the step that made `state` (see `settled`).
     pub fn settled(&self, state: &Arc<Project>) -> bool {
         self.settled.get(&key(state)).is_some_and(|w| w.strong_count() > 0)
@@ -315,7 +322,32 @@ impl History {
     }
 }
 
+/// The current state as last seen by [`Session::adopt_moved_state`].
+#[derive(Clone, Default)]
+pub struct SeenState {
+    addr: usize,
+    epoch: u64,
+    shape: [usize; 5],
+    author: Option<String>,
+}
+
 impl Session {
+    /// A write outside the undo history (footage found missing after open, a comp's Resolution)
+    /// replaces the project without a step, and `Arc::make_mut` moves it to a new address while
+    /// the author map holds a weak reference: the state keeps who made it. Run before each command
+    /// and on every change ([`Session::bump`]).
+    pub(crate) fn adopt_moved_state(&mut self) {
+        let addr = key(&self.project);
+        let shape = self.history.shape();
+        let seen = &self.seen_state;
+        if addr != seen.addr && seen.epoch == self.epoch && seen.shape == shape && seen.author.is_some() && self.history.author(&self.project).is_none() {
+            let author = seen.author.clone();
+            self.history.set_author(&self.project, author);
+        }
+        let author = self.history.author(&self.project).map(str::to_string);
+        self.seen_state = SeenState { addr, epoch: self.epoch, shape, author };
+    }
+
     /// The undo history as a tree (the History panel, `edit.history.list`).
     pub fn history_tree(&self) -> Vec<HistoryNode> {
         self.history.tree(&self.project)
