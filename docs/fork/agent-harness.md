@@ -5,6 +5,33 @@ Fork-only (eliasx45). Written 26 October 2026 from the code and commit history o
 Goal: an agent that **edits video** in EffectCraft and gets better in a way we can measure. This
 isn't about checking code.
 
+## 0. Decisions (keep this section current)
+
+Elias's decisions so far, newest last. Change a row only when he changes his mind, and say so in
+the history at the end of this file.
+
+| # | Decision | Date |
+|---|---|---|
+| D1 | **Goal:** an agent that edits video in EffectCraft, measured by evals. Evals are for editing quality, not for checking code | 26 Oct |
+| D2 | **Build both and compare.** *Outside the harness:* Claude Code is the loop (route C), with EC's MCP tools, hooks and skills, on the subscription. *Inside the harness:* our own Rust loop (route B), on an API key. Both run the same exam | 26 Oct |
+| D3 | **One policy core, two drivers.** The rules (taste/lint gate, context, approvals, budgets, trace) are written once in Rust. Claude Code reaches them through `effectcraft-cli hook …`; our loop calls them directly | 26 Oct |
+| D4 | **agentloop is a design reference only.** Clean-room: ideas from its README and behaviour, no code copied. Route A (a Go sidecar) is not the product; at most a throwaway spike | 26 Oct |
+| D5 | **API key is fine for testing B.** Whether to keep paying for it long term depends on a measured, significant improvement over C | 26 Oct |
+| D6 | **Claude models first.** Other models only as an eval comparison (e.g. through an Anthropic-compatible endpoint) | 26 Oct |
+| D7 | **Terms:** the subscription is only used by unmodified Claude Code (interactive, or `claude -p` without `--bare`). B and A never run through subscription credentials. `ANTHROPIC_API_KEY` stays unset for subscription runs, or they bill the key | 26 Oct |
+| D8 | **Don't embed Claude Code in the app now.** Build the two gains without embedding: *pins* (frame, region or range sent to the agent) and a *companion panel* (Claude Code turns linked to their revisions). Revisit embedding only if the agent ships to other users | 26 Oct |
+| D9 | **Real projects stay local.** Handover tasks built from Elias's projects never go into git or anything the agent can read | 26 Oct |
+
+### Open questions (ask Elias)
+
+| # | Question | Why it matters |
+|---|---|---|
+| Q1 | How much of the subscription limit may one eval run use, and what's the monthly API cap for B? | 21 tasks × 3 trials ≈ 63 sessions per driver |
+| Q2 | Which models to compare: Opus only, or Opus / Sonnet / Haiku, plus a non-Claude model? | Sets the size of E0 and of every comparison |
+| Q3 | Where do the `ec-handover-snap` snapshots live, and may they become local eval tasks? | E3, the best ground truth we have |
+| Q4 | Is "Elias's edits after handover" the north star, or is it time saved, or something else? | Decides what "better" means for every comparison |
+| Q5 | Which driver first after E0: C (days) or B (weeks)? Recommended: C first, B right after, so there's a baseline to beat | Order of work |
+
 ## 1. What agentloop is, briefly
 
 agentloop is a Go library (about 6 000 lines with tests; one dependency, `llmhub`, for model
@@ -186,65 +213,104 @@ runs a Stop hook (`ec-handover-snap`).
   - It isn't in the app, and you can't ship it to EffectCraft users.
 - **Ceiling:** a strong baseline and a power-user setup on Elias's machine, but you don't own it.
 
-### Recommendation
+### Recommendation (now decision D2)
 
-Do them **in order, not instead of each other**:
-1. **Now, route C.** Get a baseline. Add the taste and lint finish veto as a Claude Code Stop hook,
-   and measure it with the exam. That's days, not weeks, and it answers the first question: do
-   hard gates help?
-2. **Then route B.** Build the Rust agent crate, porting agentloop's *design* (clean-room: its
-   README and behaviour, not its code, even though MIT would allow it; repos don't share code).
-   The Claude Code run stays in the exam as the baseline to beat.
-3. **Route A only as a throwaway spike**, if we want a multi-model comparison before B has more
-   than one provider. Never as the product.
+Build **B and C both**, on **one policy core** (D3), and let the exam decide. A stays a
+throwaway spike at most (D4).
+
+```text
+                   ┌──────────────── policy core (Rust) ────────────────┐
+                   │ taste + lint gate · context packet · approvals ·   │
+                   │ budgets + dup calls · pins · trace                 │
+                   └───────▲─────────────────────────────▲──────────────┘
+                           │                             │
+     C: Claude Code driver │ effectcraft-cli hook …      │ direct calls   B: EC agent driver
+     (subscription)        │ (Stop, UserPromptSubmit,    │ (API key)      (our loop, Anthropic
+                           │  PreToolUse, PostToolUse)   │                 Messages API)
+                   ┌───────┴───────┐             ┌───────┴───────┐
+                   │  claude (CLI) │             │ effectcraft-  │
+                   │  + EC MCP     │             │ cli agent "…" │
+                   └───────┬───────┘             └───────┬───────┘
+                           └──────────► EffectCraft ◄────┘
+                              (app via --bridge, or headless)
+```
 
 ## 5. The plan
 
-**E0: baseline (first).** Run the exam as it is: 21 tasks × 3 trials, one model. Record the pass
-rate, pass^3, mean tool calls, minutes and cost in `docs/fork/agent-evals.md` (a new file; history
-appended). Read every failed trace and file the patterns.
+**E0: baseline (first).** Run the exam as it is, on C: 21 tasks × 3 trials, one model, settings
+pinned (§7). Record the pass rate, pass^3, mean tool calls, minutes and cost in
+`docs/fork/agent-evals.md` (a new file; history appended). Read every failed trace and file the
+patterns.
 
 **E1: exam upgrades.**
 - `--trials N` with pass@k and pass^k in the report.
-- Per-trial cost from `stream-json` usage.
+- `--driver claude-code|ec-agent`, so both drivers run the same tasks.
+- Per-trial cost: `total_cost_usd` from Claude Code's result, token usage from B.
 - A taste check shorthand (`{"taste": {comp, layer?}, "maxVerdict": "close"}`) so tasks grade ease
   quality.
 - A `notes` field in the report for trace tags.
 - Tag every task `capability` or `regression`.
 
-**E2: trace analysis.** `cargo xtask agent-exam --analyze DIR` groups failures by cause from the
-trace: the tool error text, repeated identical calls, the last tool before giving up, and the
-checks that failed. Use a model to tag only what rules can't, and check the tags by hand at first.
+**P1: the policy core.** One Rust module, at L5 with the engine, no model calls in it:
+- `gate(project) → ok | findings`: `taste.check` + `render.lint`, with each finding's `fix` call.
+- `context(project, client) → text`: `context.packet` plus `agent.notices` plus pins.
+- `approve(command, params) → allow | ask(preview) | deny`: destructive commands, claims,
+  `expectRevision`.
+- `budget(trace) → ok | warn | stop`: tool-call budget, repeated identical calls.
+- `record(event)`: one trace format for both drivers, linked to revisions.
 
-**E3: handover tasks (the gold).** From `ec-handover-snap` pairs, build local, gitignored tasks:
-- **Start:** the brief's project before the agent ran.
-- **Prompt:** the original instruction.
-- **Graders:**
-  - (a) the code checks the fixed version passes;
-  - (b) the **distance to Elias's fix**: how many of his post-handover edits the agent's version
-    would still need, read through `edit_feed`-style property diffs;
-  - (c) taste and lint clean.
+Tests use recorded traces, no model.
 
-Real projects never leave the machine.
+**C1–C4: the Claude Code driver** (outside the harness, subscription):
+- **C1:** `effectcraft-cli hook stop` calls `gate`. It **blocks the stop** with the findings until
+  taste and lint pass, at most N times, then lets the agent stop and say what's left.
+- **C2:** `hook prompt` (`UserPromptSubmit`) and `hook post-tool` (`PostToolUse`) add the
+  `context` text. `hook pre-tool` (`PreToolUse`) calls `approve`. `hook post-tool` also calls
+  `budget`.
+- **C3:** the setup lives in the repo, so evals are reproducible: `integrations/claude-code/`
+  holds `settings.json` (the hooks), `mcp.json`, skills (`SKILL.md`: motion recipes, Elias's ease
+  rules, library scenes) and a **critic sub-agent** (`agents/motion-critic.md`: contact sheet +
+  `get_motion` + taste results, reports what's off before handover).
+- **C4:** the exam runs C with that folder only (`--settings`, `--mcp-config`,
+  `--strict-mcp-config`), A/B-testing each piece: with and without the gate, with and without the
+  critic.
 
-**E4: multi-turn and footage tasks.**
-- Revision rounds ("make the pop snappier", "move it to the beat on 'copy'").
-- Speech-map and beat tasks with generated audio.
-- Footage tasks with own or generated media only.
-
-**E5: calibrated model grader.**
-- Frames: a contact sheet from `render_frames` plus `get_motion` text, scored against a rubric.
-- Calibration: measure agreement with Elias's verdicts on 30–50 held-out comps.
-- Rule: use it only where it agrees ≥ 80 %, and always alongside the code checks.
-
-**B1–B5: the Rust agent crate** (after E0–E2 give us the measuring stick):
+**B1–B5: the EC agent driver** (inside the harness, API key):
 - **B1:** loop, budgets, forced final answer, dup detection, trace, scripted provider; tests only.
-- **B2:** Anthropic client (streaming, tool use, prompt caching); `effectcraft-cli agent`.
-- **B3:** hooks wired to the engine: the taste and lint finish veto, `context.packet` in
-  `RebuildContext`, claims and approval in `BeforeToolCall`, a steering inbox.
-- **B4:** skills from `SKILL.md` folders (shared with the Claude Code setup).
-- **B5:** the exam runs B and Claude Code side by side. B ships in the app only once it beats or
-  matches the baseline on pass^3 and post-handover edits.
+- **B2:** Anthropic Messages API client (streaming, tool use, prompt caching);
+  `effectcraft-cli agent "…"` against the app (`--bridge`) or headless.
+- **B3:** the policy core wired in natively:
+  - `gate` as the finish veto;
+  - `context` as a `RebuildContext` that replaces stale tool output each step (C can only add
+    context);
+  - `approve` before each tool call;
+  - a steering inbox.
+- **B4:** the same skills and critic rubric as C3.
+- **B5:** in the exam beside C. Keep B long term only if it beats C clearly on pass^3 and
+  post-handover edits (D5).
+
+**U1–U2: app pieces, used by both drivers** (D8):
+- **U1: pins.** "Pin for agent" in the viewer, Timeline and Graph Editor: a frame, a drawn region,
+  a time range or keys, with an optional note. Read through the `get_pins` MCP tool. The next
+  reply carries a `notice` that there are new pins.
+- **U2: companion panel.** It reads the live Claude Code transcript
+  (`~/.claude/projects/<project>/<session>.jsonl`) or B's trace, and lists each turn with the
+  revisions it made (matched through the change feed's client and times). Per turn: jump to the
+  comp, before/after in the viewer, undo the turn (per-client undo).
+
+**E2–E5: deeper evals** (as before):
+- **E2:** trace analysis (`--analyze`).
+- **E3:** local handover tasks graded by the distance to Elias's fix.
+- **E4:** multi-turn revision rounds, speech, beat and footage tasks.
+- **E5:** a model grader calibrated against Elias's verdicts.
+
+**M1: model comparison.**
+- Claude models with `--model` on C (subscription) and on B (key).
+- A non-Claude model by pointing C at an Anthropic-compatible endpoint (`ANTHROPIC_BASE_URL`,
+  e.g. Kimi, with its own key). Same loop, so it's a fair test.
+
+**Order:** E0 → E1 → P1 → C1–C4 → U1 → B1–B5 → U2 → E2–E5, with M1 whenever a comparison is
+wanted.
 
 ## 6. How agentloop's hooks map to EffectCraft
 
@@ -259,3 +325,75 @@ Real projects never leave the machine.
 | Dup-call limit | Catches the "render frame, look, render the same frame" loop |
 | Skills L0–L3 | Motion recipes (lower thirds, pops, rigs, Elias's ease rules) as `SKILL.md`; scripts = `.jsx` via `run_script {file}` |
 | Scripted provider | Agent-loop bugs as unit tests, no model, no network |
+
+## 7. Subscription, API key and the terms (checked 26 Oct)
+
+From Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance)
+and the [headless docs](https://code.claude.com/docs/en/headless). Recheck before anything large or
+hosted: terms change.
+
+- **Subscription sign-in (OAuth)** "is designed to support ordinary use of Claude Code and other
+  native Anthropic applications". Interactive Claude Code and `claude -p` on Elias's machine are
+  that.
+- **Products, including Agent SDK ones, use an API key.** Third parties may not "route requests
+  through Free, Pro, or Max plan credentials". That's why B never runs through `claude -p`, and why
+  `claude -p` can't be B's model backend: it's a whole agent, not a model endpoint.
+- **What the Agent SDK is:** Claude Code's own loop as a library for TypeScript and Python. The
+  headless docs call `claude -p` "the Agent SDK via the CLI".
+- **Limits.** Pro and Max limits "assume ordinary, individual usage of Claude Code and the Agent
+  SDK". The pool is shared with Claude chat, with a 5-hour window and a weekly cap. Large eval runs
+  eat into normal work.
+- **`ANTHROPIC_API_KEY`** in the environment makes Claude Code bill the key instead of the
+  subscription.
+- **`--bare`** (the recommended scripted mode: no `~/.claude` hooks, skills, memory or `CLAUDE.md`)
+  doesn't use the subscription at all; it needs a key.
+
+Consequences for evals:
+- **C on the subscription.** These runs load Elias's own `~/.claude` setup, so pin everything
+  that matters: `--settings integrations/claude-code/settings.json`, `--mcp-config` with
+  `--strict-mcp-config`, a fixed working folder, and the Claude Code version recorded in the
+  report.
+- **Fully isolated C runs** (`--bare` or `--restricted`) use the key, like B.
+
+**Other models in Claude Code.** Claude Code talks to any server that speaks Anthropic's API format
+(`ANTHROPIC_BASE_URL` plus that provider's token). Some providers, Kimi among them, offer one. It's
+Claude Code's loop with their model, billed by them. Useful for M1; it doesn't put Claude models
+on the subscription into A or B.
+
+## 8. Claude Code inside the app: what it would gain and lose (decision D8)
+
+**Today:** Claude Code runs in the terminal and its `effectcraft-app` MCP server is bridged to the
+running app (`--control 9877`). The agent already sees everything live, has its own cursor and
+undo, claims comps, and sees Elias's edits through the change feed and `notice`s. Embedding wouldn't
+let it see or do more. It changes who starts `claude` and where its output appears.
+
+| Gain from embedding | Without embedding |
+|---|---|
+| Show by pointing: a region, frame or range goes with the message (`stream-json` input takes images) | **U1 pins** + `get_pins` |
+| Turns linked to revisions: undo a turn, before/after a turn | **U2 companion panel**, reading the transcript file |
+| Approvals with a rendered preview, answered in an app dialog (`--permission-prompt-tool` can be an EC MCP tool) | Partly: a `PreToolUse` hook can render the preview; the answer stays in the terminal |
+| Exact brief → result → Elias's fixes capture | Mostly: the Stop hook + change feed (`ec-handover-snap`) |
+| Other users without a terminal | No; only by embedding, or by B |
+
+**Losses from embedding:**
+- **Claude Code's terminal UI.** In `-p` mode, built-in commands that only run in the terminal
+  interface aren't available: `/login`, pickers, plan-mode approval, permission dialogs, rewind.
+  Whatever we don't rebuild is gone.
+- **Two sessions.** It's a second session beside the terminal one that builds EffectCraft.
+- **Engineering and upkeep.**
+  - Process management, `stream-json` parsing, login detection.
+  - Three desktop platforms.
+  - Impossible in the web build.
+  - The protocol changes between Claude Code versions.
+- **Closer to the terms line** (§7).
+- **Nothing gained over C.** Still Claude Code's loop: no context reshaping, no other models.
+
+Revisit if the agent is meant to ship to EffectCraft users. B with each user's own key is then
+likely the cleaner product.
+
+## History
+
+| Date | Change |
+|---|---|
+| 26 Oct | First version: map, gaps, evals primer, routes A/B/C, plan |
+| 26 Oct | Decisions D1–D9 and open questions; plan reworked for both drivers on one policy core; terms (§7); embedding analysis (§8) |
