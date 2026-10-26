@@ -419,13 +419,8 @@ fn import_doc(next: &mut Project, bytes: &[u8], source_dir: &str, resolve_media:
                         comp.background[i] = v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32;
                     }
                 }
-                // The comp's Frame Blending switch when the IR has it; otherwise off (the default).
-                if let Some(v) = field(item, &["frame_blending"]).and_then(Json::as_bool) {
-                    comp.enable_frame_blending = v;
-                }
-                if let Some(v) = field(item, &["motion_blur"]).and_then(Json::as_bool) {
-                    comp.enable_motion_blur = v;
-                }
+                // The comp's Motion Blur and Frame Blending switches stay off whatever the AE comp had
+                // (Elias, 26 Oct 2026: on by default only slows previews; he turns them on himself).
                 ItemKind::Comp(Arc::new(comp))
             }
             "footage" => {
@@ -1977,6 +1972,16 @@ mod tests {
         let mut project = Project::default();
         let result = import_ir(&mut project, bytes, "", &mut |_| None).map_err(|e| e.to_string())?;
         Ok((project.to_file_json().map_err(|e| e.to_string())?, format!("{result:?}")))
+    }
+
+    #[test]
+    fn comps_arrive_with_motion_blur_and_frame_blending_off() {
+        let ir = br#"{"schema_version":1,"items":[{"id":1,"kind":"comp","name":"C","width":10,"height":10,"duration":1,"frame_rate":30,"motion_blur":true,"frame_blending":true,"layers":[]}]}"#;
+        let mut project = Project::default();
+        import_ir(&mut project, ir, "", &mut |_| None).unwrap();
+        let comps: Vec<_> = project.items.values().filter_map(|i| if let ItemKind::Comp(c) = &i.kind { Some(c.clone()) } else { None }).collect();
+        assert_eq!(comps.len(), 1);
+        assert!(!comps[0].enable_motion_blur && !comps[0].enable_frame_blending);
     }
 
     fn fidelity_fixture() -> String {
