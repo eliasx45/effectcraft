@@ -387,3 +387,24 @@ fn rig_entrances_scrubs_and_his_fast_exits_read_as_he_animates() {
     assert!(pct > 18.0 && pct < p.rules.exit_speed_cap, "{m:#}");
     assert_eq!(m["verdict"], "approved", "{m:#}");
 }
+
+#[test]
+fn align_peak_keeps_an_approved_curve() {
+    // HT4 (A/B r2 #1): keys.alignPeak's auto-picked graph turned ✅ rig entrances into ❌.
+    for (mode, frame) in [("shift", 40), ("stretch-out", 33)] {
+        let (mut s, cid, l) = comp();
+        key(&mut s, l, "transform/position", 1.0, json!([960.0, 1300.0]));
+        key(&mut s, l, "transform/position", 1.6, json!([960.0, 540.0]));
+        ease(&mut s, cid, l, "transform/position", 0, (0.0, 0.1), (0.0, 100.0));
+        let before = only(&check(&mut s), "transform/position");
+        assert_eq!((before["moveType"].as_str(), before["verdict"].as_str()), (Some("entrance"), Some("approved")), "{before:#}");
+        let a = s.execute_checked("keys.alignPeak", json!({"layer": l, "path": "transform/position", "frame": frame, "mode": mode})).unwrap();
+        let res = &a["results"][0];
+        assert_eq!(res["graph"], "keep", "{mode}: {a:#}");
+        assert!(res["offsetFrames"].as_f64().unwrap().abs() <= 0.5, "{mode}: {a:#}");
+        let after = only(&check(&mut s), "transform/position");
+        assert_eq!(after["verdict"], "approved", "{mode}: {after:#}");
+        assert_eq!(after["curve"], before["curve"], "{mode}: {after:#}");
+        assert_ne!(after["from"], before["from"], "{mode}: the keys moved: {a:#}");
+    }
+}

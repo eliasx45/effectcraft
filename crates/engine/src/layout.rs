@@ -33,7 +33,7 @@ pub struct LayerGeometry {
 /// (cameras, lights, empty text or shape layers).
 pub fn layer_geometry(ctx: &EvalCtx, layer: &Layer) -> Option<LayerGeometry> {
     let b = effectcraft_render::content_bounds(ctx, layer)?;
-    let (m, _) = ctx.layer_to_comp(layer);
+    let m = box_to_comp(ctx, layer);
     let mut projected = true;
     let corners = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]].map(|p| {
         let (q, ok) = to_comp(&m, p);
@@ -62,8 +62,15 @@ pub fn anchor_in_comp(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
         return None;
     }
     let a = ctx.v3(layer, tr, "anchor", [0.0; 3]);
-    let (q, ok) = to_comp(&ctx.layer_to_comp(layer).0, [a[0], a[1]]);
+    let (q, ok) = to_comp(&box_to_comp(ctx, layer), [a[0], a[1]]);
     ok.then_some(q)
+}
+
+/// Layer → comp after the Transform effects the layer's children follow (Children Follow): the
+/// box and anchor are where those effects put the pixels, as the viewer draws them.
+fn box_to_comp(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
+    let m = ctx.layer_to_comp(layer).0;
+    ctx.follow_fx_2d(layer).map_or(m, |f| m * f)
 }
 
 /// Whether the compositor draws `layer` at the context time, and if not, why (every reason that

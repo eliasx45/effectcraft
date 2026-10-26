@@ -383,6 +383,18 @@ fn history_feed(s: &mut Session, p: &Value) -> Result<Value> {
 /// Empty for the user and on a client's first call.
 fn notices(s: &mut Session, _: &Value) -> Result<Value> {
     let Some(me) = s.client.clone() else { return Ok(json!({})) };
+    let mut r = others_notices(s, &me)?;
+    // The client's own edits since its last taste check / lint (once).
+    if let Some(note) = super::handover::stale_notice(s, &me) {
+        let text = r.get("text").and_then(Value::as_str).map_or(note.clone(), |t| format!("{t}\n{note}"));
+        r["handover"] = json!(note);
+        r["text"] = json!(text);
+    }
+    Ok(r)
+}
+
+fn others_notices(s: &mut Session, me: &str) -> Result<Value> {
+    let me = me.to_string();
     let (rev, epoch, path) = (s.revision, s.epoch, s.path.clone());
     let Some((seen, seen_epoch, seen_path)) = s.feed.mark_seen(&me, rev, epoch, path.clone()) else { return Ok(json!({})) };
     let name = |p: &Option<String>| p.as_deref().map(|p| p.rsplit('/').next().unwrap_or(p).to_string()).unwrap_or_else(|| "an unsaved project".into());
@@ -451,7 +463,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "agent.notices",
             "Agent Notices",
-            "{} → for the calling client, once: `projectChanged` {from, to} when another project was opened since its last call, else `meanwhile` (what the user or other agents changed since then, in words); `text` sums it up. {} when nothing happened",
+            "{} → for the calling client, once: `projectChanged` {from, to} when another project was opened since its last call, else `meanwhile` (what the user or other agents changed since then, in words); `handover` when its own edits changed layers its last taste.check / render.lint covered (rerun before handover); `text` sums it up. {} when nothing happened",
             notices
         ),
     ]

@@ -232,6 +232,19 @@ impl<'a> EvalCtx<'a> {
         m
     }
 
+    /// [`Self::follow_fx`]'s matrix as a 2D affine (layer pixels): `None` when nothing is followed.
+    pub fn follow_fx_2d(&self, layer: &Layer) -> Option<Mat3> {
+        let m = self.follow_fx(layer)?.0.0;
+        Some(Mat3([[m[0][0], m[0][1], m[0][3]], [m[1][0], m[1][1], m[1][3]], [0.0, 0.0, 1.0]]))
+    }
+
+    /// The space a layer's children live in: its [`Self::world_matrix`] then the Transform
+    /// effects they follow (see [`Self::follow_fx`]).
+    pub fn child_space(&self, layer: &Layer) -> Mat4 {
+        let m = self.world_matrix(layer);
+        self.follow_fx(layer).map_or(m, |f| m * f.0)
+    }
+
     /// The layer's Transform effects that its children follow (Children Follow, see
     /// `effectcraft_effects::transform_follow`), in stack order, as one layer-space matrix, and
     /// the opacity factor they pass on. `None` when no enabled Transform effect passes anything.

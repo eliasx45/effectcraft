@@ -32,6 +32,13 @@ pub struct Entry {
     after: Arc<Project>,
 }
 
+impl Entry {
+    /// The project before and after this change.
+    pub(crate) fn projects(&self) -> (&Arc<Project>, &Arc<Project>) {
+        (&self.before, &self.after)
+    }
+}
+
 /// What a client was last told: the revision it has seen others' changes up to, and the project.
 #[derive(Clone, Default)]
 struct Seen {

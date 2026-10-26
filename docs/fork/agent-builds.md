@@ -1,5 +1,7 @@
 # Agent builds on this fork (eliasx45/effectcraft)
 
+> **Since 26 Oct (Elias): work on `main` in the main checkout, no lanes, and no long compiles, tests or builds; he runs them at night.** Write tests but don't run them, commit only your own files straight to `main` and push. Lanes (below) only with his OK, for tasks that heavily overlap. Where this file says otherwise, this note wins.
+
 Fork-only rules. They are not part of upstream (`storytold/effectcraft`); keep this folder out of
 upstream pull requests. Where they differ from `CLAUDE.md` / `AGENTS.md` / `docs/testing.md`, they win
 on this fork.

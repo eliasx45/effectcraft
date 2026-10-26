@@ -244,6 +244,56 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
 
+    if set.on("off-word") {
+        match comp.speech.as_deref().filter(|m| !m.words.is_empty()) {
+            None => notes.push("off-word skipped: the comp has no speech map".into()),
+            Some(map) => {
+                let fps = comp.frame_rate.as_f64();
+                let lead = frames_p(p, "accentLead", lint::DEFAULT_ACCENT_LEAD, 0.0, C)?;
+                let half = if range || fps.is_nan() || fps <= 0.0 { 0.0 } else { 0.5 / fps };
+                let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, comp, effectcraft_time::Tick::ZERO);
+                let entries = crate::appear::plan(&ctx, map, None, lead);
+                let checked = entries.iter().filter(|e| e.sure()).count();
+                let mut n = 0;
+                for e in entries.iter().filter(|e| e.sure() && e.off_by.abs() > crate::appear::OFF_WORD_FRAMES) {
+                    let at = e.peak.as_ref().map_or(e.appear, |p| p.2);
+                    if at < span.0 - half || at > span.1 + half {
+                        continue;
+                    }
+                    let Some((_, word, _)) = &e.word else { continue };
+                    let (what, target) = match &e.peak {
+                        Some((prop, _, t)) => (
+                            format!("its {prop} entrance peaks at frame {:.0}", t * fps),
+                            format!("the stressed syllable of \"{word}\" (frame {:.0})", e.accent * fps),
+                        ),
+                        None => (format!("it appears at frame {:.0}", e.appear * fps), format!("\"{word}\" (said at frame {:.0})", e.word_start * fps)),
+                    };
+                    n += 1;
+                    occurrences.push((
+                        effectcraft_time::Tick::from_seconds_f64(at),
+                        lint::Finding {
+                            rule: "off-word",
+                            severity: lint::Severity::Warning,
+                            layer: e.layer,
+                            other: None,
+                            inner: None,
+                            message: format!(
+                                "“{}” shows {:?}: {what}, {:.0} frames {} {target}. Move its entrance by {:+.0} frames (speech.appearPlan lists every layer).",
+                                e.name,
+                                e.shows.chars().take(40).collect::<String>(),
+                                e.off_by.abs(),
+                                if e.off_by > 0.0 { "after" } else { "before" },
+                                -e.off_by.round()
+                            ),
+                            fix: crate::appear::fix(e, fps),
+                        },
+                    ));
+                }
+                notes.push(format!("off-word: {checked} layers matched to the word they show; more than {} frames off: {n}", crate::appear::OFF_WORD_FRAMES));
+            }
+        }
+    }
+
     if set.on("off-taste") {
         let (prof, _) = crate::taste::Profile::load(s.config.as_deref());
         let (moves, truncated) =

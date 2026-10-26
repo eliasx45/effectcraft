@@ -5,7 +5,8 @@
 //! `stretch-out` retime one key, `ease` only changes the influences within the graph's family.
 //! Every move can take one of Devin Jatho's five ease graphs ([`GRAPHS`], Motion Library →
 //! Devin Jatho → Graphs); without one, the graph whose peak sits where the target falls in the
-//! move is picked. Keys inside precomps are mapped through each precomp layer's start and
+//! move is picked, except for a move already on one of Elias's approved curves (the taste
+//! check's ✅): it keeps that curve (`graph: "keep"`), so aligning never turns ✅ into ❌. Keys inside precomps are mapped through each precomp layer's start and
 //! stretch up to the comp the target frame is in. One undo step for every property.
 
 use effectcraft_keyframe::{Ease, Eases, Interp, Keyframe, Value as KValue, side_ease, spatial_segment_length};
@@ -777,6 +778,13 @@ fn segment(prop: &effectcraft_project::Property, key: Option<usize>, clock: &Clo
     pick.ok_or_else(|| bad(C, format!("{} has no eased move (all linear or hold): pass `key` and a `graph`", prop.name)))
 }
 
+/// The approved curve (name) the taste check matches key pair `i` of property `uid` on `l` to.
+fn approved_curve(prof: &crate::taste::Profile, project: &Project, cid: ItemId, comp: &Comp, l: &Layer, uid: Uid, i: usize) -> Option<String> {
+    let ctx = effectcraft_render::EvalCtx::new(project, cid, comp, Tick::ZERO);
+    let (moves, _) = crate::taste::check(prof, &ctx, Some(&[l.id]), f64::MIN, f64::MAX, false);
+    moves.into_iter().find(|m| m.at.uid == uid && m.at.key == i && m.verdict == crate::taste::Verdict::Approved).and_then(|m| m.curve)
+}
+
 fn align(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let mode = mode_p(p)?;
@@ -808,13 +816,25 @@ fn align(s: &mut Session, p: &Value) -> Result<Value> {
         lint::segment_peak(&pr.keys, i, pr.spatial).map(|(t, _)| clock.frame(t) / fps)
     });
     let target = target_p(p, tcomp, hint)?;
+    let (prof, _) = crate::taste::Profile::load(s.config.as_deref());
     let mut plans: Vec<Plan> = vec![];
     for j in jobs.iter().filter(|j| open.contains(&j.lid)) {
         let l = comp.layer(j.lid).ok_or_else(|| bad(C, "no layer"))?;
         let pr = l.props.find(j.uid).ok_or_else(|| bad(C, "no property"))?;
         let clock = Clock { layer: l, chain: &chain, fps };
         let i = segment(pr, j.key, &clock, Some(target.time))?;
-        let (keys, mut report) = solve(pr, i, &clock, comp.frame_rate, target.time, mode, &graph, snap, tolerance)?;
+        // A move on one of his approved curves keeps it rather than taking an auto-picked graph
+        // (A/B r2, T8: aligned rig entrances came out ❌).
+        let kept = match (&graph, mode) {
+            (GraphChoice::Auto, Mode::Shift | Mode::StretchIn | Mode::StretchOut) => approved_curve(&prof, &project, cid, comp, l, pr.uid, i),
+            _ => None,
+        };
+        let (keys, mut report) =
+            solve(pr, i, &clock, comp.frame_rate, target.time, mode, if kept.is_some() { &GraphChoice::Keep } else { &graph }, snap, tolerance)?;
+        if let Some(name) = kept {
+            report["graphName"] = json!(name);
+            report["tasteCurve"] = json!(name);
+        }
         report["layer"] = json!(l.id.0);
         report["layerName"] = json!(l.name);
         report["property"] = json!(pr.name);
