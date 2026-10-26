@@ -435,7 +435,7 @@ pub(crate) fn motion_frame_at(frames: &[PathFrame], hits: &[KeyHit], pos: Pos2) 
 pub(crate) fn parent_to_comp(ectx: &EvalCtx, l: &Layer) -> Mat3 {
     match l.parent.and_then(|p| ectx.comp.layer(p)) {
         Some(p) => {
-            let w = ectx.world_matrix(p).0;
+            let w = ectx.child_space(p).0;
             Mat3([[w[0][0], w[0][1], w[0][3]], [w[1][0], w[1][1], w[1][3]], [0.0, 0.0, 1.0]])
         }
         None => Mat3::IDENTITY,

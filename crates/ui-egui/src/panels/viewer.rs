@@ -146,6 +146,9 @@ enum Gesture {
         /// The other selected layers and their scales as the drag began: they scale by the same
         /// ratio about their own anchor points, as in After Effects (#491).
         others: Vec<(LayerId, [f64; 3])>,
+        /// Set when followed Transform effects moved the box off the anchor: Position is nudged
+        /// so the box grows in place (see [`GrowInPlace`]).
+        grow: Option<GrowInPlace>,
     },
     Rotate {
         layer: LayerId,
@@ -158,6 +161,8 @@ enum Gesture {
         start_rot: f64,
         /// The other selected layers and their rotations: they turn by the same angle.
         others: Vec<(LayerId, f64)>,
+        /// As for `Scale`: the box turns in place.
+        grow: Option<GrowInPlace>,
     },
     Anchor {
         layer: LayerId,
@@ -497,7 +502,7 @@ fn box_corners(b: [f64; 4]) -> [[f64; 2]; 4] {
 /// behind the camera (its quad would flip; [`layer_outline`] draws the part in front).
 pub(crate) fn layer_quad(ctx: &EvalCtx, layer: &Layer) -> Option<(Mat3, [[f64; 2]; 4], [f64; 4])> {
     let b = bounds(ctx, layer)?;
-    let (m, _) = l2c(ctx, layer);
+    let m = box_l2c(ctx, layer);
     let corners = box_corners(b);
     if corners.iter().any(|p| homogeneous(&m, *p)[2] < NEAR_W) {
         return None;
@@ -512,7 +517,71 @@ pub(crate) fn layer_quad(ctx: &EvalCtx, layer: &Layer) -> Option<(Mat3, [[f64; 2
 /// The outline of a layer's content box in comp pixels, clipped at the camera's near plane.
 pub(crate) fn layer_outline(ctx: &EvalCtx, layer: &Layer) -> Vec<[f64; 2]> {
     let Some(b) = bounds(ctx, layer) else { return vec![] };
-    project_clipped(&l2c(ctx, layer).0, &box_corners(b))
+    project_clipped(&box_l2c(ctx, layer), &box_corners(b))
+}
+
+/// [`l2c`] after the Transform effects the layer's children follow (Children Follow): the
+/// layer's box, handles and anchor point sit on its pixels where those effects moved them.
+pub(crate) fn box_l2c(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
+    let m = l2c(ctx, layer).0;
+    ctx.follow_fx_2d(layer).map_or(m, |f| m * f)
+}
+
+/// A handle or Rotation tool drag on a layer whose followed Transform effects moved its box off
+/// its anchor point: the drag pivots on the anchor where those effects put it (`pivot`, layer
+/// pixels) and Position is nudged so that point stays put. The layer's Scale / Rotation change,
+/// never the effects (presets keep their keys); a larger Scale also lengthens the effects' moves.
+#[derive(Clone, Debug)]
+pub(crate) struct GrowInPlace {
+    /// Position as the drag began (parent space).
+    pos: [f64; 3],
+    /// The layer's own linear transform (layer pixels → parent space) as the drag began.
+    lin: [[f64; 2]; 2],
+    /// The anchor where the followed effects put it, minus the anchor (layer pixels).
+    d: [f64; 2],
+    /// The anchor where the followed effects put it (layer pixels).
+    pivot: [f64; 2],
+}
+
+impl GrowInPlace {
+    /// `None` for 3D layers and when nothing moves the box off the anchor.
+    fn begin(ctx: &EvalCtx, layer: &Layer) -> Option<GrowInPlace> {
+        if layer.is_3d() {
+            return None;
+        }
+        let f = ctx.follow_fx_2d(layer)?;
+        let tr = layer.transform()?;
+        let a = ctx.v3(layer, tr, "anchor", [0.0; 3]);
+        let q = f.apply(gv2(a[0], a[1]));
+        let d = [q.x - a[0], q.y - a[1]];
+        if d[0].hypot(d[1]) < 1e-6 || !d.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        // Layer → parent: the parent-space inverse of the layer → comp matrix (2D).
+        let m = parent_inverse(ctx, layer) * ctx.layer_to_comp(layer).0;
+        Some(GrowInPlace { pos: ctx.v3(layer, tr, "position", [0.0; 3]), lin: [[m.0[0][0], m.0[0][1]], [m.0[1][0], m.0[1][1]]], d, pivot: [q.x, q.y] })
+    }
+
+    /// Position after scaling the layer by `f` (x, y) about the pivot.
+    fn scaled(&self, f: [f64; 2]) -> [f64; 3] {
+        let v = [self.d[0] * (1.0 - f[0]), self.d[1] * (1.0 - f[1])];
+        self.offset(v)
+    }
+
+    /// Position after turning the layer by `deg` about the pivot.
+    fn turned(&self, deg: f64) -> [f64; 3] {
+        let l = &self.lin;
+        let w = [l[0][0] * self.d[0] + l[0][1] * self.d[1], l[1][0] * self.d[0] + l[1][1] * self.d[1]];
+        let (s, c) = deg.to_radians().sin_cos();
+        let r = [c * w[0] - s * w[1], s * w[0] + c * w[1]];
+        [self.pos[0] + w[0] - r[0], self.pos[1] + w[1] - r[1], self.pos[2]]
+    }
+
+    /// Position plus `v` (layer pixels) through the layer's own transform.
+    fn offset(&self, v: [f64; 2]) -> [f64; 3] {
+        let l = &self.lin;
+        [self.pos[0] + l[0][0] * v[0] + l[0][1] * v[1], self.pos[1] + l[1][0] * v[0] + l[1][1] * v[1], self.pos[2]]
+    }
 }
 
 /// Which axes a bounding-box handle scales: corners (0–3) both; the top and bottom edges (4, 6)
@@ -682,7 +751,7 @@ fn quad_intersects_box(q: &[[f64; 2]; 4], a: [f64; 2], b: [f64; 2]) -> bool {
 fn parent_inverse(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
     match layer.parent.and_then(|p| ctx.comp.layer(p)) {
         Some(p) => {
-            let w = ctx.world_matrix(p);
+            let w = ctx.child_space(p);
             let m = Mat3([[w.0[0][0], w.0[0][1], 0.0], [w.0[1][0], w.0[1][1], 0.0], [0.0, 0.0, 1.0]]);
             m.inverse().unwrap_or(Mat3::IDENTITY)
         }
@@ -1730,13 +1799,22 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Tool::Rotate => pick(app, &ectx, cpt, mods.shift).map(|l| {
                 let others = selected_others(app, &comp, l).into_iter().filter_map(|o| Some((o.id, ectx.f(o, o.transform()?, "rotation", 0.0)))).collect();
                 let layer = comp.layer(l).cloned();
-                let center = layer
-                    .as_ref()
-                    .and_then(|l| l.transform().map(|tr| ectx.v3(l, tr, "position", [0.0; 3])))
-                    .map(|p| map.to_screen([p[0], p[1]]))
-                    .unwrap_or(pos);
+                let grow = layer.as_ref().and_then(|l| GrowInPlace::begin(&ectx, l));
+                let center = match (&grow, &layer) {
+                    // It turns about the anchor where the followed effects put it.
+                    (Some(g), Some(l)) => {
+                        let c = l2c(&ectx, l).0.apply(gv2(g.pivot[0], g.pivot[1]));
+                        map.to_screen([c.x, c.y])
+                    }
+                    _ => layer
+                        .as_ref()
+                        .and_then(|l| l.transform().map(|tr| ectx.v3(l, tr, "position", [0.0; 3])))
+                        .map(|p| map.to_screen([p[0], p[1]]))
+                        .unwrap_or(pos),
+                };
                 let rot = layer.as_ref().and_then(|l| l.transform().map(|tr| ectx.f(l, tr, "rotation", 0.0))).unwrap_or(0.0);
                 Gesture::Rotate {
+                    grow,
                     layer: l,
                     center,
                     last_angle: ((pos.y - center.y) as f64).atan2((pos.x - center.x) as f64).to_degrees(),
@@ -1845,10 +1923,24 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         let tr = layer.transform()?;
                         let (l2c, _) = l2c(&ectx, &layer);
                         let inv = l2c.inverse()?;
-                        let a = ectx.v3(&layer, tr, "anchor", [0.0; 3]);
+                        let grow = GrowInPlace::begin(&ectx, &layer);
+                        // With followed Transform effects the box and its anchor are where they
+                        // moved them (layer pixels): scale about that point.
+                        let a = match &grow {
+                            Some(g) => [g.pivot[0], g.pivot[1], 0.0],
+                            None => ectx.v3(&layer, tr, "anchor", [0.0; 3]),
+                        };
                         let lp = inv.apply(gv2(cpt[0], cpt[1]));
                         let hp = handle_point(effectcraft_engine::render::content_bounds(&ectx, &layer)?, hi);
+                        let hp = match ectx.follow_fx_2d(&layer) {
+                            Some(f) => {
+                                let q = f.apply(gv2(hp[0], hp[1]));
+                                [q.x, q.y]
+                            }
+                            None => hp,
+                        };
                         Some(Gesture::Scale {
+                            grow,
                             layer: lid,
                             start_scale: ectx.v3(&layer, tr, "scale", [100.0; 3]),
                             start_local: [lp.x - a[0], lp.y - a[1]],
@@ -1934,7 +2026,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let _ = app.session.execute("prop.set", json!({"layer": lid.0, "path": "transform/position", "value": v, "merge": merge}));
                 }
             }
-            Gesture::Scale { layer, start_scale, start_local, handle, anchor, axes, l2c, inv, others } => {
+            Gesture::Scale { layer, start_scale, start_local, handle, anchor, axes, l2c, inv, others, grow } => {
                 let lp = inv.apply(gv2(cpt[0], cpt[1]));
                 let uniform = mods.shift && axes == [true, true];
                 let f = drag_ratio(start_local, [lp.x - anchor[0], lp.y - anchor[1]], axes, uniform);
@@ -1945,16 +2037,26 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let v = [s0[0] * f[0], s0[1] * f[1], s0[2]];
                     let _ = app.session.execute("prop.set", json!({"layer": lid.0, "path": "transform/scale", "value": v, "merge": merge}));
                 }
+                if let Some(g) = &grow {
+                    let _ = app.session.execute("prop.set", json!({"layer": layer.0, "path": "transform/position", "value": g.scaled(f), "merge": merge}));
+                }
             }
-            Gesture::Rotate { layer, center, last_angle, turned, start_rot, others } => {
+            Gesture::Rotate { layer, center, last_angle, turned, start_rot, others, grow } => {
                 // Count the turn incrementally: the absolute angle wraps at ±180°, so writing it
                 // straight would jump a revolution back each time the pointer went round.
                 let ang = ((pos.y - center.y) as f64).atan2((pos.x - center.x) as f64).to_degrees();
                 let turned = turned + turn_delta(last_angle, ang);
-                ui.data_mut(|dd| dd.insert_temp(gid, Gesture::Rotate { layer, center, last_angle: ang, turned, start_rot, others: others.clone() }));
+                ui.data_mut(|dd| {
+                    dd.insert_temp(gid, Gesture::Rotate { layer, center, last_angle: ang, turned, start_rot, others: others.clone(), grow: grow.clone() })
+                });
                 // Shift snaps the accumulated value (so 405° snaps to 1x +45°, not to 45°).
                 let r = rotate_value(start_rot, turned, mods.shift);
                 let _ = app.session.execute("prop.set", json!({"layer": layer.0, "path": "transform/rotation", "value": r, "merge": merge}));
+                if let Some(g) = &grow {
+                    let _ = app
+                        .session
+                        .execute("prop.set", json!({"layer": layer.0, "path": "transform/position", "value": g.turned(r - start_rot), "merge": merge}));
+                }
                 for (lid, r0) in others {
                     let _ =
                         app.session.execute("prop.set", json!({"layer": lid.0, "path": "transform/rotation", "value": r0 + (r - start_rot), "merge": merge}));
@@ -2465,7 +2567,7 @@ fn drag_axes(ctx: &EvalCtx, l: &Layer) -> ([f64; 3], [f64; 3]) {
     let wp = ctx.world_matrix(l).apply(anchor.into());
     let k = if cam.ortho { 1.0 / cam.zoom.max(1e-9) } else { cam.depth(wp).max(1.0) / cam.zoom.max(1e-9) };
     let pinv = match l.parent.and_then(|p| ctx.comp.layer(p)) {
-        Some(p) => ctx.world_matrix(p).inverse().unwrap_or_default(),
+        Some(p) => ctx.child_space(p).inverse().unwrap_or_default(),
         None => effectcraft_engine::geom::Mat4::IDENTITY,
     };
     let a = pinv.apply_vec(cam.right() * k);
@@ -3161,6 +3263,38 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
 mod tests {
     use super::*;
     use effectcraft_engine::geom::{Mat4, vec3};
+
+    /// TFX2: a Transform effect (Children Follow) slides a 100×100 solid 200 px right: its box
+    /// sits on the moved pixels, and a handle drag to 200 % (Scale plus the nudged Position)
+    /// grows it in place, as does a 30° turn.
+    #[test]
+    fn a_box_moved_by_a_followed_transform_effect_grows_in_place() {
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", json!({"name": "Main", "width": 640, "height": 360, "frameRate": 30, "duration": 2})).unwrap();
+        let id = s.execute("layer.newSolid", json!({"name": "A", "width": 100, "height": 100})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("effect.apply", json!({"layer": id, "effect": "Transform"})).unwrap();
+        s.execute("prop.set", json!({"layer": id, "path": "effects/#1/position", "value": [250.0, 50.0]})).unwrap();
+        let centre = |s: &effectcraft_engine::Session| {
+            let ctx = EvalCtx::new(&s.project, s.active_comp_id().unwrap(), s.active_comp().unwrap(), s.time());
+            let q = layer_quad(&ctx, ctx.comp.layer(LayerId(id)).unwrap()).unwrap().1;
+            ([(q[0][0] + q[2][0]) / 2.0, (q[0][1] + q[2][1]) / 2.0], q[1][0] - q[0][0])
+        };
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        let (c0, w0) = centre(&s);
+        assert!(near(c0, [520.0, 180.0]) && (w0 - 100.0).abs() < 1e-6, "the box is on the pixels: {c0:?} {w0}");
+        let g = {
+            let ctx = EvalCtx::new(&s.project, s.active_comp_id().unwrap(), s.active_comp().unwrap(), s.time());
+            GrowInPlace::begin(&ctx, ctx.comp.layer(LayerId(id)).unwrap()).unwrap()
+        };
+        s.execute("prop.set", json!({"layer": id, "path": "transform/scale", "value": [200.0, 200.0, 100.0]})).unwrap();
+        s.execute("prop.set", json!({"layer": id, "path": "transform/position", "value": g.scaled([2.0, 2.0])})).unwrap();
+        let (c1, w1) = centre(&s);
+        assert!(near(c1, c0) && (w1 - 200.0).abs() < 1e-6, "grown in place: {c1:?} {w1}");
+        s.execute("prop.set", json!({"layer": id, "path": "transform/scale", "value": [100.0, 100.0, 100.0]})).unwrap();
+        s.execute("prop.set", json!({"layer": id, "path": "transform/rotation", "value": 30.0})).unwrap();
+        s.execute("prop.set", json!({"layer": id, "path": "transform/position", "value": g.turned(30.0)})).unwrap();
+        assert!(near(centre(&s).0, c0), "turned in place: {:?}", centre(&s).0);
+    }
 
     /// EXPR-PERF5: layer boxes are measured once per snapshot, time and layer while the viewer
     /// draws, never for a stand-in copy, another snapshot or outside a paint, and the answers
