@@ -62,7 +62,15 @@ fn num(v: &Value) -> f64 {
 
 /// Animation ▸ Keyframe Velocity… (⇧⌘K) with keys selected.
 pub fn open_velocity(app: &mut EffectcraftApp) -> Result<(), String> {
-    let info = app.session.execute("keys.info", json!({})).map_err(|e| e.to_string())?;
+    app.dialog_state.velocity = velocity_draft(&mut app.session)?;
+    app.dialog = Some(Dialog::KeyVelocity);
+    Ok(())
+}
+
+/// Keyframe Velocity's draft from the selected keyframes of `s` (the first one's ease; a host's
+/// dialog too, EMBED12).
+pub fn velocity_draft(s: &mut effectcraft_engine::Session) -> Result<VelocityDraft, String> {
+    let info = s.execute("keys.info", json!({})).map_err(|e| e.to_string())?;
     let first = info.as_array().and_then(|a| a.first()).ok_or("select keyframes first")?;
     let dims = first["dims"].as_u64().unwrap_or(1).max(1) as usize;
     let side = |k: &str| -> (Vec<f64>, Vec<f64>, bool) {
@@ -74,7 +82,7 @@ pub fn open_velocity(app: &mut EffectcraftApp) -> Result<(), String> {
     };
     let (in_speed, in_inf, has_in) = side("inEase");
     let (out_speed, out_inf, has_out) = side("outEase");
-    app.dialog_state.velocity = VelocityDraft {
+    Ok(VelocityDraft {
         dims,
         units: first["units"].as_str().unwrap_or("units/sec").into(),
         name: first["name"].as_str().unwrap_or("").into(),
@@ -85,21 +93,24 @@ pub fn open_velocity(app: &mut EffectcraftApp) -> Result<(), String> {
         has_in,
         has_out,
         continuous: first["continuous"].as_bool().unwrap_or(false),
-    };
-    app.dialog = Some(Dialog::KeyVelocity);
-    Ok(())
+    })
 }
 
 /// Animation ▸ Keyframe Interpolation… (⌥⌘K).
 pub fn open_interpolation(app: &mut EffectcraftApp) -> Result<(), String> {
-    let info = app.session.execute("keys.info", json!({})).map_err(|e| e.to_string())?;
+    app.dialog_state.interp = interp_draft(&mut app.session)?;
+    app.dialog = Some(Dialog::KeyInterpolation);
+    Ok(())
+}
+
+/// Keyframe Interpolation's draft for the selected keyframes of `s` (a host's dialog too, EMBED12).
+pub fn interp_draft(s: &mut effectcraft_engine::Session) -> Result<InterpDraft, String> {
+    let info = s.execute("keys.info", json!({})).map_err(|e| e.to_string())?;
     let a = info.as_array().cloned().unwrap_or_default();
     if a.is_empty() {
         return Err("select keyframes first".into());
     }
-    app.dialog_state.interp = InterpDraft { has_spatial: a.iter().any(|k| !k["spatial"].is_null()), count: a.len(), ..Default::default() };
-    app.dialog = Some(Dialog::KeyInterpolation);
-    Ok(())
+    Ok(InterpDraft { has_spatial: a.iter().any(|k| !k["spatial"].is_null()), count: a.len(), ..Default::default() })
 }
 
 /// Layer ▸ Time ▸ Time Stretch…
@@ -139,53 +150,13 @@ fn drag(ui: &mut egui::Ui, auto: &mut Registry, id: &str, v: &mut f64, speed: f6
 
 pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut d = app.dialog_state.velocity.clone();
-    let (mut ok, mut cancel) = (false, false);
-    let title = if d.name.is_empty() { "Keyframe Velocity".to_string() } else { format!("Keyframe Velocity: {}", d.name) };
-    let h = 250.0 + 2.0 * 26.0 * d.dims as f32;
-    super::dialogs::modal(ctx, &title, vec2(440.0, h), t, |ui| {
-        for (label, out) in [("Incoming Velocity", false), ("Outgoing Velocity", true)] {
-            ui.label(egui::RichText::new(label).font(Tokens::medium(12.5)));
-            let enabled = if out { d.has_out } else { d.has_in };
-            egui::Grid::new(("vel", out)).num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
-                for dim in 0..d.dims {
-                    let tag = if d.dims > 1 { format!("Dimension {}", ["X", "Y", "Z", "W"][dim.min(3)]) } else { String::new() };
-                    ui.label(egui::RichText::new(tag).color(t.text_dim));
-                    let side = if out { "out" } else { "in" };
-                    ui.horizontal(|ui| {
-                        ui.label(tr("Speed:"));
-                        let v = if out { &mut d.out_speed[dim] } else { &mut d.in_speed[dim] };
-                        drag(ui, &mut app.auto, &format!("dialog.velocity.{side}Speed.{dim}"), v, 1.0, -1e7..=1e7, "", enabled);
-                        ui.label(egui::RichText::new(&d.units).color(t.text_dim));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(tr("Influence:"));
-                        let v = if out { &mut d.out_inf[dim] } else { &mut d.in_inf[dim] };
-                        drag(ui, &mut app.auto, &format!("dialog.velocity.{side}Influence.{dim}"), v, 0.2, 0.1..=100.0, " %", enabled);
-                    });
-                    ui.end_row();
-                }
-            });
-            ui.add_space(8.0);
-        }
-        let r = ui.checkbox(&mut d.continuous, tr("Continuous (Lock Outgoing to Incoming)"));
-        app.auto.add("dialog.velocity.continuous", r.rect, "Continuous");
-        if d.continuous {
-            d.out_speed = d.in_speed.clone();
-        }
-        (ok, cancel) = buttons(ui, &mut app.auto, t, "dialog.velocity");
-    });
+    let mut a = super::precomp::Answer::default();
+    let auto = &mut app.auto;
+    super::dialogs::modal(ctx, &velocity_title(&d), velocity_size(&d), t, |ui| a = draw_velocity(ui, &mut d, t, auto));
+    let mut cancel = a.cancel;
     app.dialog_state.velocity = d.clone();
-    if ok || super::dialogs::ui_enter(ctx) {
-        let mut params = json!({"continuous": d.continuous});
-        if d.has_in {
-            params["inSpeed"] = json!(d.in_speed);
-            params["inInfluence"] = json!(d.in_inf);
-        }
-        if d.has_out {
-            params["outSpeed"] = json!(d.out_speed);
-            params["outInfluence"] = json!(d.out_inf);
-        }
-        if let Err(e) = crate::menus::run_engine(app, ctx, "keys.velocity", params) {
+    if a.ok || super::dialogs::ui_enter(ctx) {
+        if let Err(e) = crate::menus::run_engine(app, ctx, "keys.velocity", velocity_params(&d)) {
             app.ui.status = e.to_string();
         }
         cancel = true;
@@ -193,6 +164,68 @@ pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     if cancel {
         app.dialog = None;
     }
+}
+
+/// Keyframe Velocity's title (with the property's name).
+pub fn velocity_title(d: &VelocityDraft) -> String {
+    if d.name.is_empty() { "Keyframe Velocity".to_string() } else { format!("Keyframe Velocity: {}", d.name) }
+}
+
+/// Keyframe Velocity's window size (a row per dimension).
+pub fn velocity_size(d: &VelocityDraft) -> egui::Vec2 {
+    vec2(440.0, 250.0 + 2.0 * 26.0 * d.dims.min(4) as f32)
+}
+
+/// Keyframe Velocity's contents (incoming / outgoing speed and influence per dimension,
+/// Continuous, OK / Cancel) in any `ui`: EffectCraft's modal or a host's window (EMBED12).
+pub fn draw_velocity(ui: &mut egui::Ui, d: &mut VelocityDraft, t: &Tokens, auto: &mut Registry) -> super::precomp::Answer {
+    // A draft from elsewhere may be short of dimensions: never index past its lists.
+    let dims = d.dims.min(d.in_speed.len()).min(d.out_speed.len()).min(d.in_inf.len()).min(d.out_inf.len());
+    for (label, out) in [("Incoming Velocity", false), ("Outgoing Velocity", true)] {
+        ui.label(egui::RichText::new(label).font(Tokens::medium(12.5)));
+        let enabled = if out { d.has_out } else { d.has_in };
+        egui::Grid::new(("vel", out)).num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+            for dim in 0..dims {
+                let tag = if d.dims > 1 { format!("Dimension {}", ["X", "Y", "Z", "W"][dim.min(3)]) } else { String::new() };
+                ui.label(egui::RichText::new(tag).color(t.text_dim));
+                let side = if out { "out" } else { "in" };
+                ui.horizontal(|ui| {
+                    ui.label(tr("Speed:"));
+                    let v = if out { &mut d.out_speed[dim] } else { &mut d.in_speed[dim] };
+                    drag(ui, auto, &format!("dialog.velocity.{side}Speed.{dim}"), v, 1.0, -1e7..=1e7, "", enabled);
+                    ui.label(egui::RichText::new(&d.units).color(t.text_dim));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr("Influence:"));
+                    let v = if out { &mut d.out_inf[dim] } else { &mut d.in_inf[dim] };
+                    drag(ui, auto, &format!("dialog.velocity.{side}Influence.{dim}"), v, 0.2, 0.1..=100.0, " %", enabled);
+                });
+                ui.end_row();
+            }
+        });
+        ui.add_space(8.0);
+    }
+    let r = ui.checkbox(&mut d.continuous, tr("Continuous (Lock Outgoing to Incoming)"));
+    auto.add("dialog.velocity.continuous", r.rect, "Continuous");
+    if d.continuous {
+        d.out_speed = d.in_speed.clone();
+    }
+    let (ok, cancel) = buttons(ui, auto, t, "dialog.velocity");
+    super::precomp::Answer { ok, cancel }
+}
+
+/// The parameters of OK's `keys.velocity` (on the selected keyframes).
+pub fn velocity_params(d: &VelocityDraft) -> Value {
+    let mut params = json!({"continuous": d.continuous});
+    if d.has_in {
+        params["inSpeed"] = json!(d.in_speed);
+        params["inInfluence"] = json!(d.in_inf);
+    }
+    if d.has_out {
+        params["outSpeed"] = json!(d.out_speed);
+        params["outInfluence"] = json!(d.out_inf);
+    }
+    params
 }
 
 fn combo(ui: &mut egui::Ui, auto: &mut Registry, id: &str, sel: &mut usize, opts: &[&str], enabled: bool) {
@@ -209,36 +242,13 @@ fn combo(ui: &mut egui::Ui, auto: &mut Registry, id: &str, sel: &mut usize, opts
 
 pub fn interpolation(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut d = app.dialog_state.interp.clone();
-    let (mut ok, mut cancel) = (false, false);
-    super::dialogs::modal(ctx, "Keyframe Interpolation", vec2(440.0, 250.0), t, |ui| {
-        egui::Grid::new("interp-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
-            ui.label(tr("Temporal Interpolation:"));
-            combo(ui, &mut app.auto, "dialog.interpolation.temporal", &mut d.temporal, &TEMPORAL.map(|x| x.0), true);
-            ui.end_row();
-            ui.label(tr("Spatial Interpolation:"));
-            combo(ui, &mut app.auto, "dialog.interpolation.spatial", &mut d.spatial, &SPATIAL.map(|x| x.0), d.has_spatial);
-            ui.end_row();
-            ui.label(tr("Roving:"));
-            combo(ui, &mut app.auto, "dialog.interpolation.roving", &mut d.roving, &ROVING, d.has_spatial);
-            ui.end_row();
-        });
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new(format!("{} keyframe{} selected", d.count, if d.count == 1 { "" } else { "s" })).color(t.text_dim));
-        (ok, cancel) = buttons(ui, &mut app.auto, t, "dialog.interpolation");
-    });
+    let mut a = super::precomp::Answer::default();
+    let auto = &mut app.auto;
+    super::dialogs::modal(ctx, "Keyframe Interpolation", INTERP_SIZE, t, |ui| a = draw_interpolation(ui, &mut d, t, auto));
+    let mut cancel = a.cancel;
     app.dialog_state.interp = d.clone();
-    if ok || super::dialogs::ui_enter(ctx) {
-        let mut params = json!({});
-        if d.temporal > 0 {
-            params["interpolation"] = json!(TEMPORAL[d.temporal].1);
-        }
-        if d.spatial > 0 && d.has_spatial {
-            params["spatial"] = json!(SPATIAL[d.spatial].1);
-        }
-        if d.roving > 0 && d.has_spatial {
-            params["roving"] = json!(d.roving == 2);
-        }
-        if params.as_object().is_some_and(|m| !m.is_empty())
+    if a.ok || super::dialogs::ui_enter(ctx) {
+        if let Some(params) = interp_params(&d)
             && let Err(e) = crate::menus::run_engine(app, ctx, "keys.interpolation", params)
         {
             app.ui.status = e.to_string();
@@ -248,6 +258,48 @@ pub fn interpolation(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) 
     if cancel {
         app.dialog = None;
     }
+}
+
+/// Keyframe Interpolation's window size.
+pub const INTERP_SIZE: egui::Vec2 = vec2(440.0, 250.0);
+
+/// Keyframe Interpolation's contents (temporal, spatial, roving, OK / Cancel) in any `ui`:
+/// EffectCraft's modal or a host's window (EMBED12).
+pub fn draw_interpolation(ui: &mut egui::Ui, d: &mut InterpDraft, t: &Tokens, auto: &mut Registry) -> super::precomp::Answer {
+    d.temporal = d.temporal.min(TEMPORAL.len() - 1);
+    d.spatial = d.spatial.min(SPATIAL.len() - 1);
+    d.roving = d.roving.min(ROVING.len() - 1);
+    egui::Grid::new("interp-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
+        ui.label(tr("Temporal Interpolation:"));
+        combo(ui, auto, "dialog.interpolation.temporal", &mut d.temporal, &TEMPORAL.map(|x| x.0), true);
+        ui.end_row();
+        ui.label(tr("Spatial Interpolation:"));
+        combo(ui, auto, "dialog.interpolation.spatial", &mut d.spatial, &SPATIAL.map(|x| x.0), d.has_spatial);
+        ui.end_row();
+        ui.label(tr("Roving:"));
+        combo(ui, auto, "dialog.interpolation.roving", &mut d.roving, &ROVING, d.has_spatial);
+        ui.end_row();
+    });
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(format!("{} keyframe{} selected", d.count, if d.count == 1 { "" } else { "s" })).color(t.text_dim));
+    let (ok, cancel) = buttons(ui, auto, t, "dialog.interpolation");
+    super::precomp::Answer { ok, cancel }
+}
+
+/// The parameters of OK's `keys.interpolation` (`None`: everything left at Current Settings,
+/// nothing to change).
+pub fn interp_params(d: &InterpDraft) -> Option<Value> {
+    let mut params = json!({});
+    if let Some((_, v)) = TEMPORAL.get(d.temporal).filter(|_| d.temporal > 0) {
+        params["interpolation"] = json!(v);
+    }
+    if let Some((_, v)) = SPATIAL.get(d.spatial).filter(|_| d.spatial > 0 && d.has_spatial) {
+        params["spatial"] = json!(v);
+    }
+    if d.roving > 0 && d.has_spatial {
+        params["roving"] = json!(d.roving == 2);
+    }
+    params.as_object().is_some_and(|m| !m.is_empty()).then_some(params)
 }
 
 pub fn time_stretch(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {

@@ -2,7 +2,10 @@
 //! (FigCraft's EffectCraft cards): Solid Settings (Layer ▸ New ▸ Solid…, Layer Settings on a solid
 //! or adjustment layer), Camera Settings and Light Settings (New ▸ Camera… / Light…, Layer
 //! Settings on a camera or light), Null Settings (Layer Settings on a null), Time Stretch… and the
-//! Layer Style dialog (Layer Style Options…, Layer Styles ▸ <style>).
+//! Layer Style dialog (Layer Style Options…, Layer Styles ▸ <style>); and the keyframe dialogs the
+//! Timeline and Graph Editor open: Keyframe Velocity… and Keyframe Interpolation… (their keys,
+//! the keyframe menus, a double-click on a speed graph key), Edit Value… (`keys.set` / `prop.set`
+//! without a value: EffectCraft's value form) and Sequence Layers….
 //!
 //! A host asks [`open`] when one of EffectCraft's commands runs without its settings, as
 //! EffectCraft's own menus route them (`menus::invoke`): it gets the dialog's starting state, read
@@ -21,7 +24,7 @@ use serde_json::Value;
 use super::dialogs::SolidDraft;
 use super::dialogs_3d::{CameraDraft, LightDraft};
 use super::forms::{Field, Form};
-use super::key_dialogs::StretchDraft;
+use super::key_dialogs::{InterpDraft, StretchDraft, VelocityDraft};
 use super::layer_styles_dialog::LayerStyleState;
 use crate::automation::Registry;
 use crate::theme::Tokens;
@@ -41,6 +44,10 @@ pub enum Hosted {
     TimeStretch(StretchDraft),
     /// The Layer Style dialog: its edits are live, Cancel takes them back.
     LayerStyle(LayerStyleState),
+    /// Keyframe Velocity on the selected keyframes.
+    Velocity(VelocityDraft),
+    /// Keyframe Interpolation on the selected keyframes.
+    Interpolation(InterpDraft),
 }
 
 /// What one frame of a dialog decided.
@@ -97,6 +104,14 @@ pub fn open(s: &mut Session, id: &str, params: &Value, last_solid_color: [f32; 3
         }
         "layer.timeStretch" if bare(params) => Some(super::key_dialogs::stretch_draft(s).map(Hosted::TimeStretch)),
         "layer.style.options" => Some(super::layer_styles_dialog::open_in(s, params).map(Hosted::LayerStyle)),
+        "keys.velocity" if bare(params) => Some(super::key_dialogs::velocity_draft(s).map(Hosted::Velocity)),
+        "keys.interpolation" if bare(params) => Some(super::key_dialogs::interp_draft(s).map(Hosted::Interpolation)),
+        // Edit Value… on a keyframe or property, Sequence Layers…: EffectCraft's parameter forms
+        // (none when the value is given).
+        "keys.set" | "prop.set" | "layer.sequence" => match super::forms::build_form(s, id, params)? {
+            super::forms::Built::Form(f) => Some(Ok(Hosted::Form(f))),
+            super::forms::Built::Info(_, body) => Some(Err(body)),
+        },
         _ => super::layer_styles_dialog::route_in(s, id, params).map(|r| r.map(Hosted::LayerStyle)),
     }
 }
@@ -110,6 +125,8 @@ pub fn title(s: &Session, h: &Hosted) -> Option<String> {
         Hosted::Form(f) => f.title.clone(),
         Hosted::TimeStretch(_) => "Time Stretch".into(),
         Hosted::LayerStyle(st) => return super::layer_styles_dialog::title(s, st),
+        Hosted::Velocity(d) => super::key_dialogs::velocity_title(d),
+        Hosted::Interpolation(_) => "Keyframe Interpolation".into(),
     })
 }
 
@@ -122,6 +139,8 @@ pub fn size(h: &Hosted) -> egui::Vec2 {
         Hosted::Form(_) => egui::vec2(480.0, 200.0),
         Hosted::TimeStretch(_) => super::key_dialogs::STRETCH_SIZE,
         Hosted::LayerStyle(_) => super::layer_styles_dialog::SIZE,
+        Hosted::Velocity(d) => super::key_dialogs::velocity_size(d),
+        Hosted::Interpolation(_) => super::key_dialogs::INTERP_SIZE,
     }
 }
 
@@ -150,6 +169,8 @@ pub fn draw(ui: &mut egui::Ui, h: &mut Hosted, s: &Session, t: &Tokens, height: 
             let (close, actions) = super::layer_styles_dialog::draw(ui, height, s, st, auto);
             Step { ok: close == Some(true), cancel: close == Some(false), actions }
         }
+        Hosted::Velocity(d) => answer(super::key_dialogs::draw_velocity(ui, d, t, auto)),
+        Hosted::Interpolation(d) => answer(super::key_dialogs::draw_interpolation(ui, d, t, auto)),
     }
 }
 
@@ -174,6 +195,9 @@ pub fn command(h: &Hosted) -> Option<(String, Value)> {
         Hosted::Form(f) => Some((f.command.clone(), f.params())),
         Hosted::TimeStretch(d) => Some(("layer.timeStretch".into(), super::key_dialogs::stretch_params(d))),
         Hosted::LayerStyle(_) => None,
+        Hosted::Velocity(d) => Some(("keys.velocity".into(), super::key_dialogs::velocity_params(d))),
+        // Nothing chosen: nothing to change.
+        Hosted::Interpolation(d) => super::key_dialogs::interp_params(d).map(|p| ("keys.interpolation".into(), p)),
     }
 }
 
@@ -219,6 +243,19 @@ mod tests {
         let n = s.execute("layer.newNull", json!({})).unwrap()["layer"].as_u64().unwrap();
         s.state.selected_layers = vec![LayerId(n)];
         assert!(matches!(open(&mut s, "layer.settings", &json!({}), [0.0; 3]), Some(Ok(Hosted::Form(f))) if f.title == "Null Settings"));
+        // Keyframes: Velocity / Interpolation on the selected ones, Edit Value… on one.
+        let uid = s.active_comp().unwrap().layer(LayerId(l)).unwrap().props.prop("transform/opacity").unwrap().uid;
+        for t in [0.0, 1.0] {
+            s.execute("prop.addKey", json!({"layer": l, "prop": uid, "time": t, "value": 50.0})).unwrap();
+        }
+        s.execute("keys.select", json!({"keys": [{"layer": l, "prop": uid, "time": 0.0}]})).unwrap();
+        assert!(matches!(open(&mut s, "keys.velocity", &json!({}), [0.0; 3]), Some(Ok(Hosted::Velocity(d))) if d.dims == 1));
+        assert!(matches!(open(&mut s, "keys.interpolation", &json!({}), [0.0; 3]), Some(Ok(Hosted::Interpolation(d))) if d.count == 1));
+        assert!(command(&Hosted::Interpolation(InterpDraft::default())).is_none(), "Current Settings change nothing");
+        assert!(matches!(open(&mut s, "keys.set", &json!({"layer": l, "prop": uid, "time": 0.0}), [0.0; 3]), Some(Ok(Hosted::Form(_)))));
+        assert!(open(&mut s, "keys.interpolation", &json!({"interpolation": "linear"}), [0.0; 3]).is_none());
+        s.state.selected_keys.clear();
+        assert!(matches!(open(&mut s, "keys.velocity", &json!({}), [0.0; 3]), Some(Err(_))), "no keys selected");
         // Nothing selected: why not.
         s.state.selected_layers.clear();
         assert!(matches!(open(&mut s, "layer.timeStretch", &json!({}), [0.0; 3]), Some(Err(_))));
