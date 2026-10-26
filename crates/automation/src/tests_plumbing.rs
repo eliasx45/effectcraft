@@ -188,3 +188,135 @@ fn command_batch_inlines_small_results_and_lists_failed_steps() {
     let v = ok(&mut s, "command_batch", json!({"verbose": true, "steps": [{"id": "command.list", "params": {"filter": "layer"}}]}));
     assert!(v["results"][0]["result"].is_object() || v["result_id"].is_string(), "{v}");
 }
+
+/// A/B fix 6: a script's edits are the caller's, so the caller can undo them, whether the client
+/// comes from the server (`--client`) or from the call.
+#[test]
+fn a_scripts_undo_step_belongs_to_the_client_that_ran_it() {
+    let code = "app.beginUndoGroup('Build'); var c = app.project.items.addComp('C', 64, 36, 1, 1, 30); \
+                c.layers.addSolid([1, 0, 0], 'S', 64, 36, 1); app.endUndoGroup(); c.id";
+    // As the A/B agents ran it: a file that includes another one.
+    let dir = tmp("undo-client");
+    std::fs::write(dir.join("lib.jsx"), "function f() { return 1; }").unwrap();
+    std::fs::write(dir.join("build.jsx"), format!("#include \"lib.jsx\"\n{code}")).unwrap();
+    let file = dir.join("build.jsx").to_string_lossy().to_string();
+    let cases = [(Some("claude"), None, false), (Some("claude"), None, true), (None, Some("builder-a"), true), (Some("claude"), Some("builder-a"), false)];
+    for (server_client, call_client, from_file) in cases {
+        let mut s = server();
+        if let Some(c) = server_client {
+            s.backend().set_client(Some(c.into()));
+        }
+        let mut args = if from_file { json!({"file": file}) } else { json!({"code": code}) };
+        if let Some(c) = call_client {
+            args["client"] = json!(c);
+        }
+        assert_eq!(ok(&mut s, "run_script", args)["ok"], true);
+        let me = call_client.or(server_client).unwrap();
+        let history = ok(&mut s, "history", json!({"client": me}));
+        assert!(history.to_string().contains(&format!("\"client\":\"{me}\"")), "{me}: {history}");
+        let feed = ok(&mut s, "edit_feed", json!({"client": me, "since": 0}));
+        assert!(feed["entries"].as_array().unwrap().iter().all(|e| e["by"] == me), "{me}: {feed}");
+        let undone = ok(&mut s, "undo", json!({"client": me}));
+        assert_eq!(undone["steps"], 1, "{me}: {undone}");
+        assert_eq!(undone["undoStack"], json!([]), "{me}: {undone}");
+    }
+}
+
+/// Tool calls over the stdio loop (`serve`), where `run_script` runs as a long job on a worker
+/// thread; returns each reply's JSON (or error text).
+fn serve_calls(s: &mut McpServer, calls: &[(&str, Value)]) -> Vec<Value> {
+    let input: String = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (name, args))| json!({"jsonrpc": "2.0", "id": i + 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string() + "\n")
+        .collect();
+    let mut out = Vec::new();
+    s.serve(std::io::Cursor::new(input), &mut out).unwrap();
+    String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|r| r.get("id").is_some())
+        .map(|r| {
+            let text = r["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+            serde_json::from_str(&text).unwrap_or(json!(text))
+        })
+        .collect()
+}
+
+#[test]
+fn a_scripts_undo_step_belongs_to_the_server_client_over_stdio() {
+    let mut s = server();
+    s.backend().set_client(Some("claude".into()));
+    ok(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main", "width": 64, "height": 36}}));
+    ok(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "S"}}));
+    // The commands the A/B builders' scripts ran (graphs.jsx: keys.select + keys.velocity).
+    let code = "app.run('comp.open', {comp: 'Main'}); app.beginUndoGroup('Build'); \
+                app.run('prop.addKey', {layer: 'S', path: 'transform/position', time: 0, value: [0, 0]}); \
+                app.run('prop.addKey', {layer: 'S', path: 'transform/position', time: 0.5, value: [30, 0]}); \
+                app.run('keys.select', {keys: [{layer: 'S', path: 'transform/position', time: 0}]}); \
+                app.run('keys.velocity', {outSpeed: [0], outInfluence: [80]}); \
+                app.run('comp.addMarker', {time: 0.2, comment: 'beat'}); app.endUndoGroup(); 'ok'";
+    let r = serve_calls(&mut s, &[("run_script", json!({"code": code})), ("history", json!({})), ("undo", json!({}))]);
+    assert_eq!(r[0]["ok"], true, "{r:?}");
+    assert!(r[1].to_string().contains("\"client\":\"claude\""), "{}", r[1]);
+    assert_eq!(r[2]["steps"], 1, "{}", r[2]);
+}
+
+/// A/B fix 7: a cut live read hands out a `page_token` (its revision + next offset) that continues
+/// without `expectRevision`; a token from before an edit is refused.
+#[test]
+fn live_pages_continue_with_a_page_token() {
+    let mut s = server();
+    ok(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main", "width": 64, "height": 36}}));
+    for i in 0..5 {
+        ok(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": format!("S{i}")}}));
+    }
+    let first = ok(&mut s, "get_comp", json!({"limit": 2}));
+    let token = first["page_token"].as_str().expect("page_token").to_string();
+    assert!(first["truncated"]["hint"].as_str().unwrap().contains(&token), "{first}");
+    // A bare offset still needs the revision, and the error says how to get it.
+    let (e, err) = call(&mut s, "get_comp", json!({"offset": 2}));
+    assert!(err && e.as_str().unwrap().contains("page_token"), "{e}");
+    let second = ok(&mut s, "get_comp", json!({"page_token": token, "limit": 2}));
+    assert_eq!(second["offset"], 2, "{second}");
+    assert_eq!(second["layers"].as_array().unwrap().len(), 2, "{second}");
+    let next = second["page_token"].as_str().unwrap().to_string();
+    // The project changed: the token's revision no longer holds.
+    ok(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "Late"}}));
+    let (e, err) = call(&mut s, "get_comp", json!({"page_token": next}));
+    assert!(err && e.as_str().unwrap().contains("document changed"), "{e}");
+    let (e, err) = call(&mut s, "get_comp", json!({"page_token": "nonsense"}));
+    assert!(err && e.as_str().unwrap().contains("page_token"), "{e}");
+}
+
+/// A/B fix 7: summaries for the replies that grew past agents' token caps.
+#[test]
+fn lint_frame_and_get_comp_summarise_on_request() {
+    let mut s = server();
+    ok(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main", "width": 640, "height": 360}}));
+    for i in 0..12 {
+        ok(&mut s, "command_run", json!({"id": "layer.newText", "params": {"text": format!("tiny {i}"), "size": 4}}));
+    }
+    ok(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "BG"}}));
+    // `summary: false`: every problem (too many for one reply: retained, fetched by get_result).
+    let full = ok(&mut s, "lint_frame", json!({"summary": false}));
+    let total: u64 = ["error", "warning", "info"].iter().map(|k| full["counts"][k].as_u64().unwrap()).sum();
+    assert!(total > 40, "{full}");
+    assert!(full["result_id"].is_string(), "{full}");
+    // Over 40 problems the default is the summary, which fits one reply.
+    let sum = ok(&mut s, "lint_frame", json!({}));
+    assert_eq!(sum["summary"], true, "{sum}");
+    assert_eq!(sum["total"], total, "{sum}");
+    assert!(sum["problems"].as_array().unwrap().len() <= SUMMARY_PROBLEMS, "{sum}");
+    assert!(sum["byRule"]["text-too-small"].is_object(), "{sum}");
+    assert!(!sum["byLayer"].as_array().unwrap().is_empty(), "{sum}");
+    assert_eq!(sum["counts"], full["counts"], "the counts stay whole");
+    let comp = ok(&mut s, "get_comp", json!({"summary": true}));
+    assert_eq!(comp["layerCount"], 13, "{comp}");
+    assert_eq!(comp["types"]["Text"], 12, "{comp}");
+    assert_eq!(comp["layers"].as_array().unwrap().len(), 13, "{comp}");
+    assert!(comp["layers"][0].get("switches").is_none(), "{comp}");
+}
+
+const SUMMARY_PROBLEMS: usize = 10;

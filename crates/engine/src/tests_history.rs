@@ -205,6 +205,28 @@ fn new_solid(s: &mut Session, name: &str, client: Option<&str>) -> u64 {
     s.execute_checked("layer.newSolid", p).unwrap()["layer"].as_u64().unwrap()
 }
 
+/// A/B fix 6: a write outside the undo history (the footage check marking files missing after
+/// open, a comp's Resolution) keeps who made the state, so the agent can still undo its step.
+#[test]
+fn a_write_outside_the_history_keeps_who_made_the_state() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "U", "width": 64, "height": 64})).unwrap();
+    let comp = *s.project.comps().next().unwrap().0;
+    new_solid(&mut s, "Agent's", Some("claude"));
+    // In place with no bump (as footage_check's apply when nothing changed): the author map's
+    // weak reference makes make_mut move the project.
+    let _ = Arc::make_mut(&mut s.project);
+    s.set_resolution(comp, effectcraft_project::Resolution::Half).unwrap();
+    let current = list(&mut s).into_iter().find(|n| n["current"] == true).unwrap();
+    assert_eq!(current["client"], "claude", "{current}");
+    s.execute_checked("edit.undo", json!({"client": "claude"})).unwrap();
+    assert!(names(&s).is_empty());
+    // A history change is not carried over: the user's step stays the user's.
+    new_solid(&mut s, "User's", None);
+    let current = list(&mut s).into_iter().find(|n| n["current"] == true).unwrap();
+    assert!(current.get("client").is_none(), "{current}");
+}
+
 #[test]
 fn a_number_is_a_layer_id_never_a_stack_position() {
     let mut s = Session::default();
