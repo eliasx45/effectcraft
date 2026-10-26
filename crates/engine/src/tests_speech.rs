@@ -278,6 +278,42 @@ fn trimmed_away_nested_peaks_are_dropped() {
     assert_eq!(lint::speed_peaks_deep(&s.project, main, 0.0, 12.0).peaks.len(), 1);
 }
 
+/// HS2 (A/B item 9): a word the aligner's dictionary doesn't know ("YouTube") came in without
+/// syllables, so `keys.alignPeak` and `off-accent` couldn't use it. Import estimates them.
+#[test]
+fn words_the_dictionary_doesnt_know_get_estimated_syllables() {
+    use effectcraft_project::speech::guess_syllables;
+    let count = |w: &str| guess_syllables(w, Tick::ZERO, Tick::from_seconds_f64(1.0)).len();
+    assert_eq!([count("YouTube"), count("TikTok"), count("Google"), count("table"), count("tube"), count("2026")], [2, 2, 2, 2, 1, 0]);
+
+    let (mut s, l) = comp();
+    let doc = json!({"engine": "test", "words": [
+        {"word": "watch", "start": 0.5, "end": 0.8, "syllables": [{"t": 0.5, "vowel": 0.55, "stress": 1}]},
+        {"word": "YouTube", "start": 1.0, "end": 1.7, "syllables": []},
+        {"word": "2026", "start": 1.8, "end": 2.4}
+    ]});
+    let r = s.execute("speech.import", json!({"map": doc})).unwrap();
+    assert_eq!(r["guessed"], json!(["YouTube"]), "{r}");
+    let list = s.execute("speech.get", json!({})).unwrap()["list"].clone();
+    let yt = &list[1];
+    assert_eq!(yt["guessed"], true, "{list}");
+    let syl = yt["syllables"].as_array().unwrap();
+    assert_eq!(syl.len(), 2, "You·Tube: {yt}");
+    assert_eq!((syl[0]["t"].as_f64(), syl[0]["stress"].as_u64()), (Some(1.0), Some(1)), "{yt}");
+    let t1 = syl[1]["t"].as_f64().unwrap();
+    assert!(t1 > 1.2 && t1 < 1.6 && syl[1]["stress"] == 0, "the second onset sits inside the word: {yt}");
+    assert!(list[0].get("guessed").is_none() && list[2]["syllables"] == json!([]), "aligned words and numbers stay: {list}");
+
+    // The peak lands on the estimated stressed syllable.
+    scale_keys(&mut s, l, 1.5, 2.5, false);
+    let a = s.execute_checked("keys.alignPeak", json!({"layer": l, "path": "transform/scale", "speech": "YouTube"})).unwrap();
+    assert_eq!(a["target"]["speech"]["word"], "YouTube", "{a}");
+
+    // A words-only map (scribe-words) stays words only.
+    let r = s.execute("speech.import", json!({"map": {"words": [{"word": "YouTube", "start": 1.0, "end": 1.7}]}})).unwrap();
+    assert_eq!((r["syllables"].as_u64(), r["guessed"].clone()), (Some(0), json!([])), "{r}");
+}
+
 #[test]
 fn off_accent_on_the_agents_own_keys_is_an_error() {
     let (mut s, l) = comp();
@@ -290,7 +326,7 @@ fn off_accent_on_the_agents_own_keys_is_an_error() {
     };
     let found = lint_as(&mut s);
     assert_eq!((found.len(), found[0]["severity"].as_str()), (1, Some("warning")), "{found:#?}");
-    // The agent re-keys the move (same values, its own undo step): its miss blocks.
+    // The agent re-keys the move (its own undo step): its miss blocks.
     s.execute("prop.addKey", json!({"layer": l, "path": "transform/scale", "value": [161.0, 161.0, 100.0], "time": 2.0, "timeBase": "comp", "client": "bot"}))
         .unwrap();
     let peak = lint::speed_peaks(s.active_comp().unwrap(), 0.0, 4.0)[0].time;
