@@ -89,6 +89,26 @@ pub fn user_keymaps() -> Option<effectcraft_engine::shortcuts::Keymaps> {
     Some(effectcraft_engine::shortcuts::Keymaps::from_json(&text))
 }
 
+/// The person's own EffectCraft preview options (Preview panel: each shortcut's range, play from,
+/// loop, frame rate, skip…), read from `prefs.json` in EffectCraft's settings folder, never
+/// written; `None` when there is none (a host then uses the defaults). For a host that plays a
+/// comp the way EffectCraft's Space would.
+pub fn user_preview() -> Option<effectcraft_engine::preview::PreviewSettings> {
+    #[cfg(target_arch = "wasm32")]
+    return None;
+    #[cfg(not(target_arch = "wasm32"))]
+    let path = effectcraft_host::config_dir()?.join(effectcraft_engine::prefs::PREFS_FILE);
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_PREFS_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(effectcraft_engine::prefs::Prefs::from_json(&text).preview)
+}
+
+/// The largest `prefs.json` [`user_preview`] reads.
+const MAX_PREFS_BYTES: u64 = 16 << 20;
+
 /// Use the person's own EffectCraft shortcuts ([`user_keymaps`]) in `session`; returns whether
 /// there were any. Nothing is written: the session keeps them in memory only (a host's session
 /// has no settings store, so `Session::shortcuts_changed` would not save either).
