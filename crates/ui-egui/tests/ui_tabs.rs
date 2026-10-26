@@ -483,6 +483,29 @@ fn dragging_a_comp_tab_along_the_strip_reorders_the_comps_and_out_of_it_undocks(
     let (mut d, [a, b, c]) = Driver::new();
     let dock = d.h.state().ui.dock.clone();
     let tab = |c: u64| format!("panel.tab.Timeline.{c}");
+    // While A is held over C the tabs move live: B and C slide left into its place, A follows the
+    // pointer; the comps keep their order until it is let go (Escape puts it back).
+    let (ra, rc) = (rect(&d.h, &tab(a)), rect(&d.h, &tab(c)));
+    let to = pos2(rc.min.x + rc.width() * 0.8, rc.center().y);
+    d.h.event(Event::PointerMoved(ra.center()));
+    d.frames(1);
+    d.h.event(Event::PointerButton { pos: ra.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    d.frames(1);
+    for k in 1..=8 {
+        d.h.event(Event::PointerMoved(ra.center() + (to - ra.center()) * (k as f32 / 8.0)));
+        d.frames(1);
+    }
+    d.frames(30);
+    assert!((rect(&d.h, &tab(b)).min.x - ra.min.x).abs() < 1.0, "B slides into A's place while A is dragged");
+    assert!(rect(&d.h, &tab(c)).min.x < rc.min.x - 1.0, "C slides left too");
+    assert!((rect(&d.h, &tab(a)).center().x - to.x).abs() < 1.0, "A follows the pointer");
+    assert_eq!(open_comps(&d.h), vec![a, b, c], "the comps move on release");
+    d.h.event(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    d.frames(1);
+    d.h.event(Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    d.frames(30);
+    assert_eq!(open_comps(&d.h), vec![a, b, c], "Escape cancels the move");
+    assert!((rect(&d.h, &tab(a)).min.x - ra.min.x).abs() < 1.0, "and A goes back");
     // A dropped on the right half of C goes after it; the Timeline stays where it is.
     d.drag(&tab(a), json!({"id": tab(c), "fx": 0.8, "fy": 0.5}));
     assert_eq!(open_comps(&d.h), vec![b, c, a]);
