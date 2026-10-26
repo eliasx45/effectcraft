@@ -1779,12 +1779,21 @@ pub fn viewer_hook(
                         ctx.set_cursor_icon(egui::CursorIcon::Move);
                         resp.clone().on_hover_text(format!("{}: {}", crate::i18n::effects::group(&g.match_id, &g.name), pr.name));
                     }
-                    if resp.dragged()
+                    // Moves by the drag, not to the pointer: a click or an off-centre grab leaves
+                    // the point where it is.
+                    let delta = resp.drag_delta();
+                    let key = resp.dragged().then(|| gesture_key(ui, id, resp.drag_started()));
+                    if let Some(key) = key
+                        && delta != egui::Vec2::ZERO
                         && let Some(pos) = resp.interact_pointer_pos()
                         && let Some(lp) = fw::comp_to_layer(&fm, map.to_comp(pos))
+                        && let Some(lp0) = fw::comp_to_layer(&fm, map.to_comp(pos - delta))
                     {
-                        let key = gesture_key(ui, id, resp.drag_started());
-                        actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": pr.uid, "value": [lp[0], lp[1]], "merge": key})));
+                        let v = ectx.value(layer, pr).as_vec2();
+                        actions.push((
+                            "prop.set".into(),
+                            json!({"layer": layer.id.0, "prop": pr.uid, "value": [v[0] + lp[0] - lp0[0], v[1] + lp[1] - lp0[1]], "merge": key}),
+                        ));
                     }
                 }
             }
