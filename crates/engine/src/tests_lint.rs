@@ -606,3 +606,57 @@ fn rest_poses_skip_moving_keys() {
     // 0.2 s (the overshoot) is mid-move; 1.8 s and 1.52 s hold on one side; 0.4 s and 0 too.
     assert_eq!(poses, vec![1.8, 1.52, 0.4, 0.0], "{poses:?}");
 }
+
+#[test]
+fn exit_at_cut_lets_springs_settle_and_flags_an_empty_tail() {
+    // A full-screen cutaway whose card pops with a big overshoot (0 → 150 → 100 %) and holds:
+    // the settle after the overshoot is no exit.
+    let mut s = comp(4.0);
+    base_shot(&mut s);
+    solid(&mut s, "BG", 320, 180, "#102040");
+    let card = solid(&mut s, "Card", 120, 40, "#2060c0");
+    for (time, v) in [(0.0, 0.0), (0.16, 150.0), (0.4, 100.0)] {
+        key(&mut s, card, "transform/scale", time, json!([v, v, 100.0]));
+    }
+    let rules = json!({"start": 0, "end": 4, "rules": ["exit-at-cut"]});
+    let r = lint(&mut s, rules.clone());
+    assert!(of(&r, "exit-at-cut").is_empty(), "{r:#}");
+    // A slow shrink over 3.5 s into the end is a drift, not an exit (exits take at most 1 s).
+    key(&mut s, card, "transform/scale", 3.96, json!([40.0, 40.0, 100.0]));
+    let r = lint(&mut s, rules.clone());
+    assert!(of(&r, "exit-at-cut").is_empty(), "{r:#}");
+
+    // No base shot, and the footage stops 0.8 s before the comp: 20 empty frames.
+    let rules = json!({"start": 0, "end": 2, "rules": ["exit-at-cut"]});
+    let mut s = comp(2.0);
+    let shot = base_shot(&mut s);
+    s.execute("layer.timing", json!({"layers": [shot], "out": 1.2})).unwrap();
+    let p = one(&lint(&mut s, rules), "exit-at-cut");
+    assert_eq!(p["severity"], "warning", "{p}");
+    assert!(
+        p["message"].as_str().unwrap().contains("Nothing is drawn from frame 30") && p["message"].as_str().unwrap().contains("20 frames of empty background"),
+        "{p}"
+    );
+}
+
+/// Elias's finished 20-08 task comps (A/B answer key, maintainer-local: `plan/` or
+/// `EFFECTCRAFT_AB_FINISHED`): `exit-at-cut` never warns on his own work. Skipped without the file.
+#[test]
+fn exit_at_cut_is_silent_on_his_finished_comps() {
+    let path = std::env::var("EFFECTCRAFT_AB_FINISHED")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plan/editing-harness/ab/src/20-08-finished-20261025.ecproj"));
+    if !path.exists() {
+        eprintln!("skipped: {} not here", path.display());
+        return;
+    }
+    let mut s = Session { expr: Some(std::sync::Arc::new(effectcraft_expr::Expressions)), ..Session::default() };
+    s.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+    // 02 Years Off, 04 Gatekeep, 05 8 Hours, 07 Copy That Sells, 10 Everything Is Copy, 06 Starter
+    // Kit, 11 Year Wasted, 12 100 Years.
+    for comp in [300306u64, 300333, 301104, 300490, 313971, 303626, 309234, 305155] {
+        let r = lint(&mut s, json!({"comp": comp, "start": 0, "rules": ["exit-at-cut"]}));
+        let warned: Vec<Value> = of(&r, "exit-at-cut").into_iter().filter(|p| p["severity"] != "info").collect();
+        assert!(warned.is_empty(), "{}: {warned:#?}", r["compName"]);
+    }
+}

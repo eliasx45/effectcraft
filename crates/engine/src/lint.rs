@@ -1135,11 +1135,12 @@ const CUT_FRAMES: usize = 2;
 pub const MAX_TAIL_FRAMES: usize = 300;
 /// A layer showing at most this share of its peak presence has left.
 const GONE_SHARE: f64 = 0.02;
-/// A layer still showing this share of its peak on the last frame hasn't left (a settle after
-/// an overshoot, a slow drift).
+/// A layer still showing this share of its held level on the last frame hasn't left.
 const STAYS_SHARE: f64 = 0.7;
-/// A layer at this share of its peak is fully in (its exit starts after the last such frame).
+/// A layer at this share of its held level is fully in (its exit starts after the last such frame).
 const FULL_SHARE: f64 = 0.95;
+/// Longest fade or move that counts as an exit (seconds).
+const MAX_EXIT_SECONDS: f64 = 1.0;
 /// Seconds before the content's last frame searched for the moment everything is in.
 const FULL_WINDOW: f64 = 3.0;
 /// A render is a full-screen picture when this share of its pixels is (nearly) opaque.
@@ -1223,15 +1224,22 @@ pub fn exit_tail(r: &Renderer, cid: ItemId) -> Option<Tail> {
     let early = (e + CUT_FRAMES < end).then(|| (over.get(who).map(|l| l.id), frame(first + e + 1)));
     let early = early.and_then(|(l, t)| Some((l?, t)));
     let mut at_cut = vec![];
+    let longest = (MAX_EXIT_SECONDS / fd.seconds().max(1e-9)).ceil() as usize;
     for ((row, pk), l) in pres.iter().zip(&peak).zip(&over) {
         let Some(&at_end) = row.get(end) else { continue };
-        if *pk <= 1e-9 || at_end >= STAYS_SHARE * pk {
+        // The level the layer holds once in (the median of its shown frames), not its peak: a
+        // spring's overshoot (Motion Library bounce: 130 % for a few frames) is no exit.
+        let mut shown: Vec<f64> = row.iter().copied().filter(|v| *v > GONE_SHARE * pk).collect();
+        shown.sort_by(f64::total_cmp);
+        let Some(&held) = shown.get(shown.len() / 2) else { continue };
+        if held <= 1e-9 || at_end >= STAYS_SHARE * held {
             continue;
         }
-        let Some(i0) = row.iter().rposition(|v| *v >= FULL_SHARE * pk) else { continue };
-        let i1 = (i0 + 1..=end).find(|&i| row.get(i).is_some_and(|v| *v <= GONE_SHARE * pk)).unwrap_or(end);
-        // Gradual (two frames or more: a one-frame drop is a cut) and ending on the cut.
-        if i1 + CUT_FRAMES >= end && i1 >= i0 + 2 {
+        let Some(i0) = row.iter().rposition(|v| *v >= FULL_SHARE * held) else { continue };
+        let i1 = (i0 + 1..=end).find(|&i| row.get(i).is_some_and(|v| *v <= GONE_SHARE * held)).unwrap_or(end);
+        // Gradual (two frames or more: a one-frame drop is a cut), no longer than an exit (a slow
+        // drift over seconds isn't one) and ending on the cut.
+        if i1 + CUT_FRAMES >= end && i1 >= i0 + 2 && i1 - i0 <= longest {
             at_cut.push((l.id, frame(first + i0), frame(first + i1)));
         }
     }
@@ -1263,7 +1271,8 @@ pub fn opaque_share(img: &Image) -> f64 {
 /// to its last frame and hard-cuts back to the footage: an exit into the cut is a warning, and so
 /// is everything leaving early while the comp runs on. In an overlay comp an exit into the end is
 /// right (overlays fade out over ~8 frames), so only leaving early is noted (info: the tail may
-/// be footage on purpose).
+/// be footage on purpose). Without a base shot, footage that ends before the comp leaves an
+/// empty tail: a warning.
 pub fn exit_at_cut(comp: &Comp, tail: &Tail, full_screen: bool) -> Vec<(Tick, Finding)> {
     let fd = comp.frame_rate.frame_duration();
     let f = |t: Tick| if fd.0 > 0 { t.0 / fd.0 } else { 0 };
@@ -1306,7 +1315,20 @@ pub fn exit_at_cut(comp: &Comp, tail: &Tail, full_screen: bool) -> Vec<(Tick, Fi
         && let Some(layer) = comp.layer(l)
     {
         let left = f(tail.last) - f(gone) + 1;
-        let message = if full_screen {
+        // No base shot and the last to leave is footage (the shot itself ends early): nothing
+        // is under it, so the tail is an empty gap. (An overlay precomp with no footage of its
+        // own ending early just lets its parent's footage show.)
+        let gap = tail.base.is_none() && matches!(layer.source, LayerSource::Footage { .. });
+        let message = if gap {
+            format!(
+                "Nothing is drawn from frame {} ({:.3} s, {} last to leave) to the comp's last frame {}: {left} frames of empty background. Hold the last shot (or extend the scene) to the end, or trim the comp to frame {}.",
+                f(gone),
+                gone.seconds(),
+                name(layer),
+                f(tail.last),
+                f(gone)
+            )
+        } else if full_screen {
             format!(
                 "Everything over {base} is gone from frame {} ({:.3} s, {} last to leave) but the comp runs {left} more frames, to frame {}: the full-screen cutaway ends early. Hold to the end and hard-cut, or trim the comp to frame {}.",
                 f(gone),
@@ -1324,7 +1346,7 @@ pub fn exit_at_cut(comp: &Comp, tail: &Tail, full_screen: bool) -> Vec<(Tick, Fi
                 f(tail.last)
             )
         };
-        out.push((gone, finding(l, if full_screen { Severity::Warning } else { Severity::Info }, message)));
+        out.push((gone, finding(l, if full_screen || gap { Severity::Warning } else { Severity::Info }, message)));
     }
     out
 }
