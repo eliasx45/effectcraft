@@ -342,6 +342,8 @@ fn opentype_popup(app: &mut dyn TimelineHost, ui: &mut egui::Ui, id: egui::Id, p
     let has = |tag: &str| feats.iter().any(|f| f == tag);
     let o = doc.opentype;
     let mut rects: Vec<(String, Rect, String)> = vec![];
+    // A window-level area: at the control's place in the window when a host scales the panel.
+    let pos = crate::layer_pointer::Lp::of(ui).window_p(pos);
     let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.set_min_width(230.0);
@@ -632,6 +634,8 @@ pub(super) fn font_picker(app: &mut dyn TimelineHost, ui: &mut egui::Ui, id: egu
     app.auto_mut().add(&format!("{auto}.toggle"), arrow, "Close font list");
     let mut chosen = None;
     let screen = ui.ctx().content_rect();
+    // A window-level area: at the field's place in the window when a host scales the panel.
+    let rect = crate::layer_pointer::Lp::of(ui).to_window(rect);
     let below = screen.bottom() - rect.bottom() - 16.0;
     let above = below < 100.0 && rect.top() - screen.top() > below;
     let max_height = (if above { rect.top() - screen.top() - 16.0 } else { below }).clamp(28.0, 380.0);

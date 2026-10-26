@@ -519,10 +519,14 @@ fn fast_in_split(app: &mut dyn TimelineHost, ui: &mut egui::Ui, ctx: &egui::Cont
     // Hovering the split (or its chips) shows the property chips under it.
     let open_id = egui::Id::new("tl-quick-fastin-chips");
     let chips_r = Rect::from_min_size(pos2(split.min.x, split.max.y + 2.0), vec2(330.0, ROW_H - 4.0));
-    let ptr = crate::layer_pointer::Lp::of(ui).pos(ctx.input(|i| i.pointer.hover_pos()));
-    let over = ptr.is_some_and(|p| {
-        split.expand(2.0).contains(p) || chips_r.expand(4.0).contains(p) || Rect::from_min_max(split.left_bottom(), chips_r.right_top()).contains(p)
-    });
+    let lp = crate::layer_pointer::Lp::of(ui);
+    // The chips are a window-level area: under the split's place in the window, at panel size
+    // (a host draws the Timeline in a scaled layer; as `widgets::popup_list`).
+    let chips_r = Rect::from_min_size(lp.window_p(chips_r.min), chips_r.size());
+    let raw = ctx.input(|i| i.pointer.hover_pos());
+    let ptr = lp.pos(raw);
+    let over = ptr.is_some_and(|p| split.expand(2.0).contains(p))
+        || raw.is_some_and(|p| chips_r.expand(4.0).contains(p) || Rect::from_min_max(lp.window_p(split.left_bottom()), chips_r.right_top()).contains(p));
     let open = over || pick_resp.hovered();
     ctx.data_mut(|d| d.insert_temp(open_id, open));
     if !open {
