@@ -648,6 +648,10 @@ const POPUP_LIST_MAX_H: f32 = 440.0;
 /// when `body` returns a choice, on Escape, or on a press outside it and outside `anchor` (a
 /// control that toggles the list itself). Returns the choice.
 pub fn popup_list<R>(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, anchor: Rect, rows: usize, seps: usize, body: impl FnOnce(&mut Ui) -> Option<R>) -> Option<R> {
+    // The list is a window-level area: a control in a scaled layer (a host's canvas) opens it at
+    // the control's place in the window.
+    let lp = crate::layer_pointer::Lp::of(ui);
+    let (pos, anchor) = (lp.window_p(pos), if anchor.is_positive() { lp.to_window(anchor) } else { anchor });
     let screen = ui.ctx().content_rect();
     let sp = ui.spacing();
     let want = rows as f32 * (sp.interact_size.y + sp.item_spacing.y + 4.0) + seps as f32 * (2.0 * sp.item_spacing.y + 2.0) + 16.0;

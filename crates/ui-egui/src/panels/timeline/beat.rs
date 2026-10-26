@@ -140,7 +140,7 @@ pub(crate) fn beat_dot(app: &mut dyn TimelineHost, p: &Painter, tm: TMap, cid: u
     let note = format!("speed peak f{:.1} · {} f{:.0} · {:+.1} f", b.peak * fps, b.word, b.accent * fps, b.off);
     let hit = Rect::from_center_size(c, egui::vec2(10.0, 10.0));
     app.auto_mut().add(&format!("timeline.layer.{}.beat", layer.id.0), hit, &note);
-    if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()).filter(|q| hit.contains(*q)) {
+    if let Some(ptr) = crate::layer_pointer::Lp::layer(&ctx, p.layer_id()).pos(ctx.input(|i| i.pointer.hover_pos())).filter(|q| hit.contains(*q)) {
         super::drag_tip(&ctx, &app.tokens(), ptr, note);
     }
 }

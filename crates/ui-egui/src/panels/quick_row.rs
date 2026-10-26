@@ -519,7 +519,7 @@ fn fast_in_split(app: &mut dyn TimelineHost, ui: &mut egui::Ui, ctx: &egui::Cont
     // Hovering the split (or its chips) shows the property chips under it.
     let open_id = egui::Id::new("tl-quick-fastin-chips");
     let chips_r = Rect::from_min_size(pos2(split.min.x, split.max.y + 2.0), vec2(330.0, ROW_H - 4.0));
-    let ptr = ctx.input(|i| i.pointer.hover_pos());
+    let ptr = crate::layer_pointer::Lp::of(ui).pos(ctx.input(|i| i.pointer.hover_pos()));
     let over = ptr.is_some_and(|p| {
         split.expand(2.0).contains(p) || chips_r.expand(4.0).contains(p) || Rect::from_min_max(split.left_bottom(), chips_r.right_top()).contains(p)
     });

@@ -306,7 +306,7 @@ pub(crate) fn show(
     // One handle answers at a time: the one being dragged, else the one the pointer is nearest.
     let dragged = grab.filter(|g| g.speed.is_some()).map(|g| (g.key, g.out));
     let hot = dragged.or_else(|| {
-        let ptr = ui.input(|i| i.pointer.hover_pos()).filter(|p| strip.expand(HANDLE_PICK).contains(*p))?;
+        let ptr = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.hover_pos())).filter(|p| strip.expand(HANDLE_PICK).contains(*p))?;
         pick(&handles, ptr, ctx.data(|d| d.get_temp(hot_id(uid))))
     });
     ctx.data_mut(|d| match hot {

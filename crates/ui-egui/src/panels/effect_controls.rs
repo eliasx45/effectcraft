@@ -1413,7 +1413,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     }
     // Drag an effect header to reorder: insertion line between headers.
     if let Some(du) = dragging {
-        if let Some(pos) = ctx.pointer_interact_pos() {
+        if let Some(pos) = crate::layer_pointer::Lp::layer(&ctx, bp.layer_id()).pos(ctx.pointer_interact_pos()) {
             let slot = tops.iter().position(|(_, ty)| pos.y < *ty + (ROW + 2.0) / 2.0).unwrap_or(tops.len());
             let ly = tops.get(slot).map(|(_, ty)| *ty).unwrap_or(y - 4.0);
             bp.line_segment([pos2(body.min.x + 4.0, ly), pos2(body.max.x - 4.0, ly)], Stroke::new(2.0, t.accent));

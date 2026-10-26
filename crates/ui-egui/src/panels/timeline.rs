@@ -1172,7 +1172,7 @@ fn quick_offset_note(frames: i64, layers: usize) -> String {
 
 /// A Timeline drag's readout by the pointer (After Effects shows it in the Info panel).
 fn drag_tip(ctx: &egui::Context, t: &Tokens, ptr: Pos2, note: String) {
-    let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, tl_id("tl-key-drag-tip")));
+    let fg = crate::layer_pointer::Lp::panel(ctx).overlay(ctx, egui::Order::Tooltip, tl_id("tl-key-drag-tip"));
     let g = fg.layout_no_wrap(note, Tokens::ui(11.5), t.text);
     let r = Rect::from_min_size(ptr + vec2(14.0, 14.0), g.size() + vec2(10.0, 6.0));
     fg.rect_filled(r, 3.0, t.panel_bg);
@@ -1205,7 +1205,8 @@ fn switch_gesture(ui: &egui::Ui, resp: &egui::Response, row: Rect, switch: &'sta
     }
     let d = ui.data(|d| d.get_temp::<SwitchDrag>(switch_drag_id())).filter(|d| d.switch == switch && d.value != on)?;
     // The heights the pointer moved over since the last frame, so a quick drag skips no row.
-    let (a, b) = ui.input(|i| i.pointer.interact_pos().map(|p| (p.y - i.pointer.delta().y, p.y)))?;
+    let lp = crate::layer_pointer::Lp::of(ui);
+    let (a, b) = ui.input(|i| i.pointer.interact_pos().map(|p| (lp.p(p).y - lp.vec(i.pointer.delta()).y, lp.p(p).y)))?;
     (a.min(b) < row.max.y && a.max(b) >= row.min.y).then_some((d.value, d.merge))
 }
 
@@ -1338,6 +1339,9 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     }
     let t = app.tokens();
     let ctx = ui.ctx().clone();
+    // Raw pointer reads in the panel's own coordinates (a host may scale its layer).
+    crate::layer_pointer::Lp::mark(ui);
+    let lpt = crate::layer_pointer::Lp::of(ui);
     let Some(cid) = app.session().active_comp_id() else {
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, tr("Drop footage here to create a composition"), Tokens::ui(12.0), t.text_faint);
         app.auto_mut().add("timeline.empty", rect, "Drop footage to create a composition");
@@ -1810,19 +1814,20 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     {
         app.ui_mut().timeline.scroll_y = rows.iter().take(i).map(|r| row_height(r, rh, &heights)).sum();
     }
-    if ui.rect_contains_pointer(rows_rect) && !(app.ui().timeline.graph_editor && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x >= graph_x0)) {
+    if ui.rect_contains_pointer(rows_rect) && !(app.ui().timeline.graph_editor && lpt.pos(ui.input(|i| i.pointer.hover_pos())).is_some_and(|p| p.x >= graph_x0))
+    {
         let (dy, dx, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.smooth_scroll_delta.x, i.modifiers.alt));
         // Ctrl/Cmd+wheel and a trackpad pinch reach egui as a zoom factor rather than a scroll
         // (#428); like Alt+wheel they zoom time.
         let pinch = ui.input(|i| i.zoom_delta()) as f64;
-        let at_x = ui.input(|i| i.pointer.hover_pos()).map(|p| p.x).unwrap_or(graph_x0);
+        let at_x = lpt.pos(ui.input(|i| i.pointer.hover_pos())).map(|p| p.x).unwrap_or(graph_x0);
         if (pinch - 1.0).abs() > 1e-4 {
             set_zoom(&mut app.ui_mut().timeline, &comp, tm.pps * pinch, fit_pps, tm.t(at_x), (at_x - tm.x0) as f64);
         } else if zoom && dy.abs() > 0.0 {
             // Alt+wheel zooms around the pointer, out until the whole comp shows.
             set_zoom(&mut app.ui_mut().timeline, &comp, tm.pps * (dy as f64 / 200.0).exp(), fit_pps, tm.t(at_x), (at_x - tm.x0) as f64);
         } else {
-            let over_outline = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x < graph_x0);
+            let over_outline = lpt.pos(ui.input(|i| i.pointer.hover_pos())).is_some_and(|p| p.x < graph_x0);
             let shift = ui.input(|i| i.modifiers.shift);
             if over_outline && overflow > 0.0 && (dx.abs() > 0.0 || (shift && dy.abs() > 0.0)) {
                 let d = if dx.abs() > 0.0 { dx } else { dy };
@@ -1838,7 +1843,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     // A pick whip held near the top or bottom of the layers (or past it) scrolls them, as in
     // After Effects.
     if ctx.data(|d| d.get_temp::<PickWhip>(pick_whip_id())).is_some()
-        && let Some(ptr) = ctx.input(|i| i.pointer.latest_pos()).filter(|p| rect.x_range().contains(p.x))
+        && let Some(ptr) = lpt.pos(ctx.input(|i| i.pointer.latest_pos())).filter(|p| rect.x_range().contains(p.x))
     {
         let speed = edge_scroll_speed(rows_rect, ptr.y, rh);
         if speed != 0.0 {
@@ -1849,7 +1854,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     // So does a layer reorder drag (wherever the pointer is sideways), so a layer can be dragged
     // to any place in a stack taller than the panel.
     if ctx.data(|d| d.get_temp::<Vec<u64>>(layer_drag_id())).is_some()
-        && let Some(ptr) = ctx.input(|i| i.pointer.latest_pos().filter(|_| i.pointer.primary_down()))
+        && let Some(ptr) = lpt.pos(ctx.input(|i| i.pointer.latest_pos().filter(|_| i.pointer.primary_down())))
     {
         let speed = edge_scroll_speed(rows_rect, ptr.y, rh);
         if speed != 0.0 {
@@ -1881,7 +1886,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     app.auto_mut().add("timeline.layerMarquee", outline_rect, "Drag empty outline to select layers");
     // Key marquee (dragging the empty time graph): the box now (the last one on release), the
     // keys inside it, and the selection the keys show while it is dragged, as in After Effects.
-    let key_box = match (empty.dragged(), ctx.input(|i| i.pointer.press_origin()), empty.interact_pointer_pos()) {
+    let key_box = match (empty.dragged(), lpt.pos(ctx.input(|i| i.pointer.press_origin())), empty.interact_pointer_pos()) {
         (true, Some(origin), Some(cur)) => Some(Rect::from_two_pos(origin, cur)),
         _ if empty.drag_stopped() => ctx.data(|d| d.get_temp::<Rect>(tl_id("tl-box"))),
         _ => None,
@@ -1917,7 +1922,8 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
         if !crate::widgets::any_menu_open(ui.ctx())
             && !egui::Popup::is_any_open(ui.ctx())
             && ui.input(|i| {
-                i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| r.intersect(rows_rect).contains(p) && (!graph_on || p.x < graph_x0))
+                i.pointer.any_pressed()
+                    && lpt.pos(i.pointer.interact_pos()).is_some_and(|p| r.intersect(rows_rect).contains(p) && (!graph_on || p.x < graph_x0))
             })
         {
             inline::clear_focus(app);
@@ -2256,7 +2262,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
                             if gresp.dragged()
                                 && ui.input(|i| i.modifiers.shift)
                                 && let Some(start) = ctx.data(|dd| dd.get_temp::<f64>(slip_start_id))
-                                && let (Some(o), Some(now)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+                                && let (Some(o), Some(now)) = lpt.pair(ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos())))
                             {
                                 let (cur_s, cur_e) = (layer.start_time.seconds(), layer.comp_time(d).seconds());
                                 let want = start + f64::from(now.x - o.x) / pps.max(1e-6);
@@ -2350,7 +2356,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
                         && mods.command
                         && mods.alt
                         && let Some(n) = quick_offset_layers(&comp, selected.iter().copied())
-                        && let Some(p) = ctx.input(|i| i.pointer.press_origin())
+                        && let Some(p) = lpt.pos(ctx.input(|i| i.pointer.press_origin()))
                     {
                         ctx.data_mut(|d| d.insert_temp(quick_bar_id(), QuickBar { layer: layer.id, origin_x: p.x, layers: n, applied: 0 }));
                     }
@@ -2370,7 +2376,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
                             && resp.dragged()
                             && !mods.shift
                             && let Some(start_in) = ctx.data(|d| d.get_temp::<f64>(start_in_id))
-                            && let (Some(o), Some(now)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+                            && let (Some(o), Some(now)) = lpt.pair(ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos())))
                             && let Some((to, snap)) = beat::layer_drag_target(&comp, layer, start_in + (now.x - o.x) as f64 / pps)
                         {
                             let frames = ((to - layer.in_point.seconds()) / fd).round() as i64;
@@ -2405,7 +2411,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
                         if resp.dragged()
                             && mods.shift
                             && let Some(start) = ctx.data(|d| d.get_temp::<f64>(snap_start_id))
-                            && let (Some(o), Some(now)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+                            && let (Some(o), Some(now)) = lpt.pair(ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos())))
                         {
                             let moved: Vec<LayerId> = if is_sel { selected.clone() } else { vec![layer.id] };
                             let skip = if kind == "move" {
@@ -3065,7 +3071,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
                         // (From where the button went down: a drag starts a few pixels later.)
                         if kresp.drag_started()
                             && !super::graph_tools::alt_scale_active(&ctx)
-                            && let Some(p) = ctx.input(|i| i.pointer.press_origin())
+                            && let Some(p) = lpt.pos(ctx.input(|i| i.pointer.press_origin()))
                         {
                             // Ctrl/Cmd+Alt: Quick Offset of the selected keys' layers (#1012).
                             let quick = (mods.command && mods.alt && ks).then(|| quick_offset_layers(&comp, sel_keys.iter().map(|k| k.layer))).flatten();
@@ -3148,7 +3154,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     // (Shift/Cmd adds them to the selection the drag started from).
     let box_id = tl_id("tl-layer-box");
     let base_id = tl_id("tl-layer-box-base");
-    let live_box = match (ctx.input(|i| i.pointer.press_origin()), outline_empty.interact_pointer_pos()) {
+    let live_box = match (lpt.pos(ctx.input(|i| i.pointer.press_origin())), outline_empty.interact_pointer_pos()) {
         (Some(start), Some(end)) if outline_empty.dragged() => Some(Rect::from_two_pos(start, end).intersect(outline_rect)),
         _ if outline_empty.drag_stopped() => ctx.data(|d| d.get_temp::<Rect>(box_id)),
         _ => None,
@@ -3192,8 +3198,8 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     // Pick whips: a line follows the pointer; releasing over a row links to it (an expression's
     // or a property's, also over a property in Effect Controls).
     if let Some((kind, src_layer, src_prop, start)) = ctx.data(|d| d.get_temp::<PickWhip>(pick_whip_id())) {
-        let ptr = ctx.input(|i| i.pointer.latest_pos()).unwrap_or(start);
-        let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, tl_id("tl-pickwhip-line")));
+        let ptr = lpt.pos(ctx.input(|i| i.pointer.latest_pos())).unwrap_or(start);
+        let fg = lpt.overlay(&ctx, egui::Order::Foreground, tl_id("tl-pickwhip-line"));
         fg.line_segment([start, ptr], Stroke::new(1.5, t.accent));
         fg.circle_stroke(ptr, 4.0, Stroke::new(1.5, t.accent));
         let target = hit_rows.iter().find(|(r, _)| r.contains(ptr)).map(|(r, row)| (*r, row.clone()));
@@ -3280,7 +3286,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
         let stack: Vec<u64> = comp.layers.iter().map(|l| l.id.0).collect();
         let moving: Vec<u64> = moving.into_iter().filter(|id| stack.contains(id)).collect();
         let layer_rows: Vec<(Rect, LayerId)> = hit_rows.iter().filter(|(_, r)| matches!(r.kind, RowKind::Layer)).map(|(rr, r)| (*rr, r.layer)).collect();
-        let py = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos())).map(|p| p.y);
+        let py = lpt.pos(ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()))).map(|p| p.y);
         let place = py.filter(|_| !layer_rows.is_empty() && !moving.is_empty()).map(|py| {
             let (at, line_y) = insertion(&layer_rows, py, rows_rect.min.y);
             let visible: Vec<u64> = layer_rows.iter().map(|(_, l)| l.0).collect();
@@ -3309,7 +3315,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     // Quick Offset of layer bars: the last selected layer moves by whole frames with the pointer
     // until the button is released, wherever the bar's row has scrolled to.
     if let Some(mut q) = ctx.data(|d| d.get_temp::<QuickBar>(quick_bar_id())) {
-        let (down, ptr) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
+        let (down, ptr) = ctx.input(|i| (i.pointer.primary_down(), lpt.pos(i.pointer.latest_pos())));
         match ptr.filter(|_| down) {
             Some(ptr) => {
                 let frames = (((ptr.x - q.origin_x) as f64 / pps) / fd).round() as i64;
@@ -3331,7 +3337,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     // released (one undo step); Shift snaps the grabbed key to the current time, the work area
     // and composition markers.
     if let Some(mut kd) = ctx.data(|d| d.get_temp::<KeyDrag>(key_drag_id())) {
-        let (down, ptr, shift) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos(), i.modifiers.shift));
+        let (down, ptr, shift) = ctx.input(|i| (i.pointer.primary_down(), lpt.pos(i.pointer.latest_pos()), i.modifiers.shift));
         match ptr.filter(|_| down) {
             Some(ptr) => {
                 let mut target = kd.anchor + (ptr.x - kd.origin_x) as f64 / pps;
@@ -3614,7 +3620,7 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     // (Shift: at the current time).
     if let Some(payload) = egui::DragAndDrop::payload::<crate::panels::DragPayload>(&ctx)
         && !matches!(*payload, crate::panels::DragPayload::Property { .. })
-        && let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()).filter(|_| ui.rect_contains_pointer(rows_rect))
+        && let Some(ptr) = lpt.pos(ctx.input(|i| i.pointer.hover_pos())).filter(|_| ui.rect_contains_pointer(rows_rect))
     {
         let released = ctx.input(|i| i.pointer.any_released());
         if let crate::panels::DragPayload::Effect(e) = payload.as_ref() {

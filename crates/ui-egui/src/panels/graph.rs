@@ -760,7 +760,7 @@ pub(crate) fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pain
     }
     if !navigating
         && !ui.input(|i| i.pointer.any_down())
-        && let Some(q) = ui.input(|i| i.pointer.hover_pos()).filter(|q| plot.contains(*q))
+        && let Some(q) = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.hover_pos())).filter(|q| plot.contains(*q))
     {
         let hit = cs
             .iter()
@@ -816,7 +816,7 @@ pub(crate) fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pain
     }
     // Key marquee (dragging the background): the box now (the last one on release), the keys
     // inside it, and the selection the keys show while it is dragged, as in After Effects.
-    let key_box = match (bg.dragged(), ctx.input(|i| i.pointer.press_origin()), bg.interact_pointer_pos()) {
+    let key_box = match (bg.dragged(), crate::layer_pointer::Lp::of(ui).pos(ctx.input(|i| i.pointer.press_origin())), bg.interact_pointer_pos()) {
         (true, Some(o), Some(cur)) => Some(Rect::from_two_pos(o, cur)),
         _ if bg.drag_stopped() => ctx.data(|d| d.get_temp::<Rect>(tl_id("graph-box"))),
         _ => None,
@@ -946,7 +946,7 @@ pub(crate) fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pain
             // went down (the key doesn't jump under the pointer); Shift keeps it to the time or
             // the value axis, whichever moved more.
             if kresp.drag_started()
-                && let Some(o) = ui.input(|i| i.pointer.press_origin())
+                && let Some(o) = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.press_origin()))
             {
                 ctx.data_mut(|dd| {
                     dd.insert_temp(key_grab_id(), KeyGrab { press: o, t: k.t, v: k.v, value_per_pixel: (hi - lo) / f64::from(plot.height().max(1.0)) })
@@ -1064,7 +1064,7 @@ pub(crate) fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pain
                         toggle: ui.input(|i| i.modifiers.alt).then_some(!continuous),
                         linked: if c.linked { (0..shown_dims(c.layer, c.prop)).collect() } else { vec![] },
                     };
-                    let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(hp);
+                    let press = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.press_origin())).unwrap_or(hp);
                     ctx.data_mut(|dd| {
                         dd.insert_temp::<HandleDrag>(handle_drag_id(), (press, vec![grab], (hi - lo) / f64::from(plot.height().max(1.0)), tm.pps))
                     });
@@ -1310,7 +1310,7 @@ fn navigation(app: &mut dyn TimelineHost, ui: &mut egui::Ui, comp: &Comp, tm: TM
             });
         }
         if resp.dragged() || middle_drag {
-            let delta = ui.input(|i| i.pointer.delta());
+            let delta = crate::layer_pointer::Lp::of(ui).vec(ui.input(|i| i.pointer.delta()));
             if hand {
                 app.ui_mut().timeline.start = (app.ui().timeline.start - f64::from(delta.x) / tm.pps.max(1e-6)).clamp(0.0, comp.duration.seconds());
                 if !app.ui().timeline.graph_auto_zoom {
@@ -1346,7 +1346,8 @@ fn navigation(app: &mut dyn TimelineHost, ui: &mut egui::Ui, comp: &Comp, tm: TM
     if !over {
         return;
     }
-    let (scroll, mods, pinch, at) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers, i.zoom_delta(), i.pointer.hover_pos()));
+    let lp = crate::layer_pointer::Lp::of(ui);
+    let (scroll, mods, pinch, at) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers, i.zoom_delta(), lp.pos(i.pointer.hover_pos())));
     let Some(at) = at else {
         return;
     };

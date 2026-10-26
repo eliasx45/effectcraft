@@ -449,7 +449,7 @@ pub(super) fn header(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pa
 
     // Reorder: drag a header left or right.
     if hresp.drag_started()
-        && let Some(origin) = ctx.input(|i| i.pointer.press_origin())
+        && let Some(origin) = crate::layer_pointer::Lp::of(ui).pos(ctx.input(|i| i.pointer.press_origin()))
         && let Some(id) = column_at(cw, origin.x)
     {
         ctx.data_mut(|d| d.insert_temp(drag_id(), (id, origin)));
@@ -457,9 +457,9 @@ pub(super) fn header(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pa
     let dragging: Option<(&'static str, egui::Pos2)> = ctx.data(|d| d.get_temp(drag_id()));
     if let Some((id, origin)) = dragging
         && let Some((a, b)) = cw.span(id)
-        && let Some(ptr) = ctx.input(|i| i.pointer.latest_pos())
+        && let Some(ptr) = crate::layer_pointer::Lp::of(ui).pos(ctx.input(|i| i.pointer.latest_pos()))
     {
-        let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, tl_id("tl-col-drag-ghost")));
+        let fg = crate::layer_pointer::Lp::of(ui).overlay(&ctx, egui::Order::Tooltip, tl_id("tl-col-drag-ghost"));
         let ghost = Rect::from_min_max(pos2(a, hdr.min.y), pos2(b, hdr.max.y)).translate(vec2(ptr.x - origin.x, 0.0));
         fg.rect_filled(ghost, 2.0, t.accent.gamma_multiply(0.25));
         fg.text(ghost.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, crate::i18n::tr(column_label(&app.ui().timeline, id)), Tokens::ui(11.0), t.text);
@@ -494,7 +494,7 @@ pub(super) fn header(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Pa
             ctx.data_mut(|d| d.insert_temp(start_id, column_width(&app.ui().timeline, id)));
         }
         if resp.dragged()
-            && let (Some(origin), Some(ptr)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+            && let (Some(origin), Some(ptr)) = crate::layer_pointer::Lp::of(ui).pair(ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos())))
         {
             let start = ctx.data(|d| d.get_temp::<f32>(start_id)).unwrap_or_else(|| column_width(&app.ui().timeline, id));
             let _ = set_column_width(&mut app.ui_mut().timeline, id, start + ptr.x - origin.x);
@@ -555,7 +555,7 @@ pub(super) fn splitter(app: &mut dyn TimelineHost, ui: &mut egui::Ui, x: f32, y0
         ctx.data_mut(|d| d.insert_temp(start_id, left_w));
     }
     if resp.dragged()
-        && let (Some(origin), Some(ptr)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos()))
+        && let (Some(origin), Some(ptr)) = crate::layer_pointer::Lp::of(ui).pair(ctx.input(|i| (i.pointer.press_origin(), i.pointer.latest_pos())))
     {
         let start = ctx.data(|d| d.get_temp::<f32>(start_id)).unwrap_or(left_w);
         app.ui_mut().timeline.outline_w = Some(clamp_outline(start + ptr.x - origin.x, panel_w));

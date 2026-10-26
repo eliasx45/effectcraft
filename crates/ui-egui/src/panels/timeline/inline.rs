@@ -118,7 +118,9 @@ pub(super) fn show(
         && !egui::Popup::is_any_open(ui.ctx())
         && ui.input(|i| {
             i.pointer.any_pressed()
-                && i.pointer.interact_pos().is_some_and(|p| r.intersect(left_clip.union(right_clip)).contains(p) && (!graph_on || p.x < right_clip.min.x))
+                && crate::layer_pointer::Lp::panel(ui.ctx())
+                    .pos(i.pointer.interact_pos())
+                    .is_some_and(|p| r.intersect(left_clip.union(right_clip)).contains(p) && (!graph_on || p.x < right_clip.min.x))
         })
     {
         focus(app, n.root, &n.path);

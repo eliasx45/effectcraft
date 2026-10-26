@@ -12,6 +12,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED3 | Effect Controls (+ shortcuts, widget ids) | Draws against `TimelineHost`; `keys::forward_shortcuts` / `menus::shortcut_command`; scroll-bar and Tab-order ids scoped |
 | EMBED4 | Remaining Timeline features | Markers, quick row, waveforms, dialogs (as requests) and the eyedropper through the host; 6 minor sites left |
 | EMBED5 | Keys, UI commands, inline edits in a host | `panels::timeline::hosted`: Timeline UI commands and their keys (the person's own shortcuts), frontend events, precomp redirect |
+| EMBED6 | Panels in a scaled layer | `layer_pointer::Lp`: raw pointer reads, drag overlays and popup lists in the layer's own coordinates (a host may draw the Timeline in a layer it transforms, e.g. scaled on a canvas) |
 
 ## The host interface (EMBED1)
 
@@ -218,6 +219,13 @@ All additive; nothing a host implements or calls was renamed or removed.
 - EMBED5: `panels::timeline::hosted::{handles, install, installed, user_keymaps,
   use_user_shortcuts, run, handle_events, inline, engine_command}`; `keys::forward_shortcuts` also
   runs `Physical+` bindings. The default `TimelineHost::invoke` is unchanged (engine only).
+- EMBED6: `layer_pointer::Lp` (`of`, `layer`, `mark`, `panel`, `p`, `pos`, `pair`, `vec`, `overlay`,
+  `window_p`, `to_window`). A host may draw the Timeline and Effect Controls in a layer it gives a
+  transform (`Context::set_transform_layer`): egui's responses already come back in the layer's
+  coordinates, and every raw pointer read in those panels (hover, latest, interact, press origin,
+  delta) now goes through `Lp`, as do the drag ghosts, the pick whip's line and `widgets::popup_list`
+  (opened at the control's place in the window). In EffectCraft's window nothing is transformed and
+  `Lp` changes nothing. New raw pointer reads in these panels must go through `Lp` too.
 - EMBED4: `TimelineHost::{request_dialog, waveform, pointer_color}` (defaulted: dialogs decline
   with a status message, waveforms are computed per context, no pointer colour);
   `panels::timeline::{DialogRequest, PointerColor}` (`DialogRequest` is `#[non_exhaustive]`: new

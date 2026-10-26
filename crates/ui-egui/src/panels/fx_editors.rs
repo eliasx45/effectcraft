@@ -342,7 +342,7 @@ fn huesat_curves(
     // One undo step per click or drag.
     let key = gesture_key(ui, gid, resp.drag_started() || resp.clicked());
     if resp.drag_started()
-        && let Some(pt) = ui.input(|i| i.pointer.press_origin())
+        && let Some(pt) = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.press_origin()))
     {
         let q = to_g(pt);
         let i = match cur.hit(q[0], q[1], hit_r) {
@@ -518,7 +518,7 @@ fn colorama_wheel(
     // One undo step per click or drag (a colour pick is its own step).
     let key = gesture_key(ui, wid, resp.drag_started() || resp.clicked() || !resp.dragged());
     if resp.drag_started()
-        && let Some(q) = ui.input(|i| i.pointer.press_origin())
+        && let Some(q) = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.press_origin()))
         && let Some(i) = hit(q)
     {
         ui.data_mut(|d| {

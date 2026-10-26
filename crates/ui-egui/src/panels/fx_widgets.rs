@@ -409,7 +409,7 @@ pub fn curves_graph(ui: &mut egui::Ui, rect: Rect, pts: &CurvePoints, channel: u
         return (resp, edit);
     }
     if resp.drag_started()
-        && let Some(pt) = ui.input(|i| i.pointer.press_origin())
+        && let Some(pt) = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.press_origin()))
     {
         let g = to_g(pt);
         let i = match pts.hit(g[0], g[1], hit_r) {

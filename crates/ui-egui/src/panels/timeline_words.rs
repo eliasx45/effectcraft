@@ -56,7 +56,8 @@ pub(crate) fn paint(app: &mut dyn TimelineHost, ui: &egui::Ui, gp: &egui::Painte
     }
     let (t0, t1) = (tm.t(clip.min.x).max(layer.in_point.seconds()), tm.t(clip.max.x).min(layer.out_point.seconds()));
     let first = map.words.partition_point(|w| w.end.seconds() < t0);
-    let hover = ui.ctx().pointer_hover_pos().filter(|p| bar.expand(3.0).contains(*p) && !ui.input(|i| i.pointer.any_down()));
+    let hover =
+        crate::layer_pointer::Lp::of(ui).pos(ui.ctx().pointer_hover_pos()).filter(|p| bar.expand(3.0).contains(*p) && !ui.input(|i| i.pointer.any_down()));
     let mut hovered: Option<(usize, String)> = None;
     let mid = bar.center().y;
     let h = (bar.height() - 6.0).clamp(8.0, 16.0);

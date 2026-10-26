@@ -202,7 +202,7 @@ pub(crate) fn transform_box(
         let resp = ui.interact(r, tl_id("graph-box-inside"), Sense::drag());
         app.auto_mut().add("timeline.graph.transformBox", r, "Transform box");
         if resp.drag_started()
-            && let Some(o) = ui.input(|i| i.pointer.press_origin())
+            && let Some(o) = crate::layer_pointer::Lp::of(ui).pos(ui.input(|i| i.pointer.press_origin()))
         {
             start = Some(BoxDrag { handle: 8, anchor: [0.0; 2], last: data(o), origin: [b[0], b[1]] });
         }
@@ -417,7 +417,7 @@ pub(crate) fn alt_scale_update(app: &dyn TimelineHost, ctx: &egui::Context, comp
         actions.push(("__endMerge".into(), json!({})));
         return;
     }
-    let (Some((lo, hi)), Some(px)) = (sel_range(app, comp), ctx.input(|i| i.pointer.latest_pos())) else { return };
+    let (Some((lo, hi)), Some(px)) = (sel_range(app, comp), crate::layer_pointer::Lp::panel(ctx).pos(ctx.input(|i| i.pointer.latest_pos()))) else { return };
     let fr = comp.frame_rate;
     let target = fr.snap_nearest(effectcraft_engine::time::Tick::from_seconds_f64(tm.t(px.x).max(0.0))).seconds();
     // The group's span when the drag started: every step sends the whole scale since then.
