@@ -337,3 +337,53 @@ fn moves_without_an_approved_curve_get_no_fix_and_springs_are_left_to_their_expr
     assert_eq!(pop["verdict"], "close", "{pop:#}");
     assert!(pop["message"].as_str().unwrap().contains("expression drives"), "{pop:#}");
 }
+
+#[test]
+fn rig_entrances_scrubs_and_his_fast_exits_read_as_he_animates() {
+    // HT3 (A/B item 4): his finished 20-08 moves came out ❌.
+    let (mut s, cid, card) = comp();
+    let p = builtin_profile();
+    let side = |c: &str| p.find(c).map(|c| ((c.out.speed, c.out.influence), (c.inn.speed, c.inn.influence))).unwrap();
+    // A rig null in the frame carries a card that starts 1000 px below it, off the frame: the
+    // rig's slide up is an entrance (it was an on-screen move).
+    s.execute_checked("prop.set", json!({"layer": card, "path": "transform/position", "value": [960.0, 1540.0]})).unwrap();
+    let rig = s.execute_checked("layer.newNull", json!({"name": "Rig"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute_checked("prop.set", json!({"layer": rig, "path": "transform/position", "value": [960.0, 540.0]})).unwrap();
+    s.execute_checked("layer.setParent", json!({"layers": [card], "parent": rig, "compensate": true})).unwrap();
+    key(&mut s, rig, "transform/position", 1.0, json!([960.0, 540.0]));
+    key(&mut s, rig, "transform/position", 1.8, json!([960.0, -460.0]));
+    let (o, i) = side("expo-out-1");
+    ease(&mut s, cid, rig, "transform/position", 0, o, i);
+    // A bar filling from its left edge: X scale only, anchor on the left edge.
+    let bar = s.execute("layer.newSolid", json!({"name": "Bar", "width": 400, "height": 20, "color": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute_checked("prop.set", json!({"layer": bar, "path": "transform/anchor", "value": [0.0, 10.0]})).unwrap();
+    key(&mut s, bar, "transform/scale", 2.0, json!([0.0, 100.0]));
+    key(&mut s, bar, "transform/scale", 2.8, json!([100.0, 100.0]));
+    let (o, i) = side("expo-in-out-elias");
+    ease(&mut s, cid, bar, "transform/scale", 0, o, i);
+    // The same X-only scale from the centre is still an entrance.
+    let mid = s.execute("layer.newSolid", json!({"name": "Mid", "width": 400, "height": 20, "color": "#00ff00"})).unwrap()["layer"].as_u64().unwrap();
+    key(&mut s, mid, "transform/scale", 2.0, json!([0.0, 100.0]));
+    key(&mut s, mid, "transform/scale", 2.8, json!([100.0, 100.0]));
+    // A row leaving right over 10 f with his Fast out: about 20 % of the frame per frame.
+    let row = s.execute("layer.newSolid", json!({"name": "Row", "width": 100, "height": 100, "color": "#0000ff"})).unwrap()["layer"].as_u64().unwrap();
+    key(&mut s, row, "transform/position", 3.0, json!([1100.0, 540.0]));
+    key(&mut s, row, "transform/position", 3.0 + 10.0 / 30.0, json!([1990.0, 540.0]));
+    let (o, i) = side("fast-out");
+    ease(&mut s, cid, row, "transform/position", 0, o, i);
+
+    let r = check(&mut s);
+    let of = |l: u64| moves(&r).into_iter().find(|m| m["layer"] == l).unwrap_or_else(|| panic!("no move on {l}: {r:#}"));
+    let m = of(rig);
+    assert_eq!(m["moveType"], "entrance", "{m:#}");
+    assert_eq!(m["verdict"], "approved", "{m:#}");
+    let m = of(bar);
+    assert_eq!(m["moveType"], "scrub", "{m:#}");
+    assert_ne!(m["verdict"], "off", "{m:#}");
+    assert_eq!(of(mid)["moveType"], "entrance", "{r:#}");
+    let m = of(row);
+    assert_eq!(m["moveType"], "exit", "{m:#}");
+    let pct = m["criteria"]["framePerFrame"].as_f64().unwrap();
+    assert!(pct > 18.0 && pct < p.rules.exit_speed_cap, "{m:#}");
+    assert_eq!(m["verdict"], "approved", "{m:#}");
+}
