@@ -94,6 +94,30 @@ pub(crate) const EDIT_FEED: ToolDef = ToolDef {
     run: edit_feed,
 };
 
+fn appear_plan(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let mut p = json!({});
+    for k in ["comp", "layers", "accentLead"] {
+        if let Some(v) = a.get(k).filter(|v| !v.is_null()) {
+            p[k] = v.clone();
+        }
+    }
+    Ok(Reply::Json(b.exec("speech.appearPlan", p)?))
+}
+
+pub(crate) const APPEAR_PLAN: ToolDef = ToolDef {
+    name: "appear_plan",
+    description: "When each layer should appear, from the word it shows (engine speech.appearPlan; needs the comp's speech map). For every text layer (and layers whose name has a spoken word, or the `layers` you list with the `words` each shows) it finds the word in the speech map and compares: an entrance's speed peak should land on the word's stressed syllable (1 frame before the vowel), a layer that cuts in should start on the word. Returns per layer {word, wordFrame, accentFrame, appearFrame, entrance.peakFrame, suggestedFrame, offBy (frames), fix {command, params}} and `fixes` for the ones more than 3 frames off (the off-word lint). Run it after placing layers and before handover; pass `layers: [{layer, words}]` for layers whose text doesn't say their word (a window on \"year\", a bar on \"eight hours\").",
+    bridge_only: false,
+    schema: || {
+        json!({"type": "object", "properties": {
+            "comp": {"description": "Comp id or name (default the active comp)."},
+            "layers": {"type": "array", "items": {}, "description": "Layers to plan: id, name or \"#n\", or {layer, words? (what it shows), occurrence? (1-based)}. Default: every text layer and layers whose name has a spoken word."},
+            "accentLead": {"type": "number", "minimum": 0, "description": "Frames before the stressed vowel the peak should land (default 1)."}
+        }, "additionalProperties": false})
+    },
+    run: appear_plan,
+};
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};

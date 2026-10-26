@@ -57,6 +57,10 @@
 //!   at the bottom, cover the frame), layers fading, scaling or moving out into the last 2
 //!   frames, or everything gone before the end while the comp runs on: warning ("hold to the
 //!   end and hard-cut"). In an overlay comp only leaving early is noted (info).
+//! - `off-word`: a layer that shows a spoken word (its text, or a word in its name) appears
+//!   more than [`crate::appear::OFF_WORD_FRAMES`] frames from it: its entrance's speed peak misses
+//!   the word's accent, or a layer without an entrance doesn't start on the word
+//!   ([`crate::appear`], `speech.appearPlan`). Needs the comp's speech map.
 //! - `off-taste`: a keyframed move of this comp's layers whose ease is off Elias's profile
 //!   ([`crate::taste`]: linear, Easy Ease, a speed jump, baked keys, or outside his learned
 //!   ranges). Error when its move type has enough approved curves to block a handover, else
@@ -73,7 +77,7 @@ use crate::layout;
 use crate::precomp_time::{self, Hop};
 
 /// Every rule id, in report order.
-pub const RULES: [&str; 14] = [
+pub const RULES: [&str; 15] = [
     "text-too-small",
     "low-contrast",
     "outside-title-safe",
@@ -86,6 +90,7 @@ pub const RULES: [&str; 14] = [
     "exposed-edge",
     "off-beat",
     "off-accent",
+    "off-word",
     "off-taste",
     "exit-at-cut",
 ];
@@ -1345,7 +1350,7 @@ pub fn merge(occurrences: Vec<(Tick, Finding)>) -> Vec<Problem> {
                 && p.finding.layer == f.layer
                 && p.finding.other == f.other
                 && p.finding.inner.as_ref().map(|i| (i.comp, i.layer)) == f.inner.as_ref().map(|i| (i.comp, i.layer))
-                && (!matches!(f.rule, "off-beat" | "off-accent" | "off-taste" | "exit-at-cut") || p.time == t)
+                && (!matches!(f.rule, "off-beat" | "off-accent" | "off-word" | "off-taste" | "exit-at-cut") || p.time == t)
         };
         match out.iter_mut().find(|p| same(p)) {
             Some(p) => {

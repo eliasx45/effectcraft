@@ -167,6 +167,7 @@ fn arg_alias(key: &str, props: &Map<String, Value>) -> Option<String> {
 /// Tools that only read.
 const READ_ONLY: &[&str] = &[
     "edit_feed",
+    "appear_plan",
     "taste_check",
     "handover_check",
     "ease_graph",
@@ -1607,6 +1608,7 @@ fn control(b: &mut Backend, a: &Value) -> Result<Reply> {
 
 static TOOLS: &[ToolDef] = &[
     crate::senses::EDIT_FEED,
+    crate::senses::APPEAR_PLAN,
     ToolDef {
         name: "list_commands",
         description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with command_run. The full list is large (~130 KB): narrow with `filter` (e.g. `layer.new`, `keys`, `effect`) or pass `brief: true` for just ids and labels, then describe_command for one command's parameters.",
@@ -1913,7 +1915,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "lint_frame",
-        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). Rules: text-too-small (on-screen font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio of text against what is under it under min_contrast, default 3:1), outside-title-safe (text), outside-action-safe, cut-off (partly outside the frame), text-overlap, hidden-visible (switched on but off-screen, transparent or covered), off-beat (keyframes and in points just missing the audio's beat), off-accent (speed-graph peaks just missing a stressed syllable of the comp's speech map, see speech.import / speech.accents), nested-cut-off (layers inside precomps measured in this comp's frame), text-off-centre (text vs its card/pill, measured at the text's rest pose; `fix` is the prop.set that centres it), exposed-edge (empty frame edges, transition gaps), exit-at-cut (a full-screen cutaway fading out into the comp's end or gone before it: hold to the end and hard-cut), off-taste (eases off Elias's profile, see taste_check). off-accent on keys you made is an error. Returns {clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner?, fix? {command, params}}]}; each message says what to fix. Run it before calling a design done.",
+        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). Rules: text-too-small (on-screen font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio of text against what is under it under min_contrast, default 3:1), outside-title-safe (text), outside-action-safe, cut-off (partly outside the frame), text-overlap, hidden-visible (switched on but off-screen, transparent or covered), off-beat (keyframes and in points just missing the audio's beat), off-accent (speed-graph peaks just missing a stressed syllable of the comp's speech map, see speech.import / speech.accents), nested-cut-off (layers inside precomps measured in this comp's frame), text-off-centre (text vs its card/pill, measured at the text's rest pose; `fix` is the prop.set that centres it), exposed-edge (empty frame edges, transition gaps), exit-at-cut (a full-screen cutaway fading out into the comp's end or gone before it: hold to the end and hard-cut), off-word (a layer appearing more than 3 frames from the spoken word it shows, see appear_plan), off-taste (eases off Elias's profile, see taste_check). off-accent on keys you made is an error. Returns {clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner?, fix? {command, params}}]}; each message says what to fix. Run it before calling a design done.",
         bridge_only: false,
         schema: || {
             schema(
