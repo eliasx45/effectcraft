@@ -277,3 +277,39 @@ fn trimmed_away_nested_peaks_are_dropped() {
     let (main, _) = nest(&mut s, inner, "Main 4", 3.0, 100.0, (4.0, 5.0));
     assert_eq!(lint::speed_peaks_deep(&s.project, main, 0.0, 12.0).peaks.len(), 1);
 }
+
+/// HS2 (A/B item 9): a word the aligner's dictionary doesn't know ("YouTube") came in without
+/// syllables, so `keys.alignPeak` and `off-accent` couldn't use it. Import estimates them.
+#[test]
+fn words_the_dictionary_doesnt_know_get_estimated_syllables() {
+    use effectcraft_project::speech::guess_syllables;
+    let count = |w: &str| guess_syllables(w, Tick::ZERO, Tick::from_seconds_f64(1.0)).len();
+    assert_eq!([count("YouTube"), count("TikTok"), count("Google"), count("table"), count("tube"), count("2026")], [2, 2, 2, 2, 1, 0]);
+
+    let (mut s, l) = comp();
+    let doc = json!({"engine": "test", "words": [
+        {"word": "watch", "start": 0.5, "end": 0.8, "syllables": [{"t": 0.5, "vowel": 0.55, "stress": 1}]},
+        {"word": "YouTube", "start": 1.0, "end": 1.7, "syllables": []},
+        {"word": "2026", "start": 1.8, "end": 2.4}
+    ]});
+    let r = s.execute("speech.import", json!({"map": doc})).unwrap();
+    assert_eq!(r["guessed"], json!(["YouTube"]), "{r}");
+    let list = s.execute("speech.get", json!({})).unwrap()["list"].clone();
+    let yt = &list[1];
+    assert_eq!(yt["guessed"], true, "{list}");
+    let syl = yt["syllables"].as_array().unwrap();
+    assert_eq!(syl.len(), 2, "You·Tube: {yt}");
+    assert_eq!((syl[0]["t"].as_f64(), syl[0]["stress"].as_u64()), (Some(1.0), Some(1)), "{yt}");
+    let t1 = syl[1]["t"].as_f64().unwrap();
+    assert!(t1 > 1.2 && t1 < 1.6 && syl[1]["stress"] == 0, "the second onset sits inside the word: {yt}");
+    assert!(list[0].get("guessed").is_none() && list[2]["syllables"] == json!([]), "aligned words and numbers stay: {list}");
+
+    // The peak lands on the estimated stressed syllable.
+    scale_keys(&mut s, l, 1.5, 2.5, false);
+    let a = s.execute_checked("keys.alignPeak", json!({"layer": l, "path": "transform/scale", "speech": "YouTube"})).unwrap();
+    assert_eq!(a["target"]["speech"]["word"], "YouTube", "{a}");
+
+    // A words-only map (scribe-words) stays words only.
+    let r = s.execute("speech.import", json!({"map": {"words": [{"word": "YouTube", "start": 1.0, "end": 1.7}]}})).unwrap();
+    assert_eq!((r["syllables"].as_u64(), r["guessed"].clone()), (Some(0), json!([])), "{r}");
+}

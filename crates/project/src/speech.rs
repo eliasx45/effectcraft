@@ -61,6 +61,10 @@ pub struct SpeechWord {
     pub end: Tick,
     #[serde(default)]
     pub syllables: Vec<Syllable>,
+    /// The syllables are estimated from the spelling and the word's timing ([`guess_syllables`]):
+    /// the aligner's dictionary didn't know the word (a brand or a made-up word).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guessed: bool,
 }
 
 /// One syllable of a word.
@@ -257,6 +261,56 @@ pub fn normalize(w: &str) -> String {
         .collect::<String>()
         .trim_matches('\'')
         .to_string()
+}
+
+/// Syllables for a word the aligner's dictionary doesn't know ("YouTube", "TikTok"), estimated
+/// from its spelling and timing: one per vowel group (`y` counts after the first letter; a final
+/// silent `e` doesn't), each onset at the consonant before its vowels, letters spread evenly over
+/// `start`..`end`. The first syllable takes the stress (English names mostly stress it). Empty for
+/// a word without letters (a number is said as other words).
+pub fn guess_syllables(word: &str, start: Tick, end: Tick) -> Vec<Syllable> {
+    let letters: Vec<char> = word.chars().filter(|c| c.is_alphabetic()).flat_map(char::to_lowercase).take(64).collect();
+    if letters.is_empty() {
+        return vec![];
+    }
+    let vowel = |i: usize| letters.get(i).is_some_and(|c| "aeiouäöüéèêáàíóú".contains(*c) || (*c == 'y' && i > 0));
+    // Vowel groups: (first letter, letter after the group).
+    let mut groups: Vec<(usize, usize)> = vec![];
+    let mut i = 0;
+    while i < letters.len() {
+        if vowel(i) {
+            let a = i;
+            while vowel(i) {
+                i += 1;
+            }
+            groups.push((a, i));
+        } else {
+            i += 1;
+        }
+    }
+    let n = letters.len();
+    // A final lone `e` after a consonant is silent ("tube"), unless it makes "-le" ("table").
+    if groups.len() > 1
+        && groups.last().is_some_and(|&(a, b)| b == n && a + 1 == n && letters.get(a) == Some(&'e'))
+        && letters.get(n.saturating_sub(2)) != Some(&'l')
+    {
+        groups.pop();
+    }
+    if groups.is_empty() {
+        groups.push((0, n));
+    }
+    let (a, b) = (start.seconds(), end.seconds().max(start.seconds()));
+    let at = |k: usize| Tick::from_seconds_f64(a + (b - a) * k as f64 / n as f64);
+    let mut prev_end = 0;
+    let mut out = Vec::with_capacity(groups.len());
+    for (k, &(g, e)) in groups.iter().enumerate().take(MAX_SYLLABLES) {
+        // The first syllable starts with the word; later ones take the consonant before their vowels.
+        let onset = if k == 0 { 0 } else { g.saturating_sub(1).max(prev_end) };
+        prev_end = e;
+        let t = at(onset);
+        out.push(Syllable { t, vowel: at(g).max(t), stress: u8::from(k == 0) });
+    }
+    out
 }
 
 /// One token of a script line lined up with the speech.
@@ -456,7 +510,7 @@ mod tests {
     use effectcraft_time::FrameRate;
 
     fn w(word: &str, a: f64, b: f64) -> SpeechWord {
-        SpeechWord { word: word.into(), start: Tick::from_seconds_f64(a), end: Tick::from_seconds_f64(b), syllables: vec![] }
+        SpeechWord { word: word.into(), start: Tick::from_seconds_f64(a), end: Tick::from_seconds_f64(b), ..Default::default() }
     }
 
     #[test]
