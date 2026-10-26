@@ -11,7 +11,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED2 | Graph Editor (+ id scopes, host fonts) | Draws against `TimelineHost` too; per-instance ids; `theme::install_panel_fonts` |
 | EMBED3 | Effect Controls (+ shortcuts, widget ids) | Draws against `TimelineHost`; `keys::forward_shortcuts` / `menus::shortcut_command`; scroll-bar and Tab-order ids scoped |
 | EMBED4 | Remaining Timeline features | Markers, quick row, waveforms, dialogs (as requests) and the eyedropper through the host; 6 minor sites left |
-| EMBED5 | Graph Editor keys and switch in a host | `panels::timeline::hosted`: Shift+F3 / F bound and run without the app; speed curves in the rows need nothing |
+| EMBED5 | Keys, UI commands, inline edits in a host | `panels::timeline::hosted`: Timeline UI commands and their keys (the person's own shortcuts), frontend events, precomp redirect |
 
 ## The host interface (EMBED1)
 
@@ -144,31 +144,34 @@ TimelineHost`; its command dispatch goes through `TimelineHost::invoke`. The 4 e
 gets the Graph Editor in the Timeline. `graph::shown_props` is still called with the app from
 `inline::invoke` (dispatch glue). No statics.
 
-## Graph Editor and speed curves in a host (EMBED5)
+## Keys, UI commands and inline edits in a host (EMBED5)
 
 The Graph Editor and the speed curves in the property rows (footer ∿ toggle, `speed_rows.rs`)
 draw in any host since EMBED2; their edits (key drags, Bezier handles, `keys.setEase[Selected]`,
 `keys.transform`, the transform box) are engine commands pushed as Timeline actions and run through
-`TimelineHost::invoke`, with drags merged into one undo step (`merge` params, `__endMerge`). The
-Timeline header's Graph button flips `ui.timeline.graph_editor` itself. What a host lacked were the
-two UI-only commands behind its keys, which EffectCraft's `menus::invoke` runs and the engine
-doesn't know:
+`TimelineHost::invoke`, with drags merged into one undo step (`merge` params, `__endMerge`). What a
+host lacked was everything EffectCraft's `menus::invoke` / `run_engine` do around the engine:
 
-| Command | Key | In a host |
-|---|---|---|
-| `timeline.graphEditor` (optional `value`) | Shift+F3 | `hosted::run` flips (or sets) `ui.timeline.graph_editor` |
-| `timeline.graph.fit` | F while the Graph Editor shows | `hosted::run` requests Fit All in the host's id scope; errors while it is closed |
+| Missing in a host | Now (`panels::timeline::hosted`) |
+|---|---|
+| UI-only Timeline commands (`menus/timeline.rs`) | `run(host, ctx, id, params)`: Graph Editor (Shift+F3) and its F, time zoom (- / =, `;`, Shift+;), D / X scroll, B / N work area, `[` `]` and Alt+`[` `]`, the reveal keys with double presses and Shift+ adds, Alt+Shift+P/A/S/R/T, U / UU, F4, Shift+F4, Cmd+`, Source Name. `None` for any other id |
+| Their keys (a host's session has no frontend bindables) | `install(session)` binds just those; `installed(session)` says whether a (replaced) session has them |
+| Physical-key bindings (`Physical+=` / `Physical+-` zoom) | `keys::forward_shortcuts` looks them up first, as `menus::handle_shortcuts` does |
+| The person's own shortcuts | `use_user_shortcuts(session)` reads `shortcuts.json` from EffectCraft's settings folder (`effectcraft_host::config_dir`, ≤ 8 MB) into the session's keymaps. Read only: the session has no settings store, nothing is written |
+| Frontend events of engine commands (U's `timeline.revealProps`, toasts) | `handle_events(host)` after engine commands: runs `timeline.revealProps`, puts toasts in the status line, drops the rest (viewer and cache chrome) |
+| Edits of a precomp expanded in the Timeline went to the parent | `inline(host, ctx, id, params)` (EffectCraft's own `inline::invoke`, now on `&mut dyn TimelineHost`): with an inline source row focused, supported commands run in its scope and come back to the host's engine dispatch, which wraps them with `engine_command(host, id, params)` as `comp.inlineEdit`; untargeted layer/property commands are refused ("needs the source composition open") instead of touching the parent |
 
-- `hosted::install(session)` adds just these to the session's bindable UI commands (a host's
-  session has none, so `forward_shortcuts` never found Shift+F3 or the Graph Editor's F). Call it
-  again whenever the host replaces its session; `hosted::installed(session)` says whether it is.
-- `hosted::run(host, ctx, id, params)` returns `None` for any other id. The default
-  `TimelineHost::invoke` calls it first; a host that overrides `invoke` calls it first too.
-  EffectCraft's own handlers (`menus/timeline.rs`) call the same code.
-- Graph type changes (`set_graph_type`) write `prefs.graph_type` through `Session::save_prefs`,
-  which is a no-op for a session without a config directory (FigCraft's).
+A host's `invoke`: `hosted::inline`, then `hosted::run`, then its engine dispatch through
+`hosted::engine_command`, then `hosted::handle_events`. EffectCraft's own handlers share the code
+(`reveal`, `reveal_keyed`, `reveal_targets`, `reveal_props`, `twirl_selected`, Graph Editor switch
+and fit); its app keeps the double-press memory in `last_reveal`, a host in egui memory (per id
+scope). Not hosted: anything that opens a dialog, Free Transform, clipboard glue of `menus::invoke`
+(system clipboard text/SVG pastes), tools. Graph type changes (`set_graph_type`) call
+`Session::save_prefs`, a no-op for a session without a settings store.
 
-Test: `host::tests::the_graph_editor_opens_and_draws_in_a_host_without_the_app`.
+Tests: `host::tests::{the_graph_editor_opens_and_draws_in_a_host_without_the_app,
+hosted_reveal_and_zoom_keys_run_without_the_app, hosted_inline_edits_go_to_the_expanded_precomp}`
+(the fake host's `invoke` is the reference host dispatch).
 
 ## Effect Controls (EMBED3, done)
 
@@ -212,8 +215,9 @@ All additive; nothing a host implements or calls was renamed or removed.
   (defaulted), `panels::timeline::keys::forward_shortcuts`, `menus::shortcut_command`;
   `effect_controls::show(&mut dyn TimelineHost, ui, rect)` (was `&mut EffectcraftApp`; the app still
   coerces).
-- EMBED5: `panels::timeline::hosted::{COMMANDS, install, installed, run}`; the default
-  `TimelineHost::invoke` runs `hosted::run` before the engine.
+- EMBED5: `panels::timeline::hosted::{handles, install, installed, user_keymaps,
+  use_user_shortcuts, run, handle_events, inline, engine_command}`; `keys::forward_shortcuts` also
+  runs `Physical+` bindings. The default `TimelineHost::invoke` is unchanged (engine only).
 - EMBED4: `TimelineHost::{request_dialog, waveform, pointer_color}` (defaulted: dialogs decline
   with a status message, waveforms are computed per context, no pointer colour);
   `panels::timeline::{DialogRequest, PointerColor}` (`DialogRequest` is `#[non_exhaustive]`: new

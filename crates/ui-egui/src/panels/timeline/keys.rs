@@ -31,22 +31,22 @@ pub fn forward_shortcuts(host: &mut dyn TimelineHost, ctx: &egui::Context, panel
     if ctx.egui_wants_keyboard_input() || crate::widgets::any_menu_open(ctx) || host.dialog().is_some() {
         return ran;
     }
-    let keys: Vec<(Key, Modifiers, bool)> = ctx.input(|i| {
+    let keys: Vec<(Key, Modifiers, bool, Option<Key>)> = ctx.input(|i| {
         i.events
             .iter()
             .filter_map(|e| match e {
-                Event::Key { key, pressed: true, repeat, modifiers, .. }
+                Event::Key { key, pressed: true, repeat, modifiers, physical_key }
                     if !*repeat || matches!(key, Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown) =>
                 {
-                    Some((*key, *modifiers, true))
+                    Some((*key, *modifiers, true, *physical_key))
                 }
-                Event::Key { key: Key::Space, pressed: false, .. } => Some((Key::Space, Modifiers::NONE, false)),
+                Event::Key { key: Key::Space, pressed: false, .. } => Some((Key::Space, Modifiers::NONE, false, None)),
                 _ => None,
             })
             .collect()
     });
     let graph_editor = host.ui().timeline.graph_editor;
-    for (key, mods, pressed) in keys {
+    for (key, mods, pressed, physical_key) in keys {
         if key == Key::Space && (!pressed || !mods.any()) {
             if pressed {
                 ctx.data_mut(|d| d.insert_temp(space_tap_id(), true));
@@ -60,7 +60,12 @@ pub fn forward_shortcuts(host: &mut dyn TimelineHost, ctx: &egui::Context, panel
         let command = if pressed && !mods.any() && matches!(key, Key::Delete | Key::Backspace) {
             Some(("edit.clear".to_string(), serde_json::json!({})))
         } else {
-            crate::menus::shortcut_command(host.session(), panel, graph_editor, key, mods)
+            // Physical-key bindings first (Zoom In/Out Time's - and = by key position), as
+            // EffectCraft's own dispatch: `bindings` leaves them out.
+            physical_key
+                .filter(|_| pressed)
+                .and_then(|pk| physical_binding(host.session(), pk, mods))
+                .or_else(|| crate::menus::shortcut_command(host.session(), panel, graph_editor, key, mods))
         };
         let Some((id, params)) = command else { continue };
         if pressed {
@@ -72,4 +77,12 @@ pub fn forward_shortcuts(host: &mut dyn TimelineHost, ctx: &egui::Context, panel
         ran.push(id);
     }
     ran
+}
+
+/// The command a `Physical+…` shortcut binds to physical key `key` with `mods`.
+fn physical_binding(session: &effectcraft_engine::Session, key: Key, mods: Modifiers) -> Option<(String, serde_json::Value)> {
+    session.shortcuts().bindings().into_iter().find_map(|(sc, b)| {
+        let (m, k) = crate::menus::parse_shortcut(sc.strip_prefix("Physical+")?)?;
+        (k == key && crate::menus::mods_match(m, mods)).then(|| (b.command.clone(), if b.params.is_null() { serde_json::json!({}) } else { b.params.clone() }))
+    })
 }

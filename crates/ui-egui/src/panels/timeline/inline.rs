@@ -554,7 +554,7 @@ pub(super) fn with_scope<H: TimelineHost + ?Sized, R>(app: &mut H, scope: &crate
     result
 }
 
-pub(super) fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: &serde_json::Value) -> Option<Result<serde_json::Value, String>> {
+pub(super) fn invoke(app: &mut dyn TimelineHost, ctx: &egui::Context, id: &str, params: &serde_json::Value) -> Option<Result<serde_json::Value, String>> {
     if app.ui().timeline.inline_dispatch.is_some() || id == "comp.inlineEdit" {
         return None;
     }

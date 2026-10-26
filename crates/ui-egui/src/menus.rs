@@ -912,7 +912,7 @@ pub fn bindings(session: &effectcraft_engine::Session) -> Vec<Binding> {
     v
 }
 
-fn mods_match(want: egui::Modifiers, got: egui::Modifiers) -> bool {
+pub(crate) fn mods_match(want: egui::Modifiers, got: egui::Modifiers) -> bool {
     want.command == got.command && want.shift == got.shift && want.alt == got.alt && (want.ctrl == got.ctrl || got.command && cfg!(not(target_os = "macos")))
 }
 

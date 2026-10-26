@@ -64,12 +64,10 @@ pub trait TimelineHost {
     }
 
     /// Runs a command by id the way a menu item would (UI commands included). The default runs
-    /// the Timeline's own UI commands ([`super::hosted::run`]: Graph Editor switch and fit), then
-    /// the engine; a host overriding it calls `hosted::run` first.
-    fn invoke(&mut self, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
-        if let Some(r) = super::hosted::run(self, ctx, id, &params) {
-            return r;
-        }
+    /// it on the session; a host that wants EffectCraft's Timeline commands (Graph Editor, zoom,
+    /// reveal keys, edits in expanded precomps) runs [`super::hosted::inline`] and
+    /// [`super::hosted::run`] first (see that module).
+    fn invoke(&mut self, _ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
         self.session_mut().execute(id, params).map_err(|e| e.to_string())
     }
     /// Runs an engine command (errors go to the status line).
@@ -349,11 +347,18 @@ mod tests {
         }
         fn invoke(&mut self, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
             self.commands.push(id.to_string());
-            // As a host overriding `invoke` does (FigCraft): the Timeline's UI commands first.
+            // As a host overriding `invoke` does (FigCraft): edits of an expanded precomp, the
+            // Timeline's UI commands, then the engine (redirected while an inline edit runs).
+            if let Some(r) = super::super::hosted::inline(self, ctx, id, &params) {
+                return r;
+            }
             if let Some(r) = super::super::hosted::run(self, ctx, id, &params) {
                 return r;
             }
-            self.session.execute(id, params).map_err(|e| e.to_string())
+            let (cmd, params) = super::super::hosted::engine_command(self, id, params);
+            let r = self.session.execute(&cmd, params).map_err(|e| e.to_string());
+            super::super::hosted::handle_events(self);
+            r
         }
         fn pointer_color(&mut self, _ctx: &egui::Context) -> Option<PointerColor> {
             self.pointer
@@ -493,6 +498,60 @@ mod tests {
         assert_eq!(super::super::hosted::run(&mut host, &ctx, "timeline.graphEditor", &json!({"value": false})), Some(Ok(json!({"graphEditor": false}))));
         assert!(super::super::hosted::run(&mut host, &ctx, "timeline.graph.fit", &json!({})).is_some_and(|r| r.is_err()));
         assert!(super::super::hosted::run(&mut host, &ctx, "layer.select", &json!({})).is_none());
+    }
+
+    /// EMBED5: the reveal keys and the time zoom keys (physical - / =) run in a host without the
+    /// app: P reveals Position, Shift+T adds Opacity, Collapse All clears, = zooms, D scrolls.
+    #[test]
+    fn hosted_reveal_and_zoom_keys_run_without_the_app() {
+        let mut host = host();
+        super::super::hosted::install(&mut host.session);
+        let ctx = egui::Context::default();
+        let press = |key, modifiers, physical_key| egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers };
+        let mut ran = vec![];
+        let input = egui::RawInput { events: vec![press(egui::Key::P, egui::Modifiers::NONE, None)], ..Default::default() };
+        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        assert_eq!(ran, ["timeline.reveal.position"]);
+        assert_eq!(host.ui.timeline.reveal, ["position"]);
+        host.invoke(&ctx, "timeline.revealAdd.opacity", json!({})).unwrap();
+        let layers: Vec<u64> = host.session.active_comp().unwrap().layers.iter().map(|l| l.id.0).collect();
+        assert!(layers.iter().all(|l| host.ui.timeline.layer_reveal.get(l).is_some_and(|k| k.iter().any(|k| k == "opacity"))));
+        host.invoke(&ctx, "timeline.collapseAll", json!({})).unwrap();
+        assert!(host.ui.timeline.reveal.is_empty() && host.ui.timeline.layer_reveal.is_empty());
+        let input = egui::RawInput { events: vec![press(egui::Key::Equals, egui::Modifiers::NONE, Some(egui::Key::Equals))], ..Default::default() };
+        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        assert_eq!(ran, ["timeline.zoomIn"]);
+        assert!(host.invoke(&ctx, "timeline.scrollToTime", json!({})).is_ok());
+        assert!(host.ui.timeline.scroll_to.is_some());
+    }
+
+    /// EMBED5: in a host, edits of a precomp expanded in the Timeline (its source row focused)
+    /// go to the precomp, as in EffectCraft; a layer command that can't be redirected is refused
+    /// and the parent stays as it was.
+    #[test]
+    fn hosted_inline_edits_go_to_the_expanded_precomp() {
+        let mut session = Session::default();
+        let child = ItemId(session.execute("comp.new", json!({"name": "Source"})).unwrap()["comp"].as_u64().unwrap());
+        let leaf = session.execute("layer.newSolid", json!({"name": "Leaf"})).unwrap()["layer"].as_u64().unwrap();
+        let root = ItemId(session.execute("comp.new", json!({"name": "Parent"})).unwrap()["comp"].as_u64().unwrap());
+        let a = session.execute("layer.addItem", json!({"item": child.0})).unwrap()["layer"].as_u64().unwrap();
+        session.execute("comp.inlineEdit", json!({"root": root.0, "path": [a], "command": "layer.select", "params": {"layers": [leaf]}})).unwrap();
+        let ui = UiState { focused: crate::dock::PanelKind::Timeline, ..UiState::default() };
+        let mut host =
+            FakeHost { session, ui, auto: Registry::default(), tokens: Tokens::for_kind(crate::theme::ThemeKind::Dark), commands: vec![], pointer: None };
+        host.ui.timeline.inline_focus = Some(vec![root.0, a]);
+        let ctx = egui::Context::default();
+        let layers = |h: &FakeHost, c: ItemId| h.session.project.comp(c).unwrap().layers.len();
+        host.invoke(&ctx, "edit.copy", json!({})).unwrap();
+        assert_eq!(host.session.state.clipboard.len(), 1);
+        assert_eq!(host.session.state.clipboard[0].id, effectcraft_engine::project::LayerId(leaf));
+        host.invoke(&ctx, "edit.paste", json!({})).unwrap();
+        assert_eq!(layers(&host, child), 2, "pasted into the precomp");
+        assert_eq!(layers(&host, root), 1, "not into the parent");
+        assert_eq!(host.session.active_comp_id(), Some(root), "the parent stays the Timeline's comp");
+        assert!(host.invoke(&ctx, "layer.newSolid", json!({"color": "#00ff00"})).is_err(), "no target: refused");
+        assert_eq!(layers(&host, root), 1);
+        assert_eq!(layers(&host, child), 2);
     }
 
     /// EMBED4: a hosted eyedropper takes the colour the host reports under the pointer, and the
