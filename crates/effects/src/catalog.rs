@@ -122,7 +122,7 @@ const CPU_ONLY_CONTROLS: &[(&str, &[&str])] = &[
         ],
     ),
     ("ec.perspective.cccylinder", &["positionX", "positionY", "positionZ", "rotationX", "rotationY", "rotationZ"]),
-    ("ec.blur.cameralens", &["irisProperties/diffractionFringe", "blurMap/blurMapLayer"]),
+    ("ec.blur.cameralens", &["blurMap/blurMapLayer"]),
     ("ec.noise.removegrain", &["temporalFiltering/enabled"]),
     ("ec.distort.liquify", &["viewFreezeAreaMask", "viewMesh"]),
     ("ec.distort.ccpowerpin", &["unstretch"]),

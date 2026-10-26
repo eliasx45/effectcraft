@@ -547,6 +547,68 @@ fn fxc_morph(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out, p, o);
 }
 
+// Per channel: min (operation u[1] = 0) or max (otherwise) of `a` and `b`.
+fn fxc_morph_op(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+    let lo = min(a, b);
+    var o = max(a, b);
+    for (var i = 0; i < 4; i++) {
+        if (P.u[1][i] == 0u) {
+            o[i] = lo[i];
+        }
+    }
+    return o;
+}
+
+// One sparse-table pass of `morph_axis`: out(p) = op(src(q), src(q + step)) with q = p − shift
+// along rows (u[0].y = 0) or columns, reads clamped to `src` (the first pass reads the image
+// with shift = radius, so `out` is the line padded by the radius with its edge pixels).
+// u[0] = (step, vertical, shift); u[1] = per-channel operation.
+@compute @workgroup_size(16, 16)
+fn fxc_morph_double(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = fxc_pixel(gid);
+    if (p.x < 0) {
+        return;
+    }
+    let step = i32(P.u[0].x);
+    let shift = i32(P.u[0].z);
+    var a: vec4<f32>;
+    var b: vec4<f32>;
+    if (P.u[0].y != 0u) {
+        a = tex_get_clamped(src, p.x, p.y - shift);
+        b = tex_get_clamped(src, p.x, p.y - shift + step);
+    } else {
+        a = tex_get_clamped(src, p.x - shift, p.y);
+        b = tex_get_clamped(src, p.x + step - shift, p.y);
+    }
+    textureStore(out, p, fxc_morph_op(a, b));
+}
+
+// `morph_axis`' result: the two overlapping runs of the padded table `src` that cover pixel p's
+// window (padded p … p + 2r), out(p) = op(src(p), src(p + u[0].x)); channels whose operation is
+// 2 keep `aux` (the image). u[0] = (2r + 1 − run, vertical); u[1] = per-channel operation.
+@compute @workgroup_size(16, 16)
+fn fxc_morph_final(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = fxc_pixel(gid);
+    if (p.x < 0) {
+        return;
+    }
+    let d = i32(P.u[0].x);
+    var q = p;
+    if (P.u[0].y != 0u) {
+        q.y += d;
+    } else {
+        q.x += d;
+    }
+    var o = fxc_morph_op(textureLoad(src, p, 0), tex_get_clamped(src, q.x, q.y));
+    let centre = textureLoad(aux, p, 0);
+    for (var i = 0; i < 4; i++) {
+        if (P.u[1][i] == 2u) {
+            o[i] = centre[i];
+        }
+    }
+    textureStore(out, p, o);
+}
+
 // `src` + (`aux` − `src`) × f[0].x (Plane::zip_map lerp).
 @compute @workgroup_size(16, 16)
 fn fxc_lerp(@builtin(global_invocation_id) gid: vec3<u32>) {

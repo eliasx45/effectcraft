@@ -21,6 +21,8 @@ pub(crate) const KERNELS: &[&str] = &[
     "fxc_luma",
     "fxc_sharpen",
     "fxc_morph",
+    "fxc_morph_double",
+    "fxc_morph_final",
     "fxc_lerp",
     "fxc_kl_raw",
     "fxc_kl_rollback",
@@ -233,16 +235,46 @@ fn morph(e: &mut Enc, img: &GpuImage, r: u32, modes: [u32; 4]) -> GpuImage {
     if r == 0 {
         return img.clone();
     }
-    let mut cur = img.clone();
-    for vertical in [0, 1] {
-        let mut p = Params::default();
-        p.u[0] = [r, vertical, 0, 0];
-        p.u[1] = modes;
-        let out = e.scratch(cur.width, cur.height);
-        e.pixels("fxc_morph", &p, &cur, None, &out, None);
-        cur = out;
+    let rows = morph_axis(e, img, r, false, modes);
+    morph_axis(e, &rows, r, true, modes)
+}
+
+/// Radius up to which [`morph_axis`] reads the whole window per pixel (fewer passes than the
+/// sparse table).
+const MORPH_DIRECT_R: u32 = 3;
+
+/// One axis of util::morph_plane (radius `r`, edges repeated; `modes` as in [`morph`]). Large
+/// radii build a sparse table: each pass takes the min / max of two values `step` apart along
+/// the line padded by `r` on both ends (`step` doubling from 1), so after ⌊log2(2r+1)⌋ passes
+/// every texel holds its 2^k-wide run, and two overlapping runs cover each pixel's 2r+1 window:
+/// two reads per pixel per pass instead of 2r+1, the same values as the direct window. Radii up
+/// to [`MORPH_DIRECT_R`], or a padded line past the texture limit, read the window directly.
+pub(crate) fn morph_axis(e: &mut Enc, img: &GpuImage, r: u32, vertical: bool, modes: [u32; 4]) -> GpuImage {
+    let (w, h) = (img.width, img.height);
+    let (pw, ph) = if vertical { (w, h.saturating_add(r.saturating_mul(2))) } else { (w.saturating_add(r.saturating_mul(2)), h) };
+    let mut p = Params::default();
+    p.u[1] = modes;
+    if r <= MORPH_DIRECT_R || !e.g.fits(pw, ph) {
+        p.u[0] = [r, vertical as u32, 0, 0];
+        let out = e.scratch(w, h);
+        e.pixels("fxc_morph", &p, img, None, &out, None);
+        return out;
     }
-    cur
+    let span = 2 * r + 1;
+    let mut cur = img.clone();
+    let (mut step, mut shift) = (1u32, r);
+    while step * 2 <= span {
+        p.u[0] = [step, vertical as u32, shift, 0];
+        let out = e.scratch(pw, ph);
+        e.pixels("fxc_morph_double", &p, &cur, None, &out, None);
+        cur = out;
+        shift = 0;
+        step *= 2;
+    }
+    p.u[0] = [span - step, vertical as u32, 0, 0];
+    let out = e.scratch(w, h);
+    e.pixels("fxc_morph_final", &p, &cur, Some(img), &out, None);
+    out
 }
 
 /// util::morph_frac (blend between the two nearest integer radii).

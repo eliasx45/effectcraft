@@ -407,14 +407,30 @@ fn median_col(q: &[[u16; 4]], w: usize, h: usize, x: i64, y: usize, r: i64, mut 
 /// 512 levels in 0..1, edges repeated).
 pub(crate) fn median_image(img: &Image, r: usize) -> Image {
     let (w, h) = (img.width as usize, img.height as usize);
-    if r == 0 || w == 0 || h == 0 {
+    if r == 0 || w == 0 || h == 0 || img.data.len() != w * h {
         return img.clone();
     }
     let q: Vec<[u16; 4]> = img.data.par_iter().map(|p| [quant(p[0]), quant(p[1]), quant(p[2]), quant(p[3])]).collect();
+    let mut out = Image::new(img.width, img.height);
+    if r >= MEDIAN_COLUMNS_R {
+        median_columns(&q, w, h, r, &mut out);
+    } else {
+        median_huang(&q, w, h, r, &mut out);
+    }
+    out
+}
+
+/// Radius from which [`median_image`] keeps a histogram per column ([`median_columns`]): below
+/// it, Huang's window (2r+1 reads per column step) costs less than the column histograms' fixed
+/// work per pixel.
+const MEDIAN_COLUMNS_R: usize = 8;
+
+/// [`median_image`] with Huang's sliding window: each row fills a (2r+1)² histogram and slides
+/// right, removing the column leaving and adding the one entering, O(r) per pixel.
+fn median_huang(q: &[[u16; 4]], w: usize, h: usize, r: usize, out: &mut Image) {
     let n = (2 * r + 1) * (2 * r + 1);
     let half = n / 2;
     let ri = r as i64;
-    let mut out = Image::new(img.width, img.height);
     out.rows_mut().for_each(|(y, row)| {
         let mut hist = vec![0u32; NB * 4];
         let mut med = [0usize; 4];
@@ -464,7 +480,146 @@ pub(crate) fn median_image(img: &Image, r: usize) -> Image {
             rebalance(&hist, &mut med, &mut lt);
         }
     });
-    out
+}
+
+/// Coarse bins of [`median_columns`]' two-tier histograms (16 levels each).
+const NC: usize = NB / 16;
+
+/// Columns of a [`median_columns`] tile (plus `r` on each side).
+const MEDIAN_TILE: usize = 256;
+
+/// [`median_image`] with a histogram per column (Perreault & Hébert 2007), O(1) per pixel in
+/// the radius: moving down a row updates each column's histogram by one pixel out and one in;
+/// moving right adds the entering column's 32 coarse counts and subtracts the leaving one's.
+/// The median's coarse bin is found from the coarse counts, then that bin's 16 fine counts are
+/// brought up to date (incrementally from the column they were last valid at, or summed afresh
+/// when that is further than the window). Exactly the levels [`median_huang`] finds.
+///
+/// Bands of rows run in parallel; each band walks tiles of [`MEDIAN_TILE`] columns.
+fn median_columns(q: &[[u16; 4]], w: usize, h: usize, r: usize, out: &mut Image) {
+    let half = ((2 * r + 1) * (2 * r + 1) / 2) as u32;
+    let ri = r as i64;
+    let (wi, hi) = (w as i64, h as i64);
+    let band = h.div_ceil(rayon::current_num_threads().max(1) * 2).max(16);
+    let at = |x: i64, y: i64| q.get((y.clamp(0, hi - 1) * wi + x.clamp(0, wi - 1)) as usize).copied().unwrap_or([0; 4]);
+    out.data.par_chunks_mut(w * band).enumerate().for_each(|(bi, rows)| {
+        let y0 = (bi * band) as i64;
+        let y1 = (y0 + band as i64).min(hi);
+        // Per column j (column c0 + j) and channel c: 512 fine and 32 coarse counts.
+        let mut fine: Vec<u16> = Vec::new();
+        let mut coarse: Vec<u16> = Vec::new();
+        let mut x0 = 0i64;
+        while x0 < wi {
+            let x1 = (x0 + MEDIAN_TILE as i64).min(wi);
+            let (c0, c1) = ((x0 - ri).max(0), (x1 - 1 + ri).min(wi - 1));
+            let nc = (c1 - c0 + 1) as usize;
+            fine.clear();
+            fine.resize(nc * 4 * NB, 0);
+            coarse.clear();
+            coarse.resize(nc * 4 * NC, 0);
+            let bump = |fine: &mut [u16], coarse: &mut [u16], j: usize, v: [u16; 4], add: bool| {
+                for c in 0..4 {
+                    let l = v[c] as usize;
+                    if let (Some(f), Some(k)) = (fine.get_mut((j * 4 + c) * NB + l), coarse.get_mut((j * 4 + c) * NC + l / 16)) {
+                        if add {
+                            *f = f.wrapping_add(1);
+                            *k = k.wrapping_add(1);
+                        } else {
+                            *f = f.wrapping_sub(1);
+                            *k = k.wrapping_sub(1);
+                        }
+                    }
+                }
+            };
+            for dy in -ri..=ri {
+                for j in 0..nc {
+                    bump(&mut fine, &mut coarse, j, at(c0 + j as i64, y0 + dy), true);
+                }
+            }
+            // The column histogram (index into `fine` / `coarse`) of image column x, edges repeated.
+            let col = |x: i64| (x.clamp(c0, c1) - c0) as usize;
+            let mut kf = [[0u32; NB]; 4];
+            for y in y0..y1 {
+                if y > y0 {
+                    for j in 0..nc {
+                        let x = c0 + j as i64;
+                        bump(&mut fine, &mut coarse, j, at(x, y - 1 - ri), false);
+                        bump(&mut fine, &mut coarse, j, at(x, y + ri), true);
+                    }
+                }
+                let mut kc = [[0u32; NC]; 4];
+                for x in x0 - ri..=x0 + ri {
+                    let j = col(x);
+                    for (c, kcc) in kc.iter_mut().enumerate() {
+                        let src = coarse.get((j * 4 + c) * NC..(j * 4 + c + 1) * NC).unwrap_or(&[]);
+                        for (k, s) in kcc.iter_mut().zip(src) {
+                            *k = k.wrapping_add(u32::from(*s));
+                        }
+                    }
+                }
+                // The column each coarse bin's fine counts were last valid at (none yet).
+                let mut valid = [[i64::MIN; NC]; 4];
+                let Some(row) = rows.get_mut(((y - y0) as usize) * w..((y - y0) as usize + 1) * w) else { break };
+                for x in x0..x1 {
+                    if x > x0 {
+                        let (jn, jo) = (col(x + ri), col(x - 1 - ri));
+                        for (c, kcc) in kc.iter_mut().enumerate() {
+                            let add = coarse.get((jn * 4 + c) * NC..(jn * 4 + c + 1) * NC).unwrap_or(&[]);
+                            let sub = coarse.get((jo * 4 + c) * NC..(jo * 4 + c + 1) * NC).unwrap_or(&[]);
+                            for ((k, a), s) in kcc.iter_mut().zip(add).zip(sub) {
+                                *k = k.wrapping_add(u32::from(*a)).wrapping_sub(u32::from(*s));
+                            }
+                        }
+                    }
+                    let mut px = [0.0f32; 4];
+                    for c in 0..4 {
+                        // The coarse bin holding the median, and the count below it.
+                        let mut below = 0u32;
+                        let mut bin = NC - 1;
+                        for (b, &k) in kc[c].iter().enumerate() {
+                            if below + k > half {
+                                bin = b;
+                                break;
+                            }
+                            below += k;
+                        }
+                        let seg = |j: usize| fine.get((j * 4 + c) * NB + bin * 16..(j * 4 + c) * NB + bin * 16 + 16).unwrap_or(&[]);
+                        let kfs = &mut kf[c][bin * 16..bin * 16 + 16];
+                        let last = valid[c][bin];
+                        if last == i64::MIN || x - last > 2 * ri + 1 {
+                            kfs.fill(0);
+                            for xx in x - ri..=x + ri {
+                                for (k, s) in kfs.iter_mut().zip(seg(col(xx))) {
+                                    *k = k.wrapping_add(u32::from(*s));
+                                }
+                            }
+                        } else {
+                            for xs in last + 1..=x {
+                                let (a, s) = (seg(col(xs + ri)), seg(col(xs - 1 - ri)));
+                                for ((k, a), s) in kfs.iter_mut().zip(a).zip(s) {
+                                    *k = k.wrapping_add(u32::from(*a)).wrapping_sub(u32::from(*s));
+                                }
+                            }
+                        }
+                        valid[c][bin] = x;
+                        let mut level = bin * 16 + 15;
+                        for (f, &k) in kfs.iter().enumerate() {
+                            if below + k > half {
+                                level = bin * 16 + f;
+                                break;
+                            }
+                            below += k;
+                        }
+                        px[c] = level as f32 / (NB - 1) as f32;
+                    }
+                    if let Some(o) = row.get_mut(x as usize) {
+                        *o = px;
+                    }
+                }
+            }
+            x0 = x1;
+        }
+    });
 }
 
 /// Median result honouring "operate on alpha": otherwise keep the original alpha and take the
@@ -1002,6 +1157,28 @@ mod tests {
         }
         for r in [1usize, 2, 5, 12, 30] {
             assert_eq!(median_image(&img, r), median_image_ref(&img, r), "r={r}");
+        }
+    }
+
+    /// The column-histogram median finds exactly Huang's levels: across tile and band
+    /// boundaries, with radii smaller and larger than the image, on smooth and noisy channels.
+    #[test]
+    fn median_columns_matches_huang() {
+        for (w, h) in [(600usize, 70usize), (41, 300), (5, 3)] {
+            let mut img = Image::new(w as u32, h as u32);
+            for y in 0..h as u32 {
+                for x in 0..w as u32 {
+                    let a = effectcraft_raster::hash_noise(x / 3, y / 5, 9);
+                    img.set(x, y, [effectcraft_raster::hash_noise(x, y, 4) * a, (x as f32 / w as f32) * a, a * a, a]);
+                }
+            }
+            let q: Vec<[u16; 4]> = img.data.iter().map(|p| [quant(p[0]), quant(p[1]), quant(p[2]), quant(p[3])]).collect();
+            for r in [1usize, 8, 40, 257] {
+                let (mut a, mut b) = (Image::new(w as u32, h as u32), Image::new(w as u32, h as u32));
+                median_huang(&q, w, h, r, &mut a);
+                median_columns(&q, w, h, r, &mut b);
+                assert_eq!(a, b, "{w}x{h} r={r}");
+            }
         }
     }
 

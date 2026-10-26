@@ -31,36 +31,54 @@ fn edge_preserving(src: &Image, r: f64, range: f32, hard: bool) -> Image {
     let stride = ((r / 6.0).ceil() as i64).max(1);
     let sig_s2 = 2.0 * (r / 2.0).max(0.5).powi(2);
     let sig_r2 = 2.0 * range.max(1e-3).powi(2);
+    let (w, h) = (src.width as i64, src.height as i64);
     let mut out = Image::new(src.width, src.height);
+    if src.data.len() as i64 != w * h {
+        return out;
+    }
+    // The window's taps (offset, spatial exponent), in the order the sums run.
+    let mut taps: Vec<(i64, i64, f32)> = Vec::new();
+    let mut dy = -ri;
+    while dy <= ri {
+        let mut dx = -ri;
+        while dx <= ri {
+            let d2 = (dx * dx + dy * dy) as f64;
+            if d2 <= r * r + 0.5 {
+                taps.push((dx, dy, (-d2 / sig_s2) as f32));
+            }
+            dx += stride;
+        }
+        dy += stride;
+    }
+    // Smart Blur's range test reads each tap's luminance: once per pixel, not per tap.
+    let luma: Vec<f32> = if hard { src.data.par_iter().map(|&p| plum(p)).collect() } else { Vec::new() };
+    let ext = taps.iter().fold(0i64, |m, t| m.max(t.0.abs()).max(t.1.abs()));
     out.rows_mut().for_each(|(y, row)| {
+        let y = y as i64;
+        let rows_inside = y >= ext && y + ext < h;
         for (x, o) in row.iter_mut().enumerate() {
-            let c = src.data[y * src.width as usize + x];
-            let cl = plum(c);
+            let x = x as i64;
+            let i = (y * w + x) as usize;
+            let c = src.data[i];
+            let cl = if hard { luma[i] } else { 0.0 };
+            let inside = rows_inside && x >= ext && x + ext < w;
             let mut acc = [0.0f32; 4];
             let mut wsum = 0.0f32;
-            let mut dy = -ri;
-            while dy <= ri {
-                let mut dx = -ri;
-                while dx <= ri {
-                    let d2 = (dx * dx + dy * dy) as f64;
-                    if d2 <= r * r + 0.5 {
-                        let q = src.get_clamped(x as i64 + dx, y as i64 + dy);
-                        let w = if hard {
-                            if (plum(q) - cl).abs() <= range { 1.0 } else { 0.0 }
-                        } else {
-                            let dc = (q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2) + (q[2] - c[2]).powi(2) + (q[3] - c[3]).powi(2);
-                            ((-d2 / sig_s2) as f32 - dc / sig_r2).exp()
-                        };
-                        if w > 0.0 {
-                            for k in 0..4 {
-                                acc[k] += q[k] * w;
-                            }
-                            wsum += w;
-                        }
+            for &(dx, dy, s) in &taps {
+                let j = if inside { ((y + dy) * w + x + dx) as usize } else { ((y + dy).clamp(0, h - 1) * w + (x + dx).clamp(0, w - 1)) as usize };
+                let q = src.data[j];
+                let wt = if hard {
+                    if (luma[j] - cl).abs() <= range { 1.0 } else { 0.0 }
+                } else {
+                    let dc = (q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2) + (q[2] - c[2]).powi(2) + (q[3] - c[3]).powi(2);
+                    (s - dc / sig_r2).exp()
+                };
+                if wt > 0.0 {
+                    for k in 0..4 {
+                        acc[k] += q[k] * wt;
                     }
-                    dx += stride;
+                    wsum += wt;
                 }
-                dy += stride;
             }
             *o = if wsum > 0.0 { acc.map(|v| v / wsum) } else { c };
         }

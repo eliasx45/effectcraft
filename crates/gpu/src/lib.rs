@@ -710,6 +710,8 @@ mod tests_precomp_clip;
 #[cfg(test)]
 mod tests_precomp_resident;
 #[cfg(test)]
+mod tests_radius_perf;
+#[cfg(test)]
 mod tests_shape_clip;
 #[cfg(test)]
 mod tests_shapes_gpu;

@@ -354,40 +354,6 @@ fn fxn_premul(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out, p, vec4<f32>(v.xyz * a, a));
 }
 
-// util::morph_plane along one axis (edges repeated). u[0] = (r, vertical); u[1] = per-channel
-// operation (0 min, 1 max, 2 keep).
-@compute @workgroup_size(16, 16)
-fn fxn_morph(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = fxn_pixel(gid);
-    if (p.x < 0) {
-        return;
-    }
-    let r = i32(P.u[0].x);
-    let vertical = P.u[0].y != 0u;
-    let centre = textureLoad(src, p, 0);
-    var lo = centre;
-    var hi = centre;
-    for (var k = -r; k <= r; k++) {
-        var v: vec4<f32>;
-        if (vertical) {
-            v = tex_get_clamped(src, p.x, p.y + k);
-        } else {
-            v = tex_get_clamped(src, p.x + k, p.y);
-        }
-        lo = min(lo, v);
-        hi = max(hi, v);
-    }
-    var o = centre;
-    for (var c = 0; c < 4; c++) {
-        if (P.u[1][c] == 0u) {
-            o[c] = lo[c];
-        } else if (P.u[1][c] == 1u) {
-            o[c] = hi[c];
-        }
-    }
-    textureStore(out, p, o);
-}
-
 // Crop: out(p) = src(p + u[0].xy).
 @compute @workgroup_size(16, 16)
 fn fxn_crop(@builtin(global_invocation_id) gid: vec3<u32>) {

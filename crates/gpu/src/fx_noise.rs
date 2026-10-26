@@ -31,7 +31,6 @@ pub(crate) const KERNELS: &[&str] = &[
     "fxn_cblur_out",
     "fxn_straight",
     "fxn_premul",
-    "fxn_morph",
     "fxn_crop",
     "fxn_cb_map",
     "fxn_cb_level",
@@ -486,13 +485,11 @@ fn compound_blur(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
 /// util::morph_plane per channel (`modes`: 0 min, 1 max, 2 keep) with radii (`rx`, `ry`).
 fn morph(e: &mut Enc, img: &GpuImage, rx: usize, ry: usize, modes: [u32; 4]) -> GpuImage {
     let mut cur = img.clone();
-    for (vertical, r) in [(0, rx), (1, ry)] {
+    for (vertical, r) in [(false, rx), (true, ry)] {
         if r == 0 {
             continue;
         }
-        let mut p = with_u0([r as u32, vertical, 0, 0]);
-        p.u[1] = modes;
-        cur = run(e, "fxn_morph", &p, &cur, None, None);
+        cur = crate::fx_color::morph_axis(e, &cur, u32::try_from(r).unwrap_or(u32::MAX), vertical, modes);
     }
     cur
 }

@@ -154,7 +154,18 @@ fn camera_lens(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         src = out;
     }
     let count: i64 = spans.iter().map(|(_, l, r)| r - l + 1).sum();
-    let norm = 1.0 / count as f64;
+    // Diffraction Fringe (blur2::camera_lens_blur): the outer 20 % of the iris weighs
+    // `w_ring`, the inner iris `w_in`, from the two irises' span sums.
+    let fringe = (ctx.params.f("irisProperties/diffractionFringe") / 500.0).clamp(0.0, 1.0);
+    let inner = if fringe > 0.0 && r * 0.8 >= 1.0 { effectcraft_effects::camera_lens_spans(ctx, r * 0.8).0 } else { Vec::new() };
+    let weights = if inner.is_empty() {
+        [1.0 / count as f64, 0.0]
+    } else {
+        let ni: i64 = inner.iter().map(|(_, l, r)| r - l + 1).sum();
+        let (w_in, w_ring) = (1.0 - fringe, 1.0 + 4.0 * fringe);
+        let norm = (w_in * ni as f64 + w_ring * (count - ni) as f64).max(1e-9);
+        [w_ring / norm, (w_in - w_ring) / norm]
+    };
     // Large irises sum each span from per-row prefix sums; small ones add the pixels directly.
     let prefix = count > 256;
     let pre = if prefix {
@@ -167,10 +178,12 @@ fn camera_lens(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     } else {
         None
     };
-    let data: Vec<f32> = spans.iter().flat_map(|&(dy, l, r)| [dy as f32, l as f32, r as f32]).collect();
+    let data: Vec<f32> = spans.iter().chain(&inner).flat_map(|&(dy, l, r)| [dy as f32, l as f32, r as f32]).collect();
     let mut p = Params::default();
-    p.u[0] = [spans.len() as u32, repeat as u32, linear as u32, prefix as u32];
-    p.f[0][0] = norm as f32;
+    p.u[0] = [(spans.len() + inner.len()) as u32, repeat as u32, linear as u32, prefix as u32];
+    p.u[1][0] = spans.len() as u32;
+    p.f[0][0] = weights[0] as f32;
+    p.f[0][1] = weights[1] as f32;
     let buf = e.data(&data);
     let out = e.scratch(w, h);
     e.pixels("gen_lens_blur", &p, &src, pre.as_ref(), &out, Some(&buf));

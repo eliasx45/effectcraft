@@ -2,6 +2,7 @@
 
 use effectcraft_project::ParamUi;
 use effectcraft_raster::{Image, gaussian_blur};
+use rayon::prelude::*;
 
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, slider};
 
@@ -97,26 +98,37 @@ fn shadow(ctx: &EffectCtx, mut b: Buf, v3: bool) -> Buf {
         }
     }
     let mut cast = Image::new(w, h);
-    for (sx, sy, opacity) in steps {
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let source_alpha = src.get(i64::from(x), i64::from(y))[3];
-                if source_alpha <= alpha_threshold {
+    // Each step stamps the source's alpha shifted along the shadow, keeping the strongest stamp
+    // per pixel. Output rows run in parallel; within a row the steps run in order, so each pixel
+    // sees the same candidates in the same order as stamping step by step over the whole image.
+    let sw = src.width as usize;
+    if min_x <= max_x && min_y <= max_y {
+        cast.rows_mut().for_each(|(py, row)| {
+            for &(sx, sy, opacity) in &steps {
+                let y = py as i64 - i64::from(top) - sy;
+                if y < i64::from(min_y) || y > i64::from(max_y) {
                     continue;
                 }
-                let a = source_alpha * opacity;
-                let (px, py) = (i64::from(x) + i64::from(left) + sx, i64::from(y) + i64::from(top) + sy);
-                if px < 0 || py < 0 || px >= i64::from(w) || py >= i64::from(h) {
-                    continue;
-                }
-                let index = py as usize * w as usize + px as usize;
-                if let Some(out) = cast.data.get_mut(index)
-                    && a > out[3]
-                {
-                    *out = [color[0] * a, color[1] * a, color[2] * a, a];
+                let Some(srow) = src.data.get(y as usize * sw..(y as usize + 1) * sw) else { continue };
+                for x in min_x..=max_x {
+                    let Some(source) = srow.get(x as usize) else { break };
+                    let source_alpha = source[3];
+                    if source_alpha <= alpha_threshold {
+                        continue;
+                    }
+                    let a = source_alpha * opacity;
+                    let px = i64::from(x) + i64::from(left) + sx;
+                    if px < 0 {
+                        continue;
+                    }
+                    if let Some(out) = row.get_mut(px as usize)
+                        && a > out[3]
+                    {
+                        *out = [color[0] * a, color[1] * a, color[2] * a, a];
+                    }
                 }
             }
-        }
+        });
     }
     if softness > 0.0 {
         cast = gaussian_blur(&cast, softness * 0.5, softness * 0.5, false);

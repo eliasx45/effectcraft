@@ -60,6 +60,19 @@ fn camera_lens_blur() {
     // Large iris: per-row prefix sums.
     effect_case("ec.blur.cameralens", &[("blurRadius", n(14.0)), ("irisProperties/irisRoundness", n(60.0))]);
     effect_case("ec.blur.cameralens", &[("blurRadius", n(12.0)), ("repeatEdge", b(true)), ("useLinear", b(true))]);
+    // Diffraction Fringe: the outer and inner irises' sums, weighted (small iris: direct sums;
+    // large: prefix sums), with Repeat Edge Pixels and an aspect-stretched hexagon.
+    effect_case("ec.blur.cameralens", &[("blurRadius", n(6.0)), ("irisProperties/diffractionFringe", n(100.0))]);
+    effect_case(
+        "ec.blur.cameralens",
+        &[
+            ("blurRadius", n(15.0)),
+            ("irisProperties/irisShape", e(3)),
+            ("irisProperties/irisAspectRatio", n(1.4)),
+            ("irisProperties/diffractionFringe", n(350.0)),
+            ("repeatEdge", b(true)),
+        ],
+    );
 }
 
 #[test]

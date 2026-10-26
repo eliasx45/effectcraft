@@ -156,8 +156,10 @@ fn gen_row_prefix(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// The iris sum. data = spans (dy, left, right); aux = row prefix sums (when u[0].w).
-// u[0] = (spans, repeat, linear, prefix); f[0].x = 1 / pixel count.
+// The iris sum. data = spans (dy, left, right): the outer iris' u[1].x spans, then the inner
+// iris' (Diffraction Fringe); aux = row prefix sums (when u[0].w). The result is outer sum ×
+// f[0].x + inner sum × f[0].y (no fringe: f[0].x = 1 / pixel count, no inner spans).
+// u[0] = (spans, repeat, linear, prefix).
 @compute @workgroup_size(16, 16)
 fn gen_lens_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -166,12 +168,18 @@ fn gen_lens_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let n = P.u[0].x;
+    let n_outer = P.u[1].x;
     let repeat = P.u[0].y != 0u;
     let prefix = P.u[0].w != 0u;
     let w = dims.x;
     let h = dims.y;
     var acc = vec4<f32>(0.0);
+    var outer = vec4<f32>(0.0);
     for (var s = 0u; s < n; s++) {
+        if (s == n_outer) {
+            outer = acc;
+            acc = vec4<f32>(0.0);
+        }
         var yy = p.y + i32(data[3u * s]);
         if (yy < 0 || yy >= h) {
             if (!repeat) {
@@ -210,7 +218,12 @@ fn gen_lens_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
             acc += textureLoad(aux, vec2<i32>(bnd + 1, yy), 0) - textureLoad(aux, vec2<i32>(a, yy), 0);
         }
     }
-    var px = acc * P.f[0].x;
+    var px: vec4<f32>;
+    if (n_outer < n) {
+        px = outer * P.f[0].x + acc * P.f[0].y;
+    } else {
+        px = acc * P.f[0].x;
+    }
     px.w = clamp(px.w, 0.0, 1.0);
     if (P.u[0].z != 0u) {
         let u = gen_unpremul(px);
