@@ -265,6 +265,8 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
         },
         "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_items(app)).unwrap_or_default()),
         "ui.inspect" => ok(inspect(app, ctx)),
+        // RI1: where the viewer's frame and each of its layers rendered (GPU or CPU) and why.
+        "ui.renderTimes" => ok(render_times(app)),
         "ui.elements" => {
             let prefix = s("prefix").unwrap_or("");
             ok(serde_json::to_value(app.auto.query_current(prefix)).unwrap_or_default())
@@ -768,6 +770,22 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
         // RT10e: GPU viewer frames drawn from their textures, without a copy.
         "zeroCopy": {"active": app.zero_copy_active(), "frames": app.zero_copy_frames(), "viewerOnGpu": app.viewer_on_gpu(), "compositor": app.gpu_adapter()},
     })
+}
+
+/// `ui.renderTimes`: the render times of the frame the viewer shows, where it and each layer
+/// rendered and why (`FrameTimes::to_json`), or `{frame: null}` before a frame has rendered.
+fn render_times(app: &EffectcraftApp) -> Value {
+    let shown = app.viewer_shown.as_ref().map(|(_, key)| *key);
+    let Some((key, times)) = shown.and_then(|key| Some((key, app.frames.times.get(&key)?))) else {
+        return json!({"frame": null, "layers": [], "lastMs": app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0)});
+    };
+    let comp = effectcraft_engine::project::ItemId(key.comp);
+    let mut v = times.to_json(&app.session.project, comp);
+    if let Some(f) = v.get_mut("frame").and_then(Value::as_object_mut) {
+        f.insert("frameNumber".into(), json!(key.frame));
+        f.insert("scale".into(), json!(f64::from(key.scale) / 1000.0));
+    }
+    v
 }
 
 /// Since the preview started: how many frames were shown and skipped, and the percentiles of

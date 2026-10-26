@@ -132,6 +132,7 @@ fn plan(ctx: &EvalCtx, layer: &Layer, contents: &effectcraft_project::PropGroup,
         })
         .collect();
     if resolved.iter().any(|(d, ..)| d.blend != BlendMode::Normal) {
+        crate::cpu_why::declined(crate::cpu_why::SHAPE_BLEND);
         return None;
     }
     let Some(b) = resolved.iter().map(|r| r.2).reduce(|a, b| a.union(b)) else {
@@ -162,6 +163,7 @@ fn plan(ctx: &EvalCtx, layer: &Layer, contents: &effectcraft_project::PropGroup,
         let stroke = |style: &StrokeStyle| -> Option<Vec<BezPath>> {
             if style.is_variable() {
                 // `stroke_coverage` supersamples Taper and Wave further (`fill_coverage_fine`).
+                crate::cpu_why::declined(crate::cpu_why::TAPER_STROKE);
                 return None;
             }
             let mut st = style.clone();
@@ -177,10 +179,14 @@ fn plan(ctx: &EvalCtx, layer: &Layer, contents: &effectcraft_project::PropGroup,
         let edges = match scan_edges(&fill, &sub, r.w, r.h) {
             Scan::Empty => continue,
             Scan::Edges(e) => e,
-            Scan::Decline => return None,
+            Scan::Decline => {
+                crate::cpu_why::declined(crate::cpu_why::PATH_TOO_BIG);
+                return None;
+            }
         };
         total = total.saturating_add(edges.len());
         if total > MAX_EDGES {
+            crate::cpu_why::declined(crate::cpu_why::TOO_MANY_EDGES);
             return None;
         }
         let paint = match &d.paint {

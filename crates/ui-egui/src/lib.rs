@@ -2728,6 +2728,19 @@ impl EffectcraftApp {
 
     // ---------------------------------------------------------------- frame
 
+    /// RI1: a slow viewer frame that rendered (in part) on the CPU says so once in a toast
+    /// (`frames::times::RenderTimes::notice_slow_cpu`), when no other toast is showing.
+    fn show_cpu_notice(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if self.toast.as_ref().is_some_and(|(_, at)| now - at < 4.0) {
+            return;
+        }
+        if let Some(n) = self.frames.times.take_cpu_notice() {
+            self.toast = Some((n.message(), now));
+            ctx.request_repaint();
+        }
+    }
+
     fn handle_events(&mut self, ctx: &egui::Context) {
         for ev in self.session.drain_events() {
             match ev {
@@ -2824,6 +2837,7 @@ impl EffectcraftApp {
         self.run_script_tasks(&ctx);
         self.apply_prefs(&ctx);
         self.handle_events(&ctx);
+        self.show_cpu_notice(&ctx);
         panels::unsaved::on_close_requested(self, &ctx);
         let title = panels::unsaved::window_title(self);
         if title != self.window_title {

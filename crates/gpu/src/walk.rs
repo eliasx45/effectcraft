@@ -116,6 +116,7 @@ fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[
                 (Some(item), _) => draw_collapsed(e, r, ctx, visible[i], item, canvas),
                 (None, Some(item)) => {
                     if draw_collapsed_fx(e, r, ctx, visible[i], item, canvas).is_none() {
+                        r.note_cpu(ctx, visible[i], effectcraft_render::cpu_why::COLLAPSED_FX);
                         on_cpu(e, canvas, |img| {
                             r.draw_collapsed_fx(ctx, visible[i], item, img);
                         })?;
@@ -157,6 +158,7 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
     }
     if let Some((k, item)) = run.iter().enumerate().find_map(|(k, l)| r.collapsed_fx(ctx, l).map(|item| (k, item))) {
         draw_3d(e, r, ctx, &run[..k], canvas)?;
+        r.note_cpu(ctx, run[k], effectcraft_render::cpu_why::COLLAPSED_FX);
         on_cpu(e, canvas, |img| {
             r.draw_collapsed_fx(ctx, run[k], item, img);
         })?;
@@ -170,7 +172,10 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
         let below = canvas.float(e)?;
         match crate::adv3d::draw_run(e, &prep, &below) {
             Some(img) => *canvas = img.into(),
-            None => on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?,
+            None => {
+                note_run_cpu(r, ctx, run);
+                on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?
+            }
         }
         return Some(());
     }
@@ -180,7 +185,10 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
         let below = canvas.float(e)?;
         match draw_split(e, r, ctx, &split, &below) {
             Some(img) => *canvas = img,
-            None => on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?,
+            None => {
+                note_run_cpu(r, ctx, run);
+                on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?
+            }
         }
         return Some(());
     }
@@ -205,10 +213,18 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
         Some(img) => *canvas = img.into(),
         None => {
             let _profile = effectcraft_render::profile::span("draw_3d_cpu_fallback");
+            note_run_cpu(r, ctx, run);
             on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?
         }
     }
     Some(())
+}
+
+/// A run of 3D layers drawn on the CPU (RI1: each layer says so).
+fn note_run_cpu(r: &Renderer, ctx: &EvalCtx, run: &[&Layer]) {
+    for l in run {
+        r.note_cpu(ctx, l, effectcraft_render::cpu_why::THREE_D);
+    }
 }
 
 /// `three_d::adv::draw_run`'s split path on the GPU canvas: the plain layers as one scene over
@@ -306,6 +322,7 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
         if draw_adjustment(e, r, ctx, layer, canvas).is_some() {
             return Some(());
         }
+        r.note_cpu(ctx, layer, effectcraft_render::cpu_why::ADJUSTMENT);
         return on_cpu(e, canvas, |img| r.draw_layer_cpu(ctx, layer, img));
     }
     if r.quality(layer) == Quality::Wireframe {
@@ -322,6 +339,10 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
+    if matches!(layer.source, effectcraft_project::LayerSource::Comp { .. }) {
+        // Its nested comp renders on the CPU path (RI1).
+        r.note_cpu(ctx, layer, effectcraft_render::cpu_why::PRECOMP);
+    }
     if let Some(done) = draw_yuv_footage(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
@@ -333,6 +354,10 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     }
     if let Some(done) = draw_styled_gpu(e, r, ctx, layer, canvas, opacity) {
         return done;
+    }
+    // Styles the GPU doesn't render are drawn on the CPU (unchanged ones come from the cache).
+    if styles::active(ctx, layer) && !r.layer_is_static(ctx, layer) {
+        r.note_cpu(ctx, layer, effectcraft_render::cpu_why::LAYER_STYLES);
     }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
@@ -562,9 +587,17 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
     } else {
         let _profile = effectcraft_render::profile::span("ordinary_resident_produce");
         // A shape layer rasterises here (`shapes_gpu`), else its source comes from the CPU.
+        let _ = effectcraft_render::cpu_why::take();
         let (src, at, bs) = match crate::shapes_gpu::resident_source(e, r, ctx, layer, clip) {
             Some(made) => made,
             None => {
+                // A shape, text or solid layer the GPU could have drawn (RI1: why it didn't).
+                if matches!(
+                    layer.source,
+                    effectcraft_project::LayerSource::Shape | effectcraft_project::LayerSource::Text | effectcraft_project::LayerSource::Solid { .. }
+                ) {
+                    r.note_cpu(ctx, layer, crate::shapes_gpu::why_cpu(r, ctx, layer));
+                }
                 let buf = crate::prepass::resident_source(r, ctx, layer, key, clip)?;
                 (e.g.upload_image(&buf.img)?, buf.offset, buf.scale)
             }

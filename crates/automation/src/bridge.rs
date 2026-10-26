@@ -84,9 +84,8 @@ fn host_instance(capabilities: &Value) -> Option<HostInstance> {
 /// reads can be resent there after a lost reply; unknown commands default to no replay.
 fn harmless_read(method: &str, params: &Value) -> bool {
     match method {
-        "engine.commands" | "ui.menu.list" | "ui.inspect" | "ui.elements" | "ui.viewer.locate" | "ui.viewer.hit" | "ui.timeline.locate" | "app.revision" => {
-            true
-        }
+        "engine.commands" | "ui.menu.list" | "ui.inspect" | "ui.renderTimes" | "ui.elements" | "ui.viewer.locate" | "ui.viewer.hit" | "ui.timeline.locate"
+        | "app.revision" => true,
         "ui.playback" => params["action"] == "status",
         "engine.execute" => params.get("command").and_then(Value::as_str).is_some_and(|command| {
             matches!(

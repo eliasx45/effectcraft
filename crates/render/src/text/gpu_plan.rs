@@ -136,6 +136,7 @@ type Whole = (u32, u32, [f64; 2], Vec<WholeDraw>);
 /// when nothing is drawn (the 1 × 1 empty buffer), `Err` when the CPU must draw it.
 fn whole(geom: &TextGeom, s: f64) -> Result<Option<Whole>, ()> {
     if geom.blend != BlendMode::Normal {
+        crate::cpu_why::declined(crate::cpu_why::TEXT_ANIMATORS);
         return Err(());
     }
     let mut bounds: Option<kurbo::Rect> = None;
@@ -171,6 +172,7 @@ fn whole(geom: &TextGeom, s: f64) -> Result<Option<Whole>, ()> {
         let blur = [g.xf.blur[0] * s, g.xf.blur[1] * s];
         // Blurred patches and per-pixel gradient colour stay on the CPU.
         if blur[0] > 0.05 || blur[1] > 0.05 || (!stroke && g.fills.is_some()) {
+            crate::cpu_why::declined(crate::cpu_why::TEXT_BLUR);
             return Err(());
         }
         let pad = g.stroke_width * m.mean_scale() + 2.0 + blur[0].max(blur[1]) * 1.5;
@@ -199,10 +201,14 @@ fn whole(geom: &TextGeom, s: f64) -> Result<Option<Whole>, ()> {
         let edges = match scan {
             Scan::Empty => continue,
             Scan::Edges(e) => e,
-            Scan::Decline => return Err(()),
+            Scan::Decline => {
+                crate::cpu_why::declined(crate::cpu_why::PATH_TOO_BIG);
+                return Err(());
+            }
         };
         total = total.saturating_add(edges.len());
         if total > MAX_EDGES {
+            crate::cpu_why::declined(crate::cpu_why::TOO_MANY_EDGES);
             return Err(());
         }
         // `paint_coverage`: colour × coverage × (alpha × opacity), the product taken first.

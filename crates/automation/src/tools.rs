@@ -176,6 +176,7 @@ const READ_ONLY: &[&str] = &[
     "list_fonts",
     "get_state",
     "ui_inspect",
+    "render_times",
     "ui_elements",
     "get_layout",
     "lint_frame",
@@ -1431,6 +1432,9 @@ fn passthrough(b: &mut Backend, method: &str, a: &Value) -> Result<Reply> {
 fn ui_inspect(b: &mut Backend, a: &Value) -> Result<Reply> {
     passthrough(b, "ui.inspect", a)
 }
+fn render_times(b: &mut Backend, a: &Value) -> Result<Reply> {
+    passthrough(b, "ui.renderTimes", a)
+}
 fn ui_elements(b: &mut Backend, a: &Value) -> Result<Reply> {
     passthrough(b, "ui.elements", a)
 }
@@ -2000,6 +2004,13 @@ static TOOLS: &[ToolDef] = &[
         run: ui_inspect,
     },
     ToolDef {
+        name: "render_times",
+        description: "Why was this frame slow? The render times of the frame the viewer shows (the Timeline's Render Time pane): frame {ms, backend: gpu|cpu, reason, frameDurationMs, slow, cpuLayers} and each layer, slowest first, {comp, layer, name, ms, backend: gpu|cpu, reason} (e.g. \"Taper or Wave stroke: the GPU can't draw it\", \"effect X has no GPU version\", \"the GPU ran out of memory\").",
+        bridge_only: true,
+        schema: || schema(json!({}), &[]),
+        run: render_times,
+    },
+    ToolDef {
         name: "ui_elements",
         description: "Interactive elements drawn in the last frame: id, label, rect [x,y,w,h] in points. Stable ids such as `tools.Selection`, `panel.Timeline`, `panel.tab.EffectControls`, `project.item.<id>`, `viewer.comp`, `timeline.layer.<id>.bar`, `timeline.prop.<uid>.stopwatch`, `timeline.cti`, `effects.item.<name>`. Filter with `prefix`.",
         bridge_only: true,
@@ -2065,7 +2076,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "control",
-        description: "Call any control-channel method (docs/control-protocol.md) with its params, e.g. ui.menu.list, ui.menu.invoke {id}, ui.panel.show {panel}, ui.scroll, ui.viewer.locate {x,y}, ui.timeline.locate {layer,time}, ui.playback {action}, ui.resize.",
+        description: "Call any control-channel method (docs/control-protocol.md) with its params, e.g. ui.menu.list, ui.menu.invoke {id}, ui.panel.show {panel}, ui.scroll, ui.viewer.locate {x,y}, ui.timeline.locate {layer,time}, ui.playback {action}, ui.renderTimes, ui.resize.",
         bridge_only: true,
         schema: || schema(json!({"method": {"type": "string"}, "params": {"type": "object", "additionalProperties": true}}), &["method"]),
         run: control,

@@ -84,6 +84,32 @@ pub(crate) fn eligible(r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> bool {
     }
 }
 
+/// Why a shape, text or solid layer the walk asked [`resident_source`] for renders on the CPU
+/// instead (RI1): the reason its plan left ([`effectcraft_render::cpu_why::take`]), else why it
+/// wasn't eligible. Called only when it declined.
+pub(crate) fn why_cpu(r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> effectcraft_render::CpuWhy {
+    use effectcraft_render::cpu_why as why;
+    if let Some(w) = why::take() {
+        return w;
+    }
+    let off = match layer.source {
+        LayerSource::Text => !text_enabled(),
+        _ => !enabled(),
+    };
+    if off {
+        return why::GPU_SHAPES_OFF;
+    }
+    if !effectcraft_render::masks::gpu_plan::gpu_eligible(layer) {
+        return why::MASK_FEATHER;
+    }
+    match layer.source {
+        // Its masks could be drawn: its contents' motion blur sub-frames weren't.
+        LayerSource::Shape if !r.shape_raster_eligible(ctx, layer) => why::SHAPE_MOTION_BLUR,
+        LayerSource::Text if !r.text_raster_eligible(ctx, layer) => why::TEXT_ANIMATORS,
+        _ => why::RASTER_DECLINED,
+    }
+}
+
 /// Shape layers rasterised here (tests check the GPU path ran).
 #[cfg(test)]
 pub(crate) static RASTERISED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -259,6 +285,7 @@ fn batches(draws: &[&PlanDraw], groups: bool, budget: u64) -> Option<Vec<(usize,
 pub(crate) fn raster(e: &mut Enc, plan: &RasterPlan) -> Option<GpuImage> {
     let (w, h) = (plan.width, plan.height);
     if w == 0 || h == 0 || !e.g.fits(w, h) {
+        effectcraft_render::cpu_why::declined(effectcraft_render::cpu_why::GPU_BUFFER_LIMITS);
         return None;
     }
     let drawn: Vec<&PlanDraw> = plan.draws.iter().filter(|d| !d.edges.is_empty() && d.rect[2] > 0 && d.rect[3] > 0).collect();
@@ -271,12 +298,14 @@ pub(crate) fn raster(e: &mut Enc, plan: &RasterPlan) -> Option<GpuImage> {
     let max_bind = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
     let max_groups = u64::from(limits.max_compute_workgroups_per_dimension);
     if limits.max_storage_buffers_per_shader_stage < 6 || u64::from(w) * u64::from(h) * 16 > max_bind {
+        effectcraft_render::cpu_why::declined(effectcraft_render::cpu_why::GPU_BUFFER_LIMITS);
         return None;
     }
     let groups = drawn.iter().any(|d| d.group != drawn[0].group || d.weight != 1.0);
     let batches = batches(&drawn, groups, ACC_BUDGET.min(max_bind))?;
     let edge_count: u64 = drawn.iter().map(|d| d.edges.len() as u64).sum();
     if edge_count.saturating_mul(16) > max_bind || drawn.len() >= 1 << 24 {
+        effectcraft_render::cpu_why::declined(effectcraft_render::cpu_why::GPU_BUFFER_LIMITS);
         return None;
     }
     // Edges (tagged with their draw), draw records and gradient stops of every draw; each draw's

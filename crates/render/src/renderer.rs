@@ -207,32 +207,89 @@ pub struct LayerTiming {
 /// timed under their own comp too. A 3D run's shared scene composite is split evenly between its
 /// layers. A layer whose content came from the layer cache takes only the lookup; a GPU
 /// compositor's time is the time to prepare and record its work, not the device's own run time.
+/// It also keeps where things ran (RI1): why a layer (or part of it) rendered on the CPU in a
+/// GPU frame ([`Self::cpu`]), and why the whole frame did ([`Self::set_frame_cpu`]). Nothing is
+/// kept (or allocated) for a frame that ran on the GPU throughout.
 #[derive(Debug, Default)]
-pub struct LayerTimes(std::sync::Mutex<std::collections::HashMap<(ItemId, LayerId), f64>>);
+pub struct LayerTimes {
+    ms: std::sync::Mutex<std::collections::HashMap<(ItemId, LayerId), f64>>,
+    cpu: std::sync::Mutex<std::collections::HashMap<(ItemId, LayerId), crate::cpu_why::CpuWhy>>,
+    frame_cpu: std::sync::Mutex<Option<crate::cpu_why::CpuWhy>>,
+}
+
+/// What [`LayerTimes`] kept for a frame.
+#[derive(Clone, Debug, Default)]
+pub struct TakenTimes {
+    /// Each layer's time (ms), by comp and layer.
+    pub ms: std::collections::HashMap<(ItemId, LayerId), f64>,
+    /// The layers that rendered (fully or partly) on the CPU in a GPU frame, and why.
+    pub cpu: std::collections::HashMap<(ItemId, LayerId), crate::cpu_why::CpuWhy>,
+    /// Why the whole frame rendered on the CPU; `None`: the GPU composited it.
+    pub frame_cpu: Option<crate::cpu_why::CpuWhy>,
+}
 
 impl LayerTimes {
+    /// `layer` of `comp` rendered (fully or partly) on the CPU because of `why`. The first
+    /// reason a layer gets on a frame stays.
+    pub fn cpu(&self, comp: ItemId, layer: LayerId, why: crate::cpu_why::CpuWhy) {
+        let mut m = self.cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        m.entry((comp, layer)).or_insert(why);
+    }
+
+    /// Why `layer` of `comp` rendered on the CPU so far, if it did.
+    pub fn cpu_reason(&self, comp: ItemId, layer: LayerId) -> Option<crate::cpu_why::CpuWhy> {
+        self.cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(comp, layer)).copied()
+    }
+
+    /// The whole frame rendered on the CPU because of `why` (replacing an earlier reason: the
+    /// last decision is the one that rendered it).
+    pub fn set_frame_cpu(&self, why: crate::cpu_why::CpuWhy) {
+        *self.frame_cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+    }
+
+    /// [`Self::set_frame_cpu`] unless a reason is already kept (the compositor's own decision
+    /// gives way to the caller's, which knows more: a retired GPU, a retry).
+    pub fn note_frame_cpu(&self, why: crate::cpu_why::CpuWhy) {
+        self.frame_cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(why);
+    }
+
+    /// Why the whole frame rendered on the CPU, if it did.
+    pub fn frame_cpu(&self) -> Option<crate::cpu_why::CpuWhy> {
+        *self.frame_cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Everything kept.
+    pub fn take(self) -> TakenTimes {
+        fn into<T>(m: std::sync::Mutex<T>) -> T {
+            m.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        TakenTimes { ms: into(self.ms), cpu: into(self.cpu), frame_cpu: into(self.frame_cpu) }
+    }
+
     /// Add `ms` to `layer` of `comp`.
     pub fn add(&self, comp: ItemId, layer: LayerId, ms: f64) {
         if !ms.is_finite() || ms < 0.0 {
             return;
         }
-        let mut m = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = self.ms.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *m.entry((comp, layer)).or_insert(0.0) += ms;
     }
 
     /// The time of `layer` of `comp` so far.
     pub fn get(&self, comp: ItemId, layer: LayerId) -> Option<f64> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(comp, layer)).copied()
+        self.ms.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(comp, layer)).copied()
     }
 
-    /// Forget the times taken (a frame rendered again from the start).
+    /// Forget the times taken and where things ran (a frame rendered again from the start).
     pub fn clear(&self) {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.ms.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        *self.frame_cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// The times taken.
     pub fn into_map(self) -> std::collections::HashMap<(ItemId, LayerId), f64> {
-        self.0.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.take().ms
     }
 }
 
@@ -248,6 +305,14 @@ impl<'a> Renderer<'a> {
         let out = f();
         times.add(ctx.comp_id, layer.id, t0.elapsed().as_secs_f64() * 1e3);
         out
+    }
+
+    /// `layer` of `ctx`'s comp renders (fully or partly) on the CPU because of `why`, when this
+    /// render is timed (RI1, see [`LayerTimes::cpu`]).
+    pub fn note_cpu(&self, ctx: &EvalCtx, layer: &Layer, why: crate::cpu_why::CpuWhy) {
+        if let Some(times) = self.times {
+            times.cpu(ctx.comp_id, layer.id, why);
+        }
     }
 
     /// [`Self::timed`] for a run of 3D layers drawn as one scene: what `f` timed per layer stays
@@ -397,6 +462,11 @@ impl<'a> Renderer<'a> {
                 if let Some((p, key)) = auto {
                     p.declined(key);
                 }
+                self.note_frame_cpu(crate::cpu_why::GPU_DECLINED_FRAME);
+            } else if auto.is_some_and(|(p, key)| p.stats(key).is_some_and(|s| s.declined)) {
+                self.note_frame_cpu(crate::cpu_why::GPU_DECLINED_COMP);
+            } else {
+                self.note_frame_cpu(crate::cpu_why::CPU_FASTER);
             }
             let t0 = web_time::Instant::now();
             let img = self.comp_frame_cpu(comp_id, t);
@@ -405,7 +475,24 @@ impl<'a> Renderer<'a> {
             }
             return img;
         }
+        if self.depth == 0 {
+            self.note_frame_cpu(if self.freeze.is_some() {
+                crate::cpu_why::FROZEN_PREVIEW
+            } else if self.accel.is_none() {
+                crate::cpu_why::NO_GPU
+            } else {
+                crate::cpu_why::GPU_OFF
+            });
+        }
         self.comp_frame_cpu(comp_id, t)
+    }
+
+    /// The top-level frame renders on the CPU because of `why`, unless the caller already said
+    /// why (RI1, see [`LayerTimes::note_frame_cpu`]).
+    fn note_frame_cpu(&self, why: crate::cpu_why::CpuWhy) {
+        if let Some(times) = self.times {
+            times.note_frame_cpu(why);
+        }
     }
 
     /// Build a preview cache in blending space, before display/output conversion. Call on a

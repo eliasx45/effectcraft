@@ -161,6 +161,7 @@ unsubscribes.
 | Method | Params | Result |
 |---|---|---|
 | `ui.inspect` | `{}` | Window size, pixels per point, UI fps, serialized `UiState`, playback (`achievedFps`, `targetFps`, `realTime`, `shown`, `caching`, `waiting`), time, active comp, selection, open dialog, last render ms, `keyboardFocus`, `windowFocused`, `workspaceStorageError`. Read-only `preview` diagnostics are described below. |
+| `ui.renderTimes` | `{}` | Where the frame the viewer shows rendered and why (RI1; MCP tool `render_times`). `frame: {comp, frameNumber, scale, ms, backend: "gpu"\|"cpu", reason, frameDurationMs, slow, cpuLayers, remote}` (`slow`: longer than one frame of the comp; `null` with `lastMs` before any frame rendered) and `layers: [{comp, layer, name, ms, backend, reason}]`, slowest first, nested comps' layers included. See "Render Time: GPU or CPU" below. |
 | `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h], window?}]`: the widgets from the most recently completed paint pass, in points. ID-based input uses that same snapshot, without falling back to widgets removed since an older frame. On the desktop an undocked panel group is an OS window of its own: its widgets carry `window` (the group's id) and their rect is in that window's coordinates. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?, renderQueueColumns?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, graphMode: auto|value|speed, graphShowSet, graphAutoZoom, showModes, openLayers: [ids], openGroups: [uids]}`; `renderQueueColumns: {render\|label\|num\|name\|status\|started\|time: points (null = default; without `name`, Comp Name fills)}`, read back as `ui.render_queue_columns` in `ui.inspect`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
@@ -227,6 +228,35 @@ write the file immediately. Through `ui.menu.invoke` they return an error when i
 `engine.execute` hands them to the UI and returns `{frontend}` first, so check
 `workspaceStorageError` there. The changed workspaces still apply for the session, and a later
 save retries them.
+
+### Render Time: GPU or CPU
+
+The Timeline's Render Time column (and `ui.renderTimes`) says where each layer of the viewer's
+frame rendered. A layer that rendered (fully or partly) on the CPU shows an orange **CPU** tag left
+of its time (automation id `timeline.layer.<id>.renderTimeCpu`, label = the reason; the time's
+`timeline.layer.<id>.renderTime` label ends in ` (CPU)`), and a precomp layer whose nested comp
+had one shows "a layer inside: …". A frame that rendered on the CPU throughout adds ` · CPU
+(reason)` to the footer's Frame Render Time (`timeline.frameRenderTimeCpu`), and every layer
+carries that reason. Reasons, in English on the wire (`reason`):
+
+- Whole frame: GPU acceleration is off; no GPU is available; the GPU stopped working this
+  session; the GPU ran out of memory; the GPU declined this frame; the GPU declined this comp
+  earlier (Auto keeps it on the CPU, offering the GPU a frame now and then); the GPU didn't finish
+  the frame; a frozen preview section; rendered again after a failed GPU attempt; Auto measured
+  the CPU as faster for this comp (exports and non-viewer frames).
+- Layer: Taper or Wave stroke; a shape drawn in a blend mode other than Normal; a path or mask
+  wider than 8191 px; too many path edges; too large for the GPU's buffers; motion-blurred shape
+  content; text Blur, Gradient Fill or Inter-Character Blending; blurred or gradient-filled
+  characters; mask variable-width feather, mask motion blur on an animated path, a negative or very
+  large mask expansion; GPU shape/text drawing turned off (`EFFECTCRAFT_GPU_SHAPES=0` /
+  `EFFECTCRAFT_GPU_TEXT=0`); layer styles the GPU doesn't render; effect X has no GPU version; the
+  GPU declined effect X; an adjustment layer, a collapsed precomp's effects, a nested comp or a run
+  of 3D layers the GPU can't draw.
+
+A viewer or playback frame that took longer than one frame of its comp with CPU work in it shows
+a toast once per comp, layer and reason for the session ("Shape Layer 1 rendered on the CPU
+(Taper or Wave stroke: the GPU can't draw it) · 48 ms", automation id `toast`); a changed reason
+is said again.
 
 ## Input
 

@@ -106,10 +106,12 @@ fn plan(ctx: &EvalCtx, layer: &Layer, out: &Geometry, blur: super::MaskBlur<'_>)
     for g in list {
         let GroupKind::Mask { mode, inverted, .. } = g.kind else { continue };
         if motion_blurred(g, blur) {
+            crate::cpu_why::declined(crate::cpu_why::MASK_MOTION_BLUR);
             return None;
         }
         let Some(Value::Path(sp)) = ctx.group_value(layer, g, "path") else { continue };
         if !sp.feather.is_empty() {
+            crate::cpu_why::declined(crate::cpu_why::MASK_FEATHER);
             return None;
         }
         let path = effectcraft_path::to_kurbo(&sp);
@@ -118,7 +120,10 @@ fn plan(ctx: &EvalCtx, layer: &Layer, out: &Geometry, blur: super::MaskBlur<'_>)
         let edges = |paths: &[effectcraft_path::BezPath]| match scan_edges(paths, &m, plane.width, plane.height) {
             Scan::Empty => Some(Vec::new()),
             Scan::Edges(e) => Some(e),
-            Scan::Decline => None,
+            Scan::Decline => {
+                crate::cpu_why::declined(crate::cpu_why::PATH_TOO_BIG);
+                None
+            }
         };
         let fill = edges(std::slice::from_ref(&path))?;
         let exp = ctx.f(layer, g, "expansion", 0.0);
@@ -129,6 +134,7 @@ fn plan(ctx: &EvalCtx, layer: &Layer, out: &Geometry, blur: super::MaskBlur<'_>)
             };
             // Shrinking, or growing by the distance to the mask: CPU only.
             if exp < 0.0 || !exp.is_finite() || exp * plane.scale > 0.25 * size {
+                crate::cpu_why::declined(crate::cpu_why::MASK_EXPANSION);
                 return None;
             }
             let style = StrokeStyle { width: exp * 2.0, join: effectcraft_path::Join::Round, ..Default::default() };
@@ -141,6 +147,7 @@ fn plan(ctx: &EvalCtx, layer: &Layer, out: &Geometry, blur: super::MaskBlur<'_>)
         };
         total = total.saturating_add(fill.len()).saturating_add(ring.len());
         if total > MAX_EDGES {
+            crate::cpu_why::declined(crate::cpu_why::TOO_MANY_EDGES);
             return None;
         }
         let mode = if first && matches!(mode, MaskMode::Intersect | MaskMode::Darken) { MaskMode::Add } else { mode };

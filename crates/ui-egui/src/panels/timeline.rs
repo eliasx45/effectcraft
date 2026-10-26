@@ -27,6 +27,7 @@ pub(crate) mod wheels;
 pub use host::{CacheBar, DialogRequest, PointerColor, TimelineHost, TimelineParts};
 use ids::tl_id;
 
+use crate::frames::times::why_text;
 use crate::i18n::tr;
 use crate::icons::{self, Icon, SourceIcon};
 use crate::theme::Tokens;
@@ -3465,13 +3466,29 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
     let ms = shown_times.as_ref().map(|s| s.frame.frame_ms).unwrap_or_else(|| app.last_frame_ms());
     // A cloud frame (CR5) shows the server's time, and says so.
     let cloud = shown_times.as_ref().is_some_and(|s| s.frame.remote);
-    let frt = p.text(
+    // RI1: a frame that rendered on the CPU throughout says so, and why (in orange).
+    let frame_cpu = shown_times.as_ref().and_then(|s| s.frame.frame_cpu).map(why_text);
+    let mut frt = p.text(
         pos2(graph_x0 - 12.0, footer.center().y),
         Align2::RIGHT_CENTER,
         crate::i18n::tr_args(if cloud { "Frame Render Time  {}ms (cloud)" } else { "Frame Render Time  {}ms" }, &[&format!("{ms:.0}")]),
         Tokens::ui(11.0),
         t.text_faint,
     );
+    if let Some(why) = &frame_cpu {
+        let badge = crate::i18n::tr_args(" · CPU ({})", &[why]);
+        // Left of the time, which keeps its place; long reasons are cut (the hover has them whole).
+        let max_w = (frt.min.x - tgl.max.x - 140.0).max(0.0);
+        let cut = p.with_clip_rect(Rect::from_min_max(pos2(frt.min.x - max_w, footer.min.y), pos2(frt.min.x, footer.max.y)));
+        let br = cut.text(pos2(frt.min.x, footer.center().y), Align2::RIGHT_CENTER, &badge, Tokens::ui(11.0), t.warning);
+        let br = Rect::from_min_max(pos2(br.min.x.max(frt.min.x - max_w), br.min.y), br.max);
+        if br.is_positive() {
+            ui.interact(br, tl_id("tl-frame-render-cpu"), Sense::hover())
+                .on_hover_text(crate::i18n::tr_args("The whole frame rendered on the CPU: {}", &[why]));
+        }
+        app.auto_mut().add("timeline.frameRenderTimeCpu", br, why);
+        frt = frt.union(br);
+    }
     // The RAM chip (Window ▸ Memory): atomics only, see `memory_panel::chip`.
     if let Some(a) = app.app() {
         super::memory_panel::chip(a, ui, &p, pos2(frt.min.x - 10.0, footer.center().y), tgl.max.x + 8.0);
@@ -3852,7 +3869,24 @@ fn layer_cells(
         && let Some(times) = times
         && let Some(ms) = times.layer(layer.id)
     {
-        let cr = Rect::from_min_max(pos2(cw.render_time + 4.0, r.min.y + 4.0), pos2(cw.render_time + cw.render_time_w - 4.0, r.max.y - 4.0));
+        let mut cr = Rect::from_min_max(pos2(cw.render_time + 4.0, r.min.y + 4.0), pos2(cw.render_time + cw.render_time_w - 4.0, r.max.y - 4.0));
+        // RI1: a layer that rendered (fully or partly) on the CPU gets an orange "CPU" tag left of
+        // its time, the reason on hover; a precomp layer whose nested comp did, too.
+        let cpu = times.frame.layer_cpu(times.comp, layer.id).map(why_text).or_else(|| match layer.source {
+            LayerSource::Comp { item } => times.frame.nested_cpu(item).map(|w| crate::i18n::tr_args("a layer inside: {}", &[&why_text(w)])),
+            _ => None,
+        });
+        if let Some(why) = &cpu {
+            let tag_w = 26.0_f32.min(cr.width() * 0.5);
+            let tag = Rect::from_min_size(cr.min, vec2(tag_w, cr.height()));
+            cr.min.x += tag_w + 2.0;
+            let vis = tag.intersect(lp.clip_rect());
+            if vis.is_positive() {
+                lp.with_clip_rect(vis).text(tag.left_center(), Align2::LEFT_CENTER, "CPU", Tokens::mono(10.0), t.warning);
+                ui.interact(vis, tl_id(("tl-render-time-cpu", lid)), Sense::hover()).on_hover_text(crate::i18n::tr_args("Rendered on the CPU: {}", &[why]));
+            }
+            app.auto_mut().add(&format!("timeline.layer.{lid}.renderTimeCpu"), tag, why);
+        }
         let ms = if ms.is_finite() { ms.max(0.0) } else { 0.0 };
         let label = render_time_label(ms);
         let share = if times.slowest > 0.0 && times.slowest.is_finite() { (ms / times.slowest).clamp(0.0, 1.0) as f32 } else { 0.0 };
@@ -3866,6 +3900,7 @@ fn layer_cells(
         render_time_cell(ui, lp, cr, cy, lid, &label, share, colour, t.text_dim);
         // Scripts and tests read where the time was measured.
         let auto_label = if times.frame.remote { format!("{label} (cloud)") } else { label };
+        let auto_label = if cpu.is_some() { format!("{auto_label} (CPU)") } else { auto_label };
         app.auto_mut().add(&format!("timeline.layer.{lid}.renderTime"), cr, &auto_label);
     }
     if cw.vis.comment {

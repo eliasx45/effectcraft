@@ -930,7 +930,7 @@ impl Link {
                     // pane has them when it shows the frame).
                     if let Some(timed) = p.timed.take() {
                         let layers = layer_times.into_iter().map(|(c, l, ms)| ((c, l), f64::from(ms))).collect();
-                        timed(FrameTimes { frame_ms: ms, layers, remote: true });
+                        timed(FrameTimes { frame_ms: ms, layers, remote: true, ..FrameTimes::default() });
                     }
                     if let Some(refined) = p.refined.take() {
                         self.refining.insert(id, (refined, Instant::now()));

@@ -33,6 +33,7 @@ pub use adjustment::adjustment_crop;
 pub use auto::{AutoKey, AutoPick};
 pub use cache::{CacheStats, LayerCache, LayerStore, PrefetchStore};
 pub use clip::{set_precomp_clip, set_shape_clip};
+pub use cpu_why::CpuWhy;
 pub use effectcraft_raster::Image;
 pub use eval::{EvalCtx, ExprHost, effect_bounds, source_size};
 pub use footage::{
@@ -44,5 +45,5 @@ pub use fx::{effect_canvas_extent, effect_canvas_extent_in, effect_points_in_com
 pub use layer_buf::{ContentClip, StyledLayer};
 pub use motion_blur::adaptive_samples;
 pub use placement::Placement;
-pub use renderer::{LayerTimes, LayerTiming, RenderOpts, Renderer, SHARP_MAX_PIXELS, extended_region, render_frame, roi_inside};
+pub use renderer::{LayerTimes, LayerTiming, RenderOpts, Renderer, SHARP_MAX_PIXELS, TakenTimes, extended_region, render_frame, roi_inside};
 pub use sources::{content_bounds, essential_overrides, kurbo_path};

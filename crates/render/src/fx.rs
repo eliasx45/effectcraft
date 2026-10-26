@@ -235,10 +235,11 @@ impl FxTarget for CpuFx<'_> {
     fn extent(&self) -> Option<([u32; 2], [f64; 2], f64)> {
         self.buf.as_ref().map(|b| ([b.img.width, b.img.height], b.offset, b.scale))
     }
-    fn keep(&mut self, key: u64, cache: &crate::cache::LayerCache) {
+    fn keep(&mut self, key: u64, cache: &crate::cache::LayerCache, flight: Option<crate::cache::FlightGuard>) {
         if let Some(b) = &self.buf {
             cache.insert(key, Arc::new(b.clone()));
         }
+        drop(flight);
     }
     fn restore(&mut self, key: u64, cache: &crate::cache::LayerCache) -> bool {
         let Some(b) = cache.get(key) else { return false };
@@ -568,27 +569,43 @@ impl<'a> Renderer<'a> {
         let mut k = 0;
         // The static first effects: restored when kept on an earlier frame, else kept once run.
         let mut prefix = self.static_prefix(ctx, layer, &stack, adjustment, origin, view, target.extent());
-        if let (Some((p, key)), Some(c)) = (prefix, self.cache_to_keep())
-            && target.restore(key, c)
-        {
-            k = p;
-            prefix = None;
+        // Frames rendered at once (playback renders several in parallel) share one render of
+        // the static first effects: the first claims it, the others wait for it and restore it
+        // (before, each rendered its own: a Deep Glow eight times over on the first play).
+        let mut flight = None;
+        if let (Some((p, key)), Some(c)) = (prefix, self.cache_to_keep()) {
+            let mut restored = target.restore(key, c);
+            if !restored {
+                match c.claim_gpu(key) {
+                    crate::cache::Claim::Owner(g) => flight = Some(g),
+                    // Another frame rendered it (or gave up: then this one renders it too).
+                    _ => restored = target.restore(key, c),
+                }
+            }
+            if restored {
+                k = p;
+                prefix = None;
+            }
         }
         while k < stack.len() {
             if let (Some((p, key)), Some(c)) = (prefix, self.cache_to_keep())
                 && k == p
             {
-                target.keep(key, c);
+                target.keep(key, c, flight.take());
                 prefix = None;
             }
             let (i, g, spec) = stack[k];
             // A run of GPU effects goes to the accelerator in one go (stopping where the static
             // first effects end, to keep their result).
             let end = prefix.map_or(stack.len(), |(p, _)| p);
+            // Why this effect runs on the CPU while a GPU is active (RI1): no kernel, or the
+            // GPU declined the run.
+            let mut why = crate::cpu_why::EFFECT_NO_GPU;
             if let Some(a) = accel
                 && spec.gpu
                 && a.supports_effect(spec.id)
             {
+                why = crate::cpu_why::EFFECT_DECLINED;
                 let run: Vec<_> = stack[k..end].iter().take_while(|(_, _, s)| s.gpu && a.supports_effect(s.id)).collect();
                 let params: Vec<Params> = run.iter().map(|(_, g, _)| self.effect_params(ctx, layer, g)).collect();
                 let hosts: Vec<_> = run.iter().map(|(i, _, _)| FxHost { index: *i, ..host }).collect();
@@ -620,6 +637,9 @@ impl<'a> Renderer<'a> {
                 }
             }
             k += 1;
+            if accel.is_some() {
+                self.note_cpu(ctx, layer, crate::cpu_why::CpuWhy::named(why.why, spec.name));
+            }
             let params = self.effect_params(ctx, layer, g);
             let host = FxHost { index: i, ..host };
             let env = EffectEnv { host: Some(&host), effect_index: i, ..env };

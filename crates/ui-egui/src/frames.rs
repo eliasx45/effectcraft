@@ -3723,6 +3723,7 @@ impl Worker {
         r.accel = Some(g as &dyn effectcraft_engine::render::Accelerator);
         let times = LayerTimes::default();
         r.times = Some(&times);
+        times.set_frame_cpu(effectcraft_engine::render::cpu_why::GPU_UNFINISHED);
         let t0 = web_time::Instant::now();
         let img = to_color_image(&r.comp_frame_cpu(job.comp, job.t));
         if let (Some(key), Some(p)) = (auto, pick) {
@@ -3734,16 +3735,18 @@ impl Worker {
 
     /// A failed scoped attempt retries on CPU. Retired contexts cannot recover by reducing
     /// their budget; only a healthy device's allocation failure uses the upstream backoff.
-    fn gpu_attempt_failed(&self, gpu: &Gpu, e: &str) {
+    /// Returns why the frame renders on the CPU (RI1).
+    fn gpu_attempt_failed(&self, gpu: &Gpu, e: &str) -> effectcraft_engine::render::CpuWhy {
         if gpu.context().check_health().is_err() {
             log::warn!("the GPU context is retired ({e}); the frame renders on the CPU");
-            return;
+            return effectcraft_engine::render::cpu_why::GPU_RETIRED;
         }
         log::warn!("the GPU ran out of memory ({e}); the frame renders on the CPU and fewer GPU frames are kept");
         self.gpu_gate.out_of_memory();
         if let Ok(mut c) = self.cache.lock() {
             c.gpu_out_of_memory();
         }
+        effectcraft_engine::render::cpu_why::GPU_OUT_OF_MEMORY
     }
 
     /// The frame on the GPU, kept there for the viewer, if the compositor can do it alone.
@@ -3792,13 +3795,21 @@ impl Worker {
     /// Keep a frame's render times: its layers' (`times`) and the whole frame's since `t0`.
     fn keep_times(&self, job: &Job, times: LayerTimes, t0: web_time::Instant) {
         let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        self.times.put(&job.key, times::FrameTimes { frame_ms, layers: times.into_map(), remote: false });
+        let taken = times.take();
+        let ft = times::FrameTimes { frame_ms, layers: taken.ms, remote: false, cpu: taken.cpu, frame_cpu: taken.frame_cpu };
+        // RI1: a slow viewer frame with CPU work in it says so once (`Frames::take_cpu_notices`).
+        if !job.disk_only && !job.idle && (ft.frame_cpu.is_some() || !ft.cpu.is_empty()) {
+            self.times.notice_slow_cpu(&job.src.project, job.comp, &ft);
+        }
+        self.times.put(&job.key, ft);
     }
 
-    /// [`Self::render_timed`] again on the CPU, timed afresh.
-    fn on_cpu_timed(&self, job: &Job, times: &LayerTimes) -> Rendered {
+    /// [`Self::render_timed`] again on the CPU, timed afresh; `why` it went there (RI1).
+    fn on_cpu_timed(&self, job: &Job, times: &LayerTimes, why: effectcraft_engine::render::CpuWhy) -> Rendered {
         times.clear();
-        self.render_timed(job, false, None, times)
+        let out = self.render_timed(job, false, None, times);
+        times.set_frame_cpu(why);
+        out
     }
 
     /// [`Self::render_job`], each layer's time added to `times`.
@@ -3810,6 +3821,21 @@ impl Worker {
         r.expr = job.src.expr.as_deref();
         r.times = Some(times);
         let gpu_allowed = gpu && frozen.is_empty() && !self.gpu_retired.load(Ordering::Acquire);
+        // Why the frame can't use the GPU (RI1); `on_cpu_timed` says more precisely afterwards.
+        if !gpu_allowed || job.src.gpu.is_none() {
+            use effectcraft_engine::render::cpu_why as why;
+            times.set_frame_cpu(if !frozen.is_empty() {
+                why::FROZEN_PREVIEW
+            } else if self.gpu_retired.load(Ordering::Acquire) {
+                why::GPU_RETIRED
+            } else if job.src.gpu.is_none() {
+                why::NO_GPU
+            } else if job.retry.is_some() {
+                why::RETRY
+            } else {
+                why::GPU_UNFINISHED
+            });
+        }
         // A failed GPU attempt may have populated intermediate entries before its scope
         // reported failure. The CPU retry (`gpu: false`) must compute its own pixels from the
         // snapshot. Every other CPU frame keeps the layer cache, also once the GPU is retired
@@ -3830,6 +3856,9 @@ impl Worker {
             // The browser cannot wait for the GPU to time it (and its CPU path is slow): always
             // the GPU there.
             let auto = if cfg!(target_arch = "wasm32") { None } else { r.frame_auto(a, job.comp, true) };
+            // Why it ends up on the CPU below (RI1): Auto kept a comp the GPU declined there,
+            // unless the GPU declines this very frame.
+            let mut cpu_why = effectcraft_engine::render::cpu_why::GPU_DECLINED_COMP;
             // Taken when the job was admitted ([`gpu_pick`]); a job that never went through the
             // queue chooses now.
             if job.on_gpu.unwrap_or_else(|| auto.is_none_or(|(p, key)| gpu_display_choice(p, key))) {
@@ -3866,20 +3895,20 @@ impl Worker {
                 match attempt {
                     Ok(Some(Rendered::Landing)) => {
                         if g.context().check_health().is_err() && self.unland(flight) {
-                            return self.on_cpu_timed(job, times);
+                            return self.on_cpu_timed(job, times, effectcraft_engine::render::cpu_why::GPU_RETIRED);
                         }
                         return Rendered::Landing;
                     }
                     Ok(Some(image)) => {
                         if g.context().check_health().is_err() {
-                            return self.on_cpu_timed(job, times);
+                            return self.on_cpu_timed(job, times, effectcraft_engine::render::cpu_why::GPU_RETIRED);
                         }
                         #[cfg(not(target_arch = "wasm32"))]
                         if resident {
                             // Auto's GPU time is recorded when the GPU has finished the frame.
                             if let Err(e) = self.resident.admit(g, auto.map(|(_, key)| key), t0) {
                                 log::warn!("a GPU viewer frame did not finish ({e}); it renders on the CPU");
-                                return self.on_cpu_timed(job, times);
+                                return self.on_cpu_timed(job, times, effectcraft_engine::render::cpu_why::GPU_UNFINISHED);
                             }
                             return image;
                         }
@@ -3892,7 +3921,7 @@ impl Worker {
                     }
                     Ok(None) => {
                         if g.context().check_health().is_err() {
-                            return self.on_cpu_timed(job, times);
+                            return self.on_cpu_timed(job, times, effectcraft_engine::render::cpu_why::GPU_RETIRED);
                         }
                         // called off (#329): not a frame the GPU declined, and not worth a CPU render
                         if job.called_off() {
@@ -3902,16 +3931,18 @@ impl Worker {
                         if let Some((p, key)) = auto {
                             p.declined(key);
                         }
+                        cpu_why = effectcraft_engine::render::cpu_why::GPU_DECLINED_FRAME;
                     }
                     Err(e) => {
                         if !self.unland(flight) {
                             return Rendered::Landing;
                         }
-                        self.gpu_attempt_failed(g, &e);
-                        return self.on_cpu_timed(job, times);
+                        let why = self.gpu_attempt_failed(g, &e);
+                        return self.on_cpu_timed(job, times, why);
                     }
                 }
             }
+            times.set_frame_cpu(cpu_why);
             let t0 = web_time::Instant::now();
             let img = to_color_image(&r.comp_frame_cpu(job.comp, job.t));
             if let Some((p, key)) = auto {
@@ -3924,8 +3955,8 @@ impl Worker {
             return match g.within_memory(|| r.comp_frame(job.comp, job.t)) {
                 Ok(img) => Rendered::Image(FrameImage::Cpu(Arc::new(to_color_image(&img)))),
                 Err(e) => {
-                    self.gpu_attempt_failed(g, &e);
-                    self.on_cpu_timed(job, times)
+                    let why = self.gpu_attempt_failed(g, &e);
+                    self.on_cpu_timed(job, times, why)
                 }
             };
         }
