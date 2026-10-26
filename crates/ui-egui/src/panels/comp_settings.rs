@@ -475,6 +475,30 @@ pub fn show(
     out
 }
 
+/// Composition Settings' working copy of comp `cid` as it is (EMBED11: a host shows the dialog
+/// for a comp too).
+pub fn draft_of(project: &effectcraft_engine::project::Project, cid: effectcraft_engine::project::ItemId) -> Option<CompDraft> {
+    let c = project.comp(cid)?;
+    Some(CompDraft {
+        name: project.item(cid).map(|i| i.name.clone()).unwrap_or_default(),
+        width: c.width,
+        height: c.height,
+        pixel_aspect: c.pixel_aspect,
+        fps: c.frame_rate.as_f64(),
+        duration: c.duration.seconds(),
+        start: c.display_start.seconds(),
+        bg: c.background,
+        shutter_angle: c.shutter_angle,
+        shutter_phase: c.shutter_phase,
+        samples: c.motion_blur_samples,
+        adaptive_limit: c.motion_blur_adaptive_limit,
+        preserve_frame_rate: c.preserve_frame_rate,
+        preserve_resolution: c.preserve_resolution,
+        advanced_3d: c.renderer == effectcraft_engine::project::Renderer::Advanced3D,
+        ..Default::default()
+    })
+}
+
 /// `comp.new` / `comp.settings` parameters for the draft.
 pub fn params(d: &CompDraft) -> serde_json::Value {
     json!({

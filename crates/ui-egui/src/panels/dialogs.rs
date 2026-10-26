@@ -87,25 +87,7 @@ pub fn open_comp_settings(app: &mut EffectcraftApp) -> Result<(), String> {
 
 /// Composition Settings on `cid`, open in the viewer or not.
 pub fn open_comp_settings_for(app: &mut EffectcraftApp, cid: ItemId) -> Result<(), String> {
-    let c = app.session.project.comp(cid).ok_or("no composition")?;
-    app.dialog_state.comp = CompDraft {
-        name: app.session.project.item(cid).map(|i| i.name.clone()).unwrap_or_default(),
-        width: c.width,
-        height: c.height,
-        pixel_aspect: c.pixel_aspect,
-        fps: c.frame_rate.as_f64(),
-        duration: c.duration.seconds(),
-        start: c.display_start.seconds(),
-        bg: c.background,
-        shutter_angle: c.shutter_angle,
-        shutter_phase: c.shutter_phase,
-        samples: c.motion_blur_samples,
-        adaptive_limit: c.motion_blur_adaptive_limit,
-        preserve_frame_rate: c.preserve_frame_rate,
-        preserve_resolution: c.preserve_resolution,
-        advanced_3d: c.renderer == effectcraft_engine::project::Renderer::Advanced3D,
-        ..Default::default()
-    };
+    app.dialog_state.comp = super::comp_settings::draft_of(&app.session.project, cid).ok_or("no composition")?;
     app.dialog_state.editing_existing = true;
     app.dialog_state.editing_comp = Some(cid);
     app.dialog = Some(Dialog::CompSettings);

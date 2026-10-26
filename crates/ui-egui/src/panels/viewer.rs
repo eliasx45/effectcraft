@@ -1557,55 +1557,17 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         // Picking an already selected layer preserves the group; an unselected hit
         // becomes the target, using the same visible/unlocked hit test as left-click.
         pick(app, &ectx, map.to_comp(pos), false);
-        let point = map.to_comp(pos);
-        let hits: Vec<(u64, String)> = layers_at(&ectx, point).map(|l| (l.id.0, l.name.clone())).collect();
+        let hits = super::viewer_menu::hits(&ectx, map.to_comp(pos));
         ui.data_mut(|d| d.insert_temp(menu_hits_id, hits));
     }
-    let context_layers: Vec<u64> =
-        app.session.state.selected_layers.iter().filter(|id| comp.layer(**id).is_some_and(|l| !l.switches.locked)).map(|id| id.0).collect();
+    // EMBED11: the menu's entries are `viewer_menu`'s, shared with hosts that show the comp.
+    let context_layers = super::viewer_menu::context_layers(&comp, &app.session.state.selected_layers);
     let mut context_actions = Vec::new();
-    let copy_frame = crate::i18n::label(app, "comp.copyFrame", "Copy Frame to Clipboard");
+    let labels = super::viewer_menu::Labels { copy_frame: crate::i18n::label(app, "comp.copyFrame", "Copy Frame to Clipboard").to_string() };
     crate::widgets::context_menu(&resp, |ui| {
         let hits = ui.data(|d| d.get_temp::<Vec<(u64, String)>>(menu_hits_id)).unwrap_or_default();
-        if !hits.is_empty() {
-            ui.menu_button(crate::i18n::tr("Select"), |ui| {
-                crate::widgets::menu_scroll(ui, |ui| {
-                    for (id, name) in &hits {
-                        if ui.button(name).clicked() {
-                            context_actions.push(("layer.select".to_owned(), serde_json::json!({"layers":[id]})));
-                            ui.close();
-                        }
-                    }
-                })
-            });
-            ui.separator();
-        }
-        if context_layers.is_empty() {
-            ui.label(crate::i18n::tr("No unlocked layer selected"));
-        } else {
-            let caps = context_layers.iter().filter_map(|id| comp.layer(effectcraft_engine::project::LayerId(*id))).fold(
-                super::timeline::LayerMenuCaps::default(),
-                |mut caps, layer| {
-                    let c = super::timeline::LayerMenuCaps::of(&app.session.project, layer);
-                    caps.vector |= c.vector;
-                    caps.text |= c.text;
-                    caps
-                },
-            );
-            super::timeline::layer_menu(ui, &context_layers, caps, &mut context_actions);
-        }
-        ui.separator();
-        if ui.button(copy_frame).clicked() {
-            context_actions.push(("comp.copyFrame".to_owned(), serde_json::json!({"comp": cid.0})));
-            ui.close();
-        }
-        // The comp this viewer shows, which is not always the active one.
-        let settings = ui.button(crate::i18n::tr("Composition Settings…"));
-        app.auto.add("viewer.context.settings", settings.rect, "Composition Settings…");
-        if settings.clicked() {
-            context_actions.push(("comp.settings".to_owned(), serde_json::json!({"comp": cid.0})));
-            ui.close();
-        }
+        let target = super::viewer_menu::Target { comp: cid.0, hits };
+        super::viewer_menu::contents(ui, &app.session.project, &comp, &target, &context_layers, &labels, &mut app.auto, &|_| None, &mut context_actions);
     });
     for (id, params) in context_actions {
         if let Err(e) = crate::menus::invoke(app, &ctx, &id, params) {

@@ -4378,10 +4378,26 @@ fn layer_context_menu(
 
 /// Shared layer actions for Timeline rows and Composition context menus.
 pub(crate) fn layer_menu(ui: &mut egui::Ui, layers: &[u64], caps: LayerMenuCaps, actions: &mut Vec<(String, serde_json::Value)>) {
+    layer_menu_gated(ui, layers, caps, actions, &|_| None);
+}
+
+/// [`layer_menu`] for a host that can't run every entry yet (EMBED11): `gate(command)` gives
+/// `Some(why)` for an entry it shows disabled, `why` on hover. EffectCraft's own menus gate nothing.
+pub(crate) fn layer_menu_gated(
+    ui: &mut egui::Ui,
+    layers: &[u64],
+    caps: LayerMenuCaps,
+    actions: &mut Vec<(String, serde_json::Value)>,
+    gate: &dyn Fn(&str) -> Option<String>,
+) {
     if layers.is_empty() {
         return;
     }
     let mut item = |ui: &mut egui::Ui, label: &str, cmd: &str, params: serde_json::Value| {
+        if let Some(why) = gate(cmd) {
+            ui.add_enabled(false, egui::Button::new(label)).on_disabled_hover_text(why);
+            return;
+        }
         if ui.button(label).clicked() {
             actions.push(("layer.select".into(), json!({"layers": layers})));
             actions.push((cmd.into(), params));
