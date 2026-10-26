@@ -320,3 +320,46 @@ fn lint_frame_and_get_comp_summarise_on_request() {
 }
 
 const SUMMARY_PROBLEMS: usize = 10;
+
+/// A/B round 3: the handover gate. A client's own edits after its taste_check / lint say so once;
+/// handover_check runs both over the animated range and says whether the comp is ready.
+#[test]
+fn edits_after_the_last_check_are_flagged_and_handover_check_gates() {
+    let mut s = server();
+    s.backend().set_client(Some("claude".into()));
+    ok(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main", "width": 640, "height": 360}}));
+    let card = ok(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "Card", "width": 100, "height": 100}}))["layer"].clone();
+    for (t, x) in [(0.5, 100.0), (1.5, 320.0)] {
+        ok(&mut s, "add_keyframe", json!({"layer": card, "path": "transform/position", "time": t, "value": [x, 180], "timeBase": "comp"}));
+    }
+    let r = ok(&mut s, "taste_check", json!({}));
+    assert!(r.get("notice").is_none(), "{r}");
+    ok(&mut s, "lint_frame", json!({"start": 0, "end": 2}));
+    // The user's edit is the user's news, not a stale gate.
+    let r = ok(
+        &mut s,
+        "add_keyframe",
+        json!({"client": "", "comp": "Main", "layer": card, "path": "transform/position", "time": 1.0, "value": [200, 180], "timeBase": "comp"}),
+    );
+    assert!(!r.to_string().contains("rerun before handover"), "{r}");
+    // Its own key edit after the checks: told once, with the layer.
+    let r = ok(&mut s, "add_keyframe", json!({"layer": card, "path": "transform/position", "time": 1.5, "value": [330, 180], "timeBase": "comp"}));
+    let notice = r["notice"].as_str().unwrap_or_default();
+    assert!(notice.contains("keys changed since your last taste_check/lint") && notice.contains("Card"), "{r}");
+    let r = ok(&mut s, "get_comp", json!({}));
+    assert!(!r.to_string().contains("rerun before handover"), "said once: {r}");
+    // handover_check reruns both: fresh again, ready exactly when nothing blocks.
+    let h = ok(&mut s, "handover_check", json!({}));
+    assert_eq!(h["stale"], json!([]), "{h}");
+    assert_eq!(h["ready"], h["blocking"].as_array().unwrap().is_empty(), "{h}");
+    let (start, end) = (h["range"]["start"].as_f64().unwrap(), h["range"]["end"].as_f64().unwrap());
+    assert!(start >= 0.4 && end <= 1.6 && end > start, "the keyed range: {h}");
+    assert!(h["counts"]["blocking"].is_u64() && h["text"].is_string(), "{h}");
+    for entry in h["blocking"].as_array().unwrap().iter().chain(h["warnings"].as_array().unwrap()) {
+        assert!(entry["source"] == "taste" || entry["source"] == "lint", "{entry}");
+        assert!(entry["message"].is_string(), "{entry}");
+    }
+    // A script's key edit (A/B T5) counts as the client's own too.
+    let r = ok(&mut s, "run_script", json!({"code": "app.run('prop.addKey', {layer: 'Card', path: 'transform/position', time: 1.2, value: [250, 180]}); 1"}));
+    assert!(r["notice"].as_str().unwrap_or_default().contains("rerun before handover"), "{r}");
+}

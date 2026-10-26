@@ -618,6 +618,8 @@ pub struct Session {
     pub script_calls: ScriptCalls,
     /// The current state as last seen (who made it survives writes outside the history).
     pub seen_state: history::SeenState,
+    /// Each client's last taste check and lint (`handover.check`, stale notices).
+    pub handover_gates: commands::handover::Gates,
     /// The Motion Library (cards in a remote bucket, cached locally): made on first use from
     /// `motion-library.json` or the environment, or set by the host (the web app's fetch).
     pub motion_library: motion_library::Handle,
@@ -765,6 +767,7 @@ impl Default for Session {
             footage_scan: None,
             script_calls: ScriptCalls::default(),
             seen_state: Default::default(),
+            handover_gates: Default::default(),
         }
     }
 }
@@ -828,6 +831,7 @@ impl Session {
         let caught = guard::caught();
         let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params));
         let mut r = replay::after_command(self, id, &params, &nesting, caught, r)?;
+        commands::handover::noted(self, id, &params, &r);
         if spec.journal
             && resolved.as_object().is_some_and(|o| !o.is_empty())
             && let Some(reply) = r.as_object_mut()

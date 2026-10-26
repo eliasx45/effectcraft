@@ -168,6 +168,7 @@ fn arg_alias(key: &str, props: &Map<String, Value>) -> Option<String> {
 const READ_ONLY: &[&str] = &[
     "edit_feed",
     "taste_check",
+    "handover_check",
     "ease_graph",
     "command_list",
     "list_commands",
@@ -1443,6 +1444,11 @@ fn lint_summary(mut r: Value) -> Value {
     r
 }
 
+fn handover_check(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let p = obj(&[("comp", get(a, "comp")), ("start", get(a, "start")), ("end", get(a, "end")), ("step", get(a, "step"))]);
+    json_reply(b.exec("handover.check", p)?)
+}
+
 fn taste_check(b: &mut Backend, a: &Value) -> Result<Reply> {
     let p = obj(&[
         ("comp", get(a, "comp")),
@@ -1946,6 +1952,23 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: taste_check,
+    },
+    ToolDef {
+        name: "handover_check",
+        description: "The last check before handing a comp over (handover.check): taste_check + lint_frame over the comp's animated range (first to last keyframed move) in one call. Returns {ready, counts {blocking, warnings}, blocking: [...], warnings: [...] (each {source: taste|lint, layer, layerName, time, until, message, fix?}), range, taste, lint, stale, text}. `ready` is false while a blocking taste ❌ or a lint error remains; fix those, rerun, and hand over listing every remaining warning with its reason. Run it after your final edit: replies carry a one-time `notice` when your own edits changed layers your last taste_check / lint covered.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "start": {"type": "number", "description": "Range start, comp seconds (default the animated range's start)."},
+                    "end": {"type": "number", "description": "Range end, comp seconds (default the animated range's end)."},
+                    "step": {"type": "number", "description": "Seconds between lint samples (default 0.5)."}
+                }),
+                &[],
+            )
+        },
+        run: handover_check,
     },
     ToolDef {
         name: "ease_graph",

@@ -150,6 +150,7 @@ CLI, scripts (`app.run`) and the control channel get the same.
 | --- | --- | --- |
 | `get_layout` | `layer.bounds` | Per layer: `visible` + `why`, comp-space `bounds`, `corners`, `center`, `anchorInComp`, `onScreen`, `source`; optional `pixelBounds` and `overlaps` |
 | `lint_frame` | `render.lint` | Design problems at a time or over a range (`clean`, `counts`, `problems` with rule, severity, layer, time..until and a fix hint); over 40 problems (or `summary: true`) a summary: `byRule`, `byLayer` (top 10) and the 10 worst problems, `summary: false` for all; rules in [agents.md](agents.md#design-lint) |
+| `handover_check` | `handover.check` | Taste check + lint over the comp's animated range in one call: `ready`, `blocking`, `warnings` (with fixes); run it last. Replies carry a one-time `notice` when the client's own edits changed layers its last taste_check / lint covered |
 | `get_motion` | `comp.motion` / `layer.motion` | Per layer over a time range: `segments` (enter, exit, move, hold, scale, rotate, fade-in, fade-out), `offscreen` intervals, a `summary` sentence; `overlaps` between drawn layers ([agents.md](agents.md#motion-summary)) |
 | `analyze_audio` | `audio.analyze` | Peak, true peak, RMS, integrated LUFS, clipped samples, silences, channels; optional waveform |
 
