@@ -851,6 +851,56 @@ pub struct UiState {
     pub scopes: crate::panels::scopes_panel::ScopesState,
 }
 
+impl UiState {
+    /// Run tool command `id` (`tool.<name>`, as the Tools panel's shortcuts name them): pick the
+    /// tool; a slot's shortcut cycles through its tools (Q: shapes, G: pens, Cmd+T: type…) and
+    /// `tool.camera` through the camera tools. Shared by EffectCraft's menus and hosted panels
+    /// (EMBED8). Returns the tool picked.
+    pub fn choose_tool(&mut self, id: &str) -> Result<Tool, String> {
+        let t = id.strip_prefix("tool.").unwrap_or(id);
+        if t == "camera" {
+            let tools = [Tool::Orbit, Tool::PanCamera, Tool::Dolly];
+            let next = match tools.iter().position(|x| *x == self.tool) {
+                Some(i) => tools[(i + 1) % tools.len()],
+                None => Tool::Orbit,
+            };
+            self.tool = next;
+            return Ok(next);
+        }
+        // Slot shortcuts cycle through the slot's tools.
+        let slot = match t {
+            "shape" => Some(8),
+            "pen" => Some(9),
+            "type" => Some(10),
+            "brush" => Some(11),
+            "rotoBrush" => Some(14),
+            "puppet" => Some(15),
+            _ => None,
+        };
+        if let Some(si) = slot {
+            let tools: Vec<Tool> = match si {
+                11 => vec![Tool::Brush, Tool::Clone, Tool::Eraser],
+                _ => Tool::SLOTS.get(si).map(|s| s.to_vec()).unwrap_or_default(),
+            };
+            let Some(first) = tools.first().copied() else { return Err(format!("unknown tool `{t}`")) };
+            let next = match tools.iter().position(|x| *x == self.tool) {
+                Some(i) => tools.get((i + 1) % tools.len()).copied().unwrap_or(first),
+                None => self.slot_tools.get(si).copied().filter(|x| tools.contains(x)).unwrap_or(first),
+            };
+            self.tool = next;
+            if si != 11
+                && let Some(s) = self.slot_tools.get_mut(si)
+            {
+                *s = next;
+            }
+            return Ok(next);
+        }
+        let tool = Tool::from_name(t).ok_or_else(|| format!("unknown tool `{t}`"))?;
+        self.tool = tool;
+        Ok(tool)
+    }
+}
+
 impl Default for UiState {
     fn default() -> Self {
         UiState {

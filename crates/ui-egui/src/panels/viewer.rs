@@ -14,6 +14,7 @@ use effectcraft_engine::time::Tick;
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
+use super::timeline::TimelineHost;
 use crate::state::Tool;
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
@@ -38,16 +39,16 @@ impl ViewerMap {
 }
 
 /// Move selected points by a viewer-space displacement, converting separately for each path.
-pub(crate) fn move_path_vertices(app: &mut EffectcraftApp, ctx: &egui::Context, delta: [f64; 2], merge: Option<&str>) -> Result<serde_json::Value, String> {
-    let cid = app.session.active_comp_id().ok_or("no composition")?;
-    let comp = app.session.active_comp().ok_or("no composition")?;
+pub(crate) fn move_path_vertices(app: &mut dyn TimelineHost, ctx: &egui::Context, delta: [f64; 2], merge: Option<&str>) -> Result<serde_json::Value, String> {
+    let cid = app.session().active_comp_id().ok_or("no composition")?;
+    let comp = app.session().active_comp().ok_or("no composition")?;
     let ectx = EvalCtx {
-        footage: Some(app.session.footage.as_ref()),
-        expr: app.session.expr.as_deref(),
-        ..EvalCtx::new(&app.session.project, cid, comp, app.session.time())
+        footage: Some(app.session().footage.as_ref()),
+        expr: app.session().expr.as_deref(),
+        ..EvalCtx::new(&app.session().project, cid, comp, app.session().time())
     };
     let mut paths: std::collections::BTreeMap<_, Vec<usize>> = std::collections::BTreeMap::new();
-    for vertex in &app.session.state.selected_vertices {
+    for vertex in &app.session().state.selected_vertices {
         paths.entry((vertex.layer, vertex.mask)).or_default().push(vertex.index);
     }
     let mut deltas = Vec::new();
@@ -56,7 +57,7 @@ pub(crate) fn move_path_vertices(app: &mut EffectcraftApp, ctx: &egui::Context, 
         indices.dedup();
         let layer = comp.layer(lid).ok_or("selected layer is gone")?;
         let group = layer.props.find_group(uid).ok_or("selected path is gone")?;
-        let mut matrix = match app.session.view_camera(cid) {
+        let mut matrix = match app.session().view_camera(cid) {
             Some(camera) if layer.is_3d() => three_d::layer_to_view(&ectx, layer, &camera),
             _ => ectx.layer_to_comp(layer).0,
         };
@@ -83,7 +84,7 @@ pub(crate) fn move_path_vertices(app: &mut EffectcraftApp, ctx: &egui::Context, 
             deltas.push(json!({"layer": lid.0, "mask": uid, "index": index, "delta": d}));
         }
     }
-    crate::menus::invoke(app, ctx, "mask.moveVertices", json!({"delta": [0, 0], "deltas": deltas, "merge": merge}))
+    app.invoke(ctx, "mask.moveVertices", json!({"delta": [0, 0], "deltas": deltas, "merge": merge}))
 }
 
 /// Screen points per frame, bounded even after a stalled frame or pointer outside the viewport.
@@ -122,7 +123,7 @@ pub fn last_fit(ctx: &egui::Context) -> f32 {
 
 /// What a drag in the viewer is doing.
 #[derive(Clone, Debug)]
-enum Gesture {
+pub(crate) enum Gesture {
     /// Per layer: start position and the parent-space change per comp pixel of drag in x and y.
     Move {
         layers: Vec<(LayerId, [f64; 3], [f64; 3], [f64; 3])>,
@@ -274,22 +275,22 @@ enum Gesture {
 }
 
 /// Pen tool path in progress: (layer, mask uid).
-fn pen_id() -> egui::Id {
+pub(crate) fn pen_id() -> egui::Id {
     egui::Id::new("viewer-pen")
 }
 
 use super::viewer_overlays::{self as ov, VertexHit};
 use super::viewer_tools as vt;
 
-const HANDLE: f32 = 7.0;
+pub(crate) const HANDLE: f32 = 7.0;
 /// How close (screen points) the pointer must be to a path vertex or tangent handle to grab it.
-const VERTEX_GRAB: f32 = 6.0;
+pub(crate) const VERTEX_GRAB: f32 = 6.0;
 
 /// The reach of a path vertex at `pos` (#1042): a vertex marker sitting under, or just beside, a
 /// bounding-box handle would lose the press to the handle (the handle reaches further than the
 /// vertex), so wherever a box handle is in range the vertex reaches as far as the handle does.
 /// Vertices then win in the handle's whole zone, as in After Effects.
-fn vertex_grab_radius(pos: Pos2, handles: impl IntoIterator<Item = Pos2>) -> f32 {
+pub(crate) fn vertex_grab_radius(pos: Pos2, handles: impl IntoIterator<Item = Pos2>) -> f32 {
     if handles.into_iter().any(|h| h.distance(pos) < HANDLE + 2.0) { HANDLE + 2.0 } else { VERTEX_GRAB }
 }
 /// Shown when a Roto Brush tool is used in the Composition panel (#753).
@@ -353,8 +354,8 @@ pub(crate) fn fx2c(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
 
 /// The selected, unlocked layers of `comp` other than `layer` (when `layer` is one of them): a
 /// handle or Rotation tool drag on one changes them all.
-fn selected_others<'a>(app: &EffectcraftApp, comp: &'a Comp, layer: LayerId) -> Vec<&'a Layer> {
-    let sel = &app.session.state.selected_layers;
+pub(crate) fn selected_others<'a>(app: &dyn TimelineHost, comp: &'a Comp, layer: LayerId) -> Vec<&'a Layer> {
+    let sel = &app.session().state.selected_layers;
     if !sel.contains(&layer) {
         return vec![];
     }
@@ -683,7 +684,7 @@ fn snap_handle(f: [f64; 2], h: [f64; 2], a: [f64; 2], l2c: &Mat3, axes: [bool; 2
 /// The turn from angle `from` to angle `to` (degrees), wrapped to (−180°, 180°]: the shortest way
 /// round, so summing it frame by frame follows the pointer across atan2's ±180° seam and past full
 /// revolutions. Non-finite input turns by nothing.
-fn turn_delta(from: f64, to: f64) -> f64 {
+pub(crate) fn turn_delta(from: f64, to: f64) -> f64 {
     let d = to - from;
     if !d.is_finite() {
         return 0.0;
@@ -694,14 +695,14 @@ fn turn_delta(from: f64, to: f64) -> f64 {
 
 /// The Rotation tool's value: the rotation as the drag began plus the turn so far (which may span
 /// revolutions), snapped to 45° steps with Shift.
-fn rotate_value(start_rot: f64, turned: f64, shift: bool) -> f64 {
+pub(crate) fn rotate_value(start_rot: f64, turned: f64, shift: bool) -> f64 {
     let r = start_rot + turned;
     let r = if r.is_finite() { r } else { start_rot };
     if shift { (r / 45.0).round() * 45.0 } else { r }
 }
 
 /// A drag `d` (comp pixels), kept to the axis it moves along most when `shift` is held.
-fn one_axis(d: [f64; 2], shift: bool) -> [f64; 2] {
+pub(crate) fn one_axis(d: [f64; 2], shift: bool) -> [f64; 2] {
     if !shift {
         d
     } else if d[0].abs() > d[1].abs() {
@@ -1801,51 +1802,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 })
             }
             Tool::MaskFeather => ov::begin_feather(app, &ectx, &paths, &map, press).map(Gesture::Overlay),
-            Tool::Rotate => pick(app, &ectx, cpt, mods.shift).map(|l| {
-                let others = selected_others(app, &comp, l).into_iter().filter_map(|o| Some((o.id, ectx.f(o, o.transform()?, "rotation", 0.0)))).collect();
-                let layer = comp.layer(l).cloned();
-                let grow = layer.as_ref().and_then(|l| GrowInPlace::begin(&ectx, l));
-                let center = match (&grow, &layer) {
-                    // It turns about the anchor where the followed effects put it.
-                    (Some(g), Some(l)) => {
-                        let c = l2c(&ectx, l).0.apply(gv2(g.pivot[0], g.pivot[1]));
-                        map.to_screen([c.x, c.y])
-                    }
-                    _ => layer
-                        .as_ref()
-                        .and_then(|l| l.transform().map(|tr| ectx.v3(l, tr, "position", [0.0; 3])))
-                        .map(|p| map.to_screen([p[0], p[1]]))
-                        .unwrap_or(pos),
-                };
-                let rot = layer.as_ref().and_then(|l| l.transform().map(|tr| ectx.f(l, tr, "rotation", 0.0))).unwrap_or(0.0);
-                Gesture::Rotate {
-                    grow,
-                    layer: l,
-                    center,
-                    last_angle: ((pos.y - center.y) as f64).atan2((pos.x - center.x) as f64).to_degrees(),
-                    turned: 0.0,
-                    start_rot: rot,
-                    others,
-                }
-            }),
-            Tool::PanBehind => pick(app, &ectx, cpt, false).and_then(|l| {
-                let layer = comp.layer(l)?;
-                let tr = layer.transform()?;
-                let (l2c, _) = l2c(&ectx, layer);
-                let l2p = ectx.local_matrix(layer);
-                let l2p = Mat3([[l2p.0[0][0], l2p.0[0][1], 0.0], [l2p.0[1][0], l2p.0[1][1], 0.0], [0.0, 0.0, 1.0]]);
-                Some(Gesture::Anchor {
-                    layer: l,
-                    start_anchor: ectx.v3(layer, tr, "anchor", [0.0; 3]),
-                    start_pos: ectx.v3(layer, tr, "position", [0.0; 3]),
-                    // From where the button went down (the drag starts a few points later).
-                    start: map.to_comp(press),
-                    inv: l2c.inverse().unwrap_or(Mat3::IDENTITY),
-                    l2p,
-                    own: effectcraft_engine::viewer::layer_targets(&ectx, layer, false, app.session.state.snap_features),
-                    anchor_only: mods.alt,
-                })
-            }),
+            Tool::Rotate => begin_rotate(app, &ectx, &comp, &map, cpt, pos, mods.shift),
+            Tool::PanBehind => begin_anchor(app, &ectx, &map, cpt, press, mods.alt),
             // From where the button went down: by the time the pointer has moved far enough to
             // count as a drag it has already left the press point, and the shape is drawn there.
             t if t.is_shape() => Some(Gesture::Create { tool: t, start: map.to_comp(press) }),
@@ -2046,45 +2004,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let _ = app.session.execute("prop.set", json!({"layer": layer.0, "path": "transform/position", "value": g.scaled(f), "merge": merge}));
                 }
             }
-            Gesture::Rotate { layer, center, last_angle, turned, start_rot, others, grow } => {
-                // Count the turn incrementally: the absolute angle wraps at ±180°, so writing it
-                // straight would jump a revolution back each time the pointer went round.
-                let ang = ((pos.y - center.y) as f64).atan2((pos.x - center.x) as f64).to_degrees();
-                let turned = turned + turn_delta(last_angle, ang);
-                ui.data_mut(|dd| {
-                    dd.insert_temp(gid, Gesture::Rotate { layer, center, last_angle: ang, turned, start_rot, others: others.clone(), grow: grow.clone() })
-                });
-                // Shift snaps the accumulated value (so 405° snaps to 1x +45°, not to 45°).
-                let r = rotate_value(start_rot, turned, mods.shift);
-                let _ = app.session.execute("prop.set", json!({"layer": layer.0, "path": "transform/rotation", "value": r, "merge": merge}));
-                if let Some(g) = &grow {
-                    let _ = app
-                        .session
-                        .execute("prop.set", json!({"layer": layer.0, "path": "transform/position", "value": g.turned(r - start_rot), "merge": merge}));
-                }
-                for (lid, r0) in others {
-                    let _ =
-                        app.session.execute("prop.set", json!({"layer": lid.0, "path": "transform/rotation", "value": r0 + (r - start_rot), "merge": merge}));
-                }
-            }
-            Gesture::Anchor { layer, start_anchor, start_pos, start, inv, l2p, own, anchor_only } => {
-                // Pan Behind snaps the anchor point (to its own layer's box, other layers' features,
-                // guides and the grid); Shift keeps the move to one axis.
-                let d = one_axis([cpt[0] - start[0], cpt[1] - start[1]], mods.shift);
-                let anchor_c = inv.inverse().map(|m| m.apply(gv2(start_anchor[0], start_anchor[1]))).unwrap_or(gv2(start[0], start[1]));
-                let want = [anchor_c.x + d[0], anchor_c.y + d[1]];
-                let sc = vt::snap_with(app, &ctx, &ectx, &map, &[layer], &[want], mods, &own);
-                let a = inv.apply(gv2(start[0], start[1]));
-                let b = inv.apply(gv2(start[0] + d[0] + sc[0], start[1] + d[1] + sc[1]));
-                let dl = gv2(b.x - a.x, b.y - a.y);
-                let na = [start_anchor[0] + dl.x, start_anchor[1] + dl.y, start_anchor[2]];
-                let _ = app.session.execute("prop.set", json!({"layer": layer.0, "path": "transform/anchor", "value": na, "merge": merge}));
-                // Position follows so the layer stays put, unless Alt moves the anchor point alone.
-                if !anchor_only {
-                    let dp = l2p.apply_vec(dl);
-                    let np = [start_pos[0] + dp.x, start_pos[1] + dp.y, start_pos[2]];
-                    let _ = app.session.execute("prop.set", json!({"layer": layer.0, "path": "transform/position", "value": np, "merge": merge}));
-                }
+            g @ (Gesture::Rotate { .. }
+            | Gesture::Anchor { .. }
+            | Gesture::Create { .. }
+            | Gesture::Vertices { .. }
+            | Gesture::Tangent { .. }
+            | Gesture::Pen { .. }) => {
+                update_tool_gesture(app, ui, &ectx, &map, &painter, g, pos, mods, &merge, true);
             }
             Gesture::Camera { tool } => {
                 let d = resp.drag_delta();
@@ -2099,24 +2025,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         app.ui.status = e.to_string();
                     }
                 }
-            }
-            Gesture::Create { tool, start } => {
-                if let Some(d) = shape_drag(app, tool, start, cpt, mods) {
-                    draw_shape_ghost(&painter, &map, app, &d, &t);
-                }
-            }
-            Gesture::Vertices { start, src, applied, layer } => {
-                // The grabbed vertex snaps (to other layers' vertices and features, guides, grid).
-                let want = [cpt[0] - start[0], cpt[1] - start[1]];
-                let c = vt::snap(app, &ctx, &ectx, &map, &[layer], &[[src[0] + want[0], src[1] + want[1]]], mods);
-                let total = [want[0] + c[0], want[1] + c[1]];
-                let d = [total[0] - applied[0], total[1] - applied[1]];
-                if (d != [0.0; 2])
-                    && let Err(e) = move_path_vertices(app, &ctx, d, Some(&merge))
-                {
-                    app.ui.status = e;
-                }
-                ui.data_mut(|dd| dd.insert_temp(gid, Gesture::Vertices { start, src, applied: total, layer }));
             }
             Gesture::Overlay(d) => match d {
                 ov::Drag::Guide { index, vertical } => {
@@ -2135,16 +2043,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                 }
             },
-            Gesture::Tangent { layer, mask, index, out, vertex, inv } => {
-                let lp = inv.apply(gv2(cpt[0], cpt[1]));
-                let t = [lp.x - vertex[0], lp.y - vertex[1]];
-                let mut params = json!({"layer": layer.0, "mask": mask, "index": index, "merge": merge});
-                params[if out { "out" } else { "in" }] = json!(t);
-                if !mods.alt {
-                    params[if out { "in" } else { "out" }] = json!([-t[0], -t[1]]);
-                }
-                let _ = app.session.execute("mask.setVertex", params);
-            }
             Gesture::PuppetRecord { layer, pin, others, inv, began, cti, mut samples } => {
                 let lp = inv.apply(gv2(cpt[0], cpt[1]));
                 let now = ui.input(|i| i.time) - began;
@@ -2184,15 +2082,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let lp = inv.apply(gv2(cpt[0], cpt[1]));
                 if let Err(e) = app.session.execute("puppet.movePin", json!({"layer": layer.0, "pin": pin, "position": [lp.x, lp.y], "merge": merge})) {
                     app.ui.status = e.to_string();
-                }
-            }
-            Gesture::Pen { layer, mask, index, vertex, inv, press } => {
-                if pos.distance(press) > 3.0 {
-                    let lp = inv.apply(gv2(cpt[0], cpt[1]));
-                    let t = [lp.x - vertex[0], lp.y - vertex[1]];
-                    let _ = app
-                        .session
-                        .execute("mask.setVertex", json!({"layer": layer.0, "mask": mask, "index": index, "out": t, "in": [-t[0], -t[1]], "merge": merge}));
                 }
             }
             Gesture::Track { layer, tracker, drag } => {
@@ -2522,6 +2411,160 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
+/// EMBED8: one frame of a Rotation, Pan Behind, shape / mask, path vertex, tangent or Pen drag
+/// with the pointer at `pos` (the viewer's and [`super::viewer_hosted`]'s): the values it writes
+/// (merged into one undo step by `merge`) and the shape ghost (`caption`: named where it lands).
+/// Other gestures do nothing here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_tool_gesture(
+    app: &mut dyn TimelineHost,
+    ui: &mut egui::Ui,
+    ectx: &EvalCtx,
+    map: &ViewerMap,
+    painter: &egui::Painter,
+    g: Gesture,
+    pos: Pos2,
+    mods: egui::Modifiers,
+    merge: &str,
+    caption: bool,
+) {
+    let ctx = ui.ctx().clone();
+    let gid = egui::Id::new("viewer-gesture");
+    let cpt = map.to_comp(pos);
+    let t = app.tokens();
+    match g {
+        Gesture::Rotate { layer, center, last_angle, turned, start_rot, others, grow } => {
+            // Count the turn incrementally: the absolute angle wraps at ±180°, so writing it
+            // straight would jump a revolution back each time the pointer went round.
+            let ang = ((pos.y - center.y) as f64).atan2((pos.x - center.x) as f64).to_degrees();
+            let turned = turned + turn_delta(last_angle, ang);
+            ui.data_mut(|dd| {
+                dd.insert_temp(gid, Gesture::Rotate { layer, center, last_angle: ang, turned, start_rot, others: others.clone(), grow: grow.clone() })
+            });
+            // Shift snaps the accumulated value (so 405° snaps to 1x +45°, not to 45°).
+            let r = rotate_value(start_rot, turned, mods.shift);
+            let _ = app.session_mut().execute("prop.set", json!({"layer": layer.0, "path": "transform/rotation", "value": r, "merge": merge}));
+            if let Some(g) = &grow {
+                let _ = app
+                    .session_mut()
+                    .execute("prop.set", json!({"layer": layer.0, "path": "transform/position", "value": g.turned(r - start_rot), "merge": merge}));
+            }
+            for (lid, r0) in others {
+                let _ =
+                    app.session_mut().execute("prop.set", json!({"layer": lid.0, "path": "transform/rotation", "value": r0 + (r - start_rot), "merge": merge}));
+            }
+        }
+        Gesture::Anchor { layer, start_anchor, start_pos, start, inv, l2p, own, anchor_only } => {
+            // Pan Behind snaps the anchor point (to its own layer's box, other layers' features,
+            // guides and the grid); Shift keeps the move to one axis.
+            let d = one_axis([cpt[0] - start[0], cpt[1] - start[1]], mods.shift);
+            let anchor_c = inv.inverse().map(|m| m.apply(gv2(start_anchor[0], start_anchor[1]))).unwrap_or(gv2(start[0], start[1]));
+            let want = [anchor_c.x + d[0], anchor_c.y + d[1]];
+            let sc = vt::snap_with(app, &ctx, ectx, map, &[layer], &[want], mods, &own);
+            let a = inv.apply(gv2(start[0], start[1]));
+            let b = inv.apply(gv2(start[0] + d[0] + sc[0], start[1] + d[1] + sc[1]));
+            let dl = gv2(b.x - a.x, b.y - a.y);
+            let na = [start_anchor[0] + dl.x, start_anchor[1] + dl.y, start_anchor[2]];
+            let _ = app.session_mut().execute("prop.set", json!({"layer": layer.0, "path": "transform/anchor", "value": na, "merge": merge}));
+            // Position follows so the layer stays put, unless Alt moves the anchor point alone.
+            if !anchor_only {
+                let dp = l2p.apply_vec(dl);
+                let np = [start_pos[0] + dp.x, start_pos[1] + dp.y, start_pos[2]];
+                let _ = app.session_mut().execute("prop.set", json!({"layer": layer.0, "path": "transform/position", "value": np, "merge": merge}));
+            }
+        }
+        Gesture::Create { tool, start } => {
+            if let Some(d) = shape_drag(app, tool, start, cpt, mods) {
+                draw_shape_ghost(painter, map, app, &d, &t, caption);
+            }
+        }
+        Gesture::Vertices { start, src, applied, layer } => {
+            // The grabbed vertex snaps (to other layers' vertices and features, guides, grid).
+            let want = [cpt[0] - start[0], cpt[1] - start[1]];
+            let c = vt::snap(app, &ctx, ectx, map, &[layer], &[[src[0] + want[0], src[1] + want[1]]], mods);
+            let total = [want[0] + c[0], want[1] + c[1]];
+            let d = [total[0] - applied[0], total[1] - applied[1]];
+            if (d != [0.0; 2])
+                && let Err(e) = move_path_vertices(app, &ctx, d, Some(merge))
+            {
+                app.ui_mut().status = e;
+            }
+            ui.data_mut(|dd| dd.insert_temp(gid, Gesture::Vertices { start, src, applied: total, layer }));
+        }
+        Gesture::Tangent { layer, mask, index, out, vertex, inv } => {
+            let lp = inv.apply(gv2(cpt[0], cpt[1]));
+            let t = [lp.x - vertex[0], lp.y - vertex[1]];
+            let mut params = json!({"layer": layer.0, "mask": mask, "index": index, "merge": merge});
+            params[if out { "out" } else { "in" }] = json!(t);
+            if !mods.alt {
+                params[if out { "in" } else { "out" }] = json!([-t[0], -t[1]]);
+            }
+            let _ = app.session_mut().execute("mask.setVertex", params);
+        }
+        Gesture::Pen { layer, mask, index, vertex, inv, press } if pos.distance(press) > 3.0 => {
+            let lp = inv.apply(gv2(cpt[0], cpt[1]));
+            let t = [lp.x - vertex[0], lp.y - vertex[1]];
+            let _ = app
+                .session_mut()
+                .execute("mask.setVertex", json!({"layer": layer.0, "mask": mask, "index": index, "out": t, "in": [-t[0], -t[1]], "merge": merge}));
+        }
+        _ => {}
+    }
+}
+
+/// EMBED8: a Rotation tool press at comp point `cpt` (screen `pos`): picks the layer as the
+/// viewer does and begins turning it (and the other selected layers) about its anchor point.
+/// Shared by the viewer and hosts that show the comp elsewhere ([`super::viewer_hosted`]).
+pub(crate) fn begin_rotate(app: &mut dyn TimelineHost, ectx: &EvalCtx, comp: &Comp, map: &ViewerMap, cpt: [f64; 2], pos: Pos2, shift: bool) -> Option<Gesture> {
+    pick(app, ectx, cpt, shift).map(|l| {
+        let others = selected_others(app, comp, l).into_iter().filter_map(|o| Some((o.id, ectx.f(o, o.transform()?, "rotation", 0.0)))).collect();
+        let layer = comp.layer(l).cloned();
+        let grow = layer.as_ref().and_then(|l| GrowInPlace::begin(ectx, l));
+        let center = match (&grow, &layer) {
+            // It turns about the anchor where the followed effects put it.
+            (Some(g), Some(l)) => {
+                let c = l2c(ectx, l).0.apply(gv2(g.pivot[0], g.pivot[1]));
+                map.to_screen([c.x, c.y])
+            }
+            _ => layer.as_ref().and_then(|l| l.transform().map(|tr| ectx.v3(l, tr, "position", [0.0; 3]))).map(|p| map.to_screen([p[0], p[1]])).unwrap_or(pos),
+        };
+        let rot = layer.as_ref().and_then(|l| l.transform().map(|tr| ectx.f(l, tr, "rotation", 0.0))).unwrap_or(0.0);
+        Gesture::Rotate {
+            grow,
+            layer: l,
+            center,
+            last_angle: ((pos.y - center.y) as f64).atan2((pos.x - center.x) as f64).to_degrees(),
+            turned: 0.0,
+            start_rot: rot,
+            others,
+        }
+    })
+}
+
+/// EMBED8: a Pan Behind (Anchor Point) tool press at comp point `cpt` (`press`: where the button
+/// went down): picks the layer and begins moving its anchor point (Alt: the anchor alone).
+pub(crate) fn begin_anchor(app: &mut dyn TimelineHost, ectx: &EvalCtx, map: &ViewerMap, cpt: [f64; 2], press: Pos2, alt: bool) -> Option<Gesture> {
+    let comp = ectx.comp;
+    pick(app, ectx, cpt, false).and_then(|l| {
+        let layer = comp.layer(l)?;
+        let tr = layer.transform()?;
+        let (l2c, _) = l2c(ectx, layer);
+        let l2p = ectx.local_matrix(layer);
+        let l2p = Mat3([[l2p.0[0][0], l2p.0[0][1], 0.0], [l2p.0[1][0], l2p.0[1][1], 0.0], [0.0, 0.0, 1.0]]);
+        Some(Gesture::Anchor {
+            layer: l,
+            start_anchor: ectx.v3(layer, tr, "anchor", [0.0; 3]),
+            start_pos: ectx.v3(layer, tr, "position", [0.0; 3]),
+            // From where the button went down (the drag starts a few points later).
+            start: map.to_comp(press),
+            inv: l2c.inverse().unwrap_or(Mat3::IDENTITY),
+            l2p,
+            own: effectcraft_engine::viewer::layer_targets(ectx, layer, false, app.session().state.snap_features),
+            anchor_only: alt,
+        })
+    })
+}
+
 /// The path a Selection click was on (MF3), for a double-click whose first click changed the
 /// layer selection.
 #[derive(Clone, Copy)]
@@ -2675,9 +2718,9 @@ fn draw_rigs(
 /// Mask), a shape path (Shape n group with the Tools bar's Fill and Stroke) on the selected shape
 /// layer, or a new shape layer when nothing is selected. The placed point snaps.
 /// Add a Position keyframe at a motion path's frame, keeping the path where it is.
-fn add_motion_key(app: &mut EffectcraftApp, f: ov::PathFrame) {
-    if let Err(e) = app.session.execute("prop.addKey", json!({"layer": f.layer.0, "prop": f.prop, "time": f.time.seconds()})) {
-        app.ui.status = e.to_string();
+fn add_motion_key(app: &mut dyn TimelineHost, f: ov::PathFrame) {
+    if let Err(e) = app.session_mut().execute("prop.addKey", json!({"layer": f.layer.0, "prop": f.prop, "time": f.time.seconds()})) {
+        app.ui_mut().status = e.to_string();
     }
 }
 
@@ -2734,8 +2777,8 @@ fn pen_cursor(ctx: &egui::Context, at: Pos2, icon: crate::icons::Icon) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pen_press(
-    app: &mut EffectcraftApp,
+pub(crate) fn pen_press(
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     ectx: &EvalCtx,
     map: &ViewerMap,
@@ -2760,7 +2803,7 @@ fn pen_press(
             map.to_screen([q.x, q.y])
         });
         if n >= 2 && first.is_some_and(|f| f.distance(pos) < 8.0) {
-            let _ = app.session.execute("mask.setClosed", json!({"layer": lid.0, "mask": uid, "closed": true}));
+            let _ = app.session_mut().execute("mask.setClosed", json!({"layer": lid.0, "mask": uid, "closed": true}));
             ui.data_mut(|d| {
                 d.remove::<(LayerId, u64)>(pen_id());
                 d.remove::<Gesture>(gid);
@@ -2775,7 +2818,7 @@ fn pen_press(
         };
         let lp = inv.apply(gv2(c[0], c[1]));
         let lp = [lp.x, lp.y];
-        if let Ok(v) = app.session.execute("mask.addVertex", json!({"layer": lid.0, "mask": uid, "point": lp})) {
+        if let Ok(v) = app.session_mut().execute("mask.addVertex", json!({"layer": lid.0, "mask": uid, "point": lp})) {
             let index = v.as_u64().unwrap_or(0) as usize;
             ui.data_mut(|d| d.insert_temp(gid, Gesture::Pen { layer: lid, mask: uid, index, vertex: lp, inv, press: pos }));
         }
@@ -2792,11 +2835,11 @@ fn pen_press(
         return;
     }
     if let Some((l, m, seg, t)) = ov::segment_at(paths, map, pos, 5.0) {
-        let _ = app.session.execute("mask.insertVertex", json!({"layer": l.0, "mask": m, "segment": seg, "t": t}));
+        let _ = app.session_mut().execute("mask.insertVertex", json!({"layer": l.0, "mask": m, "segment": seg, "t": t}));
         return;
     }
     let target = app
-        .session
+        .session()
         .state
         .selected_layers
         .iter()
@@ -2804,23 +2847,23 @@ fn pen_press(
         .find(|id| ectx.comp.layer(*id).is_some_and(|l| !l.switches.locked && (l.masks().is_some() || matches!(l.source, LayerSource::Shape))));
     let layer = target.and_then(|id| ectx.comp.layer(id));
     let (lid, uid, inv) = match layer {
-        Some(l) if !matches!(l.source, LayerSource::Shape) || app.session.state.shape_tool.creates_mask => {
+        Some(l) if !matches!(l.source, LayerSource::Shape) || app.session().state.shape_tool.creates_mask => {
             let Some(inv) = box_l2c(ectx, l).inverse() else { return };
             let lp = inv.apply(gv2(c[0], c[1]));
-            let Ok(v) = app.session.execute("mask.new", json!({"layer": l.id.0, "vertices": [[lp.x, lp.y]]})) else { return };
+            let Ok(v) = app.session_mut().execute("mask.new", json!({"layer": l.id.0, "vertices": [[lp.x, lp.y]]})) else { return };
             let Some(mask) = v["mask"].as_u64() else { return };
             (l.id, mask, inv)
         }
         Some(l) => {
             let Some(inv) = box_l2c(ectx, l).inverse() else { return };
             let lp = inv.apply(gv2(c[0], c[1]));
-            let r = app.session.execute("shape.newPath", json!({"layer": l.id.0, "vertices": [[lp.x, lp.y]], "space": "layer"}));
+            let r = app.session_mut().execute("shape.newPath", json!({"layer": l.id.0, "vertices": [[lp.x, lp.y]], "space": "layer"}));
             let Some(path) = r.ok().and_then(|v| v["path"].as_u64()) else { return };
             (l.id, path, inv)
         }
         None => {
             // A new shape layer at the comp centre (unrotated: comp → layer is a translation).
-            let r = app.session.execute("shape.newPath", json!({"vertices": [c], "space": "comp"}));
+            let r = app.session_mut().execute("shape.newPath", json!({"vertices": [c], "space": "comp"}));
             let Some(v) = r.ok() else { return };
             let (Some(l), Some(path)) = (v["layer"].as_u64(), v["path"].as_u64()) else { return };
             let inv = Mat3::translate(gv2(-(ectx.comp.width as f64) / 2.0, -(ectx.comp.height as f64) / 2.0));
@@ -2836,7 +2879,7 @@ fn pen_press(
 
 /// `to` moved onto the nearest line through `from` at a multiple of 45° (horizontal, vertical or
 /// diagonal), as far along it as `to` lies: the Pen's Shift-click.
-fn constrain_45(from: [f64; 2], to: [f64; 2]) -> [f64; 2] {
+pub(crate) fn constrain_45(from: [f64; 2], to: [f64; 2]) -> [f64; 2] {
     let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
     if !(dx.is_finite() && dy.is_finite()) || (dx == 0.0 && dy == 0.0) {
         return to;
@@ -2871,17 +2914,17 @@ pub(crate) fn layer_at<'a>(ectx: &EvalCtx<'a>, cpt: [f64; 2]) -> Option<&'a Laye
 /// The layer a press at a comp point acts on, selected (Shift toggles the topmost layer). As in
 /// After Effects, a selected layer under the point comes before the layers in front of it, so it
 /// can be dragged where they cover it; otherwise the topmost layer (#230).
-pub(crate) fn pick(app: &mut EffectcraftApp, ectx: &EvalCtx, cpt: [f64; 2], toggle: bool) -> Option<LayerId> {
+pub(crate) fn pick(app: &mut dyn TimelineHost, ectx: &EvalCtx, cpt: [f64; 2], toggle: bool) -> Option<LayerId> {
     if toggle {
         let hit = layer_at(ectx, cpt)?.id;
-        let _ = app.session.execute("layer.select", json!({"layers": [hit.0], "toggle": true}));
+        let _ = app.session_mut().execute("layer.select", json!({"layers": [hit.0], "toggle": true}));
         return Some(hit);
     }
-    let selected = &app.session.state.selected_layers;
+    let selected = &app.session().state.selected_layers;
     let hits: Vec<LayerId> = layers_at(ectx, cpt).map(|l| l.id).collect();
     let hit = *hits.iter().find(|id| selected.contains(id)).or(hits.first())?;
     if !selected.contains(&hit) {
-        let _ = app.session.execute("layer.select", json!({"layers": [hit.0]}));
+        let _ = app.session_mut().execute("layer.select", json!({"layers": [hit.0]}));
     }
     Some(hit)
 }
@@ -2889,7 +2932,7 @@ pub(crate) fn pick(app: &mut EffectcraftApp, ectx: &EvalCtx, cpt: [f64; 2], togg
 /// Where a shape drag is going to land: a mask on the selected layer, a group inside it, or a new
 /// shape layer.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ShapeTarget {
+pub(crate) enum ShapeTarget {
     Mask,
     IntoLayer,
     NewLayer,
@@ -2908,7 +2951,7 @@ impl ShapeTarget {
 
 /// A shape drag as it stands, after the Tools' normalisations: the path it will make and where it
 /// will land.
-struct ShapeDrag {
+pub(crate) struct ShapeDrag {
     /// The `shape.newShape` / `layer.addMask` kind for the tool.
     kind: &'static str,
     /// Comp-space centre and size, what the drag will make.
@@ -2935,16 +2978,16 @@ fn shape_kind(tool: Tool) -> &'static str {
 /// What a shape tool drag from `start` to `end` makes, or `None` while it is too small to make
 /// anything. Alt (Option) draws from the press point and Shift squares the box; the live ghost and
 /// [`create_shape`] both go through this, so the drag always shows what it will commit.
-fn shape_drag(app: &EffectcraftApp, tool: Tool, start: [f64; 2], end: [f64; 2], mods: egui::Modifiers) -> Option<ShapeDrag> {
-    let comp = app.session.active_comp()?;
-    let selected = app.session.state.selected_layers.first().copied();
+pub(crate) fn shape_drag(app: &dyn TimelineHost, tool: Tool, start: [f64; 2], end: [f64; 2], mods: egui::Modifiers) -> Option<ShapeDrag> {
+    let comp = app.session().active_comp()?;
+    let selected = app.session().state.selected_layers.first().copied();
     let sel = selected.and_then(|id| comp.layer(id));
     // A footage, solid or other non-shape layer selected, or a shape layer with Tool Creates
     // Mask: a mask on that layer. Otherwise the engine's own target: the first selected unlocked
     // shape layer, else a new one.
     let target = match sel {
-        Some(l) if l.source.is_av() && (app.session.state.shape_tool.creates_mask || !matches!(l.source, LayerSource::Shape)) => (ShapeTarget::Mask, Some(l)),
-        _ => match effectcraft_engine::commands::shape_tool::selected_shape_target(&app.session, comp).and_then(|id| comp.layer(id)) {
+        Some(l) if l.source.is_av() && (app.session().state.shape_tool.creates_mask || !matches!(l.source, LayerSource::Shape)) => (ShapeTarget::Mask, Some(l)),
+        _ => match effectcraft_engine::commands::shape_tool::selected_shape_target(app.session(), comp).and_then(|id| comp.layer(id)) {
             Some(l) => (ShapeTarget::IntoLayer, Some(l)),
             None => (ShapeTarget::NewLayer, None),
         },
@@ -2983,7 +3026,7 @@ fn paint_rgb(c: [f32; 3], opacity: f64, alpha: f32) -> Color32 {
 
 /// Draw a shape drag as it will land: the tool's own path, filled with the Tools bar's Fill and
 /// outlined in its Stroke (or the mask colour, for a mask), captioned with where it goes.
-fn draw_shape_ghost(painter: &egui::Painter, map: &ViewerMap, app: &EffectcraftApp, d: &ShapeDrag, t: &Tokens) {
+pub(crate) fn draw_shape_ghost(painter: &egui::Painter, map: &ViewerMap, app: &dyn TimelineHost, d: &ShapeDrag, t: &Tokens, caption: bool) {
     // The engine's own geometry for the kind, so the ghost is the shape and not a stand-in for it.
     let Some(sp) = effectcraft_engine::commands::shape_tool::mask_path(d.kind, d.centre, d.size) else { return };
     let mut pts = ov::flatten(&sp, &Mat3::IDENTITY, map);
@@ -2993,10 +3036,10 @@ fn draw_shape_ghost(painter: &egui::Painter, map: &ViewerMap, app: &EffectcraftA
     if pts.len() < 3 {
         return;
     }
-    let tool = &app.session.state.shape_tool;
+    let tool = &app.session().state.shape_tool;
     let (fill, line) = match d.target {
         ShapeTarget::Mask => {
-            let [r, g, b] = effectcraft_engine::prefs::mask_color(app.session.prefs.appearance.cycle_mask_colors, d.mask_index);
+            let [r, g, b] = effectcraft_engine::prefs::mask_color(app.session().prefs.appearance.cycle_mask_colors, d.mask_index);
             (Color32::from_rgb(r, g, b).gamma_multiply(0.25), Color32::from_rgb(r, g, b))
         }
         _ => {
@@ -3012,6 +3055,9 @@ fn draw_shape_ghost(painter: &egui::Painter, map: &ViewerMap, app: &EffectcraftA
     painter.add(egui::Shape::Path(egui::epaint::PathShape { points: pts, closed: true, fill, stroke: Stroke::new(1.5, line).into() }));
     // Caption it with where the shape lands: a mask, a group in the selected shape layer or a
     // new layer.
+    if !caption {
+        return;
+    }
     let font = Tokens::ui(11.0);
     let galley = painter.layout_no_wrap(d.target.label(&d.layer_name), font, line);
     let caption = Rect::from_min_size(pos2(bounds.left(), bounds.top() - 5.0 - galley.size().y), galley.size());
@@ -3029,21 +3075,21 @@ fn bounds_of(pts: &[Pos2]) -> Option<Rect> {
     Some(r)
 }
 
-fn create_shape(app: &mut EffectcraftApp, tool: Tool, a: [f64; 2], b: [f64; 2], mods: egui::Modifiers) {
+pub(crate) fn create_shape(app: &mut dyn TimelineHost, tool: Tool, a: [f64; 2], b: [f64; 2], mods: egui::Modifiers) {
     let Some(d) = shape_drag(app, tool, a, b, mods) else { return };
     let (kind, (w, h), (cx, cy)) = (d.kind, (d.size[0], d.size[1]), (d.centre[0], d.centre[1]));
     // A mask on the selected layer, as the ghost showed.
     if d.target == ShapeTarget::Mask {
         // In layer space: invert the layer transform.
-        let sel_layer = app.session.state.selected_layers.first().copied().and_then(|id| app.session.active_comp().and_then(|c| c.layer(id)).cloned());
+        let sel_layer = app.session().state.selected_layers.first().copied().and_then(|id| app.session().active_comp().and_then(|c| c.layer(id)).cloned());
         if let Some(l) = sel_layer
-            && let Some(comp) = app.session.active_comp_arc()
+            && let Some(comp) = app.session().active_comp_arc()
         {
             let ectx = EvalCtx {
-                project: &app.session.project,
-                comp_id: app.session.active_comp_id().unwrap_or_default(),
+                project: &app.session().project,
+                comp_id: app.session().active_comp_id().unwrap_or_default(),
                 comp: &comp,
-                time: app.session.time(),
+                time: app.session().time(),
                 expr: None,
                 footage: None,
             };
@@ -3051,16 +3097,16 @@ fn create_shape(app: &mut EffectcraftApp, tool: Tool, a: [f64; 2], b: [f64; 2], 
             let p0 = inv.apply(gv2(cx - w / 2.0, cy - h / 2.0));
             let p1 = inv.apply(gv2(cx + w / 2.0, cy + h / 2.0));
             let rect = [p0.x.min(p1.x), p0.y.min(p1.y), (p1.x - p0.x).abs(), (p1.y - p0.y).abs()];
-            if let Err(e) = app.session.execute("layer.addMask", json!({"layer": l.id.0, "shape": kind, "rect": rect})) {
-                app.ui.status = e.to_string();
+            if let Err(e) = app.session_mut().execute("layer.addMask", json!({"layer": l.id.0, "shape": kind, "rect": rect})) {
+                app.ui_mut().status = e.to_string();
             }
         }
         return;
     }
     // Into the selected shape layer's Contents as a new group (as in After Effects), else a new
     // shape layer; painted with the Tools bar's Fill and Stroke.
-    if let Err(e) = app.session.execute("shape.newShape", json!({"kind": kind, "size": [w, h], "position": [cx, cy], "addToSelected": true})) {
-        app.ui.status = e.to_string();
+    if let Err(e) = app.session_mut().execute("shape.newShape", json!({"kind": kind, "size": [w, h], "position": [cx, cy], "addToSelected": true})) {
+        app.ui_mut().status = e.to_string();
     }
 }
 

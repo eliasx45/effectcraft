@@ -13,6 +13,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED4 | Remaining Timeline features | Markers, quick row, waveforms, dialogs (as requests) and the eyedropper through the host; 6 minor sites left |
 | EMBED5 | Keys, UI commands, inline edits in a host | `panels::timeline::hosted`: Timeline UI commands and their keys (the person's own shortcuts), frontend events, precomp redirect |
 | EMBED6 | Panels in a scaled layer | `layer_pointer::Lp`: raw pointer reads, drag overlays and popup lists in the layer's own coordinates (a host may draw the Timeline in a layer it transforms, e.g. scaled on a canvas) |
+| EMBED8 | Composition viewer tools | `panels::viewer_hosted`: Rotation, Pan Behind, shape/mask tools, Pen (masks and shape paths, vertex tools), path vertex/tangent drags and the Type tool over a comp picture the host draws, with their keys |
 
 ## The host interface (EMBED1)
 
@@ -195,6 +196,35 @@ viewer, which uses `viewer_image`/`pointer_comp`), `choose_files_after_apply` (r
 dispatch). A foreign host's colour eyedropper therefore arms but cannot sample until it hosts the
 viewer.
 
+## Composition viewer tools (EMBED8)
+
+The Composition viewer (`viewer.rs`, its `show` about 1,500 lines) draws the frame, chrome and every
+tool against the whole app. A host that shows the comp itself (FigCraft's card) needs only the
+layer tools over its own picture, so those were factored out rather than the viewer hosted whole:
+
+- `panels::viewer_hosted::tools(host, ui, map, Options)` draws the selected layers' mask and shape
+  paths (vertices, tangents, the Pen's rubber band), the anchor point for Rotation / Pan Behind and
+  the tool's own feedback, and runs the tools over `map.area` (a `ViewerMap` the host builds with
+  `map_for(picture, comp size)`): Rotation, Pan Behind, the shape tools (mask on the selected
+  footage/solid layer, else a shape, as the viewer decides), the Pen and Add / Delete / Convert
+  Vertex, Selection-tool vertex and tangent drags, and the Type tool (`viewer_text::hook`).
+  `Frame::owns` says whether it took the pointer (with the Selection tool only on a path point, so
+  the host keeps moving layers itself); `edit_text_at` starts a text edit from a host's own
+  double-click. The shape ghost is drawn without its caption: nothing but handles and the tool's
+  feedback goes over the host's picture.
+- Shared with the viewer, no copies: `viewer::{begin_rotate, begin_anchor, update_tool_gesture,
+  pick, pen_press, shape_drag, create_shape, move_path_vertices, selected_others}`,
+  `viewer_overlays::draw_paths`, `viewer_tools::{snap, snap_with, snapping_on}` and all of
+  `viewer_text` now take `&dyn`/`&mut dyn TimelineHost` (the app coerces: EffectCraft's viewer
+  runs the same code, unchanged). `UiState::choose_tool` is the Tools panel's `tool.*` command
+  (slots cycle), used by `menus/tool.rs` and by `hosted::run`, which now also handles and binds
+  `tool.selection`, `tool.rotate`, `tool.panBehind`, `tool.shape`, `tool.pen`, `tool.type` (the
+  person's own keys through `use_user_shortcuts`).
+- Not hosted: Hand / Zoom, guides, rulers, the region of interest, motion paths, free transform,
+  Mask Feather, puppet, paint, roto, camera and tracker tools, the viewer's context menu.
+
+Tests: `panels::viewer_hosted::tests` (keys, rotation, anchor, mask, Pen, typed text, junk).
+
 ## Next steps
 
 1. ~~EMBED2: Graph Editor, per-instance ids, host font installer.~~ Done.
@@ -237,3 +267,7 @@ All additive; nothing a host implements or calls was renamed or removed.
   Signatures that now take `&mut dyn TimelineHost` (the app still coerces): `quick_row::show`,
   `markers_ui::{comp_markers, marker_bin, layer_markers}`, `text_apply::{run, run_follow_ups,
   preset_list}`, `motion_library::card_name`, the wheel actions in `timeline/wheels.rs`.
+- EMBED8: `panels::viewer_hosted::{tools, Options, Frame, hosted, active, cursor, edit_text_at,
+  comp_point, map_for}`; `panels::viewer_text::edit_at`; `state::UiState::choose_tool`;
+  `panels::timeline::hosted::run` handles the six `tool.*` commands above. Signatures that now take
+  `&mut dyn`/`&dyn TimelineHost` (the app still coerces): `viewer_text::{hook, panel_clicked}`.

@@ -6,7 +6,9 @@
 //! zoom (- / =, ;, Shift+;), D / X (scroll to time / layer), B / N (work area), [ ] (layer in /
 //! out to time), the reveal keys (P S R T A E M F L, their double presses and Shift+ adds),
 //! Alt+Shift+P… (key at time), U / UU, F4 (switches / modes), Shift+F4 (parent column),
-//! Cmd+` (twirl selected). In EffectCraft `menus::invoke` runs them; a host runs them here.
+//! Cmd+` (twirl selected), and (EMBED8) the Composition viewer tools a host's comp has (V, W, Y,
+//! Q, G, Cmd+T: `panels::viewer_hosted`). In EffectCraft `menus::invoke` runs them; a host runs
+//! them here.
 //!
 //! A host:
 //! - calls [`install`] on its session (binds these commands' keys; a host's session has no
@@ -46,6 +48,13 @@ const EXACT: &[&str] = &[
     "timeline.moveOutToTime",
     "timeline.trimInToTime",
     "timeline.trimOutToTime",
+    // EMBED8: the Composition viewer tools a host's card has (`panels::viewer_hosted`).
+    "tool.selection",
+    "tool.rotate",
+    "tool.panBehind",
+    "tool.shape",
+    "tool.pen",
+    "tool.type",
 ];
 const PREFIXES: &[&str] = &["timeline.reveal.", "timeline.revealAdd.", "timeline.keyAt."];
 
@@ -187,6 +196,7 @@ pub fn run(host: &mut dyn TimelineHost, ctx: &egui::Context, id: &str, params: &
             engine(host, ctx, "layer.timing", json!({"op": op}))
         }
         "anim.reveal" => anim_reveal(host, ctx, now, params),
+        t if t.starts_with("tool.") => host.ui_mut().choose_tool(t).map(|tool| json!({"tool": tool})),
         _ => {
             if let Some(k) = id.strip_prefix("timeline.revealAdd.") {
                 remember(ctx, Some((k.to_string(), now)));

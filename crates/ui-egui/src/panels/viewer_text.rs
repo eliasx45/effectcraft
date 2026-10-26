@@ -24,8 +24,8 @@ use effectcraft_engine::text::{TextLayout, layout_doc};
 use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, vec2};
 use serde_json::{Value, json};
 
+use super::timeline::TimelineHost;
 use super::viewer::ViewerMap;
-use crate::EffectcraftApp;
 use crate::dock::PanelKind;
 use crate::state::Tool;
 
@@ -105,12 +105,12 @@ impl Edited {
     }
 }
 
-fn edited(app: &EffectcraftApp, ectx: &EvalCtx, lid: LayerId) -> Option<Edited> {
+fn edited(app: &dyn TimelineHost, ectx: &EvalCtx, lid: LayerId) -> Option<Edited> {
     let layer = ectx.comp.layer(lid)?.clone();
     if !matches!(layer.source, LayerSource::Text) {
         return None;
     }
-    let doc = layer_doc(&app.session, lid)?;
+    let doc = layer_doc(app.session(), lid)?;
     let lay = layout_doc(&doc);
     // The text sits where the Transform effects its children follow put it.
     let m = super::viewer::box_l2c(ectx, &layer);
@@ -121,14 +121,14 @@ fn edited(app: &EffectcraftApp, ectx: &EvalCtx, lid: LayerId) -> Option<Edited> 
 
 /// Type-tool clicks prefer a selected text layer, as viewer dragging does (#230).
 /// Double-clicks retain topmost picking. Both use the same visibility/lock/time/solo filter.
-fn text_layer_at(app: &EffectcraftApp, ectx: &EvalCtx, map: &ViewerMap, s: Pos2, prefer_selected: bool) -> Option<Edited> {
+fn text_layer_at(app: &dyn TimelineHost, ectx: &EvalCtx, map: &ViewerMap, s: Pos2, prefer_selected: bool) -> Option<Edited> {
     let mut topmost = None;
     for e in super::viewer::selectable_layers(ectx.comp, ectx.time)
         .filter(|l| matches!(l.source, LayerSource::Text))
         .filter_map(|l| edited(app, ectx, l.id))
         .filter(|e| e.contains(map, s))
     {
-        if !prefer_selected || app.session.state.selected_layers.contains(&e.layer.id) {
+        if !prefer_selected || app.session().state.selected_layers.contains(&e.layer.id) {
             return Some(e);
         }
         if topmost.is_none() {
@@ -138,11 +138,11 @@ fn text_layer_at(app: &EffectcraftApp, ectx: &EvalCtx, map: &ViewerMap, s: Pos2,
     topmost
 }
 
-fn exec(app: &mut EffectcraftApp, id: &str, p: Value) -> Option<Value> {
-    match app.session.execute(id, p) {
+fn exec(app: &mut dyn TimelineHost, id: &str, p: Value) -> Option<Value> {
+    match app.session_mut().execute(id, p) {
         Ok(v) => Some(v),
         Err(e) => {
-            app.ui.status = e.to_string();
+            app.ui_mut().status = e.to_string();
             None
         }
     }
@@ -156,8 +156,8 @@ fn keeps_text_edit(p: PanelKind) -> bool {
 
 /// A click in panel `p`. Any other panel (the Timeline, the Project panel, …) ends the edit, as a
 /// click outside the text does, and gives the keyboard back to the app (#831).
-pub fn panel_clicked(app: &mut EffectcraftApp, ctx: &egui::Context, p: PanelKind) {
-    if app.session.state.text_edit.is_some() && !keeps_text_edit(p) {
+pub fn panel_clicked(app: &mut dyn TimelineHost, ctx: &egui::Context, p: PanelKind) {
+    if app.session().state.text_edit.is_some() && !keeps_text_edit(p) {
         exec(app, "text.endEdit", json!({}));
         ctx.memory_mut(|m| m.surrender_focus(focus_id()));
     }
@@ -174,10 +174,21 @@ fn typing_key(ui: &egui::Ui, bump: bool) -> String {
     format!("text-typing-{n}")
 }
 
+/// EMBED8: start editing the text layer under screen point `pos` (the topmost, as a double-click
+/// on one does), the caret where it was clicked, and give the edit the keyboard. Returns whether
+/// there was one. For hosts whose own pointer handling saw the double-click.
+pub fn edit_at(app: &mut dyn TimelineHost, ctx: &egui::Context, map: &ViewerMap, ectx: &EvalCtx, pos: Pos2) -> bool {
+    let Some(e) = text_layer_at(app, ectx, map, pos, false) else { return false };
+    let ci = e.hit(map, pos);
+    exec(app, "text.edit", json!({"layer": e.layer.id.0, "caret": ci}));
+    ctx.memory_mut(|m| m.request_focus(focus_id()));
+    true
+}
+
 /// Viewer hook: draws the edit overlay and handles text pointer and keyboard input. Returns
 /// true when it owns this frame's pointer interaction (the viewer then skips its own gestures).
 pub fn hook(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     map: &ViewerMap,
@@ -185,7 +196,7 @@ pub fn hook(
     resp: &egui::Response,
     space_pan: bool,
 ) -> bool {
-    let tool = app.ui.tool;
+    let tool = app.ui().tool;
     let type_tool = matches!(tool, Tool::Type | Tool::TypeVertical);
     let last_tool_id = egui::Id::new("viewer-text-last-tool");
     let last_tool = ui.data(|d| d.get_temp::<Tool>(last_tool_id));
@@ -195,12 +206,12 @@ pub fn hook(
         ui.data_mut(|d| d.remove::<Drag>(drag_id()));
     }
     // The session ends when its layer leaves the active comp.
-    if let Some(e) = app.session.state.text_edit.clone()
+    if let Some(e) = app.session().state.text_edit.clone()
         && ectx.comp.layer(e.layer).is_none()
     {
         exec(app, "text.endEdit", json!({}));
     }
-    let editing = app.session.state.text_edit.clone();
+    let editing = app.session().state.text_edit.clone();
     let cur = editing.as_ref().and_then(|e| edited(app, ectx, e.layer));
     let mut owns = false;
     let mut drag: Option<Drag> = ui.data(|d| d.get_temp(drag_id()));
@@ -260,8 +271,8 @@ pub fn hook(
                 && press.is_some_and(|q| q.distance(p) > 2.0)
             {
                 let ci = e.hit(map, p);
-                if app.session.state.text_edit.as_ref().is_some_and(|s| s.caret != ci) {
-                    let anchor = app.session.state.text_edit.as_ref().map_or(ci, |s| s.anchor);
+                if app.session().state.text_edit.as_ref().is_some_and(|s| s.caret != ci) {
+                    let anchor = app.session().state.text_edit.as_ref().map_or(ci, |s| s.anchor);
                     exec(app, "text.setSelection", json!({"anchor": anchor, "caret": ci}));
                 }
             }
@@ -273,7 +284,7 @@ pub fn hook(
             let b = map.to_screen(end);
             let is_box = a.distance(b) > 6.0;
             if is_box && down {
-                painter.rect_stroke(Rect::from_two_pos(a, b), 0.0, Stroke::new(1.0, app.tokens.accent), StrokeKind::Middle);
+                painter.rect_stroke(Rect::from_two_pos(a, b), 0.0, Stroke::new(1.0, app.tokens().accent), StrokeKind::Middle);
             }
             if released {
                 let mut p = json!({"text": "", "edit": true, "size": 72, "fill": [1.0, 1.0, 1.0], "vertical": vertical});
@@ -320,7 +331,7 @@ pub fn hook(
     // Double / triple click: word / line; double-click a text layer to edit it.
     if resp.triple_clicked()
         && let Some(p) = pointer
-        && let Some(e) = app.session.state.text_edit.clone().and_then(|s| edited(app, ectx, s.layer))
+        && let Some(e) = app.session().state.text_edit.clone().and_then(|s| edited(app, ectx, s.layer))
         && e.contains(map, p)
     {
         let (a, b) = e.lay.line_span(e.hit(map, p));
@@ -329,7 +340,7 @@ pub fn hook(
     } else if resp.double_clicked()
         && let Some(p) = pointer
     {
-        let cur2 = app.session.state.text_edit.clone().and_then(|s| edited(app, ectx, s.layer));
+        let cur2 = app.session().state.text_edit.clone().and_then(|s| edited(app, ectx, s.layer));
         match cur2 {
             Some(e) if e.contains(map, p) => {
                 let r = effectcraft_engine::keyframe::text_doc::word_at(&e.doc.text, e.hit(map, p));
@@ -353,7 +364,7 @@ pub fn hook(
     }
 
     // ---- keyboard
-    if app.session.state.text_edit.is_some() && app.dialog.is_none() && ui.is_enabled() {
+    if app.session().state.text_edit.is_some() && app.dialog().is_none() && ui.is_enabled() {
         // Register after pointer handling so new edits take focus in this frame. An inactive
         // editor must not take Tab focus and immediately surrender it before viewer controls.
         ui.interact(Rect::from_min_size(resp.rect.min, vec2(1.0, 1.0)), focus_id(), egui::Sense::focusable_noninteractive());
@@ -362,10 +373,10 @@ pub fn hook(
         });
         // A session started elsewhere (menu, agent, Properties) takes the keyboard once…
         let seen = egui::Id::new("viewer-text-seen");
-        let key = app.session.state.text_edit.as_ref().map(|e| e.layer.0);
+        let key = app.session().state.text_edit.as_ref().map(|e| e.layer.0);
         // …and gets it back when a click in the viewer or a formatting panel left nothing holding
         // it; not merely because nothing has the focus (#831).
-        let regain = ui.memory(|m| m.focused().is_none()) && keeps_text_edit(app.ui.focused);
+        let regain = ui.memory(|m| m.focused().is_none()) && keeps_text_edit(app.ui().focused);
         if ui.data(|d| d.get_temp::<Option<u64>>(seen)).flatten() != key || regain {
             ui.data_mut(|d| d.insert_temp(seen, key));
             ui.memory_mut(|m| m.request_focus(focus_id()));
@@ -381,7 +392,7 @@ pub fn hook(
     }
 
     // ---- overlay
-    if let Some(s) = app.session.state.text_edit.clone()
+    if let Some(s) = app.session().state.text_edit.clone()
         && let Some(e) = edited(app, ectx, s.layer)
     {
         draw(app, ui, painter, map, &e, s.range(), s.caret);
@@ -392,11 +403,11 @@ pub fn hook(
 /// This frame's keys, in order, into the edited text, up to a press outside the `viewer`: the
 /// panel it lands in decides (after this frame's panels) whether the edit ends, so the keys after
 /// it in this frame are neither typed nor run as shortcuts (#831).
-fn keyboard(app: &mut EffectcraftApp, ui: &mut egui::Ui, viewer: Rect) {
+fn keyboard(app: &mut dyn TimelineHost, ui: &mut egui::Ui, viewer: Rect) {
     let events = ui.input(|i| i.events.clone());
     let ctx = ui.ctx().clone();
     for ev in events {
-        let Some(sel) = app.session.state.text_edit.clone() else { return };
+        let Some(sel) = app.session().state.text_edit.clone() else { return };
         match ev {
             egui::Event::PointerButton { pos, pressed: true, .. } if !viewer.contains(pos) => return,
             egui::Event::Text(t) if !t.chars().any(char::is_control) => {
@@ -433,14 +444,14 @@ fn keyboard(app: &mut EffectcraftApp, ui: &mut egui::Ui, viewer: Rect) {
             egui::Event::Key { key, pressed: true, modifiers: m, .. } => {
                 use egui::Key;
                 let cmd = m.command;
-                let mv = |app: &mut EffectcraftApp, to: &str| {
+                let mv = |app: &mut dyn TimelineHost, to: &str| {
                     exec(app, "text.moveCaret", json!({"to": to, "extend": m.shift}));
                 };
                 match key {
                     Key::ArrowLeft | Key::ArrowRight if m.alt => {
                         // Kerning at the caret, tracking over a selection.
                         let step = if cmd { 100.0 } else { 20.0 } * if key == Key::ArrowLeft { -1.0 } else { 1.0 };
-                        let doc = layer_doc(&app.session, sel.layer).unwrap_or_default();
+                        let doc = layer_doc(app.session(), sel.layer).unwrap_or_default();
                         if sel.is_empty() {
                             if sel.caret < doc.char_len() {
                                 let cur = match doc.style_at(sel.caret).kerning {
@@ -491,10 +502,10 @@ fn keyboard(app: &mut EffectcraftApp, ui: &mut egui::Ui, viewer: Rect) {
                         exec(app, "text.setSelection", json!({"select": "all"}));
                     }
                     Key::Z if cmd => {
-                        let _ = crate::menus::invoke(app, &ctx, if m.shift { "edit.redo" } else { "edit.undo" }, json!({}));
+                        let _ = app.invoke(&ctx, if m.shift { "edit.redo" } else { "edit.undo" }, json!({}));
                     }
                     Key::Comma | Key::Period if cmd && m.shift => {
-                        let doc = layer_doc(&app.session, sel.layer).unwrap_or_default();
+                        let doc = layer_doc(app.session(), sel.layer).unwrap_or_default();
                         let r = sel.range();
                         let size = sel.pending.as_ref().map_or_else(|| doc.style_at(r.start).size, |p| p.size);
                         let ns = (size + if key == Key::Period { 2.0 } else { -2.0 }).max(1.0);
@@ -511,8 +522,8 @@ fn keyboard(app: &mut EffectcraftApp, ui: &mut egui::Ui, viewer: Rect) {
     }
 }
 
-fn draw(app: &mut EffectcraftApp, ui: &mut egui::Ui, painter: &egui::Painter, map: &ViewerMap, e: &Edited, sel: std::ops::Range<usize>, caret: usize) {
-    let t = app.tokens;
+fn draw(app: &mut dyn TimelineHost, ui: &mut egui::Ui, painter: &egui::Painter, map: &ViewerMap, e: &Edited, sel: std::ops::Range<usize>, caret: usize) {
+    let t = app.tokens();
     let to_s = |p: Point| e.to_screen(map, (p.x, p.y));
     // Paragraph box and its handles.
     if e.doc.box_size.is_some() {
@@ -525,7 +536,7 @@ fn draw(app: &mut EffectcraftApp, ui: &mut egui::Ui, painter: &egui::Painter, ma
             let r = Rect::from_center_size(*h, vec2(7.0, 7.0));
             painter.rect_filled(r, 0.0, Color32::WHITE);
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Middle);
-            app.auto.add(&format!("viewer.textBox.handle.{i}"), r, "Text box handle");
+            app.auto_mut().add(&format!("viewer.textBox.handle.{i}"), r, "Text box handle");
         }
     }
     // Selection highlight.
@@ -563,7 +574,7 @@ fn draw(app: &mut EffectcraftApp, ui: &mut egui::Ui, painter: &egui::Painter, ma
     let r = e.region();
     let quad = [(r[0], r[1]), (r[2], r[1]), (r[2], r[3]), (r[0], r[3])].map(|p| e.to_screen(map, p));
     let rect = Rect::from_points(&quad);
-    app.auto.add("viewer.textEdit", rect, &format!("Editing {}", e.layer.name));
+    app.auto_mut().add("viewer.textEdit", rect, &format!("Editing {}", e.layer.name));
     let cursor_rect = Rect::from_two_pos(sa, sb).expand2(vec2(1.0, 0.0));
     ui.ctx().output_mut(|o| {
         o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect, cursor_rect, should_interrupt_composition: false });

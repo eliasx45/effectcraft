@@ -12,6 +12,7 @@ use effectcraft_engine::viewer::{self as vw, Channel, Snap, SnapKind, SnapSource
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
+use super::timeline::TimelineHost;
 use super::viewer::ViewerMap;
 use crate::icons::Icon;
 use crate::state::Resolution;
@@ -29,8 +30,8 @@ fn snap_id() -> egui::Id {
 }
 
 /// Layer snapping is on: the Snapping checkbox (View ▸ Snapping), inverted while Cmd/Ctrl is held.
-pub(crate) fn snapping_on(app: &EffectcraftApp, mods: egui::Modifiers) -> bool {
-    app.session.state.snapping != mods.command
+pub(crate) fn snapping_on(app: &dyn TimelineHost, mods: egui::Modifiers) -> bool {
+    app.session().state.snapping != mods.command
 }
 
 /// Snap dragged feature points (`sources`, comp pixels) to the comp's targets: other layers'
@@ -39,7 +40,7 @@ pub(crate) fn snapping_on(app: &EffectcraftApp, mods: egui::Modifiers) -> bool {
 /// grid (View ▸ Snap to Grid). Returns the comp-space correction (zero when nothing is near) and
 /// records the feedback for this frame.
 pub(crate) fn snap(
-    app: &EffectcraftApp,
+    app: &dyn TimelineHost,
     ctx: &egui::Context,
     ectx: &EvalCtx,
     map: &ViewerMap,
@@ -52,7 +53,7 @@ pub(crate) fn snap(
 
 /// [`snap`] with `extra` layer targets (the Pan Behind layer's own box).
 pub(crate) fn snap_with(
-    app: &EffectcraftApp,
+    app: &dyn TimelineHost,
     ctx: &egui::Context,
     ectx: &EvalCtx,
     map: &ViewerMap,
@@ -62,13 +63,13 @@ pub(crate) fn snap_with(
     extra: &[vw::SnapTarget],
 ) -> [f64; 2] {
     let layers = snapping_on(app, mods);
-    let v = &app.ui.viewer;
+    let v = &app.ui().viewer;
     let guides = v.snap_guides && v.guides;
     let grid = v.snap_grid;
     if sources.is_empty() || !(layers || guides || grid) {
         return [0.0; 2];
     }
-    let opts = vw::SnapOptions { layers, features: app.session.state.snap_features, guides, grid, grid_spacing: app.session.prefs.grids.grid_spacing };
+    let opts = vw::SnapOptions { layers, features: app.session().state.snap_features, guides, grid, grid_spacing: app.session().prefs.grids.grid_spacing };
     let mut targets = vw::targets(ectx, exclude, opts);
     if layers {
         targets.extend_from_slice(extra);

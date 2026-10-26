@@ -14,6 +14,7 @@ use effectcraft_engine::{KeyRef, VertexRef};
 use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, vec2};
 use serde_json::json;
 
+use super::timeline::TimelineHost;
 use super::viewer::ViewerMap;
 use crate::EffectcraftApp;
 use crate::state::FreeTransform;
@@ -179,7 +180,7 @@ pub(crate) fn flatten(sp: &ShapePath, m: &Mat3, map: &ViewerMap) -> Vec<Pos2> {
 /// selected vertices show their tangent handles. Collects vertex hits and paths.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_paths(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     painter: &egui::Painter,
     map: &ViewerMap,
     ectx: &EvalCtx,
@@ -198,7 +199,7 @@ pub(crate) fn draw_paths(
     if let Some(masks) = l.masks() {
         for g in masks.groups() {
             let GroupKind::Mask { color, locked, .. } = g.kind else { continue };
-            if locked && app.session.state.hide_locked_masks {
+            if locked && app.session().state.hide_locked_masks {
                 continue;
             }
             let Some(sp) = g.get("path").map(|pr| ectx.value(l, pr)).and_then(|v| v.as_path().cloned()) else { continue };
@@ -233,7 +234,7 @@ pub(crate) fn draw_paths(
             }
             marks.push(VertexMark { pos: s, color: mc, selected });
             let kind = if is_mask { "mask" } else { "shapePath" };
-            app.auto.add(&format!("viewer.{kind}.{uid}.vertex.{i}"), Rect::from_center_size(s, vec2(8.0, 8.0)), &name);
+            app.auto_mut().add(&format!("viewer.{kind}.{uid}.vertex.{i}"), Rect::from_center_size(s, vec2(8.0, 8.0)), &name);
             hits.push(VertexHit { layer: l.id, mask: uid, index: i, pos: s, tangent: None, vertex: *v, l2c: pm });
         }
         // Pen rubber band from the last vertex to the pointer.
@@ -244,7 +245,7 @@ pub(crate) fn draw_paths(
         }
         let feather = if is_mask { draw_feather_points(painter, map, &sp, &pm, mc) } else { Vec::new() };
         for (i, h) in &feather {
-            app.auto.add(&format!("viewer.mask.{uid}.feather.{i}"), Rect::from_center_size(*h, vec2(8.0, 8.0)), &name);
+            app.auto_mut().add(&format!("viewer.mask.{uid}.feather.{i}"), Rect::from_center_size(*h, vec2(8.0, 8.0)), &name);
         }
         paths.push(PathInfo { layer: l.id, uid, m: pm, sp, is_mask, feather });
     }
