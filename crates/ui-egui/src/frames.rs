@@ -1520,9 +1520,9 @@ fn gpu_working_budget(g: &Gpu) -> u64 {
 /// Whether `job` composites on the GPU: the decision [`Worker::render_job`] follows, taken once
 /// when the job may first start, so the right concurrency cap applies to it ([`max_running`]).
 /// Frozen previews, a retired device, a failed landing's retry and the frames Auto puts on the
-/// CPU (measured faster there, or its periodic re-measurement) composite on the CPU and get the
-/// CPU's cap (A3). Auto's choice counts frames, so it is taken here and only here.
-fn gpu_pick(job: &Job, retired: bool, playhead: Option<&Playhead>) -> bool {
+/// CPU (a comp the GPU declined) composite on the CPU and get the CPU's cap (A3). Auto's choice
+/// counts frames, so it is taken here and only here.
+fn gpu_pick(job: &Job, retired: bool) -> bool {
     use effectcraft_engine::render::{Accelerator, AutoKey, Backend};
     let Some(g) = job.src.gpu.as_ref() else { return false };
     if retired || job.retry.is_some() {
@@ -1532,39 +1532,27 @@ fn gpu_pick(job: &Job, retired: bool, playhead: Option<&Playhead>) -> bool {
         return false;
     }
     match job.opts.backend {
+        // The viewer's display path always composites on the GPU under Auto: its frames stay on
+        // the device (no readback), so the GPU is never meaningfully slower there, while Auto's
+        // CPU warm-up and re-probe frames cost 30–160 ms each (a Deep Glow card under a moving
+        // Transform: ~1.5 ms on the GPU). A frame the GPU can't finish still falls back to the
+        // CPU (`declined`, a failed attempt, a retired GPU).
         Backend::Auto if job.src.project.settings.gpu_acceleration && job.src.gpu_display => {
-            // As `Renderer::frame_auto`: no Auto history with a region of interest, nor in the
-            // browser (it always composites on the GPU there).
             if cfg!(target_arch = "wasm32") || job.opts.roi.is_some() {
                 return true;
             }
             let Some(p) = g.auto_pick() else { return true };
-            let key = AutoKey::new(job.comp, job.opts.scale, true);
-            // A frame a playing preview reaches goes to the CPU only when that keeps up with it,
-            // and a frame someone waits for (the viewer's) only when the CPU measured within
-            // [`URGENT_CPU_MS`] (`AutoPick::choose_within`): the CPU's warm-up and re-probes go to
-            // background frames. After a preview played on the GPU, the next edit's frame was
-            // that warm-up: 1.5–3 s on the CPU instead of ~0.1 s on the GPU.
-            let playing = playhead.filter(|ph| ph.ahead(&job.key).is_some()).and_then(|_| frame_ms(job));
-            match playing.or(job.urgent.then_some(URGENT_CPU_MS)) {
-                Some(budget) => p.choose_within(key, budget),
-                None => p.choose(key),
-            }
+            gpu_display_choice(p, AutoKey::new(job.comp, job.opts.scale, true))
         }
         // The full-float path (`Renderer::comp_frame`) takes Auto's choice itself: estimated.
         _ => composites_on_gpu(job, g),
     }
 }
 
-/// The longest a viewer frame may take on the CPU for Auto to put it there (ms): the edit →
-/// frame target.
-const URGENT_CPU_MS: f64 = 100.0;
-
-/// A frame's duration in `job`'s comp (ms).
-fn frame_ms(job: &Job) -> Option<f64> {
-    let fr = job.src.project.comp(job.comp)?.frame_rate;
-    let ms = 1000.0 * fr.den as f64 / fr.num as f64;
-    (ms.is_finite() && ms > 0.0).then_some(ms)
+/// Auto's choice for a viewer display frame: the GPU, unless it declined the comp (then Auto's
+/// history decides: the CPU, offering the GPU a frame now and then).
+fn gpu_display_choice(p: &effectcraft_engine::render::AutoPick, key: effectcraft_engine::render::AutoKey) -> bool {
+    if p.stats(key).is_some_and(|s| s.declined) { p.choose(key) } else { true }
 }
 
 /// `job` will composite on the GPU, as far as can be told without taking Auto's choice: the
@@ -2913,7 +2901,7 @@ impl Worker {
             let playhead = q.playhead;
             let Some(j) = q.jobs.get_mut(i) else { return false };
             if j.on_gpu.is_none() || (retired && j.on_gpu == Some(true)) {
-                j.on_gpu = Some(gpu_pick(j, retired, playhead.as_ref()));
+                j.on_gpu = Some(gpu_pick(j, retired));
             }
             let j = &q.jobs[i];
             // Keep one viewer slot beyond the prefetch budget, but never nest another viewer
@@ -3835,8 +3823,7 @@ impl Worker {
         let _entered = gpu.map(|g| self.gpu_gate.enter(g));
         // The GPU leaves the frame in a texture for the viewer; otherwise (Software Only, no
         // adapter, or a frame the GPU cannot finish here) the CPU renders it.
-        // Auto (Mercury GPU Acceleration) shows each comp on whichever compositor measured
-        // faster for it (light comps composite faster on the CPU).
+        // Auto (Mercury GPU Acceleration) shows every viewer frame on the GPU (see [`gpu_pick`]).
         if let (Some(g), Some(a)) = (gpu, r.active_accel())
             && job.src.gpu_display
         {
@@ -3845,7 +3832,7 @@ impl Worker {
             let auto = if cfg!(target_arch = "wasm32") { None } else { r.frame_auto(a, job.comp, true) };
             // Taken when the job was admitted ([`gpu_pick`]); a job that never went through the
             // queue chooses now.
-            if job.on_gpu.unwrap_or_else(|| auto.is_none_or(|(p, key)| p.choose(key))) {
+            if job.on_gpu.unwrap_or_else(|| auto.is_none_or(|(p, key)| gpu_display_choice(p, key))) {
                 let t0 = web_time::Instant::now();
                 // The frame's flight on the landing thread, once handed over.
                 let mut flight = None;
@@ -4434,7 +4421,7 @@ mod tests {
             cancel: Arc::default(),
             print: None,
         };
-        let cap = |j: &Job, retired: bool| max_running(&Job { on_gpu: Some(gpu_pick(j, retired, None)), ..j.clone() }, 8);
+        let cap = |j: &Job, retired: bool| max_running(&Job { on_gpu: Some(gpu_pick(j, retired)), ..j.clone() }, 8);
         let gpu_cap = cap(&job(Backend::Gpu), false);
         assert!(gpu_cap > 2, "GPU frames run beyond the RAM cap ({gpu_cap})");
         assert_eq!(cap(&job(Backend::Gpu), true), 2, "a retired GPU: the CPU renders, at the CPU's cap");
@@ -4442,28 +4429,22 @@ mod tests {
         let retry = Retry { gpu: gpu.clone(), auto: None, tail: Tail { t0: now, service_start: now, ticket: None, disk: None } };
         assert_eq!(cap(&Job { retry: Some(Box::new(retry)), ..job(Backend::Gpu) }, false), 2, "a failed landing's CPU retry");
         assert_eq!(cap(&job(Backend::Cpu), false), 2);
-        // Auto measures both sides first: after a GPU frame, the next goes to the CPU.
+        // Auto puts every viewer frame on the GPU: no CPU warm-up or re-probe frames (30–160 ms
+        // each on a Deep Glow card the GPU draws in ~1.5 ms), even when the CPU measured faster.
         let mut auto = job(Backend::Auto);
         Arc::make_mut(&mut auto.src.project).settings.gpu_acceleration = true;
         let picks = gpu.auto_pick().unwrap();
         let k = AutoKey::new(uhd, 1.0, true);
-        assert!(gpu_pick(&auto, false, None), "Auto starts on the GPU");
-        picks.record(k, true, 10.0);
-        assert!(!gpu_pick(&auto, false, None), "then measures the CPU");
-        assert_eq!(cap(&auto, false), 2, "and that frame gets the CPU's cap");
-        // Not a frame a playing preview needs: the CPU is unmeasured, so it can't keep up.
-        let playing = Playhead { series: auto.key, cur: 0, start: 0, end: 100, step: 1, looping: false };
-        assert!(gpu_pick(&auto, false, Some(&playing)), "a playing preview's frame stays on the GPU");
-        // Nor a frame someone waits for: the CPU's warm-up goes to background frames.
-        assert!(gpu_pick(&Job { urgent: true, ..auto.clone() }, false, None), "a viewer frame stays on the GPU");
-        // Once both sides are measured and the CPU is the faster, within the target, viewer
-        // frames go there.
         for _ in 0..3 {
             picks.record(k, true, 10.0);
             picks.record(k, false, 5.0);
         }
-        let urgent_cpu = (0..10).filter(|_| !gpu_pick(&Job { urgent: true, ..auto.clone() }, false, None)).count();
-        assert!(urgent_cpu > 0, "a fast CPU still renders viewer frames");
+        assert!((0..100).all(|_| gpu_pick(&auto, false)), "viewer frames stay on the GPU");
+        assert!(cap(&auto, false) > 2, "at the GPU's cap");
+        // A comp the GPU declined renders on the CPU, offering the GPU a frame now and then.
+        picks.declined(k);
+        let on_gpu = (0..100).filter(|_| gpu_pick(&auto, false)).count();
+        assert!((1..10).contains(&on_gpu), "a declined comp offers the GPU {on_gpu} of 100 frames");
     }
 
     /// CR1: a GPU frame that runs out of video memory with eight GPU frames rendering leaves at
