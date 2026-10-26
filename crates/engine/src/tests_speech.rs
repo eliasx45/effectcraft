@@ -313,3 +313,29 @@ fn words_the_dictionary_doesnt_know_get_estimated_syllables() {
     let r = s.execute("speech.import", json!({"map": {"words": [{"word": "YouTube", "start": 1.0, "end": 1.7}]}})).unwrap();
     assert_eq!((r["syllables"].as_u64(), r["guessed"].clone()), (Some(0), json!([])), "{r}");
 }
+
+#[test]
+fn off_accent_on_the_agents_own_keys_is_an_error() {
+    let (mut s, l) = comp();
+    scale_keys(&mut s, l, 1.0, 2.0, false);
+    // The user's keys, 2 frames early: a warning, also when an agent lints.
+    s.execute("speech.import", json!({"map": map(1.52, 1.62)})).unwrap();
+    let lint_as = |s: &mut Session| {
+        let r = s.execute("render.lint", json!({"start": 0, "end": 4, "rules": ["off-accent"], "client": "bot"})).unwrap();
+        r["problems"].as_array().unwrap().clone()
+    };
+    let found = lint_as(&mut s);
+    assert_eq!((found.len(), found[0]["severity"].as_str()), (1, Some("warning")), "{found:#?}");
+    // The agent re-keys the move (its own undo step): its miss blocks.
+    s.execute("prop.addKey", json!({"layer": l, "path": "transform/scale", "value": [161.0, 161.0, 100.0], "time": 2.0, "timeBase": "comp", "client": "bot"}))
+        .unwrap();
+    let peak = lint::speed_peaks(s.active_comp().unwrap(), 0.0, 4.0)[0].time;
+    s.execute("speech.import", json!({"map": map(peak - 0.04, peak + 0.12)})).unwrap();
+    let found = lint_as(&mut s);
+    assert_eq!((found.len(), found[0]["severity"].as_str()), (1, Some("error")), "{found:#?}");
+    assert!(found[0]["message"].as_str().unwrap().contains("You keyed this move"), "{found:#?}");
+    // Another agent (or the user) linting sees a warning: the keys aren't theirs.
+    let r = s.execute("render.lint", json!({"start": 0, "end": 4, "rules": ["off-accent"], "client": "other"})).unwrap();
+    assert_eq!(r["problems"][0]["severity"], "warning", "{r:#}");
+    assert_eq!(off_accent(&mut s)[0]["severity"], "warning");
+}
