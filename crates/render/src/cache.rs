@@ -701,7 +701,7 @@ impl LayerCache {
                 // (A buffer of one frame is seen again later when every frame rendering then
                 // has finished.)
                 let again = if once { seen.is_some_and(|f| g.active.keys().next().is_none_or(|oldest| *oldest > f)) } else { seen.is_some() };
-                (g.missed_at.remove(&key), again)
+                (g.missed_at.remove(&key), again || warming_thread())
             }
             Err(_) => return,
         };
@@ -1043,6 +1043,11 @@ impl LayerCache {
             .unwrap_or_default()
     }
 
+    /// Whether another thread is rendering `key` right now ([`Self::claim`]).
+    pub fn in_flight(&self, key: u64) -> bool {
+        self.inflight.lock().unwrap_or_else(PoisonError::into_inner).map.contains_key(&key)
+    }
+
     /// After a miss on `key`: render it ([`Claim::Owner`], whose drop wakes the waiters), take
     /// the buffer another thread just rendered under it ([`Claim::Ready`]), or render it anyway
     /// ([`Claim::Render`]: this thread is already rendering it further up its stack, or the
@@ -1073,7 +1078,9 @@ impl LayerCache {
                 Some(f) if f.background && !BACKGROUND.get() => return Claim::Render,
                 Some(f) => f.clone(),
                 None => {
-                    if m.map.len() >= 4096 || m.map.try_reserve(1).is_err() {
+                    // A warm-up thread renders without a claim: a frame never waits for its
+                    // small pool (see [`set_warming_thread`]).
+                    if warming_thread() || m.map.len() >= 4096 || m.map.try_reserve(1).is_err() {
                         return Claim::Render;
                     }
                     let f = Arc::new(Flight { owner: me, background: BACKGROUND.get(), done: Mutex::new(false), cv: Condvar::new() });
@@ -1164,6 +1171,25 @@ static WAIT_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub fn wait_timeouts() -> u64 {
     WAIT_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed)
 }
+thread_local! {
+    /// Set on the threads that warm the caches ahead of a playing preview ([`set_warming_thread`]).
+    static WARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the calling thread as one that renders layers ahead of the frames that show them
+/// (playback warm-up of the layers a new section brings in): what it inserts skips probation
+/// and goes straight into the cache proper. On probation it would be flushed by the frames
+/// rendered between the warm-up and the playhead reaching the section, and render again there.
+/// It also never claims a key ([`LayerCache::claim`]): a frame that needs the same layer renders
+/// it itself rather than wait for the warm-up's slower pool.
+pub fn set_warming_thread(on: bool) {
+    WARMING.with(|w| w.set(on));
+}
+
+fn warming_thread() -> bool {
+    WARMING.with(|w| w.get())
+}
+
 /// How long any other thread waits.
 const WAIT_OTHER: std::time::Duration = std::time::Duration::from_secs(30);
 

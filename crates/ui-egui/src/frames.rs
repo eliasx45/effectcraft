@@ -62,6 +62,8 @@ pub mod streamed;
 pub mod times;
 mod vram;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod warmup;
+#[cfg(not(target_arch = "wasm32"))]
 mod workers;
 
 pub(crate) use idle::idle_threads;
@@ -1323,6 +1325,9 @@ pub struct Frames {
     /// Sweeps that take over the frames an edit didn't change ([`fingerprint`]).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     sweeps: fingerprint::Sweeps,
+    /// Warms the layers a playing preview reaches soon ([`warmup`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    warmup: warmup::Warmup,
     /// The threads that read queued frames from the disk cache ahead of the playhead
     /// ([`Worker::read_ahead`]).
     #[cfg(not(target_arch = "wasm32"))]
@@ -1472,6 +1477,8 @@ impl Default for Frames {
             resident: Arc::default(),
             bar: Mutex::default(),
             sweeps: fingerprint::Sweeps::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            warmup: warmup::Warmup::default(),
             #[cfg(not(target_arch = "wasm32"))]
             read_ahead: Arc::default(),
         }
@@ -1991,7 +1998,8 @@ impl Frames {
         let mut queued: Vec<i64> = q.jobs.iter().map(|j| j.key.frame).collect();
         queued.sort_unstable();
         queued.truncate(16);
-        serde_json::json!({
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut state = serde_json::json!({
             "queued": q.jobs.len(),
             "queuedFrames": queued,
             "running": running,
@@ -2002,7 +2010,19 @@ impl Frames {
             "inflight": self.inflight(),
             "layerCacheWaitTimeouts": effectcraft_render::cache::wait_timeouts(),
             "codecQueued": codec,
-        })
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = state.as_object_mut() {
+            m.insert("warmup".into(), self.warmup.stats());
+        }
+        state
+    }
+
+    /// Where the playing preview is (`None`: stopped), for the warm-up of the layers it reaches
+    /// soon ([`warmup`]). Frames rendered elsewhere ([`RemoteFrames`]) need no local warm-up.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn warm_ahead(&self, ahead: Option<warmup::Ahead>) {
+        self.warmup.set(ahead.filter(|_| self.local_workers()));
     }
 
     /// Cached frame numbers of the series of `base` (its comp content, scale, view and render

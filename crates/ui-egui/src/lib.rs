@@ -1912,6 +1912,8 @@ impl EffectcraftApp {
         let was = std::mem::replace(&mut self.playback.playing, false);
         self.frames.set_playhead(None);
         #[cfg(not(target_arch = "wasm32"))]
+        self.frames.warm_ahead(None);
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let shown = self.viewer_shown.as_ref().map(|(_, k)| *k);
             self.cloud_play.stop(&self.frames, shown, self.session.revision);
@@ -2066,6 +2068,17 @@ impl EffectcraftApp {
         // frames in flight, as it drops queued frames the preview no longer reaches.
         let playhead = plan.filter(|p| p.video).map(|p| frames::Playhead { series, cur, start: p.start, end: p.end, step: p.step, looping: p.looping });
         self.frames.set_playhead(playhead);
+        // The layers that enter a few seconds ahead have their sources made in the background
+        // (not for a cloud stream: nothing renders here then).
+        #[cfg(not(target_arch = "wasm32"))]
+        self.frames.warm_ahead(plan.filter(|p| p.video && !self.playback.caching && !streamed).map(|p| frames::warmup::Ahead {
+            src: self.render_source(),
+            comp: cid,
+            opts: self.frame_opts(cid, scale),
+            now: fr.tick_of(cur),
+            end: fr.tick_of(p.end),
+            step: fr.frame_duration(),
+        }));
         // Playing, only this series counts: a ladder rung change leaves the old rung's prefetch
         // queued, which held playback at every Full ↔ Half switch (A4).
         let mut queued = if playhead.is_some() { self.frames.focus_series(&series) } else { self.frames.inflight() };
