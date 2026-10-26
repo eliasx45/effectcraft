@@ -1,8 +1,8 @@
 //! The ease taste check (editing harness step 3): does a keyframed move ease the way Elias eases?
 //!
 //! Every pair of neighbouring keys whose value changes is a *move*. It gets a move type from its
-//! layer ([`MoveType`]: an entrance from invisible, an exit, an on-screen move, a fade, a scale
-//! pop from 0) and is judged on five criteria learned from his finished comps (25 Oct 2026,
+//! layer ([`MoveType`]: an entrance from invisible or off the frame, an exit, an on-screen move,
+//! a fade, a scale pop from 0, a one-axis scrub from an edge) and is judged on five criteria learned from his finished comps (25 Oct 2026,
 //! 20-08 + 10-10: 730 moves plus 101 keys he changed after an agent handed a comp over):
 //!
 //! 1. **Peak position**: where the speed peaks in the move. Entrances peak early, exits late,
@@ -24,6 +24,7 @@
 
 use effectcraft_keyframe::{Interp, Keyframe, Value as KValue, side_ease, spatial_segment_length};
 use effectcraft_project::{Comp, Layer, LayerId, Property, Uid};
+use effectcraft_render::EvalCtx;
 use effectcraft_time::Tick;
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +44,10 @@ const INVISIBLE: f64 = 5.0;
 const OFF_FRAME: f64 = 40.0;
 /// Most child layers looked at to tell whether a rig null's move is an entrance.
 const MAX_CHILDREN: usize = 64;
+/// Deepest parenting chain followed down to the drawn layers a rig moves.
+const MAX_DEPTH: usize = 16;
+/// An anchor this close to the content's edge (share of its size) makes a one-axis scale a scrub.
+const EDGE_ANCHOR: f64 = 0.03;
 
 // ---------------------------------------------------------------- the profile
 
@@ -60,13 +65,24 @@ pub enum MoveType {
     FadeOut,
     /// Scale from ≈ 0 up (the kick under a Motion Library Bounce).
     ScalePop,
+    /// One axis of Scale grows or shrinks from an anchor on the content's edge (a progress bar
+    /// filling, a wipe): peaks like an on-screen move.
+    Scrub,
     /// Any other animated property: only the hard fails apply.
     Other,
 }
 
 impl MoveType {
-    pub const ALL: [MoveType; 7] =
-        [MoveType::Entrance, MoveType::Exit, MoveType::Move, MoveType::FadeIn, MoveType::FadeOut, MoveType::ScalePop, MoveType::Other];
+    pub const ALL: [MoveType; 8] = [
+        MoveType::Entrance,
+        MoveType::Exit,
+        MoveType::Move,
+        MoveType::FadeIn,
+        MoveType::FadeOut,
+        MoveType::ScalePop,
+        MoveType::Scrub,
+        MoveType::Other,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -76,6 +92,7 @@ impl MoveType {
             MoveType::FadeIn => "fade-in",
             MoveType::FadeOut => "fade-out",
             MoveType::ScalePop => "scale-pop",
+            MoveType::Scrub => "scrub",
             MoveType::Other => "other",
         }
     }
@@ -88,6 +105,7 @@ impl MoveType {
             MoveType::FadeIn => "fade in",
             MoveType::FadeOut => "fade out",
             MoveType::ScalePop => "scale pop from 0",
+            MoveType::Scrub => "scrub / wipe (one-axis scale from an edge)",
             MoveType::Other => "other property",
         }
     }
@@ -189,6 +207,8 @@ pub struct Rules {
     pub sharp_b: f64,
     /// Fastest position frame, in percent of the comp's width per frame.
     pub speed_cap: f64,
+    /// The same for exits (his row exits leave at up to ≈ 21 %).
+    pub exit_speed_cap: f64,
     /// Entrances spend at least this percent of their frames on the last 10 % of the travel.
     pub entrance_tail_min: f64,
     /// A shape within this (largest gap in progress, %) of an approved curve is that curve.
@@ -206,6 +226,7 @@ impl Default for Rules {
             sharp_a: 1.3,
             sharp_b: 2.05,
             speed_cap: 18.0,
+            exit_speed_cap: 22.0,
             entrance_tail_min: 30.0,
             match_within: 5.0,
         }
@@ -539,6 +560,53 @@ fn hidden(comp: &Comp, l: &Layer, ct: Tick, frame: Tick) -> bool {
     is_null && !kids.is_empty() && kids.iter().all(|c| invisible(c, ct, frame))
 }
 
+/// The drawn layers whose place `l` sets: `l` itself when it has a picture, and every layer
+/// parented to it (directly or further down) that has one.
+fn drawn_parts<'a>(comp: &'a Comp, l: &'a Layer) -> Vec<&'a Layer> {
+    let drawn = |x: &Layer| x.source.is_av() && x.switches.video && !x.switches.guide;
+    let mut out: Vec<&Layer> = if drawn(l) { vec![l] } else { vec![] };
+    let mut frontier = vec![l.id];
+    let mut seen = 0usize;
+    for _ in 0..MAX_DEPTH {
+        if frontier.is_empty() || seen >= MAX_CHILDREN {
+            break;
+        }
+        let kids: Vec<&Layer> = comp.layers.iter().filter(|c| c.parent.is_some_and(|p| frontier.contains(&p))).take(MAX_CHILDREN).collect();
+        seen += kids.len();
+        frontier = kids.iter().map(|c| c.id).collect();
+        out.extend(kids.into_iter().filter(|c| drawn(c)));
+    }
+    out
+}
+
+/// Whether nothing `l` places shows at comp time `ct`: every drawn part is off (in/out point,
+/// opacity 0) or its content box lies wholly outside the frame. `None` when that can't be told
+/// (no drawn part, or none with a content box).
+fn out_of_frame(ctx: &EvalCtx, l: &Layer, ct: Tick) -> Option<bool> {
+    let parts = drawn_parts(ctx.comp, l);
+    let c = ctx.at(ct);
+    let (w, h) = (ctx.comp.width as f64, ctx.comp.height as f64);
+    let frame = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+    let mut measured = false;
+    for x in parts {
+        if !crate::layout::visibility(&c, x).0 {
+            continue;
+        }
+        let Some(g) = crate::layout::layer_geometry(&c, x) else { continue };
+        if !g.projected || !g.corners.iter().flatten().all(|v| v.is_finite()) {
+            continue;
+        }
+        measured = true;
+        let inside = crate::layout::polygon_area(&crate::layout::clip_convex(&g.corners, &frame));
+        if inside > 1.0 {
+            return Some(false);
+        }
+    }
+    measured.then_some(true)
+}
+
+/// Whether the anchor-only fallback puts `v` (a Position value) off the frame: only for
+/// unparented layers, whose Position is in comp pixels.
 fn off_frame(comp: &Comp, l: &Layer, v: &KValue) -> bool {
     if l.parent.is_some() {
         return false;
@@ -549,8 +617,25 @@ fn off_frame(comp: &Comp, l: &Layer, v: &KValue) -> bool {
     x < -OFF_FRAME || y < -OFF_FRAME || x > w + OFF_FRAME || y > h + OFF_FRAME
 }
 
+/// Whether a Scale move `a → b` (layer time `t`) changes one axis only, from an anchor on the
+/// content's edge along that axis.
+fn scrub(ctx: &EvalCtx, l: &Layer, ca: &[f64], cb: &[f64], t: Tick) -> bool {
+    let d = |k: usize| (cb.get(k).copied().unwrap_or(0.0) - ca.get(k).copied().unwrap_or(0.0)).abs();
+    let axis = match (d(0) > 0.5, d(1) > 0.5) {
+        (true, false) => 0,
+        (false, true) => 1,
+        _ => return false,
+    };
+    let Some(b) = effectcraft_render::content_bounds(&ctx.at(l.comp_time(t)), l) else { return false };
+    let anchor = l.transform().and_then(|g| g.prop("anchor")).map(|p| p.value_at(t).components()).unwrap_or_default();
+    let (Some(&lo), Some(&hi), Some(&at)) = (b.get(axis), b.get(axis + 2), anchor.get(axis)) else { return false };
+    let size = (hi - lo).abs();
+    size > 1e-6 && ((at - lo).abs() <= EDGE_ANCHOR * size || (hi - at).abs() <= EDGE_ANCHOR * size)
+}
+
 /// The move type of key pair `i` → `i + 1` of `prop` (match id `m`) on `l`.
-pub fn classify(comp: &Comp, l: &Layer, m: &str, prop: &Property, i: usize) -> MoveType {
+pub fn classify(ctx: &EvalCtx, l: &Layer, m: &str, prop: &Property, i: usize) -> MoveType {
+    let comp = ctx.comp;
     let (Some(a), Some(b)) = (prop.keys.get(i), prop.keys.get(i + 1)) else { return MoveType::Other };
     let (ca, cb) = (a.value.components(), b.value.components());
     let first = |c: &[f64]| c.first().copied().unwrap_or(0.0);
@@ -559,6 +644,9 @@ pub fn classify(comp: &Comp, l: &Layer, m: &str, prop: &Property, i: usize) -> M
     }
     if !checked_match(m) {
         return MoveType::Other;
+    }
+    if m == "scale" && scrub(ctx, l, &ca, &cb, a.time) {
+        return MoveType::Scrub;
     }
     let tiny = |c: &[f64]| !c.is_empty() && c.iter().take(2).all(|s| s.abs() <= INVISIBLE);
     if m == "scale" && tiny(&ca) {
@@ -569,12 +657,15 @@ pub fn classify(comp: &Comp, l: &Layer, m: &str, prop: &Property, i: usize) -> M
     }
     let frame = comp.frame_rate.frame_duration();
     let (t0, t1) = (l.comp_time(a.time), l.comp_time(b.time));
-    let is_pos = m == "position";
-    if hidden(comp, l, t0, frame) || (is_pos && off_frame(comp, l, &a.value)) {
+    let is_pos = m == "position" || m.ends_with("Position");
+    // Off the frame: the content boxes of what the layer places (itself, a rig's children), or
+    // for a layer with none to measure, its own Position.
+    let gone = |t: Tick, v: &KValue| out_of_frame(ctx, l, t).unwrap_or_else(|| m == "position" && off_frame(comp, l, v));
+    if hidden(comp, l, t0, frame) || (is_pos && gone(t0, &a.value)) {
         return MoveType::Entrance;
     }
     // The last frame of a layer that ends with its move counts as gone.
-    if hidden(comp, l, t1, frame) || (is_pos && off_frame(comp, l, &b.value)) || t1 + frame >= l.out_point {
+    if hidden(comp, l, t1, frame) || (is_pos && gone(t1, &b.value)) || t1 + frame >= l.out_point {
         return MoveType::Exit;
     }
     MoveType::Move
@@ -638,10 +729,12 @@ fn speed_jump(prop: &Property, i: usize) -> Option<(f64, f64)> {
     (opposite || si.abs().min(so.abs()) < 0.5 * big).then_some((si, so))
 }
 
-/// Judge every move of `comp`'s layers whose keys overlap `start..=end` (comp seconds); `only`
+/// Judge every move of `ctx.comp`'s layers whose keys overlap `start..=end` (comp seconds); `only`
 /// limits it to some layers. Moves on properties other than position, scale, rotation and
-/// opacity are only checked for the hard fails, and only with `all`.
-pub fn check(profile: &Profile, comp: &Comp, only: Option<&[LayerId]>, start: f64, end: f64, all: bool) -> (Vec<Judged>, bool) {
+/// opacity are only checked for the hard fails, and only with `all`. (`ctx` gives the project,
+/// for the content boxes of what a layer places.)
+pub fn check(profile: &Profile, ctx: &EvalCtx, only: Option<&[LayerId]>, start: f64, end: f64, all: bool) -> (Vec<Judged>, bool) {
+    let comp = ctx.comp;
     let mut out: Vec<Judged> = vec![];
     let mut truncated = false;
     let fps = comp.frame_rate.as_f64();
@@ -679,11 +772,11 @@ pub fn check(profile: &Profile, comp: &Comp, only: Option<&[LayerId]>, start: f6
                 // A baked run is one finding, on its first pair.
                 if let Some(&(r0, r1)) = runs.iter().find(|(r0, r1)| (*r0..*r1).contains(&i)) {
                     if i == r0 {
-                        out.push(judged_baked(profile, comp, l, p, &path, i, r1, fps));
+                        out.push(judged_baked(profile, ctx, l, p, &path, i, r1, fps));
                     }
                     continue;
                 }
-                out.push(judge(profile, comp, l, p, &path, i, fps));
+                out.push(judge(profile, ctx, l, p, &path, i, fps));
             }
         }
     }
@@ -716,9 +809,9 @@ fn base(comp: &Comp, l: &Layer, p: &Property, path: &str, i: usize, j: usize, fp
 }
 
 #[allow(clippy::too_many_arguments)]
-fn judged_baked(profile: &Profile, comp: &Comp, l: &Layer, p: &Property, path: &str, i: usize, last: usize, fps: f64) -> Judged {
-    let kind = classify(comp, l, p.match_id.as_str(), p, i);
-    let mut j = base(comp, l, p, path, i, last, fps, kind);
+fn judged_baked(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, i: usize, last: usize, fps: f64) -> Judged {
+    let kind = classify(ctx, l, p.match_id.as_str(), p, i);
+    let mut j = base(ctx.comp, l, p, path, i, last, fps, kind);
     j.blocking = profile.blocks(kind);
     j.problems.push(format!("baked: {} keys one frame apart", last - i + 1));
     j.message = format!(
@@ -741,9 +834,10 @@ fn nearest<'a>(list: &[&'a Curve], m: (Side, Side), secs: f64) -> Option<(&'a Cu
 }
 
 #[allow(clippy::too_many_arguments)]
-fn judge(profile: &Profile, comp: &Comp, l: &Layer, p: &Property, path: &str, i: usize, fps: f64) -> Judged {
+fn judge(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, i: usize, fps: f64) -> Judged {
+    let comp = ctx.comp;
     let m = p.match_id.as_str();
-    let kind = classify(comp, l, m, p, i);
+    let kind = classify(ctx, l, m, p, i);
     let mut j = base(comp, l, p, path, i, i + 1, fps, kind);
     j.blocking = profile.blocks(kind);
     let r = &profile.rules;
@@ -787,8 +881,11 @@ fn judge(profile: &Profile, comp: &Comp, l: &Layer, p: &Property, path: &str, i:
                 j.problems.push(format!("peaks at {pos:.0} % of the move: entrances peak in the first {:.0} %", r.entrance_peak_max))
             }
             MoveType::Exit if pos < r.exit_peak_min => j.problems.push(format!("peaks at {pos:.0} %: exits peak after {:.0} %", r.exit_peak_min)),
-            MoveType::Move if pos < r.move_peak.0 || pos > r.move_peak.1 => {
-                j.problems.push(format!("peaks at {pos:.0} %: on-screen moves peak between {:.0} and {:.0} %", r.move_peak.0, r.move_peak.1))
+            MoveType::Move | MoveType::Scrub if pos < r.move_peak.0 || pos > r.move_peak.1 => {
+                {
+                let what = if kind == MoveType::Scrub { "scrubs" } else { "on-screen moves" };
+                j.problems.push(format!("peaks at {pos:.0} %: {what} peak between {:.0} and {:.0} %", r.move_peak.0, r.move_peak.1))
+            }
             }
             MoveType::FadeIn if pos > r.fade_in_peak_max => {
                 j.problems.push(format!("peaks at {pos:.0} %: fade-ins peak in the first {:.0} %", r.fade_in_peak_max))
@@ -814,8 +911,9 @@ fn judge(profile: &Profile, comp: &Comp, l: &Layer, p: &Property, path: &str, i:
         let pct = shape.peak_share * dv / (comp.width.max(1) as f64) * 100.0;
         j.px_per_frame = Some((shape.peak_share * dv * 10.0).round() / 10.0);
         j.frame_pct = Some((pct * 10.0).round() / 10.0);
-        if pct > r.speed_cap {
-            j.problems.push(format!("too fast: {pct:.0} % of the frame's width in one frame at its peak (cap {:.0} %)", r.speed_cap));
+        let cap = if kind == MoveType::Exit { r.exit_speed_cap } else { r.speed_cap };
+        if pct > cap {
+            j.problems.push(format!("too fast: {pct:.0} % of the frame's width in one frame at its peak (cap {cap:.0} %)"));
         }
     }
     // The shape against his curves.
@@ -877,10 +975,10 @@ pub struct Found {
     pub nearest: Option<(String, f64)>,
 }
 
-pub fn unmatched_curves(profile: &Profile, comps: &[(&str, &Comp)], max_groups: usize) -> Vec<Found> {
+pub fn unmatched_curves(profile: &Profile, comps: &[(&str, EvalCtx)], max_groups: usize) -> Vec<Found> {
     let mut groups: Vec<Found> = vec![];
-    for (cname, comp) in comps {
-        let (moves, _) = check(profile, comp, None, f64::MIN, f64::MAX, false);
+    for (cname, ctx) in comps {
+        let (moves, _) = check(profile, ctx, None, f64::MIN, f64::MAX, false);
         for mv in moves {
             let Some(ease) = mv.ease else { continue };
             if mv.frames < 2.5 || mv.problems.iter().any(|p| p.starts_with("linear") || p.starts_with("baked")) {

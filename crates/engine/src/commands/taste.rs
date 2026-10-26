@@ -7,6 +7,8 @@
 //! rejects one. The lint rule `off-taste` (`render.lint`) runs the same check.
 
 use effectcraft_project::{ItemId, LayerId};
+use effectcraft_render::EvalCtx;
+use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use super::peak::{Graph, apply_graph};
@@ -133,7 +135,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     let (start, end) = span(s, p, cid)?;
     let only = only_p(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
-    let (mut moves, truncated) = taste::check(&prof, comp, only.as_deref(), start, end, b_p(p, "all").unwrap_or(false));
+    let (mut moves, truncated) = taste::check(&prof, &EvalCtx::new(&s.project, cid, comp, Tick::ZERO), only.as_deref(), start, end, b_p(p, "all").unwrap_or(false));
     let (ok, close, off, blocking) = taste::summary(&moves);
     if b_p(p, "problemsOnly").unwrap_or(false) {
         moves.retain(|m| m.verdict != Verdict::Approved);
@@ -184,7 +186,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         / 100.0;
     let want = str_p(p, "curve").unwrap_or("nearest");
     let curve: Curve = if taste::squash(want) == "nearest" {
-        let (moves, _) = taste::check(&prof, comp, Some(&[lid]), f64::MIN, f64::MAX, true);
+        let (moves, _) = taste::check(&prof, &EvalCtx::new(&s.project, cid, comp, Tick::ZERO), Some(&[lid]), f64::MIN, f64::MAX, true);
         let m = moves
             .iter()
             .find(|m| m.at.uid == uid && m.at.key == key)
@@ -225,7 +227,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     })?;
     let note = if curve.status == Status::Candidate { " (⏳ not approved by Elias yet)" } else { "" };
     let after = s.project.comp(cid).and_then(|c| {
-        let (moves, _) = taste::check(&prof, c, Some(&[lid]), f64::MIN, f64::MAX, true);
+        let (moves, _) = taste::check(&prof, &EvalCtx::new(&s.project, cid, c, Tick::ZERO), Some(&[lid]), f64::MIN, f64::MAX, true);
         moves.into_iter().find(|m| m.at.uid == uid && m.at.key == key)
     });
     Ok(json!({
@@ -290,7 +292,7 @@ fn propose(s: &mut Session, p: &Value) -> Result<Value> {
         let (cid, lid, uid) = prop_ref(s, p, C)?;
         let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
         let key = p.get("key").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let (moves, _) = taste::check(&prof, comp, Some(&[lid]), f64::MIN, f64::MAX, true);
+        let (moves, _) = taste::check(&prof, &EvalCtx::new(&s.project, cid, comp, Tick::ZERO), Some(&[lid]), f64::MIN, f64::MAX, true);
         let m = moves.iter().find(|m| m.at.uid == uid && m.at.key == key).ok_or_else(|| bad(C, "that key pair isn't an eased move"))?;
         let (o, i) = m.ease.ok_or_else(|| bad(C, "that move has no ease to read (linear?)"))?;
         if roles.is_empty() {
@@ -369,8 +371,11 @@ fn learn(s: &mut Session, p: &Value) -> Result<Value> {
             .map(|(id, _)| *id)
             .collect(),
     };
-    let comps: Vec<(&str, &effectcraft_project::Comp)> =
-        ids.iter().take(MAX_LEARN_COMPS).filter_map(|id| Some((s.project.item(*id)?.name.as_str(), s.project.comp(*id)?))).collect();
+    let comps: Vec<(&str, EvalCtx)> = ids
+        .iter()
+        .take(MAX_LEARN_COMPS)
+        .filter_map(|id| Some((s.project.item(*id)?.name.as_str(), EvalCtx::new(&s.project, *id, s.project.comp(*id)?, Tick::ZERO))))
+        .collect();
     let found = taste::unmatched_curves(&prof, &comps, MAX_GROUPS);
     let keep: Vec<&taste::Found> = found.iter().filter(|f| f.uses >= min_uses).collect();
     let mut saved = vec![];
@@ -436,7 +441,7 @@ fn graph(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let w = p.get("width").and_then(Value::as_u64).unwrap_or(1280).min(u32::MAX as u64) as u32;
     let h = p.get("height").and_then(Value::as_u64).unwrap_or(720).min(u32::MAX as u64) as u32;
-    let (moves, _) = taste::check(&prof, comp, Some(&[lid]), t0, t1, true);
+    let (moves, _) = taste::check(&prof, &EvalCtx::new(&s.project, cid, comp, Tick::ZERO), Some(&[lid]), t0, t1, true);
     let mine: Vec<&Judged> = moves.iter().filter(|m| m.at.uid == uid).collect();
     let path = crate::commands::match_path_of(&l.props, uid).unwrap_or_else(|| pr.name.clone());
     let comp_name = s.project.item(cid).map(|i| i.name.clone()).unwrap_or_default();

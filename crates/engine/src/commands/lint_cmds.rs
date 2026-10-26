@@ -197,7 +197,7 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
 
     if set.on("off-taste") {
         let (prof, _) = crate::taste::Profile::load(s.config.as_deref());
-        let (moves, truncated) = crate::taste::check(&prof, comp, None, span.0, span.1, false);
+        let (moves, truncated) = crate::taste::check(&prof, &effectcraft_render::EvalCtx::new(&s.project, cid, comp, effectcraft_time::Tick::ZERO), None, span.0, span.1, false);
         let (ok, close, off, blocking) = crate::taste::summary(&moves);
         notes.push(format!(
             "off-taste: {} moves judged against Elias's ease profile: ✅ {ok} · 🟡 {close} · ❌ {off} ({blocking} blocking){}; taste.check lists them with fixes",
