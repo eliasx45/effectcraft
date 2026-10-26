@@ -1736,6 +1736,32 @@ impl Frames {
         self.gpu_retired.store(false, Ordering::Release);
     }
 
+    /// The GPU compositor came up after viewer frames were drawn without one (its kernels build
+    /// in the background at launch, up to a minute after a rebuild): those frames render again,
+    /// on the GPU, so the Render Time pane doesn't keep calling them CPU frames.
+    pub fn gpu_arrived(&self) {
+        let keys: Vec<FrameKey> = match self.cache.lock() {
+            Ok(cache) => cache.map.keys().copied().collect(),
+            Err(_) => return,
+        };
+        let no_gpu = Some(effectcraft_engine::render::cpu_why::NO_GPU);
+        let stale: Vec<FrameKey> = keys.into_iter().filter(|k| self.times.get(k).is_some_and(|t| t.frame_cpu == no_gpu)).collect();
+        if stale.is_empty() {
+            return;
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            for key in &stale {
+                cache.remove(key);
+            }
+            let Cache { map, order, .. } = &mut *cache;
+            order.retain(|key| map.contains_key(key));
+            cache.sync_meter();
+        }
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+
     /// RT10e: show GPU viewer frames straight from their textures (`true`, the compositor shares
     /// egui's device) or read them back as now (`false`). See [`resident`].
     #[cfg(not(target_arch = "wasm32"))]

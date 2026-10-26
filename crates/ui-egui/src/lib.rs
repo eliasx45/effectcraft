@@ -1290,6 +1290,8 @@ impl EffectcraftApp {
                 }
                 if replacing {
                     self.frames.revive_gpu();
+                } else {
+                    self.frames.gpu_arrived();
                 }
                 // RT10e: frames stay textures when the compositor is on egui's device.
                 self.zero_copy.active = shares_window_device(&g, &rs.device) && !cfg!(target_arch = "wasm32");
