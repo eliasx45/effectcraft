@@ -27,14 +27,32 @@ the history at the end of this file.
 | D12 | **North star: Elias's edits after handover.** Fewer property changes he makes to a comp an agent handed over = better. Exam pass^3, cost and minutes are secondary | 26 Oct |
 | D13 | **Small eval runs to start:** a handful of tasks × 3 trials per driver and model, then decide whether to scale to the full exam | 26 Oct |
 
+| D14 | **API budget: $200 of promotional API credits** for B and other key-billed runs (check their expiry date in the Claude Console) | 26 Oct |
+| D15 | **A third driver: Codex CLI on Elias's ChatGPT/Codex plan.** Another outside harness (OpenAI's agent loop and GPT models) on the same EC MCP tools and the same policy core: Codex reads MCP servers from `~/.codex/config.toml` and has hooks, including a `Stop` hook that can block. Kimi comes later (through Claude Code's `ANTHROPIC_BASE_URL`). The same rule as D7: Codex's plan only runs the unmodified Codex CLI, never B | 26 Oct |
+| D16 | **Continue locally on the Mac** by teleporting this cloud session (`claude --teleport <session-id>`). The first eval runs happen there | 26 Oct |
+
 ### Open questions (ask Elias)
 
 | # | Question | Why it matters |
 |---|---|---|
-| Q1 | The monthly API cap for B and for the non-Claude model's key | Sets how often B and M1 can run |
-| Q3 | Where do the `ec-handover-snap` snapshots live, and may they become local eval tasks? | E3 and D12: the north star is measured from them |
-| Q6 | Which non-Claude model (Kimi, or another with an Anthropic-compatible endpoint)? | M1 |
-| Q7 | Which handful of tasks for the first small runs? Suggested: `easy-ease`, `lower-third`, `logo-fly-in`, `parenting`, `fix-layout` (ease, layout, rig, repair) | D13 |
+| Q3 | Where do the `ec-handover-snap` snapshots live on the Mac (look in `~/.claude/settings.json` under `hooks` → `Stop`), and may they become local eval tasks? | E3 and D12: the north star is measured from them |
+| Q7 | Which handful of tasks for the first small runs? Decide on the Mac. Suggested: `easy-ease`, `lower-third`, `logo-fly-in`, `parenting`, `fix-layout` | D13 |
+| Q8 | Does `codex exec` (Codex without its interface, for scripts) run on the ChatGPT plan, or only with an API key? Check `codex login status` and OpenAI's docs on the Mac | D15 evals |
+
+### Words used here
+
+- **Harness / driver / loop:** the program around the model that sends prompts, runs tools and decides when to stop. Claude Code, Codex CLI and our own Rust loop are three.
+- **Policy core:** our rules, written once in Rust, that every driver calls.
+- **Hook:** a command a driver runs at a fixed moment, such as before a tool call or when the agent wants to stop. It can add text or block.
+- **MCP:** the standard plug that lets any agent use EffectCraft's tools.
+- **Eval:** a measured test of the agent. Task + trial (one run) + grader (what scores it).
+- **pass^k:** all k runs of a task pass.
+- **Trace:** the full record of one run.
+- **Handover:** the agent says it's done and gives you the comp.
+- **Snapshot:** a saved copy of a comp at a moment.
+- **Headless:** run without a window or interface, from a script.
+- **API key / credits:** pay-per-use access to a model, separate from a subscription.
+- **Teleport:** pull a cloud Claude Code session into your own terminal.
 
 ## 1. What agentloop is, briefly
 
@@ -402,4 +420,5 @@ likely the cleaner product.
 |---|---|
 | 26 Oct | First version: map, gaps, evals primer, routes A/B/C, plan |
 | 26 Oct | Decisions D1–D9 and open questions; plan reworked for both drivers on one policy core; terms (§7); embedding analysis (§8) |
+| 26 Oct | D14–D16 (API credits, Codex driver, teleport to the Mac), glossary, Q3/Q7/Q8 |
 | 26 Oct | D10–D13 from Elias's answers (parallel drivers, models, north star, small runs); open questions Q1, Q3, Q6, Q7 |
