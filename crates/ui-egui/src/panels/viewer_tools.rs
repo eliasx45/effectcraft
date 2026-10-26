@@ -141,8 +141,8 @@ pub(crate) fn draw_snap(ctx: &egui::Context, painter: &egui::Painter, map: &View
 pub(crate) const RULER: f32 = 16.0;
 
 /// The viewer area left for the image once the rulers (View ▸ Show Rulers) take their strips.
-pub(crate) fn inset(app: &EffectcraftApp, area: Rect) -> Rect {
-    if app.ui.viewer.rulers { Rect::from_min_max(area.min + vec2(RULER, RULER), area.max) } else { area }
+pub(crate) fn inset(app: &dyn TimelineHost, area: Rect) -> Rect {
+    if app.ui().viewer.rulers { Rect::from_min_max(area.min + vec2(RULER, RULER), area.max) } else { area }
 }
 
 fn nice(raw: f64) -> f64 {
@@ -162,11 +162,11 @@ fn nice(raw: f64) -> f64 {
 /// Draw the rulers (ticks relative to the zero point, live pointer markers) and handle their
 /// gestures: drag from a ruler to add a guide, drag the corner to move the zero point
 /// (double-click resets it).
-pub(crate) fn rulers(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMap, outer: Rect, inner: Rect) {
-    if !app.ui.viewer.rulers {
+pub(crate) fn rulers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, map: &ViewerMap, outer: Rect, inner: Rect) {
+    if !app.ui().viewer.rulers {
         return;
     }
-    let t = app.tokens;
+    let t = app.tokens();
     let p = ui.painter().clone();
     let top = Rect::from_min_max(pos2(inner.min.x, outer.min.y), pos2(inner.max.x, inner.min.y));
     let left = Rect::from_min_max(pos2(outer.min.x, inner.min.y), pos2(inner.min.x, inner.max.y));
@@ -177,7 +177,7 @@ pub(crate) fn rulers(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMa
     }
     p.line_segment([top.left_bottom(), top.right_bottom()], Stroke::new(1.0, t.separator));
     p.line_segment([left.right_top(), left.right_bottom()], Stroke::new(1.0, t.separator));
-    let o = app.ui.viewer.ruler_origin;
+    let o = app.ui().viewer.ruler_origin;
     let zoom = map.zoom as f64;
     let step = nice(64.0 / zoom.max(1e-6));
     let minor = step / if (step / nice(step / 2.0) - 2.0).abs() < 1e-9 { 2.0 } else { 5.0 };
@@ -229,7 +229,7 @@ pub(crate) fn rulers(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMa
     let cr = ui
         .interact(corner, egui::Id::new("vw-ruler-origin"), Sense::click_and_drag())
         .on_hover_text(crate::i18n::tr("Ruler zero point (drag to move, double-click to reset)"));
-    app.auto.add("viewer.ruler.origin", corner, "Ruler zero point");
+    app.auto_mut().add("viewer.ruler.origin", corner, "Ruler zero point");
     let fg = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("vw-ruler-fg")));
     if cr.dragged()
         && let Some(hp) = cr.interact_pointer_pos()
@@ -241,16 +241,16 @@ pub(crate) fn rulers(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMa
         && let Some(hp) = cr.interact_pointer_pos()
     {
         let c = map.to_comp(hp);
-        app.ui.viewer.ruler_origin = [c[0].round(), c[1].round()];
+        app.ui_mut().viewer.ruler_origin = [c[0].round(), c[1].round()];
     }
     if cr.double_clicked() {
-        app.ui.viewer.ruler_origin = [0.0, 0.0];
+        app.ui_mut().viewer.ruler_origin = [0.0, 0.0];
     }
     // Guides dragged out of the rulers: the top ruler makes horizontal guides, the left one
     // vertical guides.
     for (r, vertical, id) in [(top, false, "top"), (left, true, "left")] {
         let resp = ui.interact(r, egui::Id::new(("vw-ruler", id)), Sense::drag()).on_hover_text(crate::i18n::tr("Drag to create a guide"));
-        app.auto.add(&format!("viewer.ruler.{id}"), r, if vertical { "Vertical ruler" } else { "Horizontal ruler" });
+        app.auto_mut().add(&format!("viewer.ruler.{id}"), r, if vertical { "Vertical ruler" } else { "Horizontal ruler" });
         if resp.hovered() {
             ui.ctx().set_cursor_icon(if vertical { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::ResizeVertical });
         }
@@ -270,23 +270,23 @@ pub(crate) fn rulers(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMa
         {
             let c = map.to_comp(hp);
             let pos = if vertical { c[0] } else { c[1] }.round();
-            let r = app.session.execute("view.addGuide", json!({"orientation": if vertical { "vertical" } else { "horizontal" }, "position": pos}));
+            let r = app.session_mut().execute("view.addGuide", json!({"orientation": if vertical { "vertical" } else { "horizontal" }, "position": pos}));
             if let Err(e) = r {
-                app.ui.status = e.to_string();
+                app.ui_mut().status = e.to_string();
             }
-            app.ui.viewer.guides = true;
+            app.ui_mut().viewer.guides = true;
         }
     }
 }
 
-pub(crate) fn guide_color(app: &EffectcraftApp) -> Color32 {
-    let [r, g, b] = super::viewer::hex_rgb(&app.session.prefs.grids.guide_color).unwrap_or([0x3c, 0xc8, 0xf0]);
+pub(crate) fn guide_color(app: &dyn TimelineHost) -> Color32 {
+    let [r, g, b] = super::viewer::hex_rgb(&app.session().prefs.grids.guide_color).unwrap_or([0x3c, 0xc8, 0xf0]);
     Color32::from_rgb(r, g, b)
 }
 
 /// The guide under a screen point (visible, unlocked guides only): (index, vertical).
-pub(crate) fn guide_at(app: &EffectcraftApp, comp: &Comp, map: &ViewerMap, pos: Pos2) -> Option<(usize, bool)> {
-    if !app.ui.viewer.guides || app.ui.viewer.lock_guides {
+pub(crate) fn guide_at(app: &dyn TimelineHost, comp: &Comp, map: &ViewerMap, pos: Pos2) -> Option<(usize, bool)> {
+    if !app.ui().viewer.guides || app.ui().viewer.lock_guides {
         return None;
     }
     comp.guides.iter().enumerate().find_map(|(i, g)| {
@@ -299,11 +299,11 @@ pub(crate) fn guide_at(app: &EffectcraftApp, comp: &Comp, map: &ViewerMap, pos: 
 
 /// Proportional grid (Grid and guide options ▸ Proportional Grid): Settings ▸ Grids & Guides
 /// horizontal × vertical cells over the comp.
-pub(crate) fn proportional_grid(app: &EffectcraftApp, painter: &egui::Painter, comp_rect: Rect) {
-    if !app.ui.viewer.proportional_grid {
+pub(crate) fn proportional_grid(app: &dyn TimelineHost, painter: &egui::Painter, comp_rect: Rect) {
+    if !app.ui().viewer.proportional_grid {
         return;
     }
-    let g = &app.session.prefs.grids;
+    let g = &app.session().prefs.grids;
     let [r, gg, b] = super::viewer::hex_rgb(&g.grid_color).unwrap_or([120, 160, 255]);
     let s = Stroke::new(1.0, Color32::from_rgba_unmultiplied(r, gg, b, 110));
     let (nx, ny) = (g.proportional_horizontal.max(1), g.proportional_vertical.max(1));
@@ -315,6 +315,134 @@ pub(crate) fn proportional_grid(app: &EffectcraftApp, painter: &egui::Painter, c
         let y = comp_rect.min.y + comp_rect.height() * i as f32 / ny as f32;
         super::viewer::styled_line(painter, [pos2(comp_rect.min.x, y), pos2(comp_rect.max.x, y)], s, &g.grid_style);
     }
+}
+
+/// The "Choose grid and guide options" menu: (entry, on) in its order; "-" is a separator.
+pub fn grid_options(app: &dyn TimelineHost) -> Vec<(String, bool)> {
+    let v = &app.ui().viewer;
+    vec![
+        ("Title/Action Safe".to_string(), v.safe_margins),
+        ("Proportional Grid".to_string(), v.proportional_grid),
+        ("Grid".to_string(), v.grid),
+        ("Guides".to_string(), v.guides),
+        ("Rulers".to_string(), v.rulers),
+        ("-".to_string(), false),
+        ("3D Reference Axes".to_string(), app.session().prefs.three_d.show_reference_axes),
+    ]
+}
+
+/// Turn entry `index` of [`grid_options`] on or off (a separator or junk index does nothing).
+pub fn toggle_grid_option(app: &mut dyn TimelineHost, index: usize) {
+    if index == 6 {
+        let a = &mut app.session_mut().prefs.three_d.show_reference_axes;
+        *a = !*a;
+        return;
+    }
+    let v = &mut app.ui_mut().viewer;
+    match index {
+        0 => v.safe_margins = !v.safe_margins,
+        1 => v.proportional_grid = !v.proportional_grid,
+        2 => v.grid = !v.grid,
+        3 => v.guides = !v.guides,
+        4 => v.rulers = !v.rulers,
+        _ => {}
+    }
+}
+
+/// Title/action safe, the grid, the proportional grid and the comp's guides over the comp picture
+/// `comp_rect` (`area`: the viewer area guides run across; `zoom`: screen points per comp
+/// pixel), each only while it is turned on (View menu, Choose grid and guide options).
+pub(crate) fn draw_view_guides(app: &dyn TimelineHost, painter: &egui::Painter, comp: &Comp, comp_rect: Rect, area: Rect, zoom: f32) {
+    use super::viewer::{hex_rgb, styled_line};
+    if !comp_rect.is_finite() || !area.is_finite() || !zoom.is_finite() || zoom <= 0.0 {
+        return;
+    }
+    let v = &app.ui().viewer;
+    let grids = &app.session().prefs.grids;
+    if v.safe_margins {
+        let (act, title) = (1.0 - grids.action_safe as f32 / 100.0, 1.0 - grids.title_safe as f32 / 100.0);
+        for (k, a) in [(act, 120u8), (title, 160)] {
+            let r = Rect::from_center_size(comp_rect.center(), comp_rect.size() * k);
+            painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_white_alpha(a)), StrokeKind::Middle);
+        }
+        let c = comp_rect.center();
+        painter.line_segment([c - vec2(10.0, 0.0), c + vec2(10.0, 0.0)], Stroke::new(1.0, Color32::from_white_alpha(140)));
+        painter.line_segment([c - vec2(0.0, 10.0), c + vec2(0.0, 10.0)], Stroke::new(1.0, Color32::from_white_alpha(140)));
+    }
+    if v.grid {
+        // Settings ▸ Grids & Guides: gridline spacing, subdivisions and colour.
+        let g = grids;
+        let [r, gg, b] = hex_rgb(&g.grid_color).unwrap_or([120, 160, 255]);
+        let major = Stroke::new(1.0, Color32::from_rgba_unmultiplied(r, gg, b, 90));
+        let minor = Stroke::new(1.0, Color32::from_rgba_unmultiplied(r, gg, b, 35));
+        let step = (g.grid_spacing as f32 * zoom).max(2.0);
+        let sub = g.grid_subdivisions.max(1) as f32;
+        let sstep = step / sub;
+        let draw_minor = sstep >= 4.0;
+        // Settings ▸ Grids & Guides ▸ Grid Style (lines, dashed lines or dots).
+        let style = g.grid_style.clone();
+        // At most this many lines a side (a tiny step on a huge picture draws nothing more).
+        const MAX_LINES: u32 = 4000;
+        let mut i = 0u32;
+        let mut gx = comp_rect.min.x;
+        while gx <= comp_rect.max.x && i < MAX_LINES {
+            let is_major = i.is_multiple_of(g.grid_subdivisions.max(1));
+            if is_major || draw_minor {
+                styled_line(painter, [pos2(gx, comp_rect.min.y), pos2(gx, comp_rect.max.y)], if is_major { major } else { minor }, &style);
+            }
+            gx += sstep;
+            i += 1;
+        }
+        let mut i = 0u32;
+        let mut gy = comp_rect.min.y;
+        while gy <= comp_rect.max.y && i < MAX_LINES {
+            let is_major = i.is_multiple_of(g.grid_subdivisions.max(1));
+            if is_major || draw_minor {
+                styled_line(painter, [pos2(comp_rect.min.x, gy), pos2(comp_rect.max.x, gy)], if is_major { major } else { minor }, &style);
+            }
+            gy += sstep;
+            i += 1;
+        }
+    }
+    proportional_grid(app, painter, comp_rect);
+    // Comp guides (View ▸ Show Guides).
+    if v.guides {
+        let [r, gg, b] = hex_rgb(&grids.guide_color).unwrap_or([0x3c, 0xc8, 0xf0]);
+        let stroke = Stroke::new(1.0, Color32::from_rgb(r, gg, b));
+        // Settings ▸ Grids & Guides ▸ Guide Style.
+        let style = grids.guide_style.clone();
+        for g in &comp.guides {
+            if g.vertical {
+                let x = comp_rect.min.x + g.px(comp.width, comp.height) as f32 * zoom;
+                styled_line(painter, [pos2(x, area.min.y), pos2(x, area.max.y)], stroke, &style);
+            } else {
+                let y = comp_rect.min.y + g.px(comp.width, comp.height) as f32 * zoom;
+                styled_line(painter, [pos2(area.min.x, y), pos2(area.max.x, y)], stroke, &style);
+            }
+        }
+    }
+}
+
+/// Settings ▸ 3D ▸ Show 3D Reference Axes: world X/Y/Z in the bottom-left corner of `area`,
+/// turning with the view, for a comp of `size` with 3D layers. The caller checks the setting.
+pub(crate) fn draw_reference_axes(app: &mut dyn TimelineHost, painter: &egui::Painter, ectx: &EvalCtx, area: Rect, size: [f32; 2]) {
+    let [cw, ch] = size;
+    let pc = super::viewer::cam_state(ectx).projection(cw as f64, ch as f64);
+    let o3 = effectcraft_engine::geom::vec3(cw as f64 / 2.0, ch as f64 / 2.0, 0.0);
+    let o = pc.apply(o3);
+    let corner = pos2(area.min.x + 34.0, area.max.y - 34.0);
+    for (axis, col, name) in [
+        (effectcraft_engine::geom::vec3(1.0, 0.0, 0.0), Color32::from_rgb(0xe0, 0x50, 0x50), "X"),
+        (effectcraft_engine::geom::vec3(0.0, 1.0, 0.0), Color32::from_rgb(0x60, 0xd0, 0x60), "Y"),
+        (effectcraft_engine::geom::vec3(0.0, 0.0, 1.0), Color32::from_rgb(0x50, 0x8c, 0xf0), "Z"),
+    ] {
+        let e = pc.apply(o3 + axis * 10.0);
+        let d = vec2((e.x - o.x) as f32, (e.y - o.y) as f32);
+        let d = if d.length() > 1e-4 && d.x.is_finite() && d.y.is_finite() { d.normalized() * 22.0 } else { vec2(0.0, 0.0) };
+        painter.arrow(corner, d, Stroke::new(1.5, col));
+        painter.text(corner + d * 1.25, Align2::CENTER_CENTER, name, Tokens::ui(10.0), col);
+    }
+    app.auto_mut().add("viewer.referenceAxes", Rect::from_center_size(corner, vec2(56.0, 56.0)), "3D reference axes");
 }
 
 // ---------------------------------------------------------------- the displayed frame
@@ -799,27 +927,9 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
     if clicked {
         toggle_popup(ui, "vw-grid-pop");
     }
-    let v = &app.ui.viewer;
-    let items = vec![
-        ("Title/Action Safe".to_string(), v.safe_margins),
-        ("Proportional Grid".to_string(), v.proportional_grid),
-        ("Grid".to_string(), v.grid),
-        ("Guides".to_string(), v.guides),
-        ("Rulers".to_string(), v.rulers),
-        ("-".to_string(), false),
-        ("3D Reference Axes".to_string(), app.session.prefs.three_d.show_reference_axes),
-    ];
+    let items = grid_options(app);
     if let Some(i) = popup(app, ui, "vw-grid-pop", gr, &items, "gridItem") {
-        let v = &mut app.ui.viewer;
-        match i {
-            0 => v.safe_margins = !v.safe_margins,
-            1 => v.proportional_grid = !v.proportional_grid,
-            2 => v.grid = !v.grid,
-            3 => v.guides = !v.guides,
-            4 => v.rulers = !v.rulers,
-            6 => app.session.prefs.three_d.show_reference_axes = !app.session.prefs.three_d.show_reference_axes,
-            _ => {}
-        }
+        toggle_grid_option(app, i);
     }
     // Show Channel and Color Management Settings.
     let vo = app.session.state.viewer.clone();

@@ -23,10 +23,27 @@
 //!   put the caret there, then type ([`super::viewer_text::hook`]: the same editing as in the
 //!   viewer). [`edit_text_at`] starts editing a text layer from a host's own double-click.
 //!
+//! EMBED14 adds the rest of what the viewer shows over a frame:
+//!
+//! - **Guides and grids**: title/action safe, the grid, the proportional grid, the comp's guides
+//!   and the 3D reference axes, each only while it is turned on (the View keys ' Cmd+' Cmd+;
+//!   Cmd+R run in a host through `timeline::hosted::run`; [`grid_options`] /
+//!   [`toggle_grid_option`] are the viewer's "Choose grid and guide options" menu for a host's
+//!   own button). [`view_overlays`] draws them alone. With the Selection tool a guide drags (off
+//!   the picture removes it); the rulers sit outside the picture's top and left edges
+//!   ([`RULER`]) and guides are dragged out of them.
+//! - **Motion paths**: the selected layers' Position motion path with its keys and spatial
+//!   tangents (Settings ▸ Composition ▸ Motion Path decides how many keys show). The Selection
+//!   tool drags keys and tangents (Alt pulls a key's tangents), the Pen slot adds, deletes and
+//!   converts keys and bends the path between two keys, as in the viewer.
+//! - **Mask Feather tool** (the Pen slot's last tool): drag from a mask's edge or its feather
+//!   boundary to add a variable feather point and pull its radius, drag a point's handle to change
+//!   it; the masks' feather boundaries show while the tool is on.
+//!
 //! Every edit is the viewer's own engine command, merged into one undo step per drag. Nothing else
 //! is drawn: no labels, buttons or badges over the picture (the shape ghost goes uncaptioned).
 //! The comp is mapped by a [`ViewerMap`] the host gives (where its picture is on screen); the
-//! viewer's Hand/Zoom, guides, rulers, motion paths, puppet and paint tools are not hosted.
+//! viewer's Hand/Zoom, region of interest, free transform, puppet and paint tools are not hosted.
 
 use effectcraft_engine::project::LayerId;
 use effectcraft_engine::render::EvalCtx;
@@ -36,6 +53,7 @@ use serde_json::json;
 use super::timeline::TimelineHost;
 use super::viewer::{self, Gesture, ViewerMap};
 use super::viewer_overlays::{self as ov, VertexHit};
+use super::viewer_tools as vt;
 use crate::layer_pointer::Lp;
 use crate::state::Tool;
 
@@ -55,6 +73,7 @@ pub fn hosted(tool: Tool) -> bool {
             | Tool::PenAdd
             | Tool::PenDelete
             | Tool::PenConvert
+            | Tool::MaskFeather
             | Tool::Type
             | Tool::TypeVertical
     )
@@ -79,11 +98,16 @@ pub struct Options {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
     /// The tools have the pointer over the picture this frame (a tool other than Selection, a
-    /// drag under way, a text edit, or the pointer on a path vertex): the host leaves it alone.
+    /// drag under way, a text edit, or the pointer on a path vertex, a motion-path key or
+    /// tangent, a guide or a ruler): the host leaves it alone.
     pub owns: bool,
     /// Something changed the project.
     pub edited: bool,
 }
+
+/// Thickness of the rulers (View ▸ Show Rulers) [`tools`] draws outside the picture's top and
+/// left edges: a host's clip must leave this much room there.
+pub const RULER: f32 = vt::RULER;
 
 fn gesture_id() -> egui::Id {
     egui::Id::new("viewer-gesture")
@@ -111,12 +135,59 @@ pub fn cursor(tool: Tool, over_vertex: bool) -> CursorIcon {
     }
 }
 
+/// The "Choose grid and guide options" menu of the viewer (Title/Action Safe, Proportional Grid,
+/// Grid, Guides, Rulers, 3D Reference Axes): (entry, on) in its order, "-" a separator. A host
+/// shows it from its own button and calls [`toggle_grid_option`] with the chosen index.
+pub fn grid_options(host: &dyn TimelineHost) -> Vec<(String, bool)> {
+    vt::grid_options(host)
+}
+
+/// Turn entry `index` of [`grid_options`] on or off, as the viewer's menu does.
+pub fn toggle_grid_option(host: &mut dyn TimelineHost, index: usize) {
+    vt::toggle_grid_option(host, index);
+}
+
+/// Whether any of [`grid_options`] shows something (the viewer's button is lit then).
+pub fn grid_options_on(host: &dyn TimelineHost) -> bool {
+    let v = &host.ui().viewer;
+    let guides = v.guides && host.session().active_comp().is_some_and(|c| !c.guides.is_empty());
+    v.grid || v.safe_margins || v.proportional_grid || guides || v.rulers
+}
+
+fn valid(map: &ViewerMap) -> bool {
+    map.area.is_finite() && map.area.is_positive() && map.zoom.is_finite() && map.zoom > 0.0 && map.origin.x.is_finite() && map.origin.y.is_finite()
+}
+
+/// What the person turned on over the picture `map.area`, drawn without taking the pointer:
+/// title/action safe, the grid, the proportional grid, the comp's guides (View menu, Choose grid
+/// and guide options) and the 3D reference axes (Settings ▸ 3D, with 3D layers). Each only while
+/// it is on; nothing otherwise. [`tools`] draws these itself; a host calls this while the tools
+/// don't run (e.g. the Timeline is read-only).
+pub fn view_overlays(host: &mut dyn TimelineHost, ui: &egui::Ui, map: ViewerMap) {
+    if !valid(&map) {
+        return;
+    }
+    let Some(cid) = host.session().active_comp_id() else { return };
+    let Some(comp) = host.session().project.comp_arc(cid) else { return };
+    let painter = ui.painter().clone();
+    let pic = Rect::from_min_size(map.origin, vec2(map.comp[0] * map.zoom, map.comp[1] * map.zoom));
+    vt::draw_view_guides(host, &painter, &comp, pic, map.area, map.zoom);
+    let time = host.session().time();
+    if host.session().prefs.three_d.show_reference_axes && comp.layers.iter().any(|l| l.is_3d() && l.is_active_at(time)) {
+        let project = host.session().project.clone();
+        let expr = host.session().expr.clone();
+        let ectx = EvalCtx { project: &project, comp_id: cid, comp: &comp, time, expr: expr.as_deref(), footage: None };
+        vt::draw_reference_axes(host, &painter, &ectx, map.area, [comp.width as f32, comp.height as f32]);
+    }
+}
+
 /// One frame of the viewer tools over the comp picture `map.area` (window coordinates of `ui`'s
-/// layer). Draws with `ui`'s painter (clip it to where the picture shows). Never panics on junk
-/// maps: a non-finite or empty one does nothing.
+/// layer). Draws with `ui`'s painter (clip it to where the picture shows, plus [`RULER`] above
+/// and left of it while the rulers are on). Never panics on junk maps: a non-finite or empty one
+/// does nothing.
 pub fn tools(host: &mut dyn TimelineHost, ui: &mut egui::Ui, map: ViewerMap, opts: Options) -> Frame {
     let mut out = Frame::default();
-    if !map.area.is_finite() || !map.area.is_positive() || !map.zoom.is_finite() || map.zoom <= 0.0 || !map.origin.x.is_finite() || !map.origin.y.is_finite() {
+    if !valid(&map) {
         return out;
     }
     let before = host.session().revision;
@@ -134,6 +205,16 @@ pub fn tools(host: &mut dyn TimelineHost, ui: &mut egui::Ui, map: ViewerMap, opt
     let hover = lp.pos(ctx.input(|i| i.pointer.hover_pos())).filter(|h| map.area.contains(*h));
     let mods = ctx.input(|i| i.modifiers);
 
+    // EMBED14: what the person turned on (guides, grids, safe areas, 3D axes), under the paths.
+    view_overlays(host, ui, map);
+    // The rulers, outside the picture's top and left edges: guides are dragged out of them.
+    let mut on_ruler = false;
+    if host.ui().viewer.rulers {
+        let outer = Rect::from_min_max(map.area.min - vec2(RULER, RULER), map.area.max);
+        vt::rulers(host, ui, &map, outer, map.area);
+        on_ruler = lp.pos(ctx.input(|i| i.pointer.hover_pos())).is_some_and(|h| outer.contains(h) && !map.area.contains(h));
+    }
+
     // A Pen path in progress ends when the tool changes or with Esc / Enter.
     let finish = ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter)) && !ctx.egui_wants_keyboard_input();
     if tool != Tool::Pen || finish {
@@ -141,18 +222,27 @@ pub fn tools(host: &mut dyn TimelineHost, ui: &mut egui::Ui, map: ViewerMap, opt
     }
     let pen = ui.data(|d| d.get_temp::<(LayerId, u64)>(viewer::pen_id()));
 
-    // The selected layers' paths and (Rotation / Pan Behind) anchor points.
+    // The selected layers' motion paths, paths and (Rotation / Pan Behind) anchor points.
     let t = host.tokens();
     let selected = host.session().state.selected_layers.clone();
     let sel_vertices = host.session().state.selected_vertices.clone();
     let show_masks = host.ui().viewer.show_masks;
+    let layer_controls = host.ui().viewer.show_layer_controls;
     let label_handles = host.session().prefs.appearance.use_label_color_for_handles;
     let point = host.session().prefs.general.path_point_size as f32 + 1.0;
     let mut hits: Vec<VertexHit> = Vec::new();
     let mut marks: Vec<ov::VertexMark> = Vec::new();
     let mut paths: Vec<ov::PathInfo> = Vec::new();
+    let mut key_hits: Vec<ov::KeyHit> = Vec::new();
+    let mut segments: Vec<ov::MotionSegment> = Vec::new();
+    let mut frames: Vec<ov::PathFrame> = Vec::new();
     for l in comp.layers.iter().filter(|l| selected.contains(&l.id) && l.is_active_at(time) && l.switches.video) {
         let col = if label_handles { t.label(l.label) } else { t.accent };
+        // EMBED14: the position motion path (keys and spatial tangents drag), as the viewer
+        // shows it (Settings ▸ Composition ▸ Motion Path: how many keyframes).
+        if layer_controls {
+            ov::motion_path(host, &painter, &map, &ectx, l, col, &mut key_hits, &mut segments, &mut frames);
+        }
         if show_masks {
             ov::draw_paths(host, &painter, &map, &ectx, l, col, &sel_vertices, pen, hover, &mut hits, &mut marks, &mut paths);
         }
@@ -171,25 +261,49 @@ pub fn tools(host: &mut dyn TimelineHost, ui: &mut egui::Ui, map: ViewerMap, opt
         }
     }
     ov::draw_vertex_marks(&painter, &marks, point);
+    // EMBED14: the Mask Feather tool shows the masks' feather boundaries.
+    if tool == Tool::MaskFeather {
+        ov::draw_feather_boundaries(&painter, &map, &ectx, &paths);
+    }
 
     let gesture: Option<Gesture> = ui.data(|d| d.get_temp(gid));
     let editing_text = host.session().state.text_edit.is_some();
     let over_vertex = hover.is_some_and(|h| vertex_at(&hits, h, true).or_else(|| vertex_at(&hits, h, false)).is_some());
+    let over_key = hover.is_some_and(|h| key_hits.iter().any(|k| k.pos.distance(h) < 6.0));
+    let over_guide = hover.and_then(|h| vt::guide_at(host, &comp, &map, h));
     let held = ctx.input(|i| i.pointer.any_down()) && ui.ctx().is_being_dragged(opts.id);
-    out.owns = !opts.space_pan && (tool != Tool::Selection || gesture.is_some() || editing_text || over_vertex || pen.is_some() || held);
-    if !out.owns {
+    out.owns = !opts.space_pan
+        && (tool != Tool::Selection
+            || gesture.is_some()
+            || editing_text
+            || over_vertex
+            || over_key
+            || over_guide.is_some()
+            || pen.is_some()
+            || held
+            || on_ruler);
+    // On a ruler (no drag under way) the ruler has the pointer, not the picture.
+    if !out.owns || (on_ruler && gesture.is_none() && !held) {
+        out.edited = host.session().revision != before;
         return out;
     }
     let resp = ui.interact(map.area, opts.id, Sense::click_and_drag());
     if resp.hovered() || resp.dragged() {
-        ctx.set_cursor_icon(cursor(tool, over_vertex));
+        let icon = match over_guide {
+            Some((_, true)) if tool == Tool::Selection => CursorIcon::ResizeHorizontal,
+            Some((_, false)) if tool == Tool::Selection => CursorIcon::ResizeVertical,
+            _ if tool == Tool::Selection && over_key => CursorIcon::Move,
+            _ => cursor(tool, over_vertex),
+        };
+        ctx.set_cursor_icon(icon);
     }
 
-    // Pen: each press places a vertex (see `viewer::pen_press`).
+    // Pen: each press places a vertex (see `viewer::pen_press`), except on a motion path.
     if tool == Tool::Pen
         && resp.hovered()
         && ctx.input(|i| i.pointer.primary_pressed())
         && let Some(pos) = lp.pos(ctx.input(|i| i.pointer.press_origin()))
+        && matches!(ov::pen_target(&key_hits, &segments, &frames, pos), ov::PenTarget::None)
     {
         viewer::pen_press(host, ui, &ectx, &map, &paths, None, pos, mods);
     }
@@ -206,10 +320,33 @@ pub fn tools(host: &mut dyn TimelineHost, ui: &mut egui::Ui, map: ViewerMap, opt
     {
         let press = lp.pos(ctx.input(|i| i.pointer.press_origin())).unwrap_or(pos);
         let cpt = map.to_comp(press);
+        let target = ov::pen_target(&key_hits, &segments, &frames, press);
         let g = match tool {
             Tool::Rotate => viewer::begin_rotate(host, &ectx, &comp, &map, cpt, pos, mods.shift),
             Tool::PanBehind => viewer::begin_anchor(host, &ectx, &map, cpt, press, mods.alt),
             t if t.is_shape() => Some(Gesture::Create { tool: t, start: cpt }),
+            // Motion paths, as in the viewer: Alt (or Convert Vertex) pulls a key's tangents out,
+            // a key or tangent drags, the Pen bends the path between two keys.
+            Tool::PenConvert | Tool::Pen | Tool::Selection if (tool == Tool::PenConvert || mods.alt) && ov::motion_key_at(&key_hits, press).is_some() => {
+                ov::motion_key_at(&key_hits, press).and_then(|h| {
+                    h.p2c
+                        .inverse()
+                        .map(|inv| Gesture::Overlay(ov::Drag::KeyTangent { layer: h.layer, prop: h.prop, time: h.time, out: true, key: h.value, inv }))
+                })
+            }
+            Tool::Pen | Tool::PenAdd | Tool::PenConvert if matches!(target, ov::PenTarget::Key(_) | ov::PenTarget::Tangent) => {
+                ov::begin_key_drag(host, &key_hits, press, cpt, mods.shift).map(Gesture::Overlay)
+            }
+            Tool::Pen | Tool::PenConvert if matches!(target, ov::PenTarget::AddFrame(_) | ov::PenTarget::PathFull) => {
+                ov::begin_segment_bend(host, &segments, press, cpt).map(Gesture::Overlay)
+            }
+            Tool::Selection if key_hits.iter().any(|h| h.pos.distance(press) < 6.0) => {
+                ov::begin_key_drag(host, &key_hits, press, cpt, mods.shift).map(Gesture::Overlay)
+            }
+            Tool::Selection if vt::guide_at(host, &comp, &map, press).is_some() => {
+                vt::guide_at(host, &comp, &map, press).map(|(index, vertical)| Gesture::Overlay(ov::Drag::Guide { index, vertical }))
+            }
+            Tool::MaskFeather => ov::begin_feather(host, &ectx, &paths, &map, press).map(Gesture::Overlay),
             Tool::Selection | Tool::PenConvert if (mods.alt || tool == Tool::PenConvert) && vertex_at(&hits, press, false).is_some() => {
                 vertex_at(&hits, press, false).map(|h| Gesture::Pen {
                     layer: h.layer,
@@ -246,11 +383,21 @@ pub fn tools(host: &mut dyn TimelineHost, ui: &mut egui::Ui, map: ViewerMap, opt
     let gesture: Option<Gesture> = ui.data(|d| d.get_temp(gid));
     if let (Some(g), Some(pos)) = (gesture.clone(), resp.interact_pointer_pos()) {
         let merge = format!("viewer-drag-{}", ui.data(|d| d.get_temp::<u64>(drag_n_id()).unwrap_or(0)));
-        viewer::update_tool_gesture(host, ui, &ectx, &map, &painter, g, pos, mods, &merge, false);
+        match g {
+            Gesture::Overlay(d) => overlay_drag(host, ui, &ectx, &map, d, pos, mods, &merge),
+            g => viewer::update_tool_gesture(host, ui, &ectx, &map, &painter, g, pos, mods, &merge, false),
+        }
+        // The snap feedback of this frame's drag (the target highlighted, where it landed).
+        vt::draw_snap(&ctx, &painter, &map, &ectx);
     }
     if resp.drag_stopped() {
-        if let (Some(Gesture::Create { tool, start }), Some(pos)) = (gesture, resp.interact_pointer_pos()) {
-            viewer::create_shape(host, tool, start, map.to_comp(pos), mods);
+        match (gesture, resp.interact_pointer_pos()) {
+            (Some(Gesture::Create { tool, start }), Some(pos)) => viewer::create_shape(host, tool, start, map.to_comp(pos), mods),
+            // A guide dragged off the picture is removed, as in the viewer.
+            (Some(Gesture::Overlay(ov::Drag::Guide { index, .. })), Some(pos)) if !map.area.expand(40.0).contains(pos) => {
+                let _ = host.session_mut().execute("view.removeGuide", json!({"index": index}));
+            }
+            _ => {}
         }
         ui.data_mut(|d| {
             d.remove::<Gesture>(gid);
@@ -262,13 +409,44 @@ pub fn tools(host: &mut dyn TimelineHost, ui: &mut egui::Ui, map: ViewerMap, opt
         && !text_owns
         && let Some(pos) = resp.interact_pointer_pos()
     {
-        click(host, &ectx, &map, &hits, &paths, tool, pos, mods);
+        let motion = Motion { keys: &key_hits, segments: &segments, frames: &frames };
+        click(host, &ectx, &map, &hits, &paths, &motion, tool, pos, mods);
     }
     out.edited = host.session().revision != before;
     if out.edited {
         ctx.request_repaint();
     }
     out
+}
+
+/// Advance a motion-path, guide or Mask Feather drag (`d`) to screen point `pos`.
+#[allow(clippy::too_many_arguments)]
+fn overlay_drag(host: &mut dyn TimelineHost, ui: &egui::Ui, ectx: &EvalCtx, map: &ViewerMap, d: ov::Drag, pos: Pos2, mods: egui::Modifiers, merge: &str) {
+    let cpt = map.to_comp(pos);
+    if !cpt.iter().all(|v| v.is_finite()) {
+        return;
+    }
+    match d {
+        ov::Drag::Guide { index, vertical } => {
+            let at = if vertical { cpt[0] } else { cpt[1] }.round();
+            let _ = host.session_mut().execute("view.moveGuide", json!({"index": index, "position": at, "merge": merge}));
+        }
+        ov::Drag::Roi { .. } => {}
+        d => {
+            let ctx = ui.ctx().clone();
+            let mut snapper = |a: &dyn TimelineHost, p: [f64; 2], l: LayerId| vt::snap(a, &ctx, ectx, map, &[l], &[p], mods);
+            if let Some(nd) = ov::update(host, &d, cpt, pos, mods, merge, map.zoom, &mut snapper) {
+                ui.data_mut(|dd| dd.insert_temp(gesture_id(), Gesture::Overlay(nd)));
+            }
+        }
+    }
+}
+
+/// The selected layers' motion paths drawn this frame.
+struct Motion<'a> {
+    keys: &'a [ov::KeyHit],
+    segments: &'a [ov::MotionSegment],
+    frames: &'a [ov::PathFrame],
 }
 
 /// A click (no drag) at screen point `pos` with `tool`.
@@ -279,12 +457,13 @@ fn click(
     map: &ViewerMap,
     hits: &[VertexHit],
     paths: &[ov::PathInfo],
+    motion: &Motion,
     tool: Tool,
     pos: Pos2,
     mods: egui::Modifiers,
 ) {
     let vertex = vertex_at(hits, pos, false).map(|h| json!({"layer": h.layer.0, "mask": h.mask, "index": h.index}));
-    if !matches!(tool, Tool::Selection | Tool::Pen | Tool::PenAdd | Tool::PenDelete | Tool::PenConvert | Tool::Type | Tool::TypeVertical) {
+    if !matches!(tool, Tool::Selection | Tool::Pen | Tool::PenAdd | Tool::PenDelete | Tool::PenConvert | Tool::MaskFeather | Tool::Type | Tool::TypeVertical) {
         // Rotation, Pan Behind and the shape tools: a click selects the layer under it (Shift
         // toggles it), or nothing.
         if viewer::pick(host, ectx, map.to_comp(pos), mods.shift).is_none() {
@@ -292,10 +471,44 @@ fn click(
         }
         return;
     }
+    // EMBED14: on a motion path, as in the viewer: the Pen deletes a key (Alt converts it) or adds
+    // one on a free frame; Delete / Convert Vertex delete / convert a key; Alt-click with the
+    // Selection tool converts it.
+    let key = ov::motion_key_at(motion.keys, pos);
+    match tool {
+        Tool::Pen | Tool::PenAdd if !matches!(ov::pen_target(motion.keys, motion.segments, motion.frames, pos), ov::PenTarget::None) => {
+            match ov::pen_target(motion.keys, motion.segments, motion.frames, pos) {
+                ov::PenTarget::Key(h) if tool == Tool::Pen => ov::edit_motion_key(host, h, !mods.alt),
+                ov::PenTarget::AddFrame(f) => ov::insert_motion_key(host, (f.layer, f.prop, f.time)),
+                _ => {}
+            }
+            return;
+        }
+        Tool::PenDelete | Tool::PenConvert if key.is_some() => {
+            if let Some(h) = key {
+                ov::edit_motion_key(host, h, tool == Tool::PenDelete);
+            }
+            return;
+        }
+        Tool::Selection if mods.alt && key.is_some() => {
+            if let Some(h) = key {
+                ov::edit_motion_key(host, h, false);
+            }
+            return;
+        }
+        Tool::PenAdd if ov::segment_at(paths, map, pos, 6.0).is_none() => {
+            if let Some(f) = ov::motion_frame_at(motion.frames, motion.keys, pos) {
+                viewer::add_motion_key(host, f);
+            }
+            return;
+        }
+        _ => {}
+    }
     let s = host.session_mut();
     let r = match tool {
-        // The Pen placed its vertex on the press; Type handled its own click.
-        Tool::Pen | Tool::Type | Tool::TypeVertical => return,
+        // The Pen placed its vertex on the press; Type handled its own click; the Mask Feather
+        // tool works by dragging.
+        Tool::Pen | Tool::Type | Tool::TypeVertical | Tool::MaskFeather => return,
         Tool::PenAdd => match ov::segment_at(paths, map, pos, 6.0) {
             Some((l, m, seg, t)) => s.execute("mask.insertVertex", json!({"layer": l.0, "mask": m, "segment": seg, "t": t})),
             None => return,
@@ -428,13 +641,64 @@ mod tests {
     }
 
     fn frame(ctx: &egui::Context, h: &mut Mini, events: Vec<Event>) -> Frame {
+        frame_on(ctx, h, events, map())
+    }
+
+    /// One frame of the tools with the picture at `m` (the card at another canvas zoom / place).
+    fn frame_on(ctx: &egui::Context, h: &mut Mini, events: Vec<Event>, m: ViewerMap) -> Frame {
         let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), events, ..Default::default() };
         let mut out = Frame::default();
         let _ = ctx.run_ui(input, |ui| {
             h.auto.begin_frame();
-            out = tools(h, ui, map(), Options { id: egui::Id::new("card-tools"), space_pan: false });
+            out = tools(h, ui, m, Options { id: egui::Id::new("card-tools"), space_pan: false });
         });
         out
+    }
+
+    /// A drag along `path` on the picture at `m`.
+    fn drag_on(ctx: &egui::Context, h: &mut Mini, path: &[Pos2], m: ViewerMap) {
+        let first = path[0];
+        frame_on(ctx, h, vec![Event::PointerMoved(first)], m);
+        frame_on(ctx, h, vec![button(first, true)], m);
+        for p in &path[1..] {
+            frame_on(ctx, h, vec![Event::PointerMoved(*p)], m);
+        }
+        let last = *path.last().unwrap();
+        frame_on(ctx, h, vec![button(last, false)], m);
+        frame_on(ctx, h, vec![], m);
+    }
+
+    /// How many shapes a frame paints: with the tools (`tools`) or without them (the baseline).
+    fn painted(ctx: &egui::Context, h: &mut Mini, with_tools: bool) -> usize {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), ..Default::default() };
+        let out = ctx.run_ui(input, |ui| {
+            h.auto.begin_frame();
+            if with_tools {
+                let _ = tools(h, ui, map(), Options { id: egui::Id::new("card-tools"), space_pan: false });
+            }
+        });
+        out.shapes.len()
+    }
+
+    /// The Box's Position keys: 160,90 at 0 s and 260,90 at 2 s (Box selected, time 0).
+    fn keyed_box(h: &mut Mini, bx: LayerId) {
+        h.session.execute("prop.addKey", json!({"layer": bx.0, "path": "transform/position", "time": 0.0, "value": [160.0, 90.0, 0.0]})).unwrap();
+        h.session.execute("prop.addKey", json!({"layer": bx.0, "path": "transform/position", "time": 2.0, "value": [260.0, 90.0, 0.0]})).unwrap();
+        h.session.execute("layer.select", json!({"layers": [bx.0]})).unwrap();
+        h.session.execute("keys.deselectAll", json!({})).ok();
+    }
+
+    fn position_keys(h: &Mini, bx: LayerId) -> Vec<effectcraft_engine::keyframe::Keyframe> {
+        let c = h.session.active_comp().unwrap();
+        c.layer(bx).unwrap().props.prop("transform/position").unwrap().keys.clone()
+    }
+
+    fn feather_points(h: &Mini, l: LayerId) -> Vec<effectcraft_engine::keyframe::FeatherPoint> {
+        let c = h.session.active_comp().unwrap();
+        let layer = c.layer(l).unwrap();
+        let g = layer.masks().unwrap().groups().next().unwrap();
+        let v = layer.props.find_group(g.uid).unwrap().get("path").unwrap().value_at(layer.layer_time(h.session.time()));
+        v.as_path().cloned().unwrap().feather
     }
 
     fn button(at: Pos2, pressed: bool) -> Event {
@@ -496,7 +760,7 @@ mod tests {
 
     #[test]
     fn only_the_card_tools_are_hosted() {
-        for t in [Tool::Rotate, Tool::PanBehind, Tool::Ellipse, Tool::Pen, Tool::Type, Tool::Selection] {
+        for t in [Tool::Rotate, Tool::PanBehind, Tool::Ellipse, Tool::Pen, Tool::MaskFeather, Tool::Type, Tool::Selection] {
             assert!(hosted(t), "{t:?}");
         }
         for t in [Tool::Hand, Tool::Zoom, Tool::Brush, Tool::Puppet, Tool::RotoBrush, Tool::Orbit] {
@@ -618,12 +882,186 @@ mod tests {
         assert!(h.session.state.text_edit.is_none());
     }
 
+    // ---- EMBED14: guides, grids, rulers, motion paths, Mask Feather ----
+
+    /// The View toggles run in a host, and the picture gets nothing over it until one is on.
+    #[test]
+    fn guides_and_grids_toggle_and_draw_only_when_on() {
+        let (mut h, _, _) = mini();
+        let ctx = ctx();
+        h.session.execute("view.addGuide", json!({"orientation": "vertical", "position": 100})).unwrap();
+        h.ui.viewer.guides = false;
+        let baseline = painted(&ctx, &mut h, false);
+        assert_eq!(painted(&ctx, &mut h, true), baseline, "nothing over the picture while everything is off");
+        for id in ["view.grid", "view.safeMargins", "view.guides", "view.rulers", "view.snapToGrid", "view.snapToGuides", "view.lockGuides"] {
+            let r = th::run(&mut h, &ctx, id, &json!({})).expect("a host runs it");
+            assert_eq!(r.unwrap()["value"], json!(true), "{id} turned on");
+        }
+        assert!(h.ui.viewer.grid && h.ui.viewer.safe_margins && h.ui.viewer.guides && h.ui.viewer.rulers);
+        assert!(painted(&ctx, &mut h, true) > baseline, "the grid, safe areas and guide draw");
+        // `value` sets rather than toggles; each is off again.
+        for id in ["view.grid", "view.safeMargins", "view.guides", "view.rulers"] {
+            th::run(&mut h, &ctx, id, &json!({"value": false})).unwrap().unwrap();
+        }
+        assert_eq!(painted(&ctx, &mut h, true), baseline);
+        // The grid and guide options menu: the same entries as the viewer's, toggled by index.
+        let items = grid_options(&h);
+        assert_eq!(
+            items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(),
+            ["Title/Action Safe", "Proportional Grid", "Grid", "Guides", "Rulers", "-", "3D Reference Axes"]
+        );
+        assert!(!grid_options_on(&h));
+        toggle_grid_option(&mut h, 1);
+        assert!(h.ui.viewer.proportional_grid && grid_options_on(&h));
+        assert!(painted(&ctx, &mut h, true) > baseline);
+        toggle_grid_option(&mut h, 1);
+        for junk in [5, 7, usize::MAX] {
+            toggle_grid_option(&mut h, junk);
+        }
+        assert!(!grid_options_on(&h));
+    }
+
+    /// A guide drags with the Selection tool (one undo step) and leaves when dragged off; one
+    /// dragged out of the top ruler is a horizontal guide where it is dropped.
+    #[test]
+    fn guides_drag_and_come_out_of_the_rulers() {
+        let (mut h, _, _) = mini();
+        let ctx = ctx();
+        h.session.execute("view.addGuide", json!({"orientation": "vertical", "position": 100})).unwrap();
+        h.ui.viewer.guides = true;
+        let guide = |h: &Mini| {
+            let c = h.session.active_comp().unwrap();
+            c.guides.first().map(|g| g.px(c.width, c.height))
+        };
+        drag(&ctx, &mut h, &[pos2(100.0, 50.0), pos2(108.0, 50.0), pos2(120.0, 50.0)]);
+        assert!((guide(&h).unwrap() - 120.0).abs() < 0.5, "{:?}", guide(&h));
+        h.session.execute("edit.undo", json!({})).unwrap();
+        assert!((guide(&h).unwrap() - 100.0).abs() < 0.5, "one undo step");
+        drag(&ctx, &mut h, &[pos2(100.0, 50.0), pos2(150.0, 50.0), pos2(395.0, 50.0)]);
+        assert!(guide(&h).is_none(), "dragged off the picture: removed");
+        // Rulers outside a picture at 50,40: drag from the top ruler down into the picture.
+        h.ui.viewer.rulers = true;
+        let m = map_for(Rect::from_min_size(pos2(50.0, 40.0), vec2(320.0, 180.0)), [320, 180]).unwrap();
+        drag_on(&ctx, &mut h, &[pos2(150.0, 32.0), pos2(150.0, 60.0), pos2(150.0, 100.0)], m);
+        let c = h.session.active_comp().unwrap();
+        let g = c.guides.first().expect("a guide from the ruler");
+        assert!(!g.vertical && (g.px(c.width, c.height) - 60.0).abs() < 0.5, "{g:?}");
+    }
+
+    /// The selected layer's motion path: a key drags (the value moves, one undo step), at any
+    /// canvas zoom.
+    #[test]
+    fn a_motion_path_key_drags_as_one_undo_step() {
+        let (mut h, _, bx) = mini();
+        keyed_box(&mut h, bx);
+        let ctx = ctx();
+        frame(&ctx, &mut h, vec![]);
+        drag(&ctx, &mut h, &[pos2(160.0, 90.0), pos2(165.0, 95.0), pos2(170.0, 100.0)]);
+        let v = position_keys(&h, bx)[0].value.as_vec3();
+        assert!((v[0] - 170.0).abs() < 0.5 && (v[1] - 100.0).abs() < 0.5, "key {v:?}");
+        h.session.execute("edit.undo", json!({})).unwrap();
+        let v = position_keys(&h, bx)[0].value.as_vec3();
+        assert!((v[0] - 160.0).abs() < 1e-6 && (v[1] - 90.0).abs() < 1e-6, "one undo step: {v:?}");
+        // The card at 200 % at 50,40 on screen: the key under the pointer is the same one.
+        let m = map_for(Rect::from_min_size(pos2(50.0, 40.0), vec2(640.0, 360.0)), [320, 180]).unwrap();
+        drag_on(&ctx, &mut h, &[pos2(370.0, 220.0), pos2(380.0, 230.0), pos2(390.0, 240.0)], m);
+        let v = position_keys(&h, bx)[0].value.as_vec3();
+        assert!((v[0] - 170.0).abs() < 0.5 && (v[1] - 100.0).abs() < 0.5, "at 200 %: {v:?}");
+        // The Motion Path setting None shows (and takes) nothing.
+        h.session.prefs.composition.motion_path = "none".into();
+        let before = position_keys(&h, bx)[0].value.as_vec3();
+        drag(&ctx, &mut h, &[pos2(170.0, 100.0), pos2(180.0, 110.0), pos2(190.0, 120.0)]);
+        assert_eq!(position_keys(&h, bx)[0].value.as_vec3(), before);
+    }
+
+    /// A key's spatial tangent handle drags the tangent (one undo step).
+    #[test]
+    fn a_motion_path_tangent_drags_as_one_undo_step() {
+        let (mut h, _, bx) = mini();
+        keyed_box(&mut h, bx);
+        let ctx = ctx();
+        let keys = position_keys(&h, bx);
+        let (_, out) = if keys[0].spatial_auto {
+            effectcraft_engine::keyframe::spatial_handles(&keys, 0)
+        } else {
+            effectcraft_engine::keyframe::spatial_tangents(&keys, 0)
+        };
+        assert!(out[0].abs() > 1.0, "the first key shows an out handle: {out:?}");
+        let at = pos2(160.0 + out[0] as f32, 90.0 + out[1] as f32);
+        frame(&ctx, &mut h, vec![]);
+        drag(&ctx, &mut h, &[at, at + vec2(0.0, 10.0), at + vec2(0.0, 30.0)]);
+        let k = &position_keys(&h, bx)[0];
+        assert!((k.spatial_out[1] - 30.0).abs() < 0.5, "out tangent {:?}", k.spatial_out);
+        h.session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(position_keys(&h, bx)[0].spatial_out, keys[0].spatial_out, "one undo step");
+    }
+
+    /// The Mask Feather tool (G cycles the Pen slot to it): a drag from the mask's edge adds a
+    /// feather point and pulls its radius out; its handle drags the radius (one undo step each).
+    #[test]
+    fn the_mask_feather_tool_adds_and_drags_feather_points() {
+        let (mut h, plate, _) = mini();
+        h.session.execute("mask.new", json!({"layer": plate.0, "vertices": [[40, 40], [120, 40], [120, 120], [40, 120]], "closed": true})).unwrap();
+        h.session.execute("layer.select", json!({"layers": [plate.0]})).unwrap();
+        let ctx = ctx();
+        for _ in 0..5 {
+            h.ui.choose_tool("tool.pen").unwrap();
+        }
+        assert_eq!(h.ui.tool, Tool::MaskFeather, "the Pen slot's fifth tool");
+        assert!(hosted(Tool::MaskFeather) && active(&h) == Tool::MaskFeather);
+        drag(&ctx, &mut h, &[pos2(80.0, 40.0), pos2(80.0, 35.0), pos2(80.0, 30.0)]);
+        let f = feather_points(&h, plate);
+        assert_eq!(f.len(), 1, "a feather point");
+        assert!((f[0].radius - 10.0).abs() < 0.5, "outer radius {}", f[0].radius);
+        // Its handle (80,30) drags the radius out to 20.
+        drag(&ctx, &mut h, &[pos2(80.0, 30.0), pos2(80.0, 25.0), pos2(80.0, 20.0)]);
+        let f = feather_points(&h, plate);
+        assert_eq!(f.len(), 1);
+        assert!((f[0].radius - 20.0).abs() < 0.5, "radius {}", f[0].radius);
+        h.session.execute("edit.undo", json!({})).unwrap();
+        assert!((feather_points(&h, plate)[0].radius - 10.0).abs() < 0.5, "one undo step");
+        // A click (no drag) changes nothing.
+        click(&ctx, &mut h, pos2(80.0, 120.0));
+        assert_eq!(feather_points(&h, plate).len(), 1);
+    }
+
+    /// The feather radius along a path between feather points, and the boundary drawn from it.
+    #[test]
+    fn the_feather_boundary_follows_the_feather_points() {
+        use effectcraft_engine::keyframe::{FeatherPoint, ShapePath};
+        let mut sp = ShapePath::polygon(&[[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]], true);
+        assert!(ov::feather_radius_at(&sp, 0.5).is_none());
+        sp.feather = vec![FeatherPoint { segment: 0, t: 0.5, radius: 10.0, tension: 1.0 }];
+        assert_eq!(ov::feather_radius_at(&sp, 2.3), Some(10.0), "one point: everywhere");
+        sp.feather.push(FeatherPoint { segment: 2, t: 0.5, radius: 30.0, tension: 1.0 });
+        let mid = ov::feather_radius_at(&sp, 1.5).unwrap();
+        assert!((mid - 20.0).abs() < 1e-9, "linear halfway: {mid}");
+        let wrap = ov::feather_radius_at(&sp, 3.5).unwrap();
+        assert!((wrap - 20.0).abs() < 1e-9, "a closed path wraps: {wrap}");
+        for junk in [f64::NAN, f64::INFINITY, -1e300, 1e300] {
+            let _ = ov::feather_radius_at(&sp, junk);
+        }
+        let p = ov::PathInfo { layer: LayerId(1), uid: 2, m: effectcraft_engine::geom::Mat3::IDENTITY, sp, is_mask: true, feather: vec![] };
+        let b = ov::feather_boundary(&p, &map());
+        assert!(!b.is_empty());
+        // Halfway along the top edge the boundary is 10 px above it (outside).
+        let top = b.iter().find(|s| s.0 == 0 && (s.1 - 0.5).abs() < 1e-9).unwrap();
+        assert!((top.2.y + 10.0).abs() < 0.01 && (top.2.x - 50.0).abs() < 0.01, "{top:?}");
+    }
+
     /// Junk maps and pointer positions never panic and do nothing.
     #[test]
     fn junk_never_panics() {
-        let (mut h, _, _) = mini();
+        let (mut h, _, bx) = mini();
         let ctx = ctx();
-        for tool in [Tool::Rotate, Tool::PanBehind, Tool::Star, Tool::Pen, Tool::Type, Tool::Selection, Tool::PenDelete] {
+        keyed_box(&mut h, bx);
+        h.ui.viewer.grid = true;
+        h.ui.viewer.rulers = true;
+        h.ui.viewer.guides = true;
+        h.ui.viewer.safe_margins = true;
+        h.session.prefs.grids.grid_spacing = 0.0;
+        let _ = h.session.execute("view.addGuide", json!({"orientation": "horizontal", "position": 1e12}));
+        for tool in [Tool::Rotate, Tool::PanBehind, Tool::Star, Tool::Pen, Tool::Type, Tool::Selection, Tool::PenDelete, Tool::PenAdd, Tool::MaskFeather] {
             h.ui.tool = tool;
             for m in [
                 ViewerMap { origin: Pos2::new(f32::NAN, 0.0), zoom: 1.0, comp: [320.0, 180.0], area: Rect::from_min_size(Pos2::ZERO, vec2(320.0, 180.0)) },
@@ -635,6 +1073,7 @@ mod tests {
                     let input = egui::RawInput { events: vec![Event::PointerMoved(at), button(at, true), button(at, false)], ..Default::default() };
                     let _ = ctx.run_ui(input, |ui| {
                         let _ = tools(&mut h, ui, m, Options { id: egui::Id::new("junk"), space_pan: false });
+                        view_overlays(&mut h, ui, m);
                         let _ = edit_text_at(&mut h, ui.ctx(), m, at);
                     });
                 }

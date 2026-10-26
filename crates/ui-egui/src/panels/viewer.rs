@@ -328,7 +328,7 @@ fn roi_drag(app: &EffectcraftApp, map: &ViewerMap, comp_rect: Rect, zoom: f32, p
 }
 
 /// The camera the viewer shows (view camera or the comp's active camera).
-fn cam_state(ctx: &EvalCtx) -> CameraState {
+pub(crate) fn cam_state(ctx: &EvalCtx) -> CameraState {
     VIEW_CAM.with(|c| c.get()).unwrap_or_else(|| three_d::active_camera(ctx))
 }
 
@@ -1188,70 +1188,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     app.auto.add("viewer.comp", comp_rect, &comp_name);
     app.auto.add("viewer.area", area, "Composition viewer");
 
-    // Guides.
+    // Guides (title/action safe, grids, the comp's guides), each while it is turned on.
     let overlays = app.overlays_visible();
-    if overlays && app.ui.viewer.safe_margins {
-        let g = &app.session.prefs.grids;
-        let (act, title) = (1.0 - g.action_safe as f32 / 100.0, 1.0 - g.title_safe as f32 / 100.0);
-        for (k, a) in [(act, 120u8), (title, 160)] {
-            let r = Rect::from_center_size(comp_rect.center(), comp_rect.size() * k);
-            painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_white_alpha(a)), StrokeKind::Middle);
-        }
-        let c = comp_rect.center();
-        painter.line_segment([c - vec2(10.0, 0.0), c + vec2(10.0, 0.0)], Stroke::new(1.0, Color32::from_white_alpha(140)));
-        painter.line_segment([c - vec2(0.0, 10.0), c + vec2(0.0, 10.0)], Stroke::new(1.0, Color32::from_white_alpha(140)));
-    }
-    if overlays && app.ui.viewer.grid {
-        // Settings ▸ Grids & Guides: gridline spacing, subdivisions and colour.
-        let g = &app.session.prefs.grids;
-        let [r, gg, b] = hex_rgb(&g.grid_color).unwrap_or([120, 160, 255]);
-        let major = Stroke::new(1.0, Color32::from_rgba_unmultiplied(r, gg, b, 90));
-        let minor = Stroke::new(1.0, Color32::from_rgba_unmultiplied(r, gg, b, 35));
-        let step = (g.grid_spacing as f32 * zoom).max(2.0);
-        let sub = g.grid_subdivisions.max(1) as f32;
-        let sstep = step / sub;
-        let draw_minor = sstep >= 4.0;
-        // Settings ▸ Grids & Guides ▸ Grid Style (lines, dashed lines or dots).
-        let style = g.grid_style.clone();
-        let mut i = 0u32;
-        let mut gx = comp_rect.min.x;
-        while gx <= comp_rect.max.x {
-            let is_major = i.is_multiple_of(g.grid_subdivisions.max(1));
-            if is_major || draw_minor {
-                styled_line(&painter, [pos2(gx, comp_rect.min.y), pos2(gx, comp_rect.max.y)], if is_major { major } else { minor }, &style);
-            }
-            gx += sstep;
-            i += 1;
-        }
-        let mut i = 0u32;
-        let mut gy = comp_rect.min.y;
-        while gy <= comp_rect.max.y {
-            let is_major = i.is_multiple_of(g.grid_subdivisions.max(1));
-            if is_major || draw_minor {
-                styled_line(&painter, [pos2(comp_rect.min.x, gy), pos2(comp_rect.max.x, gy)], if is_major { major } else { minor }, &style);
-            }
-            gy += sstep;
-            i += 1;
-        }
-    }
-
-    vt::proportional_grid(app, &painter, comp_rect);
-
-    // Comp guides (View ▸ Show Guides) and the region of interest.
-    if overlays && app.ui.viewer.guides {
-        let [r, gg, b] = hex_rgb(&app.session.prefs.grids.guide_color).unwrap_or([0x3c, 0xc8, 0xf0]);
-        let stroke = Stroke::new(1.0, Color32::from_rgb(r, gg, b));
-        // Settings ▸ Grids & Guides ▸ Guide Style.
-        let style = app.session.prefs.grids.guide_style.clone();
-        for g in &comp.guides {
-            if g.vertical {
-                let x = comp_rect.min.x + g.px(comp.width, comp.height) as f32 * zoom;
-                styled_line(&painter, [pos2(x, area.min.y), pos2(x, area.max.y)], stroke, &style);
-            } else {
-                let y = comp_rect.min.y + g.px(comp.width, comp.height) as f32 * zoom;
-                styled_line(&painter, [pos2(area.min.x, y), pos2(area.max.x, y)], stroke, &style);
-            }
-        }
+    if overlays {
+        vt::draw_view_guides(app, &painter, &comp, comp_rect, area, zoom);
+    } else {
+        vt::proportional_grid(app, &painter, comp_rect);
     }
     if let Some([rx, ry, rw, rh]) = app.session.state.region_of_interest {
         let r = Rect::from_min_size(comp_rect.min + vec2(rx as f32 * zoom, ry as f32 * zoom), vec2(rw as f32 * zoom, rh as f32 * zoom));
@@ -1386,6 +1328,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // Path points last, over the boxes' handles (#1042).
     ov::draw_vertex_marks(&painter, &vertex_marks, app.session.prefs.general.path_point_size as f32 + 1.0);
+    // EMBED14: the Mask Feather tool shows the masks' feather boundaries (variable feather).
+    if app.ui.tool == Tool::MaskFeather {
+        ov::draw_feather_boundaries(&painter, &map, &ectx, &paths);
+    }
 
     // Settings ▸ 3D: Extended Viewer (3D layers outlined beyond the comp frame) and Show 3D
     // Reference Axes (world X/Y/Z in the corner, turning with the view).
@@ -1403,22 +1349,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
     if has_3d && app.session.prefs.three_d.show_reference_axes {
-        let pc = cam_state(&ectx).projection(cw as f64, ch as f64);
-        let o3 = effectcraft_engine::geom::vec3(cw as f64 / 2.0, ch as f64 / 2.0, 0.0);
-        let o = pc.apply(o3);
-        let corner = pos2(area.min.x + 34.0, area.max.y - 34.0);
-        for (axis, col, name) in [
-            (effectcraft_engine::geom::vec3(1.0, 0.0, 0.0), Color32::from_rgb(0xe0, 0x50, 0x50), "X"),
-            (effectcraft_engine::geom::vec3(0.0, 1.0, 0.0), Color32::from_rgb(0x60, 0xd0, 0x60), "Y"),
-            (effectcraft_engine::geom::vec3(0.0, 0.0, 1.0), Color32::from_rgb(0x50, 0x8c, 0xf0), "Z"),
-        ] {
-            let e = pc.apply(o3 + axis * 10.0);
-            let d = vec2((e.x - o.x) as f32, (e.y - o.y) as f32);
-            let d = if d.length() > 1e-4 { d.normalized() * 22.0 } else { vec2(0.0, 0.0) };
-            painter.arrow(corner, d, Stroke::new(1.5, col));
-            painter.text(corner + d * 1.25, Align2::CENTER_CENTER, name, Tokens::ui(10.0), col);
-        }
-        app.auto.add("viewer.referenceAxes", Rect::from_center_size(corner, vec2(56.0, 56.0)), "3D reference axes");
+        vt::draw_reference_axes(app, &painter, &ectx, area, [cw, ch]);
     }
 
     // Track points of the current track (Tracker panel) on its layer, while that layer is selected.
@@ -1999,7 +1930,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Middle);
                 }
                 d => {
-                    let mut snapper = |a: &EffectcraftApp, p: [f64; 2], l: LayerId| vt::snap(a, &ctx, &ectx, &map, &[l], &[p], mods);
+                    let mut snapper = |a: &dyn TimelineHost, p: [f64; 2], l: LayerId| vt::snap(a, &ctx, &ectx, &map, &[l], &[p], mods);
                     if let Some(nd) = ov::update(app, &d, cpt, pos, mods, &merge, zoom, &mut snapper) {
                         ui.data_mut(|dd| dd.insert_temp(gid, Gesture::Overlay(nd)));
                     }
@@ -2680,15 +2611,15 @@ fn draw_rigs(
 /// Mask), a shape path (Shape n group with the Tools bar's Fill and Stroke) on the selected shape
 /// layer, or a new shape layer when nothing is selected. The placed point snaps.
 /// Add a Position keyframe at a motion path's frame, keeping the path where it is.
-fn add_motion_key(app: &mut dyn TimelineHost, f: ov::PathFrame) {
+pub(crate) fn add_motion_key(app: &mut dyn TimelineHost, f: ov::PathFrame) {
     if let Err(e) = app.session_mut().execute("prop.addKey", json!({"layer": f.layer.0, "prop": f.prop, "time": f.time.seconds()})) {
         app.ui_mut().status = e.to_string();
     }
 }
 
 /// Select only the motion path's keyframe `k` (what the vertex tools act on).
-fn select_motion_key(app: &mut EffectcraftApp, k: &ov::KeyHit) -> bool {
-    app.session.execute("keys.select", json!({"keys": [{"layer": k.layer.0, "prop": k.prop, "time": k.time.seconds()}]})).is_ok()
+pub(crate) fn select_motion_key(app: &mut dyn TimelineHost, k: &ov::KeyHit) -> bool {
+    app.session_mut().execute("keys.select", json!({"keys": [{"layer": k.layer.0, "prop": k.prop, "time": k.time.seconds()}]})).is_ok()
 }
 
 /// The pointer for a Pen slot tool: the tool's own pen, the Pen showing Add Vertex's over a path

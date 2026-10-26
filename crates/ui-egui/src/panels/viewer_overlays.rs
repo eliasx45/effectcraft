@@ -251,6 +251,32 @@ pub(crate) fn draw_paths(
     }
 }
 
+/// The point of segment `c` at `t` and the path's outward unit normal there (path space; outward
+/// by an even-odd test against the vertex polygon, good enough to orient feather).
+fn outward_at(sp: &ShapePath, c: &[[f64; 2]; 4], t: f64) -> ([f64; 2], [f64; 2]) {
+    let inside = |q: [f64; 2]| {
+        let v = &sp.vertices;
+        let mut inside = false;
+        for i in 0..v.len() {
+            let (Some(a), Some(b)) = (v.get(i), v.get((i + 1) % v.len())) else { continue };
+            if (a[1] > q[1]) != (b[1] > q[1]) && q[0] < (b[0] - a[0]) * (q[1] - a[1]) / (b[1] - a[1]) + a[0] {
+                inside = !inside;
+            }
+        }
+        inside
+    };
+    let at = cubic(c[0], c[1], c[2], c[3], t);
+    let (t0, t1) = ((t - 1e-3).max(0.0), (t + 1e-3).min(1.0));
+    let (a, b) = (cubic(c[0], c[1], c[2], c[3], t0), cubic(c[0], c[1], c[2], c[3], t1));
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = dx.hypot(dy).max(1e-9);
+    let mut n = [-dy / len, dx / len];
+    if inside([at[0] + n[0] * 2.0, at[1] + n[1] * 2.0]) {
+        n = [-n[0], -n[1]];
+    }
+    (at, n)
+}
+
 /// Mask feather points: a hollow dot on the path and a radius handle along the normal (outwards for
 /// outer feather, inwards for inner), joined by a line. Returns the handles' screen positions.
 fn draw_feather_points(painter: &egui::Painter, map: &ViewerMap, sp: &ShapePath, pm: &Mat3, col: Color32) -> Vec<(usize, Pos2)> {
@@ -259,29 +285,9 @@ fn draw_feather_points(painter: &egui::Painter, map: &ViewerMap, sp: &ShapePath,
         let c = pm.apply(gv2(p[0], p[1]));
         map.to_screen([c.x, c.y])
     };
-    let inside = |q: [f64; 2]| {
-        // Even-odd test against the vertex polygon (good enough to orient the handle).
-        let v = &sp.vertices;
-        let mut c = false;
-        for i in 0..v.len() {
-            let (a, b) = (v[i], v[(i + 1) % v.len()]);
-            if (a[1] > q[1]) != (b[1] > q[1]) && q[0] < (b[0] - a[0]) * (q[1] - a[1]) / (b[1] - a[1]) + a[0] {
-                c = !c;
-            }
-        }
-        c
-    };
     for (i, f) in sp.feather.iter().enumerate() {
         let Some(c) = segment(sp, f.segment) else { continue };
-        let at = cubic(c[0], c[1], c[2], c[3], f.t);
-        let (t0, t1) = ((f.t - 1e-3).max(0.0), (f.t + 1e-3).min(1.0));
-        let (a, b) = (cubic(c[0], c[1], c[2], c[3], t0), cubic(c[0], c[1], c[2], c[3], t1));
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let len = dx.hypot(dy).max(1e-9);
-        let mut n = [-dy / len, dx / len];
-        if inside([at[0] + n[0] * 2.0, at[1] + n[1] * 2.0]) {
-            n = [-n[0], -n[1]];
-        }
+        let (at, n) = outward_at(sp, &c, f.t);
         let h = [at[0] + n[0] * f.radius, at[1] + n[1] * f.radius];
         let (ps, hs) = (scr(at), scr(h));
         painter.line_segment([ps, hs], Stroke::new(1.0, col));
@@ -290,6 +296,114 @@ fn draw_feather_points(painter: &egui::Painter, map: &ViewerMap, sp: &ShapePath,
         out.push((i, hs));
     }
     out
+}
+
+/// Samples per path segment of the feather boundary.
+const BOUNDARY_STEPS: usize = 24;
+
+/// The feather radius along a mask path at parameter `s` (segment index + t) from its variable
+/// feather points: between two neighbouring points it blends from one radius to the other,
+/// smoothly at tension 0 and linearly at tension 1; a closed path wraps around, an open one keeps
+/// its end points' radii past them. `None` without feather points.
+pub(crate) fn feather_radius_at(sp: &ShapePath, s: f64) -> Option<f64> {
+    let mut pts: Vec<(f64, f64, f64)> = sp
+        .feather
+        .iter()
+        .map(|f| (f.segment as f64 + f.t.clamp(0.0, 1.0), f.radius, f.tension.clamp(0.0, 1.0)))
+        .filter(|p| p.0.is_finite() && p.1.is_finite())
+        .collect();
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (first, last) = (*pts.first()?, *pts.last()?);
+    if pts.len() == 1 {
+        return Some(first.1);
+    }
+    let n = sp.vertices.len();
+    let total = if sp.closed { n as f64 } else { n.saturating_sub(1) as f64 };
+    let blend = |a: (f64, f64, f64), b: (f64, f64, f64), u: f64| {
+        let u = u.clamp(0.0, 1.0);
+        let smooth = u * u * (3.0 - 2.0 * u);
+        let tension = (a.2 + b.2) / 2.0;
+        let k = smooth + (u - smooth) * tension;
+        a.1 + (b.1 - a.1) * k
+    };
+    if let Some(i) = pts.iter().rposition(|p| p.0 <= s)
+        && let (Some(a), Some(b)) = (pts.get(i), pts.get(i + 1))
+    {
+        let span = b.0 - a.0;
+        return Some(if span > 1e-12 { blend(*a, *b, (s - a.0) / span) } else { a.1 });
+    }
+    // Before the first point or after the last one.
+    if !sp.closed || total <= 0.0 {
+        return Some(if s < first.0 { first.1 } else { last.1 });
+    }
+    let span = first.0 + total - last.0;
+    let along = if s >= last.0 { s - last.0 } else { s + total - last.0 };
+    Some(if span > 1e-12 { blend(last, first, along / span) } else { last.1 })
+}
+
+/// The feather boundary of a mask with variable feather points (Mask Feather tool): the path
+/// pushed out (or in) by the feather radius at each point, as (segment, t, screen point) samples
+/// in order. Empty without feather points.
+pub(crate) fn feather_boundary(p: &PathInfo, map: &ViewerMap) -> Vec<(usize, f64, Pos2)> {
+    let mut out = Vec::new();
+    if !p.is_mask || p.sp.feather.is_empty() {
+        return out;
+    }
+    for i in 0..p.sp.vertices.len() {
+        let Some(c) = segment(&p.sp, i) else { continue };
+        for k in 0..=BOUNDARY_STEPS {
+            let t = k as f64 / BOUNDARY_STEPS as f64;
+            let Some(r) = feather_radius_at(&p.sp, i as f64 + t) else { return out };
+            let (at, n) = outward_at(&p.sp, &c, t);
+            let q = p.m.apply(gv2(at[0] + n[0] * r, at[1] + n[1] * r));
+            let sp = map.to_screen([q.x, q.y]);
+            if sp.x.is_finite() && sp.y.is_finite() {
+                out.push((i, t, sp));
+            }
+        }
+    }
+    out
+}
+
+/// Draw the feather boundaries of the masks in `paths` (dashed, in each mask's colour): what the
+/// Mask Feather tool shows and drags.
+pub(crate) fn draw_feather_boundaries(painter: &egui::Painter, map: &ViewerMap, ectx: &EvalCtx, paths: &[PathInfo]) {
+    for p in paths.iter().filter(|p| p.is_mask) {
+        let pts: Vec<Pos2> = feather_boundary(p, map).into_iter().map(|b| b.2).collect();
+        if pts.len() > 1 {
+            let col = ectx
+                .comp
+                .layer(p.layer)
+                .and_then(|l| l.props.find_group(p.uid))
+                .and_then(|g| match g.kind {
+                    GroupKind::Mask { color, .. } => Some(Color32::from_rgb(color[0], color[1], color[2])),
+                    _ => None,
+                })
+                .unwrap_or(Color32::WHITE);
+            painter.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.0, col), 4.0, 3.0));
+        }
+    }
+}
+
+/// The feather boundary sample under `pos` (within `tol` points): (layer, mask, segment, t, radius).
+fn boundary_at(paths: &[PathInfo], map: &ViewerMap, pos: Pos2, tol: f32) -> Option<(LayerId, u64, usize, f64, f64)> {
+    let mut best: Option<(f32, (LayerId, u64, usize, f64, f64))> = None;
+    for p in paths.iter().filter(|p| p.is_mask) {
+        let b = feather_boundary(p, map);
+        for w in b.windows(2) {
+            let (Some(a), Some(c)) = (w.first(), w.get(1)) else { continue };
+            let d = seg_dist(pos, a.2, c.2);
+            if d < tol && best.as_ref().is_none_or(|x| d < x.0) {
+                let delta = c.2 - a.2;
+                let f = if delta.length_sq() > 1e-6 { ((pos - a.2).dot(delta) / delta.length_sq()).clamp(0.0, 1.0) as f64 } else { 0.0 };
+                // A sample pair spans one segment (the last sample of a segment ends it at t = 1).
+                let (seg, t) = if a.0 == c.0 { (a.0, a.1 + (c.1 - a.1) * f) } else { (a.0, a.1) };
+                let r = feather_radius_at(&p.sp, seg as f64 + t).unwrap_or(0.0);
+                best = Some((d, (p.layer, p.uid, seg, t, r)));
+            }
+        }
+    }
+    best.map(|b| b.1)
 }
 
 // ---------------------------------------------------------------- motion paths
@@ -391,24 +505,25 @@ pub(crate) fn pen_target(hits: &[KeyHit], segments: &[MotionSegment], frames: &[
     order.into_iter().filter(|t| !is_key(*t)).find_map(frame).map_or(PenTarget::PathFull, PenTarget::AddFrame)
 }
 
-pub(crate) fn edit_motion_key(app: &mut EffectcraftApp, h: KeyHit, delete: bool) {
-    let result = app.session.execute("keys.select", json!({"keys": [{"layer": h.layer.0, "prop": h.prop, "time": h.time.seconds()}]})).and_then(|_| {
+pub(crate) fn edit_motion_key(app: &mut dyn TimelineHost, h: KeyHit, delete: bool) {
+    let s = app.session_mut();
+    let result = s.execute("keys.select", json!({"keys": [{"layer": h.layer.0, "prop": h.prop, "time": h.time.seconds()}]})).and_then(|_| {
         if delete {
-            app.session.execute("keys.delete", json!({}))
+            s.execute("keys.delete", json!({}))
         } else {
             // Convert Vertex: a curved key becomes Linear, a corner Auto Bezier (as in After Effects).
-            app.session.execute("keys.interpolation", json!({"spatial": if h.curved { "linear" } else { "autoBezier" }}))
+            s.execute("keys.interpolation", json!({"spatial": if h.curved { "linear" } else { "autoBezier" }}))
         }
     });
     if let Err(e) = result {
-        app.ui.status = e.to_string();
+        app.ui_mut().status = e.to_string();
     }
 }
 
-pub(crate) fn insert_motion_key(app: &mut EffectcraftApp, hit: (LayerId, u64, Tick)) {
+pub(crate) fn insert_motion_key(app: &mut dyn TimelineHost, hit: (LayerId, u64, Tick)) {
     let (layer, prop, time) = hit;
-    if let Err(e) = app.session.execute("keys.insertSpatial", json!({"layer": layer.0, "prop": prop, "time": time.seconds()})) {
-        app.ui.status = e.to_string();
+    if let Err(e) = app.session_mut().execute("keys.insertSpatial", json!({"layer": layer.0, "prop": prop, "time": time.seconds()})) {
+        app.ui_mut().status = e.to_string();
     }
 }
 
@@ -448,7 +563,7 @@ pub(crate) fn parent_to_comp(ectx: &EvalCtx, l: &Layer) -> Mat3 {
 /// squares (filled when selected) and spatial Bezier tangent handles. Works through parents.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn motion_path(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     painter: &egui::Painter,
     map: &ViewerMap,
     ectx: &EvalCtx,
@@ -469,11 +584,10 @@ pub(crate) fn motion_path(
     };
     // Settings ▸ Composition ▸ Motion Path: all keyframes, none, or a window around the CTI.
     let times: Vec<Tick> = pos.keys.iter().map(|k| k.time).collect();
-    let span = app
-        .session
-        .prefs
+    let prefs = &app.session().prefs;
+    let span = prefs
         .motion_path_span(&times, l.layer_time(ectx.time))
-        .or_else(|| (times.len() == 1 && app.session.prefs.composition.motion_path != "none").then(|| times.first().copied().map(|t| (t, t))).flatten());
+        .or_else(|| (times.len() == 1 && prefs.composition.motion_path != "none").then(|| times.first().copied().map(|t| (t, t))).flatten());
     let Some((lt0, lt1)) = span else { return };
     let fd = ectx.comp.frame_duration();
     let mut pts = vec![];
@@ -504,7 +618,7 @@ pub(crate) fn motion_path(
     for q in &pts {
         painter.circle_filled(*q, 1.2, faint);
     }
-    let sel = &app.session.state.selected_keys;
+    let sel = app.session().state.selected_keys.clone();
     for (i, k) in pos.keys.iter().enumerate() {
         if k.time < lt0 || k.time > lt1 {
             continue;
@@ -528,7 +642,7 @@ pub(crate) fn motion_path(
             painter.line_segment([s, h], Stroke::new(1.0, col));
             painter.circle_filled(h, 3.0, col);
             let side = if out { "out" } else { "in" };
-            app.auto.add(&format!("viewer.motionPath.{}.{i}.{side}", l.id.0), Rect::from_center_size(h, vec2(8.0, 8.0)), "Spatial tangent");
+            app.auto_mut().add(&format!("viewer.motionPath.{}.{i}.{side}", l.id.0), Rect::from_center_size(h, vec2(8.0, 8.0)), "Spatial tangent");
             hits.push(KeyHit { layer: l.id, prop: pos.uid, time: k.time, pos: h, tangent: Some(out), value: v, p2c, curved });
         }
         let r = Rect::from_center_size(s, vec2(7.0, 7.0));
@@ -538,7 +652,7 @@ pub(crate) fn motion_path(
             painter.rect_filled(r, 0.0, Color32::from_black_alpha(140));
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, col), StrokeKind::Inside);
         }
-        app.auto.add(&format!("viewer.motionPath.{}.{i}", l.id.0), r.expand(2.0), "Position keyframe");
+        app.auto_mut().add(&format!("viewer.motionPath.{}.{i}", l.id.0), r.expand(2.0), "Position keyframe");
         hits.push(KeyHit { layer: l.id, prop: pos.uid, time: k.time, pos: s, tangent: None, value: v, p2c, curved });
     }
 }
@@ -557,8 +671,8 @@ pub(crate) fn end_free_transform(app: &mut EffectcraftApp) {
 }
 
 /// Turn the box (`angle`, degrees) or move its anchor point (`anchor`, box coordinates).
-pub(crate) fn set_free_transform(app: &mut EffectcraftApp, angle: Option<f64>, anchor: Option<[f64; 2]>) {
-    if let Some(f) = app.ui.viewer.free_transform.as_mut() {
+pub(crate) fn set_free_transform(app: &mut dyn TimelineHost, angle: Option<f64>, anchor: Option<[f64; 2]>) {
+    if let Some(f) = app.ui_mut().viewer.free_transform.as_mut() {
         if let Some(a) = angle.filter(|a| a.is_finite()) {
             f.angle = a.rem_euclid(360.0);
         }
@@ -873,7 +987,7 @@ pub(crate) enum Drag {
 }
 
 /// Start a motion-path drag at `press` (keys before tangents), selecting the key.
-pub(crate) fn begin_key_drag(app: &mut EffectcraftApp, hits: &[KeyHit], press: Pos2, cpt: [f64; 2], shift: bool) -> Option<Drag> {
+pub(crate) fn begin_key_drag(app: &mut dyn TimelineHost, hits: &[KeyHit], press: Pos2, cpt: [f64; 2], shift: bool) -> Option<Drag> {
     let h = hits
         .iter()
         .rev()
@@ -885,8 +999,9 @@ pub(crate) fn begin_key_drag(app: &mut EffectcraftApp, hits: &[KeyHit], press: P
         Some(out) => Some(Drag::KeyTangent { layer: h.layer, prop: h.prop, time: h.time, out, key: h.value, inv }),
         None => {
             let k = KeyRef { layer: h.layer, prop: h.prop, time: h.time };
-            if !app.session.state.selected_keys.contains(&k) || shift {
-                let _ = app.session.execute("keys.select", json!({"keys": [{"layer": h.layer.0, "prop": h.prop, "time": h.time.seconds()}], "add": shift}));
+            if !app.session().state.selected_keys.contains(&k) || shift {
+                let _ =
+                    app.session_mut().execute("keys.select", json!({"keys": [{"layer": h.layer.0, "prop": h.prop, "time": h.time.seconds()}], "add": shift}));
             }
             Some(Drag::Key { layer: h.layer, prop: h.prop, time: h.time, start: h.value, press: cpt, inv })
         }
@@ -896,10 +1011,10 @@ pub(crate) fn begin_key_drag(app: &mut EffectcraftApp, hits: &[KeyHit], press: P
 /// Start bending the motion path between two keys at `press` (comp point `cpt`): the point of
 /// the path under the press follows the pointer and only the two keys' facing spatial tangents
 /// change; no key is added (a Pen click there adds one, as Add Vertex does in After Effects).
-pub(crate) fn begin_segment_bend(app: &EffectcraftApp, segments: &[MotionSegment], press: Pos2, cpt: [f64; 2]) -> Option<Drag> {
+pub(crate) fn begin_segment_bend(app: &dyn TimelineHost, segments: &[MotionSegment], press: Pos2, cpt: [f64; 2]) -> Option<Drag> {
     let (seg, _) = segment_near(segments, press)?;
     let inv = seg.p2c.inverse()?;
-    let keys = &app.session.active_comp()?.layer(seg.layer)?.props.find(seg.prop)?.keys;
+    let keys = &app.session().active_comp()?.layer(seg.layer)?.props.find(seg.prop)?.keys;
     let i = keys.partition_point(|k| k.time <= seg.start).checked_sub(1)?;
     let p = inv.apply(gv2(cpt[0], cpt[1]));
     let u = effectcraft_engine::keyframe::spatial_segment_param(keys, i, [p.x, p.y])?;
@@ -932,9 +1047,10 @@ pub(crate) fn begin_ft_drag(f: &FtBox, press: Pos2, map: &ViewerMap, cmd: bool) 
     Some(Drag::Ft { layer: f.layer, path: f.uid, mode, f0: f.f, angle0: f.angle, anchor0: f.anchor_uv, press: [lp.x, lp.y], applied: AF_ID, inv })
 }
 
-/// Mask Feather tool: press on a feather point's handle to drag it, or on a mask path to add a
-/// feather point there and drag its radius out.
-pub(crate) fn begin_feather(app: &mut EffectcraftApp, ectx: &EvalCtx, paths: &[PathInfo], map: &ViewerMap, press: Pos2) -> Option<Drag> {
+/// Mask Feather tool: press on a feather point's handle to drag it, on a mask path to add a
+/// feather point there and drag its radius out, or on a mask's feather boundary to add a point
+/// with the radius the boundary has there and drag it.
+pub(crate) fn begin_feather(app: &mut dyn TimelineHost, ectx: &EvalCtx, paths: &[PathInfo], map: &ViewerMap, press: Pos2) -> Option<Drag> {
     let _ = ectx;
     for p in paths.iter().filter(|p| p.is_mask) {
         if let Some((i, _)) = p.feather.iter().find(|(_, h)| h.distance(press) < 7.0) {
@@ -942,13 +1058,22 @@ pub(crate) fn begin_feather(app: &mut EffectcraftApp, ectx: &EvalCtx, paths: &[P
         }
     }
     let masks: Vec<PathInfo> = paths.iter().filter(|p| p.is_mask).cloned().collect();
-    let (layer, uid, seg, t) = segment_at(&masks, map, press, 10.0)?;
+    let (layer, uid, seg, t, radius) = match segment_at(&masks, map, press, 6.0) {
+        Some((l, m, seg, t)) => (l, m, seg, t, 0.0),
+        None => match boundary_at(&masks, map, press, 6.0) {
+            Some(b) => b,
+            None => {
+                let (l, m, seg, t) = segment_at(&masks, map, press, 10.0)?;
+                (l, m, seg, t, 0.0)
+            }
+        },
+    };
     let inv = masks.iter().find(|p| p.layer == layer && p.uid == uid)?.m.inverse()?;
-    let r = app.session.execute("mask.featherPoint.add", json!({"layer": layer.0, "mask": uid, "segment": seg, "t": t, "radius": 0}));
+    let r = app.session_mut().execute("mask.featherPoint.add", json!({"layer": layer.0, "mask": uid, "segment": seg, "t": t, "radius": radius}));
     match r {
         Ok(v) => Some(Drag::Feather { layer, mask: uid, index: v["index"].as_u64()? as usize, inv }),
         Err(e) => {
-            app.ui.status = e.to_string();
+            app.ui_mut().status = e.to_string();
             None
         }
     }
@@ -958,14 +1083,14 @@ pub(crate) fn begin_feather(app: &mut EffectcraftApp, ectx: &EvalCtx, paths: &[P
 /// point for snapping. Returns the replacement drag state.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     d: &Drag,
     cpt: [f64; 2],
     pos: Pos2,
     mods: egui::Modifiers,
     merge: &str,
     zoom: f32,
-    snap: &mut dyn FnMut(&EffectcraftApp, [f64; 2], LayerId) -> [f64; 2],
+    snap: &mut dyn FnMut(&dyn TimelineHost, [f64; 2], LayerId) -> [f64; 2],
 ) -> Option<Drag> {
     match d.clone() {
         Drag::Key { layer, prop, time, start, press, inv } => {
@@ -976,9 +1101,9 @@ pub(crate) fn update(
             target = [target[0] + s[0], target[1] + s[1]];
             let p = inv.apply(gv2(target[0], target[1]));
             let v = json!([p.x, p.y, start[2]]);
-            let r = app.session.execute("keys.set", json!({"layer": layer.0, "prop": prop, "time": time.seconds(), "value": v, "merge": merge}));
+            let r = app.session_mut().execute("keys.set", json!({"layer": layer.0, "prop": prop, "time": time.seconds(), "value": v, "merge": merge}));
             if let Err(e) = r {
-                app.ui.status = e.to_string();
+                app.ui_mut().status = e.to_string();
             }
             None
         }
@@ -987,7 +1112,7 @@ pub(crate) fn update(
             let tg = json!([p.x - key[0], p.y - key[1], 0.0]);
             let mut q = json!({"layer": layer.0, "prop": prop, "time": time.seconds(), "break": mods.alt, "merge": merge});
             q[if out { "out" } else { "in" }] = tg;
-            let _ = app.session.execute("keys.setSpatialTangents", q);
+            let _ = app.session_mut().execute("keys.setSpatialTangents", q);
             None
         }
         Drag::Segment { layer, prop, time, u, last, inv } => {
@@ -995,8 +1120,8 @@ pub(crate) fn update(
             let cur = [p.x, p.y];
             if cur != last {
                 let q = json!({"layer": layer.0, "prop": prop, "time": time.seconds(), "u": u, "offset": [cur[0] - last[0], cur[1] - last[1]], "merge": merge});
-                if let Err(e) = app.session.execute("keys.bendSpatialSegment", q) {
-                    app.ui.status = e.to_string();
+                if let Err(e) = app.session_mut().execute("keys.bendSpatialSegment", q) {
+                    app.ui_mut().status = e.to_string();
                     return None;
                 }
             }
@@ -1017,8 +1142,8 @@ pub(crate) fn update(
             let delta = af_mul(&total, &af_inv(&applied)?);
             if delta.iter().zip(AF_ID).any(|(a, b)| (a - b).abs() > 1e-9) {
                 let q = json!({"layer": layer.0, "mask": path, "matrix": delta, "merge": merge});
-                if let Err(e) = app.session.execute("path.freeTransform", q) {
-                    app.ui.status = e.to_string();
+                if let Err(e) = app.session_mut().execute("path.freeTransform", q) {
+                    app.ui_mut().status = e.to_string();
                     return None;
                 }
             }
@@ -1029,8 +1154,8 @@ pub(crate) fn update(
             let p = inv.apply(gv2(cpt[0], cpt[1]));
             let _ = (pos, zoom);
             let q = json!({"layer": layer.0, "mask": mask, "index": index, "toward": [p.x, p.y], "merge": merge});
-            if let Err(e) = app.session.execute("mask.featherPoint.set", q) {
-                app.ui.status = e.to_string();
+            if let Err(e) = app.session_mut().execute("mask.featherPoint.set", q) {
+                app.ui_mut().status = e.to_string();
             }
             None
         }

@@ -6,9 +6,10 @@
 //! zoom (- / =, ;, Shift+;), D / X (scroll to time / layer), B / N (work area), [ ] (layer in /
 //! out to time), the reveal keys (P S R T A E M F L, their double presses and Shift+ adds),
 //! Alt+Shift+P… (key at time), U / UU, F4 (switches / modes), Shift+F4 (parent column),
-//! Cmd+` (twirl selected), and (EMBED8) the Composition viewer tools a host's comp has (V, W, Y,
-//! Q, G, Cmd+T: `panels::viewer_hosted`). In EffectCraft `menus::invoke` runs them; a host runs
-//! them here.
+//! Cmd+` (twirl selected), (EMBED8) the Composition viewer tools a host's comp has (V, W, Y,
+//! Q, G, Cmd+T: `panels::viewer_hosted`) and (EMBED14) the viewer's View toggles (' title/action
+//! safe, Cmd+' grid, Cmd+; guides, Cmd+R rulers, their snap and lock). In EffectCraft
+//! `menus::invoke` runs them; a host runs them here.
 //!
 //! A host:
 //! - calls [`install`] on its session (binds these commands' keys; a host's session has no
@@ -55,6 +56,14 @@ const EXACT: &[&str] = &[
     "tool.shape",
     "tool.pen",
     "tool.type",
+    // EMBED14: the viewer's guides, grids and rulers on a host's card (View menu keys).
+    "view.safeMargins",
+    "view.grid",
+    "view.snapToGrid",
+    "view.guides",
+    "view.snapToGuides",
+    "view.lockGuides",
+    "view.rulers",
 ];
 const PREFIXES: &[&str] = &["timeline.reveal.", "timeline.revealAdd.", "timeline.keyAt."];
 
@@ -197,6 +206,20 @@ pub fn run(host: &mut dyn TimelineHost, ctx: &egui::Context, id: &str, params: &
         }
         "anim.reveal" => anim_reveal(host, ctx, now, params),
         t if t.starts_with("tool.") => host.ui_mut().choose_tool(t).map(|tool| json!({"tool": tool})),
+        "view.safeMargins" | "view.grid" | "view.snapToGrid" | "view.guides" | "view.snapToGuides" | "view.lockGuides" | "view.rulers" => {
+            let v = &mut host.ui_mut().viewer;
+            let slot = match id {
+                "view.safeMargins" => &mut v.safe_margins,
+                "view.grid" => &mut v.grid,
+                "view.snapToGrid" => &mut v.snap_grid,
+                "view.guides" => &mut v.guides,
+                "view.snapToGuides" => &mut v.snap_guides,
+                "view.lockGuides" => &mut v.lock_guides,
+                _ => &mut v.rulers,
+            };
+            let on = tl_toggle(slot);
+            Ok(json!({"value": on}))
+        }
         _ => {
             if let Some(k) = id.strip_prefix("timeline.revealAdd.") {
                 remember(ctx, Some((k.to_string(), now)));

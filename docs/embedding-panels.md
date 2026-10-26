@@ -17,6 +17,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED9 | Project panel | Draws against `TimelineHost`; New Comp and the footage menu go through the host when there is no app |
 | EMBED10 | Pre-compose, Interpret Footage dialogs | `precomp::{draft_for, draw}` and `forms::{build_form, draw_form}`: a host shows EffectCraft's own dialogs from its session and runs their command |
 | EMBED12 | Solid, Light, Camera, Layer Settings, Time Stretch, Layer Style dialogs | `hosted_dialogs::{open, draw, command, finish}`: a host shows EffectCraft's layer dialogs from its session and runs their command |
+| EMBED14 | The rest of the Composition viewer over a host's picture | `panels::viewer_hosted`: guides, grids, title/action safe, rulers, 3D reference axes (each only while on, with the View keys and the grid and guide options menu), motion paths (keys and tangents drag), the Mask Feather tool and feather boundaries |
 
 ## The host interface (EMBED1)
 
@@ -223,10 +224,24 @@ layer tools over its own picture, so those were factored out rather than the vie
   (slots cycle), used by `menus/tool.rs` and by `hosted::run`, which now also handles and binds
   `tool.selection`, `tool.rotate`, `tool.panBehind`, `tool.shape`, `tool.pen`, `tool.type` (the
   person's own keys through `use_user_shortcuts`).
-- Not hosted: Hand / Zoom, guides, rulers, the region of interest, motion paths, free transform,
-  Mask Feather, puppet, paint, roto, camera and tracker tools, the viewer's context menu.
+- EMBED14 hosts the rest of what the viewer shows over a frame, from the same code:
+  `viewer_tools::{draw_view_guides, draw_reference_axes, grid_options, toggle_grid_option}`
+  (title/action safe, grid, proportional grid, guides, 3D reference axes and the "Choose grid and
+  guide options" menu, factored out of `viewer::show`), `viewer_tools::rulers`, `guide_at`,
+  `viewer_overlays::{motion_path, begin_key_drag, begin_segment_bend, update, begin_feather}` now
+  take `&dyn`/`&mut dyn TimelineHost`. `viewer_hosted::tools` draws each overlay only while it is
+  turned on, the rulers outside the picture (`RULER`), the selected layers' motion paths (keys,
+  tangents, Pen-slot key edits, path bends) and runs the Mask Feather tool; `view_overlays` draws
+  the guides and grids alone. `timeline::hosted::run` handles `view.safeMargins`, `view.grid`,
+  `view.snapToGrid`, `view.guides`, `view.snapToGuides`, `view.lockGuides`, `view.rulers`. New in
+  both: the Mask Feather tool shows the masks' feather boundaries (dashed), and a drag from a
+  boundary adds a feather point with the radius it has there.
+- Not hosted: Hand / Zoom, the region of interest, free transform, puppet, paint, roto, camera and
+  tracker tools.
 
-Tests: `panels::viewer_hosted::tests` (keys, rotation, anchor, mask, Pen, typed text, junk).
+Tests: `panels::viewer_hosted::tests` (keys, rotation, anchor, mask, Pen, typed text, guides and
+grids drawn only when on, guide and ruler drags, motion-path key and tangent drags at two zooms,
+Mask Feather points, the feather boundary, junk).
 
 ## Next steps
 
@@ -284,6 +299,10 @@ All additive; nothing a host implements or calls was renamed or removed.
   project's item with the same id and revision never shows a stale thumbnail). Every command
   (rename, folders, labels, moves, `comp.open`, `file.import` on a double-click…) runs through
   `TimelineHost::invoke`. Test: `panels::project::tests::the_project_panel_draws_in_a_host_without_the_app`.
+- EMBED14: `panels::viewer_hosted::{view_overlays, grid_options, toggle_grid_option,
+  grid_options_on, RULER}`; `hosted` includes `Tool::MaskFeather`; `Frame::owns` is also true on a
+  motion-path key or tangent, a guide or a ruler. `timeline::hosted::run` handles the seven
+  `view.*` toggles above.
 - EMBED10: dialogs a host shows itself (FigCraft's cards). `panels::precomp::{draft_for(session,
   params), draw(ui, draft, tokens, registry) -> Answer, Answer}`: the Pre-compose dialog's starting
   draft and contents outside EffectCraft's modal (`open` and `dialog` use them; OK runs
