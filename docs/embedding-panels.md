@@ -14,6 +14,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED5 | Keys, UI commands, inline edits in a host | `panels::timeline::hosted`: Timeline UI commands and their keys (the person's own shortcuts), frontend events, precomp redirect |
 | EMBED6 | Panels in a scaled layer | `layer_pointer::Lp`: raw pointer reads, drag overlays and popup lists in the layer's own coordinates (a host may draw the Timeline in a layer it transforms, e.g. scaled on a canvas) |
 | EMBED8 | Composition viewer tools | `panels::viewer_hosted`: Rotation, Pan Behind, shape/mask tools, Pen (masks and shape paths, vertex tools), path vertex/tangent drags and the Type tool over a comp picture the host draws, with their keys |
+| EMBED9 | Project panel | Draws against `TimelineHost`; New Comp and the footage menu go through the host when there is no app |
 
 ## The host interface (EMBED1)
 
@@ -271,3 +272,13 @@ All additive; nothing a host implements or calls was renamed or removed.
   comp_point, map_for}`; `panels::viewer_text::edit_at`; `state::UiState::choose_tool`;
   `panels::timeline::hosted::run` handles the six `tool.*` commands above. Signatures that now take
   `&mut dyn`/`&dyn TimelineHost` (the app still coerces): `viewer_text::{hook, panel_clicked}`.
+- EMBED9: `panels::project::{show, begin_rename, visible_rows}` take `&mut dyn`/`&dyn TimelineHost`
+  (the app still coerces). App-only parts go through `app()`: Create a new Composition opens
+  EffectCraft's New Composition dialog in the app and asks a host with `invoke("comp.new", {})`
+  (the host shows its own way to choose settings, e.g. `comp_settings::show` in a window); the
+  footage context menu's Interpret / Replace Footage submenus are the app's, a host gets
+  `menu_entry` for Reload Footage and Reveal in Finder. Raw pointer reads (drop row, selection
+  box) go through `Lp`, and the item thumbnails' egui ids are salted with `id_scope()` (another
+  project's item with the same id and revision never shows a stale thumbnail). Every command
+  (rename, folders, labels, moves, `comp.open`, `file.import` on a double-click…) runs through
+  `TimelineHost::invoke`. Test: `panels::project::tests::the_project_panel_draws_in_a_host_without_the_app`.
