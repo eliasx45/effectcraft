@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use effectcraft_project::speech::{MAX_SYLLABLES, MAX_WORDS, SpeechMap, SpeechWord, Syllable, normalize};
+use effectcraft_project::speech::{MAX_SYLLABLES, MAX_WORDS, SpeechMap, SpeechWord, Syllable, guess_syllables, normalize};
 use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerSource};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
@@ -67,9 +67,18 @@ pub fn parse_map(doc: &Value, layer: Option<&Layer>, cmd: &str) -> Result<(Speec
             syllables.push(Syllable { t, vowel: v.max(t), stress });
         }
         syllables.sort_by_key(|s| s.t);
-        out.push(SpeechWord { word: str_p(w, "word").unwrap_or("").chars().take(200).collect(), start, end, syllables });
+        out.push(SpeechWord { word: str_p(w, "word").unwrap_or("").chars().take(200).collect(), start, end, syllables, guessed: false });
     }
     out.sort_by_key(|w| w.start);
+    // A forced-aligned map leaves words its dictionary doesn't know (brands: "YouTube") without
+    // syllables: estimate them, so peaks can be aligned to every word. A words-only map
+    // (scribe-words) stays words only.
+    if out.iter().any(|w| !w.syllables.is_empty()) {
+        for w in out.iter_mut().filter(|w| w.syllables.is_empty()) {
+            w.syllables = guess_syllables(&w.word, w.start, w.end);
+            w.guessed = !w.syllables.is_empty();
+        }
+    }
     let text = |k: &str| str_p(doc, k).unwrap_or("").chars().take(2000).collect::<String>();
     Ok((SpeechMap { engine: text("engine"), media: text("media"), layer: layer.map(|l| l.id), words: out, script: None }, dropped))
 }
@@ -135,6 +144,7 @@ fn summary(cid: ItemId, map: &SpeechMap, fps: f64) -> Value {
         "words": map.words.len(),
         "syllables": map.words.iter().map(|w| w.syllables.len()).sum::<usize>(),
         "stressed": map.stressed().len(),
+        "guessed": map.words.iter().filter(|w| w.guessed).map(|w| w.word.as_str()).take(50).collect::<Vec<_>>(),
         "start": r3(first),
         "end": r3(last),
         "fps": fps,
@@ -202,13 +212,17 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
             .filter(|w| inside(w.start) || inside(w.end))
             .take(MAX_LIST)
             .map(|w| {
-                json!({
+                let mut o = json!({
                     "word": w.word,
                     "start": r3(w.start.seconds()), "end": r3(w.end.seconds()), "frame": frame(w.start),
                     "syllables": w.syllables.iter().map(|syl| json!({
                         "t": r3(syl.t.seconds()), "frame": frame(syl.t), "vowel": r3(syl.vowel.seconds()), "stress": syl.stress,
                     })).collect::<Vec<_>>(),
-                })
+                });
+                if w.guessed {
+                    o["guessed"] = json!(true);
+                }
+                o
             })
             .collect();
         out["truncated"] = json!(list.len() >= MAX_LIST);
@@ -314,6 +328,9 @@ fn word_json(i: usize, w: &SpeechWord, fps: f64, lead: f64) -> Value {
         o["stressTime"] = json!(r3(accent));
         o["syllable"] = json!(k);
         o["onsetFrame"] = json!(frame(syl.t));
+    }
+    if w.guessed {
+        o["guessed"] = json!(true);
     }
     o
 }
