@@ -419,28 +419,36 @@ pub fn history(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
-pub fn markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
-    let t = app.tokens;
+pub fn markers(app: &mut dyn crate::panels::timeline::TimelineHost, ui: &mut egui::Ui, rect: Rect) {
+    let t = app.tokens();
     let p = ui.painter().with_clip_rect(rect);
-    let Some(c) = app.session.active_comp_arc() else { return };
+    let Some(c) = app.session().active_comp_arc() else { return };
     let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("markers-scroll"), rect);
     let mut y = rect.min.y + 8.0 - scroll.offset;
     if c.markers.is_empty() {
         p.text(rect.center(), Align2::CENTER_CENTER, tr("No composition markers"), Tokens::ui(12.0), t.text_faint);
     }
-    for m in &c.markers {
+    for (index, m) in c.markers.iter().enumerate() {
         let r = Rect::from_min_size(pos2(rect.min.x, y), vec2(rect.width(), 22.0));
         y += 22.0;
         if !r.intersects(rect) {
             continue;
         }
-        let tc = crate::panels::timecode(&app.session, &c, m.time);
+        let tc = crate::panels::timecode(app.session(), &c, m.time);
         p.text(pos2(r.min.x + 12.0, r.center().y), Align2::LEFT_CENTER, tc, Tokens::mono(11.5), t.timecode);
         p.text(pos2(r.min.x + 120.0, r.center().y), Align2::LEFT_CENTER, &m.comment, Tokens::ui(12.0), t.text);
-        if ui.interact(r, egui::Id::new(("mk", m.time.0)), Sense::click()).clicked() {
-            app.session.set_time(m.time);
+        let resp = ui.interact(r, egui::Id::new(("mk", m.time.0)), Sense::click());
+        app.auto_mut().add(&format!("markers.{index}"), r, &m.comment);
+        if resp.double_clicked() {
+            // Its Composition Marker dialog, as a double-click on the marker in the Timeline.
+            let m = crate::panels::markers_ui::MarkerRef { layer: None, index };
+            if let Err(e) = app.request_dialog(crate::panels::timeline::DialogRequest::Marker(m)) {
+                app.ui_mut().status = e;
+            }
+        } else if resp.clicked() {
+            app.session_mut().set_time(m.time);
         }
     }
     let content = y + 8.0 - (rect.min.y - scroll.offset);
-    scroll.end(ui, &mut app.auto, "markers.scroll", content, &t);
+    scroll.end(ui, app.auto_mut(), "markers.scroll", content, &t);
 }

@@ -8,9 +8,10 @@ use effectcraft_engine::render::EvalCtx;
 use egui::{Align2, Rect, Sense, pos2, vec2};
 use serde_json::json;
 
+use crate::panels::timeline::TimelineHost;
 use crate::state::TextColorPick;
 use crate::theme::Tokens;
-use crate::{EffectcraftApp, widgets};
+use crate::widgets;
 
 /// What the text panels act on: a text layer, a document whose base style and first paragraph
 /// show the selection's formatting, and the selected character range while editing.
@@ -35,11 +36,11 @@ impl TextTarget {
 }
 
 /// The edited text layer's selection, else the selected text layer's Source Text at the CTI.
-pub fn text_target(app: &EffectcraftApp) -> Option<TextTarget> {
-    let comp = app.session.active_comp()?;
-    let cid = app.session.active_comp_id()?;
-    if let Some(e) = app.session.state.text_edit.clone()
-        && let Some(full) = effectcraft_engine::commands::text_edit::layer_doc(&app.session, e.layer)
+pub fn text_target(app: &dyn TimelineHost) -> Option<TextTarget> {
+    let comp = app.session().active_comp()?;
+    let cid = app.session().active_comp_id()?;
+    if let Some(e) = app.session().state.text_edit.clone()
+        && let Some(full) = effectcraft_engine::commands::text_edit::layer_doc(app.session(), e.layer)
     {
         let r = e.range();
         let style = e.pending.clone().unwrap_or_else(|| if r.is_empty() { full.insertion_style(r.start) } else { full.style_at(r.start) });
@@ -53,18 +54,18 @@ pub fn text_target(app: &EffectcraftApp) -> Option<TextTarget> {
         return Some(TextTarget { layer: e.layer.0, doc: view, range: Some([r.start, r.end]) });
     }
     let layer = app
-        .session
+        .session()
         .state
         .selected_layers
         .iter()
         .filter_map(|id| comp.layer(*id))
         .find(|l| matches!(l.source, effectcraft_engine::project::LayerSource::Text))?;
-    let ectx = EvalCtx { project: &app.session.project, comp_id: cid, comp, time: app.session.time(), expr: app.session.expr.as_deref(), footage: None };
+    let ectx = EvalCtx { project: &app.session().project, comp_id: cid, comp, time: app.session().time(), expr: app.session().expr.as_deref(), footage: None };
     effectcraft_engine::render::text::source_text(&ectx, layer).map(|d| TextTarget { layer: layer.id.0, doc: d, range: None })
 }
 
-fn toggle(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, r: Rect, id: &str, label: &str, on: bool, bold: bool) -> bool {
-    let t = app.tokens;
+fn toggle(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, r: Rect, id: &str, label: &str, on: bool, bold: bool) -> bool {
+    let t = app.tokens();
     let resp = ui.interact(r, egui::Id::new(("text-toggle", id)), Sense::click());
     p.rect_filled(
         r,
@@ -79,12 +80,12 @@ fn toggle(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, r: Rec
     );
     let font = if bold { Tokens::semibold(13.0) } else { Tokens::ui(12.0) };
     p.text(r.center(), Align2::CENTER_CENTER, label, font, if on { egui::Color32::WHITE } else { t.text });
-    app.auto.add(id, r, label);
+    app.auto_mut().add(id, r, label);
     resp.clicked()
 }
 
-pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
-    let t = app.tokens;
+pub fn character(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
+    let t = app.tokens();
     let p = ui.painter().with_clip_rect(rect);
     let ctx = ui.ctx().clone();
     let target = text_target(app);
@@ -108,7 +109,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if widgets::dropdown(ui, sr, &doc.style, &t, egui::Id::new("char-style")).clicked() && enabled {
         widgets::open_popup(ui, spop);
     }
-    app.auto.add("character.style", sr, "Font style");
+    app.auto_mut().add("character.style", sr, "Font style");
     // The family's own styles.
     let styles: Vec<String> = if widgets::popup_is_open(ui, spop) { effectcraft_engine::font_styles(&doc.font) } else { vec![] };
     if let Some(st) = widgets::popup_menu(ui, spop, sr.left_bottom(), &styles, styles.iter().position(|s| *s == doc.style)).and_then(|i| styles.get(i)) {
@@ -138,7 +139,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let fy = y + row as f32 * 28.0;
         p.text(pos2(fx, fy + 9.0), Align2::LEFT_CENTER, glyph, Tokens::semibold(11.0), t.text_dim);
         let (r, nv, _) = widgets::hot_number_at(ui, pos2(fx + 26.0, fy), egui::Id::new(("char", key)), v, 0.5, range, 0, suffix, &t);
-        app.auto.add(&format!("character.{key}"), r, key);
+        app.auto_mut().add(&format!("character.{key}"), r, key);
         if let Some(nv) = nv
             && enabled
         {
@@ -159,7 +160,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if widgets::dropdown(ui, kr, &label, &t, egui::Id::new("char-kerning")).clicked() && enabled {
             widgets::open_popup(ui, kpop);
         }
-        app.auto.add("character.kerning", kr, "Kerning");
+        app.auto_mut().add("character.kerning", kr, "Kerning");
         let opts: Vec<String> = ["Metrics", "Optical", "0", "-50", "-25", "-10", "10", "25", "50", "100"].iter().map(|s| s.to_string()).collect();
         if let Some(i) = widgets::popup_menu(ui, kpop, kr.left_bottom(), &opts, None) {
             let v = match i {
@@ -180,7 +181,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if widgets::dropdown(ui, dr, &labels[doc.stroke_over_fill as usize], &t, egui::Id::new("char-stroke-order")).clicked() && enabled {
             widgets::open_popup(ui, pop);
         }
-        app.auto.add("character.strokeOverFill", dr, "Stroke order");
+        app.auto_mut().add("character.strokeOverFill", dr, "Stroke order");
         if let Some(i) = widgets::popup_menu(ui, pop, dr.left_bottom(), &labels, Some(doc.stroke_over_fill as usize)) {
             actions.push(json!({"strokeOverFill": i == 1}));
         }
@@ -193,30 +194,30 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if widgets::checkbox(ui, cr, on, &t, egui::Id::new(("char-apply", key))).clicked() && enabled {
             actions.push(json!({if key == "fill" { "applyFill" } else { "applyStroke" }: !on}));
         }
-        app.auto.add(&format!("character.{key}.enabled"), cr, label);
+        app.auto_mut().add(&format!("character.{key}.enabled"), cr, label);
         let fs = Rect::from_min_size(pos2(fx + 20.0, y), vec2(26.0, 20.0));
         let pop = egui::Id::new(("char-color-pop", key));
         if widgets::swatch(ui, fs, c, egui::Id::new(("char-color", key)), &t).clicked() && enabled {
             widgets::open_popup(ui, pop);
         }
-        app.auto.add(&format!("character.{key}"), fs, label);
+        app.auto_mut().add(&format!("character.{key}"), fs, label);
         let mut rgb = [c[0], c[1], c[2]];
         if crate::widgets::color_popup(ui, pop, fs.left_bottom(), &mut rgb) {
             actions.push(json!({key: [rgb[0], rgb[1], rgb[2]], "merge": format!("char-{key}")}));
         }
         let er = Rect::from_min_size(pos2(fs.max.x + 4.0, y + 1.0), vec2(18.0, 18.0));
-        let active = app.ui.text_color_pick.as_ref().is_some_and(|pick| pick.layer == target.as_ref().map_or(0, |tt| tt.layer) && pick.field == key);
+        let active = app.ui_mut().text_color_pick.as_ref().is_some_and(|pick| pick.layer == target.as_ref().map_or(0, |tt| tt.layer) && pick.field == key);
         let eye = super::fx_widgets::eyedropper_button(ui, er, active, egui::Id::new(("char-eye", key)), &t)
             .on_hover_text(tr("Eyedropper: click, then click in the Composition panel"));
-        app.auto.add(&format!("character.{key}.eyedropper"), er, &format!("{label} eyedropper"));
+        app.auto_mut().add(&format!("character.{key}.eyedropper"), er, &format!("{label} eyedropper"));
         if eye.clicked() {
             if active {
-                app.ui.text_color_pick = None;
-                app.ui.status.clear();
+                app.ui_mut().text_color_pick = None;
+                app.ui_mut().status.clear();
             } else if let Some(tt) = &target {
-                app.ui.fx_pick = None;
-                app.ui.text_color_pick = Some(TextColorPick { layer: tt.layer, field: key.into(), range: tt.range });
-                app.ui.status = crate::i18n::tr_args("Click in the Composition panel to sample text {}", &[&label]);
+                app.ui_mut().fx_pick = None;
+                app.ui_mut().text_color_pick = Some(TextColorPick { layer: tt.layer, field: key.into(), range: tt.range });
+                app.ui_mut().status = crate::i18n::tr_args("Click in the Composition panel to sample text {}", &[&label]);
             }
         }
         p.text(pos2(er.max.x + 6.0, y + 10.0), Align2::LEFT_CENTER, label, Tokens::ui(11.5), t.text_dim);
@@ -246,7 +247,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if widgets::checkbox(ui, lr, doc.ligatures, &t, egui::Id::new("char-ligatures")).clicked() && enabled {
         actions.push(json!({"ligatures": !doc.ligatures}));
     }
-    app.auto.add("character.ligatures", lr, "Ligatures");
+    app.auto_mut().add("character.ligatures", lr, "Ligatures");
     p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, tr("Ligatures"), Tokens::ui(11.5), t.text_dim);
     // OpenType: a popup with the font's layout features (like the Character panel's OpenType menu).
     let or = Rect::from_min_size(pos2(sr.max.x + 6.0, sr.min.y), vec2(78.0, 22.0));
@@ -256,7 +257,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if widgets::dropdown(ui, or, &olabel, &t, egui::Id::new("char-opentype")).clicked() && enabled {
         widgets::open_popup(ui, opop);
     }
-    app.auto.add("character.opentype", or, "OpenType");
+    app.auto_mut().add("character.opentype", or, "OpenType");
     opentype_popup(app, ui, opop, pos2((or.max.x - 300.0).max(rect.min.x), or.max.y), &doc, &mut actions);
     // Vertical type: Tate-Chu-Yoko and Standard Vertical Roman Alignment (Character panel menu).
     if doc.vertical {
@@ -270,7 +271,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             if widgets::checkbox(ui, cr, on, &t, egui::Id::new(("char-vert", key))).clicked() && enabled {
                 actions.push(json!({key: !on}));
             }
-            app.auto.add(&format!("character.{key}"), cr, label);
+            app.auto_mut().add(&format!("character.{key}"), cr, label);
             p.text(pos2(cr.max.x + 6.0, y + 7.0), Align2::LEFT_CENTER, label, Tokens::ui(11.0), t.text_dim);
         }
     }
@@ -289,7 +290,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             p.text(pos2(fx, fy + 9.0), Align2::LEFT_CENTER, &tag, Tokens::semibold(10.5), t.text_dim);
             let (r, nv, _) =
                 widgets::hot_number_at(ui, pos2(fx + 34.0, fy), egui::Id::new(("char-axis", &tag)), v as f64, 1.0, (a.min as f64, a.max as f64), 0, "", &t);
-            app.auto.add(&format!("character.axis.{tag}"), r, &a.name);
+            app.auto_mut().add(&format!("character.axis.{tag}"), r, &a.name);
             if let Some(nv) = nv
                 && enabled
             {
@@ -299,7 +300,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         y += 20.0 + axes.len().div_ceil(2) as f32 * 24.0;
     }
     // (Room for the status line at the bottom.)
-    scroll.end(ui, &mut app.auto, "character.scroll", y + 44.0 - top, &t);
+    scroll.end(ui, app.auto_mut(), "character.scroll", y + 44.0 - top, &t);
     match &target {
         None => {
             p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, tr("Select a text layer"), Tokens::ui(11.0), t.text_faint);
@@ -313,8 +314,8 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     let Some(tt) = target else { return };
     for a in actions {
-        if let Err(e) = crate::menus::invoke(app, &ctx, "layer.setText", tt.params(a)) {
-            app.ui.status = e;
+        if let Err(e) = app.invoke(&ctx, "layer.setText", tt.params(a)) {
+            app.ui_mut().status = e;
         }
     }
 }
@@ -322,12 +323,12 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 /// The Character panel's OpenType popup: feature toggles (dimmed when the font lacks them),
 /// figure styles and the twenty stylistic sets. Every row is an automation target
 /// (`character.opentype.<key>`), and every change is a `layer.setText` attribute.
-fn opentype_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos: egui::Pos2, doc: &TextDoc, actions: &mut Vec<serde_json::Value>) {
+fn opentype_popup(app: &mut dyn TimelineHost, ui: &mut egui::Ui, id: egui::Id, pos: egui::Pos2, doc: &TextDoc, actions: &mut Vec<serde_json::Value>) {
     let open_id = id.with("open");
     if !ui.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false)) {
         return;
     }
-    let t = app.tokens;
+    let t = app.tokens();
     let feats = effectcraft_engine::font_features(&doc.font, &doc.style);
     let has = |tag: &str| feats.iter().any(|f| f == tag);
     let o = doc.opentype;
@@ -405,7 +406,7 @@ fn opentype_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos
         });
     });
     for (aid, r, label) in rects {
-        app.auto.add(&aid, r, &label);
+        app.auto_mut().add(&aid, r, &label);
     }
     let outside = widgets::pressed_outside(ui.ctx(), &area.response);
     if outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -452,8 +453,8 @@ pub fn paint_justify_glyph(p: &egui::Painter, r: Rect, j: Justify, c: egui::Colo
     }
 }
 
-pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
-    let t = app.tokens;
+pub fn paragraph(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
+    let t = app.tokens();
     let p = ui.painter().with_clip_rect(rect);
     let ctx = ui.ctx().clone();
     let target = text_target(app);
@@ -482,7 +483,7 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             },
         );
         paint_justify_glyph(&p, r, j, if on { egui::Color32::WHITE } else { t.text });
-        app.auto.add(&format!("paragraph.{key}"), r, key);
+        app.auto_mut().add(&format!("paragraph.{key}"), r, key);
         if resp.clicked() && enabled {
             actions.push(json!({"justify": key}));
         }
@@ -505,7 +506,7 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let fy = y + (i / 2) as f32 * 28.0;
         p.text(pos2(fx, fy + 9.0), Align2::LEFT_CENTER, glyph, Tokens::semibold(11.0), t.text_dim);
         let (r, nv, _) = widgets::hot_number_at(ui, pos2(fx + 26.0, fy), egui::Id::new(("para-f", key)), v, 0.5, (-5000.0, 5000.0), 0, " px", &t);
-        app.auto.add(&format!("paragraph.{key}"), r, key);
+        app.auto_mut().add(&format!("paragraph.{key}"), r, key);
         if let Some(nv) = nv
             && enabled
         {
@@ -516,7 +517,7 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Direction and composer popups. Settings ▸ Type ▸ Text Engine: the South Asian and Middle
     // Eastern engine offers the paragraph direction and the World-Ready composers (the Latin
     // engine shows the direction only for right-to-left text already set).
-    let world_ready = app.session.prefs.type_.text_engine == "southAsian";
+    let world_ready = app.session().prefs.type_.text_engine == "southAsian";
     let rtl = doc.direction == Direction::Rtl;
     if world_ready || rtl {
         let dr = Rect::from_min_size(pos2(x0, y), vec2(w / 2.0 - 4.0, 22.0));
@@ -525,7 +526,7 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if widgets::dropdown(ui, dr, &dirs[rtl as usize], &t, egui::Id::new("para-direction")).clicked() && enabled {
             widgets::open_popup(ui, dpop);
         }
-        app.auto.add("paragraph.direction", dr, "Text direction");
+        app.auto_mut().add("paragraph.direction", dr, "Text direction");
         if let Some(i) = widgets::popup_menu(ui, dpop, dr.left_bottom(), &dirs, Some(rtl as usize)) {
             actions.push(json!({"direction": if i == 1 { "rtl" } else { "ltr" }}));
         }
@@ -541,7 +542,7 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if widgets::dropdown(ui, cr, &comps[single as usize], &t, egui::Id::new("para-composer")).clicked() && enabled {
         widgets::open_popup(ui, cpop);
     }
-    app.auto.add("paragraph.composer", cr, "Composer");
+    app.auto_mut().add("paragraph.composer", cr, "Composer");
     if let Some(i) = widgets::popup_menu(ui, cpop, cr.left_bottom(), &comps, Some(single as usize)) {
         actions.push(json!({"composer": if i == 1 { "singleLine" } else { "everyLine" }}));
     }
@@ -550,17 +551,17 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if widgets::checkbox(ui, hr, doc.hanging_punctuation, &t, egui::Id::new("para-hanging")).clicked() && enabled {
         actions.push(json!({"hangingPunctuation": !doc.hanging_punctuation}));
     }
-    app.auto.add("paragraph.hangingPunctuation", hr, "Roman Hanging Punctuation");
+    app.auto_mut().add("paragraph.hangingPunctuation", hr, "Roman Hanging Punctuation");
     p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, tr("Roman Hanging Punctuation"), Tokens::ui(11.5), t.text_dim);
     // (Room for the status line at the bottom.)
-    scroll.end(ui, &mut app.auto, "paragraph.scroll", y + 44.0 - top, &t);
+    scroll.end(ui, app.auto_mut(), "paragraph.scroll", y + 44.0 - top, &t);
     if !enabled {
         p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, tr("Select a text layer"), Tokens::ui(11.0), t.text_faint);
     }
     let Some(tt) = target else { return };
     for a in actions {
-        if let Err(e) = crate::menus::invoke(app, &ctx, "layer.setText", tt.params(a)) {
-            app.ui.status = e;
+        if let Err(e) = app.invoke(&ctx, "layer.setText", tt.params(a)) {
+            app.ui_mut().status = e;
         }
     }
 }
@@ -572,17 +573,17 @@ struct FontSearch {
 }
 
 /// Shared font menu for Character and Properties: search, recent fonts and previews.
-pub(super) fn font_picker(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, rect: Rect, current: &str, auto: &str, enabled: bool) -> Option<String> {
+pub(super) fn font_picker(app: &mut dyn TimelineHost, ui: &mut egui::Ui, id: egui::Id, rect: Rect, current: &str, auto: &str, enabled: bool) -> Option<String> {
     let state_id = id.with("search-state");
-    app.auto.add(auto, rect, "Font family");
+    app.auto_mut().add(auto, rect, "Font family");
     if !widgets::popup_is_open(ui, id) || !enabled {
         ui.data_mut(|d| d.remove::<FontSearch>(state_id));
-        if widgets::dropdown(ui, rect, current, &app.tokens, id.with("field")).clicked() && enabled {
+        if widgets::dropdown(ui, rect, current, &app.tokens(), id.with("field")).clicked() && enabled {
             widgets::open_popup(ui, id);
         }
         return None;
     }
-    let rows = effectcraft_engine::font_menu(&app.session.prefs);
+    let rows = effectcraft_engine::font_menu(&app.session().prefs);
     let saved = ui.data(|d| d.get_temp::<FontSearch>(state_id));
     let fresh = saved.is_none();
     let mut state = saved.unwrap_or_default();
@@ -595,8 +596,8 @@ pub(super) fn font_picker(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui:
             i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
         )
     });
-    let preview = app.session.prefs.type_.font_preview;
-    let t = app.tokens;
+    let preview = app.session().prefs.type_.font_preview;
+    let t = app.tokens();
     // The Variable Fonts filter (After Effects 26.3) stays as set while the app runs, like the
     // menu's other settings; the search query resets on every open.
     let variable_id = id.with("variable-only");
@@ -605,7 +606,7 @@ pub(super) fn font_picker(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui:
     let arrow = Rect::from_min_max(pos2(rect.max.x - 22.0, rect.min.y), rect.max);
     let edit_rect = Rect::from_min_max(rect.min, pos2(arrow.min.x, rect.max.y));
     let search = ui.put(edit_rect, egui::TextEdit::singleline(&mut state.query).id(search_id).hint_text(current).font(Tokens::ui(12.0)));
-    app.auto.add(&format!("{auto}.search"), search.rect, "Search fonts");
+    app.auto_mut().add(&format!("{auto}.search"), search.rect, "Search fonts");
     if fresh {
         search.request_focus();
     }
@@ -618,7 +619,7 @@ pub(super) fn font_picker(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui:
         ui.memory_mut(|m| m.surrender_focus(search_id));
         return None;
     }
-    app.auto.add(&format!("{auto}.toggle"), arrow, "Close font list");
+    app.auto_mut().add(&format!("{auto}.toggle"), arrow, "Close font list");
     let mut chosen = None;
     let screen = ui.ctx().content_rect();
     let below = screen.bottom() - rect.bottom() - 16.0;
@@ -637,7 +638,7 @@ pub(super) fn font_picker(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui:
             let label_rect = Rect::from_min_max(pos2(box_rect.max.x + 2.0, row.rect.min.y), row.rect.max);
             let boxed = widgets::checkbox(ui, box_rect, only_variable, &t, id.with("variable-check"));
             ui.painter().text(label_rect.left_center(), Align2::LEFT_CENTER, tr("Variable fonts only"), Tokens::ui(11.5), t.text);
-            app.auto.add(&format!("{auto}.variable"), row.rect, "Variable fonts only");
+            app.auto_mut().add(&format!("{auto}.variable"), row.rect, "Variable fonts only");
             let toggled = row.clicked() || boxed.clicked();
             if toggled {
                 only_variable = !only_variable;
@@ -686,7 +687,7 @@ pub(super) fn font_picker(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui:
             scroll.show(ui, |ui| {
                 if filtered.is_empty() {
                     let r = ui.label(tr("No matching fonts"));
-                    app.auto.add(&format!("{auto}.empty"), r.rect, "No matching fonts");
+                    app.auto_mut().add(&format!("{auto}.empty"), r.rect, "No matching fonts");
                 }
                 let mut was_recent = false;
                 for (index, r) in filtered.iter().enumerate() {
@@ -707,7 +708,7 @@ pub(super) fn font_picker(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui:
                         t.text,
                     );
                     if ui.is_rect_visible(resp.rect) {
-                        app.auto.add(&format!("{auto}.option.{}", r.family), resp.rect, &r.display);
+                        app.auto_mut().add(&format!("{auto}.option.{}", r.family), resp.rect, &r.display);
                     }
                     if index == state.selected && (fresh || up || down) {
                         resp.scroll_to_me(None);
@@ -757,23 +758,23 @@ pub(super) fn font_picker(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui:
 /// Align panel: Align Layers to Selection / Composition, the six align buttons and the six
 /// Distribute Layers buttons. Buttons run `layer.align {edge, to}` and `layer.distribute
 /// {mode}` on the selected layers.
-pub fn align(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
-    let t = app.tokens;
+pub fn align(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
+    let t = app.tokens();
     let p = ui.painter().with_clip_rect(rect);
     let x0 = rect.min.x + 10.0;
     let mut y = rect.min.y + 10.0;
     p.text(pos2(x0, y + 10.0), Align2::LEFT_CENTER, tr("Align Layers to:"), Tokens::ui(11.5), t.text_dim);
     let dr = Rect::from_min_size(pos2(x0 + 100.0, y), vec2(110.0, 20.0));
-    let to_sel = app.ui.align_to_selection;
+    let to_sel = app.ui_mut().align_to_selection;
     let pid = egui::Id::new("align-to-pop");
     if widgets::dropdown(ui, dr, if to_sel { "Selection" } else { "Composition" }, &t, pid.with("btn")).clicked() {
         widgets::open_popup(ui, pid);
     }
-    app.auto.add("align.to", dr, if to_sel { "Selection" } else { "Composition" });
+    app.auto_mut().add("align.to", dr, if to_sel { "Selection" } else { "Composition" });
     if let Some(i) =
         widgets::popup_menu(ui, pid, dr.left_bottom() + vec2(0.0, 2.0), &["Selection".to_string(), "Composition".to_string()], Some(if to_sel { 0 } else { 1 }))
     {
-        app.ui.align_to_selection = i == 0;
+        app.ui_mut().align_to_selection = i == 0;
     }
     y += 28.0;
     let ops = ["left", "hcenter", "right", "top", "vcenter", "bottom"];
@@ -791,7 +792,7 @@ pub fn align(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 align_glyph(&p, r, op, row == 1, &t);
             }
             let tip = align_tip(kind, op);
-            app.auto.add(&format!("{kind}.{op}"), r, &tip);
+            app.auto_mut().add(&format!("{kind}.{op}"), r, &tip);
             if resp.on_hover_text(tip).clicked() {
                 run = Some((kind, op));
             }
@@ -800,13 +801,13 @@ pub fn align(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     if let Some((kind, op)) = run {
         let r = if kind == "align" {
-            let to = if app.ui.align_to_selection { "selection" } else { "composition" };
-            app.session.execute("layer.align", json!({"edge": op, "to": to}))
+            let to = if app.ui_mut().align_to_selection { "selection" } else { "composition" };
+            app.session_mut().execute("layer.align", json!({"edge": op, "to": to}))
         } else {
-            app.session.execute("layer.distribute", json!({"mode": op}))
+            app.session_mut().execute("layer.distribute", json!({"mode": op}))
         };
         if let Err(e) = r {
-            app.ui.status = e.to_string();
+            app.ui_mut().status = e.to_string();
         }
     }
 }

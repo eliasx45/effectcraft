@@ -17,6 +17,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED9 | Project panel | Draws against `TimelineHost`; New Comp and the footage menu go through the host when there is no app |
 | EMBED10 | Pre-compose, Interpret Footage dialogs | `precomp::{draft_for, draw}` and `forms::{build_form, draw_form}`: a host shows EffectCraft's own dialogs from its session and runs their command |
 | EMBED12 | Solid, Light, Camera, Layer Settings, Time Stretch, Layer Style dialogs | `hosted_dialogs::{open, draw, command, finish}`: a host shows EffectCraft's layer dialogs from its session and runs their command |
+| EMBED13 | Character, Paragraph, Align, Markers, Motion Library panels; Marker dialog | Draw against `TimelineHost`; `motion_library::{hosted_command, hosted_setup}`, `TimelineHost::library_port`; `markers_ui::{draft_for, draw_dialog, dialog_keys}` |
 | EMBED14 | The rest of the Composition viewer over a host's picture | `panels::viewer_hosted`: guides, grids, title/action safe, rulers, 3D reference axes (each only while on, with the View keys and the grid and guide options menu), motion paths (keys and tangents drag), the Mask Feather tool and feather boundaries |
 
 ## The host interface (EMBED1)
@@ -329,3 +330,21 @@ All additive; nothing a host implements or calls was renamed or removed.
   `key_dialogs::{stretch_draft, draw_time_stretch, stretch_params}`,
   `layer_styles_dialog::{open_in, route_in, title, draw, finish_in}`. Behaviour in EffectCraft's app
   is unchanged. Test: `hosted_dialogs::tests::a_host_gets_each_layer_dialog_from_its_session`.
+- EMBED13: more panels for a host (FigCraft's card column). `text_panels::{character, paragraph,
+  align, text_target}`, `misc::markers`, `motion_library::show` (with `motion_library_curves`,
+  `motion_library_tools` and `panel_kit`) take `&mut dyn TimelineHost` / `&dyn TimelineHost`
+  (EffectCraft's app coerces: no call site changed). Their commands go through
+  `TimelineHost::invoke` (EffectCraft's `menus::invoke`); what only the app has goes through
+  `app()` / `app_ref()`: Sound card hover playback, the async file dialog (else `pick_files`), the OS
+  drop cursor, the Link and History workspaces (a host goes back to the cards). New:
+  `motion_library::hosted_command(host, ctx, id, params)` runs the panel's own `motionLibrary.*` /
+  `ml.saveTextPreset` commands on a host; `motion_library::hosted_setup(session, dir)` gives a
+  session without a settings store EffectCraft's settings folder read only (writes refused) and
+  the library folders of `prefs.json` (`user_settings_dir()`); `TimelineHost::library_port()`
+  (default `None`) is the control port the Motion Library plug reaches the host's project through
+  (`control_port` asks it first). The Marker dialog: `markers_ui::{draft_for(session, marker),
+  draw_dialog(ui, draft, prefs, registry, tokens) -> DialogAnswer, dialog_keys(ctx, answer),
+  MarkerRef::params}` (`open_dialog` / `dialog` use them). The Markers panel registers each row
+  (`markers.<index>`) and opens a marker's dialog on a double-click
+  (`request_dialog(DialogRequest::Marker)`), as a double-click on a marker in the Timeline does.
+  Test: `timeline::host::tests::text_markers_and_library_panels_draw_in_a_host_without_the_app`.

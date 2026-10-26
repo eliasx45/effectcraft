@@ -15,6 +15,7 @@ use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
 
 use super::timeline::TMap;
+use crate::automation::Registry;
 use crate::icons::{self, Icon};
 use crate::panels::timeline::{DialogRequest, TimelineHost};
 use crate::theme::Tokens;
@@ -29,7 +30,8 @@ pub struct MarkerRef {
 }
 
 impl MarkerRef {
-    fn params(&self) -> Value {
+    /// The marker in `markers.*` command parameters.
+    pub fn params(&self) -> Value {
         match self.layer {
             Some(l) => json!({"layer": l, "index": self.index}),
             None => json!({"index": self.index}),
@@ -64,15 +66,23 @@ pub struct MarkerDraft {
 
 /// Open the Composition/Layer Marker dialog for `m`.
 pub fn open_dialog(app: &mut EffectcraftApp, m: MarkerRef) -> Result<(), String> {
+    app.dialog_state.marker = draft_for(&mut app.session, m)?;
+    app.dialog = Some(Dialog::Marker);
+    Ok(())
+}
+
+/// The Marker dialog's starting fields for marker `m`, from the session alone (EMBED13: a host
+/// shows the dialog itself with [`draw_dialog`]).
+pub fn draft_for(session: &mut effectcraft_engine::Session, m: MarkerRef) -> Result<MarkerDraft, String> {
     let mut p = json!({});
     if let Some(l) = m.layer {
         p["layer"] = json!(l);
     }
-    let list = app.session.execute("markers.list", p).map_err(|e| e.to_string())?;
+    let list = session.execute("markers.list", p).map_err(|e| e.to_string())?;
     let v = list.get(m.index).ok_or("no such marker")?;
     let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
     let cue = &v["cuePoint"];
-    app.dialog_state.marker = MarkerDraft {
+    Ok(MarkerDraft {
         target: Some(m),
         title: if m.layer.is_some() { "Layer Marker".into() } else { "Composition Marker".into() },
         time: v["time"].as_f64().unwrap_or(0.0),
@@ -92,9 +102,7 @@ pub fn open_dialog(app: &mut EffectcraftApp, m: MarkerRef) -> Result<(), String>
         label: effectcraft_engine::color::Label::from_name(&s("label"))
             .and_then(|l| effectcraft_engine::color::Label::ALL.iter().position(|x| *x == l))
             .unwrap_or(0),
-    };
-    app.dialog = Some(Dialog::Marker);
-    Ok(())
+    })
 }
 
 /// The command parameters of the dialog's current fields.
@@ -116,130 +124,160 @@ pub fn draft_params(d: &MarkerDraft) -> Value {
     p
 }
 
-fn text_field(ui: &mut egui::Ui, app: &mut EffectcraftApp, id: &str, v: &mut String, w: f32) {
+fn text_field(ui: &mut egui::Ui, auto: &mut Registry, id: &str, v: &mut String, w: f32) {
     let r = ui.add(egui::TextEdit::singleline(v).desired_width(w));
-    app.auto.add(id, r.rect, id);
+    auto.add(id, r.rect, id);
+}
+
+/// What the Marker dialog's buttons and keys decided this frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DialogAnswer {
+    pub ok: bool,
+    pub cancel: bool,
+    pub delete: bool,
 }
 
 /// The Composition/Layer Marker dialog.
 pub fn dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut d = app.dialog_state.marker.clone();
-    let (mut ok, mut cancel, mut delete) = (false, false, false);
-    // Cmd+Backspace (Ctrl elsewhere) is Delete, in a text field too.
-    let delete_key = super::dialogs::ui_command_key(ctx, egui::Key::Backspace);
-    // Cmd+Enter (Ctrl elsewhere) is OK, also in Comment, where Enter types a new line.
-    let ok_key = super::dialogs::ui_command_key(ctx, egui::Key::Enter);
+    let mut a = DialogAnswer::default();
     let title = d.title.clone();
     super::dialogs::modal(ctx, &title, vec2(520.0, 560.0), t, |ui| {
-        egui::Grid::new("marker-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label(tr("Time:"));
-            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.time).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3)));
-            app.auto.add("dialog.marker.time", r.rect, "Time");
-            ui.end_row();
-            ui.label(tr("Duration:"));
-            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.duration).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3)));
-            app.auto.add("dialog.marker.duration", r.rect, "Duration");
-            ui.end_row();
-            ui.label(tr("Comment:"));
-            let r = ui.add(egui::TextEdit::multiline(&mut d.comment).desired_rows(3).desired_width(320.0));
-            crate::widgets::focus_on_open(ui.ctx(), &r, &d.comment);
-            app.auto.add("dialog.marker.comment", r.rect, "Comment");
-            ui.end_row();
-            ui.label(tr("Chapter:"));
-            text_field(ui, app, "dialog.marker.chapter", &mut d.chapter, 320.0);
-            ui.end_row();
-            ui.label(tr("URL:"));
-            text_field(ui, app, "dialog.marker.url", &mut d.url, 320.0);
-            ui.end_row();
-            ui.label(tr("Frame Target:"));
-            text_field(ui, app, "dialog.marker.frameTarget", &mut d.frame_target, 320.0);
-            ui.end_row();
-        });
-        ui.add_space(8.0);
-        let r = ui.checkbox(&mut d.cue, tr("Cue Point"));
-        app.auto.add("dialog.marker.cue", r.rect, "Cue Point");
-        ui.add_enabled_ui(d.cue, |ui| {
-            ui.horizontal(|ui| {
-                let r = ui.radio_value(&mut d.cue_navigation, false, tr("Event"));
-                app.auto.add("dialog.marker.cue.event", r.rect, "Event");
-                let r = ui.radio_value(&mut d.cue_navigation, true, tr("Navigation"));
-                app.auto.add("dialog.marker.cue.navigation", r.rect, "Navigation");
-                ui.label(tr("Name:"));
-                text_field(ui, app, "dialog.marker.cue.name", &mut d.cue_name, 160.0);
-            });
-            let mut remove = None;
-            for (i, (k, v)) in d.cue_params.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(tr("Parameter Name:"));
-                    text_field(ui, app, &format!("dialog.marker.cue.param.{i}.name"), k, 110.0);
-                    ui.label(tr("Value:"));
-                    text_field(ui, app, &format!("dialog.marker.cue.param.{i}.value"), v, 110.0);
-                    let r = ui.small_button("−");
-                    app.auto.add(&format!("dialog.marker.cue.param.{i}.remove"), r.rect, "Remove");
-                    if r.clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                d.cue_params.remove(i);
-            }
-            let r = ui.small_button("+ Parameter");
-            app.auto.add("dialog.marker.cue.addParam", r.rect, "Add Parameter");
-            if r.clicked() {
-                d.cue_params.push((String::new(), String::new()));
-            }
-        });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let r = ui.checkbox(&mut d.protected, tr("Protected Region"));
-            app.auto.add("dialog.marker.protected", r.rect, "Protected Region");
-            ui.add_space(20.0);
-            ui.label(tr("Label:"));
-            let labels = effectcraft_engine::color::Label::ALL;
-            let cur = labels.get(d.label).copied().unwrap_or_default();
-            let r = egui::ComboBox::from_id_salt("dialog.marker.label").selected_text(app.session.prefs.label_name(cur)).show_ui(ui, |ui| {
-                for (i, l) in labels.into_iter().enumerate() {
-                    if crate::widgets::label_entry(ui, l, &app.session.prefs.label_name(l), d.label == i, &app.tokens).clicked() {
-                        d.label = i;
-                    }
-                }
-            });
-            app.auto.add("dialog.marker.label", r.response.rect, "Label");
-        });
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            let r = ui.button(tr("Delete"));
-            app.auto.add("dialog.marker.delete", r.rect, "Delete");
-            delete = r.clicked();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(app.tokens.accent));
-                app.auto.add("dialog.marker.ok", r.rect, "OK");
-                ok = r.clicked();
-                let r = ui.button(tr("Cancel"));
-                app.auto.add("dialog.marker.cancel", r.rect, "Cancel");
-                cancel = r.clicked();
-            });
-        });
+        a = draw_dialog(ui, &mut d, &app.session.prefs, &mut app.auto, &app.tokens);
     });
     app.dialog_state.marker = d.clone();
-    delete |= delete_key && !ok && !cancel;
-    // Enter is OK, unless a text field has it.
-    if ok || (!cancel && !delete && (ok_key || super::dialogs::ui_enter(ctx))) {
-        if let Err(e) = app.session.execute("markers.set", draft_params(&d)) {
-            app.ui.status = e.to_string();
-        }
-        cancel = true;
+    let a = dialog_keys(ctx, a);
+    if a.ok
+        && let Err(e) = app.session.execute("markers.set", draft_params(&d))
+    {
+        app.ui.status = e.to_string();
     }
-    if delete && let Some(m) = d.target {
-        if let Err(e) = app.session.execute("markers.delete", m.params()) {
-            app.ui.status = e.to_string();
-        }
-        cancel = true;
+    if a.delete
+        && let Some(m) = d.target
+        && let Err(e) = app.session.execute("markers.delete", m.params())
+    {
+        app.ui.status = e.to_string();
     }
-    if cancel {
+    if a.ok || a.delete || a.cancel {
         app.dialog = None;
     }
+}
+
+/// The dialog's keys over what its buttons said: Cmd+Enter (Ctrl elsewhere) is OK, also in
+/// Comment, where Enter types a new line; Enter is OK unless a text field has it; Cmd+Backspace
+/// (Ctrl elsewhere) is Delete, in a text field too. At most one of ok / delete / cancel is set.
+pub fn dialog_keys(ctx: &egui::Context, a: DialogAnswer) -> DialogAnswer {
+    let delete_key = super::dialogs::ui_command_key(ctx, egui::Key::Backspace);
+    let ok_key = super::dialogs::ui_command_key(ctx, egui::Key::Enter);
+    let delete = a.delete || (delete_key && !a.ok && !a.cancel);
+    let ok = a.ok || (!a.cancel && !delete && (ok_key || super::dialogs::ui_enter(ctx)));
+    if ok {
+        DialogAnswer { ok: true, ..DialogAnswer::default() }
+    } else if delete {
+        DialogAnswer { delete: true, ..DialogAnswer::default() }
+    } else {
+        DialogAnswer { cancel: a.cancel, ..DialogAnswer::default() }
+    }
+}
+
+/// The Marker dialog's contents (fields, Delete, Cancel, OK) in any `ui`: EffectCraft's own window
+/// ([`dialog`]) or a host's (EMBED13). The buttons' answer; the keys are [`dialog_keys`]. OK runs
+/// `markers.set` with [`draft_params`], Delete `markers.delete` with [`MarkerRef::params`].
+pub fn draw_dialog(ui: &mut egui::Ui, d: &mut MarkerDraft, prefs: &effectcraft_engine::prefs::Prefs, auto: &mut Registry, tokens: &Tokens) -> DialogAnswer {
+    let mut a = DialogAnswer::default();
+    egui::Grid::new("marker-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+        ui.label(tr("Time:"));
+        let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.time).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3)));
+        auto.add("dialog.marker.time", r.rect, "Time");
+        ui.end_row();
+        ui.label(tr("Duration:"));
+        let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.duration).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3)));
+        auto.add("dialog.marker.duration", r.rect, "Duration");
+        ui.end_row();
+        ui.label(tr("Comment:"));
+        let r = ui.add(egui::TextEdit::multiline(&mut d.comment).desired_rows(3).desired_width(320.0));
+        crate::widgets::focus_on_open(ui.ctx(), &r, &d.comment);
+        auto.add("dialog.marker.comment", r.rect, "Comment");
+        ui.end_row();
+        ui.label(tr("Chapter:"));
+        text_field(ui, auto, "dialog.marker.chapter", &mut d.chapter, 320.0);
+        ui.end_row();
+        ui.label(tr("URL:"));
+        text_field(ui, auto, "dialog.marker.url", &mut d.url, 320.0);
+        ui.end_row();
+        ui.label(tr("Frame Target:"));
+        text_field(ui, auto, "dialog.marker.frameTarget", &mut d.frame_target, 320.0);
+        ui.end_row();
+    });
+    ui.add_space(8.0);
+    let r = ui.checkbox(&mut d.cue, tr("Cue Point"));
+    auto.add("dialog.marker.cue", r.rect, "Cue Point");
+    ui.add_enabled_ui(d.cue, |ui| {
+        ui.horizontal(|ui| {
+            let r = ui.radio_value(&mut d.cue_navigation, false, tr("Event"));
+            auto.add("dialog.marker.cue.event", r.rect, "Event");
+            let r = ui.radio_value(&mut d.cue_navigation, true, tr("Navigation"));
+            auto.add("dialog.marker.cue.navigation", r.rect, "Navigation");
+            ui.label(tr("Name:"));
+            text_field(ui, auto, "dialog.marker.cue.name", &mut d.cue_name, 160.0);
+        });
+        let mut remove = None;
+        for (i, (k, v)) in d.cue_params.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(tr("Parameter Name:"));
+                text_field(ui, auto, &format!("dialog.marker.cue.param.{i}.name"), k, 110.0);
+                ui.label(tr("Value:"));
+                text_field(ui, auto, &format!("dialog.marker.cue.param.{i}.value"), v, 110.0);
+                let r = ui.small_button("−");
+                auto.add(&format!("dialog.marker.cue.param.{i}.remove"), r.rect, "Remove");
+                if r.clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove
+            && i < d.cue_params.len()
+        {
+            d.cue_params.remove(i);
+        }
+        let r = ui.small_button("+ Parameter");
+        auto.add("dialog.marker.cue.addParam", r.rect, "Add Parameter");
+        if r.clicked() {
+            d.cue_params.push((String::new(), String::new()));
+        }
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let r = ui.checkbox(&mut d.protected, tr("Protected Region"));
+        auto.add("dialog.marker.protected", r.rect, "Protected Region");
+        ui.add_space(20.0);
+        ui.label(tr("Label:"));
+        let labels = effectcraft_engine::color::Label::ALL;
+        let cur = labels.get(d.label).copied().unwrap_or_default();
+        let r = egui::ComboBox::from_id_salt("dialog.marker.label").selected_text(prefs.label_name(cur)).show_ui(ui, |ui| {
+            for (i, l) in labels.into_iter().enumerate() {
+                if crate::widgets::label_entry(ui, l, &prefs.label_name(l), d.label == i, tokens).clicked() {
+                    d.label = i;
+                }
+            }
+        });
+        auto.add("dialog.marker.label", r.response.rect, "Label");
+    });
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        let r = ui.button(tr("Delete"));
+        auto.add("dialog.marker.delete", r.rect, "Delete");
+        a.delete = r.clicked();
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(tokens.accent));
+            auto.add("dialog.marker.ok", r.rect, "OK");
+            a.ok = r.clicked();
+            let r = ui.button(tr("Cancel"));
+            auto.add("dialog.marker.cancel", r.rect, "Cancel");
+            a.cancel = r.clicked();
+        });
+    });
+    a
 }
 
 // ---------------------------------------------------------------- timeline drawing + gestures

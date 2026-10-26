@@ -160,6 +160,15 @@ pub trait TimelineHost {
     fn pointer_color(&mut self, _ctx: &egui::Context) -> Option<PointerColor> {
         None
     }
+
+    // ---- EMBED13 (additive; defaulted).
+
+    /// The control port the Motion Library's EffectCraft plug reaches this host's project through
+    /// (Curves, Tools, saving to the library). `None` (the default and EffectCraft's app):
+    /// EffectCraft's own control port, from `EFFECTCRAFT_CONTROL_PORT` or Settings ▸ Scripting.
+    fn library_port(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// A dialog a hosted panel asks its host for ([`TimelineHost::request_dialog`]). New kinds may be
@@ -576,5 +585,77 @@ mod tests {
         assert!(host.ui.fx_pick.is_none());
         let marker = crate::panels::markers_ui::MarkerRef { layer: None, index: 0 };
         assert!(host.request_dialog(DialogRequest::Marker(marker)).is_err(), "a host without dialogs declines");
+    }
+
+    /// EMBED13: the Character, Paragraph, Markers and Motion Library panels draw against a host
+    /// without the app; a Character change runs `layer.setText` through the host (one undo step),
+    /// the Marker dialog's draft and contents come from the session alone, and the Motion
+    /// Library's own commands run on the host.
+    #[test]
+    fn text_markers_and_library_panels_draw_in_a_host_without_the_app() {
+        let mut host = host();
+        host.session.execute("layer.newText", json!({"text": "Hello"})).unwrap();
+        host.session.execute("comp.addMarker", json!({"comment": "Beat"})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_panel_fonts(&ctx);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 520.0));
+        let input = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+        let draw = |host: &mut FakeHost, input: egui::RawInput, which: u8| {
+            let _ = ctx.run_ui(input, |ui| {
+                host.auto.begin_frame();
+                match which {
+                    0 => crate::panels::text_panels::character(host, ui, rect),
+                    1 => crate::panels::text_panels::paragraph(host, ui, rect),
+                    2 => crate::panels::misc::markers(host, ui, rect),
+                    _ => crate::panels::motion_library::show(host, ui, rect),
+                }
+            });
+        };
+        for which in 0..4 {
+            draw(&mut host, input(), which);
+            draw(&mut host, input(), which);
+        }
+        // Character: Faux Bold on the selected text layer, through the host, one undo step.
+        draw(&mut host, input(), 0);
+        let [x, y, w, h] = host.auto.find_current("character.fauxBold").map(|e| e.rect).unwrap();
+        let at = egui::pos2(x + w / 2.0, y + h / 2.0);
+        let undo_before = host.session.history.undo.len();
+        let mut press = input();
+        press.events = vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        ];
+        draw(&mut host, press, 0);
+        let mut release = input();
+        release.events = vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }];
+        draw(&mut host, release, 0);
+        assert!(host.commands.iter().any(|c| c == "layer.setText"), "Faux Bold ran through the host: {:?}", host.commands);
+        assert_eq!(host.session.history.undo.len(), undo_before + 1, "one undo step");
+        // Markers: the list drew the marker; its dialog's draft and contents need only the session.
+        draw(&mut host, input(), 2);
+        assert!(host.auto.find_current("markers.0").is_some(), "the marker's row drew");
+        let m = crate::panels::markers_ui::MarkerRef { layer: None, index: 0 };
+        let mut d = crate::panels::markers_ui::draft_for(&mut host.session, m).unwrap();
+        assert_eq!(d.comment, "Beat");
+        let mut auto = Registry::default();
+        let prefs = host.session.prefs.clone();
+        let _ = ctx.run_ui(input(), |ui| {
+            let a = crate::panels::markers_ui::draw_dialog(ui, &mut d, &prefs, &mut auto, &host.tokens);
+            assert_eq!(a, crate::panels::markers_ui::DialogAnswer::default());
+        });
+        assert!(auto.find_current("dialog.marker.ok").is_some());
+        // The Motion Library's own commands run on a host; other ids are not its.
+        let r = crate::panels::motion_library::hosted_command(&mut host, &ctx, "motionLibrary.view", &json!({"query": "zoom"}));
+        assert!(matches!(r, Some(Ok(_))), "{r:?}");
+        assert_eq!(host.ui.motion_library.query, "zoom");
+        assert!(crate::panels::motion_library::hosted_command(&mut host, &ctx, "layer.select", &json!({})).is_none());
+        // Junk never panics.
+        for junk in [json!(null), json!([1, 2]), json!({"id": 5, "op": {}}), json!("x")] {
+            for id in
+                ["motionLibrary.apply", "motionLibrary.card", "motionLibrary.curve", "motionLibrary.tool", "motionLibrary.folder", "motionLibrary.copyName"]
+            {
+                let _ = crate::panels::motion_library::hosted_command(&mut host, &ctx, id, &junk);
+            }
+        }
     }
 }

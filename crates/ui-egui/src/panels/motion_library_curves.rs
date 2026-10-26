@@ -27,8 +27,9 @@ use serde_json::{Value, json};
 
 use super::motion_library::ViewState;
 use crate::i18n::tr;
+use crate::panels::timeline::TimelineHost;
 use crate::theme::Tokens;
-use crate::{EffectcraftApp, widgets};
+use crate::widgets;
 
 // ── Curve math (curve-math.js) ─────────────────────────────────────────────────────────────────
 
@@ -784,7 +785,7 @@ fn start_load(ctx: &egui::Context, st: &mut CurvesState, now: f64) {
 }
 
 /// Read keys (`match_preview`: also take their timing for the motion preview).
-fn start_analyze(app: &EffectcraftApp, ctx: &egui::Context, st: &mut CurvesState, match_preview: bool) -> Result<(), String> {
+fn start_analyze(app: &dyn TimelineHost, ctx: &egui::Context, st: &mut CurvesState, match_preview: bool) -> Result<(), String> {
     let port = super::motion_library::control_port(app)?;
     spawn(
         ctx,
@@ -819,7 +820,7 @@ fn apply_args(curve: Option<Curve>, id: Option<&str>, usage: Option<&str>) -> Re
     }
 }
 
-fn start_apply(app: &EffectcraftApp, ctx: &egui::Context, st: &mut CurvesState, args: Value) -> Result<(), String> {
+fn start_apply(app: &dyn TimelineHost, ctx: &egui::Context, st: &mut CurvesState, args: Value) -> Result<(), String> {
     let port = super::motion_library::control_port(app)?;
     st.live_due = None;
     spawn(
@@ -840,7 +841,7 @@ fn start_apply(app: &EffectcraftApp, ctx: &egui::Context, st: &mut CurvesState, 
 }
 
 /// Live: read the selected keys, then give them the editor's curve (unless they can't take one).
-fn start_live(app: &EffectcraftApp, ctx: &egui::Context, st: &mut CurvesState) {
+fn start_live(app: &dyn TimelineHost, ctx: &egui::Context, st: &mut CurvesState) {
     let port = match super::motion_library::control_port(app) {
         Ok(p) => p,
         Err(e) => {
@@ -1041,20 +1042,20 @@ fn start_save_changes(ctx: &egui::Context, st: &mut CurvesState) -> Result<(), S
 
 /// Runs a pending relink (an Ease card saved with a new curve): every move linked to the card
 /// gets the new curve, one undo step (`graph.relinkUpdate`). Called every frame (batch 1, AX3).
-pub fn drain_relink(app: &mut EffectcraftApp, ctx: &egui::Context) {
+pub fn drain_relink(app: &mut dyn TimelineHost, ctx: &egui::Context) {
     let shared = shared(ctx);
     let Ok(mut st) = shared.try_lock() else { return };
     let Some((before, after, name)) = st.relink.take() else { return };
     drop(st);
     let params = json!({"from": before, "to": after, "name": name});
-    match crate::menus::invoke(app, ctx, "graph.relinkUpdate", params) {
+    match app.invoke(ctx, "graph.relinkUpdate", params) {
         Ok(v) => {
             let n = v.get("updated").and_then(Value::as_u64).unwrap_or(0);
             if n > 0 {
-                app.toast = Some((format!("“{name}” changed: {n} linked move{} updated", if n == 1 { "" } else { "s" }), ctx.input(|i| i.time)));
+                app.toast(format!("“{name}” changed: {n} linked move{} updated", if n == 1 { "" } else { "s" }), ctx.input(|i| i.time));
             }
         }
-        Err(e) => app.ui.status = e,
+        Err(e) => app.ui_mut().status = e,
     }
 }
 
@@ -1070,7 +1071,7 @@ fn card_args(name: &str, category: &str, description: &str, curve: Curve) -> Res
 
 /// Save `curve` as a new Ease card (the plug's `save_asset`; without a control port the library
 /// backend saves it, as a drawn graph needs no project).
-fn start_save_card(app: &EffectcraftApp, ctx: &egui::Context, st: &mut CurvesState, args: Value) {
+fn start_save_card(app: &dyn TimelineHost, ctx: &egui::Context, st: &mut CurvesState, args: Value) {
     let port = super::motion_library::control_port(app).ok();
     let name = args.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
     let category = args.get("category").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -1101,8 +1102,8 @@ const GREEN: Color32 = Color32::from_rgb(0x9f, 0xd4, 0x9b);
 
 /// A text button that can be disabled; true when clicked (and enabled).
 #[allow(clippy::too_many_arguments)]
-fn button(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, auto: &str, text: &str, primary: bool, enabled: bool, s: f32) -> bool {
-    let t = app.tokens;
+fn button(app: &mut dyn TimelineHost, ui: &mut egui::Ui, r: Rect, auto: &str, text: &str, primary: bool, enabled: bool, s: f32) -> bool {
+    let t = app.tokens();
     let resp = ui.interact(r, egui::Id::new(("ml-curves-btn", auto)), if enabled { Sense::click() } else { Sense::hover() });
     let bg = match (primary, enabled, resp.hovered()) {
         (true, true, true) => t.accent_hover,
@@ -1120,7 +1121,7 @@ fn button(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, auto: &str, text
         t.text
     };
     ui.painter().text(r.center(), Align2::CENTER_CENTER, tr(text), Tokens::medium(11.5 * s), color);
-    app.auto.add(auto, r, text);
+    app.auto_mut().add(auto, r, text);
     enabled && resp.clicked()
 }
 
@@ -1159,8 +1160,8 @@ fn paint_mini(p: &egui::Painter, r: Rect, c: &Curve, accent: Color32, s: f32) {
 
 /// The graph: grid, speed and value curves, the two handles. Edits change `st`.
 #[allow(clippy::too_many_lines)]
-fn graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut CurvesState, g: Rect, now: f64, s: f32) {
-    let t = app.tokens;
+fn graph(app: &mut dyn TimelineHost, ui: &mut egui::Ui, st: &mut CurvesState, g: Rect, now: f64, s: f32) {
+    let t = app.tokens();
     let p = ui.painter().with_clip_rect(g.intersect(ui.clip_rect()));
     p.rect_filled(g, CornerRadius::same(8), t.field_bg);
     p.rect_stroke(g, CornerRadius::same(8), Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
@@ -1218,7 +1219,7 @@ fn graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut CurvesState, g: R
     p.text(pos2(plot.min.x, g.max.y - 10.0 * s), Align2::LEFT_CENTER, "0", axis.clone(), t.text_dim);
     p.text(pos2(plot.max.x, g.max.y - 10.0 * s), Align2::RIGHT_CENTER, tr("Time → 100%"), axis, t.text_dim);
     let bg = ui.interact(g, egui::Id::new("ml-curves-graph"), Sense::click());
-    app.auto.add("motionLibrary.curves.graph", g, "Easing graph");
+    app.auto_mut().add("motionLibrary.curves.graph", g, "Easing graph");
     if !st.editable() {
         return;
     }
@@ -1234,7 +1235,7 @@ fn graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut CurvesState, g: R
         let hit = Rect::from_center_size(b, vec2(22.0 * s, 22.0 * s));
         let resp = ui.interact(hit, id, Sense::click_and_drag());
         let name = if h == 0 { "out" } else { "in" };
-        app.auto.add_response(&format!("motionLibrary.curves.handle.{name}"), &resp, &format!("{hx:.3}, {hy:.3}"));
+        app.auto_mut().add_response(&format!("motionLibrary.curves.handle.{name}"), &resp, &format!("{hx:.3}, {hy:.3}"));
         if resp.drag_started() || resp.clicked() {
             resp.request_focus();
         }
@@ -1327,8 +1328,8 @@ fn graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut CurvesState, g: R
 }
 
 /// The motion preview: a dot moving with the curve from Start to End.
-fn preview_strip(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut CurvesState, r: Rect, now: f64, s: f32) {
-    let t = app.tokens;
+fn preview_strip(app: &mut dyn TimelineHost, ui: &mut egui::Ui, st: &mut CurvesState, r: Rect, now: f64, s: f32) {
+    let t = app.tokens();
     let p = ui.painter().with_clip_rect(r.intersect(ui.clip_rect()));
     p.rect_filled(r, CornerRadius::same(8), t.field_bg);
     p.rect_stroke(r, CornerRadius::same(8), Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
@@ -1346,7 +1347,7 @@ fn preview_strip(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut CurvesSta
     } else {
         p.add(egui::Shape::convex_polygon(vec![pos2(c.x - k * 0.7, c.y - k), pos2(c.x - k * 0.7, c.y + k), pos2(c.x + k, c.y)], t.text, Stroke::NONE));
     }
-    app.auto.add_response("motionLibrary.curves.preview", &resp, if playing { "Stop motion preview" } else { "Play motion preview" });
+    app.auto_mut().add_response("motionLibrary.curves.preview", &resp, if playing { "Stop motion preview" } else { "Play motion preview" });
     let resp = resp.on_hover_text(tr(if playing { "Stop motion preview" } else { "Play motion preview" }));
     if resp.clicked() {
         st.playing = if playing { None } else { Some(now) };
@@ -1386,8 +1387,8 @@ fn preview_strip(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut CurvesSta
 }
 
 /// The duration slider (0…10 s); true when changed.
-fn duration_slider(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut CurvesState, r: Rect, s: f32) -> bool {
-    let t = app.tokens;
+fn duration_slider(app: &mut dyn TimelineHost, ui: &mut egui::Ui, st: &mut CurvesState, r: Rect, s: f32) -> bool {
+    let t = app.tokens();
     let label_w = 40.0 * s;
     let track = Rect::from_min_max(r.min, pos2(r.max.x - label_w - 6.0 * s, r.max.y));
     let resp = ui.interact(track, egui::Id::new("ml-curves-duration"), Sense::click_and_drag());
@@ -1412,26 +1413,26 @@ fn duration_slider(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut CurvesS
     p.circle_filled(pos2(track.min.x + f * track.width(), y), 6.0 * s, if resp.hovered() || resp.dragged() { t.accent_hover } else { t.accent });
     let text = format!("{:.1} s", st.duration);
     p.text(pos2(r.max.x, y), Align2::RIGHT_CENTER, &text, Tokens::ui(11.0 * s), t.text_dim);
-    app.auto.add_response("motionLibrary.curves.duration", &resp, &text);
+    app.auto_mut().add_response("motionLibrary.curves.duration", &resp, &text);
     changed
 }
 
 /// A labelled text field (`rows` > 1: multi-line); the height it takes.
 #[allow(clippy::too_many_arguments)]
-fn field(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: Pos2, w: f32, auto: &str, label: &str, text: &mut String, hint: &str, rows: usize, s: f32) -> f32 {
-    let t = app.tokens;
+fn field(app: &mut dyn TimelineHost, ui: &mut egui::Ui, at: Pos2, w: f32, auto: &str, label: &str, text: &mut String, hint: &str, rows: usize, s: f32) -> f32 {
+    let t = app.tokens();
     ui.painter().text(at, Align2::LEFT_TOP, tr(label), Tokens::ui(11.0 * s), t.text_dim);
     let h = if rows > 1 { 18.0 * s * rows as f32 + 8.0 * s } else { 24.0 * s };
     let r = Rect::from_min_size(pos2(at.x, at.y + 16.0 * s), vec2(w, h));
     let edit = if rows > 1 { egui::TextEdit::multiline(text).desired_rows(rows) } else { egui::TextEdit::singleline(text) };
     let resp = ui.put(r, edit.hint_text(tr(hint)).font(Tokens::ui(11.5 * s)));
-    app.auto.add_response(auto, &resp, label);
+    app.auto_mut().add_response(auto, &resp, label);
     16.0 * s + h + 8.0 * s
 }
 
 /// The Save form (preset or Ease card) at `at`; its height.
-fn save_form(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, st: &mut CurvesState, at: Pos2, w: f32, s: f32) -> f32 {
-    let t = app.tokens;
+fn save_form(app: &mut dyn TimelineHost, ui: &mut egui::Ui, ctx: &egui::Context, st: &mut CurvesState, at: Pos2, w: f32, s: f32) -> f32 {
+    let t = app.tokens();
     let Some(mut form) = st.form.clone() else { return 0.0 };
     let card = form.target == "card";
     let mut y = at.y;
@@ -1507,7 +1508,7 @@ fn save_form(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, s
 /// The editor column at `r` (its width; top-left); returns its content height.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn editor(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     st: &mut CurvesState,
@@ -1517,7 +1518,7 @@ fn editor(
     now: f64,
     s: f32,
 ) -> f32 {
-    let t = app.tokens;
+    let t = app.tokens();
     let (x0, w) = (r.min.x, r.width());
     let mut y = r.min.y;
     let busy = st.busy.is_some();
@@ -1564,7 +1565,7 @@ fn editor(
                 let (lo, hi) = limits(k);
                 let v = c.get(k).copied().unwrap_or_default();
                 let (nr, nv, _) = widgets::hot_number_at(ui, pos2(x, y + 1.0 * s), egui::Id::new(("ml-curves-num", k)), v, 0.005, (lo, hi), 3, "", &t);
-                app.auto.add(&format!("motionLibrary.curves.{name}"), nr, &format!("{v:.3}"));
+                app.auto_mut().add(&format!("motionLibrary.curves.{name}"), nr, &format!("{v:.3}"));
                 if let (Some(nv), Some(slot)) = (nv, c.get_mut(k)) {
                     *slot = nv.clamp(lo, hi);
                 }
@@ -1584,7 +1585,7 @@ fn editor(
         let galley = p.layout(st.status.clone(), Tokens::ui(11.0 * s), color, w.max(40.0));
         let h = galley.size().y;
         p.galley(pos2(x0, y + 3.0 * s), galley, color);
-        app.auto.add("motionLibrary.curves.status", Rect::from_min_size(pos2(x0, y), vec2(w, h + 6.0 * s)), &st.status);
+        app.auto_mut().add("motionLibrary.curves.status", Rect::from_min_size(pos2(x0, y), vec2(w, h + 6.0 * s)), &st.status);
         y += h + 8.0 * s;
     }
     // Motion preview.
@@ -1679,7 +1680,7 @@ fn editor(
     ]) {
         if button(app, ui, r, auto, label, false, true, s) && super::panel_kit::exec(app, cmd, json!({})).is_some() {
             let text = format!("{label} on the selected keyframes");
-            app.ui.status = text.clone();
+            app.ui_mut().status = text.clone();
             st.say(text);
         }
     }
@@ -1708,7 +1709,7 @@ fn finish_editing(st: &mut CurvesState) {
 /// A grid of preset tiles; the height. `saved`: the library's presets (else the starters).
 #[allow(clippy::too_many_arguments)]
 fn tiles(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     st: &mut CurvesState,
@@ -1719,7 +1720,7 @@ fn tiles(
     now: f64,
     s: f32,
 ) -> f32 {
-    let t = app.tokens;
+    let t = app.tokens();
     let side = 48.0 * s;
     let gap = 6.0 * s;
     let cols = (((w + gap) / (side + gap)).floor() as usize).max(1);
@@ -1751,7 +1752,7 @@ fn tiles(
             Some(p) => format!("motionLibrary.curves.preset.{}", p.id),
             None => format!("motionLibrary.curves.starter.{name}"),
         };
-        app.auto.add(&auto, r, &tip);
+        app.auto_mut().add(&auto, r, &tip);
         let resp = resp.on_hover_text(tip.as_str());
         if resp.clicked() {
             pick = Some((key.clone(), *curve, saved.clone()));
@@ -1762,7 +1763,7 @@ fn tiles(
             ui.painter().circle_filled(b.center(), 9.0 * s, t.danger);
             ui.painter().text(b.center(), Align2::CENTER_CENTER, "−", Tokens::semibold(12.0 * s), Color32::WHITE);
             let label = if saved.is_some() { format!("Remove {name}") } else { format!("Hide {name}") };
-            app.auto.add(&format!("{auto}.remove"), b, &label);
+            app.auto_mut().add(&format!("{auto}.remove"), b, &label);
             if br.on_hover_text(label.as_str()).clicked() {
                 remove = Some((saved.as_ref().map_or_else(|| name.clone(), |p| p.id.clone()), saved.is_some()));
                 pick = None;
@@ -1780,7 +1781,7 @@ fn tiles(
         let stroke = Stroke::new(1.6 * s, if resp.hovered() { t.text } else { t.text_dim });
         ui.painter().line_segment([pos2(c.x - k, c.y), pos2(c.x + k, c.y)], stroke);
         ui.painter().line_segment([pos2(c.x, c.y - k), pos2(c.x, c.y + k)], stroke);
-        app.auto.add("motionLibrary.curves.add", r, "Save current curve");
+        app.auto_mut().add("motionLibrary.curves.add", r, "Save current curve");
         if resp.on_hover_text(tr("Save current curve")).clicked() {
             st.open_form("preset", "");
         }
@@ -1802,8 +1803,8 @@ fn tiles(
 
 /// The presets column at `r`; its content height.
 #[allow(clippy::too_many_lines)]
-fn presets(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, st: &mut CurvesState, r: Rect, now: f64, s: f32) -> f32 {
-    let t = app.tokens;
+fn presets(app: &mut dyn TimelineHost, ui: &mut egui::Ui, ctx: &egui::Context, st: &mut CurvesState, r: Rect, now: f64, s: f32) -> f32 {
+    let t = app.tokens();
     let (x0, w) = (r.min.x, r.width());
     let mut y = r.min.y;
     let busy = st.busy.is_some();
@@ -1818,7 +1819,7 @@ fn presets(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, st:
     y += 30.0 * s;
     let sr = Rect::from_min_size(pos2(x0, y), vec2(w, 24.0 * s));
     let resp = widgets::search_field(ui, sr, &mut st.search, tr("Search…"), &t);
-    app.auto.add_response("motionLibrary.curves.search", &resp, "Search curves");
+    app.auto_mut().add_response("motionLibrary.curves.search", &resp, "Search curves");
     y += 32.0 * s;
     let query = st.search.clone();
     let saved: Vec<(String, String, Curve, Option<Preset>)> =
@@ -1915,14 +1916,14 @@ fn column(ui: &mut egui::Ui, rect: Rect, salt: &str, height: f32, body: impl FnO
 }
 
 /// The Curves workspace in `rect` (right of the rail).
-pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect, view: &mut ViewState, s: f32) {
+pub fn workspace(app: &mut dyn TimelineHost, ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect, view: &mut ViewState, s: f32) {
     let shared = shared(ctx);
     let mut guard = lock(&shared);
     let st = &mut *guard;
     let now = ctx.input(|i| i.time);
-    let t = app.tokens;
+    let t = app.tokens();
     ui.painter().with_clip_rect(rect).rect_filled(rect, 0.0, t.panel_bg);
-    app.auto.add("motionLibrary.curves", rect, "Curves workspace");
+    app.auto_mut().add("motionLibrary.curves", rect, "Curves workspace");
     // Opening the workspace reads the saved presets (again after 30 s).
     let reopened = now - st.last_shown > 1.0;
     st.last_shown = now;
@@ -1950,7 +1951,7 @@ pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
         heights[0] = column(ui, inner, "stacked", h_editor, |ui, r| {
             let h = editor(app, ui, ctx, st, view, r, false, now, s);
             let y = r.min.y + h + 10.0 * s;
-            ui.painter().line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], Stroke::new(1.0, app.tokens.separator));
+            ui.painter().line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], Stroke::new(1.0, app.tokens().separator));
             let pr = Rect::from_min_max(pos2(r.min.x, y + 12.0 * s), pos2(r.max.x, r.max.y.max(y + 12.0 * s)));
             h + 22.0 * s + presets(app, ui, ctx, st, pr, now, s)
         });
@@ -2013,14 +2014,14 @@ fn text<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
 ///
 /// Operations that call the library run in the background: they answer `{"started": op}` and
 /// `state` shows `busy` until they finish, then `status` (and `error`).
-pub fn command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+pub fn command(app: &mut dyn TimelineHost, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
     let op = text(params, "op")
         .ok_or("missing `op`: state, list, load, reverse, analyze, apply, save, remove, approve, editCard, saveChanges, saveCard, done, preview or live")?;
     if op == "editCard" {
         let id = text(params, "id").unwrap_or_default().to_string();
-        let mut view = std::mem::take(&mut app.ui.motion_library);
+        let mut view = std::mem::take(&mut app.ui_mut().motion_library);
         let r = edit_card(ctx, &mut view, &id);
-        app.ui.motion_library = view;
+        app.ui_mut().motion_library = view;
         return r;
     }
     let shared = shared(ctx);
@@ -2114,7 +2115,7 @@ pub fn command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) ->
             Ok(json!({"started": "saveChanges"}))
         }
         "saveCard" => {
-            let folder = &app.ui.motion_library.folder;
+            let folder = &app.ui_mut().motion_library.folder;
             let category = text(params, "category").map(str::to_string).unwrap_or_else(|| if folder.is_empty() { "My motion".into() } else { folder.clone() });
             let args = card_args(text(params, "name").unwrap_or_default(), &category, text(params, "description").unwrap_or_default(), curve_param(st)?)?;
             start_save_card(app, ctx, st, args.clone());
@@ -2122,7 +2123,7 @@ pub fn command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) ->
         }
         "done" => {
             finish_editing(st);
-            app.ui.motion_library.workspace.clear();
+            app.ui_mut().motion_library.workspace.clear();
             Ok(json!({"workspace": ""}))
         }
         "preview" => {
@@ -2154,6 +2155,7 @@ pub fn command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EffectcraftApp;
 
     fn close(a: f64, b: f64, eps: f64) -> bool {
         (a - b).abs() <= eps

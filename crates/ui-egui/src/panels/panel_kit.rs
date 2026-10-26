@@ -3,38 +3,39 @@
 
 use egui::{Align2, Rect, pos2, vec2};
 
+use crate::panels::timeline::TimelineHost;
 use crate::theme::Tokens;
-use crate::{EffectcraftApp, widgets};
+use crate::widgets;
 
 /// A dropdown; returns the newly chosen index.
-pub fn dropdown(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, auto: &str, options: &[&str], cur: usize) -> Option<usize> {
-    let t = app.tokens;
+pub fn dropdown(app: &mut dyn TimelineHost, ui: &mut egui::Ui, r: Rect, auto: &str, options: &[&str], cur: usize) -> Option<usize> {
+    let t = app.tokens();
     let id = egui::Id::new(("kit-dd", auto));
     let text = options.get(cur).copied().unwrap_or("");
     if widgets::dropdown(ui, r, text, &t, id).clicked() {
         widgets::open_popup(ui, id);
     }
-    app.auto.add(auto, r, text);
+    app.auto_mut().add(auto, r, text);
     let opts: Vec<String> = options.iter().map(|s| s.to_string()).collect();
     widgets::popup_menu(ui, id, r.left_bottom(), &opts, Some(cur)).filter(|i| *i != cur)
 }
 
 /// A checkbox with a label; returns the new state.
-pub fn checkbox(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: egui::Pos2, auto: &str, text: &str, on: bool) -> bool {
-    let t = app.tokens;
+pub fn checkbox(app: &mut dyn TimelineHost, ui: &mut egui::Ui, at: egui::Pos2, auto: &str, text: &str, on: bool) -> bool {
+    let t = app.tokens();
     let r = Rect::from_min_size(at, vec2(16.0, 16.0));
     let clicked = widgets::checkbox(ui, r, on, &t, egui::Id::new(("kit-cb", auto))).clicked();
     ui.painter().text(pos2(r.max.x + 6.0, r.center().y), Align2::LEFT_CENTER, text, Tokens::ui(12.0), t.text);
     // The painted label is not interactive; automation must click the checkbox itself.
-    app.auto.add(auto, r, text);
+    app.auto_mut().add(auto, r, text);
     if clicked { !on } else { on }
 }
 
 /// A text button; true when clicked.
-pub fn button(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, auto: &str, text: &str, primary: bool) -> bool {
-    let t = app.tokens;
+pub fn button(app: &mut dyn TimelineHost, ui: &mut egui::Ui, r: Rect, auto: &str, text: &str, primary: bool) -> bool {
+    let t = app.tokens();
     let clicked = widgets::text_button(ui, r, text, primary, &t, egui::Id::new(("kit-btn", auto))).clicked();
-    app.auto.add(auto, r, text);
+    app.auto_mut().add(auto, r, text);
     clicked
 }
 
@@ -45,19 +46,29 @@ pub fn label(ui: &egui::Ui, at: egui::Pos2, text: &str, t: &Tokens) {
 
 /// A draggable number; returns the new value.
 #[allow(clippy::too_many_arguments)]
-pub fn number(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: egui::Pos2, auto: &str, v: f64, speed: f64, range: (f64, f64), dec: usize, suffix: &str) -> f64 {
-    let t = app.tokens;
+pub fn number(
+    app: &mut dyn TimelineHost,
+    ui: &mut egui::Ui,
+    at: egui::Pos2,
+    auto: &str,
+    v: f64,
+    speed: f64,
+    range: (f64, f64),
+    dec: usize,
+    suffix: &str,
+) -> f64 {
+    let t = app.tokens();
     let (r, nv, _) = widgets::hot_number_at(ui, at, egui::Id::new(("kit-n", auto)), v, speed, range, dec, suffix, &t);
-    app.auto.add(auto, r, &format!("{v}"));
+    app.auto_mut().add(auto, r, &format!("{v}"));
     nv.unwrap_or(v)
 }
 
 /// Run a command, reporting errors in the status bar.
-pub fn exec(app: &mut EffectcraftApp, id: &str, p: serde_json::Value) -> Option<serde_json::Value> {
-    match app.session.execute(id, p) {
+pub fn exec(app: &mut dyn TimelineHost, id: &str, p: serde_json::Value) -> Option<serde_json::Value> {
+    match app.session_mut().execute(id, p) {
         Ok(v) => Some(v),
         Err(e) => {
-            app.ui.status = e.to_string();
+            app.ui_mut().status = e.to_string();
             None
         }
     }

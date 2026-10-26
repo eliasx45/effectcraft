@@ -24,8 +24,9 @@ use serde_json::{Value, json};
 use super::motion_library::{ViewState, control_port, plug_rpc};
 use super::panel_kit as kit;
 use crate::i18n::tr;
+use crate::panels::timeline::TimelineHost;
 use crate::theme::Tokens;
-use crate::{EffectcraftApp, widgets};
+use crate::widgets;
 
 /// The sections: key (automation ids, `section` params), name, tip.
 pub const SECTIONS: [(&str, &str, &str); 4] = [
@@ -505,16 +506,16 @@ fn native_message(tool: &str, p: &Value, r: &Value) -> String {
 
 /// Run tool `tool` (the panel's buttons and `motionLibrary.tool` both come here). Native tools
 /// return their result; plug tools start in the background and return `{running}`.
-fn start(app: &mut EffectcraftApp, ctx: &egui::Context, tool: &str, p: &Value) -> Result<Value, String> {
+fn start(app: &mut dyn TimelineHost, ctx: &egui::Context, tool: &str, p: &Value) -> Result<Value, String> {
     if let Some(running) = shared().busy.clone() {
         return Err(format!("{running} is still running: one action at a time."));
     }
-    let fail = |app: &mut EffectcraftApp, e: String| {
+    let fail = |app: &mut dyn TimelineHost, e: String| {
         record(tool, &Err(e.clone()));
-        app.ui.status = e.clone();
+        app.ui_mut().status = e.clone();
         Err(e)
     };
-    let mut built = match build(tool, p, &settings(), &keyed_props(&app.session)) {
+    let mut built = match build(tool, p, &settings(), &keyed_props(app.session())) {
         Ok(b) => b,
         Err(e) => return fail(app, e),
     };
@@ -524,14 +525,14 @@ fn start(app: &mut EffectcraftApp, ctx: &egui::Context, tool: &str, p: &Value) -
     // isn't passed: the preset's spring settles by itself. No preset = a clear error.
     if let Plan::Plug { op: "toolkit_bounce", args } = &built.plan
         && args["mode"] != json!("remove")
-        && ((args["property"] == json!("selected") && reveal_keys(&app.session)) || text_layers_only(&app.session))
+        && ((args["property"] == json!("selected") && reveal_keys(app.session())) || text_layers_only(app.session()))
     {
         let a = json!({"overshoot": args["strength"], "speed": args["frequency"]});
         built = Built { plan: Plan::Native { cmd: "text.unitBounce", args: a }, section: BOUNCE, label: "Bounce text preset".into() };
     }
     match built.plan {
         Plan::Native { cmd, args } => {
-            let r = app.session.execute(cmd, args).map_err(|e| e.to_string()).map(|mut v| {
+            let r = app.session_mut().execute(cmd, args).map_err(|e| e.to_string()).map(|mut v| {
                 if v.get("message").is_none() {
                     let m = native_message(tool, p, &v);
                     match v.as_object_mut() {
@@ -545,8 +546,8 @@ fn start(app: &mut EffectcraftApp, ctx: &egui::Context, tool: &str, p: &Value) -
             });
             record(tool, &r);
             match &r {
-                Ok(v) => app.ui.status = result_message(v),
-                Err(e) => app.ui.status = e.clone(),
+                Ok(v) => app.ui_mut().status = result_message(v),
+                Err(e) => app.ui_mut().status = e.clone(),
             }
             r
         }
@@ -569,7 +570,7 @@ fn start(app: &mut EffectcraftApp, ctx: &egui::Context, tool: &str, p: &Value) -
                 ImageSource::Path(path) => spawn(ctx, tool, &built.label, move || paste(read_png(&path)?)),
                 ImageSource::Clipboard if cfg!(target_os = "macos") => spawn(ctx, tool, &built.label, move || paste(clipboard_png()?)),
                 ImageSource::Clipboard | ImageSource::Dialog => {
-                    if let Some(open) = app.hooks.file_dialog_async.as_ref() {
+                    if let Some(open) = app.app_ref().and_then(|a| a.hooks.file_dialog_async.as_ref()) {
                         let ctx = ctx.clone();
                         open(
                             crate::FileDialog::Open { exts: vec!["png".into()], many: false },
@@ -581,7 +582,7 @@ fn start(app: &mut EffectcraftApp, ctx: &egui::Context, tool: &str, p: &Value) -
                         );
                         return Ok(json!({"dialog": "png"}));
                     }
-                    let picked = app.hooks.pick_files.as_ref().map(|f| f(&["png"])).unwrap_or_default();
+                    let picked = app.pick_files(&["png"]).unwrap_or_default();
                     let Some(path) = picked.into_iter().next() else {
                         return fail(app, "Choose a PNG file (or pass `path`).".into());
                     };
@@ -738,7 +739,7 @@ fn section_index(p: &Value) -> Result<usize, String> {
 /// the running action and the last result; `{op: "show", section}` opens the Tools workspace on
 /// a section; `{op: "collapse", section, collapsed?}` folds one (toggles without `collapsed`);
 /// `{op: "shuffle"}` picks four random colours.
-pub fn command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+pub fn command(app: &mut dyn TimelineHost, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
     if let Some(op) = params.get("op").and_then(Value::as_str) {
         match op {
             "settings" => {
@@ -752,7 +753,7 @@ pub fn command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) ->
             "status" => return Ok(status_json()),
             "show" => {
                 let i = section_index(params)?;
-                app.ui.motion_library.workspace = "tools".into();
+                app.ui_mut().motion_library.workspace = "tools".into();
                 let mut sh = shared();
                 let mut set = sh.settings.clone().unwrap_or_default();
                 set.set_collapsed(i, false);
@@ -833,7 +834,7 @@ impl Cursor {
 type Action = Option<(&'static str, Value)>;
 
 /// A text button that is greyed out and inert unless `enabled`.
-fn act(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, auto: &str, text: &str, primary: bool, enabled: bool) -> bool {
+fn act(app: &mut dyn TimelineHost, ui: &mut egui::Ui, r: Rect, auto: &str, text: &str, primary: bool, enabled: bool) -> bool {
     let mut sub = ui.new_child(egui::UiBuilder::new().max_rect(r));
     if !enabled {
         sub.disable();
@@ -851,7 +852,7 @@ fn labelled(ui: &egui::Ui, c: &Cursor, t: &Tokens, label: &str) -> Rect {
 
 /// A row of buttons (wrapping to more rows when narrow): `(automation name, label, primary,
 /// enabled)`. Returns the clicked one's index.
-fn button_rows(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, section: &str, items: &[(&str, &str, bool, bool)], min_w: f32) -> Option<usize> {
+fn button_rows(app: &mut dyn TimelineHost, ui: &mut egui::Ui, c: &mut Cursor, section: &str, items: &[(&str, &str, bool, bool)], min_w: f32) -> Option<usize> {
     let gap = 6.0 * c.s;
     let per_row = (((c.w + gap) / (min_w * c.s + gap)).floor() as usize).clamp(1, items.len().max(1));
     let bw = (c.w - gap * (per_row as f32 - 1.0)) / per_row as f32;
@@ -869,12 +870,12 @@ fn button_rows(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, sect
 }
 
 /// A colour swatch that opens the colour picker; true when the colour changed.
-fn swatch(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, auto: &str, hex: &mut String) -> bool {
-    let t = app.tokens;
+fn swatch(app: &mut dyn TimelineHost, ui: &mut egui::Ui, r: Rect, auto: &str, hex: &mut String) -> bool {
+    let t = app.tokens();
     let mut rgb = rgb_of(hex);
     let id = egui::Id::new(("ml-tools-color", auto));
     let resp = widgets::swatch(ui, r, [rgb[0], rgb[1], rgb[2], 1.0], id, &t);
-    app.auto.add_response(auto, &resp, hex);
+    app.auto_mut().add_response(auto, &resp, hex);
     if resp.on_hover_text(hex.as_str()).clicked() {
         widgets::open_popup(ui, id);
     }
@@ -887,8 +888,8 @@ fn swatch(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, auto: &str, hex:
 
 /// A labelled number (`decimals` places) clamped to `range`.
 #[allow(clippy::too_many_arguments)]
-fn number_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, auto: &str, label: &str, v: f64, range: (f64, f64), decimals: usize) -> f64 {
-    let t = app.tokens;
+fn number_row(app: &mut dyn TimelineHost, ui: &mut egui::Ui, c: &mut Cursor, auto: &str, label: &str, v: f64, range: (f64, f64), decimals: usize) -> f64 {
+    let t = app.tokens();
     let ctrl = labelled(ui, c, &t, label);
     let speed = if decimals == 0 { 1.0 } else { 0.1 };
     let nv = kit::number(app, ui, pos2(ctrl.min.x, ctrl.center().y - 9.0), auto, v, speed, range, decimals, "");
@@ -897,8 +898,8 @@ fn number_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, auto:
 }
 
 /// A labelled dropdown over `options` (key, label); returns the chosen key.
-fn choice_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, auto: &str, label: &str, options: &[(&str, &str)], cur: &mut String) {
-    let t = app.tokens;
+fn choice_row(app: &mut dyn TimelineHost, ui: &mut egui::Ui, c: &mut Cursor, auto: &str, label: &str, options: &[(&str, &str)], cur: &mut String) {
+    let t = app.tokens();
     let ctrl = labelled(ui, c, &t, label);
     let labels: Vec<&str> = options.iter().map(|(_, l)| tr(l)).collect();
     let i = options.iter().position(|(k, _)| *k == cur.as_str()).unwrap_or(0);
@@ -910,16 +911,16 @@ fn choice_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, auto:
     c.y += 30.0 * c.s;
 }
 
-fn checkbox_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, auto: &str, label: &str, on: &mut bool) {
+fn checkbox_row(app: &mut dyn TimelineHost, ui: &mut egui::Ui, c: &mut Cursor, auto: &str, label: &str, on: &mut bool) {
     *on = kit::checkbox(app, ui, pos2(c.x, c.y + 4.0 * c.s), auto, tr(label), *on);
     c.y += 26.0 * c.s;
 }
 
-fn text_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, auto: &str, label: &str, hint: &str, text: &mut String) {
-    let t = app.tokens;
+fn text_row(app: &mut dyn TimelineHost, ui: &mut egui::Ui, c: &mut Cursor, auto: &str, label: &str, hint: &str, text: &mut String) {
+    let t = app.tokens();
     let ctrl = labelled(ui, c, &t, label);
     let resp = widgets::text_field(ui, ctrl, text, tr(hint), &t);
-    app.auto.add_response(auto, &resp, label);
+    app.auto_mut().add_response(auto, &resp, label);
     c.y += 30.0 * c.s;
 }
 
@@ -931,8 +932,8 @@ fn note(ui: &egui::Ui, c: &mut Cursor, t: &Tokens, text: &str) {
     c.y += h + 8.0 * c.s;
 }
 
-fn workflow_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
-    let t = app.tokens;
+fn workflow_body(app: &mut dyn TimelineHost, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
+    let t = app.tokens();
     let s = c.s;
     let mut action: Action = None;
     // Solid / fill colour: the label takes what the swatch and its hex code leave.
@@ -983,7 +984,7 @@ fn workflow_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, se
         let dot = pos2(frame.min.x + frame.width() * (i % 3) as f32 / 2.0, frame.min.y + frame.height() * (i / 3) as f32 / 2.0);
         p.circle_filled(dot, 2.6 * s, if resp.hovered() && en.plug() { t.accent_hover } else { t.accent });
         let tip = format!("Anchor {what}: move the anchor without moving the layer (static 2D transforms)");
-        app.auto.add(&format!("motionLibrary.tools.workflow.anchor.{name}"), r, &tip);
+        app.auto_mut().add(&format!("motionLibrary.tools.workflow.anchor.{name}"), r, &tip);
         if resp.on_hover_text(tip).clicked() && en.plug() {
             action = Some(("anchor", json!({"at": name})));
         }
@@ -1021,8 +1022,8 @@ fn workflow_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, se
     action
 }
 
-fn text_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
-    let t = app.tokens;
+fn text_body(app: &mut dyn TimelineHost, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
+    let t = app.tokens();
     choice_row(app, ui, c, "motionLibrary.tools.text.mode", "Split into", &SPLIT_MODES, &mut set.split_mode);
     if set.split_mode == "custom" {
         text_row(app, ui, c, "motionLibrary.tools.text.phrase", "Word / phrase", "e.g. Hello", &mut set.split_text);
@@ -1042,22 +1043,22 @@ fn text_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set: &
     button_rows(app, ui, c, "text", &items, 120.0).map(|_| ("split", json!({})))
 }
 
-fn bounce_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
-    let keyed = keyed_props(&app.session);
+fn bounce_body(app: &mut dyn TimelineHost, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
+    let keyed = keyed_props(app.session());
     if keyed.is_empty() {
         choice_row(app, ui, c, "motionLibrary.tools.bounce.property", "Property", &PROPERTIES, &mut set.property);
     } else {
         // Selected keys win over the dropdown (Apply spring springs them); deselect to pick one.
-        let t = app.tokens;
+        let t = app.tokens();
         let ctrl = labelled(ui, c, &t, "Property");
         let label = format!("{} ({})", tr("Selected keys"), keyed.join(", "));
         kit::dropdown(app, ui, ctrl, "motionLibrary.tools.bounce.property", &[label.as_str()], 0);
         c.y += 30.0 * c.s;
     }
     // CX9c: Range Selector keys or text layers get Elias's bounce text preset (native, no plug).
-    let reveal = reveal_keys(&app.session) || text_layers_only(&app.session);
+    let reveal = reveal_keys(app.session()) || text_layers_only(app.session());
     if reveal {
-        let t = app.tokens;
+        let t = app.tokens();
         note(
             ui,
             c,
@@ -1080,7 +1081,7 @@ fn bounce_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set:
     }
 }
 
-fn colour_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
+fn colour_body(app: &mut dyn TimelineHost, ui: &mut egui::Ui, c: &mut Cursor, set: &mut ToolSettings, en: Enable) -> Action {
     let s = c.s;
     let gap = 6.0 * s;
     let shuffle_w = 120.0 * s;
@@ -1103,19 +1104,19 @@ fn colour_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, c: &mut Cursor, set:
 
 /// The Tools workspace in `rect` (right of the rail): the section row, the feedback line, and the
 /// sections (two columns when wide), scrolled.
-pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect, view: &mut ViewState, s: f32) {
+pub fn workspace(app: &mut dyn TimelineHost, ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect, view: &mut ViewState, s: f32) {
     let _ = view;
-    let t = app.tokens;
+    let t = app.tokens();
     let p = ui.painter().with_clip_rect(rect);
     p.rect_filled(rect, 0.0, t.panel_bg);
-    app.auto.add("motionLibrary.tools", rect, "Motion Library tools");
+    app.auto_mut().add("motionLibrary.tools", rect, "Motion Library tools");
     // This frame's copy of the shared state.
     let (mut set, busy, feedback, jump, mut scroll, mut heights, mut focus) = {
         let mut sh = shared();
         if std::mem::take(&mut sh.status_pending)
             && let Some(f) = &sh.feedback
         {
-            app.ui.status = f.text.clone();
+            app.ui_mut().status = f.text.clone();
         }
         (sh.settings.clone().unwrap_or_default(), sh.busy.clone(), sh.feedback.clone(), sh.jump.take(), sh.scroll, sh.heights, sh.focus)
     };
@@ -1154,7 +1155,7 @@ pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
             r.width() - 10.0 * s,
             if i == focus { t.text } else { t.text_dim },
         );
-        app.auto.add(&format!("motionLibrary.tools.nav.{key}"), r, name);
+        app.auto_mut().add(&format!("motionLibrary.tools.nav.{key}"), r, name);
         if resp.on_hover_text(tr(tip)).clicked() {
             set.set_collapsed(i, false);
             jump = Some(i);
@@ -1173,7 +1174,7 @@ pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
         let galley = p.layout(text.clone(), Tokens::ui(11.5 * s), color, inner_w.max(40.0));
         let r = Rect::from_min_size(pos2(rect.min.x + pad, y), galley.size());
         p.galley(r.min, galley, color);
-        app.auto.add("motionLibrary.tools.feedback", r, &text);
+        app.auto_mut().add("motionLibrary.tools.feedback", r, &text);
         y = r.max.y + 6.0 * s;
         if busy.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -1185,7 +1186,7 @@ pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
         let galley = p.layout(text.to_string(), Tokens::ui(11.0 * s), t.warning, inner_w.max(40.0));
         let r = Rect::from_min_size(pos2(rect.min.x + pad, y), galley.size());
         p.galley(r.min, galley, t.warning);
-        app.auto.add("motionLibrary.tools.connection", r, text);
+        app.auto_mut().add("motionLibrary.tools.connection", r, text);
         y = r.max.y + 6.0 * s;
     }
     p.line_segment([pos2(rect.min.x, y), pos2(rect.max.x, y)], Stroke::new(1.0, t.separator));
@@ -1243,7 +1244,7 @@ pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
         let tw = Rect::from_center_size(pos2(head.min.x + 14.0 * s, head.center().y), vec2(14.0 * s, 14.0 * s));
         let twirled = widgets::twirl(&mut cu, tw, !collapsed, egui::Id::new(("ml-tools-twirl", *key)), &t).clicked();
         cu.painter().text(pos2(tw.max.x + 6.0 * s, head.center().y), Align2::LEFT_CENTER, tr(name), Tokens::semibold(12.0 * s), t.text);
-        app.auto.add(&format!("motionLibrary.tools.{key}.header"), head, if collapsed { "collapsed" } else { "expanded" });
+        app.auto_mut().add(&format!("motionLibrary.tools.{key}.header"), head, if collapsed { "collapsed" } else { "expanded" });
         if resp.on_hover_text(tr(tip)).clicked() || twirled {
             set.set_collapsed(i, !collapsed);
             focus = i;
@@ -1281,7 +1282,7 @@ pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
     }
     if max_scroll > 0.0 {
         let track = Rect::from_min_max(pos2(content.max.x - 8.0, content.min.y + 2.0), pos2(content.max.x - 2.0, content.max.y - 2.0));
-        scroll = widgets::scroll_bar(ui, &mut app.auto, "motionLibrary.tools.scroll", track, scroll, max_scroll, &t);
+        scroll = widgets::scroll_bar(ui, app.auto_mut(), "motionLibrary.tools.scroll", track, scroll, max_scroll, &t);
     }
     {
         let mut sh = shared();
@@ -1304,12 +1305,12 @@ pub fn workspace(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Contex
 /// The Motion Library's Families tab: every style family of the project (`style.family.list`)
 /// with its size; dragging a size and letting go changes every linked layer
 /// (`style.family.set`, one undo step). "Link selected" adds the selected layers to a family.
-pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: f32) {
-    let t = app.tokens;
+pub fn families_tab(app: &mut dyn TimelineHost, ui: &mut egui::Ui, area: Rect, s: f32) {
+    let t = app.tokens();
     let ctx = ui.ctx().clone();
     let p = ui.painter().with_clip_rect(area);
     p.rect_filled(area, 0.0, t.panel_bg);
-    app.auto.add("motionLibrary.families", area, "Style families");
+    app.auto_mut().add("motionLibrary.families", area, "Style families");
     let x0 = area.min.x + 12.0 * s;
     let w = (area.width() - 24.0 * s).max(80.0);
     let mut y = area.min.y + 12.0 * s;
@@ -1317,11 +1318,11 @@ pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: 
     y += 26.0 * s;
     // The list, read again when the document changes.
     let cache = egui::Id::new("ml-families-cache");
-    let rev = app.session.revision;
+    let rev = app.session().revision;
     let list: Value = match ctx.data(|d| d.get_temp::<(u64, Value)>(cache)) {
         Some((r, v)) if r == rev => v,
         _ => {
-            let v = app.session.execute("style.family.list", json!({})).unwrap_or(Value::Null);
+            let v = app.session_mut().execute("style.family.list", json!({})).unwrap_or(Value::Null);
             ctx.data_mut(|d| d.insert_temp(cache, (rev, v.clone())));
             v
         }
@@ -1354,19 +1355,19 @@ pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: 
         let mut v: f64 = ctx.data(|d| d.get_temp(drag_id)).unwrap_or(size);
         let sr = Rect::from_min_size(pos2(x0, y + 20.0 * s), vec2(w.min(320.0 * s), 18.0 * s));
         let resp = ui.put(sr, egui::Slider::new(&mut v, 50.0..=250.0).suffix(" %").text(tr("Size")));
-        app.auto.add_response(&format!("motionLibrary.families.{name}.size"), &resp, &format!("{name} size"));
+        app.auto_mut().add_response(&format!("motionLibrary.families.{name}.size"), &resp, &format!("{name} size"));
         if resp.dragged() || resp.has_focus() {
             ctx.data_mut(|d| d.insert_temp(drag_id, v));
         }
         let commit = resp.drag_stopped() || (resp.changed() && !resp.dragged());
         if commit && (v - size).abs() > 1e-6 {
             ctx.data_mut(|d| d.remove::<f64>(drag_id));
-            match crate::menus::invoke(app, &ctx, "style.family.set", json!({"family": name, "size": v})) {
+            match app.invoke(&ctx, "style.family.set", json!({"family": name, "size": v})) {
                 Ok(r) => {
                     let n = r["layers"].as_u64().unwrap_or(0);
-                    app.toast = Some((format!("{n} {name} updated: size {v:.0} %"), ctx.input(|i| i.time)));
+                    app.toast(format!("{n} {name} updated: size {v:.0} %"), ctx.input(|i| i.time));
                 }
-                Err(e) => app.ui.status = e,
+                Err(e) => app.ui_mut().status = e,
             }
         } else if !resp.dragged() && !resp.has_focus() {
             ctx.data_mut(|d| d.remove::<f64>(drag_id));
@@ -1379,15 +1380,15 @@ pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: 
     let mut fname: String = ctx.data(|d| d.get_temp(name_id)).unwrap_or_else(|| "Captions".to_string());
     let fr = Rect::from_min_size(pos2(x0, y), vec2((w - 130.0 * s).max(60.0), 22.0 * s));
     let fresp = ui.put(fr, egui::TextEdit::singleline(&mut fname).hint_text(tr("Family name")));
-    app.auto.add_response("motionLibrary.families.name", &fresp, "Family name");
+    app.auto_mut().add_response("motionLibrary.families.name", &fresp, "Family name");
     ctx.data_mut(|d| d.insert_temp(name_id, fname.clone()));
     let b = Rect::from_min_size(pos2(fr.max.x + 8.0 * s, y), vec2(120.0 * s, 22.0 * s));
     if kit::button(app, ui, b, "motionLibrary.families.link", "Link selected", true) {
-        match crate::menus::invoke(app, &ctx, "style.family.link", json!({"family": fname.trim()})) {
+        match app.invoke(&ctx, "style.family.link", json!({"family": fname.trim()})) {
             Ok(r) => {
-                app.toast = Some((format!("Linked {} layer(s) to {}", r["linked"].as_u64().unwrap_or(0), fname.trim()), ctx.input(|i| i.time)));
+                app.toast(format!("Linked {} layer(s) to {}", r["linked"].as_u64().unwrap_or(0), fname.trim()), ctx.input(|i| i.time));
             }
-            Err(e) => app.ui.status = e,
+            Err(e) => app.ui_mut().status = e,
         }
     }
     text_animations(app, ui, &ctx, area, y + 40.0 * s, s);
@@ -1398,8 +1399,8 @@ pub fn families_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect, s: 
 /// (read from the card, nothing built in). A preset applies to the selected text layers
 /// (`text.apply`); "Save selected as preset" saves the selected workshop layer's effects and
 /// text animators as a preset card (`ml.saveTextPreset`, again = update).
-fn text_animations(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, top: f32, s: f32) {
-    let t = app.tokens;
+fn text_animations(app: &mut dyn TimelineHost, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, top: f32, s: f32) {
+    let t = app.tokens();
     let p = ui.painter().with_clip_rect(area);
     let x0 = area.min.x + 12.0 * s;
     let w = (area.width() - 24.0 * s).max(80.0);
@@ -1407,13 +1408,13 @@ fn text_animations(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Cont
     p.text(pos2(x0, y + 8.0 * s), Align2::LEFT_CENTER, tr("Text animations · Elias ▸ Text animations"), Tokens::semibold(12.5 * s), t.text);
     y += 26.0 * s;
     let cache = egui::Id::new("ml-text-presets-cache");
-    let rev = app.session.revision;
+    let rev = app.session().revision;
     let now = ctx.input(|i| i.time);
     // Read again when the project changes and every 10 s (a card saved meanwhile shows up).
     let list: Value = match ctx.data(|d| d.get_temp::<(u64, f64, Value)>(cache)) {
         Some((r, at, v)) if r == rev && now - at < 10.0 => v,
         _ => {
-            let v = app.session.execute("text.presetFamilies", json!({})).unwrap_or(Value::Null);
+            let v = app.session_mut().execute("text.presetFamilies", json!({})).unwrap_or(Value::Null);
             ctx.data_mut(|d| d.insert_temp(cache, (rev, now, v.clone())));
             v
         }
@@ -1468,20 +1469,22 @@ fn text_animations(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Cont
     if let Some(name) = apply {
         // On the selected text layers; text.apply's followUp (the glow style) runs too.
         match super::text_apply::run(app, ctx, json!({"preset": name})) {
-            Ok(_) => app.toast = Some((format!("{name} applied"), ctx.input(|i| i.time))),
-            Err(e) => app.ui.status = e,
+            Ok(_) => app.toast(format!("{name} applied"), ctx.input(|i| i.time)),
+            Err(e) => app.ui_mut().status = e,
         }
     }
     // Save the selected workshop layer as its preset.
     let b = Rect::from_min_size(pos2(x0, y + 4.0 * s), vec2(190.0 * s, 22.0 * s));
     if kit::button(app, ui, b, "motionLibrary.textAnimations.save", "Save selected as preset", false) {
-        let layer = app.session.state.selected_layers.first().map(|l| l.0);
+        let layer = app.session().state.selected_layers.first().map(|l| l.0);
         match layer {
-            Some(l) => match crate::menus::invoke(app, ctx, "ml.saveTextPreset", json!({"layer": l})) {
-                Ok(r) => app.ui.status = format!("Saving “{}” to Motion Library ▸ {}", r["saving"].as_str().unwrap_or(""), r["folder"].as_str().unwrap_or("")),
-                Err(e) => app.ui.status = e,
+            Some(l) => match app.invoke(ctx, "ml.saveTextPreset", json!({"layer": l})) {
+                Ok(r) => {
+                    app.ui_mut().status = format!("Saving “{}” to Motion Library ▸ {}", r["saving"].as_str().unwrap_or(""), r["folder"].as_str().unwrap_or(""))
+                }
+                Err(e) => app.ui_mut().status = e,
             },
-            None => app.ui.status = "Select the workshop layer to save (Creating Text Presets)".into(),
+            None => app.ui_mut().status = "Select the workshop layer to save (Creating Text Presets)".into(),
         }
     }
 }
