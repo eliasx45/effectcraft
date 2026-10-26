@@ -11,6 +11,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED2 | Graph Editor (+ id scopes, host fonts) | Draws against `TimelineHost` too; per-instance ids; `theme::install_panel_fonts` |
 | EMBED3 | Effect Controls (+ shortcuts, widget ids) | Draws against `TimelineHost`; `keys::forward_shortcuts` / `menus::shortcut_command`; scroll-bar and Tab-order ids scoped |
 | EMBED4 | Remaining Timeline features | Markers, quick row, waveforms, dialogs (as requests) and the eyedropper through the host; 6 minor sites left |
+| EMBED5 | Graph Editor keys and switch in a host | `panels::timeline::hosted`: Shift+F3 / F bound and run without the app; speed curves in the rows need nothing |
 
 ## The host interface (EMBED1)
 
@@ -143,6 +144,32 @@ TimelineHost`; its command dispatch goes through `TimelineHost::invoke`. The 4 e
 gets the Graph Editor in the Timeline. `graph::shown_props` is still called with the app from
 `inline::invoke` (dispatch glue). No statics.
 
+## Graph Editor and speed curves in a host (EMBED5)
+
+The Graph Editor and the speed curves in the property rows (footer ∿ toggle, `speed_rows.rs`)
+draw in any host since EMBED2; their edits (key drags, Bezier handles, `keys.setEase[Selected]`,
+`keys.transform`, the transform box) are engine commands pushed as Timeline actions and run through
+`TimelineHost::invoke`, with drags merged into one undo step (`merge` params, `__endMerge`). The
+Timeline header's Graph button flips `ui.timeline.graph_editor` itself. What a host lacked were the
+two UI-only commands behind its keys, which EffectCraft's `menus::invoke` runs and the engine
+doesn't know:
+
+| Command | Key | In a host |
+|---|---|---|
+| `timeline.graphEditor` (optional `value`) | Shift+F3 | `hosted::run` flips (or sets) `ui.timeline.graph_editor` |
+| `timeline.graph.fit` | F while the Graph Editor shows | `hosted::run` requests Fit All in the host's id scope; errors while it is closed |
+
+- `hosted::install(session)` adds just these to the session's bindable UI commands (a host's
+  session has none, so `forward_shortcuts` never found Shift+F3 or the Graph Editor's F). Call it
+  again whenever the host replaces its session; `hosted::installed(session)` says whether it is.
+- `hosted::run(host, ctx, id, params)` returns `None` for any other id. The default
+  `TimelineHost::invoke` calls it first; a host that overrides `invoke` calls it first too.
+  EffectCraft's own handlers (`menus/timeline.rs`) call the same code.
+- Graph type changes (`set_graph_type`) write `prefs.graph_type` through `Session::save_prefs`,
+  which is a no-op for a session without a config directory (FigCraft's).
+
+Test: `host::tests::the_graph_editor_opens_and_draws_in_a_host_without_the_app`.
+
 ## Effect Controls (EMBED3, done)
 
 Before: `effect_controls.rs` (1.7k lines) + `fx_editors.rs` (1.2k) + `camera_tracker_ui.rs`: ~220 app
@@ -185,6 +212,8 @@ All additive; nothing a host implements or calls was renamed or removed.
   (defaulted), `panels::timeline::keys::forward_shortcuts`, `menus::shortcut_command`;
   `effect_controls::show(&mut dyn TimelineHost, ui, rect)` (was `&mut EffectcraftApp`; the app still
   coerces).
+- EMBED5: `panels::timeline::hosted::{COMMANDS, install, installed, run}`; the default
+  `TimelineHost::invoke` runs `hosted::run` before the engine.
 - EMBED4: `TimelineHost::{request_dialog, waveform, pointer_color}` (defaulted: dialogs decline
   with a status message, waveforms are computed per context, no pointer colour);
   `panels::timeline::{DialogRequest, PointerColor}` (`DialogRequest` is `#[non_exhaustive]`: new

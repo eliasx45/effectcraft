@@ -16,6 +16,7 @@ use serde_json::json;
 
 mod beat;
 pub mod host;
+pub mod hosted;
 pub mod ids;
 mod inline;
 pub mod keys;

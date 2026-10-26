@@ -5,9 +5,10 @@
 //! theme tokens, command dispatch and a handful of app services (toasts, playback, scrubbing, the
 //! cache bar). EffectCraft's app implements it by forwarding to what it did before, so behaviour
 //! is unchanged; another egui app (FigCraft) can host the Timeline by implementing it over its own
-//! session. The remaining app-only parts (the Graph Editor drawn in the Timeline's place, the quick
-//! row, markers, dialogs…) go through [`TimelineHost::app`] and are skipped by a host without an
-//! EffectCraft app; `docs/embedding-panels.md` lists each one and how it will be resolved.
+//! session. The few app-only parts left (suggestions overlay, RAM chip, frozen-layer hint…) go
+//! through [`TimelineHost::app`] and are skipped by a host without an EffectCraft app;
+//! `docs/embedding-panels.md` lists each one. The Graph Editor draws in any host, and its UI-only
+//! commands run through [`super::hosted`].
 
 use effectcraft_engine::Session;
 use effectcraft_engine::project::ItemId;
@@ -62,8 +63,13 @@ pub trait TimelineHost {
         Some(egui::Id::new("effectcraft-hosted-timeline"))
     }
 
-    /// Runs a command by id the way a menu item would (UI commands included).
-    fn invoke(&mut self, _ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    /// Runs a command by id the way a menu item would (UI commands included). The default runs
+    /// the Timeline's own UI commands ([`super::hosted::run`]: Graph Editor switch and fit), then
+    /// the engine; a host overriding it calls `hosted::run` first.
+    fn invoke(&mut self, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+        if let Some(r) = super::hosted::run(self, ctx, id, &params) {
+            return r;
+        }
         self.session_mut().execute(id, params).map_err(|e| e.to_string())
     }
     /// Runs an engine command (errors go to the status line).
@@ -341,8 +347,12 @@ mod tests {
         fn parts(&mut self) -> TimelineParts<'_> {
             TimelineParts { session: &mut self.session, ui: &mut self.ui, auto: &mut self.auto, tokens: self.tokens }
         }
-        fn invoke(&mut self, _ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+        fn invoke(&mut self, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
             self.commands.push(id.to_string());
+            // As a host overriding `invoke` does (FigCraft): the Timeline's UI commands first.
+            if let Some(r) = super::super::hosted::run(self, ctx, id, &params) {
+                return r;
+            }
             self.session.execute(id, params).map_err(|e| e.to_string())
         }
         fn pointer_color(&mut self, _ctx: &egui::Context) -> Option<PointerColor> {
@@ -437,6 +447,52 @@ mod tests {
         let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
         assert_eq!(ran, ["keys.easyEase"]);
         assert_eq!(host.commands, ["keys.easyEase"]);
+    }
+
+    /// EMBED5: the Graph Editor in a host without the app: Shift+F3 opens it (once the host
+    /// installed the Timeline's UI commands), it draws the selected property's keys, and F fits
+    /// its graphs.
+    #[test]
+    fn the_graph_editor_opens_and_draws_in_a_host_without_the_app() {
+        let mut host = host();
+        assert!(!super::super::hosted::installed(&host.session));
+        super::super::hosted::install(&mut host.session);
+        assert!(super::super::hosted::installed(&host.session));
+        let comp = host.session.active_comp().unwrap().clone();
+        let bx = comp.layers.iter().find(|l| l.name == "Box").unwrap();
+        let (lid, uid) = (bx.id.0, bx.props.prop("transform/opacity").unwrap().uid);
+        for (t, v) in [(0.0, 0.0), (2.0, 100.0)] {
+            host.session.execute("prop.addKey", json!({"layer": lid, "prop": uid, "time": t, "value": v})).unwrap();
+        }
+        host.session.execute("layer.select", json!({"layers": [lid]})).unwrap();
+        host.session.execute("prop.select", json!({"layer": lid, "prop": uid})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_panel_fonts(&ctx);
+        let screen = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 400.0))), ..Default::default() };
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        let mut ran = vec![];
+        let mut input = screen();
+        input.events = vec![key(egui::Key::F3, egui::Modifiers::SHIFT)];
+        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        assert_eq!(ran, ["timeline.graphEditor"]);
+        assert!(host.ui.timeline.graph_editor, "Shift+F3 opened the Graph Editor");
+        for _ in 0..3 {
+            frame(&ctx, &mut host, screen());
+        }
+        assert!(host.auto.find_current("timeline.graph").is_some(), "the graph plot drew");
+        assert!(!host.auto.query_current("timeline.graph.key.").is_empty(), "the opacity keys drew in the graph");
+        let mut input = screen();
+        input.events = vec![key(egui::Key::F, egui::Modifiers::NONE)];
+        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        assert_eq!(ran, ["timeline.graph.fit"]);
+        {
+            let _ids = super::super::ids::IdScope::enter(host.id_scope());
+            assert!(crate::panels::graph::take_fit_all_request(&ctx), "F asked the Graph Editor to fit, in the host's id scope");
+        }
+        // Closed again, F fits nothing.
+        assert_eq!(super::super::hosted::run(&mut host, &ctx, "timeline.graphEditor", &json!({"value": false})), Some(Ok(json!({"graphEditor": false}))));
+        assert!(super::super::hosted::run(&mut host, &ctx, "timeline.graph.fit", &json!({})).is_some_and(|r| r.is_err()));
+        assert!(super::super::hosted::run(&mut host, &ctx, "layer.select", &json!({})).is_none());
     }
 
     /// EMBED4: a hosted eyedropper takes the colour the host reports under the pointer, and the
