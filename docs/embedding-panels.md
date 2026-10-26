@@ -15,6 +15,7 @@ hosting it and how each blocker is (or will be) resolved.
 | EMBED6 | Panels in a scaled layer | `layer_pointer::Lp`: raw pointer reads, drag overlays and popup lists in the layer's own coordinates (a host may draw the Timeline in a layer it transforms, e.g. scaled on a canvas) |
 | EMBED8 | Composition viewer tools | `panels::viewer_hosted`: Rotation, Pan Behind, shape/mask tools, Pen (masks and shape paths, vertex tools), path vertex/tangent drags and the Type tool over a comp picture the host draws, with their keys |
 | EMBED9 | Project panel | Draws against `TimelineHost`; New Comp and the footage menu go through the host when there is no app |
+| EMBED10 | Pre-compose, Interpret Footage dialogs | `precomp::{draft_for, draw}` and `forms::{build_form, draw_form}`: a host shows EffectCraft's own dialogs from its session and runs their command |
 
 ## The host interface (EMBED1)
 
@@ -282,3 +283,16 @@ All additive; nothing a host implements or calls was renamed or removed.
   project's item with the same id and revision never shows a stale thumbnail). Every command
   (rename, folders, labels, moves, `comp.open`, `file.import` on a double-click…) runs through
   `TimelineHost::invoke`. Test: `panels::project::tests::the_project_panel_draws_in_a_host_without_the_app`.
+- EMBED10: dialogs a host shows itself (FigCraft's cards). `panels::precomp::{draft_for(session,
+  params), draw(ui, draft, tokens, registry) -> Answer, Answer}`: the Pre-compose dialog's starting
+  draft and contents outside EffectCraft's modal (`open` and `dialog` use them; OK runs
+  `layer.precompose` with `draft_params`). `panels::forms::{build_form(session, id, params) ->
+  Option<Built>, Built, draw_form(ui, form, tokens, max_height, regs, browse)}`: any parameter form
+  (Interpret Footage included) from the session alone and its fields and OK / Cancel in any `ui`
+  (`open_form` and `show_form` use them; OK runs `form.command` with `form.params()`). Interpret
+  Footage's form now reads the item it is given (`item` / `items`) before the Project selection,
+  as the command itself does. The Project panel's footage menu asks a host's `menu_entry` for
+  `file.interpretFootage` and `file.replaceFootage` too (a host that hosts their dialogs offers
+  them). Replace Footage needs no dialog code: a host picks the file and runs `file.replaceFootage
+  {item, path}`. Tests: `precomp::tests::a_host_gets_the_precompose_draft_from_its_session`,
+  `forms::tests::interpret_footage_builds_from_the_session_for_a_host`.

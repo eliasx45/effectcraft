@@ -69,22 +69,23 @@ pub struct PrecomposeDraft {
     pub open: bool,
 }
 
-/// Open the Pre-compose dialog for the selected (or given) layers.
-pub fn open(app: &mut EffectcraftApp, p: &serde_json::Value) -> Result<(), String> {
-    let s = &app.session;
+/// The Pre-compose dialog's starting values for the selected (or given, `layers`) layers of the
+/// active comp: what EffectCraft's dialog opens with. EMBED10: hosts (FigCraft's cards) open the
+/// same dialog from their own session.
+pub fn draft_for(s: &effectcraft_engine::Session, p: &serde_json::Value) -> Result<PrecomposeDraft, String> {
     let c = s.active_comp().ok_or("no composition is open")?;
     let layers: Vec<u64> = match p.get("layers").and_then(|v| v.as_array()) {
         Some(a) => a.iter().filter_map(|v| v.as_u64()).collect(),
         None => s.state.selected_layers.iter().map(|l| l.0).collect(),
     };
-    if layers.is_empty() {
+    let Some(first_id) = layers.first().copied() else {
         return Err("select the layers to pre-compose".into());
-    }
-    let first = c.layer(effectcraft_engine::project::LayerId(layers[0]));
+    };
+    let first = c.layer(effectcraft_engine::project::LayerId(first_id));
     let can_leave = layers.len() == 1 && first.is_some_and(|l| l.source.item().is_some());
     let n = s.project.comps().count() + 1;
     let base = if layers.len() == 1 { first.map(|l| format!("{} Comp 1", l.name)) } else { None };
-    app.dialog_state.precompose = PrecomposeDraft {
+    Ok(PrecomposeDraft {
         layers,
         name: base.unwrap_or_else(|| format!("Pre-comp {n}")),
         leave: false,
@@ -92,7 +93,12 @@ pub fn open(app: &mut EffectcraftApp, p: &serde_json::Value) -> Result<(), Strin
         layer_name: first.map(|l| l.name.clone()).unwrap_or_default(),
         adjust: false,
         open: true,
-    };
+    })
+}
+
+/// Open the Pre-compose dialog for the selected (or given) layers.
+pub fn open(app: &mut EffectcraftApp, p: &serde_json::Value) -> Result<(), String> {
+    app.dialog_state.precompose = draft_for(&app.session, p)?;
     app.dialog = Some(Dialog::Precompose);
     Ok(())
 }
@@ -108,55 +114,72 @@ pub fn draft_params(d: &PrecomposeDraft) -> serde_json::Value {
     })
 }
 
+/// What a press in the Pre-compose dialog decided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Answer {
+    pub ok: bool,
+    pub cancel: bool,
+}
+
+/// The Pre-compose dialog's contents (name, Leave / Move all attributes, Adjust duration, Open New
+/// Composition, OK / Cancel) in any `ui`: EffectCraft's modal, or a host's window (EMBED10).
+/// Enter is the caller's (EffectCraft: `dialogs::ui_enter`).
+pub fn draw(ui: &mut egui::Ui, d: &mut PrecomposeDraft, t: &Tokens, auto: &mut crate::automation::Registry) -> Answer {
+    let mut a = Answer::default();
+    ui.horizontal(|ui| {
+        ui.label(tr("New composition name:"));
+        let r = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(260.0));
+        crate::widgets::focus_on_open(ui.ctx(), &r, &d.name);
+        auto.add("dialog.precompose.name", r.rect, "New composition name");
+    });
+    ui.add_space(10.0);
+    ui.add_enabled_ui(d.can_leave, |ui| {
+        let r = ui.radio_value(&mut d.leave, true, tr_args("Leave all attributes in \"{}\"", &[&d.layer_name]));
+        auto.add("dialog.precompose.leave", r.rect, "Leave all attributes");
+        ui.label(
+            egui::RichText::new(format!(
+                "Use this option to create a new intermediate composition with only \"{}\" in it. The new composition will become the source to the current layer.",
+                d.layer_name
+            ))
+            .color(t.text_dim)
+            .size(11.0),
+        );
+    });
+    ui.add_space(6.0);
+    let r = ui.radio_value(&mut d.leave, false, "Move all attributes into the new composition");
+    auto.add("dialog.precompose.move", r.rect, "Move all attributes");
+    ui.label(
+        egui::RichText::new(tr("Use this option to place the currently selected layers together into a new intermediate composition."))
+            .color(t.text_dim)
+            .size(11.0),
+    );
+    ui.add_space(4.0);
+    ui.add_enabled_ui(!d.leave, |ui| {
+        let r = ui.checkbox(&mut d.adjust, tr("Adjust composition duration to the time span of the selected layers"));
+        auto.add("dialog.precompose.adjust", r.rect, "Adjust composition duration");
+    });
+    ui.add_space(8.0);
+    let r = ui.checkbox(&mut d.open, tr("Open New Composition"));
+    auto.add("dialog.precompose.open", r.rect, "Open New Composition");
+    ui.add_space(14.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
+        auto.add("dialog.precompose.ok", r.rect, "OK");
+        a.ok = r.clicked();
+        let r = ui.button(tr("Cancel"));
+        auto.add("dialog.precompose.cancel", r.rect, "Cancel");
+        a.cancel = r.clicked();
+    });
+    a
+}
+
 pub fn dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut d = app.dialog_state.precompose.clone();
-    let (mut ok, mut cancel) = (false, false);
+    let mut a = Answer::default();
     super::dialogs::modal(ctx, "Pre-compose", vec2(520.0, 360.0), t, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(tr("New composition name:"));
-            let r = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(260.0));
-            crate::widgets::focus_on_open(ui.ctx(), &r, &d.name);
-            app.auto.add("dialog.precompose.name", r.rect, "New composition name");
-        });
-        ui.add_space(10.0);
-        ui.add_enabled_ui(d.can_leave, |ui| {
-            let r = ui.radio_value(&mut d.leave, true, tr_args("Leave all attributes in \"{}\"", &[&d.layer_name]));
-            app.auto.add("dialog.precompose.leave", r.rect, "Leave all attributes");
-            ui.label(
-                egui::RichText::new(format!(
-                    "Use this option to create a new intermediate composition with only \"{}\" in it. The new composition will become the source to the current layer.",
-                    d.layer_name
-                ))
-                .color(t.text_dim)
-                .size(11.0),
-            );
-        });
-        ui.add_space(6.0);
-        let r = ui.radio_value(&mut d.leave, false, "Move all attributes into the new composition");
-        app.auto.add("dialog.precompose.move", r.rect, "Move all attributes");
-        ui.label(
-            egui::RichText::new(tr("Use this option to place the currently selected layers together into a new intermediate composition."))
-                .color(t.text_dim)
-                .size(11.0),
-        );
-        ui.add_space(4.0);
-        ui.add_enabled_ui(!d.leave, |ui| {
-            let r = ui.checkbox(&mut d.adjust, tr("Adjust composition duration to the time span of the selected layers"));
-            app.auto.add("dialog.precompose.adjust", r.rect, "Adjust composition duration");
-        });
-        ui.add_space(8.0);
-        let r = ui.checkbox(&mut d.open, tr("Open New Composition"));
-        app.auto.add("dialog.precompose.open", r.rect, "Open New Composition");
-        ui.add_space(14.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
-            app.auto.add("dialog.precompose.ok", r.rect, "OK");
-            ok = r.clicked();
-            let r = ui.button(tr("Cancel"));
-            app.auto.add("dialog.precompose.cancel", r.rect, "Cancel");
-            cancel = r.clicked();
-        });
+        a = draw(ui, &mut d, t, &mut app.auto);
     });
+    let (ok, mut cancel) = (a.ok, a.cancel);
     app.dialog_state.precompose = d.clone();
     if ok || super::dialogs::ui_enter(ctx) {
         if let Err(e) = app.session.execute("layer.precompose", draft_params(&d)) {
@@ -353,5 +376,22 @@ mod tests {
         d.leave = false;
         assert_eq!(draft_params(d)["mode"], "move");
         assert_eq!(draft_params(d)["adjustDuration"], true);
+    }
+
+    /// EMBED10: a host gets the same starting draft from its session, and an error to show
+    /// without a selection.
+    #[test]
+    fn a_host_gets_the_precompose_draft_from_its_session() {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "Main", "width": 200, "height": 100, "frameRate": 25, "duration": 2})).unwrap();
+        let a = s.execute("layer.newSolid", json!({"color": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+        let b = s.execute("layer.newSolid", json!({"color": "#00ff00"})).unwrap()["layer"].as_u64().unwrap();
+        s.state.selected_layers.clear();
+        assert!(draft_for(&s, &json!({})).is_err());
+        let d = draft_for(&s, &json!({"layers": [a, b]})).unwrap();
+        assert_eq!((d.name.as_str(), d.can_leave, d.open), ("Pre-comp 2", false, true));
+        let d = draft_for(&s, &json!({"layers": [a]})).unwrap();
+        assert!(d.can_leave && d.name.ends_with(" Comp 1"));
+        assert!(draft_for(&s, &json!({"layers": "junk"})).is_err());
     }
 }

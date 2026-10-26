@@ -206,9 +206,34 @@ fn value_fields(name: &str, v: &effectcraft_engine::keyframe::Value) -> Option<V
     })
 }
 
+/// What a dialog command invoked without its parameters opens ([`build_form`]).
+#[derive(Clone, Debug)]
+pub enum Built {
+    Form(Form),
+    /// A message box (title, body).
+    Info(String, String),
+}
+
 /// If `id` is a dialog command invoked without its parameters, open its form and return true.
 pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
-    let s = &app.session;
+    match build_form(&app.session, id, p) {
+        Some(Built::Form(f)) => {
+            app.dialog_state.form = f;
+            app.dialog = Some(Dialog::Form);
+            true
+        }
+        Some(Built::Info(title, body)) => {
+            info(app, &title, &body);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The form (or message) dialog command `id` opens when invoked with `p` lacking its parameters,
+/// from the session alone; `None` when it runs as it is. EMBED10: a host (FigCraft's cards) shows
+/// the same form ([`draw_form`]) and runs `form.command` with [`Form::params`].
+pub fn build_form(s: &effectcraft_engine::Session, id: &str, p: &Value) -> Option<Built> {
     let comp = s.active_comp();
     let layer = comp.and_then(|c| s.state.selected_layers.first().and_then(|l| c.layer(*l)));
     let t = s.time();
@@ -269,16 +294,16 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
             let l = p.get("layer").and_then(Value::as_u64).and_then(|l| comp?.layer(effectcraft_engine::project::LayerId(l)));
             let pr = l.and_then(|l| l.props.find(p.get("prop").and_then(Value::as_u64)?));
             let t = p.get("time").and_then(Value::as_f64).map(effectcraft_engine::time::Tick::from_seconds_f64);
-            let Some((pr, t)) = pr.zip(t) else { return false };
-            let Some(k) = pr.keys.iter().min_by_key(|k| (k.time.0 - t.0).abs()) else { return false };
-            let Some(fields) = value_fields(&pr.name, &k.value) else { return false };
+            let (pr, t) = pr.zip(t)?;
+            let k = pr.keys.iter().min_by_key(|k| (k.time.0 - t.0).abs())?;
+            let fields = value_fields(&pr.name, &k.value)?;
             (pr.name.clone(), fields)
         }
         // A property's context menu ▸ Edit Value…: its value at the current time.
         "prop.set" if !has(p, &["value"]) => {
             let l = p.get("layer").and_then(Value::as_u64).and_then(|l| comp?.layer(effectcraft_engine::project::LayerId(l)));
-            let Some((l, pr)) = l.and_then(|l| Some((l, l.props.find(p.get("prop").and_then(Value::as_u64)?)?))) else { return false };
-            let Some(fields) = value_fields(&pr.name, &pr.value_at(l.layer_time(t))) else { return false };
+            let (l, pr) = l.and_then(|l| Some((l, l.props.find(p.get("prop").and_then(Value::as_u64)?)?)))?;
+            let fields = value_fields(&pr.name, &pr.value_at(l.layer_time(t)))?;
             (pr.name.clone(), fields)
         }
         "layer.setTransform" if !has(p, &["value"]) => {
@@ -425,12 +450,19 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
             if !has(p, &["frameRate", "alpha", "loop", "pixelAspect", "colorProfile", "fields", "invertAlpha", "matteColor", "linearLight", "startFrame"]) =>
         {
             let proxy = id == "file.interpretProxy";
-            let f = s.state.project_selection.first().and_then(|i| s.project.item(*i)).and_then(|it| match (&it.kind, &it.proxy) {
+            // The item the command is given (`items` / `item`), else the Project panel's selection.
+            let given = match p.get("items").or(p.get("item")) {
+                Some(Value::Array(a)) => a.first().and_then(Value::as_u64),
+                Some(v) => v.as_u64(),
+                None => None,
+            }
+            .map(effectcraft_engine::project::ItemId);
+            let f = given.or_else(|| s.state.project_selection.first().copied()).and_then(|i| s.project.item(i)).and_then(|it| match (&it.kind, &it.proxy) {
                 (_, Some(px)) if proxy => Some(px.footage.clone()),
                 (effectcraft_engine::project::ItemKind::Footage(f), _) if !proxy => Some(f.clone()),
                 _ => None,
             });
-            let Some(f) = f else { return false };
+            let f = f?;
             let hex = |c: [f32; 3]| format!("#{:02x}{:02x}{:02x}", (c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8);
             let mut fields = vec![
                 // Main Options ▸ Alpha.
@@ -645,8 +677,10 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                 .map(|i| (i.name.clone(), json!(i.id.0)))
                 .collect();
             if data.is_empty() {
-                info(app, "Align Video to Data", "Import a data file (JSON, CSV or TSV with a time column) first: File ▸ Import.");
-                return true;
+                return Some(Built::Info(
+                    "Align Video to Data".into(),
+                    "Import a data file (JSON, CSV or TSV with a time column) first: File ▸ Import.".into(),
+                ));
             }
             let opts: Vec<(&str, Value)> = data.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
             (
@@ -760,10 +794,9 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                 ],
             )
         }
-        _ => return false,
+        _ => return None,
     };
-    form(app, &title, id, base, fields);
-    true
+    Some(Built::Form(Form { title, command: id.into(), base, fields }))
 }
 
 /// The label and control rows of a form: the part of [`show_form`] that scrolls.
@@ -847,6 +880,37 @@ fn form_grid(ui: &mut egui::Ui, f: &mut Form, regs: &mut Vec<(String, egui::Rect
     });
 }
 
+/// A form's fields (scrolling within `max_height`) and OK / Cancel in any `ui`: EffectCraft's
+/// modal ([`show_form`]) or a host's window (EMBED10). Returns (OK, Cancel) clicked; a Browse…
+/// press sets `browse` to the field's index; `regs` gets each control's automation id and rect.
+pub fn draw_form(
+    ui: &mut egui::Ui,
+    f: &mut Form,
+    t: &Tokens,
+    max_height: f32,
+    regs: &mut Vec<(String, egui::Rect, String)>,
+    browse: &mut Option<usize>,
+) -> (bool, bool) {
+    let (mut ok, mut close, mut focused) = (false, false, false);
+    egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
+        form_grid(ui, f, regs, browse, &mut focused);
+    });
+    ui.add_space(14.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let b = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
+        regs.push(("form.ok".into(), b.rect, "OK".into()));
+        if b.clicked() {
+            ok = true;
+        }
+        let c = ui.button(tr("Cancel"));
+        regs.push(("form.cancel".into(), c.rect, "Cancel".into()));
+        if c.clicked() {
+            close = true;
+        }
+    });
+    (ok, close)
+}
+
 pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut f = app.dialog_state.form.clone();
     let (mut ok, mut close) = (false, false);
@@ -862,28 +926,12 @@ pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let h = 120.0 + rows;
     let mut regs: Vec<(String, egui::Rect, String)> = vec![];
     let mut browse: Option<usize> = None;
-    let mut focused = false;
     // Wide enough for a label column and a 240 px popup. Only the fields scroll, and only
     // vertically: OK and Cancel sit under the scroll area, so they are always in view (#978).
     super::dialogs::modal_fit(ctx, &f.title.clone(), vec2(480.0, h), t, |ui, _| {
         let footer = 14.0 + ui.spacing().interact_size.y + 2.0 * ui.spacing().item_spacing.y;
         let max_height = (super::dialogs::modal_space(ctx).y - 84.0 - footer).max(40.0);
-        egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
-            form_grid(ui, &mut f, &mut regs, &mut browse, &mut focused);
-        });
-        ui.add_space(14.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let b = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
-            regs.push(("form.ok".into(), b.rect, "OK".into()));
-            if b.clicked() {
-                ok = true;
-            }
-            let c = ui.button(tr("Cancel"));
-            regs.push(("form.cancel".into(), c.rect, "Cancel".into()));
-            if c.clicked() {
-                close = true;
-            }
-        });
+        (ok, close) = draw_form(ui, &mut f, t, max_height, &mut regs, &mut browse);
     });
     for (id, r, l) in regs {
         app.auto.add(&id, r, &l);
@@ -975,6 +1023,24 @@ pub fn show_view_options(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Toke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EMBED10: a host builds Interpret Footage from its session alone, for the item it names (or
+    /// the Project selection); with its settings given the command runs as it is.
+    #[test]
+    fn interpret_footage_builds_from_the_session_for_a_host() {
+        let mut s = effectcraft_engine::Session::default();
+        let a = s.execute("file.importPlaceholder", json!({"name": "A"})).unwrap()["item"].as_u64().unwrap();
+        let b = s.execute("file.importPlaceholder", json!({"name": "B"})).unwrap()["item"].as_u64().unwrap();
+        s.state.project_selection = vec![effectcraft_engine::project::ItemId(a)];
+        let Some(Built::Form(f)) = build_form(&s, "file.interpretFootage", &json!({"item": b})) else { panic!("no form") };
+        assert_eq!((f.title.as_str(), f.command.as_str()), ("Interpret Footage", "file.interpretFootage"));
+        assert_eq!(f.params()["item"], json!(b), "the form runs on the item it was built for");
+        assert!(matches!(build_form(&s, "file.interpretFootage", &json!({})), Some(Built::Form(_))));
+        assert!(build_form(&s, "file.interpretFootage", &json!({"frameRate": 24})).is_none());
+        s.state.project_selection.clear();
+        assert!(build_form(&s, "file.interpretFootage", &json!({})).is_none(), "no footage: nothing to interpret");
+        assert!(build_form(&s, "file.interpretFootage", &json!({"item": "junk", "items": [-1]})).is_none());
+    }
 
     #[test]
     fn form_params_build_arrays_and_choices() {

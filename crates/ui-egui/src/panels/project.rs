@@ -945,10 +945,10 @@ pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) {
                         crate::menus::entry_for(a, ui, "file.reloadFootage", &mut chosen);
                         crate::menus::entry_for(a, ui, "file.revealInFinder", &mut chosen);
                     }
-                    // EMBED9: another host offers the commands it can run without EffectCraft's
-                    // dialogs ([`TimelineHost::menu_entry`]).
+                    // EMBED9: another host offers the commands it can run ([`TimelineHost::menu_entry`]);
+                    // EMBED10: Interpret / Replace Footage when it hosts their dialogs.
                     None => {
-                        for command in ["file.reloadFootage", "file.revealInFinder"] {
+                        for command in ["file.interpretFootage", "file.replaceFootage", "file.reloadFootage", "file.revealInFinder"] {
                             app.menu_entry(ui, command, &mut chosen);
                         }
                     }
