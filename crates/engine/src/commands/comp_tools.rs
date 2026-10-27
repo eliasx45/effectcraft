@@ -346,42 +346,156 @@ fn deep_duplicate(s: &mut Session, p: &Value) -> Result<Value> {
             let nid = proj.add_item(&name, it.label, it.parent, it.kind.clone());
             items.insert(*id, nid);
         }
-        for nid in items.values() {
-            let mut next = proj.next_id;
-            let Some(ItemKind::Comp(comp)) = proj.item_mut(*nid).map(|i| &mut i.kind) else { continue };
-            let comp = std::sync::Arc::make_mut(comp);
-            let mut map: BTreeMap<LayerId, LayerId> = BTreeMap::new();
-            for l in comp.layers.iter_mut() {
-                let old = l.id;
-                super::edit::reid(l, &mut next);
-                map.insert(old, l.id);
-                if let LayerSource::Comp { item } = &mut l.source
-                    && let Some(n) = items.get(item)
-                {
-                    *item = *n;
-                }
-                l.props.walk_mut(&mut |pr| {
-                    if let Some(e) = &mut pr.expr {
-                        let renamed = rename_comp_refs(&e.text, &names);
-                        if renamed != e.text {
-                            *e = Expression { text: renamed, enabled: e.enabled };
-                        }
-                    }
-                });
-            }
-            for l in comp.layers.iter_mut() {
-                l.parent = l.parent.and_then(|p| map.get(&p).copied());
-                if let Some(m) = &mut l.track_matte {
-                    m.layer = map.get(&m.layer).copied().unwrap_or(m.layer);
-                }
-            }
-            proj.next_id = next;
-        }
+        relink_copies(proj, &items, &names);
         let made: Vec<ItemId> = graph.iter().filter_map(|i| items.get(i).copied()).collect();
         st.project_selection = made.first().copied().into_iter().collect();
         Ok(made)
     })?;
     Ok(json!({"comp": created.first().map(|i| i.0), "items": created.iter().map(|i| i.0).collect::<Vec<_>>()}))
+}
+
+/// The copied comps (`items`: original → copy) get fresh layer ids, their precomp layers use the
+/// other copies, and literal `comp("…")` expression references follow `names` (old → new).
+fn relink_copies(proj: &mut effectcraft_project::Project, items: &BTreeMap<ItemId, ItemId>, names: &BTreeMap<String, String>) {
+    for nid in items.values() {
+        let mut next = proj.next_id;
+        let Some(ItemKind::Comp(comp)) = proj.item_mut(*nid).map(|i| &mut i.kind) else { continue };
+        let comp = std::sync::Arc::make_mut(comp);
+        let mut map: BTreeMap<LayerId, LayerId> = BTreeMap::new();
+        for l in comp.layers.iter_mut() {
+            let old = l.id;
+            super::edit::reid(l, &mut next);
+            map.insert(old, l.id);
+            if let LayerSource::Comp { item } = &mut l.source
+                && let Some(n) = items.get(item)
+            {
+                *item = *n;
+            }
+            l.props.walk_mut(&mut |pr| {
+                if let Some(e) = &mut pr.expr {
+                    let renamed = rename_comp_refs(&e.text, names);
+                    if renamed != e.text {
+                        *e = Expression { text: renamed, enabled: e.enabled };
+                    }
+                }
+            });
+        }
+        for l in comp.layers.iter_mut() {
+            l.parent = l.parent.and_then(|p| map.get(&p).copied());
+            if let Some(m) = &mut l.track_matte {
+                m.layer = map.get(&m.layer).copied().unwrap_or(m.layer);
+            }
+        }
+        proj.next_id = next;
+    }
+}
+
+/// A comp reference in `through`: an id, or a composition name (exact), a name looked up first
+/// among the precomps `parent` uses (two comps may share a name elsewhere in the project).
+fn chain_comp(s: &Session, parent: ItemId, v: &Value) -> Option<ItemId> {
+    match v {
+        Value::Number(n) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()),
+        Value::String(name) => {
+            let used = s.project.comp(parent).into_iter().flat_map(|c| c.layers.iter()).find_map(|l| match &l.source {
+                LayerSource::Comp { item } if s.project.item(*item).is_some_and(|i| &i.name == name) => Some(*item),
+                _ => None,
+            });
+            used.or_else(|| s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id))
+        }
+        _ => None,
+    }
+}
+
+/// Duplicate Chain (`comp.duplicateDeep`): copy `comp` and only the precomps on the path down to
+/// the last comp of `through`, each copy's precomp layers re-pointed at the next copy, so a
+/// variant edits copies the original never uses. Sibling precomps off the path stay shared.
+/// Ghostex's "3 variants" turn action uses it (S3 02 › Cards › Card 1 → S3 02 · v2 › Cards · v2 ›
+/// Card 1 · v2).
+fn duplicate_chain(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "comp.duplicateDeep";
+    let root = super::comp_id(s, p)?;
+    let suffix = str_p(p, "suffix").unwrap_or(" copy").to_string();
+    if suffix.trim().is_empty() {
+        return Err(bad(C, "`suffix` must not be empty: the copies need their own names"));
+    }
+    let mut chain = vec![root];
+    for v in p.get("through").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+        if chain.len() > MAX_DEPTH {
+            return Err(bad(C, "the chain is too deep"));
+        }
+        let last = chain.last().copied().unwrap_or(root);
+        let id = chain_comp(s, last, v).ok_or_else(|| bad(C, format!("no composition {v} in `through`")))?;
+        let Some(parent) = s.project.comp(last) else {
+            return Err(bad(C, "a composition vanished"));
+        };
+        if !parent.layers.iter().any(|l| matches!(&l.source, LayerSource::Comp { item } if *item == id)) {
+            let pname = chain.last().and_then(|c| s.project.item(*c)).map(|i| i.name.clone()).unwrap_or_default();
+            let cname = s.project.item(id).map(|i| i.name.clone()).unwrap_or_default();
+            return Err(bad(C, format!("\"{cname}\" is not a precomp layer's source in \"{pname}\": `through` must go down the nesting, one comp per level")));
+        }
+        if chain.contains(&id) {
+            return Err(bad(C, "`through` loops back to a composition already on the chain"));
+        }
+        chain.push(id);
+    }
+    // `folder`: an existing folder (id or name) or a new one by that name beside the root.
+    let (folder, new_folder_name) = match p.get("folder") {
+        None | Some(Value::Null) => (None, None),
+        Some(Value::Number(n)) => {
+            let id = n.as_u64().map(ItemId).filter(|i| s.project.item(*i).is_some_and(|x| x.is_folder()));
+            (Some(id.ok_or_else(|| bad(C, "`folder` is not a folder"))?), None)
+        }
+        Some(Value::String(name)) => match s.project.folder_named(name) {
+            Some(id) => (Some(id), None),
+            None => (None, Some(name.clone())),
+        },
+        Some(_) => return Err(bad(C, "`folder` is a folder id or name")),
+    };
+    let root_parent = s.project.item(root).and_then(|i| i.parent);
+    let (copies, names, made_folder) = s.edit("Duplicate Chain", None, |proj, st| {
+        let folder = match &new_folder_name {
+            Some(name) => Some(proj.add_item(name, Label::Yellow, root_parent, ItemKind::Folder)),
+            None => folder,
+        };
+        let mut items: BTreeMap<ItemId, ItemId> = BTreeMap::new();
+        let mut names: BTreeMap<String, String> = BTreeMap::new();
+        for id in &chain {
+            let it = proj.item(*id).ok_or_else(|| bad(C, "a composition vanished"))?.clone();
+            let name = proj.unique_item_name(&format!("{}{suffix}", it.name), |_| false);
+            names.insert(it.name.clone(), name.clone());
+            let nid = proj.add_item(&name, it.label, folder.or(it.parent), it.kind.clone());
+            items.insert(*id, nid);
+        }
+        relink_copies(proj, &items, &names);
+        st.project_selection = items.get(&root).copied().into_iter().collect();
+        Ok((items, names, new_folder_name.as_ref().and(folder)))
+    })?;
+    let ids: BTreeMap<String, u64> = copies.iter().map(|(a, b)| (a.0.to_string(), b.0)).collect();
+    let steps: Vec<Value> = chain
+        .iter()
+        .filter_map(|old| {
+            let new = copies.get(old)?;
+            let from = s.project.item(*old)?.name.clone();
+            Some(json!({"from": old.0, "fromName": from, "to": new.0, "name": names.get(&from).cloned().unwrap_or_default()}))
+        })
+        .collect();
+    // The precomp layers re-pointed at a copy, per copied parent.
+    let mut repointed = vec![];
+    for (k, old) in chain.iter().enumerate().skip(1) {
+        let (Some(parent), Some(child)) = (chain.get(k - 1).and_then(|c| copies.get(c)), copies.get(old)) else { continue };
+        if let Some(c) = s.project.comp(*parent) {
+            for l in c.layers.iter().filter(|l| matches!(&l.source, LayerSource::Comp { item } if item == child)) {
+                repointed.push(json!({"comp": parent.0, "layer": l.id.0, "item": child.0}));
+            }
+        }
+    }
+    Ok(json!({
+        "comp": copies.get(&root).map(|i| i.0),
+        "chain": steps,
+        "items": ids,
+        "layers": repointed,
+        "folder": made_folder.map(|f| f.0),
+    }))
 }
 
 /// A mask path's bounds (vertices and tangent handles) in layer space.
@@ -629,6 +743,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{comp? (default: selected or open comp)} — copy the comp and every comp nested in it, the copies using each other (literal comp(\"…\") expression references follow) → {comp, items}",
             has_comp,
             deep_duplicate
+        ),
+        cmd!(
+            "comp.duplicateDeep",
+            "Duplicate Chain",
+            [],
+            None,
+            "{comp? (default: the open comp), through?: [comp id|name, …] (the precomps down to the target, one per level, each a precomp layer's source in the one before), suffix? (default \" copy\", e.g. \" · v2\"), folder?: id|name (a name that is no folder yet makes one beside the comp)} — copy the comp and only the comps on that path, each copy's precomp layers re-pointed at the next copy; precomps off the path stay shared → {comp, chain: [{from, fromName, to, name}], items: {old: new}, layers: [{comp, layer, item}], folder}",
+            has_comp,
+            duplicate_chain
         ),
         cmd!(
             "layer.splitMasks",

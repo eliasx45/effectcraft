@@ -138,3 +138,82 @@ fn gradient_lock_keeps_the_gradient_on_its_rectangle() {
     let err = s.execute("shape.gradientLock", json!({"layers": ids})).unwrap_err().to_string();
     assert!(err.contains("not a shape layer"), "{err}");
 }
+
+/// Comp ids a comp's precomp layers use, top first.
+fn precomps_of(s: &Session, comp: u64) -> Vec<u64> {
+    s.project
+        .comp(effectcraft_project::ItemId(comp))
+        .map(|c| c.layers.iter().filter_map(|l| if let LayerSource::Comp { item } = &l.source { Some(item.0) } else { None }).collect())
+        .unwrap_or_default()
+}
+
+fn item_name(s: &Session, id: u64) -> String {
+    s.project.item(effectcraft_project::ItemId(id)).map(|i| i.name.clone()).unwrap_or_default()
+}
+
+/// Main › Scene › Cards › Card 1, with a sibling "Shared" precomp in Scene used twice and also in
+/// Main. Ghostex's variants: only the path down to the changed comp is copied.
+#[test]
+fn duplicate_chain_copies_only_the_path_to_a_nested_target() {
+    let (mut s, main, ids) = comp_with_solids(&["Bg", "Card art", "Shared art", "Card label"]);
+    // Card 1 ← "Card art" + "Card label"; Cards ← Card 1; Scene ← Cards.
+    let card = s.execute("layer.precompose", json!({"layers": [ids[1], ids[3]], "name": "Card 1", "mode": "move"})).unwrap();
+    let card_layer = card["layer"].as_u64().unwrap();
+    let card_comp = card["comp"].as_u64().unwrap();
+    let cards = s.execute("layer.precompose", json!({"layers": [card_layer], "name": "Cards", "mode": "move"})).unwrap();
+    let shared = s.execute("layer.precompose", json!({"layers": [ids[2]], "name": "Shared", "mode": "move"})).unwrap();
+    let scene = s
+        .execute("layer.precompose", json!({"layers": [cards["layer"].as_u64().unwrap(), shared["layer"].as_u64().unwrap()], "name": "S3 02", "mode": "move"}))
+        .unwrap();
+    let (scene_comp, cards_comp, shared_comp) = (scene["comp"].as_u64().unwrap(), cards["comp"].as_u64().unwrap(), shared["comp"].as_u64().unwrap());
+    // "Shared" used twice inside the scene and once more in Main.
+    s.execute("comp.open", json!({"comp": scene_comp})).unwrap();
+    s.execute("layer.addItem", json!({"comp": scene_comp, "item": shared_comp, "time": 0.0})).unwrap();
+    s.execute("comp.open", json!({"comp": main})).unwrap();
+    s.execute("layer.addItem", json!({"comp": main, "item": shared_comp, "time": 0.0})).unwrap();
+    let main_before = precomps_of(&s, main);
+    let scene_before = precomps_of(&s, scene_comp);
+
+    let r = s.execute("comp.duplicateDeep", json!({"comp": scene_comp, "through": ["Cards", card_comp], "suffix": " · v2", "folder": "Variants"})).unwrap();
+    let top = r["comp"].as_u64().unwrap();
+    assert_eq!(item_name(&s, top), "S3 02 · v2");
+    let chain: Vec<u64> = r["chain"].as_array().unwrap().iter().filter_map(|c| c["to"].as_u64()).collect();
+    assert_eq!(chain.len(), 3, "scene, Cards and Card 1 copied: {r}");
+    assert_eq!(item_name(&s, chain[1]), "Cards · v2");
+    assert_eq!(item_name(&s, chain[2]), "Card 1 · v2");
+    // The copies use each other; the sibling "Shared" stays shared (both its uses).
+    let top_uses = precomps_of(&s, top);
+    assert!(top_uses.contains(&chain[1]) && !top_uses.contains(&cards_comp), "{top_uses:?}");
+    assert_eq!(top_uses.iter().filter(|c| **c == shared_comp).count(), scene_before.iter().filter(|c| **c == shared_comp).count());
+    assert_eq!(precomps_of(&s, chain[1]), [chain[2]]);
+    // The originals are untouched, and Main still points at the original scene.
+    assert_eq!(precomps_of(&s, scene_comp), scene_before);
+    assert_eq!(precomps_of(&s, cards_comp), [card_comp]);
+    assert_eq!(precomps_of(&s, main), main_before);
+    // The copies sit in the new Variants folder.
+    let folder = r["folder"].as_u64().unwrap();
+    assert!(chain.iter().all(|c| s.project.item(effectcraft_project::ItemId(*c)).and_then(|i| i.parent).map(|p| p.0) == Some(folder)));
+    // A second variant gets its own names and copies; one undo removes it.
+    let r3 = s.execute("comp.duplicateDeep", json!({"comp": scene_comp, "through": ["Cards", "Card 1"], "suffix": " · v3", "folder": "Variants"})).unwrap();
+    assert_eq!(r3["folder"], Value::Null, "the folder exists now");
+    assert_eq!(item_name(&s, r3["comp"].as_u64().unwrap()), "S3 02 · v3");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.item(effectcraft_project::ItemId(r3["comp"].as_u64().unwrap())).is_none(), "one undo step");
+}
+
+#[test]
+fn duplicate_chain_refuses_a_path_that_does_not_nest() {
+    let (mut s, main, ids) = comp_with_solids(&["A", "B"]);
+    s.execute("layer.precompose", json!({"layers": [ids[0]], "name": "Inner", "mode": "move"})).unwrap();
+    let other = s.execute("comp.new", json!({"name": "Elsewhere", "width": 64, "height": 64, "frameRate": 30, "duration": 1})).unwrap();
+    let other = other["comp"].as_u64().or_else(|| other["id"].as_u64()).unwrap();
+    let e = s.execute("comp.duplicateDeep", json!({"comp": main, "through": [other], "suffix": " · v2"})).unwrap_err().to_string();
+    assert!(e.contains("not a precomp"), "{e}");
+    let e = s.execute("comp.duplicateDeep", json!({"comp": main, "through": ["Nope"]})).unwrap_err().to_string();
+    assert!(e.contains("no composition"), "{e}");
+    assert!(s.execute("comp.duplicateDeep", json!({"comp": main, "suffix": "  "})).is_err());
+    // No `through`: just the comp, its precomps shared.
+    let r = s.execute("comp.duplicateDeep", json!({"comp": main, "suffix": " · v2"})).unwrap();
+    let copy = r["comp"].as_u64().unwrap();
+    assert_eq!(precomps_of(&s, copy), precomps_of(&s, main));
+}
