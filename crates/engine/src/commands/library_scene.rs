@@ -136,6 +136,15 @@ fn swap_item(s: &mut Session, v: &Value, key: &str) -> Result<ItemId> {
     })
 }
 
+/// A `bool` param: `None` when it is missing or null, an error for anything but true/false.
+fn bool_p(p: &Value, key: &str) -> Result<Option<bool>> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(v) => Err(bad(C, format!("`{key}` is true or false, not {v}"))),
+    }
+}
+
 fn scene(s: &mut Session, p: &Value) -> Result<Value> {
     let folder = str_p(p, "folder").map(str::to_lowercase);
     let Some(name) = str_p(p, "scene").map(str::trim).filter(|n| !n.is_empty()) else {
@@ -162,6 +171,7 @@ fn scene(s: &mut Session, p: &Value) -> Result<Value> {
         }
         (None, None) => None,
     };
+    let collapse = bool_p(p, "collapse")?;
     let swaps: BTreeMap<String, Value> = match p.get("swap").filter(|v| !v.is_null()) {
         None => BTreeMap::new(),
         Some(Value::Object(m)) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -177,6 +187,14 @@ fn scene(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let applied = s.execute("library.insert", q)?;
         let item = applied["item"].as_u64().map(ItemId).ok_or_else(|| bad(C, format!("“{}” added no composition", card["name"].as_str().unwrap_or(&id))))?;
+        let scene_layer = applied["layer"].as_u64().map(LayerId);
+        // Collapse the scene layer when the scene holds an adjustment layer: else its dims and
+        // blurs only reach the scene's own layers, not the edit under it.
+        let has_adjustment = s.project.comp(item).is_some_and(|c| c.layers.iter().any(|l| l.switches.adjustment));
+        let collapsed = collapse.unwrap_or(has_adjustment);
+        if let Some(l) = scene_layer.filter(|_| collapsed) {
+            s.execute("layer.setSwitch", json!({"comp": cid.0, "layers": [l.0], "switch": "collapse", "value": true}))?;
+        }
         let found = slots(&s.project, item);
         let mut swapped = vec![];
         let mut unmatched = vec![];
@@ -233,6 +251,7 @@ fn scene(s: &mut Session, p: &Value) -> Result<Value> {
             "item": item.0,
             "layer": applied["layer"],
             "at": at,
+            "collapsed": collapsed,
             "slots": list,
             "swapped": swapped,
             "unmatched": unmatched,
@@ -262,7 +281,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Library Scene",
             [],
             None,
-            "{scene? (a Motion Library comp card by name, loosely: \"yt zoom out\" finds “YT Zoom Out”; or its id; none = list the scenes), folder? (category filter, e.g. \"Devin Jatho\"; default: cards in a Scenes folder win), comp? (default the open one), at? (comp s) | word? (+ occurrence?, 1-based: the scene starts on that word of the comp's speech map); default the playhead, swap? ({\"layer name or footage name\": \"new text\" for a text layer | a file path, item name or id for a footage/precomp layer}: every layer of the scene and its precomps with that name)} → {scene {id, name, category}, comp, item (the scene's comp), layer, at, slots: [{comp, compName, layer, name, kind (text|footage|comp), now (text or source name)}], swapped: [{slot, comp, layer, name, was, how (text|source)}], unmatched, alternatives (other close names), needsFootage, notes}. Imports the scene like library.apply, then swaps; one undo step",
+            "{scene? (a Motion Library comp card by name, loosely: \"yt zoom out\" finds “YT Zoom Out”; or its id; none = list the scenes), folder? (category filter, e.g. \"Devin Jatho\"; default: cards in a Scenes folder win), comp? (default the open one), at? (comp s) | word? (+ occurrence?, 1-based: the scene starts on that word of the comp's speech map); default the playhead, swap? ({\"layer name or footage name\": \"new text\" for a text layer | a file path, item name or id for a footage/precomp layer}: every layer of the scene and its precomps with that name), collapse? (bool: Collapse Transformations on the scene layer; default on when the scene comp holds an adjustment layer, so its dims and blurs reach the edit under it)} → {scene {id, name, category}, comp, item (the scene's comp), layer, at, collapsed, slots: [{comp, compName, layer, name, kind (text|footage|comp), now (text or source name)}], swapped: [{slot, comp, layer, name, was, how (text|source)}], unmatched, alternatives (other close names), needsFootage, notes}. Imports the scene like library.apply, then swaps; one undo step",
             always,
             scene
         )

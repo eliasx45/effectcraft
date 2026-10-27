@@ -137,3 +137,58 @@ fn scene_list_and_errors() {
     let e = s.execute("library.scene", json!({"scene": "Spinning Globe"})).unwrap_err().to_string();
     assert!(e.contains("no Motion Library scene matches “Spinning Globe”") && e.contains("YT Zoom Out"), "{e}");
 }
+
+fn set_start(s: &mut Session, comp: effectcraft_project::ItemId, layer: u64, seconds: f64) {
+    let p = Arc::make_mut(&mut s.project);
+    p.comp_mut(comp).unwrap().layer_mut(effectcraft_project::LayerId(layer)).unwrap().start_time = Tick::from_seconds_f64(seconds);
+}
+
+/// The scene “Speaker Card”: an adjustment layer (the dim) over a precomp “Presenter Box”
+/// (starting 1 s in) whose sample presenter footage starts 5 s before its comp.
+fn speaker_library(dir: &std::path::Path) {
+    let mut s = Session::default();
+    let cam = footage(&mut s, "sample cam.mov");
+    s.execute("comp.new", json!({"name": "Presenter Box", "width": 64, "height": 36, "frameRate": 30, "duration": 3})).unwrap();
+    let boxed = s.active_comp_id().unwrap();
+    let l = s.execute("layer.addItem", json!({"comp": boxed.0, "item": cam})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.rename", json!({"comp": boxed.0, "layer": l, "name": "Speaker"})).unwrap();
+    set_start(&mut s, boxed, l, -5.0);
+    s.execute("comp.new", json!({"name": "Speaker Card", "width": 160, "height": 90, "frameRate": 30, "duration": 3})).unwrap();
+    let main = s.active_comp_id().unwrap();
+    let b = s.execute("layer.addItem", json!({"comp": main.0, "item": boxed.0})).unwrap()["layer"].as_u64().unwrap();
+    set_start(&mut s, main, b, 1.0);
+    s.execute("layer.newAdjustment", json!({"name": "Dim"})).unwrap();
+    s.execute("file.saveAs", json!({"path": dir.join("speaker.ecproj").to_string_lossy()})).unwrap();
+    let index = json!({
+        "format": "effectcraft-library", "version": 1, "name": "Devin",
+        "entries": [{"id": "speaker", "name": "Speaker Card", "kind": "comp", "file": "speaker.ecproj", "comp": "Speaker Card", "category": "Devin Jatho/Screen Setups"}]
+    });
+    std::fs::write(dir.join("library.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+}
+
+fn collapsed(s: &Session, comp: effectcraft_project::ItemId, r: &Value) -> bool {
+    s.project.comp(comp).unwrap().layer(effectcraft_project::LayerId(r["layer"].as_u64().unwrap())).unwrap().switches.collapse
+}
+
+#[test]
+fn a_scene_with_an_adjustment_layer_is_collapsed_unless_told_not_to() {
+    let dir = out_dir("library-scene-collapse");
+    speaker_library(&dir);
+    let mut s = session(&dir);
+    let edit = s.active_comp_id().unwrap();
+    let r = s.execute("library.scene", json!({"scene": "speaker card", "at": 0})).unwrap();
+    assert_eq!(r["collapsed"], json!(true), "{r:#}");
+    assert!(collapsed(&s, edit, &r));
+    let r = s.execute("library.scene", json!({"scene": "speaker card", "at": 0, "collapse": false})).unwrap();
+    assert!(!collapsed(&s, edit, &r) && r["collapsed"] == json!(false), "{r:#}");
+    assert!(s.execute("library.scene", json!({"scene": "speaker card", "collapse": "yes"})).is_err());
+    // A scene without an adjustment layer stays as it was, unless asked.
+    let dir = out_dir("library-scene-no-collapse");
+    library(&dir);
+    let mut s = session(&dir);
+    let edit = s.active_comp_id().unwrap();
+    let r = s.execute("library.scene", json!({"scene": "YT Zoom Out", "at": 0})).unwrap();
+    assert!(!collapsed(&s, edit, &r) && r["collapsed"] == json!(false), "{r:#}");
+    let r = s.execute("library.scene", json!({"scene": "YT Zoom Out", "at": 0, "collapse": true})).unwrap();
+    assert!(collapsed(&s, edit, &r), "{r:#}");
+}
