@@ -59,6 +59,12 @@ pub trait AudioDevice: Send {
     /// Called every UI frame while playing: devices without an audio thread of their own (Web
     /// Audio) move queued samples to the output here.
     fn pump(&mut self) {}
+    /// Seconds from [`Self::start`] until the first non-silent sample was audible (the device's
+    /// playback timestamp), once it was: the play-to-sound latency `ui.inspect` and the log
+    /// report. `None` before that, and for devices that don't measure it.
+    fn first_sound(&self) -> Option<f64> {
+        None
+    }
 }
 
 /// Opens the default output device (`None` when there is none).
@@ -410,6 +416,12 @@ impl AudioPlayback {
             Some(played) => clock_sample_at(&self.span, played.saturating_sub(self.base), 0, self.speed),
             None => clock_sample_at(&self.span, self.feed.consumed().saturating_sub(self.base), self.device.latency_frames(), self.speed),
         }
+    }
+
+    /// Seconds from the device's start until this preview's first sound was audible
+    /// ([`AudioDevice::first_sound`]).
+    pub fn first_sound(&self) -> Option<f64> {
+        self.device.first_sound()
     }
 
     pub fn finished(&self) -> bool {

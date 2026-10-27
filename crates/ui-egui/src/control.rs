@@ -746,6 +746,13 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
             "lastShownAgeSeconds": last_shown.map(|t| (now - t).max(0.0)),
             "intervals": shown_intervals(&app.playback.log),
             "stream": stream,
+            // AU1: play pressed → its sound started (after pre-roll or a hold) → the first
+            // non-silent sample audible at the device, in ms (null until it was).
+            "audio": {
+                "playing": app.audio.is_some(),
+                "soundStartedMs": app.playback.sound_started.map(|t| (t - app.playback.pressed).max(0.0) * 1000.0),
+                "firstSoundMs": app.playback.first_sound_ms,
+            },
         },
         // Edit → viewer frame: `shownAt - editAt` once `shownRevision >= editRevision`.
         "latency": {

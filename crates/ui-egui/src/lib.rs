@@ -320,6 +320,10 @@ pub struct Hooks {
     pub audio_device: Option<audio::AudioDeviceFactory>,
     /// Lists audio output devices (Settings ▸ Audio).
     pub audio_devices: Option<Box<dyn Fn() -> Vec<String>>>,
+    /// Opens the audio output in the background, or keeps the open one open (AU1): called
+    /// while a comp with sound is open and the user is active, so pressing play finds the
+    /// device awake (a Bluetooth headset woke its link on every play: 2–3 s unheard).
+    pub audio_warm: Option<Box<dyn Fn(&audio::AudioOutput)>>,
     /// Picks a folder (Settings paths).
     pub pick_folder: Option<Box<dyn Fn() -> Option<String>>>,
     /// Save dialog for other file kinds: (default name or path, extension; empty: no filter). A
@@ -418,6 +422,13 @@ pub struct Playback {
     /// compressed in time at the same pitch (`audio::Stretch`); 0 = normal speed. The plan's rate and frame step are multiplied, so as many frames a second
     /// show as at normal speed.
     pub speed: u32,
+    /// UI seconds when this preview was asked to play (the play-to-sound measurement).
+    pub pressed: f64,
+    /// UI seconds when its sound was started (after pre-roll, a hold, Cache Before Playback).
+    pub sound_started: Option<f64>,
+    /// Play pressed → the first non-silent sample audible, in ms, once it was (`ui.inspect`
+    /// `preview.audio`, logged once per preview).
+    pub first_sound_ms: Option<f64>,
 }
 
 /// Play Faster's top speed (×8, as FilmCraft's Shuttle Right).
@@ -595,6 +606,9 @@ pub struct EffectcraftApp {
     pub scrub: Option<audio::AudioScrub>,
     /// Hover-to-hear in the Motion Library: its open output (see [`audio::SoundPreview`]).
     pub sound_preview: Option<audio::SoundPreview>,
+    /// (comp, project revision) last looked at for sound by [`Self::warm_audio_output`], and
+    /// whether it has any.
+    audio_warm_for: Option<((ItemId, u64), bool)>,
     /// The Sound card under the pointer this frame (the panel sets it; each frame takes it).
     pub sound_hover: Option<SoundHover>,
     /// Audio panel VU meters.
@@ -724,6 +738,7 @@ impl EffectcraftApp {
             audio: None,
             scrub: None,
             sound_preview: None,
+            audio_warm_for: None,
             sound_hover: None,
             meter: Default::default(),
             expression_diagnostics: Default::default(),
@@ -1736,6 +1751,9 @@ impl EffectcraftApp {
             observed: now,
             log: Vec::new(),
             speed: 0,
+            pressed: now,
+            sound_started: None,
+            first_sound_ms: None,
         };
         if !self.playback.caching {
             if plan.video {
@@ -1834,6 +1852,8 @@ impl EffectcraftApp {
             self.audio = Some(a);
             return;
         }
+        self.playback.sound_started = Some(self.last_time);
+        self.playback.first_sound_ms = None;
         let out = audio::AudioOutput::from_prefs(&self.session.prefs);
         let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
         let mix = self.session.prefs.audio.preview_sample_rate;
@@ -1905,6 +1925,28 @@ impl EffectcraftApp {
         sp.last_used = now;
         sp.pump();
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// AU1: keep the audio output open while a comp with sound is open and the user is active
+    /// (input this frame), so the first play is heard at once ([`Hooks::audio_warm`]). Whether the
+    /// comp has sound is looked at once per comp and project revision.
+    fn warm_audio_output(&mut self, ctx: &egui::Context) {
+        if self.hooks.audio_warm.is_none() || self.playback.playing || !ctx.input(|i| !i.events.is_empty()) {
+            return;
+        }
+        let Some(cid) = self.session.active_comp_id() else { return };
+        let key = (cid, self.session.revision);
+        let audible = match self.audio_warm_for {
+            Some((k, audible)) if k == key => audible,
+            _ => {
+                let audible = effectcraft_engine::render::audio::comp_has_audio(&self.session.project, cid);
+                self.audio_warm_for = Some((key, audible));
+                audible
+            }
+        };
+        if audible && let Some(warm) = &self.hooks.audio_warm {
+            warm(&audio::AudioOutput::from_prefs(&self.session.prefs));
+        }
     }
 
     #[track_caller]
@@ -2173,6 +2215,18 @@ impl EffectcraftApp {
         if let Some(a) = &mut self.audio {
             a.pump();
             self.meter.update(a.feed.take_peaks(), now);
+            if self.playback.first_sound_ms.is_none()
+                && let Some(device) = a.first_sound()
+            {
+                let started = self.playback.sound_started.map_or(0.0, |t| (t - self.playback.pressed).max(0.0));
+                let ms = (started + device) * 1000.0;
+                self.playback.first_sound_ms = Some(ms);
+                log::info!(
+                    "audio preview: first sound {ms:.0} ms after play (sound started {:.0} ms after play, then heard {:.0} ms later)",
+                    started * 1000.0,
+                    device * 1000.0
+                );
+            }
         } else if let Some(s) = &mut self.scrub {
             // Scrubbing: the meters follow the snippets; an idle second closes the output.
             s.pump();
@@ -2804,6 +2858,7 @@ impl EffectcraftApp {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
         self.tick_sound_preview(&ctx, ctx.input(|i| i.time));
+        self.warm_audio_output(&ctx);
         self.apply_gpu_failure(&ctx);
         self.run_dialog_answers();
         self.auto.begin_frame();

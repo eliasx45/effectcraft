@@ -612,4 +612,5 @@ fn hooks(app: &mut EffectcraftApp) {
     }));
     app.hooks.audio_device = Some(Box::new(audio_out::open));
     app.hooks.audio_devices = Some(Box::new(audio_out::devices));
+    app.hooks.audio_warm = Some(Box::new(audio_out::warm));
 }
