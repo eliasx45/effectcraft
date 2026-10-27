@@ -1,13 +1,14 @@
 //! Adjustment layers on the GPU vs the CPU: GPU-only stacks (resident on the device), mixed
 //! stacks (CPU effects in between read back and upload), masks, opacity, colour management.
 
+use effectcraft_color::BlendMode;
 use effectcraft_keyframe::{ShapePath, Value};
 use effectcraft_project::build::{self, Ids};
-use effectcraft_project::{BitDepth, ColorSpace, MaskMode, MatteKind, TrackMatte};
-use effectcraft_render::{Backend, FxStep, FxTarget, RenderOpts, Renderer};
+use effectcraft_project::{BitDepth, ColorSpace, LayerSource, MaskMode, MatteKind, TrackMatte};
+use effectcraft_render::{Backend, FxStep, FxTarget, LayerTimes, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 
-use crate::tests::{Pattern, Scene, c, check, compare_at, gpu, n, opts, set};
+use crate::tests::{Pattern, Scene, c, check, compare_at, gpu, n, opts, set, v3};
 
 fn adjustment_scene(depth: BitDepth, stack: &[(&str, Vec<(&str, Value)>)], masked: bool) -> Scene {
     let mut s = Scene::new(depth);
@@ -136,5 +137,71 @@ fn composite_reads_the_original_adjustment_input_on_gpu() {
                 check(&format!("original adjustment {depth:?} mode {mode} rgb {rgb}"), compare_at(&s, RenderOpts { scale: 0.5, ..opts() }, Tick::ZERO), 0.0);
             }
         }
+    }
+}
+
+/// Elias's "K Step Stack" glass cards (27 Oct): per card a rounded-rect shape matte and a card
+/// face parented to a null, and between them a comp-sized white adjustment solid with Gaussian
+/// Blur (Repeat Edge Pixels) + Tint (black and white to white, 12 %) at part opacity whose alpha
+/// track matte is the rounded rect. The GPU walk handed every matted adjustment layer to the CPU
+/// ("rendered on the CPU (an adjustment layer the GPU can't apply)", 136 ms a frame), a guard
+/// left from before the GPU path multiplied the footprint by the track matte. Now it renders on
+/// the GPU, with no CPU note, and matches the CPU. (The opacity and transforms are expression
+/// driven in his project; here they are static: compare_at renders without an expression host.)
+#[test]
+fn matted_glass_adjustment_renders_on_the_gpu_like_the_cpu() {
+    let glass_scene = |depth: BitDepth| {
+        let mut s = Scene::new(depth);
+        let bg = s.solid([0.05, 0.08, 0.14], 97, 61);
+        s.push(bg);
+        let mut ramp = s.footage(97, 61);
+        ramp.blend_mode = BlendMode::Add;
+        set(&mut ramp, "transform/opacity", Value::Scalar(20.0));
+        s.push(ramp);
+        let mut blob = s.footage(60, 40);
+        set(&mut blob, "transform/rotation", Value::Scalar(15.0));
+        s.push(blob);
+        let mut null = build::layer(&mut s.p, &s.comp, "K Step 3", LayerSource::Null, (100, 100), None);
+        set(&mut null, "transform/position", v3(50.0, 32.0));
+        set(&mut null, "transform/scale", Value::Vec3([90.0, 90.0, 100.0]));
+        let nid = null.id;
+        let mut card = s.solid([0.1, 0.3, 0.7], 50, 14);
+        card.parent = Some(nid);
+        set(&mut card, "transform/position", v3(50.0, 50.0));
+        s.push(card);
+        let mut glass = s.solid([1.0, 1.0, 1.0], 97, 61);
+        glass.switches.adjustment = true;
+        set(&mut glass, "transform/opacity", Value::Scalar(80.0));
+        s.effect(&mut glass, "ec.blur.gaussian", &[("blurriness", n(8.0)), ("repeatEdge", Value::Bool(true))]);
+        s.effect(&mut glass, "ec.color.tint", &[("black", c(1.0, 1.0, 1.0)), ("white", c(1.0, 1.0, 1.0)), ("amount", n(12.0))]);
+        let mut matte = build::layer(&mut s.p, &s.comp, "K Step 3 Matte", LayerSource::Shape, (97, 61), None);
+        let mut next = s.p.next_id;
+        let mut ids = Ids(&mut next);
+        let rect = build::shape_rect(&mut ids, [52.0, 16.0], [0.0, 0.0], 4.0);
+        let fill = build::shape_fill(&mut ids, [1.0, 1.0, 1.0, 1.0]);
+        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+        s.p.next_id = next;
+        matte.props.sub_mut("contents").unwrap().children.push(g.into());
+        matte.parent = Some(nid);
+        matte.switches.video = false;
+        set(&mut matte, "transform/position", v3(50.0, 50.0));
+        glass.track_matte = Some(TrackMatte { layer: matte.id, kind: MatteKind::Alpha });
+        let gid = s.push(glass);
+        s.push(matte);
+        s.push(null);
+        (s, gid)
+    };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let (s, gid) = glass_scene(depth);
+        check(&format!("glass adjustment {depth:?}"), compare_at(&s, opts(), Tick::ZERO), 0.0);
+        check(&format!("glass adjustment {depth:?} half"), compare_at(&s, RenderOpts { scale: 0.5, ..opts() }, Tick::ZERO), 0.0);
+        let Some(g) = gpu() else { return };
+        let times = LayerTimes::default();
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(g);
+        r.times = Some(&times);
+        g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
+        assert_eq!(times.frame_cpu(), None, "{depth:?}: the frame ran on the GPU");
+        assert_eq!(times.cpu_reason(s.cid, gid), None, "{depth:?}: the matted adjustment layer ran on the GPU");
     }
 }

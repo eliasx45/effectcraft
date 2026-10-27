@@ -874,8 +874,9 @@ fn composite_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, c
 /// replaces the canvas inside the layer's footprint × track matte × opacity. `None` = draw it
 /// on the CPU.
 fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels) -> Option<()> {
-    // A track matte or a blending mode on the adjustment layer is applied by the CPU path.
-    if r.track_matte(ctx, layer).is_some() || layer.blend_mode != BlendMode::Normal {
+    // A blending mode on the adjustment layer is applied by the CPU path. A track matte is
+    // not: it multiplies the footprint below (`track_matte`), as on the CPU.
+    if layer.blend_mode != BlendMode::Normal {
         return None;
     }
     let opacity = r.layer_opacity(ctx, layer);
