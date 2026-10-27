@@ -571,6 +571,16 @@ pub(crate) fn layer_p(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, Laye
     if let Some(v) = p.get("layer") {
         return checked_layer_ref(comp, cid, v, cmd)?.map(|l| (cid, l)).ok_or_else(|| bad(cmd, no_layer(v)));
     }
+    // `layers` is an accepted alias (check_params): one layer, never the selection instead.
+    if let Some(v) = p.get("layers").filter(|v| !v.is_null()) {
+        let one = match v {
+            Value::Array(a) if a.len() == 1 => a.first(),
+            Value::Array(a) => return Err(bad(cmd, format!("takes one layer, not {} (`layers`: {v})", a.len()))),
+            other => Some(other),
+        };
+        let Some(v) = one else { return Err(bad(cmd, "`layers` is empty")) };
+        return checked_layer_ref(comp, cid, v, cmd)?.map(|l| (cid, l)).ok_or_else(|| bad(cmd, no_layer(v)));
+    }
     s.state
         .selected_layers
         .first()

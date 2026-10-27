@@ -250,6 +250,23 @@ fn a_number_is_a_layer_id_never_a_stack_position() {
 }
 
 #[test]
+fn rename_takes_layers_as_well_as_layer_never_the_selection() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Plural", "width": 64, "height": 64})).unwrap();
+    let red = new_solid(&mut s, "Red", None);
+    let blue = new_solid(&mut s, "Blue", None);
+    // Blue is selected (newest layer); `layers` names Red, so Red is renamed, not the selection.
+    s.execute_checked("layer.select", json!({"layers": [blue]})).unwrap();
+    s.execute_checked("layer.rename", json!({"layers": [red], "name": "Red 2"})).unwrap();
+    assert_eq!(names(&s), ["Blue", "Red 2"]);
+    // Several layers can't share one rename: an error, nothing renamed.
+    let e = s.execute_checked("layer.rename", json!({"layers": [red, blue], "name": "Both"})).unwrap_err().to_string();
+    assert!(e.contains("one layer"), "{e}");
+    assert!(s.execute_checked("layer.rename", json!({"layers": [], "name": "None"})).is_err());
+    assert_eq!(names(&s), ["Blue", "Red 2"]);
+}
+
+#[test]
 fn ids_are_not_reused_after_undo() {
     let mut s = Session::default();
     s.execute("comp.new", json!({"name": "Ids", "width": 64, "height": 64})).unwrap();
