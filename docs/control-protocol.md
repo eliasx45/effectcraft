@@ -91,7 +91,7 @@ changed_pct, pass, diffBounds, region?, diff_path?, diff_png?}` (`region: [x, y,
 one rectangle; `diffBounds` boxes the changed pixels or is null; metrics and size rules in
 [agents.md](agents.md#verify-your-change-snapshot--edit--compare)). Analysis queries (see
 [mcp.md](mcp.md#analysis-tools)): `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}`
-(layer geometry in comp space) and `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}`
+(layer geometry in comp space), `layer.at {comp?, time?, x, y, pixels?}` (the topmost layer drawn at a comp point, plus every layer whose box covers it, front to back; locked layers count, adjustment and guide layers don't; used by Ghostex's Editing view to turn a click on the frame into a layer chip) and `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}`
 (peak, RMS, LUFS, clipping and silences of the mix). Design lint: `render.lint {comp?, time? | start?, end?, step?, rules?, minTextPx?, minContrast?}`
 → `{comp, compName, times, truncated, clean, counts {error, warning, info}, problems: [{rule, severity,
 layer, layerName, time, until, message, other?}], notes}` (rules and how to read it: [agents.md](agents.md#design-lint)).

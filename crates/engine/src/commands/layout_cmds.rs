@@ -3,11 +3,12 @@
 //! The geometry itself is [`crate::layout`]. Also holds small helpers the other analysis queries
 //! share.
 
-use effectcraft_project::{Comp, LayerId};
-use effectcraft_render::{RenderOpts, Renderer};
+use effectcraft_geom::vec2;
+use effectcraft_project::{Comp, Layer, LayerId};
+use effectcraft_render::{EvalCtx, RenderOpts, Renderer};
 use serde_json::{Value, json};
 
-use super::{CommandSpec, b_p, bad, comp_id, resolve_layer, time_p};
+use super::{CommandSpec, b_p, bad, comp_id, f_p, resolve_layer, time_p};
 use crate::{EngineError, Result, Session, layout, query};
 
 pub(super) fn r2(v: f64) -> f64 {
@@ -136,11 +137,123 @@ fn layer_bounds(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(v)
 }
 
+// ---------------------------------------------------------------- layer.at
+
+/// Most layers a `layer.at` answer lists under the point.
+const MAX_AT_HITS: usize = 32;
+/// Below this alpha a pixel counts as empty (as `layout::pixel_bounds` reads it).
+const EMPTY_ALPHA: f32 = 1.0 / 512.0;
+
+/// The layer's drawn alpha at comp point `p` (masks, effects and styles included), or None when
+/// its pixels can't be read (no buffer, a matrix that doesn't invert).
+fn alpha_at(r: &Renderer, ctx: &EvalCtx, l: &Layer, p: [f64; 2]) -> Option<f32> {
+    let buf = r.layer_buf(ctx, l)?;
+    let (m, _) = ctx.layer_to_comp(l);
+    let q = m.inverse()?.apply(vec2(p[0], p[1]));
+    let (bx, by) = buf.to_px([q.x, q.y]);
+    if !bx.is_finite() || !by.is_finite() {
+        return None;
+    }
+    let (w, h) = (i64::from(buf.img.width), i64::from(buf.img.height));
+    let (ix, iy) = (bx.floor() as i64, by.floor() as i64);
+    if ix < 0 || iy < 0 || ix >= w || iy >= h {
+        return Some(0.0);
+    }
+    let i = usize::try_from(iy.saturating_mul(w).saturating_add(ix)).ok()?;
+    buf.img.data.get(i).map(|px| px[3])
+}
+
+/// Whether comp point `p` is inside the convex quad `q` (corners in order, either winding).
+fn point_in_quad(p: [f64; 2], q: &[[f64; 2]; 4]) -> bool {
+    let mut sign = 0.0;
+    for i in 0..4 {
+        let (a, b) = (q[i], q[(i + 1) % 4]);
+        let c = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+        if c.abs() < 1e-9 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = c.signum();
+        } else if c.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+/// The layers under a comp point, front to back, and the topmost one that draws a pixel there.
+/// Unlike the viewer's click it counts locked layers, which an agent
+/// pointing at the picture still means, and skips adjustment and guide layers, which cover the
+/// frame without being anything one points at. Read-only.
+fn layer_at(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "layer.at";
+    let cid = comp_id(s, p)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let t = time_p(s, p, Some(comp));
+    let (Some(x), Some(y)) = (f_p(p, "x"), f_p(p, "y")) else {
+        return Err(bad(C, "x and y (comp pixels from the top left) are required"));
+    };
+    if !x.is_finite() || !y.is_finite() {
+        return Err(bad(C, "x and y must be finite numbers"));
+    }
+    let pixels = b_p(p, "pixels").unwrap_or(true);
+    let r = renderer(s, RenderOpts::default());
+    let ctx = r.eval_ctx(cid, t).ok_or(EngineError::NoComp)?;
+    let any_solo = comp.layers.iter().any(|l| l.switches.solo && l.source.is_av());
+    let mut hits = vec![];
+    let mut top = Value::Null;
+    for (i, l) in comp.layers.iter().enumerate() {
+        let candidate = l.is_active_at(t)
+            && l.switches.video
+            && !l.switches.adjustment
+            && !l.switches.guide
+            && !l.is_camera()
+            && !l.is_light()
+            && (!any_solo || l.switches.solo);
+        if !candidate {
+            continue;
+        }
+        let Some(g) = layout::layer_geometry(&ctx, l).filter(|g| g.projected) else { continue };
+        if !point_in_quad([x, y], &g.corners) {
+            continue;
+        }
+        let alpha = if pixels { alpha_at(&r, &ctx, l, [x, y]) } else { None };
+        let drawn = alpha.is_none_or(|a| a > EMPTY_ALPHA);
+        let o = json!({
+            "id": l.id.0,
+            "index": i + 1,
+            "name": l.name,
+            "type": l.source.type_name(),
+            "locked": l.switches.locked,
+            "alpha": alpha.map(|a| r3(f64::from(a))),
+            "drawn": drawn,
+        });
+        if top.is_null() && drawn {
+            top = o.clone();
+        }
+        hits.push(o);
+        if hits.len() >= MAX_AT_HITS {
+            break;
+        }
+    }
+    Ok(
+        json!({"comp": cid.0, "compName": s.project.item(cid).map(|i| i.name.as_str()).unwrap_or(""), "time": t.seconds(), "point": pt([x, y]), "layer": top, "hits": hits}),
+    )
+}
+
 pub fn specs() -> Vec<CommandSpec> {
-    vec![query!(
-        "layer.bounds",
-        "Layer Bounds",
-        "{comp?, time?|frame?, layers?: [id|name|#n] (default every layer), pixels? (also measure the drawn pixels: masks, effects, styles), overlaps? (pairwise overlaps of the visible layers)} → per layer: visible + why, comp-space bounds [x,y,w,h], corners, center, anchorInComp, onScreen fraction, source rect",
-        layer_bounds
-    )]
+    vec![
+        query!(
+            "layer.at",
+            "Layer At Point",
+            "{comp?, time?|frame?, x, y (comp pixels), pixels? (default true: the layer must draw a pixel there, not only cover it with its box)} → {comp, compName, time, point, layer: the topmost layer drawn at the point {id, index, name, type, locked, alpha, drawn} or null, hits: every layer whose box covers it, front to back}. Counts locked layers; skips adjustment, guide, camera and light layers",
+            layer_at
+        ),
+        query!(
+            "layer.bounds",
+            "Layer Bounds",
+            "{comp?, time?|frame?, layers?: [id|name|#n] (default every layer), pixels? (also measure the drawn pixels: masks, effects, styles), overlaps? (pairwise overlaps of the visible layers)} → per layer: visible + why, comp-space bounds [x,y,w,h], corners, center, anchorInComp, onScreen fraction, source rect",
+            layer_bounds
+        ),
+    ]
 }

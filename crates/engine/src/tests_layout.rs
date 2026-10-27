@@ -149,3 +149,25 @@ fn visibility_onscreen_overlaps_and_pixels() {
     assert!(s.execute("layer.bounds", json!({"comp": "Nope"})).is_err());
     assert!(s.execute_checked("layer.bounds", json!({"bogus": 1})).is_err());
 }
+
+#[test]
+fn layer_at_finds_the_topmost_drawn_layer_and_skips_adjustment_layers() {
+    let mut s = comp();
+    let back = solid(&mut s, "Back", 400, 300, "#0000ff");
+    let card = solid(&mut s, "Card", 100, 50, "#ff0000");
+    // The card sits centred (200, 150), 100×50: (200, 150) is on it, (20, 20) only on the back.
+    let r = s.execute("layer.at", json!({"x": 200, "y": 150})).unwrap();
+    assert_eq!(r["layer"]["id"].as_u64(), Some(card), "{r}");
+    assert_eq!(r["hits"].as_array().map(Vec::len), Some(2), "{r}");
+    let r = s.execute("layer.at", json!({"x": 20, "y": 20})).unwrap();
+    assert_eq!(r["layer"]["id"].as_u64(), Some(back), "{r}");
+    // An adjustment layer over everything is not what a click points at.
+    let adj = solid(&mut s, "Adjust", 400, 300, "#ffffff");
+    s.execute("layer.setSwitch", json!({"layers": [adj], "switch": "adjustment", "value": true})).unwrap();
+    let r = s.execute("layer.at", json!({"x": 200, "y": 150})).unwrap();
+    assert_ne!(r["layer"]["id"].as_u64(), Some(adj), "{r}");
+    // Outside the comp nothing is hit; a missing coordinate is an error, never a panic.
+    let r = s.execute("layer.at", json!({"x": -50, "y": -50})).unwrap();
+    assert!(r["layer"].is_null(), "{r}");
+    assert!(s.execute("layer.at", json!({"x": 10})).is_err());
+}
