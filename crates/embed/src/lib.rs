@@ -107,8 +107,13 @@ pub struct PointAt {
     pub time: f64,
     /// Comp pixel.
     pub point: [f64; 2],
-    /// The topmost layer drawn there: id and name.
+    /// The deepest layer drawn there (`layer.at {deep: true}`: through precomps, so a click on a
+    /// card inside a scene precomp names the card): id and name.
     pub layer: Option<(u64, String)>,
+    /// The comp that holds [`Self::layer`] (the clicked comp itself, or a precomp's): id and name.
+    pub layer_comp: Option<(u64, String)>,
+    /// The clicked comp's name, then each layer down to the deepest (`MAIN`, `26-10 P2`, `S5 01`).
+    pub path: Vec<String>,
 }
 
 /// A wgpu instance for the host to make its surface with (Metal only on macOS).
@@ -334,9 +339,17 @@ impl Embedded {
         }
         let comp_name = session.project.item(comp_id).map(|i| i.name.clone()).unwrap_or_default();
         let time = session.time().seconds();
-        let hit = session.execute("layer.at", json!({"comp": comp_id.0, "time": time, "x": x, "y": y})).ok();
-        let layer = hit.as_ref().and_then(|v| Some((v["layer"]["id"].as_u64()?, v["layer"]["name"].as_str()?.to_string())));
-        Some(PointAt { comp: comp_id.0, comp_name, time, point: [x, y], layer })
+        let hit = session.execute("layer.at", json!({"comp": comp_id.0, "time": time, "x": x, "y": y, "deep": true})).ok();
+        let levels = hit.as_ref().and_then(|v| v["path"].as_array()).cloned().unwrap_or_default();
+        let named = |l: &serde_json::Value| Some((l["id"].as_u64()?, l["name"].as_str()?.to_string()));
+        let deepest = levels.iter().rev().find(|level| named(&level["layer"]).is_some());
+        let layer = deepest.and_then(|level| named(&level["layer"])).or_else(|| hit.as_ref().and_then(|v| named(&v["layer"])));
+        let layer_comp = deepest
+            .and_then(|level| Some((level["comp"].as_u64()?, level["compName"].as_str().unwrap_or_default().to_string())))
+            .or_else(|| layer.as_ref().map(|_| (comp_id.0, comp_name.clone())));
+        let mut path = vec![comp_name.clone()];
+        path.extend(levels.iter().filter_map(|level| level["layer"]["name"].as_str().map(str::to_string)));
+        Some(PointAt { comp: comp_id.0, comp_name, time, point: [x, y], layer, layer_comp, path })
     }
 
     /// The view changed size or moved to a display with another scale.

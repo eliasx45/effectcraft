@@ -181,27 +181,24 @@ fn point_in_quad(p: [f64; 2], q: &[[f64; 2]; 4]) -> bool {
     true
 }
 
-/// The layers under a comp point, front to back, and the topmost one that draws a pixel there.
-/// Unlike the viewer's click it counts locked layers, which an agent
-/// pointing at the picture still means, and skips adjustment and guide layers, which cover the
-/// frame without being anything one points at. Read-only.
-fn layer_at(s: &mut Session, p: &Value) -> Result<Value> {
-    const C: &str = "layer.at";
-    let cid = comp_id(s, p)?;
-    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
-    let t = time_p(s, p, Some(comp));
-    let (Some(x), Some(y)) = (f_p(p, "x"), f_p(p, "y")) else {
-        return Err(bad(C, "x and y (comp pixels from the top left) are required"));
-    };
-    if !x.is_finite() || !y.is_finite() {
-        return Err(bad(C, "x and y must be finite numbers"));
-    }
-    let pixels = b_p(p, "pixels").unwrap_or(true);
-    let r = renderer(s, RenderOpts::default());
-    let ctx = r.eval_ctx(cid, t).ok_or(EngineError::NoComp)?;
+/// Most precomp levels `layer.at {deep: true}` goes down (a cycle can't loop it).
+const MAX_AT_DEPTH: usize = 8;
+
+/// One comp's answer under a point: the topmost drawn layer (json and the layer), every layer
+/// whose box covers the point, front to back.
+fn hits_at<'a>(
+    r: &Renderer<'a>,
+    comp: &'a Comp,
+    ctx: &EvalCtx,
+    t: effectcraft_time::Tick,
+    x: f64,
+    y: f64,
+    pixels: bool,
+) -> (Value, Option<&'a Layer>, Vec<Value>) {
     let any_solo = comp.layers.iter().any(|l| l.switches.solo && l.source.is_av());
     let mut hits = vec![];
     let mut top = Value::Null;
+    let mut top_layer = None;
     for (i, l) in comp.layers.iter().enumerate() {
         let candidate = l.is_active_at(t)
             && l.switches.video
@@ -213,11 +210,11 @@ fn layer_at(s: &mut Session, p: &Value) -> Result<Value> {
         if !candidate {
             continue;
         }
-        let Some(g) = layout::layer_geometry(&ctx, l).filter(|g| g.projected) else { continue };
+        let Some(g) = layout::layer_geometry(ctx, l).filter(|g| g.projected) else { continue };
         if !point_in_quad([x, y], &g.corners) {
             continue;
         }
-        let alpha = if pixels { alpha_at(&r, &ctx, l, [x, y]) } else { None };
+        let alpha = if pixels { alpha_at(r, ctx, l, [x, y]) } else { None };
         let drawn = alpha.is_none_or(|a| a > EMPTY_ALPHA);
         let o = json!({
             "id": l.id.0,
@@ -230,15 +227,76 @@ fn layer_at(s: &mut Session, p: &Value) -> Result<Value> {
         });
         if top.is_null() && drawn {
             top = o.clone();
+            top_layer = Some(l);
         }
         hits.push(o);
         if hits.len() >= MAX_AT_HITS {
             break;
         }
     }
-    Ok(
-        json!({"comp": cid.0, "compName": s.project.item(cid).map(|i| i.name.as_str()).unwrap_or(""), "time": t.seconds(), "point": pt([x, y]), "layer": top, "hits": hits}),
-    )
+    (top, top_layer, hits)
+}
+
+/// The layers under a comp point, front to back, and the topmost one that draws a pixel there.
+/// Unlike the viewer's click it counts locked layers, which an agent
+/// pointing at the picture still means, and skips adjustment and guide layers, which cover the
+/// frame without being anything one points at. Read-only.
+///
+/// `deep: true` also follows a precomp hit down: the point goes through the precomp layer's
+/// transform into its comp's pixels, the time through its time remap / stretch, and the nested
+/// comp is asked again, up to [`MAX_AT_DEPTH`] levels. `path` lists every level, outermost
+/// first; its last `layer` is the deepest layer drawn there (Ghostex's chips name it: a click on
+/// a card inside a scene precomp means the card, 27 Oct).
+fn layer_at(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "layer.at";
+    let cid = comp_id(s, p)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let t = time_p(s, p, Some(comp));
+    let (Some(x), Some(y)) = (f_p(p, "x"), f_p(p, "y")) else {
+        return Err(bad(C, "x and y (comp pixels from the top left) are required"));
+    };
+    if !x.is_finite() || !y.is_finite() {
+        return Err(bad(C, "x and y must be finite numbers"));
+    }
+    let pixels = b_p(p, "pixels").unwrap_or(true);
+    let deep = b_p(p, "deep").unwrap_or(false);
+    let r = renderer(s, RenderOpts::default());
+    let ctx = r.eval_ctx(cid, t).ok_or(EngineError::NoComp)?;
+    let comp_name = |id| s.project.item(id).map(|i| i.name.as_str()).unwrap_or("");
+    let (top, mut top_layer, hits) = hits_at(&r, comp, &ctx, t, x, y, pixels);
+    let mut v = json!({"comp": cid.0, "compName": comp_name(cid), "time": t.seconds(), "point": pt([x, y]), "layer": top, "hits": hits});
+    if !deep {
+        return Ok(v);
+    }
+    let mut path = vec![json!({"comp": cid.0, "compName": comp_name(cid), "time": t.seconds(), "point": pt([x, y]), "layer": v["layer"].clone()})];
+    let mut level = ctx;
+    let mut at = (x, y);
+    while let Some(l) = top_layer.take() {
+        if path.len() > MAX_AT_DEPTH {
+            // Eight levels down already (or a cycle): the deepest so far is the answer.
+            break;
+        }
+        let effectcraft_project::LayerSource::Comp { item } = l.source else { break };
+        let Some(nested) = s.project.comp(item) else { break };
+        let (m, _) = level.layer_to_comp(l);
+        let Some(inv) = m.inverse() else { break };
+        let q = inv.apply(vec2(at.0, at.1));
+        if !q.x.is_finite() || !q.y.is_finite() {
+            break;
+        }
+        let nt = level.nested_time(l);
+        let Some(nctx) = r.eval_ctx(item, nt) else { break };
+        let (ntop, nlayer, _) = hits_at(&r, nested, &nctx, nt, q.x, q.y, pixels);
+        if ntop.is_null() {
+            break;
+        }
+        path.push(json!({"comp": item.0, "compName": comp_name(item), "time": nt.seconds(), "point": pt([q.x, q.y]), "layer": ntop}));
+        top_layer = nlayer;
+        level = nctx;
+        at = (q.x, q.y);
+    }
+    v["path"] = json!(path);
+    Ok(v)
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -246,7 +304,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "layer.at",
             "Layer At Point",
-            "{comp?, time?|frame?, x, y (comp pixels), pixels? (default true: the layer must draw a pixel there, not only cover it with its box)} → {comp, compName, time, point, layer: the topmost layer drawn at the point {id, index, name, type, locked, alpha, drawn} or null, hits: every layer whose box covers it, front to back}. Counts locked layers; skips adjustment, guide, camera and light layers",
+            "{comp?, time?|frame?, x, y (comp pixels), pixels? (default true: the layer must draw a pixel there, not only cover it with its box), deep? (default false: also follow a precomp hit into its comp, up to 8 levels)} → {comp, compName, time, point, layer: the topmost layer drawn at the point {id, index, name, type, locked, alpha, drawn} or null, hits: every layer whose box covers it, front to back, path (deep only): [{comp, compName, time, point, layer}] outermost first, the last layer the deepest one drawn there}. Counts locked layers; skips adjustment, guide, camera and light layers",
             layer_at
         ),
         query!(

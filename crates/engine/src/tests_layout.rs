@@ -171,3 +171,29 @@ fn layer_at_finds_the_topmost_drawn_layer_and_skips_adjustment_layers() {
     assert!(r["layer"].is_null(), "{r}");
     assert!(s.execute("layer.at", json!({"x": 10})).is_err());
 }
+
+#[test]
+fn layer_at_deep_names_the_layer_inside_a_precomp() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Scene", "width": 200, "height": 100, "frameRate": 25, "duration": 2})).unwrap();
+    let card = solid(&mut s, "Roadmap Card", 50, 50, "#ff0000");
+    s.execute("comp.new", json!({"name": "MAIN", "width": 400, "height": 300, "frameRate": 25, "duration": 2})).unwrap();
+    let pre = s.execute("layer.addItem", json!({"item": "Scene"})).unwrap()["layer"].as_u64().unwrap();
+    // The precomp's centre (its comp's 100, 50) sits at MAIN's 100, 100.
+    set(&mut s, pre, "transform/position", json!([100, 100]));
+    let r = s.execute("layer.at", json!({"x": 100, "y": 100})).unwrap();
+    assert_eq!(r["layer"]["id"].as_u64(), Some(pre), "{r}");
+    assert!(r.get("path").is_none(), "{r}");
+    let r = s.execute("layer.at", json!({"x": 100, "y": 100, "deep": true})).unwrap();
+    assert_eq!(r["layer"]["id"].as_u64(), Some(pre), "the outer answer stays: {r}");
+    let path = r["path"].as_array().unwrap();
+    assert_eq!(path.len(), 2, "{r}");
+    assert_eq!(path[0]["compName"], "MAIN", "{r}");
+    assert_eq!(path[1]["compName"], "Scene", "{r}");
+    assert_eq!(path[1]["layer"]["id"].as_u64(), Some(card), "{r}");
+    close(&path[1]["point"], &[100.0, 50.0]);
+    // Inside the precomp's box but on none of its pixels: nothing drawn, no levels below.
+    let r = s.execute("layer.at", json!({"x": 20, "y": 60, "deep": true})).unwrap();
+    assert!(r["layer"].is_null(), "{r}");
+    assert_eq!(r["path"].as_array().map(Vec::len), Some(1), "{r}");
+}
