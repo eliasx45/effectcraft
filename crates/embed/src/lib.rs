@@ -159,6 +159,11 @@ pub struct Embedded {
     capture_rx: CaptureReceiver,
     control_port: Option<u16>,
     status: String,
+    /// False while the host hides the view: frames still run (the control channel, playback
+    /// state and agents keep working) but nothing is tessellated or drawn.
+    painting: bool,
+    /// Texture changes from frames that weren't painted, uploaded with the next painted one.
+    pending_textures: egui::TexturesDelta,
 }
 
 impl Embedded {
@@ -284,6 +289,8 @@ impl Embedded {
             capture_rx,
             control_port,
             status,
+            painting: true,
+            pending_textures: egui::TexturesDelta::default(),
         })
     }
 
@@ -380,6 +387,14 @@ impl Embedded {
         }
     }
 
+    /// Pause (`false`) or resume drawing while the host hides the view. A paused
+    /// [`Embedded::run_frame`] still runs the app's logic and UI pass (control requests, agents,
+    /// playback state) but draws nothing, and keeps egui's texture changes for the next drawn
+    /// frame; a screenshot request is still drawn. The view comes back exactly as it was.
+    pub fn set_painting(&mut self, painting: bool) {
+        self.painting = painting;
+    }
+
     /// Run one egui pass and draw it. Call when [`FrameOutput::repaint_after`] (or the `wake`
     /// callback) says so, or after input.
     pub fn run_frame(&mut self) -> FrameOutput {
@@ -431,7 +446,12 @@ impl Embedded {
                 }
             }
         }
-        let mut textures = full.textures_delta;
+        let mut textures = std::mem::take(&mut self.pending_textures);
+        textures.append(full.textures_delta);
+        if !self.painting && capture_data.is_empty() {
+            self.pending_textures = textures;
+            return out;
+        }
         let primitives = self.ctx.tessellate(full.shapes, full.pixels_per_point);
         out.vsync_wait = self.paint(full.pixels_per_point, &primitives, &mut textures, capture_data);
         out
