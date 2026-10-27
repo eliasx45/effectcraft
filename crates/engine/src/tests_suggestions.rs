@@ -107,3 +107,44 @@ fn usage_lists_actions_not_selection() {
     let rename = r["actions"].as_array().unwrap().iter().find(|x| x["command"] == json!("layer.rename")).unwrap();
     assert_eq!(rename["layers"][0]["name"], json!("Card"));
 }
+
+/// 27 Oct: hovering a loopd suggestion (Anchor Point to [0, 0, 0]) ran it on the scratch copy,
+/// and the scratch run's step stayed in the edit feed as the user's change. The next real edit,
+/// an agent's script deleting keys in another comp, then read as reverting it ("Delete Keyframes:
+/// Anchor Point [0, 0, 0] → [380, 130, 0]"). A preview leaves the feed as it was: no phantom
+/// change, and the agent's step describes only what it did.
+#[test]
+fn a_preview_leaves_no_change_in_the_feed() {
+    use crate::feed;
+    let (mut s, a) = session();
+    let card = s.active_comp_id().unwrap().0;
+    s.execute("prop.set", json!({"layer": a, "path": "transform/anchor", "value": [5, 5, 0]})).unwrap();
+    let steps = json!([{"command": "prop.set", "params": {"layer": a, "path": "transform/anchor", "value": [0, 0, 0]}}]);
+    let r = s.execute("suggestion.propose", json!({"label": "Anchor", "comp": card, "steps": steps, "client": "loopd"})).unwrap();
+    let id = r["id"].as_str().unwrap().to_string();
+    // The agent's comp, with a key its script removes.
+    s.execute("comp.new", json!({"name": "Agent", "width": 100, "height": 100, "frameRate": 30, "duration": 2})).unwrap();
+    let other = s.active_comp_id().unwrap().0;
+    let b = s.execute("layer.newSolid", json!({"color": "#000000"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.addKey", json!({"layer": b, "path": "transform/opacity", "time": 0.5, "value": 50})).unwrap();
+    let rev = s.revision;
+    let latest = s.freeze_runtime.latest_source.lock().unwrap().1.clone();
+    let scratch = suggestions::preview(&mut s, &id).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&scratch, &s.project));
+    assert_eq!(s.revision, rev);
+    assert_eq!(s.feed.since(rev).count(), 0, "the scratch run is no one's edit");
+    assert!(std::sync::Arc::ptr_eq(&s.freeze_runtime.latest_source.lock().unwrap().1, &latest), "Smart Freeze keeps rendering the real project");
+    // The agent's script (as `removeKey` runs it): only its own change, in its own comp.
+    s.execute("keys.select", json!({"comp": other, "keys": [{"layer": b, "path": "transform/opacity", "time": 0.5}], "client": "agent"})).unwrap();
+    s.execute("keys.delete", json!({"comp": other, "client": "agent"})).unwrap();
+    let entries: Vec<_> = s.feed.since(rev).cloned().collect();
+    assert!(!entries.is_empty());
+    for e in &entries {
+        assert_eq!(e.client.as_deref(), Some("agent"));
+        let (before, after) = e.projects();
+        assert_eq!(feed::changed_comps(before, after), vec![other], "{:?}", feed::describe(before, after));
+    }
+    // And the document never had the suggestion's value.
+    let anchor = s.execute("prop.get", json!({"comp": card, "layer": a, "path": "transform/anchor"})).unwrap()["value"].clone();
+    assert_eq!(anchor, json!([5.0, 5.0, 0.0]));
+}

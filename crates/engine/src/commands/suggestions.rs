@@ -225,10 +225,17 @@ struct Saved {
     roto_pending: Vec<(effectcraft_project::ItemId, effectcraft_project::LayerId, effectcraft_project::Uid)>,
     analyses_checked: std::sync::Weak<Project>,
     revision: u64,
+    /// Who changed what: the scratch run's steps are no one's edits. Left in, they showed as the
+    /// user's change, and the next real edit (an agent's) as reverting it (27 Oct: a hovered
+    /// loopd suggestion looked like the user's Anchor Point edit that an agent's script undid).
+    feed: crate::feed::Feed,
+    /// The project Smart Freeze renders from (`bump` points it at the scratch copy).
+    freeze_source: (u64, Arc<Project>),
 }
 
 impl Saved {
-    fn take(s: &Session) -> Saved {
+    fn take(s: &mut Session) -> Saved {
+        let freeze_source = s.freeze_runtime.latest_source.lock().unwrap_or_else(PoisonError::into_inner).clone();
         Saved {
             project: s.project.clone(),
             history: s.history.clone(),
@@ -242,6 +249,8 @@ impl Saved {
             roto_pending: s.roto_pending.clone(),
             analyses_checked: s.analyses_checked.clone(),
             revision: s.revision,
+            feed: std::mem::take(&mut s.feed),
+            freeze_source,
         }
     }
 
@@ -261,6 +270,8 @@ impl Saved {
         // TODO(batch1-verify): the revision goes back too, so nothing (frames, loopd's watcher)
         // sees a change; check that `bump`'s other side effects (freeze runtime) need no undo.
         s.revision = self.revision;
+        s.feed = self.feed;
+        *s.freeze_runtime.latest_source.lock().unwrap_or_else(PoisonError::into_inner) = self.freeze_source;
     }
 }
 
