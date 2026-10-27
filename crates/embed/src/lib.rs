@@ -166,6 +166,12 @@ impl Embedded {
         opts: EmbedOptions,
         wake: Arc<dyn Fn(Duration) + Send + Sync>,
     ) -> Result<Self, String> {
+        // Process-wide setup the desktop app's main does first. Each is a no-op when already done
+        // (a logger the host installed keeps its place). No session log file: it would rotate
+        // the desktop app's `Logs/effectcraft.log`.
+        effectcraft_engine::logging::install();
+        effectcraft_engine::render::concurrency::init_global_pool();
+        effectcraft_engine::text::fonts::scan_system_in_background();
         let config = egui_wgpu::WgpuConfiguration { wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(setup()), ..Default::default() };
         let rs = pollster::block_on(egui_wgpu::RenderState::create(&config, &instance, Some(&surface), egui_wgpu::RendererOptions::default()))
             .map_err(|e| format!("EffectCraft found no usable GPU for the embedded view: {e}"))?;
