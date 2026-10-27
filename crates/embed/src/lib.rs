@@ -23,6 +23,13 @@
 //!
 //! Must be used from one thread (the host's main thread on macOS, where the view's events
 //! arrive). No `unsafe` here: the host creates the surface.
+//!
+//! The host must give Rust an allocator of its own when it also runs Chromium (CEF): Chromium's
+//! allocator shim takes over `malloc` and sends it to PartitionAlloc, whose address-space pool
+//! runs out long before the machine's memory under EffectCraft's frame and RAM caches (27 Oct
+//! 2026, Ghostex froze at ~11 GB footprint on a 64 GB Mac: PartitionAlloc's out-of-memory trap
+//! fired on render threads and the crash handler then deadlocked on its lock). Ghostex sets
+//! mimalloc as `#[global_allocator]` in builds with this crate.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
