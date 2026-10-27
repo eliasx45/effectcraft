@@ -305,6 +305,13 @@ impl Embedded {
         self.control_port
     }
 
+    /// The open project's file as EffectCraft last opened or saved it (File ▸ Open, Open
+    /// Recent, Save, Save As), `None` while untitled. Read in process each frame, so the host can
+    /// remember what was open without a control round trip.
+    pub fn project_path(&self) -> Option<&str> {
+        self.app.session.path.as_deref()
+    }
+
     /// Why the control server didn't start, or empty.
     pub fn status(&self) -> &str {
         &self.status
