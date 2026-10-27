@@ -1,0 +1,28 @@
+[package]
+name = "effectcraft-embed"
+description = "EffectCraft's whole app (EffectcraftApp) inside another app's native view: the host gives a wgpu surface and input, EffectCraft draws itself and serves its control channel (EMB1, Ghostex's Editing mode)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+effectcraft-engine = { workspace = true }
+effectcraft-host = { workspace = true }
+# The control server's wire (`control_wire`), shared with the desktop app's server.
+effectcraft-automation = { workspace = true }
+effectcraft-ui-egui = { workspace = true }
+egui = { workspace = true }
+# The same features as ui-egui, so a host builds one eframe/egui-wgpu. No event loop is run:
+# only `eframe::Frame` (the app's `wgpu_render_state`) and the `egui_wgpu` renderer are used.
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
+serde_json = { workspace = true }
+log = { workspace = true }
+pollster = { workspace = true }
+# File dialogs (Import, Save As, Open Project) as the desktop app shows them.
+rfd = { workspace = true }
+# Sound (`audio_out.rs`, the desktop app's file).
+cpal = { workspace = true }

@@ -1527,6 +1527,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "effectcraft-embed"
+version = "0.10.0"
+dependencies = [
+ "cpal",
+ "effectcraft-automation",
+ "effectcraft-engine",
+ "effectcraft-host",
+ "effectcraft-ui-egui",
+ "eframe",
+ "egui",
+ "log",
+ "pollster 0.4.0",
+ "rfd",
+ "serde_json",
+]
+
+[[package]]
 name = "effectcraft-engine"
 version = "0.10.0"
 dependencies = [

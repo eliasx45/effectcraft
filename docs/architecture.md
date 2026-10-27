@@ -50,6 +50,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L5 | `ui-egui` | The desktop interface: docking, panels, viewer, timeline, graph editor, dialogs, control channel; the same app offscreen (`offscreen`: egui_kittest + wgpu, no window) for `mcp --ui` and the `snapshot` example |
 | L5 | `automation` | The MCP server: headless, or through a `ControlTransport` (bridged to the running app's control channel, or the CLI's offscreen app for `mcp --ui`); the Figma plug-in's local bridge (`figma_bridge`) |
 | L6 | apps `effectcraft`, `effectcraft-cli`, `effectcraft-web` | Desktop app; command-line tool (render, exec, get/set, MCP); the browser app (wasm32, [web.md](web.md)) |
+| L6 | `embed` | The whole app inside another app's native view (EMB1, Ghostex's Editing mode): the host gives a wgpu surface and input; builds the session and control server as the desktop app does |
 
 Allowed same-layer edges: `path → keyframe, raster`, `text → path`, `pdf → svg, text`, `effects → project, text, path, track`,
 `media / expr / export / gpu → render`, `export → media`, `lottie → format`, `host → engine, script`,
