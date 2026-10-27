@@ -136,6 +136,37 @@ fn solid_with_effect_and_mask() {
 }
 
 #[test]
+fn dropdown_with_named_items_round_trips() {
+    // 27 Oct (Speaker Card scene): `effects/#1/menu: "Words"` came back as an error, the
+    // recipe naming an item the fresh control's default menu (Item 1-3) doesn't have.
+    let (mut s, c) = session();
+    let l = layer(&s.execute("layer.newSolid", json!({"name": "Ctrl", "width": 16, "height": 16, "color": "#000000"})).unwrap());
+    s.execute("effect.apply", json!({"effect": "Dropdown Menu Control", "layers": [l]})).unwrap();
+    s.execute("effect.editDropdown", json!({"layer": l, "items": ["Lines", "Words", "Letters"]})).unwrap();
+    set(&mut s, l, "effects/#1/menu", json!(1));
+    let r = round_trip(&mut s, c, &[0.0]);
+    assert_eq!(r["layers"][0]["props"]["effects/#1/menu"], json!({"value": "Words", "items": ["Lines", "Words", "Letters"]}), "{r}");
+    // A renamed menu left at its first item still carries its items.
+    set(&mut s, l, "effects/#1/menu", json!(0));
+    let r = round_trip(&mut s, c, &[0.0]);
+    assert_eq!(r["layers"][0]["props"]["effects/#1/menu"]["items"], json!(["Lines", "Words", "Letters"]), "{r}");
+    // "Item N" reads as the Nth item of any menu; a name the menu doesn't have stays an error.
+    let ctl = |v: Value| {
+        json!({"recipe": {"comp": {"name": "D", "width": 10, "height": 10, "duration": 1},
+        "layers": [{"type": "null", "effects": [{"effect": "ec.control.dropdown"}], "props": {"effects/#1/menu": v}}]}})
+    };
+    for (v, want) in [(json!("Item 2"), 1), (json!({"value": "item 3", "items": ["A", "B", "C"]}), 2), (json!({"value": "b", "items": ["A", "B"]}), 1)] {
+        let id = s.execute("comp.fromRecipe", ctl(v.clone())).unwrap_or_else(|e| panic!("{v}: {e}"))["comp"].as_u64().unwrap();
+        let comp = s.project.comp(ItemId(id)).unwrap();
+        let menu = comp.layers.iter().find_map(|l| l.props.prop("effects/#1/menu")).unwrap();
+        assert_eq!(menu.value, KV::Enum(want), "{v}");
+    }
+    for v in [json!("Words"), json!("Item 4"), json!({"value": "Z", "items": ["A"]}), json!({"value": "A", "items": []}), json!({"value": 0, "items": "A"})] {
+        assert!(s.execute("comp.fromRecipe", ctl(v.clone())).is_err(), "{v}");
+    }
+}
+
+#[test]
 fn text_layer_with_animator() {
     let (mut s, c) = session();
     let l = layer(&s.execute("layer.newText", json!({"text": "Hello", "size": 40, "fill": [1, 0.2, 0.2], "position": [160, 100]})).unwrap());

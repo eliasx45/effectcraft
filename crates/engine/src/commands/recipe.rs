@@ -391,6 +391,15 @@ fn drop_z(p: &Property, base: &Property) -> bool {
     p.shown_dims == 2 && if p.keys.is_empty() { z_ok(&p.value) } else { p.keys.iter().all(|k| z_ok(&k.value)) }
 }
 
+/// A dropdown's own menu items (Dropdown Menu Control ▸ Edit) when they aren't the effect's
+/// default ones: the recipe carries them, else a value named after them can't be read back.
+fn popup_items(p: &Property, base: &Property) -> Option<Vec<String>> {
+    match (&p.ui, &base.ui) {
+        (ParamUi::Popup { options }, ParamUi::Popup { options: b }) if options != b => Some(options.clone()),
+        _ => None,
+    }
+}
+
 fn popup_label(ui: &ParamUi, i: u32) -> Option<String> {
     let ParamUi::Popup { options } = ui else { return None };
     let o = options.get(usize::try_from(i).ok()?)?;
@@ -463,7 +472,13 @@ fn dec_val(j: &J, base: &KV, p: &Property, dec: &Dec) -> R<KV> {
         KV::Enum(_) if j.is_string() => {
             let s = j.as_str().unwrap_or_default();
             let ParamUi::Popup { options } = &p.ui else { return Err(format!("`{s}`: this property takes a number")) };
-            let i = options.iter().position(|o| o.eq_ignore_ascii_case(s)).ok_or_else(|| format!("`{s}` isn't one of {}", options.join(", ")))?;
+            // An item's name, else "Item N" (1-based, as the default menu names them).
+            let nth = || {
+                let n = s.get(..5).filter(|w| w.eq_ignore_ascii_case("item "))?;
+                let i = s.get(n.len()..)?.trim().parse::<usize>().ok()?.checked_sub(1)?;
+                (i < options.len()).then_some(i)
+            };
+            let i = options.iter().position(|o| o.eq_ignore_ascii_case(s)).or_else(nth).ok_or_else(|| format!("`{s}` isn't one of {}", options.join(", ")))?;
             KV::Enum(u32::try_from(i).unwrap_or(0))
         }
         KV::Scalar(_) | KV::Vec2(_) | KV::Vec3(_) | KV::Enum(_) => base.with_components(&comps(j)?),
@@ -620,11 +635,12 @@ fn dec_key(j: &J, base: &Property, dec: &Dec) -> R<Keyframe> {
 
 // ---------------------------------------------------------------- properties
 
-/// A property as recipe JSON: its value, or `{keys?, value?, expr?, exprEnabled?}` when it is
-/// animated or has an expression.
+/// A property as recipe JSON: its value, or `{keys?, value?, expr?, exprEnabled?, items?}` when
+/// it is animated, has an expression or is a dropdown with its own menu items.
 fn enc_prop(p: &Property, base: &Property, enc: &mut Enc) -> J {
     let dz = drop_z(p, base);
-    if p.keys.is_empty() && p.expr.is_none() {
+    let items = popup_items(p, base);
+    if p.keys.is_empty() && p.expr.is_none() && items.is_none() {
         return enc_val(&p.value, &base.value, p, dz, enc);
     }
     let mut o = Map::new();
@@ -639,27 +655,43 @@ fn enc_prop(p: &Property, base: &Property, enc: &mut Enc) -> J {
             o.insert("exprEnabled".into(), J::from(false));
         }
     }
+    if let Some(items) = items {
+        o.insert("items".into(), J::from(items));
+    }
     J::Object(o)
 }
 
-/// `{keys?, value?, expr?, exprEnabled?}` with keys or an expression (not a value that is an
-/// object, like a gradient or a text style).
+/// `{keys?, value?, expr?, exprEnabled?, items?}` with keys, an expression or menu items (not a
+/// value that is an object, like a gradient or a text style).
 fn is_wrapper(j: &J) -> bool {
     j.as_object().is_some_and(|o| {
-        (o.contains_key("keys") || o.contains_key("expr")) && o.keys().all(|k| matches!(k.as_str(), "keys" | "value" | "expr" | "exprEnabled"))
+        (o.contains_key("keys") || o.contains_key("expr") || o.contains_key("items"))
+            && o.keys().all(|k| matches!(k.as_str(), "keys" | "value" | "expr" | "exprEnabled" | "items"))
     })
 }
 
 /// Set `p` (holding its default) from recipe JSON: value, keys and expression all follow it.
 fn dec_prop(j: &J, p: &mut Property, dec: &Dec) -> R<()> {
-    let base = p.clone();
     if !is_wrapper(j) {
+        let base = p.clone();
         p.value = dec_val(j, &base.value, &base, dec)?;
         p.keys.clear();
         p.expr = None;
         return Ok(());
     }
     let o = j.as_object().ok_or("expected an object")?;
+    // A dropdown's own menu items come first: its value and keys may be named after them.
+    if let Some(items) = o.get("items") {
+        let items: Vec<String> = items.as_array().ok_or("`items` must be an array of strings")?.iter().filter_map(J::as_str).map(str::to_string).collect();
+        if items.is_empty() || items.len() > 10_000 {
+            return Err("`items`: a dropdown needs 1 to 10000 menu items".into());
+        }
+        if !matches!(p.ui, ParamUi::Popup { .. }) {
+            return Err("`items`: not a dropdown property".into());
+        }
+        p.ui = ParamUi::Popup { options: items };
+    }
+    let base = p.clone();
     p.keys.clear();
     if let Some(v) = o.get("value") {
         p.value = dec_val(v, &base.value, &base, dec)?;
