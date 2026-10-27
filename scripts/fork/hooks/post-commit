@@ -1,0 +1,4 @@
+#!/bin/sh
+# Night queue (27 Oct, Elias): a commit that says "Tests not run" gets an entry for the 01:00 night run.
+command -v night-queue >/dev/null 2>&1 || [ -x "$HOME/.local/bin/night-queue" ] || exit 0
+"$HOME/.local/bin/night-queue" hook "$(git rev-parse --show-toplevel)" || true
