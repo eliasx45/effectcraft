@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use effectcraft_project::{ItemId, ItemKind, LayerId, LayerSource, Project};
+use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, bad, f_p, str_p};
@@ -80,14 +81,17 @@ struct Slot {
     kind: &'static str,
     /// The text of a text layer, the source's name of a footage or precomp layer.
     now: String,
+    /// Where `comp`'s time 0 sits in the scene comp's time (the start times of the precomp
+    /// layers down to it; 0 in the scene comp itself).
+    offset: Tick,
 }
 
 /// The text, footage and precomp layers of `root` and the comps nested in it.
 fn slots(project: &Project, root: ItemId) -> Vec<Slot> {
     let mut out = vec![];
-    let mut queue = vec![(root, 0usize)];
+    let mut queue = vec![(root, 0usize, Tick::ZERO)];
     let mut seen = vec![];
-    while let Some((cid, depth)) = queue.pop() {
+    while let Some((cid, depth, offset)) = queue.pop() {
         if seen.contains(&cid) || seen.len() >= MAX_COMPS {
             continue;
         }
@@ -105,13 +109,13 @@ fn slots(project: &Project, root: ItemId) -> Vec<Slot> {
                 LayerSource::Footage { item } => ("footage", project.item(*item).map(|i| i.name.clone()).unwrap_or_default()),
                 LayerSource::Comp { item } => {
                     if depth < MAX_DEPTH {
-                        queue.push((*item, depth + 1));
+                        queue.push((*item, depth + 1, offset + l.start_time));
                     }
                     ("comp", project.item(*item).map(|i| i.name.clone()).unwrap_or_default())
                 }
                 _ => continue,
             };
-            out.push(Slot { comp: cid, layer: l.id, name: l.name.clone(), kind, now });
+            out.push(Slot { comp: cid, layer: l.id, name: l.name.clone(), kind, now, offset });
         }
     }
     out
@@ -145,6 +149,19 @@ fn bool_p(p: &Value, key: &str) -> Result<Option<bool>> {
     }
 }
 
+/// The start time a footage layer of the scene needs to play `item` in sync with the same
+/// footage in comp `cid` (its layer live at the scene's start, else its first): the target
+/// layer's start, less the scene layer's start, less where the slot's comp sits in the scene.
+/// `None` when no layer of `cid` but the scene's plays `item`. Time stretch is not followed.
+fn synced_start(project: &Project, cid: ItemId, scene_layer: LayerId, item: ItemId, offset: Tick) -> Option<Tick> {
+    let comp = project.comp(cid)?;
+    let scene = comp.layer(scene_layer)?;
+    let at = scene.in_point.max(scene.start_time);
+    let same: Vec<_> = comp.layers.iter().filter(|l| l.id != scene_layer && matches!(l.source, LayerSource::Footage { item: i } if i == item)).collect();
+    let target = same.iter().find(|l| l.in_point <= at && at < l.out_point).or_else(|| same.first())?;
+    Some(target.start_time - scene.start_time - offset)
+}
+
 fn scene(s: &mut Session, p: &Value) -> Result<Value> {
     let folder = str_p(p, "folder").map(str::to_lowercase);
     let Some(name) = str_p(p, "scene").map(str::trim).filter(|n| !n.is_empty()) else {
@@ -172,6 +189,7 @@ fn scene(s: &mut Session, p: &Value) -> Result<Value> {
         (None, None) => None,
     };
     let collapse = bool_p(p, "collapse")?;
+    let sync = bool_p(p, "syncFootage")?.unwrap_or(false);
     let swaps: BTreeMap<String, Value> = match p.get("swap").filter(|v| !v.is_null()) {
         None => BTreeMap::new(),
         Some(Value::Object(m)) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -196,6 +214,7 @@ fn scene(s: &mut Session, p: &Value) -> Result<Value> {
             s.execute("layer.setSwitch", json!({"comp": cid.0, "layers": [l.0], "switch": "collapse", "value": true}))?;
         }
         let found = slots(&s.project, item);
+        let mut unsynced = vec![];
         let mut swapped = vec![];
         let mut unmatched = vec![];
         for (key, v) in &swaps {
@@ -206,6 +225,7 @@ fn scene(s: &mut Session, p: &Value) -> Result<Value> {
                 continue;
             }
             for sl in hits {
+                let mut synced = Value::Null;
                 let how = if sl.kind == "text" {
                     let text = match v {
                         Value::String(t) => t.clone(),
@@ -216,9 +236,22 @@ fn scene(s: &mut Session, p: &Value) -> Result<Value> {
                 } else {
                     let new = swap_item(s, v, key)?;
                     s.execute("layer.replaceSource", json!({"comp": sl.comp.0, "layer": sl.layer.0, "item": new.0}))?;
+                    // The comp's own presenter footage: play it in sync with the edit's copy.
+                    if sync && sl.kind == "footage" {
+                        match scene_layer.and_then(|l| synced_start(&s.project, cid, l, new, sl.offset)) {
+                            Some(start) => {
+                                s.edit("Sync Footage", None, |proj, _| {
+                                    super::layer_mut(proj, sl.comp, sl.layer)?.start_time = start;
+                                    Ok(())
+                                })?;
+                                synced = json!(start.seconds());
+                            }
+                            None => unsynced.push(key.clone()),
+                        }
+                    }
                     "source"
                 };
-                swapped.push(json!({"slot": key, "comp": sl.comp.0, "layer": sl.layer.0, "name": sl.name, "was": sl.now, "how": how}));
+                swapped.push(json!({"slot": key, "comp": sl.comp.0, "layer": sl.layer.0, "name": sl.name, "was": sl.now, "how": how, "syncedStart": synced}));
             }
         }
         if !unmatched.is_empty() && swapped.is_empty() && !swaps.is_empty() {
@@ -241,6 +274,12 @@ fn scene(s: &mut Session, p: &Value) -> Result<Value> {
         let mut notes = vec![];
         if !unmatched.is_empty() {
             notes.push(format!("no slot named {}: see `slots` for the names", unmatched.iter().map(|u| format!("“{u}”")).collect::<Vec<_>>().join(", ")));
+        }
+        if !unsynced.is_empty() {
+            notes.push(format!(
+                "syncFootage: no layer of the comp plays the footage swapped into {}, so it keeps the scene's timing",
+                unsynced.iter().map(|u| format!("“{u}”")).collect::<Vec<_>>().join(", ")
+            ));
         }
         if let Some(n) = applied["needsFootage"].as_array().filter(|a| !a.is_empty()) {
             notes.push(format!("{} footage item(s) are placeholders: swap them (swap {{\"layer name\": file}}) or relink with footage.relink", n.len()));
@@ -281,7 +320,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Library Scene",
             [],
             None,
-            "{scene? (a Motion Library comp card by name, loosely: \"yt zoom out\" finds “YT Zoom Out”; or its id; none = list the scenes), folder? (category filter, e.g. \"Devin Jatho\"; default: cards in a Scenes folder win), comp? (default the open one), at? (comp s) | word? (+ occurrence?, 1-based: the scene starts on that word of the comp's speech map); default the playhead, swap? ({\"layer name or footage name\": \"new text\" for a text layer | a file path, item name or id for a footage/precomp layer}: every layer of the scene and its precomps with that name), collapse? (bool: Collapse Transformations on the scene layer; default on when the scene comp holds an adjustment layer, so its dims and blurs reach the edit under it)} → {scene {id, name, category}, comp, item (the scene's comp), layer, at, collapsed, slots: [{comp, compName, layer, name, kind (text|footage|comp), now (text or source name)}], swapped: [{slot, comp, layer, name, was, how (text|source)}], unmatched, alternatives (other close names), needsFootage, notes}. Imports the scene like library.apply, then swaps; one undo step",
+            "{scene? (a Motion Library comp card by name, loosely: \"yt zoom out\" finds “YT Zoom Out”; or its id; none = list the scenes), folder? (category filter, e.g. \"Devin Jatho\"; default: cards in a Scenes folder win), comp? (default the open one), at? (comp s) | word? (+ occurrence?, 1-based: the scene starts on that word of the comp's speech map); default the playhead, swap? ({\"layer name or footage name\": \"new text\" for a text layer | a file path, item name or id for a footage/precomp layer}: every layer of the scene and its precomps with that name), syncFootage? (bool, default false: a footage layer swapped to footage the comp already plays, e.g. the presenter, starts so it plays in sync with it), collapse? (bool: Collapse Transformations on the scene layer; default on when the scene comp holds an adjustment layer, so its dims and blurs reach the edit under it)} → {scene {id, name, category}, comp, item (the scene's comp), layer, at, collapsed, slots: [{comp, compName, layer, name, kind (text|footage|comp), now (text or source name)}], swapped: [{slot, comp, layer, name, was, how (text|source), syncedStart (layer start in its comp, s, or null)}], unmatched, alternatives (other close names), needsFootage, notes}. Imports the scene like library.apply, then swaps; one undo step",
             always,
             scene
         )

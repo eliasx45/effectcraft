@@ -192,3 +192,35 @@ fn a_scene_with_an_adjustment_layer_is_collapsed_unless_told_not_to() {
     let r = s.execute("library.scene", json!({"scene": "YT Zoom Out", "at": 0, "collapse": true})).unwrap();
     assert!(collapsed(&s, edit, &r), "{r:#}");
 }
+
+#[test]
+fn swapped_presenter_footage_plays_in_sync_with_the_edit() {
+    let dir = out_dir("library-scene-sync");
+    speaker_library(&dir);
+    let mut s = session(&dir);
+    let edit = s.active_comp_id().unwrap();
+    // The edit plays the presenter from 10 s into the file.
+    let cam = footage(&mut s, "Presenter");
+    let pl = s.execute("layer.addItem", json!({"comp": edit.0, "item": cam})).unwrap()["layer"].as_u64().unwrap();
+    set_start(&mut s, edit, pl, -10.0);
+    let r = s.execute("library.scene", json!({"scene": "Speaker Card", "at": 4, "swap": {"Speaker": "Presenter"}, "syncFootage": true})).unwrap();
+    // Scene at 4 s, its box 1 s in: the swapped layer starts at -10 - 4 - 1 = -15 s in the box,
+    // so at edit time t it shows the file at t + 10, as the edit's own presenter layer does.
+    let sw = &r["swapped"][0];
+    assert_eq!(sw["syncedStart"].as_f64(), Some(-15.0), "{r:#}");
+    let l = s
+        .project
+        .comp(effectcraft_project::ItemId(sw["comp"].as_u64().unwrap()))
+        .unwrap()
+        .layer(effectcraft_project::LayerId(sw["layer"].as_u64().unwrap()))
+        .unwrap();
+    assert!(matches!(l.source, LayerSource::Footage { item } if item.0 == cam));
+    assert_eq!(l.start_time.seconds(), -15.0);
+    // Without syncFootage the sample's start stays; footage the edit doesn't play gets a note.
+    let r = s.execute("library.scene", json!({"scene": "Speaker Card", "at": 4, "swap": {"Speaker": "Presenter"}})).unwrap();
+    assert_eq!(r["swapped"][0]["syncedStart"], Value::Null, "{r:#}");
+    let other = footage(&mut s, "B-roll");
+    let r = s.execute("library.scene", json!({"scene": "Speaker Card", "at": 4, "swap": {"Speaker": other}, "syncFootage": true})).unwrap();
+    assert_eq!(r["swapped"][0]["syncedStart"], Value::Null, "{r:#}");
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("syncFootage")), "{r:#}");
+}
