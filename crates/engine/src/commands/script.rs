@@ -4,7 +4,9 @@
 //! the layers covering it and the stretches with no animation.
 //!
 //! - `script.load {path | text}`: store the script (undoable).
-//! - `script.get`: everything the Script tab shows, for Claude over MCP.
+//! - `script.get`: everything the Script tab shows, for Claude over MCP and Ghostex's Script panel.
+//!   SX7: with no .txt it builds the lines from the speech map, and every line carries its chapter
+//!   (comp markers), deep scene path and gap flag ([`crate::script_lines`]).
 //! - `script.copyRef {line | from, to}`: a short reference for the chat ("10-10 MAIN · script line 2
 //!   "really WORKS every single time" · f98–f127 · words: …"); the app puts it on the clipboard.
 //! - `script.board {lines}`: a storyboard of lines; the app sends it to FigCraft.
@@ -16,11 +18,13 @@ use std::sync::Arc;
 
 use effectcraft_project::speech::{AlignedLine, LineTok, Script, SpeechMap, SpeechWord, align_script, emphasis};
 use effectcraft_project::{Comp, FootageKind, ItemId, ItemKind, LayerId, LayerSource, Project};
+use effectcraft_render::RenderOpts;
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, b_p, bad, comp_id, f_p, frontend, has_comp, str_p};
 use crate::lint;
+use crate::script_lines::{self, Chapter, SceneFinder, SceneHit};
 use crate::{EngineError, Result, Session, cmd, query};
 
 /// Most characters a script file may have (about 2 MB of text).
@@ -193,15 +197,100 @@ fn line_json(i: usize, line: &AlignedLine, text: &str, words: &[SpeechWord], emp
     o
 }
 
+/// One said word for `script.get`'s `words`: index, text, times, frame, stress and emphasis.
+fn word_json(i: usize, w: &SpeechWord, emph: &[f32], fps: f64) -> Value {
+    let e = emph.get(i).copied().unwrap_or(0.0);
+    let mut o = json!({
+        "index": i,
+        "text": w.word,
+        "start": r3(w.start.seconds()),
+        "end": r3(w.end.seconds()),
+        "frame": (w.start.seconds() * fps).round() as i64,
+        "emphasis": e,
+        "strong": e > 0.5,
+        "stressed": w.stressed().is_some(),
+    });
+    if w.stressed().is_some() {
+        o["stress"] = json!((peak_of(w, fps).0 * fps).round() as i64);
+    }
+    o
+}
+
+/// SX7: chapter, scene path, gap and words of a line spanning words `a..=b`.
+fn annotate(o: &mut Value, finder: &mut SceneFinder, chs: &[Chapter], words: &[SpeechWord], (a, b): (usize, usize), emph: &[f32], fps: f64) {
+    let Some(ws) = words.get(a..=b) else { return };
+    let start = ws.first().map_or(0.0, |w| w.start.seconds());
+    let end = ws.last().map_or(start, |w| w.end.seconds());
+    match script_lines::chapter_at(chs, start).and_then(|i| chs.get(i).map(|c| (i, c))) {
+        Some((i, c)) => {
+            o["chapter"] = json!(c.name);
+            o["chapterIndex"] = json!(i);
+        }
+        None => {
+            o["chapter"] = Value::Null;
+            o["chapterIndex"] = Value::Null;
+        }
+    }
+    let ls = script_lines::line_scenes(finder, ws);
+    let scene = |h: &SceneHit| {
+        json!({
+            "path": h.path,
+            "layers": h.layers.iter().zip(&h.path).map(|((c, l), n)| json!({"comp": c.0, "layer": l.0, "name": n})).collect::<Vec<_>>(),
+        })
+    };
+    o["scene"] = ls.scenes.first().map(scene).unwrap_or(Value::Null);
+    o["scenePath"] = json!(ls.scenes.first().map(|h| h.path.clone()).unwrap_or_default());
+    o["scenes"] = Value::Array(ls.scenes.iter().map(scene).collect());
+    let gap = ls.gap();
+    o["gap"] = json!(gap);
+    o["gapSeconds"] = json!(if gap { r3((end - start).max(0.0)) } else { 0.0 });
+    o["coveredSeconds"] = json!(r3(ls.covered_s));
+    o["bare"] = ls.bare.as_ref().map(scene).unwrap_or(Value::Null);
+    o["words"] = Value::Array(ws.iter().enumerate().map(|(k, w)| word_json(a + k, w, emph, fps)).collect());
+}
+
+/// The layers with sound in a comp: what "Transcribe voice" (`speech.transcribe {layer}`) offers.
+fn sound_layers(project: &Project, comp: &Comp) -> Vec<Value> {
+    comp.layers
+        .iter()
+        .filter(
+            |l| matches!(l.source, LayerSource::Footage { item } if matches!(project.item(item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if f.has_audio)),
+        )
+        .take(50)
+        .map(|l| json!({"layer": l.id.0, "name": l.name}))
+        .collect()
+}
+
 fn get(s: &mut Session, p: &Value) -> Result<Value> {
-    const C: &str = "script.get";
     let cid = comp_id(s, p)?;
-    let map = the_map(s, cid, C)?;
-    let script = the_script(&map, C)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let fps = comp.frame_rate.as_f64();
+    let chs = script_lines::chapters(comp);
+    let chapters_json: Vec<Value> = chs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| json!({"index": i, "name": c.name, "start": r3(c.start), "end": r3(c.end), "frame": (c.start * fps).round() as i64}))
+        .collect();
+    let map = comp.speech.clone();
+    let has_script = map.as_ref().is_some_and(|m| m.script.is_some());
+    let want_speech = str_p(p, "source") == Some("speech");
+    let has_words = map.as_ref().is_some_and(|m| !m.words.is_empty());
+    let Some(map) = map.filter(|_| (has_script && !want_speech) || has_words) else {
+        // No words yet: Ghostex shows one "Transcribe voice" button (speech.transcribe {layer}).
+        return Ok(json!({
+            "comp": cid.0,
+            "compName": comp_name(&s.project, cid),
+            "source": "none",
+            "needsTranscribe": true,
+            "transcribe": sound_layers(&s.project, comp),
+            "fps": fps,
+            "chapters": chapters_json,
+            "lines": [],
+        }));
+    };
     let min_gap = f_p(p, "gapSeconds").filter(|g| g.is_finite() && *g > 0.0).unwrap_or(DEFAULT_GAP_S);
-    let lines = align_script(script, &map.words);
+    let pause = f_p(p, "pauseSeconds").filter(|g| g.is_finite() && *g >= 0.0).unwrap_or(script_lines::DEFAULT_PAUSE_S);
+    let max_words = p.get("maxWords").and_then(Value::as_u64).map(|n| (n as usize).clamp(1, 200)).unwrap_or(script_lines::DEFAULT_MAX_WORDS);
     let emph = emphasis(&map.words);
     let voice = map.layer;
     // Only where the voice is heard in the comp: a 575 s voice-over in a 12 s comp reported
@@ -210,30 +299,101 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
     let (va, vb) = (va.max(0.0), vb.min(comp.duration.seconds()).max(va.max(0.0)));
     let gap_list = gaps(&animation_times(&s.project, comp, voice), va, vb, min_gap);
     let summary = b_p(p, "summary").unwrap_or(false);
+    let r = super::layout_cmds::renderer(s, RenderOpts::default());
+    let mut finder = SceneFinder::new(&r, &s.project, cid, voice);
     let mut out_lines = vec![];
-    for (i, (al, sl)) in lines.iter().zip(&script.lines).enumerate() {
-        let mut o = line_json(i, al, &sl.text, &map.words, &emph, fps);
-        if let Some((a, b)) = al.span(&map.words) {
-            let (a, b) = (a.seconds(), b.seconds());
-            o["coverage"] = Value::Array(coverage(&s.project, comp, voice, a, b));
-            o["gap"] = json!(gap_list.iter().any(|(x, y)| *x < b && *y > a));
+    let script = map.script.as_ref().filter(|_| !want_speech);
+    let (source, name, said, cut, not_said, adlibs) = match script {
+        Some(script) => {
+            let lines = align_script(script, &map.words);
+            for (i, (al, sl)) in lines.iter().zip(&script.lines).enumerate() {
+                let mut o = line_json(i, al, &sl.text, &map.words, &emph, fps);
+                if let Some((a, b)) = al.span(&map.words) {
+                    let (a, b) = (a.seconds(), b.seconds());
+                    o["coverage"] = Value::Array(coverage(&s.project, comp, voice, a, b));
+                    o["quiet"] = json!(gap_list.iter().any(|(x, y)| *x < b && *y > a));
+                }
+                if let (Some(a), Some(b)) = (al.first, al.last) {
+                    annotate(&mut o, &mut finder, &chs, &map.words, (a.min(b), a.max(b)), &emph, fps);
+                }
+                out_lines.push(o);
+            }
+            (
+                "script",
+                script.name.clone(),
+                lines.iter().filter(|l| !l.cut()).count(),
+                lines.iter().filter(|l| l.cut()).count(),
+                lines.iter().map(AlignedLine::not_said).sum::<usize>(),
+                lines.iter().map(AlignedLine::adlibs).sum::<usize>(),
+            )
         }
-        if summary && let Some(m) = o.as_object_mut() {
-            m.remove("tokens");
+        None => {
+            let ranges = script_lines::speech_lines(&map.words, pause, max_words);
+            for (i, (a, b)) in ranges.iter().copied().enumerate() {
+                let Some(ws) = map.words.get(a..=b) else { continue };
+                let text = ws.iter().map(|w| w.word.as_str()).collect::<Vec<_>>().join(" ");
+                let (ta, tb) = (ws.first().map_or(0.0, |w| w.start.seconds()), ws.last().map_or(0.0, |w| w.end.seconds()));
+                // The same tokens as a script line whose every word is said (the egui panel reads them).
+                let toks: Vec<Value> = ws
+                    .iter()
+                    .enumerate()
+                    .map(|(k, w)| {
+                        let mut t = json!({"text": w.word, "said": a + k, "frame": (w.start.seconds() * fps).round() as i64, "emphasis": emph.get(a + k).copied().unwrap_or(0.0)});
+                        if w.stressed().is_some() {
+                            t["stress"] = json!((peak_of(w, fps).0 * fps).round() as i64);
+                        }
+                        t
+                    })
+                    .collect();
+                let mut o = json!({
+                    "line": i + 1,
+                    "text": text,
+                    "cut": false,
+                    "notSaid": 0,
+                    "adlibs": 0,
+                    "tokens": toks,
+                    "start": r3(ta),
+                    "end": r3(tb),
+                    "frames": [(ta * fps).round() as i64, (tb * fps).round() as i64],
+                    "firstWord": a,
+                    "lastWord": b,
+                    "coverage": coverage(&s.project, comp, voice, ta, tb),
+                    "quiet": gap_list.iter().any(|(x, y)| *x < tb && *y > ta),
+                });
+                annotate(&mut o, &mut finder, &chs, &map.words, (a, b), &emph, fps);
+                out_lines.push(o);
+            }
+            ("speech", "Voice (speech map)".to_string(), ranges.len(), 0, 0, 0)
         }
-        out_lines.push(o);
+    };
+    let scene_gaps: Vec<Value> = out_lines
+        .iter()
+        .filter(|l| l.get("gap").and_then(Value::as_bool).unwrap_or(false))
+        .map(|l| json!({"line": l["line"], "start": l["start"], "end": l["end"], "frames": l["frames"], "seconds": l["gapSeconds"], "chapter": l["chapter"]}))
+        .collect();
+    if summary {
+        for o in out_lines.iter_mut().filter_map(Value::as_object_mut) {
+            o.remove("tokens");
+            o.remove("words");
+        }
     }
     Ok(json!({
         "comp": cid.0,
         "compName": comp_name(&s.project, cid),
-        "name": script.name,
+        "source": source,
+        "name": name,
+        "engine": map.engine,
         "voiceLayer": voice.map(|l| l.0),
         "fps": fps,
+        "pauseSeconds": pause,
+        "maxWords": max_words,
+        "chapters": chapters_json,
         "lines": out_lines,
-        "said": lines.iter().filter(|l| !l.cut()).count(),
-        "cut": lines.iter().filter(|l| l.cut()).count(),
-        "notSaid": lines.iter().map(AlignedLine::not_said).sum::<usize>(),
-        "adlibs": lines.iter().map(AlignedLine::adlibs).sum::<usize>(),
+        "said": said,
+        "cut": cut,
+        "notSaid": not_said,
+        "adlibs": adlibs,
+        "sceneGaps": scene_gaps,
         "gapSeconds": min_gap,
         "gaps": gap_list.iter().map(|(a, b)| json!({"start": r3(*a), "end": r3(*b), "frames": [(a * fps).round() as i64, (b * fps).round() as i64]})).collect::<Vec<_>>(),
     }))
@@ -605,7 +765,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "script.get",
             "Script",
-            "{comp?, gapSeconds? (default 10: a stretch of voice-over this long with no animation is a gap), summary? (no tokens)} → {comp, compName, name, voiceLayer, fps, said, cut, notSaid, adlibs, gaps: [{start, end, frames}], lines: [{line (1-based), text, cut, notSaid, adlibs, start?, end?, frames?: [first, last], firstWord?, lastWord? (speech-map indices for word.apply / script.copyRef), gap?, coverage?: [{layer, name}] (layers on screen during the line), tokens: [{text, said? (word index), frame?, stress? (peak frame), emphasis? (0..1), notSaid?, adlib?}]}]}",
+            "{comp?, source? (\"speech\": lines from the speech map even when a .txt is loaded), pauseSeconds? (default 0.32: a longer pause ends a speech line), maxWords? (default 11), gapSeconds? (default 10: a stretch this long with no keyframes marks a line `quiet`), summary? (no tokens / words)} → {comp, compName, source: script | speech | none, name, engine, voiceLayer, fps, chapters: [{index, name, start, end, frame}] (the comp markers), said, cut, notSaid, adlibs, sceneGaps: [{line, start, end, frames, seconds, chapter}], gaps: [{start, end, frames}], lines: [{line (1-based), text, cut, notSaid, adlibs, start?, end?, frames?, firstWord?, lastWord? (speech-map indices for word.apply / script.copyRef), chapter, chapterIndex, scene: {path, layers: [{comp, layer, name}]} | null, scenePath, scenes (every scene during the line), gap (no scene covers it), gapSeconds, coveredSeconds, bare (where a gap is), quiet, coverage: [{layer, name}], words: [{index, text, start, end, frame, stressed, stress? (peak frame), emphasis, strong}], tokens}]}. source none (no words): {needsTranscribe, transcribe: [{layer, name}]} for speech.transcribe. docs/control-protocol.md, \"Script\"",
             get
         ),
         cmd!(

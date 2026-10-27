@@ -598,3 +598,95 @@ returns the place params; the desktop app connects to FigCraft (127.0.0.1, port
 `project` is the saved project's path (empty for an unsaved one). The toast says "Sent to
 FigCraft" when FigCraft answers `ok`, "FigCraft isn't open" when nothing listens on the port, else
 FigCraft's error. A headless session (CLI, MCP without the app) only returns the params.
+
+## Script (for Ghostex's Script panel)
+
+Ghostex draws the Script panel itself (GPUI) and reads everything from EffectCraft's engine
+commands, sent as `{"method": "engine.execute", "params": {"command": "<id>", "params": {…}}}`
+(or in process through the embedded app's session). It owns "→ Chat"; EffectCraft has no chat
+outbox. SX7, `crates/engine/src/script_lines.rs` + `commands/script.rs`.
+
+### `script.get {comp?, source?, pauseSeconds?, maxWords?, gapSeconds?, summary?}`
+
+Read-only. `comp`: id or name (default the active comp; Ghostex passes the shown comp).
+
+- **With no .txt loaded** the lines come from the comp's speech map (`speech.get`'s words: cached
+  Scribe + MFA). A pause longer than `pauseSeconds` (default **0.32 s**) or `maxWords` words
+  (default **11**, 1–200) ends a line. Every word is on exactly one line.
+- **With a .txt loaded** (`script.load {path | text}`) the lines are the script's, lined up with
+  the words said, as before (struck-out `notSaid` words, green `adlib` words in `tokens`), with
+  the same chapter / scene / gap / words fields. `source: "speech"` ignores the script.
+- **With no words** (no speech map): `{comp, compName, source: "none", needsTranscribe: true,
+  transcribe: [{layer, name}], fps, chapters, lines: []}`. Show one "Transcribe voice" button:
+  `speech.transcribe {comp, layer}` with the first `transcribe` layer (the desktop app runs it in
+  the background; `script.get` fills itself once the map is imported).
+
+Response (times are comp seconds rounded to ms, frames are comp frames):
+
+```jsonc
+{
+  "comp": 12, "compName": "MAIN",
+  "source": "speech",              // "speech" | "script" | "none"
+  "name": "Voice (speech map)",    // or the script's file name
+  "engine": "scribe_v1 + mfa …",   // how the speech map was made
+  "voiceLayer": 3, "fps": 29.97,
+  "pauseSeconds": 0.32, "maxWords": 11,
+  "chapters": [                    // the comp markers = Ghostex's Scenes strip
+    {"index": 3, "name": "IDEA · TikTokers got paid", "start": 75.63, "end": 112.93, "frame": 2267}
+  ],
+  "said": 17, "cut": 0, "notSaid": 0, "adlibs": 0,   // script counts (speech: said = lines)
+  "sceneGaps": [{"line": 5, "start": 95.1, "end": 98.6, "frames": [2850, 2955], "seconds": 3.5, "chapter": "IDEA · TikTokers got paid"}],
+  "gapSeconds": 10, "gaps": [{"start": 0, "end": 0, "frames": [0, 0]}],  // old: stretches with no keyframes
+  "lines": [{
+    "line": 4,                       // 1-based
+    "text": "it happens every single day",
+    "start": 91.5, "end": 94.2, "frames": [2742, 2823],
+    "firstWord": 210, "lastWord": 214,   // speech-map word indices (word.apply, script.copyRef)
+    "cut": false, "notSaid": 0, "adlibs": 0,
+    "chapter": "IDEA · TikTokers got paid", "chapterIndex": 3,   // null before the first marker
+    "scene": {"path": ["26-10 P1", "S1 03 Everyday"],
+              "layers": [{"comp": 12, "layer": 40, "name": "26-10 P1"}, {"comp": 31, "layer": 7, "name": "S1 03 Everyday"}]},
+    "scenePath": ["26-10 P1", "S1 03 Everyday"],   // below compName: show "MAIN › 26-10 P1 › S1 03 Everyday"
+    "scenes": [ /* every scene playing during the line, same shape as scene; 2+ = coverage chips */ ],
+    "gap": false,                    // true: no scene covers any of the line's words
+    "gapSeconds": 0,                 // the line's length when gap ("⚠ 3.5 s of voice, no animation")
+    "coveredSeconds": 2.4,
+    "bare": null,                    // a gap's path (e.g. {"path": ["26-10 P1"], …}: the part plays, no scene in it)
+    "quiet": false,                  // old flag: in a stretch of gapSeconds with no keyframes
+    "coverage": [{"layer": 40, "name": "26-10 P1"}],   // the comp's own layers during the line
+    "words": [{"index": 210, "text": "it", "start": 91.5, "end": 91.62, "frame": 2742,
+               "stressed": true,       // has a primary-stressed syllable (MFA)
+               "stress": 2743,         // the stressed syllable's accent frame (peaks land here)
+               "emphasis": 0.31,       // 0..1, how hard it's said
+               "strong": false}],      // emphasis > 0.5: draw it bright
+    "tokens": [ /* the egui panel's tokens: {text, said?, frame?, stress?, emphasis?, notSaid?, adlib?} */ ]
+  }]
+}
+```
+
+`summary: true` drops `words` and `tokens`. Re-read after the project `revision` changes.
+
+**Scenes.** A line's scene is found at the middle of each of its words (at most 24 samples). At
+each comp level the topmost visible precomp layer active then (not a guide, adjustment or the
+voice layer) is followed, its time mapped like `layer.at {deep}` (time remap, stretch, preserved
+frame rate). A precomp whose precomps play one after another (a part holding S1 01 … S1 07) is
+a container: the path goes into it, and when none of its precomps plays there the time is a gap.
+Any other precomp is the scene and the path stops there. A non-container precomp spanning 90 %+
+of its parent is a backdrop (presenter, BG) and is skipped; with no precomp, a text or shape
+layer counts as the scene. Footage, solids and nulls never count: voice over the presenter alone
+is a gap. At most 8 levels.
+
+### Acting on a line or a word
+
+- **Seek:** `time.set {frame}` (or `{time}` in seconds) with the line's `frames[0]` or a word's
+  `frame`. The active comp's time; Ghostex follows the playhead to highlight the line under it.
+- **Select a scene layer:** `scene.layers` names each layer's comp. A layer of the shown comp:
+  `layer.select {layers: [id]}`. A deeper one: `comp.open {comp}` then `layer.select {layers: [id]}`.
+- **Word wheel / phrase actions** (one undo step each, peak on the stressed syllable):
+  `word.apply {comp?, index | from, to, item}` with `item` = `pop`, `caption`, `pill`,
+  `highlight`, `zoom` (`layers?`, default the selection), `sfx`, `preset` (`id` | `query`,
+  `adapt?`), `copy` (= `script.copyRef`). A Motion Library text animation on a phrase:
+  `text.apply {preset, words: [from, to], word?, sync?, glow?, distance?: near|mid|far}`
+  (`text.presetFamilies` lists the presets; in the desktop app `followUp` runs the glow style).
+- **A reference for the chat:** `script.copyRef {line | from, to}` → `{text, …}`; the desktop app
+  also copies it to the clipboard (a frontend step that hosts can ignore).
