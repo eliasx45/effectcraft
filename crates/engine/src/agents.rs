@@ -415,7 +415,10 @@ fn release(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn claims(s: &mut Session, _: &Value) -> Result<Value> {
-    Ok(json!({"claims": s.claims_json()}))
+    // TEAM1: working shadows keep their sources claimed by their agents; the badges list them.
+    crate::commands::shadow::refresh(s);
+    let shadows = crate::commands::shadow::badges(s);
+    Ok(json!({"claims": s.claims_json(), "shadows": shadows}))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -442,6 +445,11 @@ pub fn specs() -> Vec<CommandSpec> {
             run: release,
             journal: false,
         },
-        query!("comp.claims", "Composition Claims", "{} → {claims: [{comp, name, client, expiresIn (s), ttl}]}", claims),
+        query!(
+            "comp.claims",
+            "Composition Claims",
+            "{} → {claims: [{comp, name, client, expiresIn (s), ttl}], shadows: [{shadow, name, comp, compName, agent, status, stale, …}] (the editing team's shadows, for the comps' badges)}",
+            claims
+        ),
     ]
 }

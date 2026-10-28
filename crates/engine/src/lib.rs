@@ -628,6 +628,9 @@ pub struct Session {
     /// PN1: Pen / Comment review marks on the Composition viewer (`annotate.*`): session state,
     /// never in the project or the undo history.
     pub annotations: commands::annotate::Annotations,
+    /// TEAM1: the shadows' session side (`shadow.*`): review statuses that undo doesn't take
+    /// back, the event log hosts poll, and the sources as they were copied (for exact diffs).
+    pub shadows: commands::shadow::ShadowState,
 }
 
 /// The count behind [`Session::running_for_script`]; only the engine changes it.
@@ -761,6 +764,7 @@ impl Default for Session {
             motion_library: Default::default(),
             followers: Default::default(),
             annotations: Default::default(),
+            shadows: Default::default(),
             tasks: vec![],
             job_log: vec![],
             next_task_id: 1,

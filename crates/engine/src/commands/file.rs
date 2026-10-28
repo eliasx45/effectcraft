@@ -98,7 +98,9 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
 /// ([`Session::open_comps_to_save`]; filled in here at save time, so changing tabs or the
 /// current time never marks the project modified).
 pub(crate) fn file_json(s: &Session) -> Result<String> {
-    Ok(s.project.to_file_json_with(s.open_comps_to_save().as_ref())?)
+    // TEAM1: shadow review statuses as this session has them (an undo may have rolled back the
+    // project's copy).
+    Ok(super::shadow::for_save(s).to_file_json_with(s.open_comps_to_save().as_ref())?)
 }
 
 /// The project file's text for `path`: `.ecproj` JSON, or XML for `.ecprojx` / `.xml` (a

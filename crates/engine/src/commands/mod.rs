@@ -29,6 +29,8 @@ pub mod render_compare;
 pub mod roto_cmds;
 pub mod round_corners;
 pub mod scripts;
+// TEAM1: the session keeps the shadows' statuses and events; the save writes them.
+pub mod shadow;
 pub mod shape_stroke;
 pub mod shape_tool;
 // Batch 1 lane C: the UI lists and previews suggestions (CX4).

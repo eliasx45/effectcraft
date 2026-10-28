@@ -170,7 +170,7 @@ pub fn hash_json<T: Serialize + ?Sized>(v: &T) -> u64 {
 /// A project without its items: what [`PatchOp::Head`] carries. Every field is named, so a new
 /// project field can't be left out of the sync unnoticed.
 fn head(p: &Project) -> Project {
-    let Project { schema, settings, items: _, next_id, render_queue, render_templates, render_prefs, freeze } = p;
+    let Project { schema, settings, items: _, next_id, render_queue, render_templates, render_prefs, freeze, shadows } = p;
     Project {
         schema: *schema,
         settings: settings.clone(),
@@ -180,6 +180,7 @@ fn head(p: &Project) -> Project {
         render_templates: render_templates.clone(),
         render_prefs: render_prefs.clone(),
         freeze: freeze.clone(),
+        shadows: shadows.clone(),
     }
 }
 

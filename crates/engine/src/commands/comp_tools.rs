@@ -356,7 +356,7 @@ fn deep_duplicate(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// The copied comps (`items`: original → copy) get fresh layer ids, their precomp layers use the
 /// other copies, and literal `comp("…")` expression references follow `names` (old → new).
-fn relink_copies(proj: &mut effectcraft_project::Project, items: &BTreeMap<ItemId, ItemId>, names: &BTreeMap<String, String>) {
+pub(crate) fn relink_copies(proj: &mut effectcraft_project::Project, items: &BTreeMap<ItemId, ItemId>, names: &BTreeMap<String, String>) {
     for nid in items.values() {
         let mut next = proj.next_id;
         let Some(ItemKind::Comp(comp)) = proj.item_mut(*nid).map(|i| &mut i.kind) else { continue };

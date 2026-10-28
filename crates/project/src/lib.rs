@@ -17,6 +17,7 @@ pub mod props;
 pub mod render_queue;
 pub mod render_templates;
 pub mod sequence;
+pub mod shadow;
 pub mod speech;
 pub mod styles;
 pub mod tracking;
@@ -1525,6 +1526,10 @@ pub struct Project {
     /// Preview-only Smart Freeze sections; original layers and export remain independent.
     #[serde(default, skip_serializing_if = "freeze::FreezeState::is_empty")]
     pub freeze: freeze::FreezeState,
+    /// TEAM1: the editing team's shadow compositions and their links to the live comps
+    /// ([`shadow`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shadows: Vec<shadow::ShadowLink>,
 }
 
 impl Default for Project {
@@ -1538,6 +1543,7 @@ impl Default for Project {
             render_templates: Default::default(),
             render_prefs: Default::default(),
             freeze: Default::default(),
+            shadows: Vec::new(),
         }
     }
 }
@@ -1707,6 +1713,7 @@ impl Project {
             && self.render_queue == other.render_queue
             && self.render_templates == other.render_templates
             && self.render_prefs == other.render_prefs
+            && self.shadows == other.shadows
     }
     /// The project file's text (compact JSON): the project with the version that wrote it
     /// (`savedBy`), checked to read back, so a save never writes a file that can't be opened (JSON
