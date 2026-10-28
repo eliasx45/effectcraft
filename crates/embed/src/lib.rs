@@ -47,6 +47,9 @@ mod control_server;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// PN2: the Pen's ink (filter, Catmull-Rom curve, RDP), so a host redraws a stroke exactly as the
+/// viewer does (Ghostex's card thumbnail).
+pub use effectcraft_engine::commands::annotate::ink;
 pub use eframe::{egui_wgpu, wgpu};
 pub use egui;
 pub use keys::{MacKey, mac_modifiers};

@@ -13,11 +13,12 @@
 //!
 //! CDXC:Editing 2026-10-28 DECISION: Elias: "why does the pen appear here and not under the comp like it does in hyperframes?", "its just that the popup appears directly in the comp im viewing", "instead of in the chat, but then when i press enter it gets queued in the chat", "call it the comment tool plz and make sure it works like it does in hyperframes in terms of ui/ux smoothly pop.. same for the draw boxes". The buttons stay in Ghostex's strip above the Claude panel.
 
+use effectcraft_engine::commands::annotate::ink::{self, InkFilter};
 use effectcraft_engine::commands::annotate::{Mark, Tool, bbox};
 use effectcraft_engine::project::Comp;
 use effectcraft_engine::time::Tick;
 use egui::emath::TSTransform;
-use egui::{Align2, Color32, CornerRadius, Key, Modifiers, Pos2, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Color32, CornerRadius, Key, Modifiers, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
 use super::viewer::ViewerMap;
@@ -26,8 +27,16 @@ use crate::theme::Tokens;
 
 /// HyperFrames' mark colour (its teal-green pen).
 const INK: Color32 = Color32::from_rgb(0x4c, 0xd9, 0x9b);
-/// A stroke keeps a point only once the pointer moved this far (screen points).
-const STEP: f32 = 2.0;
+/// PN2: the drawn curve is cut into pieces at most this long (screen points), so it is round at
+/// any zoom.
+const CURVE_STEP: f64 = 1.5;
+/// A finished stroke keeps its points within this of the drawn line (screen points): the curve
+/// stays the same, the stored data small.
+const KEEP_TOLERANCE: f64 = 0.25;
+/// The pen's width (screen points).
+const PEN_WIDTH: f32 = 3.0;
+/// The most samples one live stroke keeps (a very long scribble stops growing).
+const MAX_LIVE: usize = 20_000;
 /// Pop in / out (seconds), ease-out.
 const POP_IN: f64 = 0.15;
 const POP_OUT: f64 = 0.10;
@@ -51,9 +60,11 @@ struct Draft {
 
 #[derive(Clone, Debug, Default)]
 struct Live {
-    /// The Pen's stroke while the button is down (comp pixels) and its last screen point.
+    /// The Pen's stroke while the button is down: filtered samples (comp pixels), the filter, and
+    /// the newest raw sample, drawn as the stroke's tip so the line never lags the pointer.
     stroke: Vec<[f64; 2]>,
-    last: Option<Pos2>,
+    filter: InkFilter,
+    tip: Option<[f64; 2]>,
     draft: Option<Draft>,
     /// The arm the viewer last paused playback for.
     serial: u64,
@@ -111,11 +122,22 @@ fn draw_mark(painter: &egui::Painter, map: &ViewerMap, tool: Tool, points: &[[f6
     let ink = INK.gamma_multiply(alpha);
     match tool {
         Tool::Pen => {
-            let pts: Vec<Pos2> = points.iter().map(|p| map.to_screen(*p)).collect();
-            if let [only] = pts.as_slice() {
-                painter.circle_filled(*only, 2.0, ink);
-            } else {
-                painter.add(egui::Shape::line(pts, Stroke::new(3.0, ink)));
+            // PN2: one smooth curve through the samples (the same `ink::smooth` Ghostex burns into
+            // its card), round ends, anti-aliased by egui's feathering.
+            let screen: Vec<[f64; 2]> = points.iter().map(|p| map.to_screen(*p)).map(|s| [f64::from(s.x), f64::from(s.y)]).collect();
+            let curve: Vec<Pos2> = ink::smooth(&screen, CURVE_STEP).into_iter().map(|p| pos2(p[0] as f32, p[1] as f32)).collect();
+            let r = PEN_WIDTH / 2.0;
+            match curve.as_slice() {
+                [] => {}
+                [only] => {
+                    painter.circle_filled(*only, r, ink);
+                }
+                [first, .., last] => {
+                    let (first, last) = (*first, *last);
+                    painter.add(egui::Shape::line(curve, Stroke::new(PEN_WIDTH, ink)));
+                    painter.circle_filled(first, r, ink);
+                    painter.circle_filled(last, r, ink);
+                }
             }
         }
         Tool::Comment => {
@@ -161,7 +183,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMap,
     }
     if armed.is_none() && live.draft.is_none() {
         live.stroke.clear();
-        live.last = None;
+        live.tip = None;
         ctx.data_mut(|d| d.insert_temp(live_id(), live));
         return;
     }
@@ -205,22 +227,40 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMap,
     if let (Some(tool), false) = (armed, open) {
         match tool {
             Tool::Pen => {
-                if resp.drag_started()
-                    && let Some(pos) = resp.interact_pointer_pos()
-                {
-                    live.stroke = vec![map.to_comp(pos)];
-                    live.last = Some(pos);
+                // PN2: every pointer sample of the frame, not one position per frame: from the
+                // press (not from where egui decides a drag started) to the release.
+                let px = 1.0 / f64::from(map.zoom.max(1e-6));
+                let down = resp.is_pointer_button_down_on();
+                if down && live.stroke.is_empty() && live.tip.is_none() {
+                    live.filter = InkFilter::new(px);
+                    if let Some(origin) = ctx.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()) {
+                        let c = map.to_comp(origin);
+                        live.tip = Some(c);
+                        live.stroke.extend(live.filter.push(c));
+                    }
                 }
-                if resp.dragged()
-                    && let Some(pos) = resp.interact_pointer_pos()
-                    && live.last.is_none_or(|l| l.distance(pos) >= STEP)
-                {
-                    live.stroke.push(map.to_comp(pos));
-                    live.last = Some(pos);
+                if down || live.tip.is_some() {
+                    let mut samples = ctx.input(|i| drag_samples(&i.events));
+                    if samples.is_empty() && down {
+                        samples.extend(resp.interact_pointer_pos());
+                    }
+                    for s in samples {
+                        let c = map.to_comp(s);
+                        live.tip = Some(c);
+                        if live.stroke.len() < MAX_LIVE {
+                            live.stroke.extend(live.filter.push(c));
+                        }
+                    }
                 }
-                if resp.drag_stopped() {
-                    let points = std::mem::take(&mut live.stroke);
-                    live.last = None;
+                if !down && live.tip.is_some() {
+                    let mut points = std::mem::take(&mut live.stroke);
+                    if let Some(tip) = live.tip.take()
+                        && points.last().is_some_and(|l| *l != tip)
+                    {
+                        points.push(tip);
+                    }
+                    live.filter.reset();
+                    let points = ink::finish(&points, KEEP_TOLERANCE * px);
                     if points.len() >= 2 {
                         live.draft = Some(new_draft(app, comp, cid, time, Tool::Pen, points, now));
                     }
@@ -235,8 +275,14 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMap,
             }
         }
     }
-    if live.stroke.len() > 1 {
-        draw_mark(&painter, map, Tool::Pen, &live.stroke, 1.0);
+    if let Some(tip) = live.tip {
+        let mut shown = live.stroke.clone();
+        if shown.last().is_none_or(|l| *l != tip) {
+            shown.push(tip);
+        }
+        if shown.len() > 1 {
+            draw_mark(&painter, map, Tool::Pen, &shown, 1.0);
+        }
         ctx.request_repaint();
     }
 
@@ -271,6 +317,31 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMap,
         None => {}
     }
     ctx.data_mut(|d| d.insert_temp(live_id(), live));
+}
+
+/// The pointer positions of this frame's events while the button draws, in order: every
+/// `PointerMoved` (egui keeps each one the platform sent; `hover_pos` is only the last), from the
+/// primary press when it is in this frame, else from the start, up to and including the release.
+pub(crate) fn drag_samples(events: &[egui::Event]) -> Vec<Pos2> {
+    let primary_press = |e: &egui::Event| matches!(e, egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed: true, .. });
+    let mut down = !events.iter().any(primary_press);
+    let mut out = Vec::new();
+    for e in events {
+        match e {
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } => {
+                if *pressed {
+                    down = true;
+                    out.push(*pos);
+                } else if down {
+                    out.push(*pos);
+                    break;
+                }
+            }
+            egui::Event::PointerMoved(p) if down => out.push(*p),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn new_draft(app: &EffectcraftApp, comp: &Comp, cid: u64, time: Tick, tool: Tool, points: Vec<[f64; 2]>, now: f64) -> Draft {
@@ -355,15 +426,60 @@ fn draft_box(app: &mut EffectcraftApp, ctx: &egui::Context, map: &ViewerMap, d: 
     result
 }
 
+/// The Pen bar's row height (its send button's size): every item is centred on it.
+const ROW: f32 = 26.0;
+/// A chip's / small button's height.
+const CHIP_H: f32 = 20.0;
+
+/// PN2: how far below a galley's top the middle of its ink sits, measured from the glyphs
+/// themselves (top of the tallest glyph to the baseline: descenders left out, so "Drawing" centres
+/// on its cap height and "esc" on its x height). The galley's half height when it has no ink.
+pub(crate) fn ink_middle(galley: &egui::Galley) -> f32 {
+    let mut top = f32::INFINITY;
+    let mut base = f32::NEG_INFINITY;
+    if let Some(row) = galley.rows.first() {
+        for g in &row.row.glyphs {
+            if g.uv_rect.size.y <= 0.0 {
+                continue;
+            }
+            let baseline = row.pos.y + g.pos.y;
+            top = top.min(baseline + g.uv_rect.offset.y);
+            base = base.max(baseline);
+        }
+    }
+    if top.is_finite() && base.is_finite() && base > top { (top + base) / 2.0 } else { galley.size().y / 2.0 }
+}
+
+/// Paints `galley` with its ink centred on `center` (horizontally by its width).
+fn paint_centered(painter: &egui::Painter, center: Pos2, galley: std::sync::Arc<egui::Galley>, color: Color32) {
+    let at = pos2(center.x - galley.size().x / 2.0, center.y - ink_middle(&galley));
+    painter.galley(at, galley, color);
+}
+
+/// A label in a box `height` tall (padded `pad` left and right), optically centred; filled when
+/// `fill` isn't transparent. Clickable.
+fn text_box(ui: &mut egui::Ui, text: &str, font: egui::FontId, color: Color32, fill: Color32, height: f32, pad: f32) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 2.0 * pad, height), Sense::click());
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, CornerRadius::same((height / 2.0).min(8.0) as u8), fill);
+    }
+    paint_centered(ui.painter(), rect.center(), galley, color);
+    resp
+}
+
 fn note_field(ui: &mut egui::Ui, d: &mut Draft, text_id: egui::Id, hint: &str, rows: usize, width: f32, auto: &mut crate::automation::Registry) {
     let focused = ui.memory(|m| m.has_focus(text_id));
+    let font = Tokens::ui(13.0);
+    let sample = if d.text.is_empty() { hint.to_string() } else { d.text.lines().next().unwrap_or_default().to_string() };
     let edit = egui::TextEdit::multiline(&mut d.text)
         .id(text_id)
         .hint_text(hint)
         .desired_rows(rows)
         .desired_width(width)
         .frame(egui::Frame::NONE)
-        .font(Tokens::ui(13.0))
+        .margin(egui::Margin::ZERO)
+        .font(font.clone())
         .text_color(Color32::from_gray(235));
     let resp = if rows > 1 {
         // The Comment's field: framed, with a focus ring.
@@ -376,7 +492,16 @@ fn note_field(ui: &mut egui::Ui, d: &mut Draft, text_id: egui::Id, hint: &str, r
             .show(ui, |ui| ui.add(edit))
             .inner
     } else {
-        ui.add(edit)
+        // The Pen bar's field: its first line's ink centred on the row, measured on the hint (or
+        // the typed text) in the field's font.
+        let galley = ui.painter().layout_no_wrap(sample, font, Color32::WHITE);
+        let top = (ROW / 2.0 - ink_middle(&galley)).max(0.0);
+        ui.allocate_ui_with_layout(vec2(width, ROW), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_height(ROW);
+            ui.add_space(top);
+            ui.add(edit)
+        })
+        .inner
     };
     if d.focus {
         resp.request_focus();
@@ -386,26 +511,37 @@ fn note_field(ui: &mut egui::Ui, d: &mut Draft, text_id: egui::Id, hint: &str, r
 }
 
 fn chip(ui: &mut egui::Ui, text: &str, fill: Color32, color: Color32) -> egui::Response {
-    egui::Frame::NONE
-        .fill(fill)
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(egui::Margin::symmetric(7, 3))
-        .show(ui, |ui| ui.label(egui::RichText::new(text).font(Tokens::medium(11.5)).color(color)))
-        .response
+    text_box(ui, text, Tokens::medium(11.5), color, fill, CHIP_H, 7.0)
 }
 
-/// HyperFrames' draw bar: [▢ Drawing] Say what should change (optional)   esc (↑)
+/// The round send button: an up arrow drawn as strokes, exactly centred in its circle.
+fn send_button(ui: &mut egui::Ui) -> egui::Response {
+    let (r, send) = ui.allocate_exact_size(vec2(ROW, ROW), Sense::click());
+    let fill = if send.hovered() { INK } else { INK.gamma_multiply(0.9) };
+    let c = r.center();
+    let p = ui.painter();
+    p.circle_filled(c, ROW / 2.0, fill);
+    let dark = Stroke::new(1.8, Color32::from_rgb(0x0b, 0x1f, 0x16));
+    // Shaft and head span ±5 pt around the centre.
+    let (top, bottom, wing) = (c.y - 5.0, c.y + 5.0, 4.0);
+    p.line_segment([pos2(c.x, bottom), pos2(c.x, top)], dark);
+    p.line_segment([pos2(c.x - wing, top + wing), pos2(c.x, top)], dark);
+    p.line_segment([pos2(c.x + wing, top + wing), pos2(c.x, top)], dark);
+    send
+}
+
+/// HyperFrames' draw bar: [▢ Drawing] Say what should change (optional)   esc (↑), every item
+/// centred on one row.
 fn pen_bar(ui: &mut egui::Ui, _t: &Tokens, d: &mut Draft, text_id: egui::Id, result: &mut Option<bool>, auto: &mut crate::automation::Registry) {
-    ui.horizontal_top(|ui| {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(vec2(width, ROW), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_height(ROW);
         ui.spacing_mut().item_spacing.x = 8.0;
         chip(ui, "▢ Drawing", INK.gamma_multiply(0.18), INK);
         let field = (ui.available_width() - 64.0).max(80.0);
         note_field(ui, d, text_id, "Say what should change (optional)", 1, field, auto);
-        ui.label(egui::RichText::new("esc").font(Tokens::ui(10.5)).color(Color32::from_gray(130)));
-        let (r, send) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
-        let fill = if send.hovered() { INK } else { INK.gamma_multiply(0.9) };
-        ui.painter().circle_filled(r.center(), 13.0, fill);
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, "↑", Tokens::medium(14.0), Color32::from_rgb(0x0b, 0x1f, 0x16));
+        text_box(ui, "esc", Tokens::ui(10.5), Color32::from_gray(130), Color32::TRANSPARENT, ROW, 0.0);
+        let send = send_button(ui);
         auto.add_response("viewer.annotate.add", &send, "Add");
         if send.on_hover_text("Add (Enter)").clicked() {
             *result = Some(true);
@@ -417,22 +553,22 @@ fn pen_bar(ui: &mut egui::Ui, _t: &Tokens, d: &mut Draft, text_id: egui::Id, res
 fn comment_card(ui: &mut egui::Ui, _t: &Tokens, d: &mut Draft, text_id: egui::Id, result: &mut Option<bool>, auto: &mut crate::automation::Registry) {
     ui.spacing_mut().item_spacing.y = 8.0;
     let tc = d.timecode.clone();
-    chip(ui, &tc, INK.gamma_multiply(0.18), INK);
+    ui.horizontal(|ui| chip(ui, &tc, INK.gamma_multiply(0.18), INK));
     let w = ui.available_width() - 18.0;
     note_field(ui, d, text_id, "What should change here?", 2, w, auto);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Enter to add").font(Tokens::ui(11.0)).color(Color32::from_gray(130)));
+    let button_h = 26.0;
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), button_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_height(button_h);
+        text_box(ui, "Enter to add", Tokens::ui(11.0), Color32::from_gray(130), Color32::TRANSPARENT, button_h, 0.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let comment = egui::Button::new(egui::RichText::new("Comment").font(Tokens::medium(12.0)).color(Color32::from_rgb(0x14, 0x15, 0x17)))
-                .fill(Color32::from_gray(240))
-                .stroke(Stroke::NONE)
-                .corner_radius(CornerRadius::same(8));
-            let add = ui.add(comment);
+            let add = text_box(ui, "Comment", Tokens::medium(12.0), Color32::from_rgb(0x14, 0x15, 0x17), Color32::from_gray(240), button_h, 12.0)
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             auto.add_response("viewer.annotate.add", &add, "Comment");
             if add.clicked() {
                 *result = Some(true);
             }
-            let cancel = ui.add(egui::Button::new(egui::RichText::new("Cancel").font(Tokens::ui(12.0)).color(Color32::from_gray(200))).frame(false));
+            let cancel = text_box(ui, "Cancel", Tokens::ui(12.0), Color32::from_gray(200), Color32::TRANSPARENT, button_h, 8.0)
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             auto.add_response("viewer.annotate.cancel", &cancel, "Cancel");
             if cancel.clicked() {
                 *result = Some(false);
@@ -467,5 +603,33 @@ mod tests {
         assert!(at.x + 360.0 <= 800.0 && at.y + 44.0 <= 450.0 && at.y < 420.0, "{at:?}");
         let at = box_origin(Tool::Comment, Rect::from_center_size(pos2(10.0, 10.0), vec2(8.0, 8.0)), vec2(300.0, 130.0), area);
         assert!(area.contains(at) && area.contains(at + vec2(300.0, 130.0)), "{at:?}");
+    }
+
+    fn press(x: f32, y: f32, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos: pos2(x, y), button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    #[test]
+    fn a_frame_gives_every_pointer_sample_of_the_drag() {
+        // Mid-drag: every move of the frame, in order (not only the last one).
+        let mid: Vec<egui::Event> = (0..12).map(|i| egui::Event::PointerMoved(pos2(i as f32 * 9.0, 0.0))).collect();
+        assert_eq!(drag_samples(&mid).len(), 12);
+        // Press in this frame: moves before it are hover, not ink.
+        let ev = vec![egui::Event::PointerMoved(pos2(-5.0, 0.0)), press(0.0, 0.0, true), egui::Event::PointerMoved(pos2(4.0, 0.0))];
+        assert_eq!(drag_samples(&ev), vec![pos2(0.0, 0.0), pos2(4.0, 0.0)]);
+        // Release: its position is the last sample, later moves are hover.
+        let ev = vec![egui::Event::PointerMoved(pos2(4.0, 0.0)), press(6.0, 0.0, false), egui::Event::PointerMoved(pos2(50.0, 0.0))];
+        assert_eq!(drag_samples(&ev), vec![pos2(4.0, 0.0), pos2(6.0, 0.0)]);
+    }
+
+    #[test]
+    fn text_is_centred_on_its_ink_not_its_line_box() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let galley = ctx.fonts_mut(|f| f.layout_no_wrap("Drawing".into(), Tokens::ui(12.0), Color32::WHITE));
+        let mid = ink_middle(&galley);
+        assert!(mid > 0.0 && mid < galley.size().y, "{mid} in {}", galley.size().y);
+        let empty = ctx.fonts_mut(|f| f.layout_no_wrap(String::new(), Tokens::ui(12.0), Color32::WHITE));
+        assert!((ink_middle(&empty) - empty.size().y / 2.0).abs() < 1e-4);
     }
 }

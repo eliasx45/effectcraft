@@ -16,6 +16,8 @@
 //! hyperframes?", then "its just that the popup appears directly in the comp im viewing" and
 //! "instead of in the chat, but then when i press enter it gets queued in the chat".
 
+pub mod ink;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
