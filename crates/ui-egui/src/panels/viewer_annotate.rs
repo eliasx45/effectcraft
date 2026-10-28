@@ -646,7 +646,9 @@ mod tests {
     #[test]
     fn text_is_centred_on_its_ink_not_its_line_box() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        // The frame's font atlas upload must be handled (epaint panics on a dropped delta).
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
         let galley = ctx.fonts_mut(|f| f.layout_no_wrap("Drawing".into(), Tokens::ui(12.0), Color32::WHITE));
         let mid = ink_middle(&galley);
         assert!(mid > 0.0 && mid < galley.size().y, "{mid} in {}", galley.size().y);

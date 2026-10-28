@@ -133,9 +133,14 @@ pub fn smooth(points: &[[f64; 2]], step: f64) -> Vec<[f64; 2]> {
         return pts;
     };
     let n = pts.len();
-    // Mirrored end points so the curve starts and ends on the stroke's ends.
-    let head = [2.0 * first[0] - second[0], 2.0 * first[1] - second[1]];
-    let tail = [2.0 * end[0] - before_end[0], 2.0 * end[1] - before_end[1]];
+    // A closed stroke (it ends where it started, within a piece) wraps round: its end segments
+    // bend like the rest. An open one gets mirrored end points so the curve starts and ends on
+    // the stroke's ends (mirroring a closed loop's ends made them nearly straight chords).
+    let closed = n >= 4 && dist(first, end) <= step;
+    let (head, tail) = match (closed, pts.get(n.saturating_sub(2)).copied()) {
+        (true, Some(wrap_head)) => (wrap_head, second),
+        _ => ([2.0 * first[0] - second[0], 2.0 * first[1] - second[1]], [2.0 * end[0] - before_end[0], 2.0 * end[1] - before_end[1]]),
+    };
     let at = |i: isize| -> [f64; 2] { if i < 0 { head } else { pts.get(i as usize).copied().unwrap_or(tail) } };
     let mut out = Vec::with_capacity(n.saturating_mul(4).min(MAX_SMOOTH_POINTS));
     out.push(first);
@@ -256,6 +261,16 @@ mod tests {
         for w in curve.windows(2) {
             assert!(dist(w[0], w[1]) <= 1.6, "pieces stay short");
         }
+    }
+
+    #[test]
+    fn an_open_arc_still_starts_and_ends_on_its_ends() {
+        // Night run 29 Oct: closed loops wrap; an open stroke keeps its mirrored ends.
+        let arc: Vec<[f64; 2]> = circle(10, 100.0).into_iter().take(6).collect();
+        let curve = smooth(&arc, 1.5);
+        assert_eq!(curve.first(), arc.first());
+        let (a, b) = (curve.last().copied().unwrap_or_default(), arc.last().copied().unwrap_or_default());
+        assert!(dist(a, b) < 1e-6, "{a:?} vs {b:?}");
     }
 
     #[test]
