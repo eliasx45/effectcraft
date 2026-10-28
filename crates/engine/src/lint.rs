@@ -1759,7 +1759,7 @@ fn renders(l: &Layer) -> bool {
 /// Whether `l`'s keyed motion can be seen: it [`renders`], or a layer that renders is parented
 /// to it (a switched-off or guide parent still moves its children). Switched-off layers and
 /// guides don't render, so their moves are not linted (`off-accent`, `off-beat`).
-fn moves_pixels(comp: &Comp, l: &Layer) -> bool {
+pub(crate) fn moves_pixels(comp: &Comp, l: &Layer) -> bool {
     renders(l) || comp.layers.iter().any(|c| renders(c) && parented_to(comp, c, l.id))
 }
 
@@ -1792,34 +1792,74 @@ pub struct DeepPeaks {
 /// start and stretch to `cid`'s seconds. A nested peak is kept only when every precomp layer on
 /// the way shows it (inside its in/out, inside its comp's duration, Video switch on, not a guide);
 /// switched-off and guide layers are skipped at every level ([`moves_pixels`]). Time-remapped precomp
-/// layers are not searched (see `skipped`). Sorted by time.
+/// layers are not searched (see `skipped`). Sorted by time. The comps searched are [`deep_comps`].
 pub fn speed_peaks_deep(project: &Project, cid: ItemId, start: f64, end: f64) -> DeepPeaks {
-    let Some(comp) = project.comp(cid) else { return DeepPeaks::default() };
-    let mut out = DeepPeaks { peaks: speed_peaks(comp, start, end), skipped: vec![] };
-    let mut budget = MAX_PRECOMP_VISITS;
-    nested_peaks(project, (cid, comp), (start, end), &mut vec![], &mut vec![cid], &mut out, &mut budget);
+    if project.comp(cid).is_none() {
+        return DeepPeaks::default();
+    }
+    let (comps, skipped) = deep_comps(project, cid, start, end);
+    let mut out = DeepPeaks { peaks: vec![], skipped };
+    for dc in comps {
+        if out.peaks.len() >= MAX_PEAKS {
+            break;
+        }
+        let Some(comp) = project.comp(dc.comp) else { continue };
+        let nested = !dc.via.is_empty();
+        for mut pk in speed_peaks(comp, dc.window.0, dc.window.1) {
+            if nested {
+                pk.time = precomp_time::up(&dc.via, pk.time);
+                (pk.comp, pk.via) = (Some(dc.comp), dc.via.clone());
+            }
+            out.peaks.push(pk);
+        }
+    }
     out.peaks.sort_by(|a, b| a.time.total_cmp(&b.time));
     out.peaks.truncate(MAX_PEAKS);
     out
 }
 
-/// Peaks inside the precomp layers of `at` whose shown part overlaps `lo..=hi` (`at`'s seconds).
-fn nested_peaks(
+/// One comp [`deep_comps`] searches: `cid` itself (empty `via`) or a precomp shown inside it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeepComp {
+    pub comp: ItemId,
+    /// The precomp layers from the comp searched down to `comp`, outermost first.
+    pub via: Vec<Hop>,
+    /// The part of `comp` (its own seconds) that every precomp layer on the way shows.
+    pub window: (f64, f64),
+}
+
+/// `cid` and every precomp shown inside it in `start..=end` (`cid`'s seconds), depth first (each
+/// precomp before the precomps inside it), at most [`precomp_time::MAX_DEPTH`] deep and
+/// [`MAX_PRECOMP_VISITS`] precomp layers. Switched-off and guide precomp layers, a comp inside
+/// itself and time-remapped precomp layers (the second list says why) are not followed. The
+/// traversal behind [`speed_peaks_deep`] and `sfx.hits`.
+pub fn deep_comps(project: &Project, cid: ItemId, start: f64, end: f64) -> (Vec<DeepComp>, Vec<String>) {
+    let Some(comp) = project.comp(cid) else { return (vec![], vec![]) };
+    let mut out = vec![DeepComp { comp: cid, via: vec![], window: (start, end) }];
+    let mut skipped = vec![];
+    let mut budget = MAX_PRECOMP_VISITS;
+    nested_comps(project, (cid, comp), (start, end), &mut vec![], &mut vec![cid], (&mut out, &mut skipped), &mut budget);
+    (out, skipped)
+}
+
+/// The precomps inside the precomp layers of `at` whose shown part overlaps `lo..=hi` (`at`'s seconds).
+fn nested_comps(
     project: &Project,
     at: (ItemId, &Comp),
     (lo, hi): (f64, f64),
     chain: &mut Vec<Hop>,
     comps: &mut Vec<ItemId>,
-    out: &mut DeepPeaks,
+    out: (&mut Vec<DeepComp>, &mut Vec<String>),
     budget: &mut usize,
 ) {
+    let (found, skipped) = out;
     if chain.len() >= precomp_time::MAX_DEPTH {
         return;
     }
     for l in &at.1.layers {
         let LayerSource::Comp { item } = l.source else { continue };
         // A switched-off or guide precomp layer shows nothing of its comp.
-        if !renders(l) || comps.contains(&item) || out.peaks.len() >= MAX_PEAKS || *budget == 0 {
+        if !renders(l) || comps.contains(&item) || *budget == 0 {
             continue;
         }
         let Some(inner) = project.comp(item) else { continue };
@@ -1831,8 +1871,8 @@ fn nested_peaks(
         let h = match precomp_time::hop(at.0, l) {
             Ok(h) => h,
             Err(why) => {
-                if !out.skipped.contains(&why) {
-                    out.skipped.push(why);
+                if !skipped.contains(&why) {
+                    skipped.push(why);
                 }
                 continue;
             }
@@ -1846,12 +1886,8 @@ fn nested_peaks(
         }
         chain.push(h);
         comps.push(item);
-        for mut pk in speed_peaks(inner, x, y) {
-            pk.time = precomp_time::up(chain, pk.time);
-            (pk.comp, pk.via) = (Some(item), chain.clone());
-            out.peaks.push(pk);
-        }
-        nested_peaks(project, (item, inner), (x, y), chain, comps, out, budget);
+        found.push(DeepComp { comp: item, via: chain.clone(), window: (x, y) });
+        nested_comps(project, (item, inner), (x, y), chain, comps, (&mut *found, &mut *skipped), budget);
         chain.pop();
         comps.pop();
     }
