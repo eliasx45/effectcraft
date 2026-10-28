@@ -625,6 +625,9 @@ pub struct Session {
     pub motion_library: motion_library::Handle,
     /// Render boxes mirroring this session (`app.sync`, [`remote_follow`]).
     pub followers: remote_follow::Followers,
+    /// PN1: Pen / Comment review marks on the Composition viewer (`annotate.*`): session state,
+    /// never in the project or the undo history.
+    pub annotations: commands::annotate::Annotations,
 }
 
 /// The count behind [`Session::running_for_script`]; only the engine changes it.
@@ -757,6 +760,7 @@ impl Default for Session {
             storage: None,
             motion_library: Default::default(),
             followers: Default::default(),
+            annotations: Default::default(),
             tasks: vec![],
             job_log: vec![],
             next_task_id: 1,

@@ -2296,6 +2296,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("viewer-video-off-chip"), r));
     }
 
+    // PN1: Pen / Comment review marks over the comp (above the viewer's own tools while armed).
+    super::viewer_annotate::show(app, ui, &map, cid.0, &comp, time);
     vt::draw_snap(&ctx, &painter, &map, &ectx);
     vt::rulers(app, ui, &map, outer, area);
     vt::bottom_bar(app, ui, bar, zoom, time, &comp);

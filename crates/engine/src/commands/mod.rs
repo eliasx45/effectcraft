@@ -7,6 +7,8 @@
 
 include!(concat!(env!("OUT_DIR"), "/commands.rs"));
 pub mod anim_tools;
+// PN1: the viewer and the embed read the review marks.
+pub mod annotate;
 // Batch 1 lane C: the UI reads card masks (CX1).
 pub mod cards;
 pub mod content_fill;

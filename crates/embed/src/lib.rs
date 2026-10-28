@@ -169,6 +169,8 @@ pub struct Embedded {
     painting: bool,
     /// Texture changes from frames that weren't painted, uploaded with the next painted one.
     pending_textures: egui::TexturesDelta,
+    /// The newest review mark [`Embedded::new_annotations`] handed over.
+    annotations_seen: u64,
 }
 
 impl Embedded {
@@ -243,6 +245,8 @@ impl Embedded {
             app.share_display_device(Some(light.clone()));
         }
         app.ui.start_screen = false;
+        // PN1: the host queues review marks as chat cards: no clipboard copy, waiting marks shown.
+        app.session.annotations.hosted = true;
         if let Some(r) = recovery {
             app.offer_recovery(r);
         }
@@ -296,6 +300,7 @@ impl Embedded {
             status,
             painting: true,
             pending_textures: egui::TexturesDelta::default(),
+            annotations_seen: 0,
         })
     }
 
@@ -310,6 +315,34 @@ impl Embedded {
     /// remember what was open without a control round trip.
     pub fn project_path(&self) -> Option<&str> {
         self.app.session.path.as_deref()
+    }
+
+    /// Run an engine command in process (`annotate.start`, `time.set`, …), as the control
+    /// channel's `engine.execute` would, without the round trip. The app redraws after it.
+    pub fn execute(&mut self, command: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let r = self.app.session.execute(command, params).map_err(|e| e.to_string());
+        self.ctx.request_repaint();
+        r
+    }
+
+    /// PN1: the Pen / Comment marks added on the viewer since the last call (`annotate.add`,
+    /// oldest first, each as `annotate.get` returns it), for the host to queue as chat cards. The
+    /// marks stay in the session (drawn faintly on their frame) until the host removes them with
+    /// `annotate.remove` once their card is sent or dropped.
+    pub fn new_annotations(&mut self) -> Vec<serde_json::Value> {
+        let since = self.annotations_seen;
+        let marks: Vec<serde_json::Value> =
+            self.app.session.annotations.since(since).map(effectcraft_engine::commands::annotate::mark_json).filter(|v| !v.is_null()).collect();
+        if let Some(last) = self.app.session.annotations.marks.last() {
+            self.annotations_seen = self.annotations_seen.max(last.id);
+        }
+        marks
+    }
+
+    /// PN1: the armed review tool (`"pen"`, `"comment"`), or `None`: the host's Pen / Comment
+    /// buttons follow it (Esc in the viewer disarms).
+    pub fn annotate_armed(&self) -> Option<&'static str> {
+        self.app.session.annotations.armed.map(|t| t.id())
     }
 
     /// Why the control server didn't start, or empty.
