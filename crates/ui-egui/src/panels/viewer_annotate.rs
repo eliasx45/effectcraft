@@ -26,36 +26,44 @@ use crate::EffectcraftApp;
 use crate::theme::Tokens;
 
 /// HyperFrames' mark colour (its teal-green pen).
-const INK: Color32 = Color32::from_rgb(0x4c, 0xd9, 0x9b);
+pub const INK: Color32 = Color32::from_rgb(0x4c, 0xd9, 0x9b);
 /// PN2: the drawn curve is cut into pieces at most this long (screen points), so it is round at
 /// any zoom.
-const CURVE_STEP: f64 = 1.5;
+pub const CURVE_STEP: f64 = 1.5;
 /// A finished stroke keeps its points within this of the drawn line (screen points): the curve
 /// stays the same, the stored data small.
-const KEEP_TOLERANCE: f64 = 0.25;
+pub const KEEP_TOLERANCE: f64 = 0.25;
 /// The pen's width (screen points).
-const PEN_WIDTH: f32 = 3.0;
+pub const PEN_WIDTH: f32 = 3.0;
 /// The most samples one live stroke keeps (a very long scribble stops growing).
 const MAX_LIVE: usize = 20_000;
 /// Pop in / out (seconds), ease-out.
 const POP_IN: f64 = 0.15;
-const POP_OUT: f64 = 0.10;
+pub const POP_OUT: f64 = 0.10;
 const PEN_BAR_WIDTH: f32 = 360.0;
 const COMMENT_WIDTH: f32 = 300.0;
 
-/// The box waiting for its note.
+/// The box waiting for its note (EMBED15: public, so a host drawing marks itself, FigCraft's
+/// MAIN board, shows the same box with [`mark_box`]).
 #[derive(Clone, Debug)]
-struct Draft {
-    tool: Tool,
-    comp: u64,
-    time: f64,
-    timecode: String,
-    points: Vec<[f64; 2]>,
-    text: String,
-    opened: f64,
+pub struct Draft {
+    pub tool: Tool,
+    pub comp: u64,
+    pub time: f64,
+    pub timecode: String,
+    pub points: Vec<[f64; 2]>,
+    pub text: String,
+    pub opened: f64,
     /// Closing since (pop out), then dropped.
-    closing: Option<f64>,
-    focus: bool,
+    pub closing: Option<f64>,
+    pub focus: bool,
+}
+
+impl Draft {
+    /// A new box for a mark of `tool` on comp `comp` at comp second `time`, opened at `now`.
+    pub fn new(tool: Tool, comp: u64, time: f64, timecode: String, points: Vec<[f64; 2]>, now: f64) -> Draft {
+        Draft { tool, comp, time, timecode, points, text: String::new(), opened: now, closing: None, focus: true }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,7 +89,7 @@ fn ease_out(p: f64) -> f32 {
 
 /// Pop progress of a box opened at `opened` (closing at `closing`): (opacity, scale), and whether
 /// it is still moving. Motion off (egui's animation time 0): no pop.
-pub(crate) fn pop(now: f64, opened: f64, closing: Option<f64>, motion: bool) -> (f32, f32, bool) {
+pub fn pop(now: f64, opened: f64, closing: Option<f64>, motion: bool) -> (f32, f32, bool) {
     if !motion {
         return (if closing.is_some() { 0.0 } else { 1.0 }, 1.0, false);
     }
@@ -99,7 +107,7 @@ pub(crate) fn pop(now: f64, opened: f64, closing: Option<f64>, motion: bool) -> 
 
 /// Where a box of `size` goes for a mark (screen): a comment's card above-right of its point, the
 /// Pen's bar under the stroke's box (above it when there is no room); kept inside `area`.
-pub(crate) fn box_origin(tool: Tool, mark: Rect, size: egui::Vec2, area: Rect) -> Pos2 {
+pub fn box_origin(tool: Tool, mark: Rect, size: egui::Vec2, area: Rect) -> Pos2 {
     let want = match tool {
         Tool::Comment => pos2(mark.center().x + 14.0, mark.center().y - size.y - 14.0),
         Tool::Pen => {
@@ -119,12 +127,19 @@ fn screen_rect(map: &ViewerMap, points: &[[f64; 2]]) -> Rect {
 }
 
 fn draw_mark(painter: &egui::Painter, map: &ViewerMap, tool: Tool, points: &[[f64; 2]], alpha: f32) {
+    let screen: Vec<Pos2> = points.iter().map(|p| map.to_screen(*p)).collect();
+    draw_screen_mark(painter, tool, &screen, alpha);
+}
+
+/// A mark drawn from its screen points (EMBED15: hosts drawing marks on their own pictures use it):
+/// Pen a smooth round-ended curve through them, Comment a pin at the first.
+pub fn draw_screen_mark(painter: &egui::Painter, tool: Tool, points: &[Pos2], alpha: f32) {
     let ink = INK.gamma_multiply(alpha);
     match tool {
         Tool::Pen => {
             // PN2: one smooth curve through the samples (the same `ink::smooth` Ghostex burns into
             // its card), round ends, anti-aliased by egui's feathering.
-            let screen: Vec<[f64; 2]> = points.iter().map(|p| map.to_screen(*p)).map(|s| [f64::from(s.x), f64::from(s.y)]).collect();
+            let screen: Vec<[f64; 2]> = points.iter().map(|s| [f64::from(s.x), f64::from(s.y)]).collect();
             let curve: Vec<Pos2> = ink::smooth(&screen, CURVE_STEP).into_iter().map(|p| pos2(p[0] as f32, p[1] as f32)).collect();
             let r = PEN_WIDTH / 2.0;
             match curve.as_slice() {
@@ -141,8 +156,7 @@ fn draw_mark(painter: &egui::Painter, map: &ViewerMap, tool: Tool, points: &[[f6
             }
         }
         Tool::Comment => {
-            if let Some(p) = points.first() {
-                let at = map.to_screen(*p);
+            if let Some(at) = points.first().copied() {
                 painter.circle_filled(at, 7.0, ink);
                 painter.circle_stroke(at, 7.0, Stroke::new(2.0, Color32::WHITE.gamma_multiply(alpha)));
             }
@@ -322,7 +336,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMap,
 /// The pointer positions of this frame's events while the button draws, in order: every
 /// `PointerMoved` (egui keeps each one the platform sent; `hover_pos` is only the last), from the
 /// primary press when it is in this frame, else from the start, up to and including the release.
-pub(crate) fn drag_samples(events: &[egui::Event]) -> Vec<Pos2> {
+pub fn drag_samples(events: &[egui::Event]) -> Vec<Pos2> {
     let primary_press = |e: &egui::Event| matches!(e, egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed: true, .. });
     let mut down = !events.iter().any(primary_press);
     let mut out = Vec::new();
@@ -346,17 +360,7 @@ pub(crate) fn drag_samples(events: &[egui::Event]) -> Vec<Pos2> {
 
 fn new_draft(app: &EffectcraftApp, comp: &Comp, cid: u64, time: Tick, tool: Tool, points: Vec<[f64; 2]>, now: f64) -> Draft {
     let t = comp.frame_rate.snap(time);
-    Draft {
-        tool,
-        comp: cid,
-        time: t.seconds(),
-        timecode: effectcraft_engine::commands::time::display_time(&app.session, comp, t),
-        points,
-        text: String::new(),
-        opened: now,
-        closing: None,
-        focus: true,
-    }
+    Draft::new(tool, cid, t.seconds(), effectcraft_engine::commands::time::display_time(&app.session, comp, t), points, now)
 }
 
 /// `annotate.add`; standalone, the reference goes on the clipboard.
@@ -382,6 +386,23 @@ fn add(app: &mut EffectcraftApp, ctx: &egui::Context, d: &Draft) {
 fn draft_box(app: &mut EffectcraftApp, ctx: &egui::Context, map: &ViewerMap, d: &mut Draft, alpha: f32, scale: f32) -> Option<bool> {
     let t = app.tokens;
     let mark = screen_rect(map, &d.points);
+    mark_box(ctx, &t, &mut app.auto, d, mark, map.area, alpha, scale)
+}
+
+/// The mark's box (the Pen's bar or the Comment's card) next to `mark` (its screen box), kept
+/// inside `area`, popping with `alpha` / `scale` ([`pop`]). `Some(true)`: add, `Some(false)`:
+/// cancel. EMBED15: public for hosts that draw marks on their own pictures.
+#[allow(clippy::too_many_arguments)]
+pub fn mark_box(
+    ctx: &egui::Context,
+    t: &Tokens,
+    auto: &mut crate::automation::Registry,
+    d: &mut Draft,
+    mark: Rect,
+    area: Rect,
+    alpha: f32,
+    scale: f32,
+) -> Option<bool> {
     let width = match d.tool {
         Tool::Pen => PEN_BAR_WIDTH,
         Tool::Comment => COMMENT_WIDTH,
@@ -389,7 +410,7 @@ fn draft_box(app: &mut EffectcraftApp, ctx: &egui::Context, map: &ViewerMap, d: 
     // The box's size from last frame (its height grows with the note).
     let size_id = egui::Id::new("viewer-annotate-box-size");
     let size = ctx.data(|m| m.get_temp::<egui::Vec2>(size_id)).unwrap_or(vec2(width, if d.tool == Tool::Pen { 44.0 } else { 132.0 }));
-    let origin = box_origin(d.tool, mark, size, map.area);
+    let origin = box_origin(d.tool, mark, size, area);
     // Pops from the mark: scaled around the corner nearest it.
     let pivot = match d.tool {
         Tool::Comment => pos2(origin.x, origin.y + size.y),
@@ -416,13 +437,13 @@ fn draft_box(app: &mut EffectcraftApp, ctx: &egui::Context, map: &ViewerMap, d: 
         frame.show(ui, |ui| {
             ui.set_width(width - 20.0);
             match d.tool {
-                Tool::Pen => pen_bar(ui, &t, d, text_id, &mut result, &mut app.auto),
-                Tool::Comment => comment_card(ui, &t, d, text_id, &mut result, &mut app.auto),
+                Tool::Pen => pen_bar(ui, t, d, text_id, &mut result, auto),
+                Tool::Comment => comment_card(ui, t, d, text_id, &mut result, auto),
             }
         });
     });
     ctx.data_mut(|m| m.insert_temp(size_id, shown.response.rect.size()));
-    app.auto.add("viewer.annotate.box", shown.response.rect, if d.tool == Tool::Pen { "Drawing" } else { "Comment" });
+    auto.add("viewer.annotate.box", shown.response.rect, if d.tool == Tool::Pen { "Drawing" } else { "Comment" });
     result
 }
 
