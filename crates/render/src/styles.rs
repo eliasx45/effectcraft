@@ -873,7 +873,8 @@ fn bevel(o: Org, body: &mut Image, alpha: &Plane, d: &Lazy, bv: &Bevel, s: f64, 
 // GPU plan
 
 /// A Drop Shadow or Inner Shadow for an accelerator, in buffer pixels: the content alpha (the
-/// inverse for an inner shadow) blurred by `sigma`, moved by `offset`.
+/// inverse for an inner shadow) blurred by `sigma`, moved by `offset`. With Spread / Choke the
+/// content is first grown by `spread` pixels on the distance field (`soft_shape`).
 #[derive(Clone, Debug)]
 pub struct GpuShadow {
     pub mode: BlendMode,
@@ -883,9 +884,14 @@ pub struct GpuShadow {
     pub sigma: f64,
     pub noise: f32,
     pub knocks_out: bool,
+    /// Spread / Choke in buffer pixels (`size · spread`); 0 = none (no distance field).
+    pub spread: f32,
 }
 
-/// A Softer Outer or Inner Glow for an accelerator: intensity `min(2 · blur(alpha), 1)`.
+/// An Outer or Inner Glow for an accelerator. Softer: intensity `min(2 · blur(shape), 1)`, the
+/// shape being the content alpha, or with Spread / Choke the content grown by `spread` pixels
+/// on the distance field. Precise (`precise = Some(soft)`): the intensity straight from the
+/// distance field, `1 − max(d − spread, 0) / soft` (`glow_intensity`).
 #[derive(Clone, Debug)]
 pub struct GpuGlow {
     pub mode: BlendMode,
@@ -899,6 +905,22 @@ pub struct GpuGlow {
     pub jitter: f32,
     /// Inner Glow from the centre.
     pub center: bool,
+    /// Spread / Choke in buffer pixels; 0 = none.
+    pub spread: f32,
+    /// Precise technique: its falloff width in buffer pixels.
+    pub precise: Option<f32>,
+}
+
+/// Stroke for an accelerator, in buffer pixels: the ring `inside` pixels into the content
+/// (blended with `mode` inside it) and `outside` pixels out of it (added where the content
+/// leaves the pixel uncovered), on the distance field (`render`'s Stroke step).
+#[derive(Clone, Debug)]
+pub struct GpuStroke {
+    pub mode: BlendMode,
+    pub color: [f32; 3],
+    pub opacity: f32,
+    pub inside: f32,
+    pub outside: f32,
 }
 
 /// Gradient Overlay for an accelerator: its frame in buffer pixels.
@@ -946,14 +968,14 @@ pub struct GpuBevel {
     pub shadow: (BlendMode, [f32; 3], f32),
 }
 
-/// Widest Bevel and Emboss (in buffer pixels) an accelerator renders: its distance field
-/// works on 256-row tiles with this much context on both sides.
+/// Farthest (in buffer pixels) an accelerator's distance field is exact: it works on 256-row
+/// tiles with this much context on both sides. Every style that reads the field (Stroke,
+/// Spread / Choke, Precise glows, Bevel and Emboss) must stay within it.
 pub const GPU_BEVEL_REACH: u32 = 256;
 
 /// A layer's styles as an accelerator renders them (see [`gpu_prepare`]): the steps of
-/// [`render`] with every distance in buffer pixels. Only styles that need no distance field
-/// (spread / choke 0, Softer glows; no Stroke) or a short one (Bevel and Emboss up to
-/// [`GPU_BEVEL_REACH`]) have a plan.
+/// [`render`] with every distance in buffer pixels. Styles that read the distance field share
+/// one, exact to [`GpuStyles::field`] pixels (at most [`GPU_BEVEL_REACH`]).
 #[derive(Clone, Debug)]
 pub struct GpuStyles {
     /// Noise origin: where the buffer's pixel (0, 0) sat before it was cropped.
@@ -968,7 +990,10 @@ pub struct GpuStyles {
     pub satin: Option<GpuSatin>,
     pub inner_glow: Option<GpuGlow>,
     pub inner_shadows: Vec<GpuShadow>,
+    pub stroke: Option<GpuStroke>,
     pub bevel: Option<GpuBevel>,
+    /// Pixels the shared distance field must be exact to (0: no style reads it).
+    pub field: u32,
 }
 
 impl GpuStyles {
@@ -995,9 +1020,9 @@ pub fn pack_gradient(g: &Gradient) -> Vec<f32> {
 
 /// The layer's styles as an accelerator renders them, and the buffer they render around: the
 /// content cropped to its visible part and padded by their reach, as [`render`] does. `None`
-/// when the layer has no styles, its content is empty, or a style needs the CPU (a distance
-/// field: spread or choke, Precise glows, Stroke, a Bevel and Emboss wider than
-/// [`GPU_BEVEL_REACH`]; a stencil pass mode).
+/// when the layer has no styles, its content is empty, or a style needs the CPU (one reading
+/// the distance field farther than [`GPU_BEVEL_REACH`] pixels; a stencil pass mode): the
+/// reason, naming the style, is left in [`crate::cpu_why::declined`].
 pub fn gpu_prepare(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2]) -> Option<(Buf, GpuStyles)> {
     let dims = [content.img.width, content.img.height];
     let prep = gpu_prepare_shape(ctx, layer, dims, content.offset, content.scale, content.img.alpha_bounds(), layer_size, None)?;
@@ -1045,29 +1070,48 @@ pub fn gpu_prepare_shape(
 ) -> Option<GpuStylePrep> {
     let g = group(layer)?;
     let [w, h] = dims;
-    if w == 0 || h == 0 || pass_modes(ctx, layer).iter().any(|m| m.is_stencil()) {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    if pass_modes(ctx, layer).iter().any(|m| m.is_stencil()) {
+        crate::cpu_why::declined(crate::cpu_why::STYLE_STENCIL);
         return None;
     }
     let styles = evaluate(ctx, layer, g);
-    if styles.stroke.is_some() {
-        return None;
-    }
     let s = scale.max(1e-6);
+    // Pixels of distance field a style reading it needs: exact a little past its radius (the
+    // shapes it makes are flat beyond); `None` (with the reason) past what the GPU computes.
+    let field_for = |r: f64, what: &'static str| -> Option<u32> {
+        let need = if r.is_finite() && r >= 0.0 { (r.ceil() as u32).saturating_add(3) } else { u32::MAX };
+        if need > GPU_BEVEL_REACH {
+            crate::cpu_why::declined(crate::cpu_why::CpuWhy::named(crate::cpu_why::STYLE_TOO_WIDE.why, what));
+            return None;
+        }
+        Some(need)
+    };
+    let mut field = 0u32;
     let bevel = match &styles.bevel {
         Some(bv) => {
             let (size, sigma, soften, k, light) = bevel_frame(bv, s);
-            let reach = (size.ceil() as u32).saturating_add(3);
-            if reach > GPU_BEVEL_REACH || !size.is_finite() {
-                return None;
-            }
+            let reach = field_for(f64::from(size), "Bevel and Emboss")?;
+            field = field.max(reach);
             Some(GpuBevel { style: bv.style, size, sigma, soften, k, light, reach, highlight: bv.hl, shadow: bv.sh })
         }
         None => None,
     };
     let hard = |size: f64, spread: f64| size * s * spread;
     let soft = |size: f64, spread: f64| (size * s - hard(size, spread)).max(0.0) / 2.0;
-    let shadow = |d: &Shadow| {
-        (hard(d.size, d.spread) <= 0.01).then(|| GpuShadow {
+    // soft_shape grows the content on the distance field only past 0.01 px.
+    let grow = |size: f64, spread: f64| {
+        let r = hard(size, spread);
+        if r > 0.01 { r as f32 } else { 0.0 }
+    };
+    let mut shadow = |d: &Shadow, what: &'static str| -> Option<GpuShadow> {
+        let spread = grow(d.size, d.spread);
+        if spread > 0.0 {
+            field = field.max(field_for(f64::from(spread), what)?);
+        }
+        Some(GpuShadow {
             mode: d.mode,
             color: d.color,
             opacity: d.opacity,
@@ -1075,10 +1119,26 @@ pub fn gpu_prepare_shape(
             sigma: soft(d.size, d.spread),
             noise: d.noise,
             knocks_out: d.knocks_out,
+            spread,
         })
     };
-    let glow = |gl: &Glow| {
-        (!gl.precise && hard(gl.size, gl.spread) <= 0.01).then(|| GpuGlow {
+    let drops = styles.drop.iter().map(|d| shadow(d, "Drop Shadow (Spread)")).collect::<Option<Vec<_>>>()?;
+    let inner_shadows = styles.inner_shadow.iter().map(|d| shadow(d, "Inner Shadow (Choke)")).collect::<Option<Vec<_>>>()?;
+    let mut glow = |gl: &Glow, what: &'static str| -> Option<GpuGlow> {
+        // glow_intensity: Precise reads the field out to the glow's size, Softer to its spread.
+        let (spread, precise) = if gl.precise {
+            let size = gl.size * s;
+            let hard = (size * gl.spread) as f32;
+            field = field.max(field_for(size, what)?);
+            (hard, Some((size as f32 - hard).max(0.5)))
+        } else {
+            let spread = grow(gl.size, gl.spread);
+            if spread > 0.0 {
+                field = field.max(field_for(f64::from(spread), what)?);
+            }
+            (spread, None)
+        };
+        Some(GpuGlow {
             mode: gl.mode,
             opacity: gl.opacity,
             noise: gl.noise,
@@ -1088,16 +1148,29 @@ pub fn gpu_prepare_shape(
             range: gl.range as f32,
             jitter: gl.jitter,
             center: gl.center,
+            spread,
+            precise,
         })
     };
-    let drops = styles.drop.iter().map(shadow).collect::<Option<Vec<_>>>()?;
-    let inner_shadows = styles.inner_shadow.iter().map(shadow).collect::<Option<Vec<_>>>()?;
     let outer_glow = match &styles.outer_glow {
-        Some(gl) => Some(glow(gl)?),
+        Some(gl) => Some(glow(gl, "Outer Glow")?),
         None => None,
     };
     let inner_glow = match &styles.inner_glow {
-        Some(gl) => Some(glow(gl)?),
+        Some(gl) => Some(glow(gl, "Inner Glow")?),
+        None => None,
+    };
+    let stroke = match &styles.stroke {
+        Some(sk) => {
+            let size = (sk.size * s) as f32;
+            let (outside, inside) = match sk.position {
+                1 => (0.0, size),
+                2 => (size / 2.0, size / 2.0),
+                _ => (size, 0.0),
+            };
+            field = field.max(field_for(f64::from(size), "Stroke")?);
+            Some(GpuStroke { mode: sk.mode, color: sk.color, opacity: sk.opacity, inside, outside })
+        }
         None => None,
     };
     let bl = blending(ctx, layer);
@@ -1160,7 +1233,9 @@ pub fn gpu_prepare_shape(
         satin,
         inner_glow,
         inner_shadows,
+        stroke,
         bevel,
+        field,
     };
     Some(GpuStylePrep { plan, region, pad, shape })
 }

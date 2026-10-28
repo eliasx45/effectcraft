@@ -153,7 +153,11 @@ fn sty_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         a = sty_noisy(a, P.f[1].z, p, seed);
     } else {
-        let v = min(textureLoad(src, p, 0).x * 2.0, 1.0);
+        // Softer: min(2 · blurred shape, 1); Precise (flag 32): the intensity itself.
+        var v = min(textureLoad(src, p, 0).x * 2.0, 1.0);
+        if ((P.u[0].w & 32u) != 0u) {
+            v = textureLoad(src, p, 0).x;
+        }
         let g = sty_glow_color(v, p);
         c = g.xyz;
         a = sty_noisy(g.w * P.f[0].w * (1.0 - textureLoad(aux, p, 0).w), P.f[1].z, p, seed ^ 0x5a5au);
@@ -164,7 +168,8 @@ fn sty_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // An interior style blended over the body inside the content (styles::blend_clipped).
 // src = body; aux = (plane, 0, 0, content alpha) (overlays: the content itself).
-// u[0] = (kind, mode, seed, flags: 1 gradient glow, 2 reverse, 4 invert, 8 centre, 16 dissolve);
+// u[0] = (kind, mode, seed, flags: 1 gradient glow, 2 reverse, 4 invert, 8 centre, 16 dissolve,
+// 32 Precise glow: aux.x is the intensity);
 // u[1] = (org x, org y, gradient style, 0); f[0] = (colour, opacity);
 // f[1] = (offset x, offset y, noise, jitter); f[2] = (range, centre x, centre y, extent);
 // f[3] = (dir x, dir y, radius, angle). Kinds: 0 colour overlay, 1 gradient overlay, 2 satin,
@@ -229,7 +234,10 @@ fn sty_body(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         a = v * P.f[0].w;
     } else if (kind == 3u) {
-        let v = min(textureLoad(aux, p, 0).x * 2.0, 1.0);
+        var v = min(textureLoad(aux, p, 0).x * 2.0, 1.0);
+        if ((flags & 32u) != 0u) {
+            v = textureLoad(aux, p, 0).x;
+        }
         let e = select(v, 1.0 - v, (flags & 8u) != 0u);
         let g = sty_glow_color(e, p);
         c = g.xyz;
@@ -512,4 +520,78 @@ fn sty_bounds(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         textureStore(out, vec2<i32>(y, 0), vec4<f32>(f32(first), f32(last + 1), 0.0, 1.0));
     }
+}
+
+// ---------------------------------------------------------------- Distance-field shapes (GLS1)
+// The styles that read the content's distance field (the column pass above, exact within the
+// farthest of their radii) besides Bevel and Emboss.
+
+// styles::grown: coverage of the content grown by r (negative r shrinks).
+fn sty_grown(sd: f32, r: f32) -> f32 {
+    return clamp(r + 0.5 - sd, 0.0, 1.0);
+}
+
+// A shape from the field (src = column pass): (outer, inner, 0, alpha), inner reading the
+// negated field. u[0].z = 0: the content grown by f[0].x (styles::soft_shape's Spread / Choke
+// base); 1: a Precise glow's intensity, hard part f[0].x, falloff f[0].y
+// (styles::glow_intensity).
+@compute @workgroup_size(16, 16)
+fn sty_field_shape(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!sty_inside(p)) {
+        return;
+    }
+    let t = textureLoad(src, p, 0);
+    let sd = bev_sdf(t);
+    let r = P.f[0].x;
+    var o = 0.0;
+    var i = 0.0;
+    if (P.u[0].z == 1u) {
+        let soft = P.f[0].y;
+        o = clamp(1.0 - max(sd - r, 0.0) / soft, 0.0, 1.0);
+        i = clamp(1.0 - max(-sd - r, 0.0) / soft, 0.0, 1.0);
+    } else {
+        o = sty_grown(sd, r);
+        i = sty_grown(-sd, r);
+    }
+    textureStore(out, p, vec4<f32>(o, i, 0.0, t.w));
+}
+
+// Stroke over the body (styles::render's Stroke step). src = body, aux = column pass (w: the
+// content alpha). u[0] = (0, mode, seed, flags: 16 dissolve); u[1].xy = org;
+// f[0] = (colour, opacity); f[1] = (inside width, outside width, 0, 0).
+@compute @workgroup_size(16, 16)
+fn sty_stroke(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!sty_inside(p)) {
+        return;
+    }
+    var d = textureLoad(src, p, 0);
+    let t = textureLoad(aux, p, 0);
+    let a = t.w;
+    let sd = bev_sdf(t);
+    let c = P.f[0].xyz;
+    let r_in = P.f[1].x;
+    let r_out = P.f[1].y;
+    // Inside: blended over the body within the content (styles::blend_clipped), over the
+    // share of the pixel's coverage the ring takes.
+    if (r_in > 0.0 && a > 0.0) {
+        let ring = clamp((a - sty_grown(sd, -r_in)) / max(a, 1e-6), 0.0, 1.0);
+        let sa = ring * P.f[0].w;
+        if (sa > 0.0) {
+            var n = 0.5;
+            if ((P.u[0].w & 16u) != 0u) {
+                n = sty_noise(p, P.u[0].z);
+            }
+            d = blend_pixel(P.u[0].y, d / a, vec4<f32>(c * sa, sa), n) * a;
+        }
+    }
+    // Outside: covers exactly what the content leaves uncovered (added, premultiplied).
+    if (r_out > 0.0) {
+        let ring = max(sty_grown(sd, r_out) - a, 0.0) * P.f[0].w;
+        if (ring > 0.0) {
+            d = d + vec4<f32>(c * ring, ring);
+        }
+    }
+    textureStore(out, p, d);
 }

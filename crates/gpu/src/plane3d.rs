@@ -101,7 +101,15 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32
     let view = r
         .plane_view_rect(ctx, layer, out)
         .map(|v| [v[0] * scale + offset[0] - 4.0, v[1] * scale + offset[1] - 4.0, v[2] * scale + offset[0] + 4.0, v[3] * scale + offset[1] + 4.0]);
-    let prep = styles::gpu_prepare_shape(ctx, layer, [img.width, img.height], offset, scale, bounds, layer_size, view).ok_or("a style the GPU can't run")?;
+    // The plan's decline reason (`cpu_why::declined`) is for a 2D styled layer's note; this
+    // plane has its own. A reason left before it stays for its caller.
+    let pending = effectcraft_render::cpu_why::take();
+    let prep = styles::gpu_prepare_shape(ctx, layer, [img.width, img.height], offset, scale, bounds, layer_size, view);
+    let _ = effectcraft_render::cpu_why::take();
+    if let Some(why) = pending {
+        effectcraft_render::cpu_why::declined(why);
+    }
+    let prep = prep.ok_or("a style the GPU can't run")?;
     if !prep.plan.pass_modes().is_empty() {
         return Err("styles that paint outside the layer");
     }

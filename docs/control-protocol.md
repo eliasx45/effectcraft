@@ -250,9 +250,10 @@ carries that reason. Reasons, in English on the wire (`reason`):
   content; text Blur, Gradient Fill or Inter-Character Blending; blurred or gradient-filled
   characters; mask variable-width feather, mask motion blur on an animated path, a negative or very
   large mask expansion; GPU shape/text drawing turned off (`EFFECTCRAFT_GPU_SHAPES=0` /
-  `EFFECTCRAFT_GPU_TEXT=0`); layer styles the GPU doesn't render; effect X has no GPU version; the
-  GPU declined effect X; an adjustment layer, a collapsed precomp's effects, a nested comp or a run
-  of 3D layers the GPU can't draw.
+  `EFFECTCRAFT_GPU_TEXT=0`); layer styles the GPU doesn't render, layer style X reaching farther than
+  the GPU's distance field, layer styles drawn once on the CPU to cache a revisited frame; effect X
+  has no GPU version; the GPU declined effect X; an adjustment layer, a collapsed precomp's
+  effects, a nested comp or a run of 3D layers the GPU can't draw.
 
 A viewer or playback frame that took longer than one frame of its comp with CPU work in it shows
 a toast once per comp, layer and reason for the session ("Shape Layer 1 rendered on the CPU

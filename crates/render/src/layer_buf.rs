@@ -347,22 +347,27 @@ impl<'a> Renderer<'a> {
     }
 
     /// A styled layer for an accelerator that renders its styles itself: the content cropped
-    /// and padded for them, and the styles ([`crate::styles::gpu_prepare`]). `None` leaves the
-    /// layer to [`Self::styled`]: styles the accelerator can't render, a static layer with
-    /// static styles (they are cached and uploaded once), or a frame seen before. Static content
-    /// with animated styles styles here: on the CPU it took about 57 ms a frame for a 1200 × 700
-    /// card in a 1080p comp (`tests_styles_static` in the GPU crate). The first visit of a frame
-    /// leaves a mark in the layer cache; the next one styles it on the CPU and caches the
-    /// result, so scrubbing back over it costs no styling at all.
-    pub fn gpu_styles(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, crate::styles::GpuStyles)> {
+    /// and padded for them, and the styles ([`crate::styles::gpu_prepare`]). `Err` leaves the
+    /// layer to [`Self::styled`], with why it then styles on the CPU: `Err(None)` when it
+    /// doesn't (a static layer with static styles: they are cached and uploaded once; a frame
+    /// whose styles are cached; no content), `Err(Some(why))` when it does (a style the
+    /// accelerator can't render, named; or a frame seen before). Static content with animated
+    /// styles styles here: on the CPU it took about 57 ms a frame for a 1200 × 700 card in a
+    /// 1080p comp (`tests_styles_static` in the GPU crate). The first visit of a frame leaves a
+    /// mark in the layer cache; the next one styles it on the CPU and caches the result, so
+    /// scrubbing back over it costs no styling at all.
+    pub fn gpu_styles(&self, ctx: &EvalCtx, layer: &Layer) -> Result<(Arc<Buf>, crate::styles::GpuStyles), Option<crate::cpu_why::CpuWhy>> {
         if self.layer_is_static(ctx, layer) && self.styles_are_static(ctx, layer) {
-            return None;
+            return Err(None);
         }
-        let (content, ckey) = self.content_buf_timed(ctx, layer, None, None)?;
+        let (content, ckey) = self.content_buf_timed(ctx, layer, None, None).ok_or(None)?;
         if let (Some(c), Some(k)) = (self.cache, ckey.map(|k| cache::styles_key(ctx, layer, k))) {
+            if c.peek(k).is_some() {
+                return Err(None);
+            }
             let mark = cache::derive(k, 0x6e57);
-            if c.peek(k).is_some() || c.peek(mark).is_some() {
-                return None;
+            if c.peek(mark).is_some() {
+                return Err(Some(crate::cpu_why::STYLES_REVISITED));
             }
             if let Some(keep) = self.cache_to_keep() {
                 keep.insert(mark, Arc::new(Buf { img: effectcraft_raster::Image::new(1, 1), offset: [0.0; 2], scale: 1.0 }));
@@ -370,8 +375,18 @@ impl<'a> Renderer<'a> {
         }
         let size = source_size(self.project, layer);
         let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-        let (buf, plan) = crate::styles::gpu_prepare(ctx, layer, &content, layer_size)?;
-        Some((Arc::new(buf), plan))
+        // Only the plan's own reason names the styles; one left before it (by the content's
+        // planners) stays for its caller.
+        let pending = crate::cpu_why::take();
+        let prep = crate::styles::gpu_prepare(ctx, layer, &content, layer_size);
+        let why = crate::cpu_why::take();
+        if let Some(p) = pending {
+            crate::cpu_why::declined(p);
+        }
+        match prep {
+            Some((buf, plan)) => Ok((Arc::new(buf), plan)),
+            None => Err(Some(why.unwrap_or(crate::cpu_why::LAYER_STYLES))),
+        }
     }
 
     /// The layer with its styles: exterior passes and body (cached per pass).

@@ -348,12 +348,12 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if let Some(done) = draw_resident_fx(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
-    if let Some(done) = draw_styled_gpu(e, r, ctx, layer, canvas, opacity) {
-        return done;
-    }
-    // Styles the GPU doesn't render are drawn on the CPU (unchanged ones come from the cache).
-    if styles::active(ctx, layer) && !r.layer_is_static(ctx, layer) {
-        r.note_cpu(ctx, layer, effectcraft_render::cpu_why::LAYER_STYLES);
+    // Styles the GPU doesn't render are drawn on the CPU, with the reason naming the style
+    // (unchanged ones come from the cache: no reason).
+    match draw_styled_gpu(e, r, ctx, layer, canvas, opacity) {
+        Ok(done) => return done,
+        Err(Some(why)) => r.note_cpu(ctx, layer, why),
+        Err(None) => {}
     }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
@@ -399,15 +399,24 @@ pub(crate) static STYLED_ON_GPU: std::sync::atomic::AtomicUsize = std::sync::ato
 /// An animated layer with Layer Styles the GPU renders (`fx_styles`): its content (from the
 /// layer cache) cropped to its visible part, uploaded once, styled by kernels and placed like
 /// the CPU path's passes and body (knockout, track matte / Preserve Transparency, channel
-/// switches); the CPU path styles it on the CPU and uploads every pass. `None`: no styles,
-/// styles the GPU doesn't render (a distance field: spread, choke, Precise glows, Stroke, Bevel
-/// and Emboss), or cached styles (`Renderer::gpu_styles`); `Some(None)`: the GPU failed.
-fn draw_styled_gpu(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32) -> Option<Option<()>> {
+/// switches); the CPU path styles it on the CPU and uploads every pass. `Err`: the CPU path
+/// draws it, with why it styles there (`Renderer::gpu_styles`: a style the GPU doesn't render,
+/// named, or a revisited frame; `Err(None)`: no styles, or cached ones); `Ok(None)`: the GPU
+/// failed.
+fn draw_styled_gpu(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    canvas: &mut Pixels,
+    opacity: f32,
+) -> Result<Option<()>, Option<effectcraft_render::cpu_why::CpuWhy>> {
     if !styles::active(ctx, layer) {
-        return None;
+        return Err(None);
     }
     let (buf, plan) = r.gpu_styles(ctx, layer)?;
-    let failed = |e: &mut Enc| if e.g.check_health().is_ok() { None } else { Some(None) };
+    // A missing kernel on a healthy device: the CPU styles it.
+    let failed = |e: &mut Enc| if e.g.check_health().is_ok() { Err(Some(effectcraft_render::cpu_why::LAYER_STYLES)) } else { Ok(None) };
     let Some(src) = e.upload_buf(&buf) else { return failed(e) };
     let Some(st) = crate::fx_styles::render(e, &src, &plan) else { return failed(e) };
     #[cfg(test)]
@@ -425,7 +434,7 @@ fn draw_styled_gpu(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
     }
     // The placement only reads the buffer's size, offset and scale.
     let shape = Buf { img: Image { width: buf.img.width, height: buf.img.height, data: Vec::new() }, offset: buf.offset, scale: buf.scale };
-    Some(composite_styled_gpu(e, r, ctx, layer, canvas, opacity, &shape, &passes, body, content))
+    Ok(composite_styled_gpu(e, r, ctx, layer, canvas, opacity, &shape, &passes, body, content))
 }
 
 /// [`draw_styled_gpu`]'s composite: the CPU styled branch of `draw_layer` on GPU images.

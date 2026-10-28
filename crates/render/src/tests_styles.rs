@@ -899,3 +899,67 @@ fn shadows_deep_glow_and_bevel_run_on_the_reachable_part_of_the_canvas() {
         }
     }
 }
+
+/// GLS1: the GPU plan covers Stroke, Spread / Choke and Precise glows through one distance
+/// field exact to the farthest radius (Elias's reel cards: white Inside Stroke, 2.4 px, 32 %),
+/// and a style reaching farther than the field leaves a reason naming it.
+#[test]
+fn gpu_plan_covers_distance_field_styles_and_names_what_it_declines() {
+    let plan = |f: &dyn Fn(&mut Project, &Comp, &mut Layer), scale: f64| {
+        let (p, cid) = scene([1.0; 3], None, |p, c, l| f(p, c, l));
+        let c = p.comp(cid).unwrap();
+        let l = &c.layers[0];
+        let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+        let _ = crate::cpu_why::take();
+        let prep = crate::styles::gpu_prepare_shape(&ctx, l, [40, 40], [0.0, 0.0], scale, Some((0, 0, 40, 40)), [40.0, 40.0], None);
+        (prep.map(|p| p.plan), crate::cpu_why::take())
+    };
+    let reel = |p: &mut Project, c: &Comp, l: &mut Layer| {
+        add(p, c, l, "stroke");
+        set(l, "stroke/size", Value::Scalar(2.4));
+        set(l, "stroke/opacity", Value::Scalar(32.0));
+        set(l, "stroke/position", Value::Enum(1));
+    };
+    let (pl, why) = plan(&reel, 1.0);
+    let pl = pl.expect("the reel stroke has a GPU plan");
+    assert_eq!(why, None);
+    let sk = pl.stroke.as_ref().expect("stroke planned");
+    assert!((sk.inside - 2.4).abs() < 1e-6 && sk.outside == 0.0 && (sk.opacity - 0.32).abs() < 1e-6);
+    assert_eq!(pl.field, 6, "exact to ⌈2.4⌉ + 3 px");
+    // Half resolution halves the ring.
+    let (pl, _) = plan(&reel, 0.5);
+    assert!((pl.expect("half res plan").stroke.expect("stroke").inside - 1.2).abs() < 1e-6);
+    // Spread, Choke and Precise glows share the field: the farthest radius wins.
+    let (pl, why) = plan(
+        &|p, c, l| {
+            add(p, c, l, "dropShadow");
+            set(l, "dropShadow/size", Value::Scalar(10.0));
+            set(l, "dropShadow/spread", Value::Scalar(40.0));
+            add(p, c, l, "innerGlow");
+            set(l, "innerGlow/technique", Value::Enum(1));
+            set(l, "innerGlow/size", Value::Scalar(20.0));
+            set(l, "innerGlow/choke", Value::Scalar(25.0));
+        },
+        1.0,
+    );
+    let pl = pl.expect("spread and precise glows have a GPU plan");
+    assert_eq!(why, None);
+    assert!((pl.drops[0].spread - 4.0).abs() < 1e-5 && (pl.drops[0].sigma - 3.0).abs() < 1e-9);
+    let ig = pl.inner_glow.as_ref().expect("inner glow planned");
+    assert!((ig.spread - 5.0).abs() < 1e-5 && ig.precise.is_some_and(|s| (s - 15.0).abs() < 1e-5));
+    assert_eq!(pl.field, 23, "exact to the precise glow's ⌈20⌉ + 3 px");
+    // Without any of them there is no field to compute.
+    let (pl, _) = plan(&|p, c, l| add(p, c, l, "dropShadow"), 1.0);
+    assert_eq!(pl.expect("plain shadow").field, 0);
+    // A stroke reaching farther than the field (a layer rasterised 4× up): CPU, named.
+    let (pl, why) = plan(
+        &|p, c, l| {
+            add(p, c, l, "stroke");
+            set(l, "stroke/size", Value::Scalar(100.0));
+        },
+        4.0,
+    );
+    assert!(pl.is_none());
+    assert_eq!(why, Some(crate::cpu_why::CpuWhy::named(crate::cpu_why::STYLE_TOO_WIDE.why, "Stroke")));
+    assert_eq!(why.map(|w| w.text()).as_deref(), Some("layer style Stroke reaches farther than the GPU's distance field"));
+}
