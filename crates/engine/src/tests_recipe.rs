@@ -146,8 +146,9 @@ fn dropdown_with_named_items_round_trips() {
     set(&mut s, l, "effects/#1/menu", json!(1));
     let r = round_trip(&mut s, c, &[0.0]);
     assert_eq!(r["layers"][0]["props"]["effects/#1/menu"], json!({"value": "Words", "items": ["Lines", "Words", "Letters"]}), "{r}");
-    // A renamed menu left at its first item still carries its items.
-    set(&mut s, l, "effects/#1/menu", json!(0));
+    // A renamed menu left at its first item still carries its items. (The round trip opened the
+    // rebuilt comp, so name the original one; night run 29 Oct.)
+    s.execute("prop.set", json!({"comp": c, "layer": l, "path": "effects/#1/menu", "value": 0})).unwrap();
     let r = round_trip(&mut s, c, &[0.0]);
     assert_eq!(r["layers"][0]["props"]["effects/#1/menu"]["items"], json!(["Lines", "Words", "Letters"]), "{r}");
     // "Item N" reads as the Nth item of any menu; a name the menu doesn't have stays an error.

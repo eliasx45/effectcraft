@@ -92,8 +92,14 @@ fn a_replica_edit_lands_as_one_undo_step_and_undoes_here() {
     s.execute("project.applyPatch", json!({"client": CLIENT, "patch": patch, "label": "Change Opacity", "merge": "fig-1"})).unwrap();
     assert_eq!(s.history.undo.len(), steps, "merged");
     assert_eq!(opacity(&s.project, main, l), 55.0);
-    // The app's undo takes the whole gesture back.
-    s.execute("edit.undo", json!({})).unwrap();
+    // The app's undo takes the whole gesture back. The patch is authored by `client`, so the
+    // user's plain undo (AN13: only the caller's own step) is refused while the replica's edit is
+    // on top; `any: true` (History panel / "undo whoever made it") takes it back. (Night run
+    // 29 Oct: the test called plain edit.undo, which AN13 refuses.)
+    let refused = s.execute("edit.undo", json!({})).unwrap_err().to_string();
+    assert!(refused.contains(CLIENT), "{refused}");
+    assert_eq!(opacity(&s.project, main, l), 55.0, "a refused undo changes nothing");
+    s.execute("edit.undo", json!({"any": true})).unwrap();
     assert_eq!(opacity(&s.project, main, l), 100.0);
 }
 

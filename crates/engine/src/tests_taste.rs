@@ -391,7 +391,9 @@ fn rig_entrances_scrubs_and_his_fast_exits_read_as_he_animates() {
 #[test]
 fn align_peak_keeps_an_approved_curve() {
     // HT4 (A/B r2 #1): keys.alignPeak's auto-picked graph turned ✅ rig entrances into ❌.
-    for (mode, frame) in [("shift", 40), ("stretch-out", 33)] {
+    // An Expo Out entrance peaks on its first key, which stretch-out keeps (refused since PEAK1),
+    // so the stretching case is stretch-in (night run 29 Oct).
+    for (mode, frame) in [("shift", 40), ("stretch-in", 33)] {
         let (mut s, cid, l) = comp();
         key(&mut s, l, "transform/position", 1.0, json!([960.0, 1300.0]));
         key(&mut s, l, "transform/position", 1.6, json!([960.0, 540.0]));

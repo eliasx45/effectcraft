@@ -159,25 +159,17 @@ mod tests {
             assert!(j.hits.is_empty());
         }
         let comp = app.session.active_comp().unwrap();
-        let layers = context_layers(&comp, &app.session.state.selected_layers);
+        let layers = context_layers(comp, &app.session.state.selected_layers);
         assert_eq!(layers, vec![l]);
         let ctx = egui::Context::default();
         let mut actions = Vec::new();
         let mut auto = Registry::default();
         let project = app.session.project.clone();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            contents(
-                ui,
-                &project,
-                &comp,
-                &t,
-                &layers,
-                &Labels::default(),
-                &mut auto,
-                &|c| (c == "comp.settings").then(|| "not here".to_string()),
-                &mut actions,
-            );
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            contents(ui, &project, comp, &t, &layers, &Labels::default(), &mut auto, &|c| (c == "comp.settings").then(|| "not here".to_string()), &mut actions);
         });
+        // The frame's font atlas upload must be handled (epaint panics on a dropped delta).
+        out.textures_delta.clear();
         assert!(actions.is_empty(), "nothing chosen without a click");
     }
 }

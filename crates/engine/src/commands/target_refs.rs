@@ -220,6 +220,11 @@ pub(crate) fn validate_target_refs(s: &Session, cmd: &str, p: &Value) -> Result<
     if cmd.starts_with("render.") && p.get("item").is_some_and(|v| !v.is_null()) {
         return Ok(json!({}));
     }
+    // memory.purge takes a comp id that may be gone from the project (its buffers still cached)
+    // and resolves it itself.
+    if cmd == "memory.purge" {
+        return Ok(json!({}));
+    }
     // comp.open accepts `item` as an alias; its other caller resolves through comp_id too.
     if cmd == "comp.open"
         && p.get("comp").is_none()

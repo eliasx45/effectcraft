@@ -436,7 +436,7 @@ fn median_huang(q: &[[u16; 4]], w: usize, h: usize, r: usize, out: &mut Image) {
         let mut med = [0usize; 4];
         let mut lt = [0usize; 4];
         for dx in -ri..=ri {
-            median_col(&q, w, h, dx, y, ri, |v| {
+            median_col(q, w, h, dx, y, ri, |v| {
                 for c in 0..4 {
                     hist[c * NB + v[c] as usize] += 1;
                 }
@@ -461,7 +461,7 @@ fn median_huang(q: &[[u16; 4]], w: usize, h: usize, r: usize, out: &mut Image) {
             if x + 1 == w {
                 break;
             }
-            median_col(&q, w, h, x as i64 - ri, y, ri, |v| {
+            median_col(q, w, h, x as i64 - ri, y, ri, |v| {
                 for c in 0..4 {
                     hist[c * NB + v[c] as usize] -= 1;
                     if (v[c] as usize) < med[c] {
@@ -469,7 +469,7 @@ fn median_huang(q: &[[u16; 4]], w: usize, h: usize, r: usize, out: &mut Image) {
                     }
                 }
             });
-            median_col(&q, w, h, x as i64 + ri + 1, y, ri, |v| {
+            median_col(q, w, h, x as i64 + ri + 1, y, ri, |v| {
                 for c in 0..4 {
                     hist[c * NB + v[c] as usize] += 1;
                     if (v[c] as usize) < med[c] {
