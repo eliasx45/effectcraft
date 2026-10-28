@@ -58,7 +58,7 @@ fn nested() -> Session {
     s.execute("comp.addMarker", json!({"time": 0.0, "comment": "HOOK"})).unwrap();
     s.execute("comp.addMarker", json!({"time": 3.0, "comment": "IDEA · TikTokers got paid"})).unwrap();
     let words = json!([
-        {"word": "this", "start": 0.5, "end": 0.8},
+        {"word": "this", "start": 0.5, "end": 0.8, "syllables": [{"t": 0.5, "vowel": 0.55, "stress": 0}]},
         {"word": "one", "start": 0.85, "end": 1.2, "syllables": [{"t": 0.85, "vowel": 0.9, "stress": 1}]},
         {"word": "huge", "start": 2.2, "end": 2.5},
         {"word": "problem", "start": 2.55, "end": 2.8},

@@ -18,7 +18,9 @@ fn talk() -> (Session, u64) {
             if *w == "WORKS" {
                 json!({"word": w, "start": a, "end": a + 0.35, "syllables": [{"t": a, "vowel": a + 0.08, "stress": 1}]})
             } else {
-                json!({"word": w, "start": a, "end": a + 0.35})
+                // An unstressed syllable each: a word without syllables in a map that has some gets
+                // estimated ones with the first stressed (HS2), which would stress every word.
+                json!({"word": w, "start": a, "end": a + 0.35, "syllables": [{"t": a, "vowel": a + 0.05, "stress": 0}]})
             }
         })
         .collect();
