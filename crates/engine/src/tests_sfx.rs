@@ -99,7 +99,7 @@ fn a_null_camera_move_is_a_camera_hit_whose_id_survives_a_retime() {
         let l = p.comp_mut(main).unwrap().layer_mut(LayerId(cam)).unwrap();
         let pos = l.props.prop_mut("transform/position").unwrap();
         for k in &mut pos.keys {
-            k.time = k.time + Tick::from_seconds_f64(0.5);
+            k.time += Tick::from_seconds_f64(0.5);
         }
         Ok(())
     })
@@ -150,12 +150,13 @@ fn an_expression_driven_slider_is_a_run_and_what_it_drives_folds_into_it() {
 
 #[test]
 fn a_move_two_precomps_deep_is_found_at_the_main_frame() {
-    // Card's box scales in 1.0–1.5 s (peak 1.25); Card in Middle from 1 s; Middle in MAIN from 2 s:
-    // MAIN 4.0–4.5, peak 4.25.
+    // Card's box scales in 1.0–1.56 s (peak 1.28); Card in Middle from 1 s; Middle in MAIN from 2 s:
+    // MAIN 4.0–4.56, peak 4.28. (Night run 29 Oct: every time sits on a 25 fps frame; 1.5 s is
+    // frame 37.5, so its key snapped to 1.48 and the test asked for a time no key can have.)
     let mut s = session();
     let card = comp(&mut s, "Card", 4.0);
     let bx = solid(&mut s, "S2 01 Card Box");
-    keys(&mut s, bx, "transform/scale", (1.0, json!([0.0, 0.0, 100.0])), (1.5, json!([100.0, 100.0, 100.0])), false);
+    keys(&mut s, bx, "transform/scale", (1.0, json!([0.0, 0.0, 100.0])), (1.56, json!([100.0, 100.0, 100.0])), false);
     let (middle, inner_layer) = nest(&mut s, card, "Middle", 1.0, (1.0, 5.0));
     let (_, top) = nest(&mut s, middle, "MAIN", 2.0, (2.0, 8.0));
 
@@ -167,8 +168,8 @@ fn a_move_two_precomps_deep_is_found_at_the_main_frame() {
     assert_eq!(appear["via"], json!([top, inner_layer]), "{appear:#}");
     assert_eq!(appear["scene"], "Middle", "the top-level layer it is in");
     assert!(appear["id"].as_str().unwrap().starts_with(&format!("{top}>{inner_layer}>{bx}:")), "{appear:#}");
-    assert!(near(&appear["start"]["main"], 4.0, 1e-3) && near(&appear["end"]["main"], 4.5, 1e-3), "{appear:#}");
-    assert!(near(&appear["peak"]["main"], 4.25, 0.01) && near(&appear["peak"]["comp"], 1.25, 0.01), "{appear:#}");
+    assert!(near(&appear["start"]["main"], 4.0, 1e-3) && near(&appear["end"]["main"], 4.56, 1e-3), "{appear:#}");
+    assert!(near(&appear["peak"]["main"], 4.28, 1e-3) && near(&appear["peak"]["comp"], 1.28, 1e-3), "{appear:#}");
     assert!(near(&appear["size"]["scalePct"], 100.0, 0.01), "{appear:#}");
     // The scene change: Middle starts in MAIN at 2 s.
     let scene = h.iter().find(|h| h["kind"] == "scene" && h["id"] == format!("scene:{top}")).unwrap_or_else(|| panic!("{r:#}"));
