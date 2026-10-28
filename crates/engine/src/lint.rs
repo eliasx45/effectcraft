@@ -1448,11 +1448,11 @@ pub struct KeyMoment {
 
 /// Key moments of `comp` in `start`..=`end` (comp seconds): the keyframes of every layer's
 /// Transform properties (Opacity included), and the in points after the comp start of layers
-/// with pixels.
+/// with pixels (switched-off and guide layers skipped, see [`moves_pixels`]).
 pub fn key_moments(project: &Project, comp: &Comp, start: f64, end: f64) -> Vec<KeyMoment> {
     let inside = |t: f64| t >= start - 1e-9 && t <= end + 1e-9;
     let mut out: Vec<KeyMoment> = vec![];
-    for l in &comp.layers {
+    for l in comp.layers.iter().filter(|l| moves_pixels(comp, l)) {
         let mut add = |time: f64, what: String| {
             if inside(time) && !out.iter().any(|m| m.layer == l.id && (m.time - time).abs() < 1e-9) && out.len() < MAX_CANDIDATES {
                 out.push(KeyMoment { layer: l.id, time, what });
@@ -1717,10 +1717,12 @@ pub fn segment_peak(keys: &[effectcraft_keyframe::Keyframe], i: usize, spatial: 
 /// Speed-graph peaks of every keyframed property of `comp`'s layers in `start..=end` (comp
 /// seconds): for each pair of neighbouring keyframes with different values and no hold between
 /// them, the time of the highest speed (keyframes only; expressions are not evaluated), when it
-/// falls inside the layer's in/out. Linear segments (constant speed) have no peak. Sorted by time.
+/// falls inside the layer's in/out. Switched-off and guide layers are skipped unless a rendered
+/// layer is parented to them ([`moves_pixels`]). Linear segments (constant speed) have no peak.
+/// Sorted by time.
 pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
     let mut out: Vec<SpeedPeak> = vec![];
-    for l in &comp.layers {
+    for l in comp.layers.iter().filter(|l| moves_pixels(comp, l)) {
         l.props.walk("", &mut |path, p| {
             if p.keys.len() < 2 || out.len() >= MAX_PEAKS {
                 return;
@@ -1749,6 +1751,31 @@ pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
     out
 }
 
+/// A layer that renders: its Video switch is on and it is not a guide layer.
+fn renders(l: &Layer) -> bool {
+    l.switches.video && !l.switches.guide
+}
+
+/// Whether `l`'s keyed motion can be seen: it [`renders`], or a layer that renders is parented
+/// to it (a switched-off or guide parent still moves its children). Switched-off layers and
+/// guides don't render, so their moves are not linted (`off-accent`, `off-beat`).
+fn moves_pixels(comp: &Comp, l: &Layer) -> bool {
+    renders(l) || comp.layers.iter().any(|c| renders(c) && parented_to(comp, c, l.id))
+}
+
+/// Whether `id` is on `c`'s parent chain (depth-limited: a broken file may loop).
+fn parented_to(comp: &Comp, c: &Layer, id: LayerId) -> bool {
+    let mut at = c.parent;
+    for _ in 0..comp.layers.len() {
+        let Some(p) = at else { return false };
+        if p == id {
+            return true;
+        }
+        at = comp.layer(p).and_then(|x| x.parent);
+    }
+    false
+}
+
 /// Most precomp layers [`speed_peaks_deep`] looks into.
 const MAX_PRECOMP_VISITS: usize = 4096;
 
@@ -1763,7 +1790,8 @@ pub struct DeepPeaks {
 /// [`speed_peaks`] of `cid`'s own layers and of the layers in its precomps, at most
 /// [`precomp_time::MAX_DEPTH`] deep, each peak's time mapped up through every precomp layer's
 /// start and stretch to `cid`'s seconds. A nested peak is kept only when every precomp layer on
-/// the way shows it (inside its in/out, and inside its comp's duration). Time-remapped precomp
+/// the way shows it (inside its in/out, inside its comp's duration, Video switch on, not a guide);
+/// switched-off and guide layers are skipped at every level ([`moves_pixels`]). Time-remapped precomp
 /// layers are not searched (see `skipped`). Sorted by time.
 pub fn speed_peaks_deep(project: &Project, cid: ItemId, start: f64, end: f64) -> DeepPeaks {
     let Some(comp) = project.comp(cid) else { return DeepPeaks::default() };
@@ -1790,7 +1818,8 @@ fn nested_peaks(
     }
     for l in &at.1.layers {
         let LayerSource::Comp { item } = l.source else { continue };
-        if comps.contains(&item) || out.peaks.len() >= MAX_PEAKS || *budget == 0 {
+        // A switched-off or guide precomp layer shows nothing of its comp.
+        if !renders(l) || comps.contains(&item) || out.peaks.len() >= MAX_PEAKS || *budget == 0 {
             continue;
         }
         let Some(inner) = project.comp(item) else { continue };

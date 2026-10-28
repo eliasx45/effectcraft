@@ -258,6 +258,48 @@ fn a_peak_two_precomps_deep_maps_through_each_start_and_stretch() {
     assert!(lint::speed_peaks_deep(&s.project, main, 0.0, 3.0).peaks.is_empty());
 }
 
+/// LN1 (28 Oct, 26-10): `handover.check` on MAIN gave 8 off-accent warnings on layers Elias had
+/// switched off inside precomp "S1 06". Switched-off layers don't render, so they aren't linted:
+/// not inside a precomp, not under a switched-off precomp layer, not as guides; a switched-off
+/// parent of a rendered layer still moves it, so its keys still count.
+#[test]
+fn switched_off_layers_inside_precomps_are_not_linted_for_accents() {
+    let (mut s, l) = comp();
+    let inner = s.active_comp_id().unwrap();
+    scale_keys(&mut s, l, 1.0, 2.0, false);
+    let (main, pre) = nest(&mut s, inner, "Main", 3.0, 100.0, (3.0, 11.0));
+    // Peak at 3 + 1.5 = 4.5 s; accent = vowel 4.62 − 1 frame = 4.58: 2 frames early.
+    s.execute("speech.import", json!({"comp": main.0, "map": map(4.5, 4.62)})).unwrap();
+    let count = |s: &mut Session| {
+        s.execute("render.lint", json!({"comp": main.0, "start": 0, "end": 12, "rules": ["off-accent"]})).unwrap()["problems"].as_array().unwrap().len()
+    };
+    fn switches(s: &mut Session, comp: effectcraft_project::ItemId, layer: u64) -> &mut effectcraft_project::Switches {
+        &mut std::sync::Arc::make_mut(&mut s.project).comp_mut(comp).unwrap().layer_mut(LayerId(layer)).unwrap().switches
+    }
+    assert_eq!(count(&mut s), 1, "enabled: the off-accent peak is reported");
+
+    switches(&mut s, inner, l).video = false;
+    assert_eq!(count(&mut s), 0, "switched off inside the precomp");
+    assert!(lint::speed_peaks_deep(&s.project, main, 0.0, 12.0).peaks.is_empty());
+    switches(&mut s, inner, l).video = true;
+    assert_eq!(count(&mut s), 1);
+
+    switches(&mut s, main, pre).video = false;
+    assert_eq!(count(&mut s), 0, "the precomp layer is switched off");
+    switches(&mut s, main, pre).video = true;
+    switches(&mut s, inner, l).guide = true;
+    assert_eq!(count(&mut s), 0, "guide layers don't render");
+    switches(&mut s, inner, l).guide = false;
+
+    // A switched-off parent still moves a rendered child: its peak counts.
+    let child = s.execute("layer.newSolid", json!({"comp": inner.0, "name": "Child", "width": 10, "height": 10, "color": "#ffffff"})).unwrap()["layer"]
+        .as_u64()
+        .unwrap();
+    std::sync::Arc::make_mut(&mut s.project).comp_mut(inner).unwrap().layer_mut(LayerId(child)).unwrap().parent = Some(LayerId(l));
+    switches(&mut s, inner, l).video = false;
+    assert_eq!(count(&mut s), 1, "a hidden parent's move still shows through its child");
+}
+
 #[test]
 fn trimmed_away_nested_peaks_are_dropped() {
     let (mut s, l) = comp();
