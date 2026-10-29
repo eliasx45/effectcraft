@@ -11,7 +11,7 @@
 use crate::i18n::tr;
 use effectcraft_engine::project::{Comp, Layer, Marker};
 use effectcraft_engine::time::Tick;
-use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
 
 use super::timeline::TMap;
@@ -313,10 +313,73 @@ fn marker_shape(x: f32, y0: f32, h: f32) -> Vec<Pos2> {
     vec![pos2(x - 4.0, y0), pos2(x + 4.0, y0), pos2(x + 4.0, ym), pos2(x, y0 + h), pos2(x - 4.0, ym)]
 }
 
-/// Draw one marker (triangle + duration bar + comment) at `x` in a strip `[y0, y1]` and handle
-/// its gestures. `comp_t` is the marker's comp time.
+/// Fewest characters a cut marker name keeps before its "…"; with less room it isn't drawn.
+const LABEL_MIN_CHARS: usize = 3;
+/// Space kept between a marker name and the next marker (or the bar's end).
+const LABEL_GAP: f32 = 4.0;
+
+/// `text` fitted to `room` points (`width` measures a string): whole when it fits, else cut to end
+/// in "…" keeping at least [`LABEL_MIN_CHARS`], else `None` (the name is shown on hover only).
+fn fit_label(text: &str, room: f32, width: impl Fn(&str) -> f32) -> Option<String> {
+    if width(text) <= room {
+        return Some(text.to_string());
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let s: String = chars.iter().take(mid).collect::<String>() + "…";
+        if width(&s) <= room { lo = mid } else { hi = mid - 1 }
+    }
+    (lo >= LABEL_MIN_CHARS.min(chars.len())).then(|| chars.iter().take(lo).collect::<String>().trim_end().to_string() + "…")
+}
+
+/// Where the name of the marker at `xs[own]` must end: before the next marker to its right in
+/// `xs` (a marker at the same x counts when it comes later), else at `limit`.
+fn label_end(xs: &[f32], own: usize, limit: f32) -> f32 {
+    let Some(&x) = xs.get(own) else { return limit };
+    xs.iter().enumerate().filter(|&(j, &o)| j != own && (o > x || (o == x && j > own))).fold(limit, |end, (_, &o)| end.min(o))
+}
+
+/// A marker's name right of its tab at `x` (middle `cy`), cut with "…" so it ends before `end`
+/// rather than printing over the next marker's name or past its bar (Elias, 29 Oct 2026: marker
+/// names and the quotes on layer bars "pile up"). A cut name shows whole on hover; one with no
+/// room for a few characters isn't drawn (the tab's own hover names it).
 #[allow(clippy::too_many_arguments)]
-fn marker(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, comp: &Comp, tm: TMap, m: &Marker, comp_t: f64, r: MarkerRef, y0: f32, y1: f32) {
+fn marker_label(ui: &egui::Ui, p: &egui::Painter, id: egui::Id, x: f32, cy: f32, end: f32, comment: &str, colour: Color32) {
+    let font = Tokens::ui(10.0);
+    let first = comment.lines().next().unwrap_or_default();
+    let x0 = x + 7.0;
+    let width = |s: &str| p.layout_no_wrap(s.to_string(), font.clone(), colour).size().x;
+    let Some(shown) = fit_label(first, end - LABEL_GAP - x0, width) else { return };
+    let g = p.layout_no_wrap(shown.clone(), font, colour);
+    let r = Rect::from_min_size(pos2(x0, cy - g.size().y / 2.0), g.size());
+    p.galley(r.min, g, colour);
+    if shown == comment {
+        return;
+    }
+    let hover = crate::layer_pointer::Lp::of(ui).pos(ui.ctx().pointer_hover_pos());
+    if hover.is_some_and(|h| r.contains(h) && p.clip_rect().contains(h)) && !ui.input(|i| i.pointer.any_down()) {
+        egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), id.with("label-tip"), egui::PopupAnchor::Pointer).show(|ui| ui.label(comment));
+    }
+}
+
+/// Draw one marker (triangle + duration bar + comment) at `x` in a strip `[y0, y1]` and handle
+/// its gestures. `comp_t` is the marker's comp time; its comment ends before `label_end`.
+#[allow(clippy::too_many_arguments)]
+fn marker(
+    app: &mut dyn TimelineHost,
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    comp: &Comp,
+    tm: TMap,
+    m: &Marker,
+    comp_t: f64,
+    r: MarkerRef,
+    y0: f32,
+    y1: f32,
+    label_end: f32,
+) {
     let t = app.tokens();
     let ctx = ui.ctx().clone();
     let x = tm.x(comp_t);
@@ -336,11 +399,11 @@ fn marker(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, comp
         p.line_segment([pos2(xe, y0), pos2(xe, y0 + h)], Stroke::new(1.0, col));
     }
     p.add(egui::Shape::convex_polygon(marker_shape(x, y0, h), col, Stroke::NONE));
+    let id = egui::Id::new(("marker", r.layer, r.index));
     if !m.comment.is_empty() {
-        p.text(pos2(x + 7.0, y0 + h / 2.0), Align2::LEFT_CENTER, m.comment.lines().next().unwrap_or_default(), Tokens::ui(10.0), t.text);
+        marker_label(ui, p, id, x, y0 + h / 2.0, label_end, &m.comment, t.text);
     }
     let hit = Rect::from_min_max(pos2(x - 5.0, y0 - 1.0), pos2(x + 5.0, y1));
-    let id = egui::Id::new(("marker", r.layer, r.index));
     let resp = ui.interact(hit, id, Sense::click_and_drag());
     app.auto_mut().add(&r.auto_id(), hit, if m.comment.is_empty() { "marker" } else { &m.comment });
     let tip = if m.comment.is_empty() { "Marker".to_string() } else { m.comment.clone() };
@@ -419,8 +482,10 @@ pub(crate) fn comp_markers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, comp: 
         rp.line_segment([pos2(x0, rows.min.y), pos2(x0, rows.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x60, 0x90, 0xd0, 90)));
         rp.line_segment([pos2(x1, rows.min.y), pos2(x1, rows.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x60, 0x90, 0xd0, 90)));
     }
+    let xs: Vec<f32> = comp.markers.iter().map(|m| tm.x(m.time.seconds())).collect();
     for (i, m) in comp.markers.iter().enumerate() {
-        marker(app, ui, &p, comp, tm, m, m.time.seconds(), MarkerRef { layer: None, index: i }, strip.min.y, strip.max.y);
+        let end = label_end(&xs, i, strip.max.x);
+        marker(app, ui, &p, comp, tm, m, m.time.seconds(), MarkerRef { layer: None, index: i }, strip.min.y, strip.max.y, end);
     }
 }
 
@@ -459,40 +524,69 @@ pub(crate) fn marker_bin(app: &mut dyn TimelineHost, ui: &mut egui::Ui, comp: &C
 /// outlined: hover names them, a double-click opens the nested comp at the marker).
 pub(crate) fn layer_markers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, clip: Rect, comp: &Comp, layer: &Layer, tm: TMap, r: Rect) {
     let p = ui.painter().with_clip_rect(clip);
-    nested_markers(app, ui, &p, comp, layer, tm, r);
+    // Every name on the row (the layer's markers, then its precomp's) ends before the next marker
+    // on the row or at the bar's out point, whichever comes first.
+    let nested = nested_at(app, ui, comp, layer);
+    let xs: Vec<f32> = layer.markers.iter().map(|m| tm.x(layer.comp_time(m.time).seconds())).chain(nested.iter().map(|(t, _)| tm.x(t.seconds()))).collect();
+    let bar_end = tm.x(layer.out_point.seconds());
+    nested_markers(app, ui, &p, layer, &nested, tm, r, &xs, bar_end);
     for (i, m) in layer.markers.iter().enumerate() {
-        marker(app, ui, &p, comp, tm, m, layer.comp_time(m.time).seconds(), MarkerRef { layer: Some(layer.id.0), index: i }, r.min.y + 3.0, r.max.y - 3.0);
+        let end = label_end(&xs, i, bar_end);
+        marker(app, ui, &p, comp, tm, m, layer.comp_time(m.time).seconds(), MarkerRef { layer: Some(layer.id.0), index: i }, r.min.y + 3.0, r.max.y - 3.0, end);
     }
 }
 
-/// The nested comp's markers on a precomp layer's bar (`markers.nested`).
-fn nested_markers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Painter, comp: &Comp, layer: &Layer, tm: TMap, r: Rect) {
-    let effectcraft_engine::project::LayerSource::Comp { item } = layer.source else { return };
-    let Some(cid) = app.session().active_comp_id() else { return };
-    let project = app.session().project.clone();
-    let Some(nc) = project.comp(item) else { return };
-    if nc.markers.is_empty() {
-        return;
+/// Where a precomp layer's nested comp markers land in this comp (`markers.nested`): (comp time,
+/// index in the nested comp), worked out once per revision (with time remapping that samples the
+/// layer's frames). Empty for any other layer.
+fn nested_at(app: &mut dyn TimelineHost, ui: &egui::Ui, comp: &Comp, layer: &Layer) -> Vec<(Tick, usize)> {
+    let effectcraft_engine::project::LayerSource::Comp { item } = layer.source else { return vec![] };
+    let Some(cid) = app.session().active_comp_id() else { return vec![] };
+    if app.session().project.comp(item).is_none_or(|nc| nc.markers.is_empty()) {
+        return vec![];
     }
-    // Where they land, once per revision (with time remapping that samples the layer's frames).
     let (key, rev) = (egui::Id::new(("nested-markers", cid.0, layer.id.0)), app.session().revision);
     let cached = ui.ctx().data(|d| d.get_temp::<(u64, Vec<(Tick, usize)>)>(key)).filter(|(r, _)| *r == rev);
-    let at = cached.map(|(_, v)| v).unwrap_or_else(|| {
+    cached.map(|(_, v)| v).unwrap_or_else(|| {
         let v: Vec<(Tick, usize)> =
-            effectcraft_engine::commands::markers::nested_markers(&project, cid, comp, layer).into_iter().map(|(t, i, _)| (t, i)).collect();
+            effectcraft_engine::commands::markers::nested_markers(&app.session().project, cid, comp, layer).into_iter().map(|(t, i, _)| (t, i)).collect();
         ui.ctx().data_mut(|d| d.insert_temp(key, (rev, v.clone())));
         v
-    });
-    let list: Vec<(Tick, usize, &Marker)> = at.into_iter().filter_map(|(t, i)| Some((t, i, nc.markers.get(i)?))).collect();
+    })
+}
+
+/// The nested comp's markers (`at`, from [`nested_at`]) on a precomp layer's bar; `xs` is every
+/// marker on the row (the layer's own first), so names stop before the next one or `bar_end`.
+#[allow(clippy::too_many_arguments)]
+fn nested_markers(
+    app: &mut dyn TimelineHost,
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    layer: &Layer,
+    at: &[(Tick, usize)],
+    tm: TMap,
+    r: Rect,
+    xs: &[f32],
+    bar_end: f32,
+) {
+    let effectcraft_engine::project::LayerSource::Comp { item } = layer.source else { return };
+    if at.is_empty() {
+        return;
+    }
+    let project = app.session().project.clone();
+    let Some(nc) = project.comp(item) else { return };
+    let own = layer.markers.len();
+    let list: Vec<(usize, Tick, usize, &Marker)> = at.iter().enumerate().filter_map(|(k, &(t, i))| Some((own + k, t, i, nc.markers.get(i)?))).collect();
     let t = app.tokens();
     let name = project.item(item).map(|i| i.name.clone()).unwrap_or_default();
     let (y0, h) = (r.min.y + 3.0, (r.height() - 6.0).min(10.0));
-    for (ct, i, m) in list {
+    for (pos, ct, i, m) in list {
         let x = tm.x(ct.seconds());
         let col = marker_color(&t, m.label).gamma_multiply(0.75);
         p.add(egui::Shape::closed_line(marker_shape(x, y0, h), Stroke::new(1.2, col)));
         if !m.comment.is_empty() {
-            p.text(pos2(x + 7.0, y0 + h / 2.0), Align2::LEFT_CENTER, m.comment.lines().next().unwrap_or_default(), Tokens::ui(10.0), t.text_dim);
+            let id = egui::Id::new(("nested-marker", layer.id.0, i));
+            marker_label(ui, p, id, x, y0 + h / 2.0, label_end(xs, pos, bar_end), &m.comment, t.text_dim);
         }
         let hit = Rect::from_min_max(pos2(x - 5.0, y0 - 1.0), pos2(x + 5.0, r.max.y - 3.0));
         let tip = if m.comment.is_empty() { format!("Marker in {name}") } else { format!("{} (marker in {name})", m.comment) };
@@ -513,6 +607,26 @@ fn nested_markers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, p: &egui::Paint
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marker_names_are_cut_to_the_room_before_the_next_marker() {
+        // 6 points a character, as a stand-in for the font.
+        let w = |s: &str| s.chars().count() as f32 * 6.0;
+        assert_eq!(fit_label("HOOK", 30.0, w).as_deref(), Some("HOOK"));
+        assert_eq!(fit_label("IDEA · TikTokers got paid", 60.0, w).as_deref(), Some("IDEA · Ti…"));
+        // A space before the cut is dropped, and too little room draws nothing (hover only).
+        assert_eq!(fit_label("INTRO what", 42.0, w).as_deref(), Some("INTRO…"));
+        assert_eq!(fit_label("PROBLEM", 20.0, w), None);
+        assert_eq!(fit_label("PROBLEM", -5.0, w), None);
+        // The next marker to the right ends a name; the last one runs to the limit; of two at the
+        // same x the earlier gets no room.
+        let xs = [100.0, 40.0, 160.0, 160.0];
+        assert_eq!(label_end(&xs, 1, 500.0), 100.0);
+        assert_eq!(label_end(&xs, 0, 500.0), 160.0);
+        assert_eq!(label_end(&xs, 2, 500.0), 160.0);
+        assert_eq!(label_end(&xs, 3, 500.0), 500.0);
+        assert_eq!(label_end(&xs, 3, 120.0), 120.0);
+    }
 
     #[test]
     fn marker_dialog_reads_and_writes_every_field() {
