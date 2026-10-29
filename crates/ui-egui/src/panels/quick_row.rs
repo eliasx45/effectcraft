@@ -340,17 +340,41 @@ fn divider(ui: &egui::Ui, x: f32, r: Rect, c: Color32) {
     ui.painter().line_segment([pos2(x, r.min.y + 6.0), pos2(x, r.max.y - 6.0)], Stroke::new(1.0, c));
 }
 
+/// Whether [`show`] draws the row at the top of a Timeline in `rect` (it is on and there's room).
+pub fn shown(app: &dyn TimelineHost, rect: Rect) -> bool {
+    app.ui().timeline.quick_row.shown && rect.height() >= ROW_H * 3.0
+}
+
+fn lift_id(scope: Option<egui::Id>) -> egui::Id {
+    scope.unwrap_or(egui::Id::NULL).with("quick-row-lift")
+}
+
+/// How far up (the Timeline's points) the host whose [`TimelineHost::id_scope`] is `scope` wants
+/// the row drawn this frame, 0 when it never said.
+pub fn lift(ctx: &egui::Context, scope: Option<egui::Id>) -> f32 {
+    ctx.data(|d| d.get_temp::<f32>(lift_id(scope))).filter(|l| l.is_finite() && *l > 0.0).unwrap_or(0.0)
+}
+
+/// For a host: draw the row `up` points higher this frame (FigCraft lifts it above its floating
+/// toolbar when the toolbar would cover it; Elias, 29 Oct 2026: "Fast In, Caption glow … + pin"
+/// under the toolbar at 77 %+). Its slot in the Timeline stays where it was.
+pub fn set_lift(ctx: &egui::Context, scope: Option<egui::Id>, up: f32) {
+    ctx.data_mut(|d| d.insert_temp(lift_id(scope), if up.is_finite() { up.max(0.0) } else { 0.0 }));
+}
+
 /// Draws the row at the top of `rect` and returns the rest of `rect` for the Timeline.
 // The Timeline lays out everything from the returned rect; the empty-comp drop runs before the row
 // (no comp, no row), and the panel clip is restored before returning.
 pub fn show(app: &mut dyn TimelineHost, ui: &mut egui::Ui, rect: Rect) -> Rect {
-    if !app.ui().timeline.quick_row.shown || rect.height() < ROW_H * 3.0 {
+    if !shown(app, rect) {
         return rect;
     }
     let ctx = ui.ctx().clone();
     let t = app.tokens();
-    let row = Rect::from_min_size(rect.min, vec2(rect.width(), ROW_H));
-    let rest = Rect::from_min_max(pos2(rect.min.x, row.max.y), rect.max);
+    let slot = Rect::from_min_size(rect.min, vec2(rect.width(), ROW_H));
+    // A host can lift the row above something of its own covering it (its slot stays empty).
+    let row = slot.translate(vec2(0.0, -lift(&ctx, app.id_scope())));
+    let rest = Rect::from_min_max(pos2(rect.min.x, slot.max.y), rect.max);
     ui.painter().rect_filled(row, 0.0, t.panel_bg);
     ui.painter().line_segment([row.left_bottom(), row.right_bottom()], Stroke::new(1.0, t.field_border));
     let clip = ui.clip_rect();
