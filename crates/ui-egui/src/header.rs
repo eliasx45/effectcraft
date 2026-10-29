@@ -45,83 +45,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     p.line_segment([pos2(x, cy - 10.0), pos2(x, cy + 10.0)], Stroke::new(1.0, t.separator));
     x += 6.0;
 
-    // Tool slots (with group separators after camera tools and pan-behind).
-    let held_id = egui::Id::new("tool-slot-held");
-    if ui.input(|i| i.pointer.any_pressed()) {
-        ui.data_mut(|d| d.remove::<egui::Id>(held_id));
-    }
-    for (si, slot) in Tool::SLOTS.iter().enumerate() {
-        let cur = app.ui.slot_tools.get(si).copied().unwrap_or(slot[0]);
-        let r = Rect::from_min_size(pos2(x, cy - 13.0), vec2(26.0, 26.0));
-        let active = slot.contains(&app.ui.tool);
-        let id = egui::Id::new(("tool-slot", si));
-        let resp = widgets::icon_button(ui, r, cur.icon(), active, &t, id);
-        if slot.len() > 1 {
-            // Flyout corner triangle.
-            p.add(egui::Shape::convex_polygon(
-                vec![pos2(r.max.x - 2.0, r.max.y - 6.0), pos2(r.max.x - 2.0, r.max.y - 2.0), pos2(r.max.x - 6.0, r.max.y - 2.0)],
-                if active { Color32::WHITE } else { t.text_dim },
-                Stroke::NONE,
-            ));
-        }
-        app.auto.add_response(&format!("tools.{cur:?}"), &resp, cur.label());
-        let tip = match cur.shortcut() {
-            Some(s) => format!("{} ({})", cur.label(), crate::menus::shortcut_text(s)),
-            None => cur.label().to_string(),
-        };
-        let resp = resp.on_hover_text(tip);
-        let held = ui.data(|d| d.get_temp::<egui::Id>(held_id)) == Some(id);
-        if resp.clicked() && !held {
-            app.ui.tool = cur;
-        }
-        // Ctrl+double-click Pan Behind: Center Anchor Point in Layer Content.
-        if cur == Tool::PanBehind
-            && resp.double_clicked()
-            && ui.input(|i| i.modifiers.command)
-            && let Err(e) = crate::menus::invoke(app, ui.ctx(), "layer.centerAnchor", json!({}))
-        {
-            app.ui.status = e;
-        }
-        if slot.len() > 1 {
-            let held_for = resp.is_pointer_button_down_on().then(|| ui.input(|i| i.pointer.press_start_time().map(|s| i.time - s))).flatten();
-            if let Some(seconds) = held_for
-                && seconds < 0.35
-            {
-                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(0.35 - seconds));
-            }
-            let long_press = held_for.is_some_and(|seconds| seconds >= 0.35) && !held;
-            let command = if resp.secondary_clicked() || long_press {
-                if long_press {
-                    ui.data_mut(|d| d.insert_temp(held_id, id));
-                }
-                Some(egui::SetOpenCommand::Bool(true))
-            } else if resp.clicked() && !held {
-                Some(egui::SetOpenCommand::Bool(false))
-            } else {
-                None
-            };
-            let close_behavior = if held && resp.clicked() { egui::PopupCloseBehavior::IgnoreClicks } else { egui::PopupCloseBehavior::CloseOnClickOutside };
-            egui::Popup::menu(&resp).style(crate::widgets::menu_style).open_memory(command).close_behavior(close_behavior).show(|ui| {
-                for tool in slot.iter() {
-                    let row = ui.selectable_label(app.ui.tool == *tool, tool.label());
-                    app.auto.add(&format!("tools.select.{tool:?}"), row.rect, tool.label());
-                    if row.clicked() {
-                        app.ui.tool = *tool;
-                        if let Some(saved) = app.ui.slot_tools.get_mut(si) {
-                            *saved = *tool;
-                        }
-                        ui.close();
-                    }
-                }
-            });
-        }
-        x += 28.0;
-        if matches!(si, 2 | 5 | 7 | 10 | 13) {
-            x += 4.0;
-            p.line_segment([pos2(x, cy - 10.0), pos2(x, cy + 10.0)], Stroke::new(1.0, t.separator));
-            x += 6.0;
-        }
-    }
+    // Tool slots (with group separators after camera tools and pan-behind): EMBED16's one
+    // drawing, which hosts (FigCraft's card Timeline) show too.
+    x = crate::panels::toolbar_hosted::slots(app, ui, x, cy, &crate::panels::toolbar_hosted::Options::default());
 
     // Tool options.
     x += 10.0;

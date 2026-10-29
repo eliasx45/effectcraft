@@ -463,9 +463,9 @@ pub(crate) fn shown_region(ctx: &egui::Context, comp: [f32; 2]) -> [f64; 4] {
 }
 
 /// Show Snapshot: the stored snapshot is on screen (button or F5 held).
-pub(crate) fn showing_snapshot(app: &EffectcraftApp, ctx: &egui::Context) -> bool {
+pub(crate) fn showing_snapshot(app: &dyn TimelineHost, ctx: &egui::Context) -> bool {
     let f5 = ctx.input(|i| i.key_down(egui::Key::F5)) && !ctx.egui_wants_keyboard_input();
-    app.session.snapshot.is_some() && (app.session.state.viewer.show_snapshot || f5)
+    app.session().snapshot.is_some() && (app.session().state.viewer.show_snapshot || f5)
 }
 
 /// Show Channel and exposure, then the display colour conversion (View ▸ Use Display Color
@@ -609,7 +609,7 @@ fn fitted_uv(ctx: &egui::Context, size: [usize; 2], minify: usize) -> Rect {
 
 /// A popup list above `anchor` (selected entries highlighted); entries register
 /// `viewer.<auto>.<n>` automation ids.
-fn popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: &str, anchor: Rect, items: &[(String, bool)], auto: &str) -> Option<usize> {
+fn popup(app: &mut dyn TimelineHost, ui: &mut egui::Ui, id: &str, anchor: Rect, items: &[(String, bool)], auto: &str) -> Option<usize> {
     let pid = egui::Id::new(id);
     if !widgets::popup_is_open(ui, pid) {
         return None;
@@ -627,7 +627,7 @@ fn popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: &str, anchor: Rect, it
             // The item is the English source: the drawn text is looked up in the catalog, while
             // the automation label stays English for scripts and tests.
             let r = ui.selectable_label(*on, crate::i18n::tr(label));
-            app.auto.add(&format!("viewer.{auto}.{i}"), r.rect, label);
+            app.auto_mut().add(&format!("viewer.{auto}.{i}"), r.rect, label);
             if r.clicked() {
                 chosen = Some(i);
             }
@@ -737,7 +737,7 @@ fn toggle_popup(ui: &egui::Ui, id: &str) {
 /// Returns the chosen magnification (`Some(None)` = Fit).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn magnification_menu(
-    app: &mut EffectcraftApp,
+    app: &mut dyn TimelineHost,
     ui: &mut egui::Ui,
     r: Rect,
     id: &str,
@@ -747,7 +747,7 @@ pub(crate) fn magnification_menu(
     current: Option<f32>,
     fit_up: bool,
 ) -> Option<(Option<f32>, bool)> {
-    let t = app.tokens;
+    let t = app.tokens();
     let ppp = ui.ctx().pixels_per_point();
     let pop = format!("{id}-pop");
     let response =
@@ -755,7 +755,7 @@ pub(crate) fn magnification_menu(
     if response.clicked() {
         toggle_popup(ui, &pop);
     }
-    app.auto.add_response(auto_id, &response, "Magnification");
+    app.auto_mut().add_response(auto_id, &response, "Magnification");
     const MAGS: [&str; 15] = ["Fit", "Fit up to 100%", "-", "1.5%", "3.1%", "6.25%", "12.5%", "25%", "33.3%", "50%", "100%", "200%", "400%", "800%", "1600%"];
     let cur = (zoom * ppp * 100.0 * 10.0).round() / 10.0;
     let items: Vec<(String, bool)> = MAGS
@@ -809,11 +809,44 @@ pub(crate) fn resolution_label(res: Resolution, scale: f64) -> String {
 /// options, show channel, reset exposure, exposure, take / show snapshot, Fast Previews, the 3D
 /// renderer and view, and the current time.
 pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, time: Tick, comp: &Comp) {
-    let t = app.tokens;
+    let (_, magnification) = bar_in(app, ui, bar, zoom, time, comp, None);
+    if let Some((z, up)) = magnification {
+        app.ui.viewer.pan = [0.0, 0.0];
+        app.ui.viewer.fit_up_to_100 = up;
+        app.ui.viewer.zoom = z;
+    }
+}
+
+/// EMBED16: the bottom bar for a host that shows the comp somewhere else (FigCraft, under a card
+/// on its canvas): the same controls, drawn in `bar` (the host's layer may be scaled with its
+/// canvas) on the host's session. `zoom` is the magnification the host shows the comp at
+/// (screen points per comp pixel). Returns the magnification picked from its menu
+/// (`Some((None, up))`: Fit, `up`: Fit up to 100 %), which only the host can apply: it owns the
+/// view. Controls that need EffectCraft's whole app (Preview On, the cloud) are left out.
+pub fn hosted_bar(host: &mut dyn TimelineHost, ui: &mut egui::Ui, bar: Rect, zoom: f32) -> Option<(Option<f32>, bool)> {
+    let comp = host.session().active_comp_arc()?;
+    let time = host.session().time();
+    let scope = host.id_scope().unwrap_or_else(|| egui::Id::new("effectcraft-hosted-viewer-bar"));
+    bar_in(host, ui, bar, zoom, time, &comp, Some(scope)).1
+}
+
+/// The bar's frame (background, the horizontal scroll when it doesn't fit) around its contents.
+/// Returns its contents' width and the magnification picked.
+fn bar_in(
+    app: &mut dyn TimelineHost,
+    ui: &mut egui::Ui,
+    bar: Rect,
+    zoom: f32,
+    time: Tick,
+    comp: &Comp,
+    scope: Option<egui::Id>,
+) -> (f32, Option<(Option<f32>, bool)>) {
+    let t = app.tokens();
     let p = ui.painter().clone();
     p.rect_filled(bar, 0.0, t.panel_bg);
     p.line_segment([bar.left_top(), bar.right_top()], Stroke::new(1.0, t.separator));
-    app.auto.add("viewer.controls", bar, "Viewer controls");
+    app.auto_mut().add("viewer.controls", bar, "Viewer controls");
+    let mut out = (bar.width(), None);
     ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
         let scroll = &mut ui.style_mut().spacing.scroll;
         scroll.floating = false;
@@ -821,13 +854,15 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
         scroll.bar_width = 4.0;
         scroll.bar_inner_margin = 1.0;
         scroll.bar_outer_margin = 1.0;
-        egui::ScrollArea::horizontal().id_salt("viewer-controls").auto_shrink([false, false]).show(ui, |ui| {
+        let salt = scope.map_or(egui::Id::new("viewer-controls"), |s| s.with("viewer-controls"));
+        egui::ScrollArea::horizontal().id_salt(salt).auto_shrink([false, false]).show(ui, |ui| {
             let row = Rect::from_min_size(ui.max_rect().min, vec2(bar.width(), 30.0));
-            let first_control = app.auto.elements.len();
-            let width = bottom_bar_contents(app, ui, row, zoom, time, comp);
+            let first_control = app.auto().elements.len();
+            let (width, mag) = bottom_bar_contents(app, ui, row, zoom, time, comp, scope);
+            out = (width, mag);
             ui.allocate_rect(Rect::from_min_size(row.min, vec2(width, row.height())), Sense::hover());
             if let Some(focused) = ui.ctx().memory(|memory| memory.focused())
-                && app.auto.elements.get(first_control..).is_some_and(|controls| controls.iter().any(|control| control.response_id == Some(focused)))
+                && app.auto().elements.get(first_control..).is_some_and(|controls| controls.iter().any(|control| control.response_id == Some(focused)))
                 && let Some(response) = ui.ctx().read_response(focused)
                 && response.gained_focus()
             {
@@ -835,35 +870,61 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
             }
         });
     });
+    out
 }
 
-fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, time: Tick, comp: &Comp) -> f32 {
-    let t = app.tokens;
+/// The bar's controls from `bar`'s left edge. `scope`: a host's (its popups and buttons get ids of
+/// their own, and the app-only controls are left out); `None`: EffectCraft's Composition panel.
+/// Returns the width they took and the magnification picked.
+#[allow(clippy::too_many_arguments)]
+fn bottom_bar_contents(
+    app: &mut dyn TimelineHost,
+    ui: &mut egui::Ui,
+    bar: Rect,
+    zoom: f32,
+    time: Tick,
+    comp: &Comp,
+    scope: Option<egui::Id>,
+) -> (f32, Option<(Option<f32>, bool)>) {
+    let t = app.tokens();
     let p = ui.painter().clone();
     let cy = bar.center().y;
     let mut x = bar.min.x + 8.0;
     let ppp = ui.ctx().pixels_per_point();
+    // A host's ids: its popups and buttons never share state with the app's own viewer bar.
+    let pid = |id: &str| -> String {
+        match scope {
+            Some(s) => format!("{id}@{:?}", s),
+            None => id.to_string(),
+        }
+    };
+    let wid = |id: &str| -> egui::Id {
+        match scope {
+            Some(s) => s.with(id),
+            None => egui::Id::new(id),
+        }
+    };
 
     // Magnification.
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(80.0, 20.0));
-    let fit_up = app.ui.viewer.fit_up_to_100;
-    if let Some((z, up)) = magnification_menu(app, ui, r, "vw-mag", "viewer.magnification", "magnification", zoom, app.ui.viewer.zoom, fit_up) {
-        app.ui.viewer.pan = [0.0, 0.0];
-        app.ui.viewer.fit_up_to_100 = up;
-        app.ui.viewer.zoom = z;
-    }
+    let fit_up = app.ui().viewer.fit_up_to_100;
+    let current = if scope.is_some() { Some(zoom) } else { app.ui().viewer.zoom };
+    let magnification = magnification_menu(app, ui, r, &pid("vw-mag"), "viewer.magnification", "magnification", zoom, current, fit_up);
     x = r.max.x + 4.0;
 
     // Resolution / down-sample factor.
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(84.0, 20.0));
-    let scale = app.viewer_scale(zoom, ppp);
-    let res = app.viewer_res();
-    let response = widgets::dropdown(ui, r, &resolution_label(res, scale), &t, egui::Id::new("vw-res"))
-        .on_hover_text(crate::i18n::tr("Resolution/Down Sample Factor Popup"));
+    let res = app.session().active_comp().map(|c| c.resolution).unwrap_or_default();
+    let scale = match app.app_ref() {
+        Some(a) => a.viewer_scale(zoom, ppp),
+        None => res.scale(zoom, ppp),
+    };
+    let response =
+        widgets::dropdown(ui, r, &resolution_label(res, scale), &t, wid("vw-res")).on_hover_text(crate::i18n::tr("Resolution/Down Sample Factor Popup"));
     if response.clicked() {
-        toggle_popup(ui, "vw-res-pop");
+        toggle_popup(ui, &pid("vw-res-pop"));
     }
-    app.auto.add_response("viewer.resolution", &response, "Resolution/Down Sample Factor");
+    app.auto_mut().add_response("viewer.resolution", &response, "Resolution/Down Sample Factor");
     let items: Vec<(String, bool)> = vec![
         ("Full".into(), res == Resolution::Full),
         ("Half".into(), res == Resolution::Half),
@@ -873,11 +934,13 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
         ("-".into(), false),
         ("Auto".into(), res == Resolution::Auto),
     ];
-    if let Some(i) = popup(app, ui, "vw-res-pop", r, &items, "resolutionItem") {
+    if let Some(i) = popup(app, ui, &pid("vw-res-pop"), r, &items, "resolutionItem") {
         let ctx = ui.ctx().clone();
-        let id = ["view.res.full", "view.res.half", "view.res.third", "view.res.quarter", "view.res.custom", "", "view.res.auto"][i];
-        if let Err(e) = crate::menus::invoke(app, &ctx, id, json!({})) {
-            app.ui.status = e;
+        let ids = ["view.res.full", "view.res.half", "view.res.third", "view.res.quarter", "view.res.custom", "", "view.res.auto"];
+        if let Some(id) = ids.get(i).filter(|id| !id.is_empty())
+            && let Err(e) = app.invoke(&ctx, id, json!({}))
+        {
+            app.ui_mut().status = e;
         }
     }
     x = r.max.x + 6.0;
@@ -899,56 +962,62 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
         };
         // The tip is the English source: the tooltip is looked up in the catalog, while the
         // automation label stays English for scripts and tests.
-        let resp = widgets::icon_button_local(ui, r, icon, local, on, &t, egui::Id::new(("vw-btn", id))).on_hover_text(crate::i18n::tr(tip));
+        let resp = widgets::icon_button_local(ui, r, icon, local, on, &t, wid("vw-btn").with(id)).on_hover_text(crate::i18n::tr(tip));
         auto.add_response(&format!("viewer.{id}"), &resp, tip);
         *x += 24.0;
         (resp.clicked(), r)
     };
-    if tog(ui, &mut app.auto, &mut x, Icon::Checker, app.ui.viewer.transparency_grid, "transparency", "Toggle Transparency Grid").0 {
-        app.ui.viewer.transparency_grid = !app.ui.viewer.transparency_grid;
+    let on = app.ui().viewer.transparency_grid;
+    if tog(ui, app.auto_mut(), &mut x, Icon::Checker, on, "transparency", "Toggle Transparency Grid").0 {
+        app.ui_mut().viewer.transparency_grid = !on;
     }
-    if tog(ui, &mut app.auto, &mut x, Icon::MaskVis, app.ui.viewer.show_masks, "masks", "Toggle Mask and Shape Path Visibility").0 {
-        app.ui.viewer.show_masks = !app.ui.viewer.show_masks;
+    let on = app.ui().viewer.show_masks;
+    if tog(ui, app.auto_mut(), &mut x, Icon::MaskVis, on, "masks", "Toggle Mask and Shape Path Visibility").0 {
+        app.ui_mut().viewer.show_masks = !on;
     }
     // Region of interest: with none, arm drawing (the next drag draws it); with one, clear it.
-    let has_roi = app.session.state.region_of_interest.is_some();
-    if tog(ui, &mut app.auto, &mut x, Icon::Region, has_roi || app.ui.viewer.roi_draw, "roi", "Region of Interest").0 {
+    let has_roi = app.session().state.region_of_interest.is_some();
+    let on = has_roi || app.ui().viewer.roi_draw;
+    if tog(ui, app.auto_mut(), &mut x, Icon::Region, on, "roi", "Region of Interest").0 {
         if has_roi {
-            let _ = app.session.execute("view.setRegionOfInterest", json!({"rect": null}));
-            app.ui.viewer.roi_draw = false;
+            let _ = app.session_mut().execute("view.setRegionOfInterest", json!({"rect": null}));
+            app.ui_mut().viewer.roi_draw = false;
         } else {
-            app.ui.viewer.roi_draw = !app.ui.viewer.roi_draw;
+            let v = &mut app.ui_mut().viewer;
+            v.roi_draw = !v.roi_draw;
         }
     }
     // Grid and guide options.
-    let v = &app.ui.viewer;
+    let v = &app.ui().viewer;
     let any = v.grid || v.safe_margins || v.proportional_grid || (v.guides && !comp.guides.is_empty()) || v.rulers;
-    let (clicked, gr) = tog(ui, &mut app.auto, &mut x, Icon::Grid, any, "grid", "Choose grid and guide options");
+    let (clicked, gr) = tog(ui, app.auto_mut(), &mut x, Icon::Grid, any, "grid", "Choose grid and guide options");
     if clicked {
-        toggle_popup(ui, "vw-grid-pop");
+        toggle_popup(ui, &pid("vw-grid-pop"));
     }
     let items = grid_options(app);
-    if let Some(i) = popup(app, ui, "vw-grid-pop", gr, &items, "gridItem") {
+    if let Some(i) = popup(app, ui, &pid("vw-grid-pop"), gr, &items, "gridItem") {
         toggle_grid_option(app, i);
     }
     // Show Channel and Color Management Settings.
-    let vo = app.session.state.viewer.clone();
-    let (clicked, cr) = tog(ui, &mut app.auto, &mut x, Icon::Channel, vo.channel != Channel::Rgb, "channel", "Show Channel and Color Management Settings");
+    let vo = app.session().state.viewer.clone();
+    let (clicked, cr) = tog(ui, app.auto_mut(), &mut x, Icon::Channel, vo.channel != Channel::Rgb, "channel", "Show Channel and Color Management Settings");
     if clicked {
-        toggle_popup(ui, "vw-channel-pop");
+        toggle_popup(ui, &pid("vw-channel-pop"));
     }
     let mut items: Vec<(String, bool)> = Channel::ALL.iter().map(|c| (c.label().to_string(), vo.channel == *c)).collect();
     items.push(("-".into(), false));
     items.push(("Colorize".into(), vo.colorized));
-    if let Some(i) = popup(app, ui, "vw-channel-pop", cr, &items, "channelItem") {
-        let params =
-            if i < Channel::ALL.len() { json!({"channel": Channel::ALL[i].id()}) } else { json!({"channel": vo.channel.id(), "colorized": !vo.colorized}) };
-        let _ = app.session.execute("view.channel", params);
+    if let Some(i) = popup(app, ui, &pid("vw-channel-pop"), cr, &items, "channelItem") {
+        let params = match Channel::ALL.get(i) {
+            Some(c) => json!({"channel": c.id()}),
+            None => json!({"channel": vo.channel.id(), "colorized": !vo.colorized}),
+        };
+        let _ = app.session_mut().execute("view.channel", params);
     }
     // Exposure.
     let exposed = vo.exposure != 0.0;
-    if tog(ui, &mut app.auto, &mut x, Icon::Exposure, exposed, "resetExposure", "Reset Exposure").0 {
-        let _ = app.session.execute("view.resetExposure", json!({}));
+    if tog(ui, app.auto_mut(), &mut x, Icon::Exposure, exposed, "resetExposure", "Reset Exposure").0 {
+        let _ = app.session_mut().execute("view.resetExposure", json!({}));
     }
     let er = Rect::from_min_size(pos2(x, cy - 10.0), vec2(42.0, 20.0));
     let mut ev = vo.exposure as f64;
@@ -963,49 +1032,55 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
         ),
     );
     let resp = resp.on_hover_text(crate::i18n::tr("Adjust Exposure (stops)"));
-    app.auto.add_response("viewer.exposure", &resp, "Adjust Exposure");
+    app.auto_mut().add_response("viewer.exposure", &resp, "Adjust Exposure");
     if resp.changed() {
-        let _ = app.session.execute("view.exposure", json!({"stops": ev}));
+        let _ = app.session_mut().execute("view.exposure", json!({"stops": ev}));
     }
     x = er.max.x + 4.0;
     // Snapshots.
-    if tog(ui, &mut app.auto, &mut x, Icon::Snapshot, false, "snapshot", "Take Snapshot").0 {
-        let scale = app.viewer_scale(zoom, ppp);
-        match app.session.execute("view.takeSnapshot", json!({"scale": scale.clamp(0.05, 1.0)})) {
-            Ok(_) => app.ui.status = "Snapshot taken".into(),
-            Err(e) => app.ui.status = e.to_string(),
-        }
+    if tog(ui, app.auto_mut(), &mut x, Icon::Snapshot, false, "snapshot", "Take Snapshot").0 {
+        let result = app.session_mut().execute("view.takeSnapshot", json!({"scale": scale.clamp(0.05, 1.0)}));
+        app.ui_mut().status = match result {
+            Ok(_) => "Snapshot taken".into(),
+            Err(e) => e.to_string(),
+        };
     }
     let showing = showing_snapshot(app, ui.ctx());
-    let (_, sr) = tog(ui, &mut app.auto, &mut x, Icon::ShowSnapshot, showing, "showSnapshot", "Show Snapshot (hold)");
+    let (_, sr) = tog(ui, app.auto_mut(), &mut x, Icon::ShowSnapshot, showing, "showSnapshot", "Show Snapshot (hold)");
     // Show Snapshot works while the button is held, like F5.
     let held = ui.input(|i| i.pointer.primary_down()) && ui.input(|i| i.pointer.press_origin()).is_some_and(|o| sr.intersect(ui.clip_rect()).contains(o));
-    if app.session.snapshot.is_some() && held != app.session.state.viewer.show_snapshot {
-        let _ = app.session.execute("view.showSnapshot", json!({"value": held}));
+    if app.session().snapshot.is_some() && held != app.session().state.viewer.show_snapshot {
+        let _ = app.session_mut().execute("view.showSnapshot", json!({"value": held}));
     }
     // Fast Previews.
     let fp = vo.fast_previews;
-    let (clicked, fr) = tog(ui, &mut app.auto, &mut x, Icon::Sparkle, fp != FastPreviews::Off || app.ui.viewer.fast_preview, "fastPreviews", "Fast Previews");
+    let on = fp != FastPreviews::Off || app.ui().viewer.fast_preview;
+    let (clicked, fr) = tog(ui, app.auto_mut(), &mut x, Icon::Sparkle, on, "fastPreviews", "Fast Previews");
     if clicked {
-        toggle_popup(ui, "vw-fast-pop");
+        toggle_popup(ui, &pid("vw-fast-pop"));
     }
     let mut items: Vec<(String, bool)> = FastPreviews::ALL.iter().map(|m| (m.label().to_string(), fp == *m)).collect();
     // Settings ▸ Previews: drafts while playing in any mode.
-    items.push(("Adaptive Resolution While Playing".to_string(), app.session.prefs.previews.adaptive_playback));
+    items.push(("Adaptive Resolution While Playing".to_string(), app.session().prefs.previews.adaptive_playback));
     // UP1: Half / Third / Quarter frames upscaled with FSR1 instead of shown as blocks.
-    items.push(("Sharpen Low-Resolution Previews (FSR)".to_string(), app.session.prefs.previews.upscale_low_res));
-    if let Some(i) = popup(app, ui, "vw-fast-pop", fr, &items, "fastPreviewsItem") {
+    items.push(("Sharpen Low-Resolution Previews (FSR)".to_string(), app.session().prefs.previews.upscale_low_res));
+    if let Some(i) = popup(app, ui, &pid("vw-fast-pop"), fr, &items, "fastPreviewsItem") {
         let n = FastPreviews::ALL.len();
         let _ = match FastPreviews::ALL.get(i) {
-            Some(m) => app.session.execute("view.fastPreviewMode", json!({"mode": m.id()})),
-            None if i == n => app.session.execute("view.adaptivePlayback", json!({})),
-            None => app.session.execute("view.upscaleLowRes", json!({})),
+            Some(m) => app.session_mut().execute("view.fastPreviewMode", json!({"mode": m.id()})),
+            None if i == n => app.session_mut().execute("view.adaptivePlayback", json!({})),
+            None => app.session_mut().execute("view.upscaleLowRes", json!({})),
         };
     }
     x += 4.0;
+    // Preview On needs EffectCraft's whole app (its cloud link): the Composition panel's only.
     #[cfg(not(target_arch = "wasm32"))]
     {
-        x = preview_on(app, ui, x, cy) + 4.0;
+        if scope.is_none()
+            && let Some(full) = app.app()
+        {
+            x = preview_on(full, ui, x, cy) + 4.0;
+        }
     }
     // 3D renderer + view.
     if comp.has_3d() {
@@ -1015,57 +1090,57 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
         let renderers = [(Renderer::Classic3D, "Classic 3D", "classic3D"), (Renderer::Advanced3D, "Advanced 3D", "advanced3D")];
         let current = renderers.iter().find(|(r, ..)| *r == comp.renderer).map_or("Classic 3D", |(_, label, _)| *label);
         let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(96.0, 20.0));
-        if widgets::dropdown(ui, r, crate::i18n::tr(current), &t, egui::Id::new("vw-3d")).clicked() {
-            toggle_popup(ui, "vw-3d-pop");
+        if widgets::dropdown(ui, r, crate::i18n::tr(current), &t, wid("vw-3d")).clicked() {
+            toggle_popup(ui, &pid("vw-3d-pop"));
         }
-        app.auto.add("viewer.renderer3d", r, current);
+        app.auto_mut().add("viewer.renderer3d", r, current);
         let items: Vec<(String, bool)> = renderers.iter().map(|(r, label, _)| (label.to_string(), *r == comp.renderer)).collect();
-        if let Some((renderer, _, id)) = popup(app, ui, "vw-3d-pop", r, &items, "renderer3dItem").and_then(|i| renderers.get(i))
+        if let Some((renderer, _, id)) = popup(app, ui, &pid("vw-3d-pop"), r, &items, "renderer3dItem").and_then(|i| renderers.get(i))
             && *renderer != comp.renderer
-            && let Err(e) = app.session.execute("comp.settings", json!({"renderer": id}))
+            && let Err(e) = app.session_mut().execute("comp.settings", json!({"renderer": id}))
         {
-            app.ui.status = e.to_string();
+            app.ui_mut().status = e.to_string();
         }
         x = r.max.x + 4.0;
-        let cid = app.session.active_comp_id();
-        let cur = cid.and_then(|c| app.session.state.views3d.get(&c)).map(|v| v.current).unwrap_or_default();
+        let cid = app.session().active_comp_id();
+        let cur = cid.and_then(|c| app.session().state.views3d.get(&c)).map(|v| v.current).unwrap_or_default();
         let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(118.0, 20.0));
-        let response = widgets::dropdown(ui, r, cur.label(), &t, egui::Id::new("vw-cam"));
+        let response = widgets::dropdown(ui, r, cur.label(), &t, wid("vw-cam"));
         if response.clicked() {
-            toggle_popup(ui, "vw-cam-pop");
+            toggle_popup(ui, &pid("vw-cam-pop"));
         }
-        app.auto.add_response("viewer.view3d", &response, "3D View");
+        app.auto_mut().add_response("viewer.view3d", &response, "3D View");
         use effectcraft_engine::render::three_d::View3D;
         let items: Vec<(String, bool)> = View3D::ALL.iter().map(|v| (v.label().to_string(), *v == cur)).collect();
-        if let Some(i) = popup(app, ui, "vw-cam-pop", r, &items, "view3dItem") {
-            let _ = app.session.execute("view.set3DView", json!({"view": View3D::ALL[i].id()}));
+        if let Some(view) = popup(app, ui, &pid("vw-cam-pop"), r, &items, "view3dItem").and_then(|i| View3D::ALL.get(i)) {
+            let _ = app.session_mut().execute("view.set3DView", json!({"view": view.id()}));
         }
         x = r.max.x + 4.0;
         // Extended Viewer (Settings ▸ 3D): custom views and Draft 3D show past the comp frame.
-        let on = app.session.prefs.three_d.extended_viewer;
-        if tog(ui, &mut app.auto, &mut x, Icon::ExtendedViewer, on, "extendedViewer", "Extended Viewer").0 {
-            let _ = app.session.execute("view.extendedViewer", json!({}));
+        let on = app.session().prefs.three_d.extended_viewer;
+        if tog(ui, app.auto_mut(), &mut x, Icon::ExtendedViewer, on, "extendedViewer", "Extended Viewer").0 {
+            let _ = app.session_mut().execute("view.extendedViewer", json!({}));
         }
         x += 2.0;
     }
     // Current time.
-    let tc = crate::panels::timecode(&app.session, comp, time);
+    let tc = crate::panels::timecode(app.session(), comp, time);
     let g = p.layout_no_wrap(tc, Tokens::mono(12.0), t.timecode);
     let tr = Rect::from_min_size(pos2(x + 4.0, cy - 9.0), g.size() + vec2(8.0, 4.0));
     p.galley(pos2(tr.min.x + 4.0, tr.min.y + 2.0), g, t.timecode);
-    let resp = ui.interact(tr, egui::Id::new("vw-timecode"), Sense::click());
+    let resp = ui.interact(tr, wid("vw-timecode"), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Current time"));
     if resp.has_focus() {
         p.rect_stroke(tr.shrink(1.0), 2.0, Stroke::new(1.0, t.focus), StrokeKind::Inside);
     }
-    app.auto.add_response("viewer.timecode", &resp, "Current time");
+    app.auto_mut().add_response("viewer.timecode", &resp, "Current time");
     crate::panels::toggle_time_display(app, &resp);
     // Right: render time.
-    let ms = app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0);
+    let ms = app.last_frame_ms();
     if tr.max.x + 50.0 < bar.max.x {
         p.text(pos2(bar.max.x - 10.0, cy), Align2::RIGHT_CENTER, format!("{ms:.0} ms"), Tokens::ui(11.0), t.text_faint);
     }
-    (tr.right() + 8.0 - bar.left()).max(bar.width())
+    ((tr.right() + 8.0 - bar.left()).max(bar.width()), magnification)
 }
 
 #[cfg(test)]
