@@ -90,10 +90,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
         // While a preview plays: the frame rate it achieves and whether that is real time.
-        if let (Some(fps), Some(rt)) = (app.playback.achieved_fps(), app.playback.real_time()) {
-            let note = if rt { "real-time" } else { "not real-time" };
-            p.text(pos2(x0, ly), Align2::LEFT_CENTER, format!("{fps:.2} fps ({note})"), Tokens::ui(11.5), if rt { t.text_dim } else { t.warning });
-            app.auto.add("info.previewFps", Rect::from_min_size(pos2(x0, ly - 8.0), vec2(200.0, 16.0)), &format!("{fps:.2} fps ({note})"));
+        if let Some((label, rt)) = app.playback.rate_label() {
+            p.text(pos2(x0, ly), Align2::LEFT_CENTER, &label, Tokens::ui(11.5), if rt { t.text_dim } else { t.warning });
+            app.auto.add("info.previewFps", Rect::from_min_size(pos2(x0, ly - 8.0), vec2(200.0, 16.0)), &label);
             ly += 18.0;
         }
         // Settings ▸ Composition ▸ Show Rendering Progress in Info Panel.

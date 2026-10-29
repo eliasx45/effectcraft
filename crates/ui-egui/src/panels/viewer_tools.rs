@@ -804,6 +804,73 @@ pub(crate) fn resolution_label(res: Resolution, scale: f64) -> String {
     }
 }
 
+/// The real-time chip of a host that plays a comp (FigCraft's card): the Info panel's readout
+/// ([`crate::Playback::rate_label`]) on a dark chip whose dot is green while the preview keeps
+/// real time and red when it doesn't, its top-right corner at `right_top`. Returns its rect.
+pub fn paint_rate(painter: &egui::Painter, right_top: Pos2, label: &str, real_time: bool) -> Rect {
+    let font = Tokens::ui(11.0);
+    let g = painter.layout_no_wrap(label.to_string(), font, Color32::WHITE);
+    let dot = 7.0;
+    let size = g.size() + vec2(8.0 + dot + 5.0, 4.0);
+    let r = Rect::from_min_size(pos2(right_top.x - size.x, right_top.y), size);
+    if !r.is_finite() {
+        return Rect::NOTHING;
+    }
+    painter.rect_filled(r, 3.0, Color32::from_black_alpha(180));
+    let green = Color32::from_rgb(0x3D, 0xC4, 0x6B);
+    let red = Color32::from_rgb(0xE5, 0x48, 0x4D);
+    painter.circle_filled(pos2(r.min.x + 4.0 + dot / 2.0, r.center().y), dot / 2.0, if real_time { green } else { red });
+    painter.galley(pos2(r.min.x + 4.0 + dot + 5.0, r.min.y + 2.0), g, Color32::WHITE);
+    r
+}
+
+/// The resolution entries of [`resolution_chip`] (the bottom bar's, Custom with its factor).
+const CHIP_RES: [Resolution; 5] = [Resolution::Full, Resolution::Half, Resolution::Third, Resolution::Quarter, Resolution::Auto];
+
+/// EMBED17: the bottom bar's Resolution/Down Sample Factor control for a host that renders a comp
+/// at its own size (FigCraft's card): the same dropdown, label and choices (Full, Half, Third,
+/// Quarter, Custom with its factor, Auto), on no session: `res` is what the host renders at and
+/// `scale` the scale Auto resolves to (its label in brackets). Returns the resolution picked.
+pub fn resolution_chip(ui: &mut egui::Ui, rect: Rect, res: Resolution, scale: f64, t: &Tokens, id: egui::Id) -> Option<Resolution> {
+    let response = widgets::dropdown(ui, rect, &resolution_label(res, scale), t, id).on_hover_text(crate::i18n::tr("Resolution/Down Sample Factor Popup"));
+    let pid = id.with("pop");
+    if response.clicked() {
+        let open = widgets::popup_is_open(ui, pid);
+        ui.data_mut(|d| d.insert_temp(pid.with("open"), !open));
+    }
+    if !widgets::popup_is_open(ui, pid) {
+        return None;
+    }
+    let custom_id = id.with("custom");
+    let mut custom: u32 = ui.data(|d| d.get_temp(custom_id)).unwrap_or(match res {
+        Resolution::Custom(n) => u32::from(n),
+        _ => 5,
+    });
+    widgets::popup_list(ui, pid, rect.left_bottom(), rect, CHIP_RES.len() + 1, 1, |ui| {
+        ui.set_min_width(150.0);
+        let mut chosen = None;
+        for r in CHIP_RES {
+            if r == Resolution::Auto {
+                // Custom (every n-th pixel) before Auto, as in the bottom bar.
+                ui.horizontal(|ui| {
+                    let on = matches!(res, Resolution::Custom(_));
+                    if ui.selectable_label(on, crate::i18n::tr("Custom")).clicked() {
+                        chosen = Some(Resolution::from_factor(u64::from(custom)));
+                    }
+                    if ui.add(egui::DragValue::new(&mut custom).range(1..=40).speed(0.1)).changed() {
+                        ui.data_mut(|d| d.insert_temp(custom_id, custom));
+                    }
+                });
+                ui.separator();
+            }
+            if ui.selectable_label(res == r, crate::i18n::tr(r.label())).clicked() {
+                chosen = Some(r);
+            }
+        }
+        chosen
+    })
+}
+
 /// The Composition panel's bottom bar, in After Effects 2026 order: magnification, resolution,
 /// transparency grid, mask and shape path visibility, region of interest, grid and guide
 /// options, show channel, reset exposure, exposure, take / show snapshot, Fast Previews, the 3D

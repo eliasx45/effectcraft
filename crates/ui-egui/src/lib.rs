@@ -476,6 +476,15 @@ impl Playback {
         self.achieved_fps().map(|f| f * step >= self.fps * 0.95)
     }
 
+    /// The Info panel's real-time readout while the preview plays: "23.98 fps (real-time)" or
+    /// "(not real-time)", and whether it is real time. Hosts that play a comp (FigCraft's card)
+    /// keep a `Playback` of their own ([`Self::frame_shown`], [`Self::observe`]) and show this.
+    pub fn rate_label(&self) -> Option<(String, bool)> {
+        let (fps, rt) = (self.achieved_fps()?, self.real_time()?);
+        let note = if rt { "real-time" } else { "not real-time" };
+        Some((format!("{fps:.2} fps ({note})"), rt))
+    }
+
     /// The preview has kept real time for the last quarter second (at least two frames) up to
     /// `now`: rendering keeps up, so sound can start without waiting for the whole preview.
     pub fn keeps_up(&self, now: f64) -> bool {
