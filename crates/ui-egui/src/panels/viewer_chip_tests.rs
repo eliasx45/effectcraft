@@ -32,7 +32,9 @@ fn the_resolution_chip_opens_and_never_panics() {
     }
     assert!(ctx.data(|d| d.get_temp::<bool>(id.with("pop").with("open"))).unwrap_or(false), "the list is open");
     for scale in [f64::NAN, 0.0, -1.0, 1e9] {
-        let _ = ctx.run_ui(RawInput::default(), |ui| resolution_chip(ui, rect, Resolution::Custom(7), scale, &t, id));
+        let _ = ctx.run_ui(RawInput::default(), |ui| {
+            let _ = resolution_chip(ui, rect, Resolution::Custom(7), scale, &t, id);
+        });
     }
 }
 

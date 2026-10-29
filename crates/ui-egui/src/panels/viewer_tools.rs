@@ -616,8 +616,9 @@ fn popup(app: &mut dyn TimelineHost, ui: &mut egui::Ui, id: &str, anchor: Rect, 
     }
     let h: f32 = items.iter().map(|(l, _)| if l == "-" { 9.0 } else { 21.0 }).sum::<f32>() + 14.0;
     let seps = items.iter().filter(|(l, _)| l == "-").count();
+    let width = widgets::menu_check_width(ui, items.iter().filter(|(l, _)| l != "-").map(|(l, _)| crate::i18n::tr(l).to_string()), 170.0);
     widgets::popup_list(ui, pid, anchor.left_top() - vec2(0.0, h + 4.0), anchor, items.len().saturating_sub(seps), seps, |ui| {
-        ui.set_min_width(170.0);
+        ui.set_min_width(width);
         let mut chosen = None;
         for (i, (label, on)) in items.iter().enumerate() {
             if label == "-" {
@@ -625,8 +626,9 @@ fn popup(app: &mut dyn TimelineHost, ui: &mut egui::Ui, id: &str, anchor: Rect, 
                 continue;
             }
             // The item is the English source: the drawn text is looked up in the catalog, while
-            // the automation label stays English for scripts and tests.
-            let r = ui.selectable_label(*on, crate::i18n::tr(label));
+            // the automation label stays English for scripts and tests. A check mark shows
+            // what's on, the row under the pointer is blue (never a host's selection colour).
+            let r = widgets::menu_check(ui, *on, crate::i18n::tr(label), width);
             app.auto_mut().add(&format!("viewer.{auto}.{i}"), r.rect, label);
             if r.clicked() {
                 chosen = Some(i);
@@ -846,15 +848,16 @@ pub fn resolution_chip(ui: &mut egui::Ui, rect: Rect, res: Resolution, scale: f6
         Resolution::Custom(n) => u32::from(n),
         _ => 5,
     });
+    let width = widgets::menu_check_width(ui, CHIP_RES.iter().map(|r| crate::i18n::tr(r.label()).to_string()), 150.0);
     widgets::popup_list(ui, pid, rect.left_bottom(), rect, CHIP_RES.len() + 1, 1, |ui| {
-        ui.set_min_width(150.0);
+        ui.set_min_width(width);
         let mut chosen = None;
         for r in CHIP_RES {
             if r == Resolution::Auto {
                 // Custom (every n-th pixel) before Auto, as in the bottom bar.
                 ui.horizontal(|ui| {
                     let on = matches!(res, Resolution::Custom(_));
-                    if ui.selectable_label(on, crate::i18n::tr("Custom")).clicked() {
+                    if widgets::menu_check(ui, on, crate::i18n::tr("Custom"), (width - 56.0).max(80.0)).clicked() {
                         chosen = Some(Resolution::from_factor(u64::from(custom)));
                     }
                     if ui.add(egui::DragValue::new(&mut custom).range(1..=40).speed(0.1)).changed() {
@@ -863,7 +866,7 @@ pub fn resolution_chip(ui: &mut egui::Ui, rect: Rect, res: Resolution, scale: f6
                 });
                 ui.separator();
             }
-            if ui.selectable_label(res == r, crate::i18n::tr(r.label())).clicked() {
+            if widgets::menu_check(ui, res == r, crate::i18n::tr(r.label()), width).clicked() {
                 chosen = Some(r);
             }
         }

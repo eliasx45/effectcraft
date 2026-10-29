@@ -92,6 +92,69 @@ impl Lp {
             None => r,
         }
     }
+
+    /// Whether the layer is transformed (a host's canvas).
+    pub fn transformed(self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Window points per layer point: the host's canvas zoom (1 when untransformed).
+    pub fn scale(self) -> f32 {
+        match self.0 {
+            Some(t) if t.scaling.is_finite() && t.scaling > 0.0 => 1.0 / t.scaling,
+            _ => 1.0,
+        }
+    }
+
+    /// The scale a popup opened from this layer shows at: [`popup_scale`] of [`Lp::scale`].
+    pub fn popup_scale(self) -> f32 {
+        popup_scale(self.scale())
+    }
+}
+
+/// The smallest and largest a popup opened in a host's canvas is drawn, times its normal size.
+pub const POPUP_SCALE: (f32, f32) = (0.75, 1.5);
+
+/// The scale of a popup opened from a card on a host's canvas (the Guides menu, zoom %,
+/// resolution, channel, a right-click menu): the canvas zoom `canvas_scale`, clamped to
+/// [`POPUP_SCALE`] so its text stays readable; it is anchored to its button every frame (Elias,
+/// 29 Oct 2026: at 23 % the Guides menu was bigger than the whole card, at 120 % tiny next to a
+/// huge toolbar, and it drifted from its button while the canvas zoomed).
+pub fn popup_scale(canvas_scale: f32) -> f32 {
+    if canvas_scale.is_finite() && canvas_scale > 0.0 { canvas_scale.clamp(POPUP_SCALE.0, POPUP_SCALE.1) } else { 1.0 }
+}
+
+/// Draw `layer` (a popup laid out in window coordinates) `k` times its size about the window
+/// point `about`, which stays where it is (the popup's corner on its button).
+pub fn scale_layer_about(ctx: &Context, layer: LayerId, about: Pos2, k: f32) {
+    ctx.set_transform_layer(layer, TSTransform::new(about.to_vec2() * (1.0 - k), k));
+}
+
+/// The corner of `area` (a popup) on the side of `anchor` (its button, or the point it opened
+/// at): the point it is scaled about, so the side touching the button stays on it.
+pub fn corner_toward(area: Rect, anchor: Rect) -> Pos2 {
+    let c = anchor.center();
+    Pos2::new(if c.x <= area.center().x { area.min.x } else { area.max.x }, if c.y <= area.center().y { area.min.y } else { area.max.y })
+}
+
+/// Scale the open egui popup (menu or context menu) of `resp` with `resp`'s layer, as
+/// [`popup_scale`] says. Call it right after showing the popup. Nothing happens in an
+/// untransformed layer (EffectCraft's own window) or while the popup is closed. Its submenus
+/// stay at their normal size.
+pub fn scale_egui_popup(resp: &egui::Response) {
+    let ctx = &resp.ctx;
+    let lp = Lp::layer(ctx, resp.layer_id);
+    if !lp.transformed() {
+        return;
+    }
+    let id = egui::Popup::default_response_id(resp);
+    if !egui::Popup::is_id_open(ctx, id) {
+        return;
+    }
+    let Some(area) = ctx.memory(|m| m.area_rect(id)) else { return };
+    // A context menu opens at the pointer, a menu at its button.
+    let anchor = egui::Popup::position_of_id(ctx, id).map_or_else(|| lp.to_window(resp.interact_rect), Rect::from_pos);
+    scale_layer_about(ctx, LayerId::new(egui::Order::Foreground, id), corner_toward(area, anchor), lp.popup_scale());
 }
 
 #[cfg(test)]

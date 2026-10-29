@@ -649,38 +649,107 @@ const POPUP_LIST_MAX_H: f32 = 440.0;
 /// control that toggles the list itself). Returns the choice.
 pub fn popup_list<R>(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, anchor: Rect, rows: usize, seps: usize, body: impl FnOnce(&mut Ui) -> Option<R>) -> Option<R> {
     // The list is a window-level area: a control in a scaled layer (a host's canvas) opens it at
-    // the control's place in the window.
+    // the control's place in the window, drawn `k` times its size (the canvas zoom, kept
+    // readable: [`crate::layer_pointer::popup_scale`]). Every length below is in the list's own
+    // points; `k` turns one into window points.
     let lp = crate::layer_pointer::Lp::of(ui);
-    let (pos, anchor) = (lp.window_p(pos), if anchor.is_positive() { lp.to_window(anchor) } else { anchor });
+    let k = lp.popup_scale();
+    let (pos, anchor) = popup_anchor(lp, pos, anchor, k);
     let screen = ui.ctx().content_rect();
     let sp = ui.spacing();
     let want = rows as f32 * (sp.interact_size.y + sp.item_spacing.y + 4.0) + seps as f32 * (2.0 * sp.item_spacing.y + 2.0) + 16.0;
-    let want = want.min(POPUP_LIST_MAX_H.min(screen.height() - 24.0).max(120.0));
+    let want = want.min(POPUP_LIST_MAX_H.min(screen.height() / k - 24.0).max(120.0));
     // The control's top: the list opens above it when it doesn't fit below.
-    let above_y = if anchor.is_positive() { anchor.min.y } else { pos.y - sp.interact_size.y - 4.0 };
-    let below = screen.bottom() - 8.0 - pos.y;
-    let above = above_y - 8.0 - screen.top();
+    let above_y = if anchor.is_positive() { anchor.min.y } else { pos.y - (sp.interact_size.y + 4.0) * k };
+    let below = (screen.bottom() - 8.0 - pos.y) / k;
+    let above = (above_y - 8.0 - screen.top()) / k;
     let (top, est) = if want <= below || below >= above {
         (pos.y, want.min(below.max(120.0)))
     } else {
         let h = want.min(above.max(120.0));
-        (above_y - h, h)
+        (above_y - h * k, h)
     };
     let max_h = (est - 12.0).max(80.0);
-    let pos = egui::pos2(pos.x, top.min(screen.bottom() - est).max(screen.top()));
+    let pos = egui::pos2(pos.x, top.min(screen.bottom() - est * k).max(screen.top()));
+    let area_id = id.with("area");
+    let scaled = lp.transformed();
+    if scaled {
+        // Laid out at `pos` in window points, drawn `k` times its size from there: its corner
+        // stays on the control at any canvas zoom, every frame (the canvas zooming or panning
+        // moves the control, and the list with it).
+        crate::layer_pointer::scale_layer_about(ui.ctx(), egui::LayerId::new(egui::Order::Foreground, area_id), pos, k);
+    }
     let mut chosen = None;
-    let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
+    // (egui keeps an area inside the window by its unscaled size: a scaled one is placed above.)
+    let area = egui::Area::new(area_id).order(egui::Order::Foreground).fixed_pos(pos).constrain(!scaled).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             // (An area's content is laid out in last frame's size: ask for the estimate.)
             egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height((est - 16.0).min(max_h)).show(ui, |ui| chosen = body(ui));
         });
     });
     note_open_popup_list(ui.ctx());
-    let outside = pressed_outside(ui.ctx(), &area.response) && !ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| anchor.contains(p));
+    // Where the list shows in the window (its layer is scaled about `pos`).
+    let shown = if scaled { Rect::from_min_size(pos + (area.response.rect.min - pos) * k, area.response.rect.size() * k) } else { area.response.rect };
+    let pressed_out = ui.ctx().input(|i| i.pointer.any_pressed() && !i.pointer.interact_pos().is_some_and(|p| shown.contains(p)));
+    let outside = pressed_out && !ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| anchor.contains(p));
     if chosen.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.data_mut(|d| d.insert_temp(id.with("open"), false));
     }
     chosen
+}
+
+/// A popup list's place `pos` and its control `anchor` (both in `lp`'s layer) in window points,
+/// for a list drawn `k` times its size: a list placed below (or above) its control keeps that
+/// gap in its own points, so it sits on the control at any canvas zoom instead of drifting off
+/// it by the difference between the canvas zoom and `k`.
+pub(crate) fn popup_anchor(lp: crate::layer_pointer::Lp, pos: egui::Pos2, anchor: Rect, k: f32) -> (egui::Pos2, Rect) {
+    if !anchor.is_positive() || !lp.transformed() {
+        return (lp.window_p(pos), if anchor.is_positive() { lp.to_window(anchor) } else { anchor });
+    }
+    let a = lp.to_window(anchor);
+    let x = a.min.x + (pos.x - anchor.min.x) * k;
+    let y = if pos.y >= anchor.max.y {
+        a.max.y + (pos.y - anchor.max.y) * k
+    } else if pos.y <= anchor.min.y {
+        a.min.y - (anchor.min.y - pos.y) * k
+    } else {
+        lp.window_p(pos).y
+    };
+    (egui::pos2(x, y), a)
+}
+
+/// The blue of a popup row under the pointer, as in EffectCraft's own menus (never the host's
+/// selection colour: FigCraft's green showed through on a card's Guides menu).
+pub const MENU_HOVER: Color32 = Color32::from_rgb(0x46, 0x97, 0xf3);
+
+/// The width a [`menu_check`] row needs for `label` (its check column and padding), at least
+/// `min`.
+pub fn menu_check_width(ui: &Ui, labels: impl IntoIterator<Item = String>, min: f32) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widest = labels.into_iter().map(|l| ui.fonts_mut(|f| f.layout_no_wrap(l, font.clone(), Color32::WHITE).size().x)).fold(0.0_f32, f32::max);
+    (widest + 40.0).max(min)
+}
+
+/// One row of a popup list `width` wide: a check mark when `on`, the label, and the whole row in
+/// [`MENU_HOVER`] under the pointer (text white). Its looks never come from the host's style.
+pub fn menu_check(ui: &mut Ui, on: bool, label: &str, width: f32) -> Response {
+    let h = ui.spacing().interact_size.y;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, h), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hot = resp.hovered() || resp.has_focus();
+        let text = if hot { Color32::WHITE } else { ui.visuals().text_color() };
+        let p = ui.painter();
+        if hot {
+            p.rect_filled(rect, 4.0, MENU_HOVER);
+        }
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        if on {
+            p.text(rect.left_center() + vec2(10.0, 0.0), egui::Align2::CENTER_CENTER, "✓", font.clone(), text);
+        }
+        p.text(rect.left_center() + vec2(22.0, 0.0), egui::Align2::LEFT_CENTER, label, font, text);
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), on, label));
+    resp
 }
 
 /// Custom popup lists also hold the app's keyboard shortcuts while open.
@@ -721,14 +790,19 @@ pub fn menu_style(style: &mut egui::Style) {
 }
 
 /// `resp`'s context menu in the app's [`menu_style`] (its submenus inherit it).
+/// In a host's scaled canvas it is drawn with the canvas zoom, kept readable
+/// ([`crate::layer_pointer::scale_egui_popup`]).
 pub fn context_menu(resp: &Response, add_contents: impl FnOnce(&mut Ui)) -> Option<egui::InnerResponse<()>> {
-    egui::Popup::context_menu(resp).style(menu_style).show(add_contents)
+    let out = egui::Popup::context_menu(resp).style(menu_style).show(add_contents);
+    crate::layer_pointer::scale_egui_popup(resp);
+    out
 }
 
 /// A button opening a menu in the app's [`menu_style`], for one outside the menu bar.
 pub fn menu_button<'a, R>(ui: &mut Ui, atoms: impl egui::IntoAtoms<'a>, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<Option<R>> {
     let config = egui::containers::menu::MenuConfig::new().style(menu_style);
     let (response, inner) = egui::containers::menu::MenuButton::new(atoms).config(config).ui(ui, add_contents);
+    crate::layer_pointer::scale_egui_popup(&response);
     egui::InnerResponse::new(inner.map(|i| i.inner), response)
 }
 
