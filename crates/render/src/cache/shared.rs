@@ -97,9 +97,17 @@ impl Split {
     }
 
     /// The most `kind` may hold: the total less the other caches' floors (never above the total).
+    /// The footage cache never grows past its own budget (Settings ▸ Memory & CPU ▸ Footage Frame
+    /// Cache): it is the footage's own cap, so a long deep clip (12-bit ProRes 4444, 16.6 MB a
+    /// 1080p frame) can't fill the room the comps' layers and RAM preview frames share. On 29 Oct
+    /// 2026 it grew to about 30 GB of a 40.5 GB total and the Mac swapped 39 GB.
     pub fn limit(&self, kind: ShareKind) -> u64 {
         let others = ShareKind::ALL.iter().filter(|k| **k != kind).map(|k| self.floor(*k)).fold(0u64, u64::saturating_add);
-        self.total.saturating_sub(others)
+        let room = self.total.saturating_sub(others);
+        match kind {
+            ShareKind::Media => room.min(self.share(kind)),
+            _ => room,
+        }
     }
 }
 

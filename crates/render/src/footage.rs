@@ -242,6 +242,11 @@ pub trait FootageSource: Send + Sync {
     /// Settings ▸ Previews ▸ Hardware Video Decoding: let previews decode footage on a hardware
     /// decoder (visually identical, not bit-exact). Sources without one ignore it.
     fn set_hardware_decoding(&self, _on: bool) {}
+    /// Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits: keep footage frames deeper than 8
+    /// bits at 8 bits per channel in previews, in previews and exports (the [`Self::exact`] view
+    /// too), or nowhere (half the memory; Interpret Footage overrides it per item). Sources that
+    /// keep no decoded frames ignore it.
+    fn set_eight_bit(&self, _mode: effectcraft_project::EightBit) {}
     /// Settings ▸ Media & Disk Cache ▸ Disk Cache: where decoded stills that are slow to decode
     /// persist between sessions (`None` = off). Sources without a still decoder ignore it.
     fn set_still_cache(&self, _disk: Option<Arc<crate::disk_cache::DiskCache>>) {}
@@ -357,6 +362,9 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn set_hardware_decoding(&self, on: bool) {
         self.inner.set_hardware_decoding(on)
+    }
+    fn set_eight_bit(&self, mode: effectcraft_project::EightBit) {
+        self.inner.set_eight_bit(mode)
     }
     fn set_still_cache(&self, disk: Option<Arc<crate::disk_cache::DiskCache>>) {
         self.inner.set_still_cache(disk)

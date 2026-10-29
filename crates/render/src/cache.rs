@@ -1634,6 +1634,7 @@ impl std::fmt::Debug for FootageKey<'_> {
             page,
             alphabetical,
             start_timecode,
+            eight_bit,
         } = self.0;
         f.debug_struct("Footage")
             .field("path", path)
@@ -1662,6 +1663,7 @@ impl std::fmt::Debug for FootageKey<'_> {
             .field("page", page)
             .field("alphabetical", alphabetical)
             .field("start_timecode", start_timecode)
+            .field("eight_bit", eight_bit)
             .finish()
     }
 }

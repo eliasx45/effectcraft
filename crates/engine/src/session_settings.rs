@@ -32,6 +32,15 @@ impl Session {
         self.footage.set_conform_folder(self.conformed_audio_folder());
         // Settings ▸ Previews ▸ Hardware Video Decoding (previews only: exports read the exact view).
         self.footage.set_hardware_decoding(self.prefs.previews.hardware_pro_res_decoding);
+        // Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits (Preview Only: the exact view,
+        // which exports read, keeps full depth). Pixels made from the other depth are dropped.
+        let eight = self.prefs.eight_bit_footage();
+        self.footage.set_eight_bit(eight);
+        if self.applied_eight_bit_footage.replace(eight).is_some_and(|was| was != eight) {
+            self.footage.purge();
+            self.layer_cache.clear();
+            self.events.push(crate::Event::PurgeCaches);
+        }
         // Switches Affect Nested Comps changes what precomp layers render: drop cached pixels.
         let nested = self.prefs.general.switches_affect_nested_comps;
         if self.applied_nested_switches.replace(nested).is_some_and(|was| was != nested) {

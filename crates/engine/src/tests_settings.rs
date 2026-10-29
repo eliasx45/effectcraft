@@ -338,7 +338,8 @@ fn shared_budget_limits_and_off_switch() {
     // own budget.
     assert_eq!(split.floors, [640 << 20, 640 << 20, 640 << 20]);
     assert_eq!(s.layer_cache.budget() as u64, split.total - (1280 << 20), "the total less the others' floors");
-    assert_eq!(*src.0.lock().unwrap() as u64, split.total - (1280 << 20));
+    // The footage cache keeps to its own budget (Footage Frame Cache): its cap, not the room.
+    assert_eq!(*src.0.lock().unwrap() as u64, 1 << 30);
     for kind in ShareKind::ALL {
         assert!(b.limit(kind) as u64 <= split.total, "no cache past the total");
     }
@@ -968,4 +969,57 @@ fn gpu_summary_names_the_adapter_or_says_why_there_is_none() {
     let on = gpu_summary(&s);
     assert!(on.starts_with("Compositing: GPU, NVIDIA GeForce RTX 4070 (Vulkan)."), "{on}");
     assert!(!on.contains("compositing is off"), "{on}");
+}
+
+/// FC1 (29 Oct 2026): Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits is a pref agents set
+/// with `prefs.set` (`memory.eightBitFootage`: off / preview / all, default all: previews and
+/// exports), applied to the footage source; a change empties the layer cache (its pixels came
+/// from the other depth). Interpret Footage ▸ Decode at 8 Bits (`eightBit`) overrides it per
+/// clip, round-trips through `default`, and is undoable.
+#[test]
+fn eight_bit_footage_pref_and_per_clip_override() {
+    use effectcraft_project::EightBit;
+    struct Src(std::sync::Mutex<Vec<EightBit>>);
+    impl effectcraft_render::FootageSource for Src {
+        fn frame(&self, _: effectcraft_project::ItemId, _: &effectcraft_project::Footage, _: effectcraft_time::Tick) -> Option<Arc<effectcraft_raster::Image>> {
+            None
+        }
+        fn set_eight_bit(&self, mode: EightBit) {
+            self.0.lock().unwrap().push(mode);
+        }
+    }
+    let mut s = Session::default();
+    assert_eq!(s.prefs.memory.eight_bit_footage, "all", "previews and exports by default");
+    assert_eq!(s.prefs.eight_bit_footage(), EightBit::All);
+    let src = Arc::new(Src(Default::default()));
+    s.footage = src.clone();
+    s.prefs_changed();
+    assert_eq!(src.0.lock().unwrap().last(), Some(&EightBit::All));
+    s.execute("prefs.set", json!({"key": "memory.eightBitFootage", "value": "preview"})).unwrap();
+    assert_eq!(src.0.lock().unwrap().last(), Some(&EightBit::Preview));
+    assert!(s.events.iter().any(|e| matches!(e, crate::Event::PurgeCaches)), "a change drops pixels of the other depth");
+    s.execute("prefs.set", json!({"key": "memory.eightBitFootage", "value": "off"})).unwrap();
+    assert_eq!(s.prefs.eight_bit_footage(), EightBit::Off);
+    // A corrupt value falls back to the default.
+    let mut p = Prefs::from_json(r#"{"memory": {"eightBitFootage": "sixteen"}}"#);
+    p.normalize();
+    assert_eq!(p.eight_bit_footage(), EightBit::All);
+
+    let id = s.execute("file.importPlaceholder", json!({"name": "clip", "width": 64, "height": 36, "frameRate": 24, "duration": 2})).unwrap();
+    let item = id["item"].as_u64().or_else(|| id.as_u64()).map(effectcraft_project::ItemId).unwrap_or_else(|| *s.project.items.keys().last().unwrap());
+    let own = |s: &Session| match &s.project.item(item).unwrap().kind {
+        effectcraft_project::ItemKind::Footage(f) => f.eight_bit,
+        _ => panic!("not footage"),
+    };
+    assert_eq!(own(&s), None);
+    let out = s.execute("file.interpretFootage", json!({"items": [item.0], "eightBit": "off"})).unwrap();
+    assert_eq!(own(&s), Some(EightBit::Off));
+    assert_eq!(out["items"][0]["eightBit"], "off");
+    s.execute("file.interpretFootage", json!({"items": [item.0], "eightBit": "all"})).unwrap();
+    assert_eq!(own(&s), Some(EightBit::All));
+    s.execute("file.interpretFootage", json!({"items": [item.0], "eightBit": "default"})).unwrap();
+    assert_eq!(own(&s), None);
+    assert!(s.undo());
+    assert_eq!(own(&s), Some(EightBit::All));
+    assert!(s.execute("file.interpretFootage", json!({"items": [item.0], "eightBit": "twelve"})).is_err());
 }

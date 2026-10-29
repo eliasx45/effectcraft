@@ -132,6 +132,32 @@ pub(crate) fn frame_rows(f: &VideoFrame, op: AlphaOp, y0: usize, out: &mut [Px])
     }
 }
 
+/// A 9–16-bit Y'CbCr frame with its samples rounded to 8 bits, for previews that keep footage
+/// at 8 bits per channel (Settings ▸ Previews ▸ Decode Footage at 8 Bits for Previews): half the
+/// memory (12-bit 4:4:4 + alpha, 8 bytes a pixel → 4), converted by the same matrix and range,
+/// so the picture differs from the full-depth one by at most about one 8-bit step. `None` for
+/// frames that are 8-bit (or RGBA, or float) already: they are kept as they are.
+pub(crate) fn frame_to_8bit(f: &VideoFrame) -> Option<VideoFrame> {
+    let PixelData::Yuv16 { planes, chroma, bits, alpha } = &f.data else { return None };
+    let bits = (*bits).clamp(8, 16);
+    let max = (1u32 << bits) - 1;
+    let shift = bits - 8;
+    let half = (1u32 << shift) >> 1;
+    // Limited range scales by 2^(bits-8) (16..235 at 8 bits is 64..940 at 10); full range by
+    // max / 255 around the chroma midpoint. Alpha is always full range.
+    let full = |v: u16| ((u32::from(v).min(max) * 255 + max / 2) / max).min(255) as u8;
+    let limited = |v: u16| ((u32::from(v).min(max) + half) >> shift).min(255) as u8;
+    let mid = 1i64 << (bits - 1);
+    let full_chroma = |v: u16| (128 + ((i64::from(v).min(i64::from(max)) - mid) * 255 + i64::from(max / 2)).div_euclid(i64::from(max))).clamp(0, 255) as u8;
+    let conv = |p: &[u16], f: &(dyn Fn(u16) -> u8 + Sync)| -> Arc<Vec<u8>> { Arc::new(p.par_iter().map(|v| f(*v)).collect()) };
+    let planes = match f.color.range {
+        Range::Limited => [conv(&planes[0], &limited), conv(&planes[1], &limited), conv(&planes[2], &limited)],
+        Range::Full => [conv(&planes[0], &full), conv(&planes[1], &full_chroma), conv(&planes[2], &full_chroma)],
+    };
+    let alpha = alpha.as_ref().map(|a| conv(a, &full));
+    Some(VideoFrame { width: f.width, height: f.height, data: PixelData::Yuv8 { planes, chroma: *chroma, alpha }, color: f.color, par: f.par, pts: f.pts })
+}
+
 /// A decoded picture kept compactly and turned into compositor pixels on use, exactly as
 /// [`frame_to_image`] / [`dynamic_to_image`] convert it: the decoder's own samples (8-bit 4:2:0
 /// Y'CbCr is 1.5 bytes a pixel, 10-bit 3) or a still's 8 / 16-bit RGBA, instead of 16 bytes a
@@ -147,6 +173,21 @@ impl Packed {
         match self {
             Packed::Video { frame, .. } => (frame.width, frame.height),
             Packed::Rgba8 { width, height, .. } | Packed::Rgba16 { width, height, .. } => (*width, *height),
+        }
+    }
+
+    /// The frame with its samples rounded to 8 bits ([`frame_to_8bit`]; 16-bit stills to 8-bit
+    /// RGBA), for previews that keep footage at 8 bits. `None` when it is 8-bit already.
+    pub(crate) fn to_8bit(&self) -> Option<Packed> {
+        match self {
+            Packed::Video { frame, op } => frame_to_8bit(frame).map(|f| Packed::Video { frame: Arc::new(f), op: *op }),
+            Packed::Rgba16 { width, height, data, op } => Some(Packed::Rgba8 {
+                width: *width,
+                height: *height,
+                data: data.par_iter().map(|v| ((u32::from(*v) * 255 + 32_767) / 65_535) as u8).collect(),
+                op: *op,
+            }),
+            Packed::Rgba8 { .. } => None,
         }
     }
 
@@ -781,6 +822,48 @@ mod tests {
 
     fn frame(w: u32, h: u32, data: PixelData, color: filmcraft_color::ColorInfo) -> VideoFrame {
         VideoFrame { width: w, height: h, data, color, par: (1, 1), pts: filmcraft_time::Tick::ZERO }
+    }
+
+    /// FC1: 12-bit Y'CbCr 4:4:4 with alpha rounded to 8 bits keeps the video range (16..235 at
+    /// 8 bits is 256..3760 at 12), maps full-range alpha 0..4095 onto 0..255, halves the bytes,
+    /// and converts within an 8-bit step of the 12-bit frame. 8-bit and float frames are kept.
+    #[test]
+    fn twelve_bit_yuv_rounds_to_eight_bits() {
+        let rec709 = filmcraft_color::ColorInfo::REC709;
+        let y: Vec<u16> = vec![256, 3760, 2000, 2009, 1000, 3000];
+        let cb: Vec<u16> = vec![2048, 256, 3840, 2056, 1500, 2600];
+        let cr: Vec<u16> = vec![2048, 3840, 256, 2040, 2600, 1500];
+        let a: Vec<u16> = vec![0, 4095, 2048, 1, 4094, 3000];
+        let f = frame(
+            3,
+            2,
+            PixelData::Yuv16 { planes: [Arc::new(y), Arc::new(cb), Arc::new(cr)], chroma: Chroma::C444, bits: 12, alpha: Some(Arc::new(a)) },
+            rec709,
+        );
+        let e = frame_to_8bit(&f).expect("12-bit converts");
+        let PixelData::Yuv8 { planes, chroma, alpha } = &e.data else { panic!("8-bit samples") };
+        assert_eq!(*chroma, Chroma::C444);
+        assert_eq!(&planes[0][..], &[16, 235, 125, 126, 63, 188]);
+        assert_eq!(&planes[1][..3], &[128, 16, 240]);
+        assert_eq!(&alpha.as_ref().unwrap()[..], &[0, 255, 128, 0, 255, 187]);
+        let (p16, p8) = (
+            Packed::Video { frame: Arc::new(f.clone()), op: AlphaOp::new(AlphaMode::Straight, [0.0; 3]) },
+            Packed::Video { frame: Arc::new(e.clone()), op: AlphaOp::new(AlphaMode::Straight, [0.0; 3]) },
+        );
+        assert_eq!(p8.bytes() * 2, p16.bytes(), "half the memory");
+        let (a, b) = (frame_to_image(&e, AlphaOp::new(AlphaMode::Straight, [0.0; 3])), frame_to_image(&f, AlphaOp::new(AlphaMode::Straight, [0.0; 3])));
+        for (p, q) in a.data.iter().zip(&b.data) {
+            for (x, w) in p.iter().zip(q) {
+                assert!((x - w).abs() <= 2.5 / 255.0, "{p:?} vs {q:?}");
+            }
+        }
+        // Already 8-bit: nothing to do.
+        assert!(frame_to_8bit(&e).is_none());
+        assert!(p8.to_8bit().is_none());
+        // 16-bit stills: 8-bit RGBA.
+        let s16 = Packed::Rgba16 { width: 1, height: 1, data: vec![0, 65535, 32768, 257], op: AlphaOp::new(AlphaMode::Straight, [0.0; 3]) };
+        let Some(Packed::Rgba8 { data, .. }) = s16.to_8bit() else { panic!("8-bit RGBA") };
+        assert_eq!(data, vec![0, 255, 128, 1]);
     }
 
     fn noise8(n: usize, seed: u32) -> Arc<Vec<u8>> {

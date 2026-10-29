@@ -303,8 +303,16 @@ page!(Memory {
     cache_max_percent: u32 = DEFAULT_CACHE_MAX_PERCENT,
     /// Processed-layer cache budget (MB).
     layer_cache_mb: u32 = 1024,
-    /// Decoded footage frame cache budget (MB).
+    /// Decoded footage frame cache budget (MB): the footage's own cap, never grown into the
+    /// shared budget's room (at the default, 4 GB on a 64 GB machine).
     media_cache_mb: u32 = 1024,
+    /// Decode Footage at 8 Bits: where 10 / 12 / 16-bit movie and image-sequence frames are kept
+    /// at 8 bits per channel: `off`, `preview` (renders and exports read full depth) or `all`
+    /// (previews and exports; 29 Oct 2026, Elias: "not jsut previexw i think even export").
+    /// 12-bit ProRes 4444 with alpha: 8 bytes a pixel → 4, 16.6 → 8.3 MB a 1080p frame, within
+    /// one 8-bit step. Only the footage's decoded pixels: blending, effects, gradients and text
+    /// stay at the project's working depth. Interpret Footage ▸ Decode at 8 Bits overrides it.
+    eight_bit_footage: String = "all".into(),
     /// RAM preview (viewer frame) cache budget (MB).
     preview_cache_mb: u32 = 3072,
     /// The layer, footage and preview caches share one budget, what the three budgets add up
@@ -722,6 +730,9 @@ impl Prefs {
         let m = &mut self.memory;
         m.layer_cache_mb = m.layer_cache_mb.clamp(64, 1 << 20);
         m.media_cache_mb = m.media_cache_mb.clamp(64, 1 << 20);
+        if effectcraft_project::EightBit::parse(&m.eight_bit_footage).is_none() {
+            m.eight_bit_footage = effectcraft_project::EightBit::default().id().into();
+        }
         m.preview_cache_mb = m.preview_cache_mb.clamp(64, 1 << 20);
         m.preview_raw_window = m.preview_raw_window.min(240);
         self.grids.grid_spacing = self.grids.grid_spacing.clamp(1.0, 10_000.0);
@@ -838,6 +849,11 @@ impl Prefs {
         self.recent_projects.truncate(self.general.recent_items as usize);
     }
 
+    /// Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits.
+    pub fn eight_bit_footage(&self) -> effectcraft_project::EightBit {
+        effectcraft_project::EightBit::parse(&self.memory.eight_bit_footage).unwrap_or_default()
+    }
+
     /// Layer / media / preview cache budgets in bytes.
     pub fn layer_cache_bytes(&self) -> usize {
         (self.memory.layer_cache_mb as usize) << 20
@@ -859,8 +875,9 @@ impl Prefs {
     }
 
     /// The Memory & CPU cache budgets in effect: the configured layer / footage / preview
-    /// budgets (on a machine with at least [`LARGE_MEMORY`], the layer and preview caches at
-    /// their defaults grow with its memory: an eighth and a quarter of it, up to 16 and 32 GB, so
+    /// budgets (on a machine with at least [`LARGE_MEMORY`], the layer, footage and preview caches
+    /// at their defaults grow with its memory: an eighth, a sixteenth and a quarter of it, up to
+    /// 16, [`MEDIA_CACHE_GROWN`] (4) and 32 GB, so
     /// the layers and frames an edit doesn't change stay cached across the timeline; the preview
     /// only up to [`COMPRESSED_PREVIEW_CACHE`] with Compress RAM Preview Frames on), scaled
     /// down so together they leave **RAM Reserved for Other Applications** free and stay within
@@ -883,6 +900,11 @@ impl Prefs {
             let defaults = Memory::default();
             if self.memory.layer_cache_mb == defaults.layer_cache_mb {
                 l = l.max((total / 8).min(16 << 30));
+            }
+            // The footage cache is the footage's own cap (it never grows into the shared
+            // budget's room, see `Split::limit`): a sixteenth of the memory, up to 4 GB.
+            if self.memory.media_cache_mb == defaults.media_cache_mb {
+                m = m.max((total / 16).min(MEDIA_CACHE_GROWN));
             }
             if self.memory.preview_cache_mb == defaults.preview_cache_mb {
                 // Compressed frames take about 2.4× less: the same frames in less memory.
@@ -1061,6 +1083,11 @@ pub const WEB_LAYER_CACHE: u64 = 512 << 20;
 /// (see [`Prefs::cache_budgets`]): a 32 GB machine and up (a 64 GB unified-memory Mac keeps 8 GB
 /// of processed layers and 16 GB of RAM preview frames instead of 1 and 3).
 pub const LARGE_MEMORY: u64 = 32 << 30;
+/// Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits.
+pub const EIGHT_BIT_FOOTAGE: &[(&str, &str)] = &[("Off (Full Depth)", "off"), ("Preview Only", "preview"), ("Preview and Export", "all")];
+/// The most the footage frame cache grows to at its default on a large-memory machine (64 GB:
+/// 4 GB, about 480 1080p frames of 12-bit ProRes 4444 kept at 8 bits for previews).
+pub const MEDIA_CACHE_GROWN: u64 = 4 << 30;
 
 /// The most a default RAM preview grows to on a large-memory machine with Compress RAM Preview
 /// Frames on (see [`Prefs::cache_budgets`]): 8 GB of compressed frames hold about what 19 GB of
@@ -1518,6 +1545,10 @@ pub fn pages() -> Vec<Page> {
                 Section("Cache Budgets"),
                 s("memory.layerCacheMb", "Layer Cache", Kind::Int(64, 1 << 20, "MB"), true),
                 s("memory.mediaCacheMb", "Footage Frame Cache", Kind::Int(64, 1 << 20, "MB"), true),
+                s("memory.eightBitFootage", "Decode Footage at 8 Bits", Kind::Choice(EIGHT_BIT_FOOTAGE), true),
+                Note(
+                    "10, 12 and 16-bit footage (ProRes 4444, HDR movies, 16-bit sequences) is decoded at 8 bits per channel: half the memory, within one 8-bit step. Comp blending, effects, gradients and text keep the project's depth. Interpret Footage overrides it per clip.",
+                ),
                 s("memory.previewCacheMb", "Preview (RAM) Cache", Kind::Int(64, 1 << 20, "MB"), true),
                 s("memory.sharedCacheBudget", "Share One Budget Between the Caches", B, true),
                 s("memory.previewCompress", "Compress RAM Preview Frames", B, true),

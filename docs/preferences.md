@@ -101,7 +101,17 @@ Commands (CLI, MCP, control channel):
 - `audio.outputLeft`: Left (Audio Output Mapping)
 - `audio.outputRight`: Right (Audio Output Mapping)
 - `memory.layerCacheMb`: Layer Cache (in the browser at most 512 MB, see [web.md](web.md))
-- `memory.mediaCacheMb`: Footage Frame Cache (in the browser at most 256 MB)
+- `memory.mediaCacheMb`: Footage Frame Cache (in the browser at most 256 MB). The footage's own
+  cap: with the shared budget on it never grows past it into the room the layer and preview
+  caches share. At its default (1024) a machine with 32 GB or more grows it to a sixteenth of
+  its memory, at most 4 GB (64 GB: 4 GB)
+- `memory.eightBitFootage`: Decode Footage at 8 Bits (`off`, `preview`, `all`; default `all`:
+  previews and exports). 10 / 12 / 16-bit movie and image-sequence frames are kept at 8 bits per
+  channel (12-bit ProRes 4444 + alpha: 16.6 → 8.3 MB a 1080p frame, within one 8-bit step).
+  Only the footage's decoded pixels change; comp blending, effects, gradients and text keep the
+  project's working depth. `preview` keeps renders and exports at the file's full depth.
+  Interpret Footage ▸ Decode at 8 Bits (`file.interpretFootage {eightBit: default|off|preview|all}`)
+  overrides it per clip (for clips with heavy grades or curves)
 - `memory.previewCacheMb`: Preview (RAM) Cache
 - `threeD.defaultRenderer`: Default 3D Renderer
 - `labels.N.name` / `labels.N.color`: the 16 label names and colours, used by the Label menu,

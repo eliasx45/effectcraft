@@ -1,11 +1,11 @@
 //! [`MediaPool`]: decoded footage frames for the compositor, with a memory-budgeted LRU cache.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::ThreadId;
 
-use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
+use effectcraft_project::{AlphaMode, EightBit, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
 use effectcraft_render::cache::shared::{Member, ShareKind, ShareLink, SharedBudget};
 use effectcraft_render::{FloatCurve, FootageFrame, FootageSource, SharedFrame, preview_size};
@@ -54,6 +54,9 @@ struct Key {
     /// Decoded by a hardware decoder (previews only, see [`crate::hw`]): not the exact pixels an
     /// export must read.
     hw: bool,
+    /// Kept at 8 bits per channel ([`MediaPool::set_eight_bit`]): not the full-depth samples
+    /// a read that wants them must get.
+    lite: bool,
 }
 
 /// A layer drawn at reduced resolution: its nominal size `w`×`h` at render scale `s` (< 0.75).
@@ -358,9 +361,21 @@ impl<'a> Waited<'a> {
     }
 }
 
+/// [`EightBit`] as its index in [`EightBit::ALL`] (what [`Inner::eight_bit`] stores).
+fn eight_bit_index(mode: EightBit) -> u8 {
+    EightBit::ALL.iter().position(|m| *m == mode).map_or(2, |i| i as u8)
+}
+
 /// Whether `a` and `b` key frames of the same stream (all but the frame index match).
 fn same_stream(a: &Key, b: &Key) -> bool {
-    a.path == b.path && a.interp == b.interp && a.matte == b.matte && a.crop == b.crop && a.preview == b.preview && a.raster == b.raster && a.hw == b.hw
+    a.path == b.path
+        && a.interp == b.interp
+        && a.matte == b.matte
+        && a.crop == b.crop
+        && a.preview == b.preview
+        && a.raster == b.raster
+        && a.hw == b.hw
+        && a.lite == b.lite
 }
 
 /// A movie/audio source by path and the turn its picture is shown with
@@ -508,6 +523,11 @@ struct Inner {
     /// Settings ▸ Previews ▸ Hardware Video Decoding: preview reads of ProRes footage may use a
     /// registered hardware decoder (off by default; the exact view never does).
     hardware: AtomicBool,
+    /// Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits ([`EightBit`] as its index in
+    /// [`EightBit::ALL`]): where movie and image-sequence frames deeper than 8 bits are kept at
+    /// 8 bits (a new pool: off; the app's setting: previews and exports by default; Interpret
+    /// Footage overrides it per item).
+    eight_bit: AtomicU8,
     hits: AtomicU64,
     misses: AtomicU64,
     prefetched: AtomicU64,
@@ -617,6 +637,8 @@ impl MediaPool {
             budget: AtomicU64::new(bytes as u64),
             read_ahead: AtomicBool::new(cfg!(not(target_arch = "wasm32"))),
             hardware: AtomicBool::new(false),
+            // (full depth until the app applies its setting, whose default is previews and exports)
+            eight_bit: AtomicU8::new(eight_bit_index(EightBit::Off)),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             prefetched: AtomicU64::new(0),
@@ -637,6 +659,28 @@ impl MediaPool {
     /// [`MediaPool::exact`] view never does.
     pub fn set_hardware_decoding(&self, on: bool) {
         self.inner.hardware.store(on, Ordering::Relaxed);
+    }
+
+    /// Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits: keep 10 / 12 / 16-bit movie and
+    /// image-sequence frames at 8 bits per channel in previews ([`EightBit::Preview`]: the
+    /// [`MediaPool::exact`] view, which exports read, keeps full depth), in previews and exports
+    /// ([`EightBit::All`], the setting's default), or nowhere (a new pool, until this is called). Half the memory of 12-bit 4:4:4 + alpha, the
+    /// picture within about one 8-bit step; only the footage's decoded pixels change (the
+    /// compositor converts them to its working depth as before). Footage whose Interpret Footage
+    /// ▸ Decode at 8 Bits is set ([`Footage::eight_bit`]) follows that instead.
+    pub fn set_eight_bit(&self, mode: EightBit) {
+        self.inner.eight_bit.store(eight_bit_index(mode), Ordering::Relaxed);
+    }
+
+    /// Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits as set.
+    pub fn eight_bit(&self) -> EightBit {
+        EightBit::ALL.get(usize::from(self.inner.eight_bit.load(Ordering::Relaxed))).copied().unwrap_or_default()
+    }
+
+    /// Whether this view keeps the frames of `footage` at 8 bits: movies and image sequences,
+    /// as the footage's own setting or else Settings says, for this view (preview or exact).
+    fn lite_for(&self, footage: &Footage) -> bool {
+        matches!(footage.kind, FootageKind::Video | FootageKind::Sequence) && footage.eight_bit.unwrap_or_else(|| self.eight_bit()).applies(self.exact)
     }
 
     /// Keep decoded stills that are slow to decode (a PDF or SVG with big embedded pictures, a
@@ -787,7 +831,7 @@ impl MediaPool {
 
     /// Decode (or fetch from cache) the frame of `footage` at source time `t`.
     pub fn frame_at(&self, footage: &Footage, t: Tick) -> Result<Arc<Image>> {
-        Ok(Inner::pixels_at(&self.inner, footage, t, true, None, self.hw_for(footage), FloatCurve::Srgb)?.image())
+        Ok(Inner::pixels_at(&self.inner, footage, t, true, None, self.hw_for(footage), self.lite_for(footage), FloatCurve::Srgb)?.image())
     }
 
     /// Settings ▸ Disk ▸ Conformed Audio Folder: write each footage file's decoded audio there
@@ -1116,7 +1160,7 @@ impl Inner {
             } << 2);
         let matte = if footage.alpha == AlphaMode::Premultiplied { footage.premul_color.map(f32::to_bits) } else { [0; 3] };
         let crop = footage.layer.as_ref().and_then(|l| l.crop_bounds).map(|b| b.map(f64::to_bits));
-        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop, preview: None, raster: 0, hw: false };
+        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop, preview: None, raster: 0, hw: false, lite: false };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
@@ -1150,14 +1194,16 @@ impl Inner {
 
     #[cfg(test)]
     fn frame_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool) -> Result<Arc<Image>> {
-        Ok(self.pixels_at(footage, t, playback, None, false, FloatCurve::Srgb)?.image())
+        Ok(self.pixels_at(footage, t, playback, None, false, false, FloatCurve::Srgb)?.image())
     }
 
     /// Where the frame of `footage` at `t` comes from, resampled for `preview` when the footage's
-    /// frames are larger than the preview needs, decoded on a hardware decoder when `hw`.
-    fn locate_for(footage: &Footage, t: Tick, preview: Option<Preview>, hw: bool, float: FloatCurve) -> Loc {
+    /// frames are larger than the preview needs, decoded on a hardware decoder when `hw`, kept
+    /// at 8 bits when `lite` (movies and image sequences).
+    fn locate_for(footage: &Footage, t: Tick, preview: Option<Preview>, hw: bool, lite: bool, float: FloatCurve) -> Loc {
         let mut loc = Self::locate(footage, t, float);
         loc.key.hw = hw && loc.media_t.is_some();
+        loc.key.lite = lite && matches!(footage.kind, FootageKind::Video | FootageKind::Sequence);
         if let Some(p) = preview
             && let Some((w, h)) = preview_size(footage.width, p.w, p.h, p.s)
         {
@@ -1170,11 +1216,20 @@ impl Inner {
     /// The cached (or newly decoded) pixels of `footage` at source time `t` (resampled for
     /// `preview`; on a hardware decoder when `hw`).
     #[allow(clippy::too_many_arguments)]
-    fn pixels_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool, preview: Option<Preview>, hw: bool, float: FloatCurve) -> Result<Pixels> {
+    fn pixels_at(
+        self: &Arc<Self>,
+        footage: &Footage,
+        t: Tick,
+        playback: bool,
+        preview: Option<Preview>,
+        hw: bool,
+        lite: bool,
+        float: FloatCurve,
+    ) -> Result<Pixels> {
         if !footage.has_video {
             return Err(MediaError::Unsupported(format!("{}: no video", footage.path)));
         }
-        let loc = Self::locate_for(footage, t, preview, hw, float);
+        let loc = Self::locate_for(footage, t, preview, hw, lite, float);
         let raw = footage.frame_rate.frame_at(t);
         let mut c = lock(&self.cache);
         // a movie read in order: decode the next frames ahead
@@ -1358,7 +1413,7 @@ impl Inner {
             self.done.notify_all();
             return false;
         }
-        let (footage, preview, hw, float) = (a.footage.clone(), a.preview, a.stream.hw, a.float);
+        let (footage, preview, hw, lite, float) = (a.footage.clone(), a.preview, a.stream.hw, a.stream.lite, a.float);
         let batch = ahead_batch(&footage.codec);
         let rate = footage.frame_rate;
         // (frame index, where it comes from) of the frames this step decodes
@@ -1371,7 +1426,7 @@ impl Inner {
             let raw = a.next;
             a.next = a.next.saturating_add(1);
             let t = rate.tick_of(raw) + Tick(rate.frame_duration().0 / 2);
-            let loc = Self::locate_for(&footage, t, preview, hw, float);
+            let loc = Self::locate_for(&footage, t, preview, hw, lite, float);
             if c.lru.map.contains_key(&loc.key) || c.inflight.contains_key(&loc.key) || todo.iter().any(|(_, l)| l.key == loc.key) {
                 continue;
             }
@@ -1431,7 +1486,22 @@ impl Inner {
     /// ([`Packed`]), float stills, layered and vector documents as float pixels.
     ///
     /// `detached`: a movie not open already is opened for this frame only (thumbnails).
+    ///
+    /// A read at 8 bits (`loc.key.lite`) keeps deeper samples rounded to 8 bits
+    /// ([`Packed::to_8bit`]); float pixels stay as they are.
     fn decode(&self, loc: &Loc, footage: &Footage, detached: bool) -> Result<Pixels> {
+        let px = self.decode_full(loc, footage, detached)?;
+        Ok(match px {
+            Pixels::Packed(p) if loc.key.lite => match p.to_8bit() {
+                Some(q) => Pixels::Packed(Arc::new(q)),
+                None => Pixels::Packed(p),
+            },
+            px => px,
+        })
+    }
+
+    /// [`Self::decode`] at the file's own depth.
+    fn decode_full(&self, loc: &Loc, footage: &Footage, detached: bool) -> Result<Pixels> {
         let _profile = effectcraft_render::profile::span("decode");
         // A reduced-resolution preview: the full frame (cached, or decoded and not kept)
         // resampled exactly as the renderer resamples it.
@@ -1614,6 +1684,9 @@ impl FootageSource for MediaPool {
     fn set_hardware_decoding(&self, on: bool) {
         MediaPool::set_hardware_decoding(self, on);
     }
+    fn set_eight_bit(&self, mode: EightBit) {
+        MediaPool::set_eight_bit(self, mode);
+    }
     fn set_still_cache(&self, disk: Option<Arc<effectcraft_render::disk_cache::DiskCache>>) {
         MediaPool::set_still_cache(self, disk)
     }
@@ -1725,7 +1798,7 @@ impl MediaPool {
         if footage.missing {
             return None;
         }
-        match Inner::pixels_at(&self.inner, footage, t, true, preview, self.hw_for(footage), float) {
+        match Inner::pixels_at(&self.inner, footage, t, true, preview, self.hw_for(footage), self.lite_for(footage), float) {
             Ok(px) => Some(px),
             // nobody wants the frame any more (`cancellable`): not an error
             Err(MediaError::Cancelled) => None,
@@ -1942,7 +2015,7 @@ mod tests {
         let f = Footage { path: "/matte.png".into(), kind: FootageKind::Still, width: 8, height: 4, has_video: true, ..Default::default() };
         // Another thread holds the still's decode and never finishes it.
         let stuck = std::thread::spawn(|| std::thread::current().id()).join().unwrap();
-        let key = Inner::locate_for(&f, Tick::ZERO, None, false, FloatCurve::Srgb).key;
+        let key = Inner::locate_for(&f, Tick::ZERO, None, false, false, FloatCurve::Srgb).key;
         lock(&pool.inner.cache).inflight.insert(key.clone(), stuck);
         // Meanwhile another file's frames keep finishing.
         let stop = Arc::new(AtomicBool::new(false));
@@ -2073,6 +2146,173 @@ mod tests {
         mux.finish().unwrap().into_inner()
     }
 
+    /// A 12-bit ProRes 4444 movie with alpha (his presenter clip's format, 29 Oct 2026) of `n`
+    /// frames, each a different gradient with a soft alpha ramp.
+    fn prores4444_movie(w: u32, h: u32, n: u32) -> Vec<u8> {
+        use filmcraft_isobmff::{Brand, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+        use filmcraft_prores::{ChromaFormat, Encoder, Frame, Profile};
+        let mut enc = Encoder::new(Profile::P4444, w, h);
+        let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+        let vt = mux.add_track(TrackConfig::new(SampleEntry::prores(FourCc(*b"ap4h"), w as u16, h as u16), 24)).unwrap();
+        for i in 0..n {
+            let mut fr = Frame::new(w, h, ChromaFormat::Yuv444, 12, true);
+            for (k, y) in fr.y.iter_mut().enumerate() {
+                *y = 256 + ((k as u32 % w) * 29 + (k as u32 / w) * 13 + i * 160) as u16 % 3504;
+            }
+            for (k, c) in fr.cb.iter_mut().enumerate() {
+                *c = 256 + (k as u32 * 21 + i * 240) as u16 % 3584;
+            }
+            if let Some(a) = fr.alpha.as_mut() {
+                for (k, v) in a.iter_mut().enumerate() {
+                    *v = ((k as u32 % w) * 4095 / w.max(1)) as u16;
+                }
+            }
+            let data = enc.encode(&fr).unwrap();
+            mux.write_sample(vt, WriteSample { data: &data, duration: 1, composition_offset: 0, is_sync: true }).unwrap();
+        }
+        mux.finish().unwrap().into_inner()
+    }
+
+    /// The decoded samples of a cached frame: (8-bit, bytes).
+    fn depth_of(px: &Pixels) -> (bool, usize) {
+        match px {
+            Pixels::Packed(p) => match &**p {
+                Packed::Video { frame, .. } => (matches!(frame.data, filmcraft_frame::PixelData::Yuv8 { .. }), p.bytes()),
+                Packed::Rgba8 { .. } => (true, p.bytes()),
+                Packed::Rgba16 { .. } => (false, p.bytes()),
+            },
+            other => (false, other.bytes()),
+        }
+    }
+
+    /// FC1 (29 Oct 2026, Elias: "LMK HOW TO SET to 8 bit even if its 12 bit"): a 12-bit ProRes
+    /// 4444 frame read for a preview is kept as 8-bit samples, half the bytes, and shows within
+    /// one 8-bit step of the full-depth frame. With Preview Only the exact view (exports) still
+    /// reads the 12-bit samples, bit-identical to a pool that never decodes at 8 bits.
+    #[test]
+    fn twelve_bit_footage_previews_at_eight_bits_and_exports_at_full_depth() {
+        let bytes: Arc<[u8]> = prores4444_movie(64, 48, 3).into();
+        let path = "/mem/4444.mov";
+        let footage = crate::probe::probe_bytes(path, bytes.clone()).unwrap();
+        let t = footage.frame_rate.tick_of(1) + Tick(footage.frame_rate.frame_duration().0 / 2);
+        let full = MediaPool::new();
+        full.set_read_ahead(false);
+        full.add_bytes(path, bytes.clone());
+        assert_eq!(full.eight_bit(), EightBit::Off, "a bare pool decodes at full depth");
+        let want = full.pixels(&footage, t, None, FloatCurve::Srgb).unwrap();
+        let (eight, full_bytes) = depth_of(&want);
+        assert!(!eight, "the source decodes as 12-bit samples");
+
+        let pool = MediaPool::new();
+        pool.set_read_ahead(false);
+        pool.add_bytes(path, bytes);
+        pool.set_eight_bit(EightBit::Preview);
+        let preview = pool.pixels(&footage, t, None, FloatCurve::Srgb).unwrap();
+        let (eight, bytes8) = depth_of(&preview);
+        assert!(eight, "the preview keeps 8-bit samples");
+        assert!(bytes8 * 2 <= full_bytes + 128, "half the memory: {bytes8} vs {full_bytes}");
+        let (a, b) = (preview.image(), want.image());
+        assert_eq!((a.width, a.height), (b.width, b.height));
+        // The compositor still gets float pixels; they are within one 8-bit step (plus the
+        // conversion's rounding) of the full-depth ones.
+        let worst = a.data.iter().zip(&b.data).flat_map(|(p, q)| p.iter().zip(q).map(|(x, y)| (x - y).abs())).fold(0f32, f32::max);
+        assert!(worst <= 2.5 / 255.0, "within an 8-bit step: {worst}");
+        assert!(worst > 0.0, "the 8-bit frame is not the full-depth one");
+
+        // Preview Only: an export reads the file's full depth, exactly.
+        let export = pool.exact().pixels(&footage, t, None, FloatCurve::Srgb).unwrap();
+        assert!(!depth_of(&export).0, "exports read the 12-bit samples");
+        assert_eq!(export.image().data, b.data, "bit-identical to full depth");
+        // Both kinds of frame are cached apart (an export never gets a preview's 8-bit frame).
+        assert_eq!(pool.stats().frames, 2);
+
+        // A clip's own setting wins: Off keeps its previews at full depth.
+        let own = Footage { eight_bit: Some(EightBit::Off), ..footage.clone() };
+        assert!(!depth_of(&pool.pixels(&own, t, None, FloatCurve::Srgb).unwrap()).0);
+    }
+
+    /// FC1 (29 Oct 2026, Elias: "not jsut previexw i think even export"): with Preview and
+    /// Export an export reads the footage at 8 bits too, the same frame the preview cached (one
+    /// copy), still handed to the compositor as float pixels (its blending, effects and
+    /// gradients keep the working depth). With Off the export is unchanged at full depth.
+    #[test]
+    fn preview_and_export_reads_eight_bits_in_exports_and_off_keeps_full_depth() {
+        let bytes: Arc<[u8]> = prores4444_movie(64, 48, 2).into();
+        let path = "/mem/4444-export.mov";
+        let footage = crate::probe::probe_bytes(path, bytes.clone()).unwrap();
+        let t = footage.frame_rate.tick_of(0) + Tick(footage.frame_rate.frame_duration().0 / 2);
+        let full = MediaPool::new();
+        full.add_bytes(path, bytes.clone());
+        let want = full.exact().pixels(&footage, t, None, FloatCurve::Srgb).unwrap().image();
+
+        let pool = MediaPool::new();
+        pool.set_read_ahead(false);
+        pool.add_bytes(path, bytes);
+        pool.set_eight_bit(EightBit::All);
+        let preview = pool.pixels(&footage, t, None, FloatCurve::Srgb).unwrap();
+        let export = pool.exact().pixels(&footage, t, None, FloatCurve::Srgb).unwrap();
+        assert!(depth_of(&export).0, "the export reads 8-bit samples");
+        assert_eq!(export.image().data, preview.image().data, "the preview's frame");
+        assert_eq!(pool.stats().frames, 1, "one cached copy for preview and export");
+        // Through the footage source the renderer uses: float pixels (working depth).
+        let img = effectcraft_render::exact_footage(&pool).frame(ItemId(1), &footage, t).unwrap();
+        assert_eq!(img.data, preview.image().data);
+        assert_ne!(img.data, want.data, "not the 12-bit pixels");
+
+        pool.set_eight_bit(EightBit::Off);
+        let export = pool.exact().pixels(&footage, t, None, FloatCurve::Srgb).unwrap();
+        assert!(!depth_of(&export).0, "Off: the export reads the 12-bit samples");
+        assert_eq!(export.image().data, want.data, "Off: unchanged at full depth");
+    }
+
+    /// FC1: the footage frame cache is the footage's own cap. Reading a long deep clip evicts
+    /// only footage frames (the pool's own oldest), never asks the shared budget's other
+    /// caches (the RAM preview of his animated comps) to give way, and its limit in the shared
+    /// budget is its own budget, not the room the others share (29 Oct 2026: ~30 GB of 4444
+    /// frames took that room and the Mac swapped).
+    #[test]
+    fn the_footage_cap_evicts_footage_frames_only() {
+        use effectcraft_render::cache::shared::{Member, Split};
+        use std::sync::atomic::AtomicUsize;
+        struct Preview(AtomicUsize);
+        impl Member for Preview {
+            fn evict_oldest(&self) -> u64 {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                0
+            }
+        }
+        let bytes: Arc<[u8]> = prores4444_movie(64, 48, 24).into();
+        let path = "/mem/4444-long.mov";
+        let footage = crate::probe::probe_bytes(path, bytes.clone()).unwrap();
+        let frame = 64 * 48 * 4 + 64;
+        // Footage: room for 5 frames at 8 bits; the layer and preview caches far larger.
+        let split = Split::of(64 << 20, 5 * frame as u64, 64 << 20);
+        assert_eq!(split.limit(ShareKind::Media), split.share(ShareKind::Media), "the footage cache's limit is its own budget");
+        assert!(split.limit(ShareKind::Preview) > split.share(ShareKind::Preview), "the others still share the room");
+        let budget = SharedBudget::new().without_thread();
+        budget.configure(Some(split));
+        let preview = Arc::new(Preview(AtomicUsize::new(0)));
+        let link = budget.join(ShareKind::Preview, preview.clone()).unwrap();
+        // His comps' RAM preview frames: old, and filling their own share.
+        link.report(60 << 20, Some(effectcraft_render::cache::shared::stamp()));
+
+        let pool = MediaPool::with_budget(split.limit(ShareKind::Media) as usize);
+        pool.set_read_ahead(false);
+        pool.add_bytes(path, bytes);
+        pool.set_eight_bit(EightBit::All);
+        pool.share(Some(&budget));
+        for i in 0..24 {
+            let t = footage.frame_rate.tick_of(i) + Tick(footage.frame_rate.frame_duration().0 / 2);
+            pool.pixels(&footage, t, None, FloatCurve::Srgb).unwrap();
+            budget.settle();
+            assert!(pool.stats().bytes <= 5 * frame, "frame {i}: {} bytes over the footage cap", pool.stats().bytes);
+        }
+        assert!((4..=5).contains(&pool.stats().frames), "the newest footage frames stay: {}", pool.stats().frames);
+        assert_eq!(preview.0.load(Ordering::Relaxed), 0, "the preview was never asked to give way");
+        assert!(budget.usage().used <= split.total);
+        drop(link);
+    }
+
     /// Decode-ahead of an intra-only movie decodes several frames at once and caches them in
     /// frame order, with the same pixels as decoding each frame on its own.
     #[test]
@@ -2175,7 +2415,7 @@ mod tests {
     fn lru_respects_budget() {
         let mut c = Lru::default();
         let img = || Pixels::Float(Arc::new(Image::new(16, 16))); // 4 KiB + overhead
-        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None, preview: None, raster: 0, hw: false };
+        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None, preview: None, raster: 0, hw: false, lite: false };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
             c.insert(k(i), img(), budget);

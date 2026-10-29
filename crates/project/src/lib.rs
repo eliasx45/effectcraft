@@ -1314,6 +1314,60 @@ pub struct Footage {
     /// timecode isn't read). It only relabels source time, as in After Effects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_timecode: Option<i64>,
+    /// Interpret Footage ▸ Decode at 8 Bits: where this footage's decoded frames are kept at 8
+    /// bits per channel (never, in previews, or in previews and exports), or as Settings ▸
+    /// Memory & CPU ▸ Decode Footage at 8 Bits says (`None`). Only the footage's own pixels: the
+    /// comp's blending, effects, gradients and text stay at the project's working depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eight_bit: Option<EightBit>,
+}
+
+/// Where footage deeper than 8 bits per channel (10 / 12-bit movies, 16-bit sequences) is
+/// decoded to 8 bits: half the memory of 12-bit 4:4:4 + alpha, within one 8-bit step. Only the
+/// footage's decoded pixels change; comp math stays at the working depth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EightBit {
+    /// Full depth everywhere.
+    Off,
+    /// 8 bits in previews; renders and exports read the full depth.
+    Preview,
+    /// 8 bits in previews and in renders and exports.
+    #[default]
+    All,
+}
+
+impl EightBit {
+    pub const ALL: [EightBit; 3] = [EightBit::Off, EightBit::Preview, EightBit::All];
+
+    /// The id commands and settings use: `off`, `preview`, `all`.
+    pub fn id(self) -> &'static str {
+        match self {
+            EightBit::Off => "off",
+            EightBit::Preview => "preview",
+            EightBit::All => "all",
+        }
+    }
+
+    /// From an id (`off` / `full`, `preview`, `all` / `export`); `None` for anything else.
+    pub fn parse(s: &str) -> Option<EightBit> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "full" | "none" => Some(EightBit::Off),
+            "preview" | "previews" | "previewonly" => Some(EightBit::Preview),
+            "all" | "export" | "previewandexport" | "on" => Some(EightBit::All),
+            _ => None,
+        }
+    }
+
+    /// Whether a read for a preview (`exact` false) or a render / export (`exact` true) keeps
+    /// the frames at 8 bits.
+    pub fn applies(self, exact: bool) -> bool {
+        match self {
+            EightBit::Off => false,
+            EightBit::Preview => !exact,
+            EightBit::All => true,
+        }
+    }
 }
 
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {
@@ -1349,6 +1403,7 @@ impl Default for Footage {
             page: 0,
             alphabetical: false,
             start_timecode: None,
+            eight_bit: None,
         }
     }
 }

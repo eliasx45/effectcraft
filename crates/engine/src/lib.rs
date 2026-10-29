@@ -580,6 +580,9 @@ pub struct Session {
     pub memory_map: memory_map::Hooks,
     /// Switches Affect Nested Comps as last applied (a change empties the layer cache).
     pub applied_nested_switches: Option<bool>,
+    /// Decode Footage at 8 Bits as last applied (a change empties the layer cache
+    /// and the frontends' frames: they were made from the other depth).
+    pub applied_eight_bit_footage: Option<effectcraft_project::EightBit>,
     /// Runs renders and analyses off the UI thread where there are no threads (the web app's
     /// Web Workers, see [`offload`]); `None` = threads (desktop) or inline (wasm32).
     pub offload: Option<Arc<dyn offload::Offload>>,
@@ -755,6 +758,7 @@ impl Default for Session {
             memory_watch: Default::default(),
             memory_map: Default::default(),
             applied_nested_switches: None,
+            applied_eight_bit_footage: None,
             offload: None,
             offloaded: vec![],
             offload_log: vec![],

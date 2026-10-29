@@ -508,6 +508,18 @@ pub fn build_form(s: &effectcraft_engine::Session, id: &str, p: &Value) -> Optio
                 ),
                 Field::bool("preserveRgb", "Preserve RGB", f.preserve_rgb),
                 Field::bool("linearLight", "Interpret As Linear Light", f.linear_light),
+                // Other Options ▸ Decode at 8 Bits (a clip with heavy grades can keep full depth).
+                Field::choice(
+                    "eightBit",
+                    "Decode at 8 Bits",
+                    &[
+                        ("Use Memory & CPU Setting", json!("default")),
+                        ("Off (Full Depth)", json!("off")),
+                        ("Preview Only", json!("preview")),
+                        ("Preview and Export", json!("all")),
+                    ],
+                    f.eight_bit.map_or(0, |m| 1 + effectcraft_engine::project::EightBit::ALL.iter().position(|x| *x == m).unwrap_or(0)),
+                ),
             ];
             // After Frame Rate: an image sequence's frames (missing ones show colour bars, as in
             // After Effects), then Start Timecode.

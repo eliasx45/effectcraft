@@ -223,7 +223,8 @@ fn default_cache_budgets_grow_with_a_large_memory() {
     let big = SysMemory { total: 64 << 30, available: 40 << 30, pressure: None };
     let b = p.cache_budgets(Some(big));
     // Compressed RAM preview frames (the default): 8 GB hold what 16 GB did and more.
-    assert_eq!((b.layer >> 30, b.media >> 20, b.preview >> 30, b.capped), (8, 1024, 8, false));
+    // The footage cache: a sixteenth of the memory, up to 4 GB (its own cap, FC1).
+    assert_eq!((b.layer >> 30, b.media >> 20, b.preview >> 30, b.capped), (8, 4096, 8, false));
     p.memory.preview_compress = false;
     assert_eq!(p.cache_budgets(Some(big)).preview >> 30, 16, "uncompressed: a quarter of the memory");
     p.memory.preview_compress = true;
@@ -245,7 +246,7 @@ fn default_cache_budgets_grow_with_a_large_memory() {
 
 /// MEM3: the owner's settings on the 64 GB Mac that froze on 22 Oct 2026 (10 GB reserved, a
 /// 32288 MB RAM preview, shared budget, compression on): the caches shared 40.5 GB, and nothing
-/// shrank them while macOS swapped. They keep their 40.5 GB under the default Maximum Share of
+/// shrank them while macOS swapped. They keep their 43.5 GB (the footage cache at 4 GB since FC1) under the default Maximum Share of
 /// RAM for Caches (75 %, 48 GB), and shrink to half under memory pressure and a quarter under
 /// critical pressure; at 50 % they share 32 GB.
 #[test]
@@ -257,8 +258,9 @@ fn owner_cache_budgets_on_a_64_gb_mac_shrink_under_pressure() {
     p.memory.idle_cache_cores = 4;
     let at = |pressure| SysMemory { total: 64 << 30, available: 15 << 30, pressure: Some(pressure) };
     let total = |b: &crate::prefs::CacheBudgets| b.shared.expect("shared").total;
-    // 8 GB of layers (an eighth of 64), 1 GB of footage, 32288 MB of preview frames.
-    let full = (8192u64 + 1024 + 32288) << 20;
+    // 8 GB of layers (an eighth of 64), 4 GB of footage (a sixteenth, its own cap since FC1),
+    // 32288 MB of preview frames.
+    let full = (8192u64 + 4096 + 32288) << 20;
     let normal = p.cache_budgets(Some(at(MemoryPressure::Normal)));
     assert!(!normal.capped && !normal.reduced, "{normal:?}");
     assert!((total(&normal) as i64 - full as i64).abs() < 4, "{normal:?}");

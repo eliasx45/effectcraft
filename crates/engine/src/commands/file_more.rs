@@ -578,6 +578,8 @@ pub(crate) struct Interpretation {
     preserve_rgb: Option<bool>,
     /// Start Timecode.
     start: Option<StartTimecode>,
+    /// Decode at 8 Bits: `Some(None)` = as Settings ▸ Memory & CPU says, else this clip's own.
+    eight_bit: Option<Option<effectcraft_project::EightBit>>,
 }
 
 /// Interpret Footage ▸ Start Timecode.
@@ -656,6 +658,16 @@ impl Interpretation {
         };
         it.linear = super::b_p(p, "linearLight");
         it.preserve_rgb = super::b_p(p, "preserveRgb");
+        // Other Options ▸ Decode at 8 Bits (a clip with heavy grades or curves can keep its
+        // full depth while the rest of the project decodes at 8 bits).
+        it.eight_bit = match p.get("eightBit") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(v)) if matches!(v.as_str(), "default" | "settings" | "") => Some(None),
+            Some(Value::String(v)) => {
+                Some(Some(effectcraft_project::EightBit::parse(v).ok_or_else(|| bad(cmd, format!("eightBit: default|off|preview|all, not `{v}`")))?))
+            }
+            Some(_) => return Err(bad(cmd, "eightBit: default|off|preview|all")),
+        };
         // Start Timecode: Use Source File Timecode (`overrideStart: false`), or Override Start
         // (timecode or a frame number).
         let start_err = || bad(cmd, "startTimecode: timecode (0:00:41:20) or a frame number, 0 to 1e9");
@@ -732,6 +744,9 @@ impl Interpretation {
         }
         if let Some(v) = self.preserve_rgb {
             f.preserve_rgb = v;
+        }
+        if let Some(v) = self.eight_bit {
+            f.eight_bit = v;
         }
         // After the frame rate: timecode is read at the footage's rate.
         if let Some(start) = self.start.as_ref().and_then(|t| t.frame(f.frame_rate)) {
@@ -814,12 +829,17 @@ fn interpret(s: &mut Session, p: &Value) -> Result<Value> {
                 "item": i.0, "alpha": format!("{:?}", f.alpha), "matteColor": f.premul_color, "invertAlpha": f.invert_alpha,
                 "fields": f.fields.label(), "pixelAspect": f.pixel_aspect, "loop": f.loop_count, "frameRate": f.frame_rate.as_f64(),
                 "linearLight": f.linear_light, "preserveRgb": f.preserve_rgb, "startTimecode": f.timecode(0), "overrideStart": f.start_timecode.is_some(),
-                "frames": f.sequence_frames(),
+                "frames": f.sequence_frames(), "eightBit": eight_bit_id(f.eight_bit),
             })),
             _ => None,
         })
         .collect();
     Ok(json!({"items": out}))
+}
+
+/// Interpret Footage ▸ Decode at 8 Bits as `eightBit` names it (`default`: as Settings says).
+pub(crate) fn eight_bit_id(v: Option<effectcraft_project::EightBit>) -> &'static str {
+    v.map_or("default", effectcraft_project::EightBit::id)
 }
 
 fn remember_interpretation(s: &mut Session, p: &Value) -> Result<Value> {
@@ -844,6 +864,7 @@ fn apply_interpretation(s: &mut Session, p: &Value) -> Result<Value> {
                 f.invert_alpha = src.invert_alpha;
                 f.linear_light = src.linear_light;
                 f.preserve_rgb = src.preserve_rgb;
+                f.eight_bit = src.eight_bit;
                 f.color_profile = src.color_profile;
                 if src.native_rate.is_some() {
                     if f.native_rate.is_none() {
@@ -1054,7 +1075,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Main...",
             ["File", "Interpret Footage"],
             Some("Cmd+Alt+G"),
-            "{items?, frameRate?: fps|\"file\", alpha?: straight|premultiplied|ignore|guess, guessAlpha?, matteColor?, invertAlpha?, loop?, pixelAspect?, fields?: off|upper|lower, colorProfile?: srgb|rec709|rec2020|p3|auto, linearLight?, preserveRgb? (the file's values unconverted), overrideStart?: bool (false: Use Source File Timecode), startTimecode?: timecode|frame (Override Start)}",
+            "{items?, frameRate?: fps|\"file\", alpha?: straight|premultiplied|ignore|guess, guessAlpha?, matteColor?, invertAlpha?, loop?, pixelAspect?, fields?: off|upper|lower, colorProfile?: srgb|rec709|rec2020|p3|auto, linearLight?, preserveRgb? (the file's values unconverted), overrideStart?: bool (false: Use Source File Timecode), startTimecode?: timecode|frame (Override Start), eightBit?: default|off|preview|all (decode this clip's 10/12/16-bit frames at 8 bits nowhere, in previews, or in previews and exports; default = Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits; comp math keeps the working depth)}",
             has_footage_selection,
             interpret
         ),
