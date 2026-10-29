@@ -43,7 +43,7 @@ impl Default for Options<'_> {
 }
 
 impl Options<'_> {
-    fn id(&self, salt: impl std::hash::Hash) -> egui::Id {
+    fn id(&self, salt: impl std::hash::Hash + std::fmt::Debug) -> egui::Id {
         match self.id_scope {
             Some(scope) => scope.with(salt),
             None => egui::Id::new(salt),
