@@ -22,6 +22,8 @@ use crate::{EngineError, Result, Session, cmd, query};
 /// Smallest and largest influence (%), as After Effects allows.
 const MIN_INFLUENCE: f64 = 0.1;
 const MAX_INFLUENCE: f64 = 100.0;
+/// Fastest handle speed, in units of the segment's average speed.
+const MAX_SPEED: f64 = 50.0;
 
 fn r3(v: f64) -> f64 {
     if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { 0.0 }
@@ -104,6 +106,18 @@ fn influence_p(p: &Value, k: &str, cmd: &str) -> Result<Option<f64>> {
     }
 }
 
+/// A handle's speed in units of the segment's average speed (0 = still at the key).
+fn speed_p(p: &Value, k: &str, cmd: &str) -> Result<Option<f64>> {
+    match p.get(k).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .filter(|x| x.is_finite())
+            .map(|x| Some(x.clamp(0.0, MAX_SPEED)))
+            .ok_or_else(|| bad(cmd, format!("`{k}` is a speed in units of the segment's average speed (0 to {MAX_SPEED})"))),
+    }
+}
+
 fn set_influence(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "nowGraphs.setInfluence";
     let (cid, lid, uid) = prop_ref(s, p, C)?;
@@ -111,8 +125,9 @@ fn set_influence(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, "the layer is locked"));
     }
     let (out_inf, in_inf) = (influence_p(p, "out", C)?, influence_p(p, "in", C)?);
-    if out_inf.is_none() && in_inf.is_none() {
-        return Err(bad(C, "pass `out` and/or `in` (influence %)"));
+    let (out_speed, in_speed) = (speed_p(p, "outSpeed", C)?, speed_p(p, "inSpeed", C)?);
+    if out_inf.is_none() && in_inf.is_none() && out_speed.is_none() && in_speed.is_none() {
+        return Err(bad(C, "pass `out` and/or `in` (influence %), `outSpeed` and/or `inSpeed`"));
     }
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let l = comp.layer(lid).ok_or_else(|| bad(C, "no layer"))?;
@@ -134,8 +149,8 @@ fn set_influence(s: &mut Session, p: &Value) -> Result<Value> {
     let g = Graph {
         id: "nowgraphs",
         name: "Now graphs",
-        out: Ease { speed: out.speed, influence: new_out / 100.0 },
-        inn: Ease { speed: inn.speed, influence: new_in / 100.0 },
+        out: Ease { speed: out_speed.unwrap_or(out.speed), influence: new_out / 100.0 },
+        inn: Ease { speed: in_speed.unwrap_or(inn.speed), influence: new_in / 100.0 },
     };
     let mut keys = pr.keys.clone();
     apply_graph(&mut keys, key, pr.spatial, &g)?;
@@ -148,6 +163,7 @@ fn set_influence(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "comp": cid.0, "layer": lid.0, "path": path, "property": name, "key": key,
         "out": r3(new_out), "in": r3(new_in),
+        "outSpeed": r3(out_speed.unwrap_or(out.speed)), "inSpeed": r3(in_speed.unwrap_or(inn.speed)),
     }))
 }
 
@@ -326,7 +342,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Segment Influence",
             [],
             None,
-            "{comp?, layer, path|prop, key (the segment's first key, 0-based), out? (influence % of the first key's out side), in? (of the second key's in side), merge? (same key: one undo step, a drag)} → {comp, layer, path, property, key, out, in}. Both sides become Bezier; the speeds stay.",
+            "{comp?, layer, path|prop, key (the segment's first key, 0-based), out? (influence % of the first key's out side), in? (of the second key's in side), outSpeed? / inSpeed? (each side's speed at its key in units of the segment's average speed, 0 = still: the graph's handle height), merge? (same key: one undo step, a drag)} → {comp, layer, path, property, key, out, in, outSpeed, inSpeed}. Both sides become Bezier; a speed not passed stays.",
             has_comp,
             set_influence
         ),

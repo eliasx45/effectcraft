@@ -80,6 +80,9 @@ pub struct NowGraph {
     pub speed: Vec<f64>,
     /// The fastest speed sampled (units per second of layer time).
     pub max_speed: f64,
+    /// The fastest speed in units of the segment's average speed (the scale between `speed` and
+    /// the eases' speeds), when the value changes.
+    pub peak: Option<f64>,
     /// The object (animated layer) it belongs to: 0, 1, 2… in the order found.
     pub object: usize,
     /// The profile curve whose shape it has (id), if any.
@@ -117,6 +120,9 @@ impl NowGraph {
             "maxSpeed": r3(self.max_speed),
             "object": self.object,
         });
+        if let Some(k) = self.peak.filter(|k| k.is_finite() && *k > 0.0) {
+            o["peak"] = json!(r3(k));
+        }
         if let Some((out, inn)) = self.ease {
             o["ease"] = json!({"out": side(out), "in": side(inn)});
         }
@@ -218,7 +224,11 @@ pub fn under_playhead(project: &Project, cid: ItemId, t: f64, window: f64, profi
                 };
                 let (Some(a), Some(b)) = (p.keys.get(i), p.keys.get(i + 1)) else { continue };
                 let (speed, max_speed) = speed_samples(&p.keys, i, p.spatial);
-                let ease = taste::normalised(p, i).map(|(o, n, _)| (o, n));
+                let norm = taste::normalised(p, i);
+                let ease = norm.map(|(o, n, _)| (o, n));
+                // Average speed = the change over the segment's layer time.
+                let dt = (b.time.seconds() - a.time.seconds()).abs();
+                let peak = norm.map(|(_, _, dv)| dv / dt.max(1e-9)).filter(|avg| *avg > 1e-12).map(|avg| max_speed / avg);
                 let curve = match (profile, ease) {
                     (Some(prof), Some(e)) if a.out_interp == Interp::Bezier && b.in_interp == Interp::Bezier => matching_curve(prof, e, (s1 - s0).abs()),
                     _ => None,
@@ -248,6 +258,7 @@ pub fn under_playhead(project: &Project, cid: ItemId, t: f64, window: f64, profi
                     ease,
                     speed,
                     max_speed,
+                    peak,
                     object,
                     curve,
                 });
