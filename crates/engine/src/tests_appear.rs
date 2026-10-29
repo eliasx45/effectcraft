@@ -159,3 +159,53 @@ fn his_20_08_comps_mostly_appear_on_their_words() {
         "most of his own layers should pass: {on} of {sure} (read the OFF lines: a pattern of his, like beat-staggered captions, or a matching problem)"
     );
 }
+
+/// 29 Oct 2026, Tapa 26-10 "full-time pill 17 f late": a pill showing "Full-time income" inside a
+/// scene precomp peaked on IN-come, 17 frames after "full". `off-word` flagged it in the scene
+/// comp but not in the part / MAIN lint the handover ran. It now looks into precomps that carry
+/// their own speech map and reports the time in the comp linted.
+#[test]
+fn off_word_looks_inside_a_scene_precomp_with_its_own_speech_map() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Scene", "width": 320, "height": 180, "frameRate": 25, "duration": 4.0})).unwrap();
+    let scene = s.active_comp_id().unwrap();
+    let words = |off: f64| {
+        json!({"engine": "test", "words": [
+            {"word": "full", "start": 1.0 + off, "end": 1.3 + off, "syllables": [{"t": 1.0 + off, "vowel": 1.08 + off, "stress": 1}]},
+            {"word": "time", "start": 1.3 + off, "end": 1.6 + off, "syllables": [{"t": 1.3 + off, "vowel": 1.36 + off, "stress": 1}]},
+            {"word": "income", "start": 1.68 + off, "end": 2.1 + off, "syllables": [{"t": 1.68 + off, "vowel": 1.72 + off, "stress": 1}]}
+        ]})
+    };
+    s.execute("speech.import", json!({"comp": scene.0, "map": words(0.0)})).unwrap();
+    let l = text(&mut s, "Full-time income");
+    pop(&mut s, l, 1.48, 1.88); // peak 1.68 s (frame 42) on IN-come; "full" accent = frame 26
+    // In the scene comp itself it was already flagged.
+    assert_eq!(off_word(&mut s).len(), 1);
+
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 25, "duration": 8.0})).unwrap();
+    let main = s.active_comp_id().unwrap();
+    let pre = s.execute("layer.addItem", json!({"comp": main.0, "item": scene.0, "time": 0.0})).unwrap()["layer"].as_u64().unwrap();
+    {
+        let p = std::sync::Arc::make_mut(&mut s.project);
+        let nl = p.comp_mut(main).unwrap().layer_mut(LayerId(pre)).unwrap();
+        nl.start_time = effectcraft_time::Tick::from_seconds_f64(2.0);
+        nl.in_point = effectcraft_time::Tick::from_seconds_f64(2.0);
+        nl.out_point = effectcraft_time::Tick::from_seconds_f64(6.0);
+    }
+    s.execute("speech.import", json!({"comp": main.0, "map": words(2.0)})).unwrap();
+    let r = s.execute("render.lint", json!({"comp": main.0, "start": 0, "end": 8, "rules": ["off-word"]})).unwrap();
+    let found: Vec<Value> = r["problems"].as_array().unwrap().iter().filter(|p| p["rule"] == "off-word").cloned().collect();
+    assert_eq!(found.len(), 1, "{r:#}");
+    let f = &found[0];
+    assert_eq!(f["layer"], pre, "reported on the precomp layer in Main: {f:#}");
+    let msg = f["message"].as_str().unwrap();
+    assert!(msg.contains("\"full\"") && msg.contains("in precomp \"Scene\""), "{msg}");
+    assert!((f["time"].as_f64().unwrap() - 3.68).abs() < 0.03, "Main seconds (2 + 1.68): {f:#}");
+    assert_eq!(f["fix"]["params"]["comp"], scene.0, "the fix runs in the scene comp: {f:#}");
+
+    // Its fix lands it on "full", and Main's lint is clean.
+    let fix = f["fix"].clone();
+    s.execute_checked(fix["command"].as_str().unwrap(), fix["params"].clone()).unwrap();
+    let r = s.execute("render.lint", json!({"comp": main.0, "start": 0, "end": 8, "rules": ["off-word"]})).unwrap();
+    assert!(r["problems"].as_array().unwrap().iter().all(|p| p["rule"] != "off-word"), "{r:#}");
+}

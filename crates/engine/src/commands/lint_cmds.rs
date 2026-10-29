@@ -251,45 +251,77 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
                 let fps = comp.frame_rate.as_f64();
                 let lead = frames_p(p, "accentLead", lint::DEFAULT_ACCENT_LEAD, 0.0, C)?;
                 let half = if range || fps.is_nan() || fps <= 0.0 { 0.0 } else { 0.5 / fps };
-                let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, comp, effectcraft_time::Tick::ZERO);
-                let entries = crate::appear::plan(&ctx, map, None, lead);
-                let checked = entries.iter().filter(|e| e.sure()).count();
+                // This comp and every precomp it shows in the span that has its own speech map (a
+                // scene comp inside a part inside MAIN): the 26-10 "Full-time income" pill sat 17 f
+                // after "full" inside "S1 02 Five minutes", flagged there but not in the P1 / MAIN
+                // lint every handover ran (29 Oct 2026).
+                let (deep, _) = lint::deep_comps(&s.project, cid, span.0 - half, span.1 + half);
+                let own = |c: ItemId, l: LayerId, path: &str| s.client.as_deref().is_some_and(|who| keyed_by(s, who, c, l, path));
+                let mut checked = 0;
                 let mut n = 0;
-                for e in entries.iter().filter(|e| e.sure() && e.off_by.abs() > crate::appear::OFF_WORD_FRAMES) {
-                    let at = e.peak.as_ref().map_or(e.appear, |p| p.2);
-                    if at < span.0 - half || at > span.1 + half {
-                        continue;
-                    }
-                    let Some((_, word, _)) = &e.word else { continue };
-                    let (what, target) = match &e.peak {
-                        Some((prop, _, t)) => (
-                            format!("its {prop} entrance peaks at frame {:.0}", t * fps),
-                            format!("the stressed syllable of \"{word}\" (frame {:.0})", e.accent * fps),
-                        ),
-                        None => (format!("it appears at frame {:.0}", e.appear * fps), format!("\"{word}\" (said at frame {:.0})", e.word_start * fps)),
+                for dc in &deep {
+                    let nested = !dc.via.is_empty();
+                    let Some(inner) = s.project.comp(dc.comp) else { continue };
+                    let Some(imap) = (if nested { inner.speech.as_deref().filter(|m| !m.words.is_empty()) } else { Some(map) }) else { continue };
+                    let ifps = inner.frame_rate.as_f64();
+                    let ctx = effectcraft_render::EvalCtx::new(&s.project, dc.comp, inner, effectcraft_time::Tick::ZERO);
+                    let entries = crate::appear::plan(&ctx, imap, None, lead);
+                    checked += entries.iter().filter(|e| e.sure()).count();
+                    let top_layer = dc.via.first().map(|h| h.layer);
+                    let where_ = if nested {
+                        let names: Vec<String> =
+                            dc.via.iter().map(|h| s.project.comp(h.comp).and_then(|x| x.layer(h.layer)).map(|l| l.name.clone()).unwrap_or_default()).collect();
+                        format!(" (in precomp \"{}\", via {})", s.project.item(dc.comp).map(|i| i.name.as_str()).unwrap_or_default(), names.join(" → "))
+                    } else {
+                        String::new()
                     };
-                    n += 1;
-                    occurrences.push((
-                        effectcraft_time::Tick::from_seconds_f64(at),
-                        lint::Finding {
-                            rule: "off-word",
-                            severity: lint::Severity::Warning,
-                            layer: e.layer,
-                            other: None,
-                            inner: None,
-                            message: format!(
-                                "“{}” shows {:?}: {what}, {:.0} frames {} {target}. Move its entrance by {:+.0} frames (speech.appearPlan lists every layer).",
-                                e.name,
-                                e.shows.chars().take(40).collect::<String>(),
-                                e.off_by.abs(),
-                                if e.off_by > 0.0 { "after" } else { "before" },
-                                -e.off_by.round()
+                    for e in entries.iter().filter(|e| e.sure() && e.off_by.abs() > crate::appear::OFF_WORD_FRAMES) {
+                        let at_inner = e.peak.as_ref().map_or(e.appear, |p| p.2);
+                        // `dc.window` is the padded span in this comp's own seconds.
+                        if at_inner < dc.window.0 || at_inner > dc.window.1 {
+                            continue;
+                        }
+                        let at = if nested { crate::precomp_time::up(&dc.via, at_inner) } else { at_inner };
+                        let Some((_, word, _)) = &e.word else { continue };
+                        let mine = e.peak.as_ref().is_some_and(|(_, path, _)| own(dc.comp, e.layer, path));
+                        let (what, target) = match &e.peak {
+                            Some((prop, _, t)) => (
+                                format!("its {prop} entrance peaks at frame {:.0}", t * ifps),
+                                format!("the stressed syllable of \"{word}\" (frame {:.0})", e.accent * ifps),
                             ),
-                            fix: crate::appear::fix(e, fps),
-                        },
-                    ));
+                            None => (format!("it appears at frame {:.0}", e.appear * ifps), format!("\"{word}\" (said at frame {:.0})", e.word_start * ifps)),
+                        };
+                        let mut fix = crate::appear::fix(e, ifps);
+                        if nested && let Some(params) = fix.as_mut().and_then(|f| f.get_mut("params")).and_then(Value::as_object_mut) {
+                            params.insert("comp".into(), json!(dc.comp.0));
+                        }
+                        n += 1;
+                        occurrences.push((
+                            effectcraft_time::Tick::from_seconds_f64(at),
+                            lint::Finding {
+                                rule: "off-word",
+                                severity: if mine { lint::Severity::Error } else { lint::Severity::Warning },
+                                layer: top_layer.unwrap_or(e.layer),
+                                other: None,
+                                inner: None,
+                                message: format!(
+                                    "“{}”{where_} shows {:?}: {what}, {:.0} frames {} {target} (frames in its own comp). Move its entrance by {:+.0} frames (speech.appearPlan lists every layer).{}",
+                                    e.name,
+                                    e.shows.chars().take(40).collect::<String>(),
+                                    e.off_by.abs(),
+                                    if e.off_by > 0.0 { "after" } else { "before" },
+                                    -e.off_by.round(),
+                                    if mine { " You keyed this move: fix it before handover (an error, not a warning, for keys you made)." } else { "" }
+                                ),
+                                fix,
+                            },
+                        ));
+                    }
                 }
-                notes.push(format!("off-word: {checked} layers matched to the word they show; more than {} frames off: {n}", crate::appear::OFF_WORD_FRAMES));
+                notes.push(format!(
+                    "off-word: {checked} layers matched to the word they show (this comp and its precomps with a speech map); more than {} frames off: {n}",
+                    crate::appear::OFF_WORD_FRAMES
+                ));
             }
         }
     }
