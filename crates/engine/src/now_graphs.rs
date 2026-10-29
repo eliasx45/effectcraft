@@ -10,11 +10,13 @@
 //!   and moves (its two values differ, its first key doesn't hold).
 //! - **Times** are the searched comp's seconds, mapped up through each precomp layer's start and
 //!   stretch ([`precomp_time`]).
+//! - **Order** (Elias, 29 Oct: "can't reach the third graph"): segments that contain the playhead
+//!   first, then the nearest; objects are numbered in that order (the first card's is 0).
 //! - **Objects.** Each animated layer (through its precomp chain) is one object, numbered in the
-//!   order found: the frontend gives each its own colour and outlines its box on the viewer
+//!   order listed: the frontend gives each its own colour and outlines its box on the viewer
 //!   ([`object_quad`]: the layer's content box through every precomp layer, in the searched comp's
 //!   pixels).
-//! - **Edits** are commands (`nowGraphs.setInfluence`, `nowGraphs.applyEase`): see
+//! - **Edits** are commands (`nowGraphs.setInfluence`, `nowGraphs.applyEase`, `nowGraphs.moveKey`): see
 //!   `commands/now_graphs.rs`.
 //!
 //! Nothing here touches the project.
@@ -64,6 +66,11 @@ pub struct NowGraph {
     pub end: f64,
     /// The two keys' times in their layer's seconds (as `keys.setEase` takes them).
     pub layer_times: (f64, f64),
+    /// The two keys' times (`key`, then `key + 1`) in the searched comp's seconds: unlike
+    /// `start`/`end` not sorted (a negative stretch puts `key` last).
+    pub key_times: (f64, f64),
+    /// Seconds from the playhead to the segment (0: it contains the playhead).
+    pub gap: f64,
     /// The first key's out and the second key's in interpolation.
     pub interp: (Interp, Interp),
     /// Normalised eases (speed in units of the segment's average speed, influence %), when the
@@ -103,6 +110,8 @@ impl NowGraph {
             "key": self.key,
             "start": r3(self.start), "end": r3(self.end),
             "layerTimes": [r3(self.layer_times.0), r3(self.layer_times.1)],
+            "keyTimes": [r3(self.key_times.0), r3(self.key_times.1)],
+            "containsPlayhead": self.gap <= 1e-9,
             "interp": {"out": interp_id(self.interp.0), "in": interp_id(self.interp.1)},
             "speed": self.speed.iter().map(|v| r3(*v)).collect::<Vec<_>>(),
             "maxSpeed": r3(self.max_speed),
@@ -172,7 +181,7 @@ pub fn under_playhead(project: &Project, cid: ItemId, t: f64, window: f64, profi
             });
             for (_, p) in props {
                 // The segment nearest the playhead that touches the window and moves.
-                let mut best: Option<(f64, usize, f64, f64)> = None;
+                let mut best: Option<(f64, usize, f64, f64, (f64, f64))> = None;
                 for i in 0..p.keys.len().saturating_sub(1) {
                     let (Some(a), Some(b)) = (p.keys.get(i), p.keys.get(i + 1)) else { continue };
                     if a.value == b.value || a.out_interp == Interp::Hold {
@@ -192,10 +201,10 @@ pub fn under_playhead(project: &Project, cid: ItemId, t: f64, window: f64, profi
                         0.0
                     };
                     if best.is_none_or(|b| gap < b.0) {
-                        best = Some((gap, i, s0, s1));
+                        best = Some((gap, i, s0, s1, (x, y)));
                     }
                 }
-                let Some((_, i, s0, s1)) = best else { continue };
+                let Some((gap, i, s0, s1, key_times)) = best else { continue };
                 if out.graphs.len() >= MAX_GRAPHS {
                     out.truncated = true;
                     continue;
@@ -233,6 +242,8 @@ pub fn under_playhead(project: &Project, cid: ItemId, t: f64, window: f64, profi
                     start: s0,
                     end: s1,
                     layer_times: (a.time.seconds(), b.time.seconds()),
+                    key_times,
+                    gap,
                     interp: (a.out_interp, b.in_interp),
                     ease,
                     speed,
@@ -243,7 +254,30 @@ pub fn under_playhead(project: &Project, cid: ItemId, t: f64, window: f64, profi
             }
         }
     }
+    order(&mut out);
     out
+}
+
+/// Segments containing the playhead first, then the nearest (found order breaks ties); objects
+/// renumbered in the order their first graph is listed.
+fn order(out: &mut NowGraphs) {
+    out.graphs.sort_by(|a, b| a.gap.total_cmp(&b.gap));
+    let mut map: Vec<Option<usize>> = vec![None; out.objects.len()];
+    let mut objects = Vec::with_capacity(out.objects.len());
+    for g in &mut out.graphs {
+        let Some(slot) = map.get_mut(g.object) else { continue };
+        let k = match *slot {
+            Some(k) => k,
+            None => {
+                let Some(o) = out.objects.get(g.object) else { continue };
+                objects.push(o.clone());
+                *slot = Some(objects.len() - 1);
+                objects.len() - 1
+            }
+        };
+        g.object = k;
+    }
+    out.objects = objects;
 }
 
 /// The profile curve (approved or ⏳) whose shape a segment of `secs` seconds has, if any.

@@ -181,3 +181,106 @@ fn junk_times_and_windows_never_panic() {
     let q = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
     assert!(!crate::now_graphs::off_frame(&q, 320.0, 180.0));
 }
+
+#[test]
+fn segments_containing_the_playhead_come_first_and_objects_follow_the_order() {
+    let (mut s, main, _, _, pill, title, _) = board();
+    // 3.8 s: the title's 3 → 4 fade contains it; the pill (2.5 → 3.5 in MAIN) ended 0.3 s before.
+    let r = s.execute("nowGraphs.list", json!({"comp": main.0, "time": 3.8})).unwrap();
+    let g = graphs(&r);
+    assert_eq!(g.len(), 2, "{r:#}");
+    assert_eq!(g[0]["layer"], title, "the segment under the playhead first: {r:#}");
+    assert_eq!(g[0]["containsPlayhead"], true);
+    assert_eq!(g[1]["layer"], pill);
+    assert_eq!(g[1]["containsPlayhead"], false);
+    // Objects are numbered in the order listed: the first card's object is 0.
+    assert_eq!(g[0]["object"], 0);
+    assert_eq!(g[1]["object"], 1);
+    assert_eq!(r["objects"][0]["layer"], title);
+    assert_eq!(r["frameRate"].as_f64(), Some(25.0));
+    // keyTimes: the two keys in MAIN seconds, key first.
+    let kt = g[1]["keyTimes"].as_array().unwrap();
+    assert!((kt[0].as_f64().unwrap() - 2.5).abs() < 0.01 && (kt[1].as_f64().unwrap() - 3.5).abs() < 0.01, "{:#}", g[1]);
+}
+
+#[test]
+fn move_key_retimes_a_nested_key_in_the_outer_comps_frames_as_one_drag() {
+    let (mut s, main, scene, _, pill, _, _) = board();
+    let g = graphs(&s.execute("nowGraphs.list", json!({"comp": main.0, "time": 3.0})).unwrap());
+    let p = g.iter().find(|x| x["layer"] == pill).unwrap().clone();
+    // Drag the pill's last key (MAIN 3.5 s) to 3.9, then 4.013 (snaps to MAIN's frame 4.0): Scene
+    // starts at 2 s in MAIN, so the key lands at Scene's 2.0 s (layer time).
+    let held = keys_of(&s, scene, pill, "transform/position")[1].value.clone();
+    let call = |t: f64| json!({"comp": p["comp"], "layer": p["layer"], "path": p["path"], "key": 1, "time": t, "top": main.0, "via": p["via"], "merge": "nowgraphs-key-1"});
+    s.execute("nowGraphs.moveKey", call(3.9)).unwrap();
+    let r = s.execute("nowGraphs.moveKey", call(4.013)).unwrap();
+    assert!((r["time"].as_f64().unwrap() - 4.0).abs() < 1e-6, "{r:#}");
+    assert!((r["layerTime"].as_f64().unwrap() - 2.0).abs() < 1e-6, "{r:#}");
+    let k = keys_of(&s, scene, pill, "transform/position");
+    assert!((k[1].time.seconds() - 2.0).abs() < 1e-6);
+    assert!((k[0].time.seconds() - 0.5).abs() < 1e-6, "the other key stays");
+    assert_eq!(k[1].value, held, "the key keeps its value");
+    // Listed again, the segment is longer.
+    let g = graphs(&s.execute("nowGraphs.list", json!({"comp": main.0, "time": 3.0})).unwrap());
+    let p2 = g.iter().find(|x| x["layer"] == pill).unwrap();
+    assert!((p2["end"].as_f64().unwrap() - 4.0).abs() < 0.01, "{p2:#}");
+    // The whole drag is one undo step.
+    s.execute("edit.undo", json!({})).unwrap();
+    let k = keys_of(&s, scene, pill, "transform/position");
+    assert!((k[1].time.seconds() - 1.5).abs() < 1e-6, "one undo puts it back");
+}
+
+#[test]
+fn move_key_never_passes_a_neighbour_and_keeps_the_ease_shape() {
+    let (mut s, main, _, _, _, title, _) = board();
+    s.execute("nowGraphs.applyEase", json!({"comp": main.0, "layer": title, "path": "transform/opacity", "key": 0, "curve": "expo-out-1"})).unwrap();
+    let before = {
+        let comp = s.project.comp(main).unwrap();
+        crate::taste::normalised(comp.layer(LayerId(title)).unwrap().props.prop("transform/opacity").unwrap(), 0).unwrap()
+    };
+    // The first key (3 s) dragged past the second (4 s): it stops a frame before it.
+    let r = s.execute("nowGraphs.moveKey", json!({"comp": main.0, "layer": title, "path": "transform/opacity", "key": 0, "time": 9.0})).unwrap();
+    assert!((r["time"].as_f64().unwrap() - 3.96).abs() < 1e-6, "{r:#}");
+    // Back to 2 s: a 2 s move with the same Expo Out 1 shape (normalised speeds and influences).
+    s.execute("nowGraphs.moveKey", json!({"comp": main.0, "layer": title, "path": "transform/opacity", "key": 0, "time": 2.0})).unwrap();
+    let k = keys_of(&s, main, title, "transform/opacity");
+    assert!((k[0].time.seconds() - 2.0).abs() < 1e-6 && (k[1].time.seconds() - 4.0).abs() < 1e-6);
+    let after = {
+        let comp = s.project.comp(main).unwrap();
+        crate::taste::normalised(comp.layer(LayerId(title)).unwrap().props.prop("transform/opacity").unwrap(), 0).unwrap()
+    };
+    assert!((before.0.influence - after.0.influence).abs() < 1e-6 && (before.1.influence - after.1.influence).abs() < 1e-6);
+    assert!((before.0.speed - after.0.speed).abs() < 1e-3 && (before.1.speed - after.1.speed).abs() < 1e-3, "{before:?} vs {after:?}");
+}
+
+#[test]
+fn move_key_refuses_bad_params_without_panicking() {
+    let (mut s, main, scene, pre, pill, title, _) = board();
+    let base = json!({"comp": main.0, "layer": title, "path": "transform/opacity"});
+    let with = |extra: Value| {
+        let mut p = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        p
+    };
+    for bad in [
+        json!({"key": 0}),
+        json!({"key": 2, "time": 3.0}),
+        json!({"key": 0, "time": f64::NAN}),
+        json!({"key": 0, "time": 1e300}),
+        json!({"key": 0, "time": 3.0, "top": 999_999}),
+        json!({"key": 0, "time": 3.0, "via": "nope"}),
+    ] {
+        assert!(s.execute("nowGraphs.moveKey", with(bad.clone())).is_err(), "{bad}");
+    }
+    // A nested key with a wrong or missing chain is refused.
+    let nested = json!({"comp": scene.0, "layer": pill, "path": "transform/position", "key": 1, "time": 3.6, "top": main.0});
+    assert!(s.execute("nowGraphs.moveKey", nested.clone()).is_err(), "no via from MAIN");
+    let mut wrong = nested.clone();
+    wrong["via"] = json!([{"comp": scene.0, "layer": pre}]);
+    assert!(s.execute("nowGraphs.moveKey", wrong).is_err());
+    // layerTime instead of time works without top/via.
+    let r = s.execute("nowGraphs.moveKey", json!({"comp": scene.0, "layer": pill, "path": "transform/position", "key": 1, "layerTime": 1.8})).unwrap();
+    assert!((r["layerTime"].as_f64().unwrap() - 1.8).abs() < 1e-6, "{r:#}");
+}
