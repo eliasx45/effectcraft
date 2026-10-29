@@ -283,6 +283,75 @@ fn a_working_shadow_claims_its_source_but_elias_still_edits_it() {
     assert_eq!(f.s.execute_checked("shadow.list", json!({"agent": "nobody"})).unwrap()["shadows"], json!([]));
 }
 
+fn claim_owner(s: &mut Session, comp: u64) -> Option<String> {
+    let c = s.execute_checked("comp.claims", json!({})).unwrap();
+    c["claims"].as_array().unwrap().iter().find(|x| x["comp"].as_u64() == Some(comp)).and_then(|x| x["client"].as_str().map(str::to_string))
+}
+
+/// 1028-137: a dropped shadow's 24 h claim went with it only while the agent had another shadow.
+#[test]
+fn dropping_an_agents_last_shadow_releases_its_claim() {
+    let mut f = setup();
+    let (shadow, _) = create(&mut f.s, f.scene, "editing-chat-4");
+    assert_eq!(claim_owner(&mut f.s, f.scene).as_deref(), Some("editing-chat-4"));
+    f.s.execute_checked("shadow.drop", json!({"shadow": shadow})).unwrap();
+    assert_eq!(claim_owner(&mut f.s, f.scene), None, "the claim goes with the agent's last shadow");
+    assert!(set_opacity(&mut f.s, f.scene, f.title, 5.0, Some("editing-team")).is_ok());
+}
+
+/// 1028-137: a stopped team run releases its shadows: kept, parked, the source unclaimed; working
+/// on one again takes the claim back.
+#[test]
+fn release_keeps_the_shadow_and_lifts_its_claim_until_work_resumes() {
+    let mut f = setup();
+    let (shadow, _) = create(&mut f.s, f.scene, "editing-chat-4");
+    let (other, _) = create(&mut f.s, f.card, "editing-chat-4");
+    let r = f.s.execute_checked("shadow.release", json!({"agent": "editing-chat-4"})).unwrap();
+    assert_eq!(r["released"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(r["shadows"][0]["parked"], true);
+    assert_eq!(claim_owner(&mut f.s, f.scene), None);
+    assert_eq!(claim_owner(&mut f.s, f.card), None);
+    assert!(f.s.project.comp(ItemId(shadow)).is_some() && f.s.project.comp(ItemId(other)).is_some(), "the shadows are kept");
+    // Another client may now edit the source; refreshes don't take the claim back.
+    set_opacity(&mut f.s, f.scene, f.title, 5.0, Some("editing-team")).unwrap();
+    f.s.execute_checked("shadow.list", json!({})).unwrap();
+    assert_eq!(claim_owner(&mut f.s, f.scene), None);
+    // Parked survives a save and reopen.
+    let text = f.s.project.to_file_json().unwrap();
+    let mut s2 = Session::default();
+    s2.replace_project(Project::from_json(&text).unwrap(), None);
+    assert_eq!(s2.execute_checked("shadow.get", json!({"shadow": shadow})).unwrap()["parked"], true);
+    assert_eq!(claim_owner(&mut s2, f.scene), None);
+    // Work resumes: the claim is back.
+    f.s.execute_checked("shadow.setStatus", json!({"shadow": shadow, "status": "working"})).unwrap();
+    assert_eq!(claim_owner(&mut f.s, f.scene).as_deref(), Some("editing-chat-4"));
+    assert_eq!(f.s.execute_checked("shadow.get", json!({"shadow": shadow})).unwrap()["parked"], false);
+    assert!(f.s.execute_checked("shadow.release", json!({})).is_err(), "release needs a target");
+}
+
+/// 1028-137: `force` swaps in over a stale claim another client holds; without it the refusal
+/// says so (Ghostex offers "Keep anyway" when the error names `force`).
+#[test]
+fn force_swaps_in_over_another_clients_claim() {
+    let mut f = setup();
+    f.s.execute_checked("comp.claim", json!({"comp": f.scene, "ttl": 86_400, "client": "editing-chat-4"})).unwrap();
+    let (shadow, _) = create(&mut f.s, f.scene, "editing-chat-5");
+    let s_title = layer_named(&f.s, shadow, "Title");
+    set_opacity(&mut f.s, shadow, s_title, 40.0, Some("editing-chat-5")).unwrap();
+    pass(&mut f.s, shadow);
+    let e = f.s.execute_checked("shadow.swapIn", json!({"shadow": shadow, "client": "editing-team"})).unwrap_err().to_string();
+    assert!(e.contains("claimed by editing-chat-4") && e.contains("force"), "{e}");
+    assert_eq!(claim_owner(&mut f.s, f.scene).as_deref(), Some("editing-chat-4"), "a refusal leaves the claim");
+    let r = f.s.execute_checked("shadow.swapIn", json!({"shadow": shadow, "client": "editing-team", "force": true})).unwrap();
+    assert_eq!(r["status"], "swapped", "{r}");
+    assert_eq!(opacity(&f.s, f.scene, layer_named(&f.s, f.scene, "Title")), 40.0);
+    // The user (no client) is never blocked by a claim.
+    f.s.execute_checked("comp.claim", json!({"comp": f.card, "ttl": 86_400, "client": "B1"})).unwrap();
+    let (shadow2, _) = create(&mut f.s, f.card, "editing-chat-5");
+    pass(&mut f.s, shadow2);
+    assert_eq!(f.s.execute_checked("shadow.swapIn", json!({"shadow": shadow2})).unwrap()["status"], "swapped");
+}
+
 #[test]
 fn shadows_and_their_status_survive_a_save_and_reopen() {
     let mut f = setup();
@@ -376,6 +445,7 @@ fn junk_input_never_panics() {
         "shadow.rebase",
         "shadow.frames",
         "shadow.events",
+        "shadow.release",
         "shadow.drop",
     ];
     for id in ids {

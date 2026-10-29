@@ -117,6 +117,11 @@ pub struct ShadowLink {
     /// How many times it was swapped in or out.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub swaps: u32,
+    /// Nobody works on it for now (`shadow.release`: the team run stopped, the agent is done or
+    /// asleep): the shadow is kept but its source is no longer claimed. Rebasing it or setting it
+    /// back to working / checking takes it up again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parked: bool,
 }
 
 fn is_zero(n: &u32) -> bool {

@@ -82,6 +82,12 @@ pub struct ShadowState {
     dropped: VecDeque<(ItemId, Value)>,
     /// Fingerprints by comp, valid while the comp is this very snapshot and keeps its name.
     cache: HashMap<ItemId, (Arc<Comp>, String, CompPrint)>,
+    /// `shadow.release` / take-up set in this session (it wins over the project's copy, which
+    /// undo may roll back).
+    parked: BTreeMap<ItemId, bool>,
+    /// The claims the shadows made (comp → owner), so they are released when no working
+    /// shadow needs them any more, also after the agent's last shadow was dropped.
+    made: BTreeMap<ItemId, String>,
 }
 
 impl ShadowState {
@@ -462,9 +468,25 @@ fn status_name(s: &Session, l: &ShadowLink) -> &'static str {
     if l.swapped { "swapped" } else { status_of(s, l).0.id() }
 }
 
+/// Whether nobody works on the shadow for now (`shadow.release`; this session's, else the
+/// project's).
+fn parked_of(s: &Session, l: &ShadowLink) -> bool {
+    s.shadows.parked.get(&l.shadow).copied().unwrap_or(l.parked)
+}
+
 /// Whether the shadow is being worked on (its source counts as claimed by its agent).
 fn active(s: &Session, l: &ShadowLink) -> bool {
-    !l.swapped && matches!(status_of(s, l).0, ShadowStatus::Working | ShadowStatus::Checking)
+    !l.swapped && !parked_of(s, l) && matches!(status_of(s, l).0, ShadowStatus::Working | ShadowStatus::Checking)
+}
+
+/// Park the shadow (`true`: kept, its source no longer claimed) or take it up again.
+fn set_parked(s: &mut Session, shadow: ItemId, parked: bool) {
+    s.shadows.parked.insert(shadow, parked);
+    write_links(s, |links| {
+        if let Some(x) = links.iter_mut().find(|x| x.shadow == shadow) {
+            x.parked = parked;
+        }
+    });
 }
 
 /// Change the project's shadow bookkeeping without an undo step (statuses and checks): the
@@ -492,11 +514,15 @@ pub fn refresh(s: &mut Session) {
     }
     // Statuses: this session's win (an undo of an earlier step may have rolled them back).
     let notes = s.shadows.notes.clone();
+    let parked = s.shadows.parked.clone();
     write_links(s, |links| {
         for l in links.iter_mut() {
             if let Some(n) = notes.get(&l.shadow) {
                 l.status = n.status;
                 l.checks.clone_from(&n.checks);
+            }
+            if let Some(x) = parked.get(&l.shadow) {
+                l.parked = *x;
             }
         }
     });
@@ -552,7 +578,21 @@ fn sync_claims(s: &mut Session) {
                 let ttl = crate::agents::MAX_TTL;
                 let expires = std::time::Duration::try_from_secs_f64(ttl).ok().and_then(|d| now.checked_add(d)).unwrap_or(now);
                 s.claims.map.insert(*comp, crate::agents::Claim { owner: agent.clone(), expires, ttl });
+                s.shadows.made.insert(*comp, agent.clone());
             }
+        }
+    }
+    // Claims a shadow made that no working shadow wants any more: released, also when the
+    // agent's last shadow is gone (dropped) or parked (1028-137: a stopped team run's shadows
+    // kept their sources claimed for 24 h).
+    let made: Vec<(ItemId, String)> = s.shadows.made.iter().map(|(c, o)| (*c, o.clone())).collect();
+    for (comp, owner) in made {
+        if wanted.get(&comp) == Some(&owner) {
+            continue;
+        }
+        s.shadows.made.remove(&comp);
+        if s.claims.map.get(&comp).is_some_and(|c| c.owner == owner && c.ttl >= crate::agents::MAX_TTL) {
+            s.claims.map.remove(&comp);
         }
     }
     // Release claims shadow agents hold on sources none of their shadows works on any more.
@@ -610,6 +650,7 @@ fn link_json(s: &mut Session, l: &ShadowLink, detail: bool) -> Value {
         "checksPassed": !checks.is_empty() && checks.iter().all(|c| c.ok),
         "swapped": l.swapped,
         "swaps": l.swaps,
+        "parked": parked_of(s, l),
         "stale": stale,
         "claimedBy": claim,
         "folder": l.folder.map(|f| f.0),
@@ -896,14 +937,44 @@ fn snapshot(p: &Project, source: ItemId) -> BTreeMap<ItemId, Arc<Comp>> {
     graph(p, source).unwrap_or_default().into_iter().filter_map(|id| p.comp_arc(id).map(|c| (id, c))).collect()
 }
 
-/// Lift the claims shadow agents hold on `comp` (a swap is the team's own edit); returns them to
-/// put back if the swap fails.
-fn lift_claims(s: &mut Session, comp: ItemId) -> Option<crate::agents::Claim> {
-    let owner = s.claims.map.get(&comp)?.owner.clone();
-    if !s.project.shadows.iter().any(|l| l.source == comp && l.agent == owner) {
-        return None;
+/// Lift the claims on the comps a swap of `l` changes (its source and the comps nested in it):
+/// a shadow agent's claim always (a swap is the team's own edit), anyone's with `force` (a stale
+/// claim must not block Elias's keep). Returns the lifted claims to put back if the swap fails,
+/// or the refusal when another client's claim holds and `force` wasn't given.
+fn lift_claims(s: &mut Session, l: &ShadowLink, force: bool, cmd: &str) -> Result<Vec<(ItemId, crate::agents::Claim)>> {
+    let lives: BTreeSet<ItemId> = std::iter::once(l.source).chain(l.copies.iter().map(|(a, _)| *a)).collect();
+    let mut lifted = vec![];
+    let mut held: Vec<String> = vec![];
+    for comp in lives {
+        let Some(c) = s.claims.get(comp).cloned() else { continue };
+        if s.client.as_deref() == Some(c.owner.as_str()) {
+            continue;
+        }
+        let shadow_agent = s.project.shadows.iter().any(|x| x.agent == c.owner && (x.source == comp || x.copies.iter().any(|(a, _)| *a == comp)));
+        if shadow_agent || force {
+            if let Some(c) = s.claims.map.remove(&comp) {
+                lifted.push((comp, c));
+            }
+        } else if s.client.is_some() {
+            held.push(format!(
+                "\"{}\" is claimed by {} (expires in {})",
+                item_name(&s.project, comp),
+                c.owner,
+                crate::agents::fmt_secs(s.claims.remaining(&c))
+            ));
+        }
     }
-    s.claims.map.remove(&comp)
+    if !held.is_empty() {
+        put_back(s, lifted);
+        return Err(bad(cmd, format!("refused: {}. Wait for the claim to be released, or pass `force: true` to swap anyway", held.join("; "))));
+    }
+    Ok(lifted)
+}
+
+fn put_back(s: &mut Session, lifted: Vec<(ItemId, crate::agents::Claim)>) {
+    for (comp, c) in lifted {
+        s.claims.map.insert(comp, c);
+    }
 }
 
 // ---------------------------------------------------------------- commands
@@ -949,6 +1020,7 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
             checks: vec![],
             swapped: false,
             swaps: 0,
+            parked: false,
         };
         proj.shadows.push(link.clone());
         Ok(link)
@@ -1041,6 +1113,9 @@ fn set_status(s: &mut Session, p: &Value) -> Result<Value> {
         warnings.push("status passed with a failed check".into());
     }
     s.shadows.notes.insert(l.shadow, Note { status, checks: checks.clone() });
+    if matches!(status, ShadowStatus::Working | ShadowStatus::Checking) && parked_of(s, &l) {
+        set_parked(s, l.shadow, false);
+    }
     let shadow = l.shadow;
     write_links(s, |links| {
         if let Some(x) = links.iter_mut().find(|x| x.shadow == shadow) {
@@ -1096,13 +1171,11 @@ fn swap_in(s: &mut Session, p: &Value) -> Result<Value> {
             format!("refused: {}. shadow.rebase to take Elias's latest version, set the status, or pass `force: true` to swap in anyway", why.join("; ")),
         ));
     }
-    let lifted = lift_claims(s, l.source);
+    let lifted = lift_claims(s, &l, force, C)?;
     let label = format!("Swap In ✎{}", l.agent);
     let r = s.edit(&label, None, |proj, _| swap(proj, i, C));
     if let Err(e) = r {
-        if let Some(c) = lifted {
-            s.claims.map.insert(l.source, c);
-        }
+        put_back(s, lifted);
         return Err(e);
     }
     s.sanitize_state();
@@ -1142,13 +1215,11 @@ fn revert(s: &mut Session, p: &Value) -> Result<Value> {
     if !why.is_empty() && !force {
         return Err(bad(C, format!("refused: {}; reverting would undo those edits too. Pass `force: true` to revert anyway", why.join("; "))));
     }
-    let lifted = lift_claims(s, l.source);
+    let lifted = lift_claims(s, &l, force, C)?;
     let label = format!("Revert ✎{}", l.agent);
     let r = s.edit(&label, None, |proj, _| swap(proj, i, C));
     if let Err(e) = r {
-        if let Some(c) = lifted {
-            s.claims.map.insert(l.source, c);
-        }
+        put_back(s, lifted);
         return Err(e);
     }
     s.sanitize_state();
@@ -1197,8 +1268,10 @@ fn rebase(s: &mut Session, p: &Value) -> Result<Value> {
         slot.base_revision = revision;
         slot.status = ShadowStatus::Working;
         slot.checks.clear();
+        slot.parked = false;
         Ok(())
     })?;
+    s.shadows.parked.insert(l.shadow, false);
     s.sanitize_state();
     s.shadows.bases.insert(l.shadow, snapshot(&s.project, l.source));
     s.shadows.notes.insert(l.shadow, Note { status: ShadowStatus::Working, checks: vec![] });
@@ -1251,6 +1324,7 @@ fn drop_shadow(s: &mut Session, p: &Value) -> Result<Value> {
     })?;
     s.sanitize_state();
     s.shadows.notes.remove(&l.shadow);
+    s.shadows.parked.remove(&l.shadow);
     s.shadows.bases.remove(&l.shadow);
     s.shadows.stale_seen.remove(&l.shadow);
     let mut tomb = before;
@@ -1268,6 +1342,52 @@ fn drop_shadow(s: &mut Session, p: &Value) -> Result<Value> {
         tomb["note"] = json!("it was swapped in: the live comp keeps the shadow's contents; the Before copy went with the shadow (undo brings it back)");
     }
     Ok(tomb)
+}
+
+/// `shadow.release {shadow? | agent? | comp?}`: nobody works on these shadows for now (the team
+/// run stopped, the agent is done or asleep): they are kept, their sources are no longer claimed.
+fn release(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "shadow.release";
+    refresh(s);
+    let one = match p.get("shadow").filter(|v| !v.is_null()) {
+        Some(_) => Some(link_at(s, shadow_index(s, p, C)?, C)?.shadow),
+        None => None,
+    };
+    let agent = match p.get("agent").filter(|v| !v.is_null()) {
+        Some(Value::String(a)) if !a.trim().is_empty() => Some(a.trim().to_string()),
+        Some(v) => return Err(bad(C, format!("`agent` must be a name, got {v}"))),
+        None => None,
+    };
+    let comp = match p.get("comp").filter(|v| !v.is_null()) {
+        Some(_) => Some(comp_id(s, p)?),
+        None => None,
+    };
+    if one.is_none() && agent.is_none() && comp.is_none() {
+        return Err(bad(C, "give `shadow`, `agent` (every shadow of that agent) or `comp` (every shadow of that live comp)"));
+    }
+    let links: Vec<ShadowLink> = s
+        .project
+        .shadows
+        .iter()
+        .filter(|l| one.is_none_or(|x| l.shadow == x))
+        .filter(|l| agent.as_deref().is_none_or(|a| l.agent == a))
+        .filter(|l| comp.is_none_or(|c| l.source == c))
+        .filter(|l| !l.swapped)
+        .cloned()
+        .collect();
+    let before: BTreeSet<ItemId> = s.claims.map.keys().copied().collect();
+    let mut released = vec![];
+    for l in &links {
+        if !parked_of(s, l) {
+            set_parked(s, l.shadow, true);
+            log(s, l, "released", json!({}));
+        }
+        released.push(l.shadow.0);
+    }
+    sync_claims(s);
+    let unclaimed: Vec<u64> = before.iter().filter(|c| !s.claims.map.contains_key(c)).map(|c| c.0).collect();
+    let shadows: Vec<Value> = links.iter().map(|l| link_json(s, l, false)).collect();
+    Ok(json!({"released": released, "unclaimed": unclaimed, "shadows": shadows}))
 }
 
 fn reach_contains(p: &Project, root: ItemId, stop: &BTreeSet<ItemId>, x: ItemId) -> bool {
@@ -1434,7 +1554,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Swap In Shadow",
             [],
             None,
-            "{shadow: id|name, force?: bool (swap a stale or not-passed shadow anyway)} — the live comp (and its nested comps) take the shadow's contents, keeping their ids, names and uses, as one undo step; the shadow then holds the comp as it was (Before) → the shadow with status swapped, forced: [reasons overridden]",
+            "{shadow: id|name, force?: bool (swap a stale or not-passed shadow anyway, also over another client's claim)} — the live comp (and its nested comps) take the shadow's contents, keeping their ids, names and uses, as one undo step; the shadow then holds the comp as it was (Before) → the shadow with status swapped, forced: [reasons overridden]",
             super::always,
             swap_in
         ),
@@ -1465,10 +1585,19 @@ pub fn specs() -> Vec<CommandSpec> {
             super::always,
             drop_shadow
         ),
+        CommandSpec {
+            journal: true,
+            ..query!(
+                "shadow.release",
+                "Release Shadows",
+                "{shadow?: id|name, agent?: name (every shadow of that agent), comp?: live comp (every shadow of it)} — nobody works on them for now (team run stopped, agent done or asleep): the shadows are kept (parked: true) and their sources are no longer claimed; shadow.rebase or setStatus working/checking takes one up again (no undo step) → {released: [shadow ids], unclaimed: [comp ids], shadows}",
+                release
+            )
+        },
         query!(
             "shadow.events",
             "Shadow Events",
-            "{since? (event number: the `next` of the last reply), limit?} → {events: [{seq, kind: created|status|stale|fresh|swapped|reverted|rebased|dropped, shadow, name, comp, compName, agent, summary?, message?, revision}], next, latest, revision}: stale = the user edited a comp an agent works on (warn him; the agent rebases)",
+            "{since? (event number: the `next` of the last reply), limit?} → {events: [{seq, kind: created|status|stale|fresh|swapped|reverted|rebased|released|dropped, shadow, name, comp, compName, agent, summary?, message?, revision}], next, latest, revision}: stale = the user edited a comp an agent works on (warn him; the agent rebases)",
             events
         ),
         query!(
