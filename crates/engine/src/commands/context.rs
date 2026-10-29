@@ -350,13 +350,25 @@ fn history_feed(s: &mut Session, p: &Value) -> Result<Value> {
     let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(20).clamp(1, 200) as usize;
     let lines = p.get("lines").and_then(Value::as_u64).unwrap_or(6).clamp(1, 100) as usize;
     let others = p.get("others").and_then(Value::as_bool).unwrap_or(false);
+    let places = p.get("places").and_then(Value::as_bool).unwrap_or(false);
     let since = match p.get("since").filter(|v| !v.is_null()) {
         Some(v) => Some(v.as_u64().ok_or_else(|| super::bad("history.feed", "`since` must be a revision number"))?),
         None => me.as_deref().and_then(|c| s.feed.seen_revision(c)),
     };
     let all: Vec<&feed::Entry> = s.feed.since(since.unwrap_or(0)).filter(|e| !(others && e.client.is_some() && e.client == me)).collect();
     let skipped = all.len().saturating_sub(limit);
-    let entries: Vec<Value> = all.iter().skip(skipped).map(|e| feed::entry_json(e, me.as_deref(), lines)).collect();
+    let entries: Vec<Value> = all
+        .iter()
+        .skip(skipped)
+        .map(|e| {
+            let mut v = feed::entry_json(e, me.as_deref(), lines);
+            if places {
+                let (b, a) = e.projects();
+                v["places"] = json!(feed::places(b, a));
+            }
+            v
+        })
+        .collect();
     let mut text: Vec<String> = entries.iter().map(feed::entry_text).collect();
     if skipped > 0 {
         text.insert(0, format!("({skipped} older changes not shown)"));
@@ -451,7 +463,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "history.feed",
             "Change Feed",
-            "{since?: revision (default: what you were last shown; else the latest), limit? (20), lines? (6 per change), others?: bool (leave out your own)} → who changed what: entries {revision, by (`user` or the agent/script client), who (`you` for yours), label, changes: [\"Layer › Position: key @ 6:20 [960, 540] → [900, 540]\"], comps: [ids of the comps it touched]}, `text`; `gap` when older changes are gone",
+            "{since?: revision (default: what you were last shown; else the latest), limit? (20), lines? (6 per change), others?: bool (leave out your own), places?: bool (add where each change shows)} → who changed what: entries {revision, by (`user` or the agent/script client), who (`you` for yours), label, changes: [\"Layer › Position: key @ 6:20 [960, 540] → [900, 540]\"], comps: [ids of the comps it touched], places? [{comp, layer (null: the comp's settings), name, start, end (seconds of that comp's time the change touches), deleted?}]}, `text`; `gap` when older changes are gone",
             history_feed
         ),
         query!(

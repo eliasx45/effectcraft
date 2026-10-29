@@ -342,6 +342,10 @@ fn native_undo(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
 /// Fold every command in a group into a single bounded-history entry, even if the
 /// oldest intermediate undo state was trimmed before the group ended.
 pub(crate) fn collapse(s: &mut Session, name: &str, snap: &Arc<Project>, prior: &History, saved: &Arc<Project>) {
+    if !Arc::ptr_eq(&s.project, snap) {
+        let client = s.client.clone();
+        s.feed.fold(snap, name, client.as_deref());
+    }
     let h = &mut s.history;
     if let Some(start) = h.undo.iter().rposition(|(_, p)| Arc::ptr_eq(p, snap)) {
         // The group is short enough that its opening snapshot is still in history.
