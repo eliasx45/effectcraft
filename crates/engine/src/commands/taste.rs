@@ -160,7 +160,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
-fn apply(s: &mut Session, p: &Value) -> Result<Value> {
+pub(crate) fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "taste.apply";
     let (prof, _) = profile(s);
     let (cid, lid, uid) = prop_ref(s, p, C)?;
