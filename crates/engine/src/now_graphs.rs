@@ -83,6 +83,8 @@ pub struct NowGraph {
     /// The fastest speed in units of the segment's average speed (the scale between `speed` and
     /// the eases' speeds), when the value changes.
     pub peak: Option<f64>,
+    /// The two keys' values (`key`, then `key + 1`), their components as `keys.set` takes them.
+    pub values: (Vec<f64>, Vec<f64>),
     /// The object (animated layer) it belongs to: 0, 1, 2… in the order found.
     pub object: usize,
     /// The profile curve whose shape it has (id), if any.
@@ -120,6 +122,7 @@ impl NowGraph {
             "maxSpeed": r3(self.max_speed),
             "object": self.object,
         });
+        o["values"] = json!([self.values.0.iter().map(|v| r3(*v)).collect::<Vec<_>>(), self.values.1.iter().map(|v| r3(*v)).collect::<Vec<_>>()]);
         if let Some(k) = self.peak.filter(|k| k.is_finite() && *k > 0.0) {
             o["peak"] = json!(r3(k));
         }
@@ -259,6 +262,7 @@ pub fn under_playhead(project: &Project, cid: ItemId, t: f64, window: f64, profi
                     speed,
                     max_speed,
                     peak,
+                    values: (a.value.components(), b.value.components()),
                     object,
                     curve,
                 });
