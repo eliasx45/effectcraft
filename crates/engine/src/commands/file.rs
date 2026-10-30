@@ -40,7 +40,10 @@ fn demo(s: &mut Session, _: &Value) -> Result<Value> {
 pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.open", "missing `path`"))?;
     // A windowless host holding it saves it and stops first (a handover, not a second copy).
-    let handover = crate::hosts::take_over(path);
+    // `handover: false` reads the file as it is and leaves the host running: a viewer that only
+    // renders it (FigCraft's in-process cards, 30 Oct 2026: the cards of a Ghostex control room
+    // stopped all three team hosts they showed).
+    let handover = if p.get("handover").and_then(Value::as_bool) == Some(false) { None } else { crate::hosts::take_over(path) };
     if let Some(h) = &handover {
         s.toast(h.clone());
     }
@@ -747,7 +750,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("file.newProject", "New Project", ["File", "New"], Some("Cmd+Alt+N"), "{}", always, new_project),
         cmd!("file.openDemoProject", "Open Demo Project", ["Help"], None, "{}", always, demo),
-        cmd!("file.open", "Open Project...", ["File"], Some("Cmd+O"), "{path}", always, open),
+        cmd!("file.open", "Open Project...", ["File"], Some("Cmd+O"), "{path, handover?}", always, open),
         cmd!("file.save", "Save", ["File"], Some("Cmd+S"), "{path?, force? (overwrite a file changed on disk since it was opened)}", always, save),
         cmd!("file.saveAs", "Save As...", ["File", "Save As"], Some("Cmd+Shift+S"), "{path, force?}", always, save_as),
         cmd!("file.incrementAndSave", "Increment and Save", ["File"], Some("Cmd+Alt+Shift+S"), "{}", has_path, increment_save),
