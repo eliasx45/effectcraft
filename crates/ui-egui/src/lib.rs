@@ -846,7 +846,7 @@ impl EffectcraftApp {
         self.frames.set_budget(budgets.limit(effectcraft_render::cache::shared::ShareKind::Preview));
         self.frames.share(budgets.shared.is_some().then_some(&self.session.cache_share));
         if self.zero_copy.active && self.zero_copy.unified {
-            self.frames.set_gpu_budget(budgets.preview);
+            self.frames.set_gpu_budget(frames::unified_gpu_budget(budgets.preview, self.session.sys_memory.map_or(0, |m| m.total)));
         }
         if let Some(g) = &self.gpu {
             g.context().set_cache_budget(budgets.layer);
@@ -1325,7 +1325,8 @@ impl EffectcraftApp {
                 if self.zero_copy.active {
                     log::info!("GPU viewer frames are drawn without a copy (the compositor shares the window's device)");
                     if self.zero_copy.unified {
-                        self.frames.set_gpu_budget(self.session.prefs.cache_budgets(self.session.sys_memory).preview);
+                        let preview = self.session.prefs.cache_budgets(self.session.sys_memory).preview;
+                        self.frames.set_gpu_budget(frames::unified_gpu_budget(preview, self.session.sys_memory.map_or(0, |m| m.total)));
                     }
                 }
                 log::info!("GPU compositor: {}", effectcraft_engine::render::Accelerator::name(&g));

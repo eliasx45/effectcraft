@@ -30,6 +30,9 @@ pub struct PreviewUsage {
     pub bytes: u64,
     /// Of `bytes`, frames kept as GPU textures.
     pub gpu_bytes: u64,
+    /// GPU frames kept at most (bytes; on unified memory a share of the RAM, see
+    /// `frames::unified_gpu_budget` in the frontend).
+    pub gpu_budget: u64,
     pub frames: u64,
     pub budget: u64,
     /// Of `bytes`, compressed frame bytes (Compress RAM Preview Frames); the rest is pixels.

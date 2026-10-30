@@ -81,6 +81,24 @@ const MAX_KEEPERS: usize = 64;
 pub(crate) const GPU_BUDGET: usize = 1 << 30;
 const MIN_GPU_BUDGET: usize = 64 << 20;
 
+/// Most GPU frames kept on unified memory (Apple Silicon), in bytes (see [`unified_gpu_budget`]).
+const UNIFIED_GPU_MAX: usize = 4 << 30;
+
+/// GPU frames to keep on unified memory with a RAM preview budget of `preview` bytes and `ram`
+/// bytes of RAM (0: unknown): a 32nd of the RAM, from [`GPU_BUDGET`] to [`UNIFIED_GPU_MAX`], never
+/// more than the preview's budget. Past it the oldest GPU frames are compressed into RAM (Compress
+/// RAM Preview Frames) or leave the cache, so the RAM preview keeps its frames.
+///
+/// It used to be the whole preview budget ("video memory is RAM there"): 31.5 GB with Elias's
+/// setting. In Ghostex (30 Oct 2026, embedded EffectCraft idle-caching Elias's project for 3 h)
+/// the process reached a 30.5 GB footprint, 28 GB of it swapped graphics memory (151 IOAccelerator
+/// regions of 128 MB), and a canvas render waited 77 of its 88 ms: macOS can't compress GPU
+/// memory as it does CPU pages, it swaps it out whole, and every frame drawn pages it back in.
+pub(crate) fn unified_gpu_budget(preview: usize, ram: u64) -> usize {
+    let share = usize::try_from(ram / 32).unwrap_or(UNIFIED_GPU_MAX).clamp(GPU_BUDGET, UNIFIED_GPU_MAX);
+    share.min(preview).max(MIN_GPU_BUDGET)
+}
+
 /// A rendered viewer frame: CPU pixels or a GPU texture.
 #[derive(Clone)]
 pub enum FrameImage {
@@ -95,8 +113,11 @@ impl FrameImage {
             FrameImage::Gpu(f) => [f.width as usize, f.height as usize],
         }
     }
+    /// What the frame takes: RGBA8 pixels, and for a GPU texture its mip chain too (a third more:
+    /// viewer frames are made with every level, `Enc::display_from`).
     fn bytes(&self) -> usize {
-        self.size()[0] * self.size()[1] * 4
+        let px = self.size()[0].saturating_mul(self.size()[1]).saturating_mul(4);
+        if self.is_gpu() { px.saturating_add(px / 3) } else { px }
     }
     fn is_gpu(&self) -> bool {
         matches!(self, FrameImage::Gpu(_))
@@ -1380,6 +1401,7 @@ fn memory_usage(cache: &Mutex<Cache>, detail: bool) -> effectcraft_engine::memor
     let mut u = PreviewUsage {
         bytes: c.bytes as u64,
         gpu_bytes: c.gpu_bytes as u64,
+        gpu_budget: c.gpu_budget as u64,
         frames: c.map.len() as u64,
         budget: c.budget as u64,
         packed_bytes: c.packed_bytes as u64,
@@ -5322,6 +5344,18 @@ mod tests {
             c.gpu_out_of_memory();
         }
         assert_eq!(c.gpu_budget, MIN_GPU_BUDGET);
+    }
+
+    /// On unified memory GPU frames keep to a 32nd of the RAM (1 to 4 GiB), not the whole RAM
+    /// preview budget (31.5 GB of swapped graphics memory in Ghostex, 30 Oct 2026).
+    #[test]
+    fn unified_memory_gpu_frames_keep_to_a_share_of_the_ram() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(unified_gpu_budget(32288 << 20, 64 * GIB), 2 << 30, "64 GB Mac, 31.5 GB preview budget");
+        assert_eq!(unified_gpu_budget(32288 << 20, 256 * GIB), UNIFIED_GPU_MAX);
+        assert_eq!(unified_gpu_budget(8 << 30, 16 * GIB), GPU_BUDGET, "at least 1 GiB");
+        assert_eq!(unified_gpu_budget(512 << 20, 64 * GIB), 512 << 20, "never more than the preview's budget");
+        assert_eq!(unified_gpu_budget(8 << 30, 0), GPU_BUDGET, "RAM unknown");
     }
 
     #[test]
