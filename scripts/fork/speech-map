@@ -4,7 +4,7 @@
 speech-map MEDIA [--start S] [--dur S] [--fps 29.97] [--offset S] [--out map.json] [--text FILE] [--local]
 
 Pipeline (the winner of ~/Developer/lab/S1-speech-timing, 0.15 frames median on stressed onsets):
-  1. ElevenLabs Scribe text (`scribe-words`; `--local` = faster-whisper; `--text` = a known script)
+  1. Transcript text from `scribe-words` (Deepgram nova-3 since 31 Oct 2026; `--local` = faster-whisper; `--text` = a known script)
   2. Montreal Forced Aligner (english_us_arpa) on that text: words + ARPAbet phones with stress digits
   3. forward acoustic snap: each word-initial or stressed syllable onset moves to the strongest
      4-band energy rise 40 ms before to 120 ms after it
