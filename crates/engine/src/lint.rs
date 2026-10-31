@@ -554,6 +554,26 @@ pub fn rest_poses(comp: &Comp, l: &Layer) -> Vec<Tick> {
     times.into_iter().rev().filter(|t| still(*t, true) || still(*t, false)).take(MAX_REST).collect()
 }
 
+/// The opacity `low-contrast` reads `l` at: its opacity now, or, while its own Opacity is moving
+/// on this frame (a fade in or out), the highest its Opacity keys reach. A fade frame is meant to
+/// be faint; the text is read once it has landed. A text held faint is still measured as it is.
+// CDXC:Lint 2026-10-31 WHY: three load-test agents in Ghostex's control room each added a white
+// text with an 8-frame Entrance fade (Elias's rule for anything appearing) and each got a
+// low-contrast error on the fade's first frames (white at ~10 % over #121212); one was blocked on
+// it. Every faded-in text tripped it.
+fn contrast_opacity(ctx: &EvalCtx, l: &Layer) -> f64 {
+    let now = ctx.opacity(l);
+    let Some(p) = l.transform().and_then(|tr| tr.get("opacity")).filter(|p| p.keys.len() >= 2) else {
+        return now;
+    };
+    let fd = ctx.comp.frame_rate.frame_duration();
+    let at = |t: Tick| EvalCtx { time: t, ..*ctx }.opacity(l);
+    if [ctx.time - fd, ctx.time + fd].into_iter().all(|t| (at(t) - now).abs() <= 1e-6) {
+        return now;
+    }
+    p.keys.iter().map(|k| at(l.comp_time(k.time))).fold(now, f64::max)
+}
+
 /// Every enabled rule (except `off-beat` and `off-accent`, which look at the whole span) at the context time.
 /// `backdrop` (the comp without text) is needed for `low-contrast`.
 pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Vec<Finding> {
@@ -666,7 +686,7 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
                 && let Some(c) = t.color
                 && let Some(bg) = bd.mean(p.bounds)
             {
-                let a = (c[3] * ctx.opacity(l)).clamp(0.0, 1.0);
+                let a = (c[3] * contrast_opacity(ctx, l)).clamp(0.0, 1.0);
                 if a > EPS {
                     let fg = [0, 1, 2].map(|k| bg[k] * (1.0 - a) + c[k] * a);
                     let ratio = contrast_ratio(fg, bg);

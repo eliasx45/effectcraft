@@ -103,6 +103,25 @@ fn low_contrast_measures_what_is_under_the_text() {
 }
 
 #[test]
+fn low_contrast_reads_a_fade_at_its_landed_opacity() {
+    let mut s = comp(2.0);
+    solid(&mut s, "Black", 320, 180, "#121212");
+    let t = text(&mut s, "Tag", "Hello", 30.0, "#ffffff", [160.0, 90.0]);
+    // An 8-frame fade-in from 0.2 s (25 fps), then held: mid-fade is meant to be faint.
+    for (time, v) in [(0.2, 0.0), (0.52, 100.0)] {
+        s.execute("prop.addKey", json!({"layer": t, "path": "transform/opacity", "value": v, "time": time})).unwrap();
+    }
+    for time in [0.24, 0.32, 0.44, 1.0] {
+        assert!(of(&lint(&mut s, json!({"time": time, "rules": ["low-contrast"]})), "low-contrast").is_empty(), "{time}");
+    }
+    // A fade that lands faint (to 10 %) and holds is still too faint, during and after it.
+    s.execute("prop.addKey", json!({"layer": t, "path": "transform/opacity", "value": 10.0, "time": 0.52})).unwrap();
+    for time in [0.32, 1.0] {
+        assert_eq!(one(&lint(&mut s, json!({"time": time, "rules": ["low-contrast"]})), "low-contrast")["severity"], "error", "{time}");
+    }
+}
+
+#[test]
 fn safe_areas_and_cut_off() {
     let mut s = comp(2.0);
     // A title 20 px from the left edge: on screen but outside title safe (32 px per side).
