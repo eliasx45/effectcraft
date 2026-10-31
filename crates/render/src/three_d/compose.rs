@@ -597,7 +597,7 @@ fn collapsed_items<'a>(
                 && !l.switches.adjustment
                 && (!any_solo || l.switches.solo)
                 && (r.opts.guides || !l.switches.guide)
-                && r.opts.context_keeps(nctx.comp_id, l)
+                && r.opts.context_keeps(nctx.comp_id, &nctx.comp.layers, l)
         })
         .collect();
     let mut items = Vec::new();

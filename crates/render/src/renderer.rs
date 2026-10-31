@@ -65,15 +65,18 @@ impl ContextChain {
         Some(c)
     }
 
-    /// Whether layer `l` of comp `comp` is drawn: in a comp on the chain, a precomp layer only
-    /// when it is the chain's own.
-    pub fn keeps(&self, comp: ItemId, l: &Layer) -> bool {
+    /// Whether layer `l` of comp `comp` (whose layers, top first, are `layers`) is drawn: in a
+    /// comp on the chain, a precomp layer above the chain's own is left out (another scene);
+    /// the ones under it stay (a BG precomp the scene sits on: 26-10 S1 01 on Gradient Ribbons).
+    pub fn keeps(&self, comp: ItemId, layers: &effectcraft_project::Layers, l: &Layer) -> bool {
         if !matches!(l.source, effectcraft_project::LayerSource::Comp { .. }) {
             return true;
         }
-        match self.hops[..self.len as usize].iter().find(|(c, _)| *c == comp.0) {
-            Some((_, layer)) => *layer == l.id.0,
-            None => true,
+        let Some(&(_, own)) = self.hops[..self.len as usize].iter().find(|(c, _)| *c == comp.0) else { return true };
+        let at = |id: u64| layers.iter().position(|x| x.id.0 == id);
+        match (at(own), at(l.id.0)) {
+            (Some(o), Some(i)) => i >= o,
+            _ => l.id.0 == own,
         }
     }
 }
@@ -111,8 +114,8 @@ impl RenderOpts {
     }
 
     /// Whether layer `l` of comp `comp` is drawn in context (always without a context).
-    pub fn context_keeps(&self, comp: ItemId, l: &Layer) -> bool {
-        self.context.is_none_or(|c| c.keeps(comp, l))
+    pub fn context_keeps(&self, comp: ItemId, layers: &effectcraft_project::Layers, l: &Layer) -> bool {
+        self.context.is_none_or(|c| c.keeps(comp, layers, l))
     }
 }
 

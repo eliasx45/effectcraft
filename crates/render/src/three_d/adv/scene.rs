@@ -980,7 +980,7 @@ fn collapsed_layer<'a>(r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &Layer, item:
             || matches!(l.source, LayerSource::Camera)
             || (any_solo && !l.switches.solo)
             || (!r.opts.guides && l.switches.guide)
-            || !r.opts.context_keeps(nctx.comp_id, l)
+            || !r.opts.context_keeps(nctx.comp_id, &nctx.comp.layers, l)
         {
             continue;
         }

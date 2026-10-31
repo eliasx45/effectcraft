@@ -248,7 +248,7 @@ impl<'a> Renderer<'a> {
                     && !l.environment
                     && (!any_solo || l.switches.solo)
                     && (self.opts.guides || !l.switches.guide)
-                    && self.opts.context_keeps(ctx.comp_id, l)
+                    && self.opts.context_keeps(ctx.comp_id, &comp.layers, l)
             })
             .collect()
     }
