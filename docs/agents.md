@@ -186,6 +186,10 @@ command, also inside `engine.batch`) keep you from stepping on each other:
 - `client`: a name for you (`"client": "my-agent"`). Your undo steps are tagged with it, and
   `edit.undo {"client": "my-agent"}` only undoes your own last step: if the last change was the user's
   or another client's, it refuses and changes nothing. `edit.history.list` shows each state's `client`.
+  `edit.undoChanges {"revisions": [n]}` takes back the steps at those `history.feed` revisions, any age
+  and whoever made them, each as a new "Undo <label>" step (taking back "Undo X" is "Redo X"); it
+  refuses, changing nothing, when a later change touched the same layer, comp settings, layer order or
+  project settings.
 
 To notice edits made by someone else without polling, the control channel's `events.subscribe`
 sends `project.changed` and `selection.changed` lines with the new `revision`

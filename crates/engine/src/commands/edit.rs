@@ -76,6 +76,23 @@ fn undo(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
 }
+/// `edit.undoChanges {revisions}`: take back the steps at these feed revisions, whatever came after
+/// them (crate::selective_undo::undo_changes).
+fn undo_changes(s: &mut Session, p: &Value) -> Result<Value> {
+    let Some(list) = p.get("revisions").and_then(Value::as_array) else {
+        return Err(super::bad("edit.undoChanges", "revisions: [n] (history.feed revisions) is required"));
+    };
+    let mut revisions = Vec::with_capacity(list.len().min(256));
+    for v in list.iter().take(256) {
+        revisions.push(v.as_u64().ok_or_else(|| super::bad("edit.undoChanges", format!("{v} is not a revision number")))?);
+    }
+    let done = crate::selective_undo::undo_changes(s, &revisions)?;
+    Ok(json!({
+        "undone": done.iter().map(|d| json!({"revision": d.revision, "label": d.label, "step": d.step})).collect::<Vec<_>>(),
+        "revision": s.revision,
+    }))
+}
+
 fn redo(s: &mut Session, _: &Value) -> Result<Value> {
     let label = s.history.redo.last().map(|u| u.0.clone());
     s.redo();
@@ -867,6 +884,15 @@ pub fn specs() -> Vec<CommandSpec> {
             undo
         ),
         cmd!("edit.redo", "Redo", ["Edit"], Some("Cmd+Shift+Z"), "{}", can_redo, redo),
+        cmd!(
+            "edit.undoChanges",
+            "Undo Changes",
+            [],
+            None,
+            "{revisions: [n] (history.feed revisions)} → {undone: [{revision, label, step}], revision} — takes back exactly what those steps changed, whoever made them and whatever came after, newest first, each as a new step \"Undo <label>\" (taking back \"Undo X\" is \"Redo X\"); all or nothing: refused, changing nothing, when a later change touched the same layer, comp settings, layer order or project settings",
+            super::always,
+            undo_changes
+        ),
         cmd!("edit.cut", "Cut", ["Edit"], Some("Cmd+X"), "{layers?} (keyframes, effects or shape items when they are selected)", layers_or_keys, cut),
         cmd!("edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{layers?} (keyframes, effects or shape items when they are selected)", layers_or_keys, copy),
         cmd!(

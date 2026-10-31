@@ -454,3 +454,40 @@ fn evicted_branch_parent_does_not_discard_other_reachable_branches() {
     assert_eq!(history.branch_states(), 1);
     assert_eq!(history.tree(&current).len(), 2);
 }
+
+/// Ghostex's per-change Undo: `edit.undoChanges` takes back one older step while later steps on
+/// other layers stand, brings it back with "Redo", and refuses (changing nothing) when a later
+/// step touched the same layer.
+#[test]
+fn undo_changes_takes_back_an_older_step_alone() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "U", "width": 64, "height": 64})).unwrap();
+    solid(&mut s, "A");
+    solid(&mut s, "B");
+    let sorted = |s: &Session| {
+        let mut n = names(s);
+        n.sort();
+        n
+    };
+    s.execute_checked("layer.rename", json!({"layer": "A", "name": "A1", "client": "claude"})).unwrap();
+    let older = s.revision;
+    s.execute_checked("layer.rename", json!({"layer": "B", "name": "B1", "client": "claude"})).unwrap();
+    let r = s.execute_checked("edit.undoChanges", json!({"revisions": [older], "client": "claude"})).unwrap();
+    assert_eq!(sorted(&s), ["A", "B1"], "{r}");
+    let label = r["undone"][0]["label"].as_str().unwrap().to_string();
+    assert!(label.starts_with("Undo "), "{r}");
+    let step = r["undone"][0]["step"].as_u64().unwrap();
+    // Redo: taking back the undo brings the change back.
+    let r = s.execute_checked("edit.undoChanges", json!({"revisions": [step], "client": "claude"})).unwrap();
+    assert_eq!(sorted(&s), ["A1", "B1"], "{r}");
+    assert_eq!(r["undone"][0]["label"].as_str().unwrap(), label.replacen("Undo ", "Redo ", 1));
+    // A later change to the same layer: refused, nothing changes.
+    s.execute_checked("layer.rename", json!({"layer": "A1", "name": "A2"})).unwrap();
+    let revision = s.revision;
+    let e = s.execute_checked("edit.undoChanges", json!({"revisions": [older]})).unwrap_err().to_string();
+    assert!(e.contains("can't be undone alone"), "{e}");
+    assert_eq!(sorted(&s), ["A2", "B1"]);
+    assert_eq!(s.revision, revision);
+    // An unknown revision is an error, not a guess.
+    assert!(s.execute_checked("edit.undoChanges", json!({"revisions": [999_999]})).is_err());
+}

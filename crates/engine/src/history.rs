@@ -39,6 +39,9 @@ pub struct History {
     /// States own-step undo skips (`crate::selective_undo`): steps it undid and the steps that
     /// undid them, so the next ⌘Z goes on to the step before instead of bringing one back.
     pub(crate) settled: HashMap<usize, Weak<Project>>,
+    /// For a state an own-step undo or `edit.undoChanges` made: the state of the original step it
+    /// took back (by state address), so taking that undo back again unsettles the original.
+    pub(crate) origins: HashMap<usize, (Weak<Project>, Weak<Project>)>,
 }
 
 /// A line of states that grows from another state of the history.
@@ -314,6 +317,24 @@ impl History {
     pub fn settle(&mut self, state: &Arc<Project>) {
         self.settled.retain(|_, w| w.strong_count() > 0);
         self.settled.insert(key(state), Arc::downgrade(state));
+    }
+
+    /// Own-step undo may take back the step that made `state` again (it was brought back).
+    pub fn unsettle(&mut self, state: &Arc<Project>) {
+        self.settled.remove(&key(state));
+    }
+
+    /// The original step's state that the undo which made `state` took back.
+    pub fn origin(&self, state: &Arc<Project>) -> Option<Arc<Project>> {
+        let (me, origin) = self.origins.get(&key(state))?;
+        me.upgrade()?;
+        origin.upgrade()
+    }
+
+    /// Remember that the undo which made `state` took back the step that made `origin`.
+    pub fn set_origin(&mut self, state: &Arc<Project>, origin: &Arc<Project>) {
+        self.origins.retain(|_, (me, o)| me.strong_count() > 0 && o.strong_count() > 0);
+        self.origins.insert(key(state), (Arc::downgrade(state), Arc::downgrade(origin)));
     }
 
     /// Number of states on branches (not on the working line).

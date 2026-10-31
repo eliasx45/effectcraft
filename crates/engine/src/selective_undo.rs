@@ -141,19 +141,10 @@ fn who(author: Option<&str>) -> String {
     author.map_or_else(|| "the user".to_string(), |a| format!("client `{a}`"))
 }
 
-/// Undo `me`'s (`None`: the user's) latest step on the undo line as a new step. `Ok(None)`: the
-/// line holds no step of theirs. Refused, changing nothing, when someone changed the same item
-/// (or the project settings) after it.
-pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
-    let n = s.history.undo.len();
-    // State k + 1 is what step k made (the last one made the current state).
-    let made: Vec<Arc<Project>> = (0..n).map(|k| s.history.undo.get(k + 1).map_or_else(|| s.project.clone(), |(_, p)| p.clone())).collect();
-    let Some(k) = (0..n).rev().find(|&k| made.get(k).is_some_and(|after| s.history.author(after) == me && !s.history.settled(after))) else { return Ok(None) };
-    let (Some((label, before)), Some(after)) = (s.history.undo.get(k).cloned(), made.get(k).cloned()) else { return Ok(None) };
-    let cur = s.project.clone();
-    let later: Vec<(String, Option<String>)> =
-        (k + 1..n).filter_map(|j| Some((s.history.undo.get(j)?.0.clone(), s.history.author(made.get(j)?).map(str::to_string)))).collect();
-
+/// What taking back the step `before` → `after` makes of the current project `cur`: each item the
+/// step changed as it was before it, where nobody changed it since (a composition layer by
+/// layer). `Err`: what both the step and someone after it changed.
+fn revert(before: &Project, after: &Project, cur: &Project) -> std::result::Result<Project, Vec<String>> {
     let mut items = cur.items.clone();
     let mut clashes: Vec<String> = vec![];
     let ids: BTreeSet<ItemId> = before.items.keys().chain(after.items.keys()).copied().collect();
@@ -180,29 +171,51 @@ pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
             None => items.remove(&id),
         };
     }
-    let settings = rest(&before) != rest(&after);
-    if settings && rest(&cur) != rest(&after) {
+    let settings = rest(before) != rest(after);
+    if settings && rest(cur) != rest(after) {
         clashes.push("the project settings".into());
     }
     if !clashes.is_empty() {
-        let (last, last_by) = later.last().cloned().unwrap_or_default();
-        let mine = me.map_or_else(|| "you".to_string(), |m| format!("`{m}`"));
-        let others: BTreeSet<String> = later.iter().filter(|(_, a)| a.as_deref() != me).map(|(_, a)| who(a.as_deref())).collect();
-        let way = if me.is_some() {
-            "undo it there, or undo without `client`"
-        } else {
-            "use the History panel, or edit.undo {any: true} to undo the last change whoever made it"
-        };
-        return Err(EngineError::Other(format!(
-            "the last change (“{last}”) was made by {}, not {mine}, and {} changed {} since your “{label}”; {way}",
-            who(last_by.as_deref()),
-            others.into_iter().collect::<Vec<_>>().join(", "),
-            clashes.join(", "),
-        )));
+        return Err(clashes);
     }
-    let mut next = if settings { (*before).clone() } else { (*cur).clone() };
+    let mut next = if settings { before.clone() } else { cur.clone() };
     next.items = items;
     next.next_id = cur.next_id;
+    Ok(next)
+}
+
+/// Undo `me`'s (`None`: the user's) latest step on the undo line as a new step. `Ok(None)`: the
+/// line holds no step of theirs. Refused, changing nothing, when someone changed the same item
+/// (or the project settings) after it.
+pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
+    let n = s.history.undo.len();
+    // State k + 1 is what step k made (the last one made the current state).
+    let made: Vec<Arc<Project>> = (0..n).map(|k| s.history.undo.get(k + 1).map_or_else(|| s.project.clone(), |(_, p)| p.clone())).collect();
+    let Some(k) = (0..n).rev().find(|&k| made.get(k).is_some_and(|after| s.history.author(after) == me && !s.history.settled(after))) else { return Ok(None) };
+    let (Some((label, before)), Some(after)) = (s.history.undo.get(k).cloned(), made.get(k).cloned()) else { return Ok(None) };
+    let cur = s.project.clone();
+    let later: Vec<(String, Option<String>)> =
+        (k + 1..n).filter_map(|j| Some((s.history.undo.get(j)?.0.clone(), s.history.author(made.get(j)?).map(str::to_string)))).collect();
+
+    let next = match revert(&before, &after, &cur) {
+        Ok(next) => next,
+        Err(clashes) => {
+            let (last, last_by) = later.last().cloned().unwrap_or_default();
+            let mine = me.map_or_else(|| "you".to_string(), |m| format!("`{m}`"));
+            let others: BTreeSet<String> = later.iter().filter(|(_, a)| a.as_deref() != me).map(|(_, a)| who(a.as_deref())).collect();
+            let way = if me.is_some() {
+                "undo it there, or undo without `client`"
+            } else {
+                "use the History panel, or edit.undo {any: true} to undo the last change whoever made it"
+            };
+            return Err(EngineError::Other(format!(
+                "the last change (“{last}”) was made by {}, not {mine}, and {} changed {} since your “{label}”; {way}",
+                who(last_by.as_deref()),
+                others.into_iter().collect::<Vec<_>>().join(", "),
+                clashes.join(", "),
+            )));
+        }
+    };
     s.edit(&format!("Undo {label}"), None, move |p, _| {
         *p = next;
         Ok(())
@@ -211,8 +224,90 @@ pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
     s.history.settle(&after);
     let undo_step = s.project.clone();
     s.history.settle(&undo_step);
+    s.history.set_origin(&undo_step, &after);
     s.sanitize_state();
     Ok(Some(label))
+}
+
+/// One step [`undo_changes`] took back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Undone {
+    /// The feed revision of the step taken back.
+    pub revision: u64,
+    /// The new step's label: "Undo <label>", or "Redo <label>" for a step that was "Undo <label>".
+    pub label: String,
+    /// The revision the new step made.
+    pub step: u64,
+}
+
+/// Take back the steps the feed lists at `revisions`, any age and whoever made them, newest first,
+/// each as a new step ("Undo <its label>"; taking back "Undo X" is "Redo X"). All or nothing: when
+/// a later change touched the same item (a layer, a comp's settings, the layer order, the project
+/// settings) as one of them, nothing changes and the error names what.
+///
+/// CDXC:Editing 2026-10-31 WHY: Ghostex's per-change Undo (EDITING's edit list) could only plain-undo
+/// a chat's newest step; an older change went to that chat's Claude as a prompt, which was slow and
+/// not deterministic. This reverts exactly what the step changed, with the same per-layer check
+/// `undo_own` uses, so a clash is refused instead of guessed at; the steps it takes back (and the
+/// new ones) are settled like `undo_own`'s, and taking back such an undo unsettles the original, so
+/// a client's `edit.undo` afterwards still picks its right step.
+pub fn undo_changes(s: &mut Session, revisions: &[u64]) -> Result<Vec<Undone>> {
+    let mut wanted: Vec<u64> = revisions.to_vec();
+    wanted.sort_unstable_by(|a, b| b.cmp(a));
+    wanted.dedup();
+    if wanted.is_empty() {
+        return Err(EngineError::Other("no revisions given".into()));
+    }
+    let mut steps: Vec<(u64, String, Arc<Project>, Arc<Project>)> = vec![];
+    for &revision in &wanted {
+        let Some(entry) = s.feed.since(revision.saturating_sub(1)).find(|e| e.revision == revision) else {
+            return Err(EngineError::Other(format!(
+                "revision {revision} isn't in the change feed (it keeps the last changes of this project only); undo it in the History panel"
+            )));
+        };
+        let (before, after) = entry.projects();
+        steps.push((revision, entry.label.clone(), before.clone(), after.clone()));
+    }
+    // A dry run first: nothing changes unless every step can be taken back.
+    let mut cur = s.project.clone();
+    let mut refused: Vec<String> = vec![];
+    for (_, label, before, after) in &steps {
+        match revert(before, after, &cur) {
+            Ok(next) => cur = Arc::new(next),
+            Err(clashes) => refused.push(format!("“{label}” ({})", clashes.join(", "))),
+        }
+    }
+    if !refused.is_empty() {
+        return Err(EngineError::Other(format!(
+            "a later change touched the same thing, so it can't be undone alone: {}; undo the later change first",
+            refused.join("; ")
+        )));
+    }
+    let mut done = vec![];
+    for (revision, label, before, after) in steps {
+        let next = revert(&before, &after, &s.project).map_err(|clashes| EngineError::Other(format!("“{label}” changed meanwhile: {}", clashes.join(", "))))?;
+        let (new_label, redo) = match label.strip_prefix("Undo ") {
+            Some(was) => (format!("Redo {was}"), true),
+            None => (format!("Undo {}", label.strip_prefix("Redo ").unwrap_or(&label)), false),
+        };
+        s.edit(&new_label, None, move |p, _| {
+            *p = next;
+            Ok(())
+        })?;
+        let origin = s.history.origin(&after).unwrap_or_else(|| after.clone());
+        if redo {
+            s.history.unsettle(&origin);
+        } else {
+            s.history.settle(&origin);
+        }
+        s.history.settle(&after);
+        let made = s.project.clone();
+        s.history.settle(&made);
+        s.history.set_origin(&made, &origin);
+        done.push(Undone { revision, label: new_label, step: s.revision });
+    }
+    s.sanitize_state();
+    Ok(done)
 }
 
 /// The step `edit.undo` would undo for `me` (`None`: the user): the last step when `me` made it,
