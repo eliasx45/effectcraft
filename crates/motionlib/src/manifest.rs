@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::hash::{is_hash, sha256_hex};
 
@@ -65,6 +66,31 @@ pub struct CardFile {
     /// The path the project names (on the publishing Mac); replaced by the cached copy on apply.
     pub path: String,
     pub blob: BlobRef,
+}
+
+/// A variant of a card (Elias's refined copy of the entry, saved with `library.saveVariant` into
+/// the library folder's `variants.json`), uploaded with its card.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CardVariant {
+    pub id: String,
+    pub name: String,
+    /// `layers` (layers to add to a comp) or `comp` (a precomp to nest).
+    pub kind: String,
+    /// The comp in its project holding the layers or the whole variant.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub comp: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
+    /// Its situation card, as `variants.json` keeps it.
+    #[serde(skip_serializing_if = "Value::is_null")]
+    pub card: Value,
+    /// The variant's `.ecproj`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<BlobRef>,
+    /// Footage its project uses that is uploaded with it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<CardFile>,
 }
 
 /// Footage a card's project uses that was not uploaded (video, or over the size limit): the
@@ -190,6 +216,9 @@ pub struct Card {
     pub files: Vec<CardFile>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub placeholders: Vec<Placeholder>,
+    /// The entry's variants (`variants.json` beside `library.json`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<CardVariant>,
     /// Listed with its thumbnail only: applied in After Effects on the Mac that keeps the library.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub on_mac: bool,

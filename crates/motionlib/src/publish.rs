@@ -5,6 +5,9 @@
 //! Big footage stays home: video (unless `include_video`) and files over `max_file_bytes` become
 //! [`Placeholder`]s; the card's project still names them, so applying it imports them as missing
 //! footage to relink.
+//!
+//! An entry's variants (`variants.json` beside `library.json`) go up with its card, each with its
+//! project and footage, so a changed or new variant changes the card.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -14,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::hash::sha256_hex;
-use crate::manifest::{BlobRef, Card, CardFile, Collection, Crop, HEAD_KEY, Head, Manifest, Placeholder, decode_blob, encode_blob};
+use crate::manifest::{BlobRef, Card, CardFile, CardVariant, Collection, Crop, HEAD_KEY, Head, Manifest, Placeholder, decode_blob, encode_blob};
 use crate::remote::{Remote, get_blocking};
 
 /// Ticks per second (`effectcraft_time::Tick`), to report placeholder durations in seconds.
@@ -22,6 +25,8 @@ const TICKS_PER_SECOND: f64 = 254_016_000_000.0;
 const TIMEOUT: Duration = Duration::from_secs(120);
 /// The hash cache next to `library.json` (path, size and mtime → SHA-256).
 const HASH_CACHE: &str = ".motion-library-hashes.json";
+/// The variants sidecar next to `library.json` (written by EffectCraft's `library.saveVariant`).
+const VARIANTS: &str = "variants.json";
 
 /// Video containers left out unless `include_video`.
 const VIDEO: &[&str] = &["mov", "mp4", "m4v", "mkv", "webm", "avi", "mxf", "mpg", "mpeg", "mts", "m2ts", "wmv", "flv", "3gp", "ogv", "r3d", "braw"];
@@ -107,6 +112,56 @@ pub struct Report {
     pub skipped: Vec<Skipped>,
     /// Entries that could not be published (missing project, unreadable file), with why.
     pub errors: Vec<String>,
+    /// How each of [`Options::ids`] differs from its published copy.
+    pub diffs: Vec<CardDiff>,
+}
+
+/// How a card differs from its published copy.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CardDiff {
+    pub id: String,
+    /// `new` (not in the catalog, or listed there with its thumbnail only), `changed` or `same`.
+    pub status: String,
+    /// The card fields that differ (`name`, `description`, `tags`, `project`, `variants`…).
+    pub fields: Vec<String>,
+    /// Variant names added, changed and removed.
+    #[serde(rename = "variantsAdded")]
+    pub variants_added: Vec<String>,
+    #[serde(rename = "variantsChanged")]
+    pub variants_changed: Vec<String>,
+    #[serde(rename = "variantsRemoved")]
+    pub variants_removed: Vec<String>,
+}
+
+/// How `now` differs from `old`, the card in the published catalog.
+pub fn diff_card(old: Option<&Card>, now: &Card) -> CardDiff {
+    let mut d = CardDiff { id: now.id.clone(), ..CardDiff::default() };
+    let old = old.filter(|o| !o.on_mac || now.on_mac);
+    let empty = Card::default();
+    let fields = |c: &Card| match serde_json::to_value(c) {
+        Ok(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let (a, b) = (fields(old.unwrap_or(&empty)), fields(now));
+    let mut keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    keys.remove(&"rev".to_string());
+    d.fields = keys.into_iter().filter(|k| a.get(*k) != b.get(*k)).cloned().collect();
+    let was: Vec<&CardVariant> = old.map(|o| o.variants.iter().collect()).unwrap_or_default();
+    for v in &now.variants {
+        match was.iter().find(|w| w.id == v.id) {
+            None => d.variants_added.push(v.name.clone()),
+            Some(w) if *w != v => d.variants_changed.push(v.name.clone()),
+            Some(_) => {}
+        }
+    }
+    d.variants_removed = was.iter().filter(|w| !now.variants.iter().any(|v| v.id == w.id)).map(|w| w.name.clone()).collect();
+    d.status = match old {
+        None => "new",
+        Some(_) if d.fields.is_empty() => "same",
+        Some(_) => "changed",
+    }
+    .into();
+    d
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -337,6 +392,8 @@ struct Builder<'a> {
     hasher: Hasher,
     uploads: BTreeMap<String, Upload>,
     report: Report,
+    /// `variants.json`'s variants by their entry's id.
+    variants: BTreeMap<String, Vec<Value>>,
 }
 
 impl Builder<'_> {
@@ -449,42 +506,91 @@ impl Builder<'_> {
         let project_name = file_name(&file);
         card.project = Some(self.blob(&project_path, &project_name).ok_or_else(|| format!("{name}: cannot read {}", project_path.display()))?);
         if kind == "comp" {
-            let bytes = std::fs::read(&project_path).map_err(|e| format!("{name}: {}: {e}", project_path.display()))?;
-            let v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("{name}: {}: {e}", project_path.display()))?;
-            for (path, footage) in project_paths(&v) {
-                let stat = Hasher::stat(Path::new(&path));
-                let size = stat.map_or(0, |s| s.0);
-                let reason = match stat {
-                    None => Some("missing"),
-                    Some(_) if !self.opts.include_video && VIDEO.contains(&ext(&path).as_str()) => Some("video"),
-                    Some((size, _)) if size > max => Some("too large"),
-                    Some(_) => None,
-                };
-                let blob = if reason.is_none() { self.blob(Path::new(&path), &file_name(&path)) } else { None };
-                match blob {
-                    Some(blob) => card.files.push(CardFile { path, blob }),
-                    None => {
-                        let reason = reason.unwrap_or("unreadable").to_string();
-                        let num = |k: &str| footage.and_then(|f| f.get(k)).and_then(Value::as_f64);
-                        let rate = footage.and_then(|f| f.get("frame_rate")).and_then(|r| Some(r.get("num")?.as_f64()? / r.get("den")?.as_f64()?.max(1.0)));
-                        self.report.skipped.push(Skipped { card: name.clone(), path: path.clone(), size, reason: reason.clone() });
-                        card.placeholders.push(Placeholder {
-                            name: file_name(&path),
-                            path,
-                            size,
-                            reason,
-                            width: num("width").map(|w| w as u32).filter(|w| *w > 1),
-                            height: num("height").map(|h| h as u32).filter(|h| *h > 1),
-                            duration: num("duration").map(|d| d / TICKS_PER_SECOND),
-                            fps: rate.filter(|r| r.is_finite() && *r > 0.0),
-                        });
-                    }
-                }
+            (card.files, card.placeholders) = self.footage(&project_path, &name, max)?;
+        }
+        // A broken variant is reported and left out; the card itself still goes up.
+        for v in self.variants.get(&id).cloned().unwrap_or_default() {
+            match self.variant(&v, &name, max) {
+                Ok(v) => card.variants.push(v),
+                Err(e) => self.report.errors.push(e),
             }
         }
         card.rev = card.compute_rev();
         Ok(card)
     }
+
+    /// The footage a comp project uses: uploaded files, and placeholders for what stays home.
+    fn footage(&mut self, project_path: &Path, name: &str, max: u64) -> Result<(Vec<CardFile>, Vec<Placeholder>), String> {
+        let bytes = std::fs::read(project_path).map_err(|e| format!("{name}: {}: {e}", project_path.display()))?;
+        let v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("{name}: {}: {e}", project_path.display()))?;
+        let (mut files, mut placeholders) = (Vec::new(), Vec::new());
+        for (path, footage) in project_paths(&v) {
+            let stat = Hasher::stat(Path::new(&path));
+            let size = stat.map_or(0, |s| s.0);
+            let reason = match stat {
+                None => Some("missing"),
+                Some(_) if !self.opts.include_video && VIDEO.contains(&ext(&path).as_str()) => Some("video"),
+                Some((size, _)) if size > max => Some("too large"),
+                Some(_) => None,
+            };
+            let blob = if reason.is_none() { self.blob(Path::new(&path), &file_name(&path)) } else { None };
+            match blob {
+                Some(blob) => files.push(CardFile { path, blob }),
+                None => {
+                    let reason = reason.unwrap_or("unreadable").to_string();
+                    let num = |k: &str| footage.and_then(|f| f.get(k)).and_then(Value::as_f64);
+                    let rate = footage.and_then(|f| f.get("frame_rate")).and_then(|r| Some(r.get("num")?.as_f64()? / r.get("den")?.as_f64()?.max(1.0)));
+                    self.report.skipped.push(Skipped { card: name.to_string(), path: path.clone(), size, reason: reason.clone() });
+                    placeholders.push(Placeholder {
+                        name: file_name(&path),
+                        path,
+                        size,
+                        reason,
+                        width: num("width").map(|w| w as u32).filter(|w| *w > 1),
+                        height: num("height").map(|h| h as u32).filter(|h| *h > 1),
+                        duration: num("duration").map(|d| d / TICKS_PER_SECOND),
+                        fps: rate.filter(|r| r.is_finite() && *r > 0.0),
+                    });
+                }
+            }
+        }
+        Ok((files, placeholders))
+    }
+
+    /// One of `variants.json`'s variants of the card `name`: its project and footage.
+    fn variant(&mut self, v: &Value, name: &str, max: u64) -> Result<CardVariant, String> {
+        let file = text(v, "file");
+        let vname = text(v, "name");
+        let path = self.resolve(&file);
+        let project = self.blob(&path, &file_name(&file)).ok_or_else(|| format!("{name}: variant “{vname}”: cannot read {}", path.display()))?;
+        let (files, _) = self.footage(&path, &format!("{name} · {vname}"), max)?;
+        Ok(CardVariant {
+            id: text(v, "id"),
+            name: vname,
+            kind: text(v, "kind"),
+            comp: text(v, "comp"),
+            layers: strings(v, "layers"),
+            card: v.get("card").cloned().unwrap_or(Value::Null),
+            project: Some(project),
+            files,
+        })
+    }
+}
+
+/// The variants in `variants.json` beside the library's `library.json`, by their entry's id (none
+/// when there is no sidecar; a damaged one is an error rather than a catalog without them).
+fn read_variants(library: &Path) -> Result<BTreeMap<String, Vec<Value>>, String> {
+    let path = library.join(VARIANTS);
+    let Ok(bytes) = std::fs::read(&path) else { return Ok(BTreeMap::new()) };
+    let side: Value = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut by_parent: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for v in side.get("variants").and_then(Value::as_array).into_iter().flatten() {
+        let parent = text(v, "parent");
+        if !parent.is_empty() && !text(v, "id").is_empty() && !text(v, "file").is_empty() {
+            by_parent.entry(parent).or_default().push(v.clone());
+        }
+    }
+    Ok(by_parent)
 }
 
 /// The catalog published at `remote` now (head and manifest), if any.
@@ -540,7 +646,13 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
         if opts.catalog_all { format!(", {} listed only", mac_entries.len()) } else { String::new() }
     ));
 
-    let mut b = Builder { opts, hasher: Hasher::open(&opts.library), uploads: BTreeMap::new(), report: Report { dry_run: opts.dry_run, ..Report::default() } };
+    let mut b = Builder {
+        opts,
+        hasher: Hasher::open(&opts.library),
+        uploads: BTreeMap::new(),
+        report: Report { dry_run: opts.dry_run, ..Report::default() },
+        variants: read_variants(&opts.library)?,
+    };
     let mut cards = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         if i % 50 == 0 && i > 0 {
@@ -572,6 +684,8 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
     report.unchanged = previous.is_some() && prev_cards == now_cards && same_folders && !opts.force;
     let version = if report.unchanged { prev_version } else { prev_version + 1 };
     report.version = version;
+    report.diffs =
+        opts.ids.iter().filter_map(|id| cards.iter().find(|c| c.id == *id)).map(|c| diff_card(previous.as_ref().and_then(|(_, m)| m.card(&c.id)), c)).collect();
     let mut manifest = Manifest::new(&lib_name, folders, cards, version);
     manifest.collections = collections;
     if let Some((_, m)) = &previous {
@@ -587,7 +701,14 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
         .map(|(h, m)| {
             m.cards
                 .iter()
-                .flat_map(|c| c.thumbnail.iter().chain(c.preview.iter()).chain(c.project.iter()).chain(c.files.iter().map(|f| &f.blob)))
+                .flat_map(|c| {
+                    c.thumbnail
+                        .iter()
+                        .chain(c.preview.iter())
+                        .chain(c.project.iter())
+                        .chain(c.files.iter().map(|f| &f.blob))
+                        .chain(c.variants.iter().flat_map(|v| v.project.iter().chain(v.files.iter().map(|f| &f.blob))))
+                })
                 .chain(m.collections.iter().filter_map(|c| c.icon.as_ref()))
                 .map(BlobRef::remote_key)
                 .chain(std::iter::once(h.manifest.remote_key()))
@@ -672,7 +793,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("icon.png"), b"png").unwrap();
         let opts = Options::new(&dir, vec!["Devin Jatho".into(), "SceneYard".into()]);
-        let mut b = Builder { opts: &opts, hasher: Hasher::open(&dir), uploads: BTreeMap::new(), report: Report::default() };
+        let mut b = Builder { opts: &opts, hasher: Hasher::open(&dir), uploads: BTreeMap::new(), report: Report::default(), variants: BTreeMap::new() };
         let index = json!({"collections": {
             "order": {"Devin Jatho": 2, "Devin Jatho/Screen Setups": 0, "Devin Jatho/Basics": 1, "Tapa": 0},
             "icons": {"Devin Jatho": "icon.png", "SceneYard": "missing.png"},
@@ -691,5 +812,53 @@ mod tests {
         assert_eq!(got[5].group, "Stock");
         assert_eq!(b.uploads.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn variants_go_up_with_their_card_and_text_edits_show_in_the_diff() {
+        let root = std::env::temp_dir().join(format!("ml-variants-{}", std::process::id()));
+        let (lib, bucket) = (root.join("lib"), root.join("bucket"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(lib.join("variants/a")).unwrap();
+        std::fs::write(lib.join("a.png"), b"png").unwrap();
+        std::fs::write(lib.join("variants/a/v1.ecproj"), b"{}").unwrap();
+        let index =
+            |desc: &str| json!({"entries": [{"id": "a", "name": "A", "category": "F", "kind": "footage", "file": "a.png", "description": desc}]}).to_string();
+        std::fs::write(lib.join("library.json"), index("one")).unwrap();
+        let variant = |id: &str| json!({"id": id, "parent": "a", "name": format!("A {id}"), "file": format!("variants/a/{id}.ecproj"), "kind": "comp", "comp": "C", "card": {"word": "go"}});
+        std::fs::write(lib.join("variants.json"), json!({"format": "effectcraft-library-variants", "version": 1, "variants": [variant("v1")]}).to_string())
+            .unwrap();
+        let remote = crate::DirRemote::new(&bucket);
+        let mut opts = Options::new(&lib, vec!["F".into()]);
+        opts.ids = vec!["a".into()];
+        let first = publish(&remote, &opts, &mut |_| {}).unwrap();
+        assert_eq!(first.diffs[0].status, "new");
+        assert_eq!(first.diffs[0].variants_added, ["A v1"]);
+        let (_, m) = current(&remote).unwrap().unwrap();
+        let card = m.card("a").unwrap();
+        assert_eq!(card.variants.len(), 1);
+        assert!(card.variants[0].project.is_some());
+        assert_eq!(card.variants[0].card["word"], "go");
+
+        // A text-only edit: nothing to upload, but the card changed.
+        std::fs::write(lib.join("library.json"), index("two")).unwrap();
+        opts.dry_run = true;
+        let dry = publish(&remote, &opts, &mut |_| {}).unwrap();
+        assert_eq!(dry.uploads, 0);
+        assert_eq!(dry.diffs[0].status, "changed");
+        assert_eq!(dry.diffs[0].fields, ["description"]);
+
+        // A new variant: its project is the upload.
+        std::fs::write(lib.join("variants/a/v2.ecproj"), b"{\"v\": 2}").unwrap();
+        std::fs::write(
+            lib.join("variants.json"),
+            json!({"format": "effectcraft-library-variants", "version": 1, "variants": [variant("v1"), variant("v2")]}).to_string(),
+        )
+        .unwrap();
+        let dry = publish(&remote, &opts, &mut |_| {}).unwrap();
+        assert_eq!(dry.uploads, 1);
+        assert_eq!(dry.diffs[0].variants_added, ["A v2"]);
+        assert!(dry.diffs[0].fields.contains(&"variants".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

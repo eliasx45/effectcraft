@@ -417,48 +417,76 @@ fn save_card(s: &mut Session, p: &Value) -> Result<Value> {
     let confirm = b_p(p, "confirm").unwrap_or(false);
     let ask = f_p(p, "askAboveMB").filter(|m| m.is_finite() && *m >= 0.0).unwrap_or(ASK_ABOVE_MB);
     let name = e.name.clone();
+    let quiet = b_p(p, "quiet").unwrap_or(false);
     s.spawn_task("librarySave", format!("Saving “{name}” to the library"), b_p(p, "wait").unwrap_or(false), move |ctl| {
-        ctl.message("working out what to upload");
-        let mut plan = opts.clone();
-        plan.dry_run = true;
-        let r = effectcraft_motionlib::publish::publish(remote.as_ref(), &plan, &mut |line| ctl.message(line))?;
-        let mb = r.upload_bytes as f64 / 1e6;
-        // What stays home (video, too large), for this card.
-        let skipped: Vec<Value> = r
-            .skipped
-            .iter()
-            .filter(|k| k.card == name)
-            .map(|k| json!({"file": k.path.rsplit('/').next().unwrap_or(&k.path), "size": k.size, "reason": k.reason}))
-            .collect();
-        let skipped_text = if skipped.is_empty() {
-            String::new()
-        } else {
-            let names: Vec<String> =
-                skipped.iter().take(3).map(|k| format!("{} ({})", k["file"].as_str().unwrap_or(""), k["reason"].as_str().unwrap_or(""))).collect();
-            format!("; left at home: {}{}", names.join(", "), if skipped.len() > 3 { format!(" and {} more", skipped.len() - 3) } else { String::new() })
-        };
-        let base = json!({"id": id, "name": name, "uploadMB": (mb * 10.0).round() / 10.0, "uploads": r.uploads, "skipped": skipped});
-        if dry || (mb > ask && !confirm) {
-            let mut out = base;
-            out["dryRun"] = json!(dry);
-            out["needsConfirm"] = json!(!dry);
-            out["toast"] = json!(if dry {
-                format!("Saving “{name}” would upload {mb:.1} MB{skipped_text}")
+        let work = || -> std::result::Result<Value, String> {
+            ctl.message("working out what to upload");
+            let mut plan = opts.clone();
+            plan.dry_run = true;
+            let r = effectcraft_motionlib::publish::publish(remote.as_ref(), &plan, &mut |line| ctl.message(line))?;
+            let mb = r.upload_bytes as f64 / 1e6;
+            // What stays home (video, too large), for this card.
+            let skipped: Vec<Value> = r
+                .skipped
+                .iter()
+                .filter(|k| k.card == name)
+                .map(|k| json!({"file": k.path.rsplit('/').next().unwrap_or(&k.path), "size": k.size, "reason": k.reason}))
+                .collect();
+            let skipped_text = if skipped.is_empty() {
+                String::new()
             } else {
-                format!("“{name}” is {mb:.1} MB to upload: confirm to save it{skipped_text}")
+                let names: Vec<String> =
+                    skipped.iter().take(3).map(|k| format!("{} ({})", k["file"].as_str().unwrap_or(""), k["reason"].as_str().unwrap_or(""))).collect();
+                format!("; left at home: {}{}", names.join(", "), if skipped.len() > 3 { format!(" and {} more", skipped.len() - 3) } else { String::new() })
+            };
+            // How the card differs from its cloud copy: text alone uploads no file, a variant adds one.
+            let diff = r.diffs.iter().find(|d| d.id == id);
+            let base = json!({
+                "id": id,
+                "name": name,
+                "uploadMB": (mb * 10.0).round() / 10.0,
+                "uploads": r.uploads,
+                "skipped": skipped,
+                "cloud": diff.map_or("new", |d| d.status.as_str()),
+                "changed": diff.is_none_or(|d| d.status != "same"),
+                "fields": diff.map(|d| d.fields.clone()).unwrap_or_default(),
+                "variantsAdded": diff.map(|d| d.variants_added.clone()).unwrap_or_default(),
+                "variantsChanged": diff.map(|d| d.variants_changed.clone()).unwrap_or_default(),
+                "variantsRemoved": diff.map(|d| d.variants_removed.clone()).unwrap_or_default(),
             });
-            return Ok(Box::new(move |_: &mut Session| Ok(out)) as super::super::jobs::Apply);
-        }
-        ctl.message(format!("uploading {mb:.1} MB"));
-        let done = effectcraft_motionlib::publish::publish(remote.as_ref(), &opts, &mut |line| ctl.message(line))?;
-        // This session sees the saved card right away.
-        if let Some(c) = &client {
-            c.refresh_blocking(std::time::Duration::from_secs(60));
-            c.adopt_update();
-        }
-        let mut out = base;
-        out["version"] = json!(done.version);
-        out["toast"] = json!(format!("Saved “{name}” to the library ({mb:.1} MB uploaded, version {}){skipped_text}", done.version));
+            if dry || (mb > ask && !confirm) {
+                let mut out = base;
+                out["dryRun"] = json!(dry);
+                out["needsConfirm"] = json!(!dry);
+                out["toast"] = json!(if dry {
+                    format!("Saving “{name}” would upload {mb:.1} MB{skipped_text}")
+                } else {
+                    format!("“{name}” is {mb:.1} MB to upload: confirm to save it{skipped_text}")
+                });
+                return Ok(out);
+            }
+            ctl.message(format!("uploading {mb:.1} MB"));
+            let done = effectcraft_motionlib::publish::publish(remote.as_ref(), &opts, &mut |line| ctl.message(line))?;
+            // This session sees the saved card right away.
+            if let Some(c) = &client {
+                c.refresh_blocking(std::time::Duration::from_secs(60));
+                c.adopt_update();
+            }
+            let mut out = base;
+            out["version"] = json!(done.version);
+            out["toast"] = json!(format!("Saved “{name}” to the library ({mb:.1} MB uploaded, version {}){skipped_text}", done.version));
+            Ok(out)
+        };
+        let out = match work() {
+            Ok(mut out) if quiet => {
+                out["quiet"] = json!(true);
+                out
+            }
+            Ok(out) => out,
+            // A quiet check fails quietly too: the caller reads `error`.
+            Err(e) if quiet => json!({"id": id, "error": e, "quiet": true}),
+            Err(e) => return Err(e),
+        };
         Ok(Box::new(move |_: &mut Session| Ok(out)) as super::super::jobs::Apply)
     })
 }
@@ -549,7 +577,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 "Save Card to Motion Library",
                 [],
                 None,
-                "{id (a card in this Mac's library folder), confirm? (upload even above askAboveMB), askAboveMB? (default 50), dryRun?, wait?, maxPreviewMB? (default 2), folderMaxMB? (default {\"SceneYard\": 20})} — desktop, in the background: uploads the card's files (video and big files stay home) and a new catalog version; it stays saved in later publishes → {job}; the job's result: {id, name, uploadMB, uploads, skipped: [{file, size, reason}], needsConfirm?, version?}",
+                "{id (a card in this Mac's library folder), confirm? (upload even above askAboveMB), askAboveMB? (default 50), dryRun?, quiet? (no toast when it ends; a failure is the result's `error`: a background check), wait?, maxPreviewMB? (default 2), folderMaxMB? (default {\"SceneYard\": 20})} — desktop, in the background: uploads the card's files and its variants (variants.json; video and big files stay home) and a new catalog version; it stays saved in later publishes → {job}; the job's result: {id, name, uploadMB, uploads, skipped: [{file, size, reason}], cloud: new|changed|same, changed, fields (the card fields that differ from the cloud copy: name, description, tags, project, variants…), variantsAdded, variantsChanged, variantsRemoved (names), needsConfirm?, version?, error? (quiet only)}",
                 always,
                 save_card
             )
