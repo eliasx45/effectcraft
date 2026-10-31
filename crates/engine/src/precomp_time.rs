@@ -74,3 +74,27 @@ pub fn chains(project: &Project, outer: ItemId, inner: ItemId) -> Vec<Vec<(ItemI
     }
     out
 }
+
+/// Where `comp` sits in the video: the comp named MAIN (else the comp `outer`) and the first
+/// chain of precomp layers down to `comp` whose time can be mapped, preferring layers that are
+/// switched on. `None` for MAIN itself, or a comp MAIN doesn't use. The in-context view (FigCraft
+/// cards, the viewer) shows `comp` through it.
+pub fn in_main(project: &Project, comp: ItemId, outer: Option<ItemId>) -> Option<(ItemId, Vec<Hop>)> {
+    let main = outer.or_else(|| project.items.values().find(|i| i.name == "MAIN" && i.as_comp().is_some()).map(|i| i.id))?;
+    if main == comp {
+        return None;
+    }
+    let mapped = |path: &Vec<(ItemId, LayerId)>| -> Option<(bool, Vec<Hop>)> {
+        let mut on = true;
+        let mut hops = Vec::with_capacity(path.len());
+        for (c, l) in path {
+            let layer = project.comp(*c)?.layer(*l)?;
+            on &= layer.switches.video;
+            hops.push(hop(*c, layer).ok()?);
+        }
+        Some((on, hops))
+    };
+    let mut found: Vec<(bool, Vec<Hop>)> = chains(project, main, comp).iter().filter_map(mapped).collect();
+    found.sort_by_key(|(on, _)| !on);
+    found.into_iter().next().map(|(_, hops)| (main, hops))
+}

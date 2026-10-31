@@ -165,6 +165,8 @@ pub struct FramesParams {
     pub frames: Vec<i64>,
     pub max_side: u32,
     pub quality: u8,
+    /// In context: the comp's frames as they sit in MAIN (its footage and voice under it).
+    pub context: bool,
 }
 
 /// `figcraft.audio`'s params.
@@ -174,6 +176,8 @@ pub struct AudioParams {
     pub start: f64,
     pub end: f64,
     pub rate: u32,
+    /// In context: MAIN's audio where the comp sits in it.
+    pub context: bool,
 }
 
 fn comp_param(p: &Value) -> Result<Value, String> {
@@ -218,7 +222,8 @@ pub fn parse_frames(p: &Value) -> Result<FramesParams, String> {
     }
     let max_side = clamped(p, "maxSide", 32, 1920, None)? as u32;
     let quality = clamped(p, "quality", 30, 95, Some(80))? as u8;
-    Ok(FramesParams { comp, frames, max_side, quality })
+    let context = p.get("context").and_then(Value::as_bool).unwrap_or(false);
+    Ok(FramesParams { comp, frames, max_side, quality, context })
 }
 
 pub fn parse_audio(p: &Value) -> Result<AudioParams, String> {
@@ -232,7 +237,8 @@ pub fn parse_audio(p: &Value) -> Result<AudioParams, String> {
         return Err(format!("at most {MAX_AUDIO_SECONDS} s of audio per request"));
     }
     let rate = clamped(p, "rate", 8000, 96000, Some(48000))? as u32;
-    Ok(AudioParams { comp, start, end, rate })
+    let context = p.get("context").and_then(Value::as_bool).unwrap_or(false);
+    Ok(AudioParams { comp, start, end, rate, context })
 }
 
 // ---------------------------------------------------------------- control methods
@@ -278,6 +284,11 @@ enum Slot {
 fn frames(app: &mut EffectcraftApp, p: &Value, reply: &std::sync::mpsc::Sender<Value>) -> Result<Option<Value>, String> {
     let req = parse_frames(p)?;
     let id = resolve(app, &req.comp)?;
+    if req.context
+        && let Some(found) = effectcraft_engine::precomp_time::in_main(&app.session.project, id, None)
+    {
+        return frames_in_context(app, &req, id, found, reply);
+    }
     let comp = app.session.project.comp_arc(id).ok_or("no such composition")?;
     let (rate, duration) = (comp.frame_rate, comp.duration);
     // The viewer's series of the comp at each scale (and the scale it shows now).
@@ -315,6 +326,63 @@ fn frames(app: &mut EffectcraftApp, p: &Value, reply: &std::sync::mpsc::Sender<V
     let busy = if ready && !cfg!(target_arch = "wasm32") { Busy::take() } else { None };
     let Some(busy) = busy else {
         // Nothing to encode, or every encoder is busy (FigCraft asks again for pending frames).
+        let list: Vec<Value> = slots
+            .iter()
+            .map(|(f, s)| if matches!(s, Slot::Failed) { json!({"frame": f, "failed": true}) } else { json!({"frame": f, "pending": true}) })
+            .collect();
+        return Ok(Some(with_frames(head, list)));
+    };
+    spawn_frames(app.gpu.clone(), slots, req.max_side, req.quality, head, reply.clone(), busy)
+}
+
+/// `figcraft.frames` with `context`: each frame of scene `id` is MAIN's frame at that moment,
+/// drawn with only the scene's own chain of precomp layers (its footage, BG and presenter under
+/// it; the other scenes left out). Nothing is added to the project.
+/// CDXC:FigCraftLink 2026-10-31 DECISION: Elias (reviewing scene cards): "for me to review an
+/// animation, I need the footage and the audio inside my precomp" without a copy in each
+/// precomp. In context renders MAIN through the chain instead, so a recut shows at once.
+fn frames_in_context(
+    app: &mut EffectcraftApp,
+    req: &FramesParams,
+    id: effectcraft_engine::project::ItemId,
+    (main_id, hops): (effectcraft_engine::project::ItemId, Vec<effectcraft_engine::precomp_time::Hop>),
+    reply: &std::sync::mpsc::Sender<Value>,
+) -> Result<Option<Value>, String> {
+    use effectcraft_engine::precomp_time::up;
+    let scene = app.session.project.comp_arc(id).ok_or("no such composition")?;
+    let main = app.session.project.comp_arc(main_id).ok_or("no MAIN composition")?;
+    let chain = effectcraft_engine::render::ContextChain::new(&hops.iter().map(|h| (h.comp, h.layer)).collect::<Vec<_>>())
+        .ok_or("the comp is nested too deep in MAIN")?;
+    let want = request_scale(main.width.max(main.height).max(1), req.max_side);
+    let mut opts = app.frame_opts(main_id, scale_factor(want));
+    opts.context = Some(chain);
+    let series = FrameKey { opts: crate::frames::opts_hash(&opts), ..app.frame_series(main_id, scale_factor(want)) };
+    let (rate, main_rate) = (scene.frame_rate, main.frame_rate);
+    let mut src = None;
+    let mut slots = Vec::with_capacity(req.frames.len());
+    for f in req.frames.iter().copied().filter(|f| *f >= 0 && rate.tick_of(*f) < scene.duration) {
+        let at = up(&hops, rate.tick_of(f).seconds());
+        let mf = (at * main_rate.as_f64()).round() as i64;
+        if mf < 0 || main_rate.tick_of(mf) >= main.duration {
+            slots.push((f, Slot::Failed));
+            continue;
+        }
+        let key = FrameKey { frame: mf, ..series };
+        if let Some(img) = app.frames.get(&key) {
+            slots.push((f, Slot::Ready(img)));
+        } else if app.frames.failed(&key) {
+            slots.push((f, Slot::Failed));
+        } else {
+            let src = src.get_or_insert_with(|| app.render_source());
+            app.frames.request(src, key, main_id, main_rate.tick_of(mf), opts);
+            slots.push((f, Slot::Pending));
+        }
+    }
+    let head =
+        json!({"comp": id.0, "context": main_id.0, "revision": app.session.revision, "width": main.width, "height": main.height, "frameRate": rate.as_f64()});
+    let ready = slots.iter().any(|(_, s)| matches!(s, Slot::Ready(_)));
+    let busy = if ready && !cfg!(target_arch = "wasm32") { Busy::take() } else { None };
+    let Some(busy) = busy else {
         let list: Vec<Value> = slots
             .iter()
             .map(|(f, s)| if matches!(s, Slot::Failed) { json!({"frame": f, "failed": true}) } else { json!({"frame": f, "pending": true}) })
@@ -401,13 +469,23 @@ fn jpeg_of(img: &FrameImage, gpu: Option<&effectcraft_gpu::Gpu>, max_side: u32, 
 
 /// `figcraft.audio`: `{silent: true}` at once for a comp without audio, else mixed on a thread.
 fn audio(app: &mut EffectcraftApp, p: &Value, reply: &std::sync::mpsc::Sender<Value>) -> Result<Option<Value>, String> {
-    let req = parse_audio(p)?;
-    let id = resolve(app, &req.comp)?;
+    let mut req = parse_audio(p)?;
+    let mut id = resolve(app, &req.comp)?;
+    // In context: MAIN's mix (his voice) over the same moment; the reply keeps the comp's times.
+    let mut shift = 0.0;
+    if req.context
+        && let Some((main, hops)) = effectcraft_engine::precomp_time::in_main(&app.session.project, id, None)
+    {
+        let start = effectcraft_engine::precomp_time::up(&hops, req.start);
+        let end = start + (req.end - req.start) / effectcraft_engine::precomp_time::scale(&hops);
+        shift = start - req.start;
+        (id, req.start, req.end) = (main, start.max(0.0), end);
+    }
     let src = app.render_source();
     if !effectcraft_engine::render::audio::comp_has_audio(&src.project, id) {
         return Ok(Some(json!({"silent": true})));
     }
-    spawn_audio(src, id, req, reply.clone())
+    spawn_audio(src, id, req, shift, reply.clone())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -415,6 +493,7 @@ fn spawn_audio(
     src: crate::frames::RenderSource,
     id: effectcraft_engine::project::ItemId,
     req: AudioParams,
+    shift: f64,
     reply: std::sync::mpsc::Sender<Value>,
 ) -> Result<Option<Value>, String> {
     let busy = Busy::take().ok_or("busy encoding other requests: ask again")?;
@@ -431,7 +510,7 @@ fn spawn_audio(
                 mix_pcm(mix, Tick::from_seconds_f64(start), frames, rate).map(|pcm| crate::control::base64(&wav_pcm16(&pcm, rate, 2)))
             }));
             let v = match mixed {
-                Ok(Some(wav)) => json!({"ok": true, "result": {"rate": rate, "channels": 2, "start": start, "end": end, "wav": wav}}),
+                Ok(Some(wav)) => json!({"ok": true, "result": {"rate": rate, "channels": 2, "start": start - shift, "end": end - shift, "wav": wav}}),
                 Ok(None) => json!({"ok": true, "result": {"silent": true}}),
                 Err(_) => json!({"ok": false, "error": "figcraft.audio: mixing failed"}),
             };
@@ -446,6 +525,7 @@ fn spawn_audio(
     _: crate::frames::RenderSource,
     _: effectcraft_engine::project::ItemId,
     _: AudioParams,
+    _: f64,
     _: std::sync::mpsc::Sender<Value>,
 ) -> Result<Option<Value>, String> {
     Err("the FigCraft link runs in the desktop app".into())

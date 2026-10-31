@@ -292,6 +292,8 @@ impl<'a> Cx<'a> {
             draft_shadows: true,
             sharp: false,
             proxy: s.proxy_use,
+            // Exports are never in context.
+            context: None,
         };
         let mut r = Renderer::new(&self.project, self.job.source(), opts);
         r.expr = self.job.expr;

@@ -1701,6 +1701,7 @@ impl EffectcraftApp {
             draft_shadows: self.session.prefs.three_d.realtime_shadows,
             sharp: false,
             proxy: Default::default(),
+            context: None,
         }
     }
 

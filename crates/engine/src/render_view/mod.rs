@@ -53,6 +53,10 @@ pub struct ViewRequest {
     /// `[x, y, w, h]` in comp pixels, whole pixels, inside the frame.
     pub region: Option<[f64; 4]>,
     pub overlays: Overlays,
+    /// In context: a scene comp as it sits in MAIN (MAIN's frame at that moment, with only the
+    /// scene's own chain of precomp layers: the presenter and BG under it, other scenes left out).
+    /// A comp MAIN doesn't use renders as it is.
+    pub context: bool,
 }
 
 /// A rendered view: straight 8-bit RGBA plus a JSON description.
@@ -161,7 +165,14 @@ pub fn request(s: &Session, p: &Value, cmd: &str) -> Result<ViewRequest> {
     };
     let region = present(p, "region").map(|v| region_p(v, fw, fh, cmd)).transpose()?;
     let overlays = Overlays::parse(present(p, "overlays")).map_err(|m| bad(cmd, m))?;
-    Ok(ViewRequest { target, layer, time, max_side, transparent, region, overlays })
+    let context = match present(p, "context") {
+        None => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad(cmd, "`context` must be true or false"))?,
+    };
+    if context && (layer.is_some() || region.is_some()) {
+        return Err(bad(cmd, "`context` renders the whole frame of the comp: leave out `layer` and `region`"));
+    }
+    Ok(ViewRequest { target, layer, time, max_side, transparent, region, overlays, context })
 }
 
 /// `region: [x, y, w, h]` (comp pixels) → whole pixels clipped to the `fw` × `fh` frame.
@@ -218,11 +229,22 @@ fn item_project(s: &Session, item: ItemId, rate: FrameRate) -> Result<(Project, 
 }
 
 /// Render `cid` of `project` with the session's hosts at `scale`, optionally just `roi`.
-fn render_image(s: &Session, project: &Project, cid: ItemId, t: Tick, scale: f64, roi: Option<[f64; 4]>, guides: bool) -> effectcraft_raster::Image {
+#[allow(clippy::too_many_arguments)]
+fn render_image(
+    s: &Session,
+    project: &Project,
+    cid: ItemId,
+    t: Tick,
+    scale: f64,
+    roi: Option<[f64; 4]>,
+    guides: bool,
+    context: Option<effectcraft_render::ContextChain>,
+) -> effectcraft_raster::Image {
     let opts = RenderOpts {
         scale,
         roi,
         guides,
+        context,
         backend: Backend::Auto,
         nested_switches: s.prefs.general.switches_affect_nested_comps,
         draft_shadows: s.prefs.three_d.realtime_shadows,
@@ -261,7 +283,18 @@ impl Session {
         let long = region[2].max(region[3]).max(1.0);
         let scale = if r.max_side == 0 { 1.0 } else { (r.max_side as f64 / long).min(1.0) };
         let roi = r.region.filter(|g| *g != full);
-        let img = render_image(self, &project, cid, r.time, scale, roi, guides);
+        // In context: MAIN's frame at the moment the scene shows, through the scene's chain.
+        let within = match (r.context, r.target, r.layer) {
+            (true, Target::Comp(scene), None) => crate::precomp_time::in_main(&project, scene, None).and_then(|(main, hops)| {
+                let chain = effectcraft_render::ContextChain::new(&hops.iter().map(|h| (h.comp, h.layer)).collect::<Vec<_>>())?;
+                Some((main, Tick::from_seconds_f64(crate::precomp_time::up(&hops, r.time.seconds())), chain))
+            }),
+            _ => None,
+        };
+        let img = match within {
+            Some((main, at, chain)) => render_image(self, &project, main, at, scale, None, guides, Some(chain)),
+            None => render_image(self, &project, cid, r.time, scale, roi, guides, None),
+        };
         let (w, h) = (img.width, img.height);
         let mut rgba = if r.transparent { img.to_rgba8() } else { img.to_rgba8_over(comp.background) };
         drop(img);
@@ -274,6 +307,9 @@ impl Session {
         info["width"] = json!(w);
         info["height"] = json!(h);
         info["scale"] = json!(scale);
+        if let Some((main, at, _)) = within {
+            info["context"] = json!({"comp": main.0, "time": at.seconds()});
+        }
         if let Some(l) = r.layer {
             info["layer"] = json!(l.0);
             let active = self.project.comp(cid).and_then(|c| c.layer(l)).map(|l| l.is_active_at(r.time));
@@ -284,7 +320,7 @@ impl Session {
         if let Some(g) = r.region {
             info["region"] = json!(g);
         }
-        if r.overlays.any() {
+        if r.overlays.any() && within.is_none() {
             let geo = match r.target {
                 Target::Comp(c) => overlay_layers(self, c, r.time, r.layer, &r.overlays),
                 Target::Item(_) => vec![],
@@ -397,7 +433,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "render.frame",
             "Render Frame",
-            "{comp?, item?, layer?, time? (s), frame?, max_side?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, base64?, wait? (false: a background task)}",
+            "{comp?, item?, layer?, time? (s), frame?, max_side?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], context? (true: a scene comp as it sits in MAIN, the presenter and BG under it, other scenes left out), path?, base64?, wait? (false: a background task)}",
             render_frame_cmd
         ),
         query!(

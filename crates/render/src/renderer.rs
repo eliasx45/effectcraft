@@ -36,13 +36,53 @@ pub struct RenderOpts {
     /// buffer is held within [`SHARP_MAX_PIXELS`] (drawn at a lower scale and magnified past it)
     /// and nested comps are drawn only where they show. Exports to a larger output leave it off.
     pub sharp: bool,
+    /// In context (viewer / FigCraft cards only): a scene comp shown where it sits in an outer
+    /// comp (MAIN). The outer comp renders with, in each comp on the chain, only the chain's own
+    /// precomp layer (the scene's footage, BG and presenter stay; the other scenes go).
+    pub context: Option<ContextChain>,
+}
+
+/// The precomp layers from an outer comp down to the scene shown in context (outermost first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ContextChain {
+    /// (comp, its precomp layer on the chain), `len` of them used.
+    pub hops: [(u64, u64); ContextChain::MAX],
+    pub len: u8,
+}
+
+impl ContextChain {
+    pub const MAX: usize = 8;
+
+    /// The chain of (comp, layer) hops; `None` when it is longer than [`Self::MAX`] or empty.
+    pub fn new(hops: &[(ItemId, LayerId)]) -> Option<ContextChain> {
+        if hops.is_empty() || hops.len() > Self::MAX {
+            return None;
+        }
+        let mut c = ContextChain { len: hops.len() as u8, ..Default::default() };
+        for (i, (comp, layer)) in hops.iter().enumerate() {
+            c.hops[i] = (comp.0, layer.0);
+        }
+        Some(c)
+    }
+
+    /// Whether layer `l` of comp `comp` is drawn: in a comp on the chain, a precomp layer only
+    /// when it is the chain's own.
+    pub fn keeps(&self, comp: ItemId, l: &Layer) -> bool {
+        if !matches!(l.source, effectcraft_project::LayerSource::Comp { .. }) {
+            return true;
+        }
+        match self.hops[..self.len as usize].iter().find(|(c, _)| *c == comp.0) {
+            Some((_, layer)) => *layer == l.id.0,
+            None => true,
+        }
+    }
 }
 
 /// The `Debug` text keys caches (viewer frames on disk, nested comps): `sharp` shows only when on,
 /// so every other render keeps the text, and the keys, it had before the field.
 impl std::fmt::Debug for RenderOpts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let RenderOpts { scale, motion_blur, guides, draft, view, backend, roi, proxy, nested_switches, draft_shadows, sharp } = self;
+        let RenderOpts { scale, motion_blur, guides, draft, view, backend, roi, proxy, nested_switches, draft_shadows, sharp, context } = self;
         let mut d = f.debug_struct("RenderOpts");
         d.field("scale", scale)
             .field("motion_blur", motion_blur)
@@ -57,6 +97,9 @@ impl std::fmt::Debug for RenderOpts {
         if *sharp {
             d.field("sharp", sharp);
         }
+        if let Some(c) = context {
+            d.field("context", &&c.hops[..c.len as usize]);
+        }
         d.finish()
     }
 }
@@ -65,6 +108,11 @@ impl RenderOpts {
     /// Whether 3D layers cast shadows in this render.
     pub fn shadows(&self) -> bool {
         !self.draft || self.draft_shadows
+    }
+
+    /// Whether layer `l` of comp `comp` is drawn in context (always without a context).
+    pub fn context_keeps(&self, comp: ItemId, l: &Layer) -> bool {
+        self.context.is_none_or(|c| c.keeps(comp, l))
     }
 }
 
@@ -119,6 +167,7 @@ impl Default for RenderOpts {
             draft_shadows: true,
             sharp: false,
             proxy: effectcraft_project::render_queue::ProxyUse::CurrentSettings,
+            context: None,
         }
     }
 }
