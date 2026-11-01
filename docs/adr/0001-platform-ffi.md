@@ -230,7 +230,7 @@ for CPU pixels:
   (so the media pool knows a stand-in and never reads its planes), and shared zero "ballast"
   planes (one virtual allocation per length) so its byte size is the picture's and FilmCraft's
   GOP cache bounds it as before. A picture lives while its stand-in does. Bounded by bytes
-  (8 GiB default, `resident::set_budget`); past it, or for 5 s after a hardware decode failed
+  (4 GiB default since the follow-up below, `resident::set_budget`); past it, or for 5 s after a hardware decode failed
   while pictures were held, or with `EFFECTCRAFT_RESIDENT_FRAMES=0`, decodes copy at once as
   before. Holding never blocks a decode (VideoToolbox gives each picture a new buffer).
 - `effectcraft_media::hw::ResidentHooks` (resolve, sweep, usage) is how the media pool, which
@@ -240,9 +240,10 @@ for CPU pixels:
   gained `gpu_yuv()`: a view without samples and a surface key (`yuv::View::surface`), which the
   GPU's native decode reads through the same importer as Fix 2; `yuv()` / `rows()` (CPU renders,
   CPU-only layer work, Save Frame, thumbnails, a GPU that can't read the surface) make the CPU
-  copy once, into recycled plane buffers (`media::recycle`), rounded to 8 bits on scoped threads
-  when the frame is kept at 8 bits. Pictures are bit-identical to the copy-at-decode path on both
-  the GPU (Fix 2's shader rounding) and the CPU (the same copy code). After a CPU copy of a
+  copy once, into recycled plane buffers (`media::recycle`), rounded to 8 bits on the calling
+  thread when the frame is kept at 8 bits (no rayon inside the once-only cell: a re-entrant
+  init). Pictures are bit-identical to the copy-at-decode path on both the GPU (Fix 2's shader
+  rounding) and the CPU (the same copy code). After a CPU copy of a
   movie's frame its next frames are copied at decode for 10 s, so footage the CPU reads anyway
   isn't held twice.
 - Memory: a cached frame counts its surface; a CPU copy made later counts too. `memory.stats`
@@ -264,3 +265,35 @@ for CPU pixels:
   affected by the overflow checks.
 - H.264 / HEVC keep copying at decode (Fix 2's surfaces): their decoders feed FilmCraft's GOP
   cache with reordering and replay, and their 8-bit NV12 copy is cheap.
+
+### Follow-up (2026-11-01, the owner's answers): GPU memory inside the budget; direct reads
+
+The owner kept the 8-bit cache holding full-depth surfaces and the copy at decode under pressure,
+and asked that no GPU memory sit outside the budget: macOS can't compress GPU memory and swaps it
+whole (on 30 Oct an embedded EffectCraft had 28 GB of GPU memory swapped out and renders waited
+77 of 88 ms).
+
+- **Spare pictures.** FilmCraft's GOP cache keeps the last 64 frames of each movie, so it kept
+  64 surfaces per open movie that no budget saw. A picture only a decoder's cache holds (no frame
+  of the media pool has it: *spare*) now counts in the media pool's share of the cache budget
+  (`ResidentHooks::spare`, in `Lru::held`) and goes first when the pool or the shared arbiter
+  needs room (`ResidentHooks::shed`, before any cached frame). Each decoder keeps at most
+  `resident::SPARE_PER_DECODER` (8) spare pictures, all decoders together at most an eighth of the
+  held-pictures budget; each decoder's newest stays (the pool is about to take it). The
+  decoder's cache still holds the stand-in of a picture that went: reading it decodes the frame
+  again on a source of its own, copied at decode (0.6–3.2 ms on the 352×198 test clip, including
+  the open), with the same pixels.
+- **Budget** for held pictures: 4 GiB by default (was 8).
+- **Direct reads (Fix 3c).** The native YUV decode reads imported surfaces directly
+  (`yuv_surface.wgsl`) instead of first splitting them into `R32Uint` planes (`surface.wgsl`)
+  that it then reads back. Both make each sample with the same functions
+  (`surface_samples.wgsl`) and decode with the same IEEE-exact arithmetic (`yuv_math.wgsl`), so
+  the pictures are identical: the platform tests compare direct, split and uploaded pictures
+  float for float on the ffmpeg fixtures and the owner's 1080p / 4K ProRes 4444+alpha and 4K 422
+  HQ clips. The split pass stays for a frame whose alpha the surface lacks, when the direct
+  pipeline can't be built, and with `EFFECTCRAFT_SURFACE_DIRECT=0`. Measured
+  (`resident_bench`, one kept frame decoded again and again, GPU wall time, load average ~115–160):
+  1080p 4444+alpha 2.25 → 2.07 ms (8 bits 1.97 → 1.79), 4K 4444+alpha 5.69 → 5.32 ms (5.62 →
+  5.05), 4K 422 HQ 7.79 → 7.60 ms (7.84 → 7.46); no transient split planes (133 MB a 4K
+  4444+alpha frame, 66 MB 4K 4:2:2). The preview read (decode + GPU) is dominated by the decode:
+  4K 4444+alpha 9.8 ms wall either way.

@@ -217,6 +217,12 @@ fn check(gpu: &effectcraft_gpu::Gpu, what: &str, footage: &Footage, eight: Eight
     let (_, b) = gpu.decode_yuv(rv, false, true).expect("reference uploaded");
     let b = b.expect("read back");
     assert_same(&a.expect("read back").data, &b.data, &format!("{what}: GPU picture"));
+    // read directly (Fix 3c) or split into planes first: the same picture, still no copy
+    effectcraft_gpu::surface::set_direct(false);
+    let split = gpu.decode_yuv(view, true, true);
+    effectcraft_gpu::surface::set_direct(true);
+    assert_same(&split.and_then(|(_, c)| c).expect("split").data, &b.data, &format!("{what}: split from the surface"));
+    assert_eq!(copies(&p), 0, "{what}: the split made no CPU copy either");
 
     // memory: the cache counts the surface, then the copy
     // (the pool's own frames: spare pictures of earlier pools' decoders count in its budget too)

@@ -60,9 +60,10 @@ impl Pipelines {
                 label: Some("native YUV"),
                 source: wgpu::ShaderSource::Wgsl(
                     format!(
-                        "{}\n{}\n{}\n{}",
+                        "{}\n{}\n{}\n{}\n{}",
                         include_str!("ieee_add.wgsl"),
                         include_str!("ieee_mul.wgsl"),
+                        include_str!("yuv_math.wgsl"),
                         include_str!("yuv.wgsl"),
                         include_str!("unpack.wgsl")
                     )
@@ -219,40 +220,8 @@ fn upload(g: &GpuContext, plane: Plane<'_>) -> Option<wgpu::Texture> {
     Some(texture)
 }
 
-pub(crate) fn decode(e: &mut Enc, view: View<'_>) -> Option<GpuImage> {
-    decode_from(e, view, true).map(|(image, _)| image)
-}
-
-/// [`decode`], reading the planes from the decoder's surface only when `surfaces`; also whether
-/// they came from it (no upload).
-pub(crate) fn decode_from(e: &mut Enc, view: View<'_>, surfaces: bool) -> Option<(GpuImage, bool)> {
-    let _profile = effectcraft_render::profile::span("yuv_upload");
-    let input_bytes = view.validate().ok()?;
-    let g = e.g;
-    let p = g.yuv.as_ref()?;
-    if !g.fits(view.width, view.height) {
-        return None;
-    }
-    // HWDEC2 / Fix 2: the hardware decoder's own surface when the platform can share it, else an
-    // upload.
-    let surface = if surfaces { crate::surface::planes(e, view) } else { None };
-    // Fix 3: a frame kept only as a surface has no samples to upload (the caller asks the frame
-    // for its CPU planes then)
-    if surface.is_none() && view.surface.is_some() {
-        return None;
-    }
-    let from_surface = surface.is_some();
-    let (yuv, surface_alpha) = match surface {
-        Some(s) => (s.yuv, s.alpha),
-        None => ([upload(g, view.planes[0])?, upload(g, view.planes[1])?, upload(g, view.planes[2])?], None),
-    };
-    let [y, u, v] = yuv;
-    let a = match (view.alpha, surface_alpha) {
-        (Some(_), Some(a)) => Some(a),
-        (Some(a), None) => Some(upload(g, a)?),
-        (None, _) => None,
-    };
-    let views = [&y, &u, &v, a.as_ref().unwrap_or(&y)].map(|t| t.create_view(&Default::default()));
+/// The decode's uniform (`yuv_math.wgsl`'s `Params`) for `view`.
+fn coefficients(g: &GpuContext, view: View<'_>) -> wgpu::Buffer {
     let mode = match view.alpha_mode {
         effectcraft_project::AlphaMode::Ignore => 0,
         effectcraft_project::AlphaMode::Straight => 1,
@@ -276,8 +245,63 @@ pub(crate) fn decode_from(e: &mut Enc, view: View<'_>, surfaces: bool) -> Option
     let mut bytes = Vec::with_capacity(64);
     bytes.extend_from_slice(bytemuck::cast_slice(&header));
     bytes.extend_from_slice(bytemuck::cast_slice(&values));
-    let uniform = buffer_init(&g.device, &g.queue, Some("YUV coefficients"), &bytes, wgpu::BufferUsages::UNIFORM);
+    buffer_init(&g.device, &g.queue, Some("YUV coefficients"), &bytes, wgpu::BufferUsages::UNIFORM)
+}
+
+pub(crate) fn decode(e: &mut Enc, view: View<'_>) -> Option<GpuImage> {
+    decode_from(e, view, true).map(|(image, _)| image)
+}
+
+/// [`decode`], reading the planes from the decoder's surface only when `surfaces`; also whether
+/// they came from it (no upload).
+pub(crate) fn decode_from(e: &mut Enc, view: View<'_>, surfaces: bool) -> Option<(GpuImage, bool)> {
+    let _profile = effectcraft_render::profile::span("yuv_upload");
+    let input_bytes = view.validate().ok()?;
+    let g = e.g;
+    let p = g.yuv.as_ref()?;
+    if !g.fits(view.width, view.height) {
+        return None;
+    }
+    // HWDEC2 / Fix 2: the hardware decoder's own surface when the platform can share it, else an
+    // upload.
+    let imported = if surfaces { crate::surface::import(e, view) } else { None };
+    // Fix 3: a frame kept only as a surface has no samples to upload (the caller asks the frame
+    // for its CPU planes then)
+    if imported.is_none() && view.surface.is_some() {
+        return None;
+    }
+    let uniform = coefficients(g, view);
     let out = e.scratch(view.width, view.height);
+    // Fix 3c: the decode reads the surface directly (no split planes written and read back), the
+    // same samples and arithmetic, so the same floats
+    let imported = match imported {
+        Some(imp) if imp.has_frame_alpha(view) => {
+            if crate::surface::direct(e, &imp, &uniform, &out.view) {
+                return Some((out, true));
+            }
+            Some(imp)
+        }
+        other => other,
+    };
+    let surface = match imported {
+        Some(imp) => crate::surface::split(e, imp),
+        None => None,
+    };
+    if surface.is_none() && view.surface.is_some() {
+        return None;
+    }
+    let from_surface = surface.is_some();
+    let (yuv, surface_alpha) = match surface {
+        Some(s) => (s.yuv, s.alpha),
+        None => ([upload(g, view.planes[0])?, upload(g, view.planes[1])?, upload(g, view.planes[2])?], None),
+    };
+    let [y, u, v] = yuv;
+    let a = match (view.alpha, surface_alpha) {
+        (Some(_), Some(a)) => Some(a),
+        (Some(a), None) => Some(upload(g, a)?),
+        (None, _) => None,
+    };
+    let views = [&y, &u, &v, a.as_ref().unwrap_or(&y)].map(|t| t.create_view(&Default::default()));
     let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("native YUV"),
         layout: &p.decode_layout,

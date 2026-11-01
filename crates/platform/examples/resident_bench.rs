@@ -3,7 +3,8 @@
 //! (decode-ahead off, so all the work is on the reading thread and the threads it starts):
 //! frames copied out of VideoToolbox at decode (before: the copy, at 8 bits also the CPU rounding,
 //! then the GPU reads Fix 2's kept surface) against frames left in the surface (now). Full depth
-//! and Decode Footage at 8 Bits, runs alternated. CPU time is the whole process's (`ps`), wall time
+//! and Decode Footage at 8 Bits, runs alternated; frames left in the surface read directly by the
+//! decode (Fix 3c) or split into planes first. CPU time is the whole process's (`ps`), wall time
 //! includes waiting for the GPU.
 //!
 //! `cargo run -p effectcraft-platform --example resident_bench -- <file.mov> [frames] [rounds]`
@@ -36,18 +37,21 @@ fn main() {
     let at = |i: u32| footage.frame_rate.tick_of(i64::from(i)) + Tick(footage.frame_rate.frame_duration().0 / 2);
     println!("{} {}x{} ({}), {n} frames a run, {rounds} rounds", path, footage.width, footage.height, footage.codec);
 
-    // (mode name, eight-bit, resident) -> (per-frame wall ms, per-frame CPU ms, frames from the surface)
+    // (mode name, eight-bit, resident, direct read) -> (per-frame wall ms, per-frame CPU ms, frames from the surface)
     let modes = [
-        ("full depth, copied at decode (before)", EightBit::Off, false),
-        ("full depth, kept on the GPU (now)", EightBit::Off, true),
-        ("8 bits, copied + rounded on the CPU (before)", EightBit::All, false),
-        ("8 bits, kept on the GPU (now)", EightBit::All, true),
+        ("full depth, copied at decode (before)", EightBit::Off, false, false),
+        ("full depth, kept on the GPU, split pass", EightBit::Off, true, false),
+        ("full depth, kept on the GPU, read directly", EightBit::Off, true, true),
+        ("8 bits, copied + rounded on the CPU (before)", EightBit::All, false, false),
+        ("8 bits, kept on the GPU, split pass", EightBit::All, true, false),
+        ("8 bits, kept on the GPU, read directly", EightBit::All, true, true),
     ];
     let mut wall: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
     let mut cpu: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
     let mut read: Vec<usize> = vec![0; modes.len()];
     for _ in 0..rounds {
-        for (m, (_, eight, resident)) in modes.iter().enumerate() {
+        for (m, (_, eight, resident, direct)) in modes.iter().enumerate() {
+            effectcraft_gpu::surface::set_direct(*direct);
             let pool = MediaPool::new();
             pool.set_hardware_decoding(true);
             pool.set_eight_bit(*eight);
@@ -69,6 +73,7 @@ fn main() {
             assert!(!*resident || st.copies == 0, "a GPU-only read made {} CPU copies", st.copies);
         }
     }
+    effectcraft_gpu::surface::set_direct(true);
     for (m, (name, ..)) in modes.iter().enumerate() {
         let w = &mut wall[m];
         let mean = w.iter().sum::<f64>() / w.len().max(1) as f64;
@@ -76,6 +81,35 @@ fn main() {
         let median = w.get(w.len() / 2).copied().unwrap_or(f64::NAN);
         let c = cpu[m].iter().sum::<f64>() / cpu[m].len().max(1) as f64;
         println!("{name:46} wall median {median:6.2} ms  mean {mean:6.2} ms   CPU {c:6.2} ms/frame   ({} of {} read from the surface)", read[m], w.len());
+    }
+
+    // The GPU decode alone (Fix 3c): one frame kept on the GPU, read from its surface again and
+    // again, directly or through the split pass (wall time, waiting for the GPU each time).
+    for eight in [EightBit::Off, EightBit::All] {
+        let pool = MediaPool::new();
+        pool.set_hardware_decoding(true);
+        pool.set_eight_bit(eight);
+        pool.set_read_ahead(false);
+        let px = pool.frame_pixels(ItemId(1), &footage, at(1)).expect("frame");
+        let Some(view) = px.gpu_yuv().filter(|v| v.surface.is_some()) else { continue };
+        let mut t: [Vec<f64>; 2] = Default::default();
+        for _ in 0..rounds.max(1) * 40 {
+            for (k, direct) in [false, true].into_iter().enumerate() {
+                effectcraft_gpu::surface::set_direct(direct);
+                let s = Instant::now();
+                let (from_surface, _) = gpu.decode_yuv(view, true, false).expect("GPU decode");
+                t[k].push(s.elapsed().as_secs_f64() * 1e3);
+                assert!(from_surface);
+            }
+        }
+        effectcraft_gpu::surface::set_direct(true);
+        for (k, name) in ["split pass", "read directly"].iter().enumerate() {
+            let v = &mut t[k];
+            v.sort_by(f64::total_cmp);
+            let median = v.get(v.len() / 2).copied().unwrap_or(f64::NAN);
+            let p10 = v.get(v.len() / 10).copied().unwrap_or(f64::NAN);
+            println!("GPU decode of a kept frame ({eight:?}), {name:14} median {median:6.2} ms  p10 {p10:6.2} ms  ({} runs)", v.len());
+        }
     }
 
     // CPU copies made on demand (a CPU reader of a frame kept on the GPU): into fresh pages (every

@@ -137,13 +137,22 @@ fn prores_pictures_read_from_the_decoder_surface_equal_the_uploaded_ones() {
             let v = view(&frame);
             assert_eq!(v.alpha.is_some(), four, "{name}: alpha plane");
             assert!(surfaces::kept_bytes() <= surfaces::budget(), "{name}: kept surfaces within the budget");
+            let direct = effectcraft_gpu::surface::direct_frames();
             let (from_surface, a) = gpu.decode_yuv(v, true, true).expect("decoded from the surface");
             let (uploaded, b) = gpu.decode_yuv(v, false, true).expect("decoded from uploaded planes");
             assert!(from_surface, "{name}: frame {i} read from the decoder surface");
+            assert!(effectcraft_gpu::surface::direct_frames() > direct, "{name}: frame {i}: the decode read the surface directly (Fix 3c)");
             assert!(!uploaded);
             let (a, b) = (a.expect("read back"), b.expect("read back"));
             assert_eq!((a.width, a.height), (w, h));
             assert_same(&a.data, &b.data, &format!("{name}: frame {i}"));
+            // the split pass (before Fix 3c, and the fallback) gives the same picture
+            effectcraft_gpu::surface::set_direct(false);
+            let split = gpu.decode_yuv(v, true, true);
+            effectcraft_gpu::surface::set_direct(true);
+            let (from_surface, c) = split.expect("decoded from split planes");
+            assert!(from_surface, "{name}: frame {i}: split from the surface");
+            assert_same(&c.expect("read back").data, &b.data, &format!("{name}: frame {i}, split"));
             if four && name.starts_with("prores_ks") {
                 assert!(a.data.iter().any(|p| p[3] < 1.0) && a.data.iter().any(|p| p[3] > 0.99), "{name}: frame {i}: the alpha ramp came through");
             }
@@ -154,7 +163,12 @@ fn prores_pictures_read_from_the_decoder_surface_equal_the_uploaded_ones() {
             let (from_surface, a8) = gpu.decode_yuv(e, true, true).expect("8-bit frame decoded from the surface");
             let (_, b8) = gpu.decode_yuv(e, false, true).expect("8-bit frame decoded from uploaded planes");
             assert!(from_surface, "{name}: frame {i}: the 8-bit frame read from the decoder surface");
-            assert_same(&a8.expect("read back").data, &b8.expect("read back").data, &format!("{name}: frame {i} at 8 bits"));
+            let b8 = b8.expect("read back");
+            assert_same(&a8.expect("read back").data, &b8.data, &format!("{name}: frame {i} at 8 bits"));
+            effectcraft_gpu::surface::set_direct(false);
+            let split = gpu.decode_yuv(e, true, true);
+            effectcraft_gpu::surface::set_direct(true);
+            assert_same(&split.and_then(|(_, c)| c).expect("8-bit frame split").data, &b8.data, &format!("{name}: frame {i} at 8 bits, split"));
             let (full_again, _) = gpu.decode_yuv(v, true, false).expect("full frame uploaded");
             assert!(!full_again, "{name}: the surface went to the 8-bit frame");
             imported += 1;

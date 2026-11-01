@@ -1,30 +1,10 @@
 // A decoder's surface (a Y plane, an interleaved CbCr plane and, for ProRes 4444, an alpha plane;
 // 8-bit, or 16-bit words holding the coded depth in their high bits) split into the integer planes
 // `yuv.wgsl`'s `decode` reads (surface.rs). Exactly the samples the platform decoder copies for the
-// CPU: luma / chroma either shifted down (H.264 / HEVC: the low bits are zero) or rounded to the
-// nearest code and clamped (ProRes: VideoToolbox keeps more precision than the coded depth);
-// alpha always shifted down (its low bits repeat the high ones).
-
-struct Split {
-    shift: u32,
-    width: u32,
-    height: u32,
-    // 1: luma / chroma round to nearest (and clamp) instead of shifting down
-    round: u32,
-    // the picture's origin in the surface (a multiple of the chroma subsampling)
-    x: u32,
-    y: u32,
-    // chroma plane size of the picture and its subsampling shifts
-    cw: u32,
-    ch: u32,
-    sx: u32,
-    sy: u32,
-    // 1: write the alpha plane
-    alpha: u32,
-    // 10 / 12: round the samples (at this depth) to 8 bits, as the media pool's `frame_to_8bit`
-    // does (limited-range Y'CbCr; alpha is full range); 0: keep them
-    to8: u32,
-}
+// CPU (`surface_samples.wgsl`): luma / chroma either shifted down (H.264 / HEVC: the low bits are
+// zero) or rounded to the nearest code and clamped (ProRes: VideoToolbox keeps more precision than
+// the coded depth); alpha always shifted down (its low bits repeat the high ones). Used when the
+// decode can't read the surface directly (`yuv_surface.wgsl`).
 
 @group(0) @binding(0) var<uniform> split_params: Split;
 @group(0) @binding(1) var split_luma: texture_2d<u32>;
@@ -34,37 +14,6 @@ struct Split {
 @group(0) @binding(5) var split_v: texture_storage_2d<r32uint, write>;
 @group(0) @binding(6) var split_alpha_in: texture_2d<u32>;
 @group(0) @binding(7) var split_a: texture_storage_2d<r32uint, write>;
-
-fn down(v: u32) -> u32 {
-    let s = split_params.shift;
-    if (split_params.round == 0u) {
-        return v >> s;
-    }
-    // ((v + half) >> s), at most the largest code of 16 - s bits (convert.rs round_down)
-    let half = (1u << s) >> 1u;
-    return min((v + half) >> s, 0xffffu >> s);
-}
-
-// a limited-range Y'CbCr sample at `to8` bits, rounded to 8
-fn eight(v: u32) -> u32 {
-    let b = split_params.to8;
-    if (b == 0u) {
-        return v;
-    }
-    let max = (1u << b) - 1u;
-    let s = b - 8u;
-    return min((min(v, max) + ((1u << s) >> 1u)) >> s, 255u);
-}
-
-// a full-range alpha sample at `to8` bits, scaled to 8
-fn eight_alpha(v: u32) -> u32 {
-    let b = split_params.to8;
-    if (b == 0u) {
-        return v;
-    }
-    let max = (1u << b) - 1u;
-    return min((min(v, max) * 255u + max / 2u) / max, 255u);
-}
 
 @compute @workgroup_size(16, 16)
 fn split(@builtin(global_invocation_id) id: vec3<u32>) {
