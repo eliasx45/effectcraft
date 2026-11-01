@@ -866,7 +866,8 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
         let _profile = effectcraft_render::profile::span("native_source_lookup");
         r.native_footage(ctx, layer)?
     };
-    let view = footage.pixels.yuv()?;
+    // (a frame kept only on the GPU, as its decoder's surface, stays there: Fix 3)
+    let view = footage.pixels.gpu_yuv()?;
     let metadata = crate::yuv::metadata(view);
     let cache = {
         let _profile = effectcraft_render::profile::span("native_content_key");
@@ -878,7 +879,13 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
         let _profile = effectcraft_render::profile::span("native_cached_place");
         return composite_resident(e, r, ctx, layer, canvas, opacity, image.into());
     }
-    let mut src = crate::yuv::decode(e, view)?;
+    let mut src = match crate::yuv::decode(e, view) {
+        Some(src) => src,
+        // the surface could not be read (another device, the importer declined): the frame
+        // makes its CPU planes now and they are uploaded
+        None if view.surface.is_some() => crate::yuv::decode(e, footage.pixels.yuv()?)?,
+        None => return None,
+    };
     if let Some((w, h)) = footage.preview {
         if !e.g.fits(w, h) {
             return None;

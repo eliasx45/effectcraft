@@ -77,10 +77,18 @@ pub struct View<'a> {
     pub coefficients: Coefficients,
     pub alpha_mode: AlphaMode,
     pub matte: [f32; 3],
+    /// Fix 3 (1 Nov 2026): the frame is kept only as a hardware decoder's surface, no CPU
+    /// samples yet. The planes give the layout (and the sample width, `U8` / `U16`) with empty
+    /// sample slices, and this is the key the GPU asks the platform's surface importer for (the
+    /// address of an allocation the frame keeps alive, never dereferenced). A GPU that can't
+    /// read the surface asks the frame for its CPU planes ([`crate::FramePixels::yuv`]), which
+    /// makes them then. `None`: the planes hold the samples.
+    pub surface: Option<usize>,
 }
 impl View<'_> {
     /// Validate untrusted metadata before any GPU allocation. Backends additionally
-    /// enforce their adapter dimensions and memory limits.
+    /// enforce their adapter dimensions and memory limits. The bytes of samples the planes
+    /// hold (0 for a [`View::surface`] frame, whose planes hold none).
     pub fn validate(self) -> Result<usize, &'static str> {
         if self.width == 0 || self.height == 0 {
             return Err("empty YUV frame");
@@ -108,6 +116,13 @@ impl View<'_> {
             let size = if i == 1 || i == 2 { chroma } else { [self.width, self.height] };
             if [plane.width, plane.height] != size || plane.samples.bytes_per_sample() != bytes {
                 return Err("inconsistent YUV plane layout");
+            }
+            if self.surface.is_some() {
+                // (no samples: the layout is all there is to check)
+                if plane.stride < plane.width as usize || !plane.samples.is_empty() {
+                    return Err("a surface frame's planes hold no samples");
+                }
+                continue;
             }
             let n = plane.required_bytes().ok_or("truncated YUV plane or invalid stride")?;
             total = total.checked_add(n).ok_or("YUV plane byte count overflow")?;
@@ -147,6 +162,7 @@ mod tests {
             coefficients: Coefficients { luma: [0.0, 1.0 / 255.0], chroma: [128.0, 1.0 / 255.0], rgb: [1.0; 4] },
             alpha_mode: effectcraft_project::AlphaMode::Straight,
             matte: [0.0; 3],
+            surface: None,
         };
         assert_eq!(view.validate(), Ok(12));
         assert!(View { bits: 7, ..view }.validate().is_err());
@@ -157,5 +173,12 @@ mod tests {
         assert!(View { alpha: Some(Plane { width: 1, ..plane }), ..view }.validate().is_err());
         assert!(View { alpha: Some(plane), matte: [f32::NAN; 3], ..view }.validate().is_err());
         assert!(View { coefficients: Coefficients { chroma: [0.0, f32::INFINITY], ..view.coefficients }, ..view }.validate().is_err());
+        // a surface frame: the layout without samples
+        let empty = Plane { samples: Samples::U8(&[]), ..plane };
+        let surface = View { planes: [empty; 3], surface: Some(0x1000), ..view };
+        assert_eq!(surface.validate(), Ok(0));
+        assert!(View { planes: [empty; 3], ..view }.validate().is_err(), "no samples and no surface");
+        assert!(View { planes: [plane, empty, empty], ..surface }.validate().is_err(), "a surface frame holds no samples");
+        assert!(View { planes: [Plane { width: 1, ..empty }, empty, empty], ..surface }.validate().is_err(), "its layout is still checked");
     }
 }

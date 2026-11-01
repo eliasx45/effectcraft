@@ -22,6 +22,8 @@ pub(crate) fn metadata(view: View<'_>) -> Vec<u64> {
         };
         key.extend([pointer as u64, p.samples.len() as u64, p.samples.bytes_per_sample() as u64, p.stride as u64, u64::from(p.width), u64::from(p.height)]);
     }
+    // a surface frame's planes hold no samples: its surface key tells frames apart
+    key.push(view.surface.map_or(0, |k| k as u64));
     key.extend(view.coefficients.luma.iter().chain(&view.coefficients.chroma).chain(&view.coefficients.rgb).chain(&view.matte).map(|v| u64::from(v.to_bits())));
     key
 }
@@ -234,6 +236,11 @@ pub(crate) fn decode_from(e: &mut Enc, view: View<'_>, surfaces: bool) -> Option
     // HWDEC2 / Fix 2: the hardware decoder's own surface when the platform can share it, else an
     // upload.
     let surface = if surfaces { crate::surface::planes(e, view) } else { None };
+    // Fix 3: a frame kept only as a surface has no samples to upload (the caller asks the frame
+    // for its CPU planes then)
+    if surface.is_none() && view.surface.is_some() {
+        return None;
+    }
     let from_surface = surface.is_some();
     let (yuv, surface_alpha) = match surface {
         Some(s) => (s.yuv, s.alpha),
@@ -417,6 +424,7 @@ mod tests {
                                 },
                                 alpha_mode: mode,
                                 matte: [0.7, 0.2, 0.5],
+                                surface: None,
                             };
                             let mut e = Enc::new(&g.ctx);
                             let decoded = decode(&mut e, v).expect("native planes accepted");
@@ -463,6 +471,7 @@ mod tests {
                 coefficients: Coefficients { luma: [16.0, 1.0 / 219.0], chroma: [128.0, 1.0 / 224.0], rgb: [1.5748, 0.46812427, 0.18732427, 1.8556] },
                 alpha_mode: AlphaMode::Straight,
                 matte: [0.0; 3],
+                surface: None,
             }
         }
     }

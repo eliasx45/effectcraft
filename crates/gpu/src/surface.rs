@@ -163,10 +163,11 @@ pub(crate) fn planes(e: &mut Enc, view: View<'_>) -> Option<SurfacePlanes> {
     if !matches!(view.subsampling, [0, 0] | [1, 0] | [1, 1]) || !(8..=16).contains(&view.bits) {
         return None;
     }
-    let luma = match view.planes[0].samples {
+    // (a frame kept only as a surface names its key; others are found by their luma samples)
+    let luma = view.surface.unwrap_or(match view.planes[0].samples {
         Samples::U8(v) => v.as_ptr() as usize,
         Samples::U16(v) => v.as_ptr() as usize,
-    };
+    });
     let (w, h) = (view.width, view.height);
     let g = e.g;
     let key = SurfaceKey { luma, width: w, height: h, bits: view.bits, subsampling: view.subsampling, alpha: view.alpha.is_some() };

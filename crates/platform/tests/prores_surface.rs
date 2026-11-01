@@ -87,6 +87,7 @@ fn view(f: &VideoFrame) -> View<'_> {
         },
         alpha_mode: effectcraft_project::AlphaMode::Straight,
         matte: [0.0; 3],
+        surface: None,
     }
 }
 

@@ -21,9 +21,17 @@ pub trait FramePixels: Send + Sync {
     /// [`FootageSource::frame`] returns for the frame.
     fn rows(&self, y0: usize, out: &mut [Px]);
     /// Native planar video samples, when their interpretation is supported.
-    /// The source keeps ownership; CPU consumers continue using `rows`.
+    /// The source keeps ownership; CPU consumers continue using `rows`. A frame kept only on
+    /// the GPU (a hardware decoder's surface, Fix 3) makes its CPU samples now, once.
     fn yuv(&self) -> Option<crate::yuv::View<'_>> {
         None
+    }
+    /// [`Self::yuv`] for the GPU's native decode: a frame kept only as a hardware decoder's
+    /// surface gives its layout and surface key without samples ([`crate::yuv::View::surface`]),
+    /// so reading it on the GPU makes no CPU copy; when the GPU can't read the surface it asks
+    /// [`Self::yuv`]. Other frames: [`Self::yuv`].
+    fn gpu_yuv(&self) -> Option<crate::yuv::View<'_>> {
+        self.yuv()
     }
     /// The pixels themselves when they are an [`Image`] already.
     fn image(&self) -> Option<&Image> {
@@ -470,7 +478,8 @@ impl<'a> Renderer<'a> {
             return None;
         }
         let pixels = self.footage.frame_pixels_with(item, footage, time, self.pipe.float_curve(footage))?;
-        let view = pixels.yuv()?;
+        // (a frame kept on the GPU stays there: no CPU copy to look at its layout)
+        let view = pixels.gpu_yuv()?;
         view.validate().ok()?;
         if pixels.size() != (view.width, view.height) {
             return None;

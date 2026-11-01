@@ -297,6 +297,7 @@ impl effectcraft_render::FramePixels for Packed {
             coefficients: Coefficients { luma: [k.y_off, k.y_scale], chroma: [k.c_off, k.c_scale], rgb: [k.cr_r, k.cr_g, k.cb_g, k.cb_b] },
             alpha_mode: op.mode,
             matte: op.matte,
+            surface: None,
         })
     }
     fn size(&self) -> (u32, u32) {
