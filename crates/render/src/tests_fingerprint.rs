@@ -538,6 +538,133 @@ fn real_project_layer_keys_kept_after_one_keyframe_edit() {
     eprintln!("{edits} content keyframe edits: {:.1} % of layer keys kept ({kept_total}/{keyed_total})", 100.0 * kept_total as f64 / keyed_total.max(1) as f64);
 }
 
+/// An expression engine whose every expression reads its own layer's opacity a second later
+/// (`transform.opacity.valueAtTime(time + 1) / 10`).
+struct OwnAhead;
+
+impl ExprHost for OwnAhead {
+    fn eval(&self, ctx: &EvalCtx, layer: &Layer, _: &effectcraft_project::Property, value: &Value) -> Result<Value, String> {
+        let Some(p) = layer.props.prop("transform/opacity") else { return Ok(value.clone()) };
+        Ok(Value::Scalar(ctx.at(ctx.time + s(1.0)).value(layer, p).as_f64() / 10.0))
+    }
+}
+
+/// A layer read at other times (an Echo) whose expressions read only the layer itself (as text
+/// presets' do: `effect("Blur In")("Slider")`, `text.animator(…)`, the layer's markers) is
+/// keyed by the whole layer, so its comp keeps a fingerprint (Q3, 1 Nov 2026: such captions kept
+/// whole scene precomps out of the layer cache); an edit to what it reads changes the key, and
+/// reading another layer, a layer parameter or under motion blur's window still doesn't key.
+#[test]
+fn a_time_reader_reading_its_own_layer_keeps_its_fingerprint() {
+    let (mut p, cid) = scene();
+    let mut l = p.comp(cid).unwrap().layers.get(0).unwrap().clone();
+    l.props.prop_mut("transform/opacity").unwrap().keys = keys(&[0.0, 1.0, 2.0, 3.0], |i| Value::Scalar(100.0 - 20.0 * i as f64));
+    effect(&mut p, &mut l, "ec.time.echo");
+    effect(&mut p, &mut l, "ec.blur.gaussian");
+    let own = |text: &str| Some(Expression { text: text.into(), enabled: true });
+    l.props.prop_mut("effects/#2/blurriness").unwrap().expr = own("transform.opacity.valueAtTime(time + 1) / 10");
+    *p.comp_mut(cid).unwrap().layers.get_mut(0).unwrap() = l;
+    assert!(print(&p, cid, s(1.0)).is_some(), "own-layer reads are keyed");
+    // The opacity it reads a second ahead changes: every frame it's on changes key (the whole
+    // layer counts), and every frame kept is the same picture (`kept_with` renders both).
+    let q = edit(&p, cid, |l| l.props.prop_mut("transform/opacity").unwrap().keys[3].value = Value::Scalar(0.0));
+    assert_eq!(kept_with(&p, &q, cid, Some(&OwnAhead)), vec![END]);
+    // So does a static edit to it.
+    let q = edit(&p, cid, |l| l.props.prop_mut("effects/#2/blurriness").unwrap().value = Value::Scalar(3.0));
+    assert_eq!(kept_with(&p, &q, cid, Some(&OwnAhead)), vec![END]);
+    // Reading another layer: not keyed.
+    let other = edit(&p, cid, |l| l.props.prop_mut("effects/#2/blurriness").unwrap().expr = own("thisComp.layer(2).transform.opacity.valueAtTime(time + 1)"));
+    assert_eq!(print(&other, cid, s(1.0)), None);
+    // Own reads, but another expression of the layer reads another layer (at the frame time on
+    // its own, yet the own read can reach it at other times): not keyed.
+    let mixed = edit(&p, cid, |l| l.props.prop_mut("transform/opacity").unwrap().expr = own("thisComp.layer(2).transform.opacity"));
+    assert_eq!(print(&mixed, cid, s(1.0)), None);
+    // A layer parameter set to another layer hands an own read that layer: not keyed. Set to
+    // none, it hands it nothing.
+    let mut with_layer = p.clone();
+    let mut l = with_layer.comp(cid).unwrap().layers.get(0).unwrap().clone();
+    effect(&mut with_layer, &mut l, "ec.control.layer");
+    *with_layer.comp_mut(cid).unwrap().layers.get_mut(0).unwrap() = l;
+    assert!(print(&with_layer, cid, s(1.0)).is_some());
+    let bg = with_layer.comp(cid).unwrap().layers.get(1).unwrap().id;
+    let with_layer = edit(&with_layer, cid, |l| l.props.prop_mut("effects/#3/layer").unwrap().value = Value::Layer(Some(bg.0)));
+    assert_eq!(print(&with_layer, cid, s(1.0)), None);
+    // Motion blur keys only the keyframes in the shutter's window: own reads elsewhere aren't
+    // in the key.
+    let mut blurred = scene().0;
+    blurred.comp_mut(cid).unwrap().enable_motion_blur = true;
+    let blurred = edit(&blurred, cid, |l| {
+        l.switches.motion_blur = true;
+        l.props.prop_mut("transform/rotation").unwrap().expr = own("transform.position.valueAtTime(0)[0]");
+    });
+    assert_eq!(print(&blurred, cid, s(1.0)), None);
+    // A pure expression there still is.
+    let blurred = edit(&blurred, cid, |l| l.props.prop_mut("transform/rotation").unwrap().expr = own("value + time * thisComp.frameDuration"));
+    assert!(print(&blurred, cid, s(1.0)).is_some());
+}
+
+/// What expressions read, by their text: own-layer reads (the caption presets') and the ways out
+/// of the layer.
+#[test]
+fn expression_reads() {
+    use crate::cache::free::{Reads, reads};
+    let pure = [
+        "value + time * thisComp.frameDuration",
+        "[thisComp.width / 2, thisComp.height / 2]",
+        "function f(a, b) { return a * b; } f(time, 2)",
+        "var a = 1, b = 2; try { a = b * time } catch (e) { a = 0 } a",
+        "var sp = /\\s/.test(\"a b\"); sp ? 1 : 0",
+        "var s = \"a/b\".replace(/\\//g, ''); s.length",
+        "var o = {top: 1, left: 2}; o.top + o.left",
+        "createPath([[0, 0], [1, 1]], [], [], false)",
+        "var a=thisComp.marker.key('PAGE MOVE START').time; clamp((time-a)/Math.max(thisComp.frameDuration,1),0,1)",
+    ];
+    for e in pure {
+        assert_eq!(reads(e), Reads::Pure, "{e}");
+    }
+    let own = [
+        "effect(\"Animate By\")(\"Menu\")==2?100:0",
+        "text.animator(\"Fade Up\").selector(\"Range Selector 1\").offset",
+        "var d=effect(\"Travel Distance (px)\")(\"Slider\"), a=effect(\"Direction\")(\"Angle\")*Math.PI/180;\n[d*Math.cos(a), d*Math.sin(a), 0]",
+        "var m=null; try{ m=thisLayer.marker.key(\"In\"); }catch(e){}\nif(!m || numKeys<2){ value; } else {\n  var k1=key(1).time, k2=key(numKeys).time, d=Math.max(thisComp.frameDuration, m.duration);\n  valueAtTime(Math.max(k1, Math.min(k2, k1+(time-m.time)/d*(k2-k1))));\n}",
+        "(function(){\nif(effect(\"Animate By\")(\"Menu\")!=2 || effect(\"Out\")(\"Checkbox\")==0) return [0,0,0];\nvar mo=null; try{ mo=thisLayer.marker.key(\"Out\"); }catch(e){}\nvar D=Math.max(thisComp.frameDuration, mo?mo.duration:0.3), end=mo?mo.time+D:thisLayer.outPoint;\nvar n=textTotal, i=effect(\"Out Order\")(\"Menu\")==2?textIndex-1:n-textIndex, unit=D*0.6, spread=D-unit;\nvar s=end-D+(n>1?spread*i/(n-1):0);\nvar p=Math.min(1,Math.max(0,(time-s)/unit)); p=p*p;\nreturn [100*p,100*p,100*p];\n})()",
+        "// Colours word number \"Highlight Word #\".\nvar s=(\"\"+thisLayer.text.sourceText), n=Math.round(effect(\"Highlight Word #\")(\"Slider\")), w=0, a=-1, b=-1, inW=false;\nfor(var j=0;j<s.length;j++){ var sp=/\\s/.test(s.charAt(j)); if(!sp&&!inW){ w++; inW=true; if(w==n) a=j+1; } if(sp&&inW){ inW=false; if(w==n) b=j; } }\nif(a>0&&b<0) b=s.length;\nvar v=(n>0&&a>0&&textIndex>=a&&textIndex<=b)?100:0; [v,v,v]",
+        "var v=100*Math.cos(textIndex*1.7+time*0.9)*0.35+65; [v,v,v]",
+        "loopOut()",
+        "wiggle(2, 10)",
+        "var key = 3; key",
+    ];
+    for e in own {
+        assert_eq!(reads(e), Reads::Own, "{e}");
+    }
+    let other = [
+        "thisComp.layer(1).transform.position",
+        "thisComp.numLayers",
+        "var c = thisComp; c.layer(1)",
+        "thisLayer.parent.transform.position",
+        "var L = thisLayer; L.toComp([0, 0])",
+        "thisLayer.sourceRectAtTime().width",
+        "thisLayer.source.width",
+        "thisLayer[\"par\" + \"ent\"]",
+        "var x = {}; x[\"a\"]",
+        "comp(\"A\").layer(1)",
+        "var width = 10; width",
+        "var comp = 1; comp",
+        "\"\".constructor",
+        "[...thisComp.layer(1).position.value]",
+        "var s = 'a'.replace(/\"/g, ''); \"x\" + thisComp.layer(\"X\").name",
+        "this.x",
+        "x",
+        "`${time}`",
+        "__h(2, 0, 1)",
+        "footage(\"data.json\").sourceData",
+        "thisProject.bitsPerChannel",
+    ];
+    for e in other {
+        assert_eq!(reads(e), Reads::Other, "{e}");
+    }
+}
+
 /// An expression engine whose every expression reads the first layer's opacity a second later
 /// (`thisComp.layer(1).transform.opacity.valueAtTime(time + 1)`).
 struct ReadsAhead;

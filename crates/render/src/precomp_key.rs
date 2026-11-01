@@ -17,10 +17,11 @@
 //! effects, Wiggle, paint spans, Auto-Orient along a path, frame blending, time remapping), and
 //! every layer of a comp sampled at other times from above or by a layer that reads other layers
 //! at other times, with every keyframe. The time counts when a layer is read at other times, and
-//! such a layer's expressions must read nothing but their own value and the time
-//! ([`crate::cache::free::self_contained`]): one that may read other layers or comps at those
-//! times, out of the key's sight, leaves the comp unkeyed. A layer the frame doesn't use (not
-//! active, and nothing used points at it) counts only by its place, expressions included.
+//! such a layer's expressions must read nothing but their own value, the time, the comp's
+//! settings and, where every keyframe counts, their own layer ([`crate::cache::free::reads`]):
+//! one that may read other layers or comps at those times, out of the key's sight, leaves the
+//! comp unkeyed. A layer the frame doesn't use (not active, and nothing used points at it)
+//! counts only by its place, expressions included.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -267,11 +268,14 @@ impl<'a> Renderer<'a> {
         let mut timed = false;
         for (i, ((l, li), mode)) in nc.layers.iter().zip(&info.layers).zip(&modes).enumerate() {
             let lights = matches!(l.source, LayerSource::Camera | LayerSource::Light { .. });
+            // A layer keyed whole (every keyframe, marker and property) may also read itself by
+            // its expressions; one keyed by a shutter's window of keyframes may not.
             let contained = match mode {
                 Mode::Free => true,
-                _ if strict || lights => li.contained,
+                Mode::Whole if strict || lights => li.contained_whole,
+                _ if lights => li.contained,
                 Mode::Window(..) => li.contained_sampled,
-                Mode::Whole => li.contained_inner && (!sampled.get(i).copied().unwrap_or(true) || li.contained_sampled),
+                Mode::Whole => li.contained_inner && (!sampled.get(i).copied().unwrap_or(true) || li.contained_sampled || li.contained_whole),
             };
             if !used(i) {
                 // Unused: its id and switches (solo hides the comp's other layers at every time).

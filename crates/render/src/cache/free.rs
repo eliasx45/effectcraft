@@ -144,16 +144,6 @@ pub(crate) fn sampled_contained(layer: &Layer) -> bool {
     })
 }
 
-/// [`contained`] for what a layer that reads its own other times reads there: its source, masks
-/// and effects (`EffectHost::self_at`, frame blending, time remapping), not its transform, which
-/// is read at the frame time (Auto-Orient along its path aside, which reads its position).
-pub(crate) fn inner_contained(layer: &Layer) -> bool {
-    if layer.auto_orient == AutoOrient::AlongPath {
-        return contained(&layer.props);
-    }
-    layer.props.children.iter().all(|c| matches!(c, Node::Group(g) if g.match_id == "transform") || contained_node(c))
-}
-
 fn contained_node(n: &Node) -> bool {
     match n {
         Node::Prop(p) => !super::live_expression(p) || p.expr.as_ref().is_some_and(|e| self_contained(&e.text)),
@@ -161,8 +151,77 @@ fn contained_node(n: &Node) -> bool {
     }
 }
 
-/// Names an expression may use and still be self-contained: the language, `value`, `time` and
-/// functions of their arguments alone.
+/// For a layer that reads its own other times, keyed whole (every property, keyframe and
+/// marker, its in and out points, and its comp's settings: `Mode::Whole` in `precomp_key`): do
+/// the expressions of what it reads there (its source, masks and effects, `EffectHost::self_at`,
+/// frame blending, time remapping; not its transform, read at the frame time, Auto-Orient along
+/// its path aside, which reads its position) read nothing but their own value, the time, the
+/// comp's settings and the layer itself (see [`own_contained`])?
+pub(crate) fn inner_contained(layer: &Layer) -> bool {
+    if layer.auto_orient == AutoOrient::AlongPath {
+        return whole_contained(layer);
+    }
+    let inner = layer.props.children.iter().filter(|c| !matches!(c, Node::Group(g) if g.match_id == "transform")).map(node_reads).max();
+    own_contained(layer, inner.unwrap_or(Reads::Pure))
+}
+
+/// Every expression of `layer` reads nothing but its own value, the time, its comp's settings
+/// and its own layer (see [`own_contained`]): what a layer whose key hashes it whole may read
+/// at any time.
+pub(crate) fn whole_contained(layer: &Layer) -> bool {
+    own_contained(layer, node_group_reads(&layer.props))
+}
+
+/// Whether expressions reading at most `reads` are keyed by the whole layer: an expression that
+/// reads its own layer may read any of its properties (at any time, through `valueAtTime`), so
+/// every expression of the layer must read nothing outside it, and no property may name a
+/// layer (`effect("Layer Control")("Layer")` hands it another layer).
+fn own_contained(layer: &Layer, reads: Reads) -> bool {
+    match reads {
+        Reads::Pure => true,
+        Reads::Other => false,
+        Reads::Own => node_group_reads(&layer.props) != Reads::Other && !names_a_layer(&layer.props),
+    }
+}
+
+/// Does a property of `g` name a layer (a Layer Control or layer parameter set to one,
+/// keyframed or driven by an expression)? One set to None hands an expression nothing.
+fn names_a_layer(g: &PropGroup) -> bool {
+    g.children.iter().any(|c| match c {
+        Node::Prop(p) => matches!(p.value, Value::Layer(_)) && (matches!(p.value, Value::Layer(Some(_))) || !p.keys.is_empty() || p.has_expression()),
+        Node::Group(sub) => names_a_layer(sub),
+    })
+}
+
+fn node_group_reads(g: &PropGroup) -> Reads {
+    g.children.iter().map(node_reads).max().unwrap_or(Reads::Pure)
+}
+
+fn node_reads(n: &Node) -> Reads {
+    match n {
+        Node::Prop(p) if super::live_expression(p) => p.expr.as_ref().map_or(Reads::Pure, |e| reads(&e.text)),
+        Node::Prop(_) => Reads::Pure,
+        Node::Group(sub) => node_group_reads(sub),
+    }
+}
+
+/// What an expression may read, as far as its text shows, least first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Reads {
+    /// Its property's own value, the time, and its comp's settings (`thisComp.frameDuration`,
+    /// `.width`, `.height`, `.duration`, `.pixelAspect`, `.marker`): its value at any time
+    /// follows from its property's keyframes and that time.
+    Pure,
+    /// Also its own layer: its properties at any time (`effect(…)`, `text.animator(…)`,
+    /// `valueAtTime`, `key(…)`), markers, in and out points, index, text selector inputs.
+    Own,
+    /// Possibly another layer, comp, footage item or the project, or something the check doesn't
+    /// know (an undeclared name, a computed member, a template literal).
+    Other,
+}
+
+/// Names an expression may use and still read nothing but its value and the time: the
+/// language, `value`, `time` and functions of their arguments alone.
 const PURE: &[&str] = &[
     "value",
     "time",
@@ -184,6 +243,7 @@ const PURE: &[&str] = &[
     "var",
     "let",
     "const",
+    "function",
     "if",
     "else",
     "return",
@@ -192,7 +252,15 @@ const PURE: &[&str] = &[
     "do",
     "break",
     "continue",
+    "switch",
+    "case",
+    "default",
+    "try",
+    "catch",
+    "finally",
+    "throw",
     "typeof",
+    "instanceof",
     "new",
     "of",
     "in",
@@ -209,90 +277,396 @@ const PURE: &[&str] = &[
     "normalize",
     "dot",
     "cross",
+    "lookAt",
     "degreesToRadians",
     "radiansToDegrees",
+    "rgbToHsl",
+    "hslToRgb",
+    "hexToRgb",
+    "createPath",
     "posterizeTime",
     "framesToTime",
     "timeToFrames",
     "noise",
 ];
 
+/// Names that read the expression's own layer (see [`Reads::Own`]): the layer and property
+/// objects, the layer attributes and property methods the expression language makes global,
+/// and the text Expression Selector's inputs. (`random` is seeded by the layer's index and the
+/// property.)
+const OWN: &[&str] = &[
+    "thisLayer",
+    "thisProperty",
+    "effect",
+    "mask",
+    "content",
+    "text",
+    "marker",
+    "transform",
+    "position",
+    "scale",
+    "rotation",
+    "opacity",
+    "anchorPoint",
+    "name",
+    "index",
+    "inPoint",
+    "outPoint",
+    "startTime",
+    "hasParent",
+    "enabled",
+    "active",
+    "numKeys",
+    "velocity",
+    "speed",
+    "key",
+    "nearestKey",
+    "valueAtTime",
+    "velocityAtTime",
+    "speedAtTime",
+    "wiggle",
+    "temporalWiggle",
+    "smooth",
+    "loopIn",
+    "loopOut",
+    "loopInDuration",
+    "loopOutDuration",
+    "textIndex",
+    "textTotal",
+    "selectorValue",
+    "random",
+    "gaussRandom",
+    "seedRandom",
+];
+
+/// `thisComp` members fixed by the comp's settings (which every comp key hashes, the comp's
+/// markers included).
+const COMP_SETTINGS: &[&str] = &["frameDuration", "width", "height", "duration", "pixelAspect", "marker"];
+
+/// Members that lead out of the layer (its parent, source, comp, other layers, its pixels, its
+/// transform to the comp or world, which its parents and the camera move; a layer's `width`
+/// and `height`, its source's size) or into the language's machinery (constructors, the
+/// expression engine's internals).
+const LEAVES: &[&str] = &[
+    "parent",
+    "source",
+    "containingComp",
+    "layer",
+    "comp",
+    "footage",
+    "toComp",
+    "fromComp",
+    "toWorld",
+    "fromWorld",
+    "toCompVec",
+    "fromCompVec",
+    "toWorldVec",
+    "fromWorldVec",
+    "sourceRectAtTime",
+    "sampleImage",
+    "width",
+    "height",
+    "hasVideo",
+    "constructor",
+    "prototype",
+];
+
+/// Global names of the expression language's object model that a variable of the same name
+/// doesn't hide until it is set (and functions it doesn't replace before its definition runs).
+const HOST: &[&str] = &[
+    "comp",
+    "footage",
+    "width",
+    "height",
+    "hasVideo",
+    "Comp",
+    "Footage",
+    "Layer",
+    "Prop",
+    "Markers",
+    "timeToTimecode",
+    "timeToFeetAndFrames",
+    "timeToCurrentFormat",
+];
+
+/// Words that fail an expression wherever they appear, in strings and comments too: a second
+/// check that doesn't depend on reading the text right (a regular expression read as a
+/// division could hide what follows it in a "string").
+const NEVER: &[&str] = &[
+    "thisProject",
+    "parent",
+    "footage",
+    "toComp",
+    "fromComp",
+    "toWorld",
+    "fromWorld",
+    "toCompVec",
+    "fromCompVec",
+    "toWorldVec",
+    "fromWorldVec",
+    "sampleImage",
+    "sourceRectAtTime",
+    "containingComp",
+    "constructor",
+    "prototype",
+    "eval",
+    "Function",
+    "globalThis",
+];
+
 /// Does expression `text` read nothing but its property's own value and the time? Then its value
 /// at any time follows from its own property (whose keyframes the key hashes) and that time.
-/// Conservative: any name that isn't the language, `value`, `time`, a pure function or a variable
-/// it declares (`var`/`let`/`const`/`function`) fails, as do names after `.` that aren't method
-/// calls on those (`Math.floor`, `x.toString`), checked by being after a dot at all.
+/// See [`reads`].
 pub(crate) fn self_contained(text: &str) -> bool {
+    reads(text) == Reads::Pure
+}
+
+/// A token of an expression's text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Tok<'a> {
+    Name(&'a str),
+    Num,
+    Str,
+    /// A regular expression literal.
+    Regex,
+    Punct(u8),
+}
+
+/// The tokens of `text`, each with whether a line break comes before it; `None` for text this
+/// reading doesn't follow (template literals, non-ASCII code, unterminated strings, comments or
+/// regular expressions).
+fn tokens(text: &str) -> Option<Vec<(Tok<'_>, bool)>> {
     let b = text.as_bytes();
-    let mut names: Vec<&str> = vec![];
-    let mut declared: Vec<&str> = vec![];
+    let mut out: Vec<(Tok, bool)> = vec![];
     let mut i = 0;
-    let mut after_dot = false;
-    let mut declare_next = false;
+    let mut nl = false;
     while let Some(&c) = b.get(i) {
-        match c {
-            b'"' | b'\'' | b'`' => {
-                // A string: skip to its end (escapes included). Template literals may hold code.
-                if c == b'`' {
-                    return false;
-                }
+        let tok = match c {
+            b'\n' | b'\r' => {
+                nl = true;
                 i += 1;
-                while let Some(&d) = b.get(i) {
-                    if d == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    if d == c {
-                        break;
+                continue;
+            }
+            c if c.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            b'`' => return None,
+            b'"' | b'\'' => {
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None | Some(b'\n') => return None,
+                        Some(b'\\') => i += 2,
+                        Some(&d) => {
+                            i += 1;
+                            if d == c {
+                                break;
+                            }
+                        }
                     }
                 }
-                after_dot = false;
+                Tok::Str
             }
             b'/' if b.get(i + 1) == Some(&b'/') => {
                 while b.get(i).is_some_and(|d| *d != b'\n') {
                     i += 1;
                 }
+                continue;
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
                 i += 2;
-                while i < b.len() && !(b.get(i) == Some(&b'*') && b.get(i + 1) == Some(&b'/')) {
-                    i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return None,
+                        Some(b'*') if b.get(i + 1) == Some(&b'/') => break,
+                        Some(b'\n') => {
+                            nl = true;
+                            i += 1;
+                        }
+                        Some(_) => i += 1,
+                    }
                 }
                 i += 2;
+                continue;
+            }
+            // A regular expression where a value starts (after an operator, a keyword, or
+            // nothing); a division after a value.
+            b'/' if regex_may_start(out.last().map(|t| t.0)) => {
+                i += 1;
+                let mut class = false;
+                loop {
+                    match b.get(i) {
+                        None | Some(b'\n') => return None,
+                        Some(b'\\') => i += 2,
+                        Some(b'[') => {
+                            class = true;
+                            i += 1;
+                        }
+                        Some(b']') => {
+                            class = false;
+                            i += 1;
+                        }
+                        Some(b'/') if !class => {
+                            i += 1;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+                // Flags.
+                while b.get(i).is_some_and(u8::is_ascii_alphabetic) {
+                    i += 1;
+                }
+                Tok::Regex
             }
             b'0'..=b'9' => {
                 while b.get(i).is_some_and(|d| d.is_ascii_alphanumeric() || *d == b'.') {
                     i += 1;
                 }
-                after_dot = false;
+                Tok::Num
+            }
+            b'.' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                i += 1;
+                while b.get(i).is_some_and(|d| d.is_ascii_alphanumeric() || *d == b'.') {
+                    i += 1;
+                }
+                Tok::Num
             }
             c if c.is_ascii_alphabetic() || c == b'_' || c == b'$' => {
                 let start = i;
                 while b.get(i).is_some_and(|d| d.is_ascii_alphanumeric() || *d == b'_' || *d == b'$') {
                     i += 1;
                 }
-                let Some(name) = text.get(start..i) else { return false };
-                if declare_next {
-                    declared.push(name);
-                } else if !after_dot {
-                    names.push(name);
-                }
-                declare_next = matches!(name, "var" | "let" | "const" | "function");
-                after_dot = false;
+                Tok::Name(text.get(start..i)?)
             }
-            b'.' => {
-                after_dot = true;
-                i += 1;
-            }
-            c if c.is_ascii_whitespace() => i += 1,
             c if c.is_ascii() => {
-                after_dot = false;
                 i += 1;
+                Tok::Punct(c)
             }
-            // Non-ASCII outside strings: not a name this check knows.
-            _ => return false,
+            // Non-ASCII outside strings and comments: not code this reading knows.
+            _ => return None,
+        };
+        out.push((tok, nl));
+        nl = false;
+    }
+    Some(out)
+}
+
+/// May a `/` after `prev` start a regular expression (rather than divide)?
+fn regex_may_start(prev: Option<Tok>) -> bool {
+    match prev {
+        None => true,
+        Some(Tok::Punct(c)) => !matches!(c, b')' | b']'),
+        Some(Tok::Name(n)) => matches!(n, "return" | "typeof" | "instanceof" | "in" | "of" | "new" | "case" | "do" | "else" | "throw" | "void"),
+        Some(Tok::Num | Tok::Str | Tok::Regex) => false,
+    }
+}
+
+/// Is `word` (as a whole word) in `text` anywhere, strings and comments included?
+fn has_word(text: &str, word: &str) -> bool {
+    let is_name = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let b = text.as_bytes();
+    text.match_indices(word).any(|(at, _)| {
+        let before = at.checked_sub(1).and_then(|j| b.get(j)).is_some_and(|c| is_name(*c));
+        let after = b.get(at + word.len()).is_some_and(|c| is_name(*c));
+        !before && !after
+    })
+}
+
+/// What expression `text` may read (see [`Reads`]). Conservative: a name that isn't the
+/// language, `value`, `time`, a pure function, an own-layer name ([`OWN`]), `thisComp.` with a
+/// settings member or a variable the expression declares (`var`/`let`/`const` lists, function
+/// names and parameters, `catch` bindings) reads something else, as does a member that leaves the
+/// layer ([`LEAVES`]), a member computed from a string (`x["parent"]`), any subscript of a layer
+/// or property object, and any word of [`NEVER`] anywhere in the text. A declared variable
+/// named like a layer attribute counts as reading the layer, and one named like another global
+/// of the object model ([`HOST`]) as reading anything: it may be read before it's set.
+pub(crate) fn reads(text: &str) -> Reads {
+    if NEVER.iter().any(|w| has_word(text, w)) || text.contains("__") {
+        return Reads::Other;
+    }
+    let Some(toks) = tokens(text) else { return Reads::Other };
+    // Declared names, first (`var` hoists: a declared name is a variable everywhere).
+    let mut declared: Vec<&str> = vec![];
+    // Bracket depth, and the depth of the `var` list being read.
+    let mut depth = 0i32;
+    let mut list: Option<i32> = None;
+    let mut params: Option<i32> = None;
+    for (i, (t, nl)) in toks.iter().enumerate() {
+        let prev = i.checked_sub(1).and_then(|j| toks.get(j)).map(|t| t.0);
+        if *nl && list == Some(depth) && prev != Some(Tok::Punct(b',')) {
+            list = None;
+        }
+        match t {
+            Tok::Name(n) => {
+                let opens = matches!(prev, Some(Tok::Name("var" | "let" | "const" | "function")))
+                    || (list == Some(depth) && prev == Some(Tok::Punct(b',')))
+                    || (params == Some(depth) && matches!(prev, Some(Tok::Punct(b'(' | b','))));
+                if opens {
+                    declared.push(n);
+                }
+                if matches!(*n, "var" | "let" | "const") {
+                    list = Some(depth);
+                }
+            }
+            Tok::Punct(b'(' | b'[' | b'{') => {
+                depth += 1;
+                // `function name(…)`, `function (…)`, `catch (e)`: the parameters.
+                let name_before = i.checked_sub(2).and_then(|j| toks.get(j)).is_some_and(|t| t.0 == Tok::Name("function"));
+                if *t == Tok::Punct(b'(') && (matches!(prev, Some(Tok::Name("function" | "catch"))) || name_before) {
+                    params = Some(depth);
+                }
+            }
+            Tok::Punct(b')' | b']' | b'}') => {
+                if params == Some(depth) {
+                    params = None;
+                }
+                depth -= 1;
+                if list.is_some_and(|d| d > depth) {
+                    list = None;
+                }
+            }
+            Tok::Punct(b';') if list == Some(depth) => list = None,
+            _ => {}
         }
     }
-    names.iter().all(|n| PURE.contains(n) || declared.contains(n))
+    let mut most = Reads::Pure;
+    let mut i = 0;
+    while let Some(&(t, _)) = toks.get(i) {
+        let prev = i.checked_sub(1).and_then(|j| toks.get(j)).map(|t| t.0);
+        let next = toks.get(i + 1).map(|t| t.0);
+        // (Not spread syntax, `...x`.)
+        let after_dot = prev == Some(Tok::Punct(b'.')) && i.checked_sub(2).and_then(|j| toks.get(j)).map(|t| t.0) != Some(Tok::Punct(b'.'));
+        match t {
+            Tok::Name(n) if after_dot => {
+                if LEAVES.contains(&n) {
+                    return Reads::Other;
+                }
+            }
+            // An object literal's key (`{top: 1, left: 2}`).
+            Tok::Name(_) if matches!(prev, Some(Tok::Punct(b'{' | b','))) && next == Some(Tok::Punct(b':')) => {}
+            Tok::Name("thisComp") => {
+                let member = toks.get(i + 2).map(|t| t.0);
+                match (next, member) {
+                    (Some(Tok::Punct(b'.')), Some(Tok::Name(m))) if COMP_SETTINGS.contains(&m) => i += 2,
+                    _ => return Reads::Other,
+                }
+            }
+            Tok::Name(n) if OWN.contains(&n) => {
+                // A layer or property object indexed by a computed name could reach anything.
+                if next == Some(Tok::Punct(b'[')) {
+                    return Reads::Other;
+                }
+                most = most.max(Reads::Own);
+            }
+            Tok::Name(n) if PURE.contains(&n) || (declared.contains(&n) && !HOST.contains(&n)) => {}
+            Tok::Name(_) => return Reads::Other,
+            // A member named by a string: `x["parent"]`.
+            Tok::Punct(b'[') if matches!(prev, Some(Tok::Name(_) | Tok::Punct(b')' | b']'))) && next == Some(Tok::Str) => return Reads::Other,
+            _ => {}
+        }
+        i += 1;
+    }
+    most
 }

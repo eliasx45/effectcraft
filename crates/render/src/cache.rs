@@ -1863,8 +1863,12 @@ pub(crate) struct LayerInfo {
     pub(crate) contained: bool,
     /// [`Self::contained`] for what motion blur reads at other times ([`free::sampled_contained`]).
     pub(crate) contained_sampled: bool,
-    /// [`Self::contained`] for what a layer's own other times read ([`free::inner_contained`]).
+    /// What a layer's own other times read reads nothing outside the layer, where its key
+    /// hashes it whole ([`free::inner_contained`]).
     pub(crate) contained_inner: bool,
+    /// [`Self::contained`] where the key hashes the whole layer: expressions may also read their
+    /// own layer ([`free::whole_contained`]).
+    pub(crate) contained_whole: bool,
     /// Enabled paint strokes (their Duration spans show and hide them).
     pub(crate) paint: bool,
     masks_or_effects: bool,
@@ -1930,6 +1934,7 @@ impl LayerInfo {
             contained: free::contained(&layer.props),
             contained_sampled: free::sampled_contained(layer),
             contained_inner: free::inner_contained(layer),
+            contained_whole: free::whole_contained(layer),
             paint,
             masks_or_effects: layer.masks().is_some_and(|m| !m.children.is_empty()) || layer.effects().is_some_and(|fx| !fx.children.is_empty()),
             layer_refs: fx.is_some_and(|fx| fx.groups().any(|g| g.enabled && names_layers(g))),
