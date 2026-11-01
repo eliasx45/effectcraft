@@ -404,12 +404,15 @@ fn line_get(horizontal: bool, line: i32, i: i32, n: i32, repeat: bool) -> vec4<f
 }
 
 // One box pass of radius r along rows (horizontal) or columns, as running sums over blocks of
-// `block` pixels (each block restarts its sum, as the CPU's vertical pass does).
+// `block` pixels (each block restarts its sum, as the CPU's vertical pass does). u[0].w = the
+// blocks' phase: they start `phase` pixels before the image (an adjustment layer's window of
+// the comp keeps the comp's block grid, `adjust_window`); 0 for a whole image.
 fn box_pass(gid: vec3<u32>, horizontal: bool) {
     let dims = out_dims();
     let r = i32(P.u[0].x);
     let repeat = P.u[0].y != 0u;
     let block = i32(P.u[0].z);
+    let phase = i32(P.u[0].w);
     var lines = dims.x;
     var n = dims.y;
     if (horizontal) {
@@ -417,7 +420,8 @@ fn box_pass(gid: vec3<u32>, horizontal: bool) {
         n = dims.x;
     }
     let line = i32(gid.x);
-    let b0 = i32(gid.y) * block;
+    let s0 = i32(gid.y) * block - phase;
+    let b0 = max(s0, 0);
     if (line >= lines || b0 >= n) {
         return;
     }
@@ -426,7 +430,7 @@ fn box_pass(gid: vec3<u32>, horizontal: bool) {
     for (var i = b0 - r; i <= b0 + r; i++) {
         acc += line_get(horizontal, line, i, n, repeat);
     }
-    let b1 = min(b0 + block, n);
+    let b1 = min(s0 + block, n);
     for (var i = b0; i < b1; i++) {
         if (horizontal) {
             textureStore(out, vec2<i32>(i, line), acc * norm);
@@ -454,7 +458,7 @@ var<workgroup> box_trail: array<vec4<f32>, 512>;
 // 8-pixel runs of their rows together (adjacent threads, adjacent pixels) instead of each
 // reading its own row a pixel at a time. Each thread then sums exactly as `box_pass` does (the
 // same values in the same order), so the output is bit-identical to `box_h_serial`.
-// u[0] = (radius, repeat edges, block); dispatched over (line, block).
+// u[0] = (radius, repeat edges, block, phase as in `box_pass`); dispatched over (line, block).
 @compute @workgroup_size(64, 1)
 fn box_h(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let dims = out_dims();
@@ -463,11 +467,12 @@ fn box_h(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
     let block = i32(P.u[0].z);
     let n = dims.x;
     let line = i32(gid.x);
-    let b0 = i32(wg.y) * block;
+    let s0 = i32(wg.y) * block - i32(P.u[0].w);
+    let b0 = max(s0, 0);
     if (b0 >= n) {
         return;
     }
-    let b1 = min(b0 + block, n);
+    let b1 = min(s0 + block, n);
     let norm = 1.0 / f32(2 * r + 1);
     // The leading edge runs over [b0 - r, b1 - 1 + r]: the first 2r + 1 pixels are the
     // starting sum, each later one moves the window by a pixel.

@@ -54,6 +54,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod adapter_choice;
+mod adjust_window;
 mod adv3d;
 mod bokeh;
 mod classic3d;
@@ -654,6 +655,8 @@ mod tests;
 mod tests_3d;
 #[cfg(test)]
 mod tests_adjust;
+#[cfg(test)]
+mod tests_adjust_window;
 #[cfg(test)]
 mod tests_adv3d;
 #[cfg(test)]

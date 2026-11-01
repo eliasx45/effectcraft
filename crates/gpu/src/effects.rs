@@ -144,11 +144,23 @@ pub(crate) struct GpuFx<'e, 'g> {
     e: &'e mut Enc<'g>,
     b: Option<PBuf>,
     levels: Option<f32>,
+    /// GPU only: a step on the CPU fails the run (see [`GpuFx::gpu_only`]).
+    gpu_only: bool,
 }
 
 impl<'e, 'g> GpuFx<'e, 'g> {
     pub fn new(e: &'e mut Enc<'g>, img: impl Into<Pixels>, offset: [f64; 2], scale: f64, levels: Option<f32>) -> Self {
-        GpuFx { e, b: Some(PBuf { img: img.into(), offset, scale }), levels }
+        GpuFx { e, b: Some(PBuf { img: img.into(), offset, scale }), levels, gpu_only: false }
+    }
+
+    /// [`GpuFx::new`] for a stack that must run on the GPU from start to end: a step the GPU
+    /// declines at run time leaves no result ([`GpuFx::finish`] is `None`) instead of running
+    /// on the CPU (an adjustment layer's window of the comp: a CPU effect would see only the
+    /// window, `adjust_window`).
+    pub fn gpu_only(e: &'e mut Enc<'g>, img: impl Into<Pixels>, offset: [f64; 2], scale: f64, levels: Option<f32>) -> Self {
+        let mut fx = GpuFx::new(e, img, offset, scale, levels);
+        fx.gpu_only = true;
+        fx
     }
 
     /// The result: (image, offset, scale); `None` when a step failed.
@@ -176,6 +188,9 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
 
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
         let Some(b) = self.b.take() else { return };
+        if self.gpu_only {
+            return;
+        }
         // Codes read back as 4 bytes a pixel, decoded with the same table.
         let Some(img) = self.e.download_px(&b.img) else { return };
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
@@ -454,14 +469,15 @@ pub(crate) fn box_passes_owned(e: &mut Enc, h: &str, img: GpuImage, rx: &[usize]
         let block = if vertical { (4 * r).clamp(32, 256) } else { 256 } as u32;
         let (lines, n) = if vertical { (cur.width, cur.height) } else { (cur.height, cur.width) };
         let mut p = Params::default();
-        p.u[0] = [r as u32, repeat as u32, block, 0];
+        let phase = crate::adjust_window::block_phase(e, (cur.width, cur.height), vertical, block);
+        p.u[0] = [r as u32, repeat as u32, block, phase];
         let half = match precision {
             Precision::F32 => false,
             Precision::HalfPasses => i < last,
             Precision::Half => true,
         };
         let out = e.scratch_as(cur.width, cur.height, half);
-        e.dispatch(if vertical { "box_v" } else { h }, &p, &cur, None, &out, None, (lines.div_ceil(64), n.div_ceil(block)));
+        e.dispatch(if vertical { "box_v" } else { h }, &p, &cur, None, &out, None, (lines.div_ceil(64), (n + phase).div_ceil(block)));
         cur = out;
     }
     cur
@@ -492,9 +508,10 @@ pub(crate) fn box_passes_px(e: &mut Enc, img: Pixels, rx: &[usize], ry: &[usize]
     let block = if vertical { (4 * r).clamp(32, 256) } else { 256 } as u32;
     let (lines, n) = if vertical { (w, h) } else { (h, w) };
     let mut p = Params::default();
-    p.u[0] = [r as u32, repeat as u32, block, 0];
+    let phase = crate::adjust_window::block_phase(e, (w, h), vertical, block);
+    p.u[0] = [r as u32, repeat as u32, block, phase];
     let out = e.scratch(w, h);
-    codes::dispatch(e, if vertical { "box_v" } else { "box_h" }, &p, &img, None, &out.clone().into(), None, (lines.div_ceil(64), n.div_ceil(block)));
+    codes::dispatch(e, if vertical { "box_v" } else { "box_h" }, &p, &img, None, &out.clone().into(), None, (lines.div_ceil(64), (n + phase).div_ceil(block)));
     drop(img);
     // `out` by value: it goes back to the pool once the next pass has read it.
     box_passes_owned(e, "box_h", out, rx, ry, repeat, precision).into()
@@ -521,7 +538,7 @@ fn take_img(e: &Enc, b: &mut PBuf) -> Pixels {
     std::mem::replace(&mut b.img, Pixels::Float(e.zeros(1, 1)))
 }
 
-fn dims_xy(dim: u32) -> (f64, f64) {
+pub(crate) fn dims_xy(dim: u32) -> (f64, f64) {
     match dim {
         1 => (1.0, 0.0),
         2 => (0.0, 1.0),

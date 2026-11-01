@@ -367,19 +367,33 @@ fn mosaic(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if w == 0 || h == 0 {
         return Some(b);
     }
-    let cw = (w as f64 / hb as f64).max(1.0);
-    let ch = (h as f64 / vb as f64).max(1.0);
+    // An adjustment layer's window of the comp keeps the comp's tiles (`adjust_window`): the
+    // grid is laid over the whole comp (`full`) and read from the window at `at`.
+    let frame = crate::adjust_window::frame_of(e, (b.img.width, b.img.height));
+    let ([ax, ay], [fw, fh]) = frame.map_or(([0, 0], [w, h]), |f| ([f.at[0] as usize, f.at[1] as usize], [f.full[0] as usize, f.full[1] as usize]));
+    let cw = (fw as f64 / hb as f64).max(1.0);
+    let ch = (fh as f64 / vb as f64).max(1.0);
     let mut p = Params::default();
     if ctx.params.b("sharpColors") {
-        let centre = |i: usize, c: f64| (((i as f64 / c).floor() + 0.5) * c) as i64 as f32;
-        let data: Vec<f32> = (0..w).map(|x| centre(x, cw)).chain((0..h).map(|y| centre(y, ch))).collect();
+        let centre = |i: usize, c: f64| (((i as f64 / c).floor() + 0.5) * c) as i64;
+        let (ox, oy) = (ax as i64, ay as i64);
+        let data: Vec<f32> = (0..w).map(|x| (centre(x + ax, cw) - ox) as f32).chain((0..h).map(|y| (centre(y + ay, ch) - oy) as f32)).collect();
         p.u[0][0] = w as u32;
         let buf = e.data(&data);
         return run(e, "dst_mosaic_sharp", &p, b, Some(&buf));
     }
-    let (nx, ny) = ((w as f64 / cw).ceil() as usize, (h as f64 / ch).ceil() as usize);
-    let tx: Vec<usize> = (0..w).map(|x| ((x as f64 / cw) as usize).min(nx - 1)).collect();
-    let ty: Vec<usize> = (0..h).map(|y| ((y as f64 / ch) as usize).min(ny - 1)).collect();
+    let (mut nx, mut ny) = ((fw as f64 / cw).ceil() as usize, (fh as f64 / ch).ceil() as usize);
+    let mut tx: Vec<usize> = (0..w).map(|x| (((x + ax) as f64 / cw) as usize).min(nx - 1)).collect();
+    let mut ty: Vec<usize> = (0..h).map(|y| (((y + ay) as f64 / ch) as usize).min(ny - 1)).collect();
+    if frame.is_some() {
+        // The window's tiles only, numbered from its first (the sums cover the same pixels in
+        // the same order; tiles cut by the window's edges are outside what it keeps).
+        for (t, n) in [(&mut tx, &mut nx), (&mut ty, &mut ny)] {
+            let (first, last) = (t.first().copied().unwrap_or(0), t.last().copied().unwrap_or(0));
+            t.iter_mut().for_each(|v| *v = v.saturating_sub(first));
+            *n = last.saturating_sub(first) + 1;
+        }
+    }
     // Tile bounds: tile i covers the columns with tx == i (tx is non-decreasing).
     let bounds = |t: &[usize], n: usize| -> Vec<f32> { (0..=n).map(|i| t.partition_point(|&v| v < i) as f32).collect() };
     let mut data: Vec<f32> = tx.iter().chain(&ty).map(|&v| v as f32).collect();

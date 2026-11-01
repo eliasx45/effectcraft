@@ -2849,6 +2849,9 @@ pub(crate) struct Enc<'g> {
     /// Effects may keep their intermediates as RGBA16F ([`Enc::half_for`]): a viewer display
     /// render with [`GpuContext::set_half_intermediates`] on. Off everywhere else.
     pub(crate) half: bool,
+    /// The effects running now see a window of the comp, not all of it (an adjustment layer,
+    /// `adjust_window`): blur blocks and Mosaic tiles stay on the comp's grid.
+    pub(crate) fx_frame: Option<crate::adjust_window::Frame>,
 }
 
 /// Submitted encoder ids an [`Enc`] remembers for [`Enc::owns`] (older ones lose in-place).
@@ -3067,6 +3070,7 @@ impl<'g> Enc<'g> {
             opened: None,
             cell: Default::default(),
             half: false,
+            fx_frame: None,
             #[cfg(feature = "profile")]
             timestamps: None,
         }
