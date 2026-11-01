@@ -2141,6 +2141,28 @@ impl GpuContext {
         })
     }
 
+    /// An `R32Uint` `STORAGE_BINDING | TEXTURE_BINDING` plane a compute pass fills (decoder
+    /// surfaces split into planes, `surface.rs`): a free one of this size when there is one, else
+    /// a new one. Hand it to [`Enc::stage`] like a [`GpuContext::plane_texture`]. (Only these are
+    /// pooled as `R32Uint`, so a pooled one always has storage usage.)
+    pub(crate) fn storage_plane(&self, w: u32, h: u32) -> wgpu::Texture {
+        let key = (w.max(1), h.max(1), wgpu::TextureFormat::R32Uint);
+        if let Some(t) = self.planes.lock().ok().and_then(|mut p| p.get_mut(&key).and_then(Vec::pop)) {
+            return t;
+        }
+        self.transfers.count_made(u64::from(key.0).saturating_mul(u64::from(key.1)).saturating_mul(4));
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("decoder surface plane"),
+            size: wgpu::Extent3d { width: key.0, height: key.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: key.2,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    }
+
     /// Plane textures whose every reader has been submitted (or discarded) are free again.
     fn free_planes(&self, textures: Vec<wgpu::Texture>) {
         if textures.is_empty() || self.check_health().is_err() {

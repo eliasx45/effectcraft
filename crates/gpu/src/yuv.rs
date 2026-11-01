@@ -218,6 +218,12 @@ fn upload(g: &GpuContext, plane: Plane<'_>) -> Option<wgpu::Texture> {
 }
 
 pub(crate) fn decode(e: &mut Enc, view: View<'_>) -> Option<GpuImage> {
+    decode_from(e, view, true).map(|(image, _)| image)
+}
+
+/// [`decode`], reading the planes from the decoder's surface only when `surfaces`; also whether
+/// they came from it (no upload).
+pub(crate) fn decode_from(e: &mut Enc, view: View<'_>, surfaces: bool) -> Option<(GpuImage, bool)> {
     let _profile = effectcraft_render::profile::span("yuv_upload");
     let input_bytes = view.validate().ok()?;
     let g = e.g;
@@ -225,16 +231,19 @@ pub(crate) fn decode(e: &mut Enc, view: View<'_>) -> Option<GpuImage> {
     if !g.fits(view.width, view.height) {
         return None;
     }
-    // HWDEC2: the hardware decoder's own surface when the platform can share it, else an upload.
-    let surface = crate::surface::planes(e, view);
+    // HWDEC2 / Fix 2: the hardware decoder's own surface when the platform can share it, else an
+    // upload.
+    let surface = if surfaces { crate::surface::planes(e, view) } else { None };
     let from_surface = surface.is_some();
-    let [y, u, v] = match surface {
-        Some(planes) => planes,
-        None => [upload(g, view.planes[0])?, upload(g, view.planes[1])?, upload(g, view.planes[2])?],
+    let (yuv, surface_alpha) = match surface {
+        Some(s) => (s.yuv, s.alpha),
+        None => ([upload(g, view.planes[0])?, upload(g, view.planes[1])?, upload(g, view.planes[2])?], None),
     };
-    let a = match view.alpha {
-        Some(a) => Some(upload(g, a)?),
-        None => None,
+    let [y, u, v] = yuv;
+    let a = match (view.alpha, surface_alpha) {
+        (Some(_), Some(a)) => Some(a),
+        (Some(a), None) => Some(upload(g, a)?),
+        (None, _) => None,
     };
     let views = [&y, &u, &v, a.as_ref().unwrap_or(&y)].map(|t| t.create_view(&Default::default()));
     let mode = match view.alpha_mode {
@@ -275,14 +284,14 @@ pub(crate) fn decode(e: &mut Enc, view: View<'_>) -> Option<GpuImage> {
         ],
     });
     e.custom_pixels("yuv_decode", &p.decode, &bg, (view.width, view.height));
-    // (surface planes are not upload planes: they don't go back to the upload pool)
+    // (the planes split from a surface go back to the pool too; only uploads count as transfers)
+    for t in [Some(y), Some(u), Some(v), a].into_iter().flatten() {
+        e.stage(t);
+    }
     if !from_surface {
-        for t in [Some(y), Some(u), Some(v), a].into_iter().flatten() {
-            e.stage(t);
-        }
         g.transfers.count_yuv(input_bytes);
     }
-    Some(out)
+    Some((out, from_surface))
 }
 
 pub(crate) fn mask(e: &mut Enc, source: &GpuImage, mask: &effectcraft_raster::Mask) -> Option<GpuImage> {

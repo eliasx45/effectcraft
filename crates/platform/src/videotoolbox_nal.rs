@@ -229,7 +229,8 @@ fn copy_out(pb: &CVImageBuffer, s: &Shared) -> Result<VideoFrame, String> {
     drop(lock);
     // HWDEC2: the GPU may read this picture from the decoder's surface instead of uploading it.
     if surfaces::enabled() {
-        surfaces::keep(luma, (w as u32, h as u32), l.bits, (ox as u32, oy as u32), Surface::retain(pb));
+        let layout = surfaces::Layout { size: (w as u32, h as u32), bits: l.bits, subsampling: [1, 1], alpha: false, eight_from: 0 };
+        surfaces::keep(luma, layout, (ox as u32, oy as u32), Surface::retain(pb));
     }
     Ok(VideoFrame { width: w as u32, height: h as u32, data, color: l.color, par: l.par, pts: filmcraft_time::Tick::ZERO })
 }

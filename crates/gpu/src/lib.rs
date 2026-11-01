@@ -485,6 +485,25 @@ impl Gpu {
         }
     }
 
+    /// Decode one native YUV frame to premultiplied RGBA on the GPU, exactly as a footage layer's
+    /// native path does: from the hardware decoder's surface when `surfaces` and the platform
+    /// still holds it ([`surface`]), else by uploading the CPU planes. Waits for the GPU; the
+    /// picture is read back only when `read`. Whether the planes came from the surface, and the
+    /// picture. `None`: the GPU declined the frame. (Tests and benchmarks of the zero-copy path.)
+    #[doc(hidden)]
+    pub fn decode_yuv(&self, view: effectcraft_render::yuv::View<'_>, surfaces: bool, read: bool) -> Option<(bool, Option<Image>)> {
+        let mut e = Enc::new(&self.ctx);
+        let (img, imported) = crate::yuv::decode_from(&mut e, view, surfaces)?;
+        let image = if read {
+            Some(e.download(&img)?)
+        } else {
+            e.submit();
+            self.wait();
+            None
+        };
+        Some((imported, image))
+    }
+
     /// Wait for submitted GPU work with the readback deadline (benchmarks).
     pub fn wait(&self) {
         let _ = self.ctx.poll_readbacks(wgpu::PollType::Wait { submission_index: None, timeout: Some(crate::readback::TIMEOUT) });

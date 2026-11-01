@@ -8,6 +8,7 @@
 
 mod nal;
 
+use effectcraft_gpu::surface::SurfaceKey;
 use effectcraft_platform::h26x::VtNalDecoder;
 use effectcraft_platform::nal::select;
 use effectcraft_platform::surfaces::{self, MAX_SURFACES};
@@ -84,6 +85,12 @@ fn read(device: &wgpu::Device, queue: &wgpu::Queue, t: &wgpu::Texture, channels:
     out
 }
 
+/// The registry key of a 4:2:0 picture without alpha (what the hardware H.264 / HEVC decoder
+/// outputs).
+fn key(luma: usize, width: u32, height: u32, bits: u32) -> SurfaceKey {
+    SurfaceKey { luma, width, height, bits, subsampling: [1, 1], alpha: false }
+}
+
 fn bytemuck_u32(b: &[u8]) -> Vec<u32> {
     b.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
@@ -104,7 +111,7 @@ fn the_gpu_reads_exactly_the_decoded_samples_from_the_decoder_surface() {
         return;
     };
     // the first ask turns keeping surfaces on (nothing is kept before)
-    assert!(surfaces::import(&device, 1, 2, 2, 8).is_none());
+    assert!(surfaces::import(&device, key(1, 2, 2, 8)).is_none());
     for (name, s) in [("H.264", nal::h264(194, 110, 24, 2, 8)), ("HEVC Main 10", nal::hevc(192, 108, 6, true, 3))] {
         let stream = select(&s.entry, true, |_| true).expect("taken");
         let mut d = match VtNalDecoder::new(stream) {
@@ -125,7 +132,7 @@ fn the_gpu_reads_exactly_the_decoded_samples_from_the_decoder_surface() {
         for f in recent {
             let (address, cpu, bits) = planes(f);
             let (w, h) = (f.frame.width, f.frame.height);
-            let Some(p) = surfaces::import(&device, address, w, h, bits) else { continue };
+            let Some(p) = surfaces::import(&device, key(address, w, h, bits)) else { continue };
             imported += 1;
             // the picture's window of the surface, row by row
             let window = |t: &wgpu::Texture, channels: u32, c: u32, (x0, y0): (u32, u32), (ww, hh): (u32, u32)| -> Vec<u32> {
@@ -139,14 +146,14 @@ fn the_gpu_reads_exactly_the_decoded_samples_from_the_decoder_surface() {
             assert_eq!(window(&p.chroma, 2, 0, (ox / 2, oy / 2), (cw, ch)), cpu[1], "{name}: frame {}: Cb read from the surface", f.pts);
             assert_eq!(window(&p.chroma, 2, 1, (ox / 2, oy / 2), (cw, ch)), cpu[2], "{name}: frame {}: Cr read from the surface", f.pts);
             // a size or depth that doesn't match is never served
-            assert!(surfaces::import(&device, address, w + 2, h, bits).is_none());
+            assert!(surfaces::import(&device, key(address, w + 2, h, bits)).is_none());
         }
         assert!(imported > 0, "{name}: the recent frames' surfaces are kept");
         // once the frames are gone their surfaces are never found again
         let keys: Vec<_> = frames.iter().map(|f| (planes(f).0, f.frame.width, f.frame.height, planes(f).2)).collect();
         drop(frames);
         for (address, w, h, bits) in keys {
-            assert!(surfaces::import(&device, address, w, h, bits).is_none(), "{name}: a dropped frame's surface");
+            assert!(surfaces::import(&device, key(address, w, h, bits)).is_none(), "{name}: a dropped frame's surface");
         }
     }
 }

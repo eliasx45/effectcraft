@@ -11,7 +11,9 @@
 //! has no parameter sets), hardware decoding is required, and each sample is decoded
 //! synchronously into a tri-planar `s4as` (4:4:4 + alpha; the decoder's own layout: the packed
 //! `y416` it also offers comes with low-passed chroma) or biplanar `x422` (4:2:2) buffer that the
-//! callback copies into planes ([`crate::convert`]).
+//! callback copies into planes ([`crate::convert`]). The buffers are IOSurface-backed and
+//! Metal-compatible, and once the GPU shares surfaces ([`crate::surfaces`]) the callback also
+//! hands back the buffer itself, so the GPU can read it without an upload (Fix 2).
 
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
@@ -26,8 +28,8 @@ use objc2_core_media::{
 use objc2_core_video::{
     CVImageBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane,
     CVPixelBufferGetPixelFormatType, CVPixelBufferGetPlaneCount, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress, kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
-    kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar,
+    CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey, kCVPixelBufferPixelFormatTypeKey,
+    kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar,
 };
 use objc2_video_toolbox::{
     VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionOutputCallbackRecord, VTDecompressionSession,
@@ -35,6 +37,8 @@ use objc2_video_toolbox::{
 };
 
 use crate::convert::{self, Planes, Rows};
+use crate::metal_surface::Surface;
+use crate::surfaces;
 
 /// Tri-planar 4:4:4 Y', Cb Cr, A, 16 bits each (ProRes 4444 / 4444 XQ, with or without alpha).
 pub(crate) const S4AS: u32 = kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar;
@@ -64,7 +68,14 @@ struct Shared {
     pixel_format: u32,
     width: usize,
     height: usize,
-    out: Mutex<Option<Result<Planes, String>>>,
+    out: Mutex<Option<Result<Decoded, String>>>,
+}
+
+/// A decoded picture: its planar copy, and the decoder's buffer itself when the GPU shares
+/// surfaces ([`surfaces::enabled`]).
+pub(crate) struct Decoded {
+    pub planes: Planes,
+    pub surface: Option<Surface>,
 }
 
 /// A hardware ProRes decompression session for one fourcc, size and output format. Dropping it
@@ -120,7 +131,8 @@ unsafe extern "C-unwind" fn output_callback(
         // SAFETY: VideoToolbox passes a valid image buffer that stays alive for the duration of
         // the callback; we only borrow it here.
         let pb = unsafe { image.as_ref() };
-        copy_out(pb, shared, alpha)
+        let planes = copy_out(pb, shared, alpha)?;
+        Ok(Decoded { planes, surface: surfaces::enabled().then(|| Surface::retain(pb)) })
     }));
     let r = r.unwrap_or_else(|_| Err("panic while reading a decoded picture".into()));
     *shared.out.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
@@ -206,7 +218,12 @@ impl Session {
         let pf = CFNumber::new_i32(pixel_format as i32);
         // SAFETY: reading an immutable framework constant.
         let pf_key: &CFString = unsafe { kCVPixelBufferPixelFormatTypeKey };
-        let attrs = CFDictionary::<CFString, CFType>::from_slices(&[pf_key], &[pf.as_ref()]);
+        // IOSurface-backed, Metal-compatible buffers: the GPU can read them without a copy (Fix 2)
+        // SAFETY: reading immutable framework constants.
+        let (io_key, metal_key): (&CFString, &CFString) = unsafe { (kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey) };
+        let io_props = CFDictionary::<CFString, CFType>::from_slices(&[], &[]);
+        let yes = CFBoolean::new(true);
+        let attrs = CFDictionary::<CFString, CFType>::from_slices(&[pf_key, io_key, metal_key], &[pf.as_ref(), io_props.as_ref(), yes.as_ref()]);
         let shared = Box::new(Shared { pixel_format, width: width as usize, height: height as usize, out: Mutex::new(None) });
         let record = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(output_callback),
@@ -224,7 +241,7 @@ impl Session {
     }
 
     /// Decode one ProRes frame (synchronously) into planes; alpha only when `alpha`.
-    pub(crate) fn decode(&self, sample: &[u8], alpha: bool) -> Result<Planes, String> {
+    pub(crate) fn decode(&self, sample: &[u8], alpha: bool) -> Result<Decoded, String> {
         let buffer = sample_buffer(sample, 0, &self.format)?;
         *self.shared.out.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let mut info = VTDecodeInfoFlags(0);

@@ -24,9 +24,10 @@
 //!   the last restart point ([`hybrid::HybridDecoder`]): same pictures, pts and order.
 //!
 //! Frames come out as the software decoders' planar YUV (a CPU copy of the decoded buffer), so
-//! the media pool, caches and every CPU path are unchanged. H.264 / HEVC pictures also keep their
-//! decoder surface for a while ([`surfaces`]): on Metal the GPU compositor samples it directly
-//! instead of uploading the planes (`effectcraft_gpu::surface`, FFI in `metal_surface`).
+//! the media pool, caches and every CPU path are unchanged. Hardware pictures (H.264 / HEVC and
+//! ProRes) also keep their decoder surface for a while ([`surfaces`]): on Metal the GPU compositor
+//! samples it directly instead of uploading the planes (`effectcraft_gpu::surface`, FFI in
+//! `metal_surface`).
 //!
 //! [`register`] also installs the VideoToolbox ProRes encoder ([`prores_enc`], Fix 4) behind
 //! `effectcraft_media::prores_enc`: ProRes exports and proxies encode on the media engines, and
@@ -96,9 +97,14 @@ pub fn register() -> Availability {
         }
         if nal {
             filmcraft_codecs::register_video_decoder(h26x::factory);
-            // HWDEC2: the GPU compositor reads decoded H.264 / HEVC pictures from the decoder's
-            // surface instead of uploading them (Metal only; anything else uploads as before)
+        }
+        if prores || nal {
+            // HWDEC2 / Fix 2: the GPU compositor reads hardware-decoded H.264 / HEVC / ProRes
+            // pictures from the decoder's surface instead of uploading them (Metal only; anything
+            // else uploads as before)
             effectcraft_gpu::surface::set_surface_import(surfaces::import);
+            // ...also when previews keep footage at 8 bits (the pool rounds each frame)
+            effectcraft_media::hw::set_eight_bit_hook(surfaces::rounded_to_8bit);
         }
         effectcraft_media::hw::set_available(prores || nal);
         // Fix 4: ProRes exports and proxies encode on the media engines, falling back to

@@ -51,6 +51,8 @@ wgpu = { workspace = true }
 
 [dev-dependencies]
 pollster = { workspace = true }
+# prores_surface_bench: the old 8-bit rounding, for comparison
+rayon = { workspace = true }
 effectcraft-hevcenc = { workspace = true }
 filmcraft-h264enc = { workspace = true }
 effectcraft-project = { workspace = true }

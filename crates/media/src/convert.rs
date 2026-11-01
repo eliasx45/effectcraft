@@ -149,13 +149,27 @@ pub(crate) fn frame_to_8bit(f: &VideoFrame) -> Option<VideoFrame> {
     let limited = |v: u16| ((u32::from(v).min(max) + half) >> shift).min(255) as u8;
     let mid = 1i64 << (bits - 1);
     let full_chroma = |v: u16| (128 + ((i64::from(v).min(i64::from(max)) - mid) * 255 + i64::from(max / 2)).div_euclid(i64::from(max))).clamp(0, 255) as u8;
-    let conv = |p: &[u16], f: &(dyn Fn(u16) -> u8 + Sync)| -> Arc<Vec<u8>> { Arc::new(p.par_iter().map(|v| f(*v)).collect()) };
     let planes = match f.color.range {
-        Range::Limited => [conv(&planes[0], &limited), conv(&planes[1], &limited), conv(&planes[2], &limited)],
-        Range::Full => [conv(&planes[0], &full), conv(&planes[1], &full_chroma), conv(&planes[2], &full_chroma)],
+        Range::Limited => [to_u8(&planes[0], limited), to_u8(&planes[1], limited), to_u8(&planes[2], limited)],
+        Range::Full => [to_u8(&planes[0], full), to_u8(&planes[1], full_chroma), to_u8(&planes[2], full_chroma)],
     };
-    let alpha = alpha.as_ref().map(|a| conv(a, &full));
+    let alpha = alpha.as_ref().map(|a| to_u8(a, full));
     Some(VideoFrame { width: f.width, height: f.height, data: PixelData::Yuv8 { planes, chroma: *chroma, alpha }, color: f.color, par: f.par, pts: f.pts })
+}
+
+/// `f` of every sample of a plane, in parallel bands. Each band is a plain loop over the plane
+/// with `f` inlined, which the compiler vectorises (the limited-range rounding is a min, an add
+/// and a shift); it was a parallel iterator over single samples through a `dyn Fn`, 43–57 % of
+/// all CPU time while previews decoded 1080p ProRes 4444 at 8 bits (1 Nov 2026 profile).
+fn to_u8(p: &[u16], f: impl Fn(u16) -> u8 + Sync) -> Arc<Vec<u8>> {
+    const BAND: usize = 1 << 18;
+    let mut out = vec![0u8; p.len()];
+    out.par_chunks_mut(BAND).zip(p.par_chunks(BAND)).for_each(|(o, s)| {
+        for (o, v) in o.iter_mut().zip(s) {
+            *o = f(*v);
+        }
+    });
+    Arc::new(out)
 }
 
 /// A decoded picture kept compactly and turned into compositor pixels on use, exactly as
@@ -180,7 +194,11 @@ impl Packed {
     /// RGBA), for previews that keep footage at 8 bits. `None` when it is 8-bit already.
     pub(crate) fn to_8bit(&self) -> Option<Packed> {
         match self {
-            Packed::Video { frame, op } => frame_to_8bit(frame).map(|f| Packed::Video { frame: Arc::new(f), op: *op }),
+            Packed::Video { frame, op } => frame_to_8bit(frame).map(|f| {
+                // (the decoder surface the GPU may read goes with the 8-bit frame)
+                crate::hw::rounded_to_8bit(frame, &f);
+                Packed::Video { frame: Arc::new(f), op: *op }
+            }),
             Packed::Rgba16 { width, height, data, op } => Some(Packed::Rgba8 {
                 width: *width,
                 height: *height,

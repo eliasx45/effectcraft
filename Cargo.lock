@@ -1868,6 +1868,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-video-toolbox",
  "pollster 0.4.0",
+ "rayon",
  "wgpu",
 ]
 

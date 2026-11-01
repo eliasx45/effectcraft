@@ -18,6 +18,7 @@ use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use filmcraft_isobmff::{CodecConfig, SampleEntry};
 use filmcraft_prores::{AlphaType, ChromaFormat, FrameHeader, Interlace};
 
+use crate::surfaces;
 use crate::videotoolbox::{self, S4AS, Session, X422};
 
 /// Hardware sessions alive at once (all formats).
@@ -101,6 +102,9 @@ fn acquire(f: Format) -> std::result::Result<Session, String> {
 }
 
 const BUSY: &str = "every hardware session is busy";
+/// Ends the error of a hardware decode that failed while surfaces were held for the GPU (they were
+/// let go; the failure doesn't count towards [`GIVE_UP_AFTER`]).
+const SHED: &str = " (decoded surfaces held for the GPU were let go)";
 
 /// Give a working session back.
 fn release(f: Format, s: Session) {
@@ -210,16 +214,22 @@ impl VtProResDecoder {
         }
         let alpha = hdr.alpha != AlphaType::None && self.chroma == ChromaFormat::Yuv444;
         let session = acquire(f)?;
-        let planes = match session.decode(sample, alpha) {
+        let decoded = match session.decode(sample, alpha) {
             Ok(p) => {
                 release(f, session);
                 p
             }
             Err(e) => {
                 discard(session);
+                // Surfaces held for the GPU might have drained the decoder's buffer pool: let
+                // them go, and don't count this failure towards giving the stream up.
+                if surfaces::shed() > 0 {
+                    return Err(format!("{e}{SHED}"));
+                }
                 return Err(e);
             }
         };
+        let planes = decoded.planes;
         let (chroma, bits) = match self.chroma {
             ChromaFormat::Yuv422 => (Chroma::C422, 10),
             ChromaFormat::Yuv444 => (Chroma::C444, 12),
@@ -232,10 +242,17 @@ impl VtProResDecoder {
         if let Some(t) = filmcraft_color::Transfer::from_code(hdr.color.transfer) {
             color.transfer = t;
         }
+        let y = Arc::new(planes.y);
+        // Fix 2: the GPU may read this picture from the decoder's surface instead of uploading it
+        if let Some(surface) = decoded.surface {
+            let subsampling = if chroma == Chroma::C444 { [0, 0] } else { [1, 0] };
+            let layout = surfaces::Layout { size: (f.width, f.height), bits, subsampling, alpha: planes.alpha.is_some(), eight_from: 0 };
+            surfaces::keep(surfaces::Luma::U16(Arc::downgrade(&y)), layout, (0, 0), surface);
+        }
         Ok(VideoFrame {
             width: f.width,
             height: f.height,
-            data: PixelData::Yuv16 { planes: [Arc::new(planes.y), Arc::new(planes.cb), Arc::new(planes.cr)], chroma, bits, alpha: planes.alpha.map(Arc::new) },
+            data: PixelData::Yuv16 { planes: [y, Arc::new(planes.cb), Arc::new(planes.cr)], chroma, bits, alpha: planes.alpha.map(Arc::new) },
             color,
             par: (1, 1),
             pts: filmcraft_time::Tick::ZERO,
@@ -252,7 +269,7 @@ impl VideoDecoder for VtProResDecoder {
                 Ok(vec![DecodedFrame { pts, frame, draft: false }])
             }
             Err(why) => {
-                if why != BUSY {
+                if why != BUSY && !why.ends_with(SHED) {
                     self.failures = self.failures.saturating_add(1);
                 }
                 if !self.warned {

@@ -142,6 +142,34 @@ need an upload to reach the GPU compositor on Metal. The fourth job of this crat
   cache and every CPU path need them); dropping that copy would need a surface-carrying variant
   of `filmcraft_frame::PixelData` upstream.
 
+## Amendment (2026-11-01): ProRes surfaces shared with the GPU too (Fix 2)
+
+**Status:** accepted (2026-11-01, approved by the project owner, Elias, as "Fix 2" of the ProRes
+preview speed plan).
+
+A 4K ProRes 4444 + alpha frame cost about 15 ms of GPU upload per layer (66 MB of planes; the
+hardware decode itself is about 3 ms). HWDEC2's zero-copy path now covers hardware ProRes too,
+under the same rules:
+
+- ProRes sessions (`videotoolbox`) ask for IOSurface-backed, Metal-compatible `s4as` / `x422`
+  buffers; once the GPU shares surfaces, the output callback also retains the decoded buffer and
+  `prores` keeps it in `surfaces` with the picture's layout (bits, chroma subsampling, alpha).
+- `metal_surface` imports `s4as` as R16 Y, RG16 CbCr and R16 alpha planes and `x422` as R16 Y and
+  half-width RG16 CbCr (plane sizes from CoreVideo); the GPU's split pass rounds luma / chroma to
+  the coded depth and clamps, and shifts alpha down, exactly as `convert` does for the CPU planes,
+  so the decoded picture is bit-identical to the uploaded one.
+- Held surfaces are bounded by bytes (768 MB by default, `surfaces::set_budget`) as well as count
+  (64); gone pictures leave first, then those the GPU already read, then the oldest. A hardware
+  ProRes decode that fails while surfaces are held lets them all go (in case the decoder's pool
+  ran dry) and is not counted towards giving the stream up. Every other failure uploads as before.
+- Decode Footage at 8 Bits (the owner's default): the media pool still rounds each frame to 8 bits
+  on the CPU (now a vectorised loop) and keeps only that, and tells the platform through
+  `effectcraft_media::hw::set_eight_bit_hook`; the kept surface moves to the 8-bit frame and the
+  split pass rounds it to 8 bits exactly as `frame_to_8bit` does (limited range only; other
+  frames upload), so the 8-bit picture is bit-identical to its upload too.
+- The CPU copy stays (CPU renders, caches and the footage cache read it); keeping frames on the
+  GPU with a CPU copy only on demand is a later step ("Fix 3").
+
 ## Amendment (2026-11-01): hardware ProRes encoding (Fix 4)
 
 **Status:** accepted (2026-11-01, approved by the project owner, Elias, as "Fix 4" of his ProRes

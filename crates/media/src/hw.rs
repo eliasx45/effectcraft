@@ -57,6 +57,36 @@ pub fn available() -> bool {
     AVAILABLE.load(Ordering::Relaxed)
 }
 
+/// Told when a preview read rounds a decoded frame to 8 bits (`full` to `eight_bit`, Settings ▸
+/// Previews ▸ Decode Footage at 8 Bits): a platform layer that keeps the hardware decoder's
+/// surface of `full` for the GPU hands it over to `eight_bit`, so the GPU reads the 8-bit frame
+/// from the surface too instead of uploading its planes (Fix 2, 1 Nov 2026).
+pub type EightBitHook = fn(full: &filmcraft_frame::VideoFrame, eight_bit: &filmcraft_frame::VideoFrame);
+
+static EIGHT_BIT: std::sync::OnceLock<EightBitHook> = std::sync::OnceLock::new();
+
+/// Install the platform's [`EightBitHook`] (once; later calls are ignored).
+pub fn set_eight_bit_hook(f: EightBitHook) {
+    let _ = EIGHT_BIT.set(f);
+}
+
+/// The 8-bit frame a preview read at 8 bits keeps of `f`, made as the media pool makes it (and
+/// the [`EightBitHook`] told); `None` when `f` is 8-bit already. (Tests and benchmarks of the
+/// platform's surface handover.)
+#[doc(hidden)]
+pub fn round_to_8bit(f: &filmcraft_frame::VideoFrame) -> Option<filmcraft_frame::VideoFrame> {
+    let e = crate::convert::frame_to_8bit(f)?;
+    rounded_to_8bit(f, &e);
+    Some(e)
+}
+
+/// `full` was rounded to `eight_bit` ([`EightBitHook`]).
+pub(crate) fn rounded_to_8bit(full: &filmcraft_frame::VideoFrame, eight_bit: &filmcraft_frame::VideoFrame) {
+    if let Some(f) = EIGHT_BIT.get() {
+        f(full, eight_bit);
+    }
+}
+
 /// Whether footage with this codec description ([`effectcraft_project::Footage::codec`]) is one
 /// a registered hardware decoder may take: Apple ProRes, H.264 and HEVC (FilmCraft's labels,
 /// e.g. "Apple ProRes 4444", "H.264 (High)", "HEVC"). The decoder factory itself still declines
