@@ -49,6 +49,7 @@ impl<K> Default for Latest<K> {
     }
 }
 impl<K: Eq> Latest<K> {
+    #[cfg(test)]
     pub(crate) fn completed(key: Option<K>) -> Self {
         Self { pending: None, started: key, declined: None }
     }

@@ -964,9 +964,18 @@ pub struct GpuContext {
     bgl_ext: wgpu::BindGroupLayout,
     pub(crate) fusion: crate::fusion::Pipelines,
     pub(crate) yuv: Option<crate::yuv::Pipelines>,
+    /// The compositor's own kernels (built with the context).
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
+    /// Effect kernels, each built the first time a frame needs it ([`GpuContext::kernel`]) or by
+    /// [`GpuContext::warm_kernels`] in the background (#6, 1 Nov 2026: building all ~230 of them
+    /// up front kept every frame on the CPU for over two minutes on a busy Mac with a cold shader
+    /// cache). `None`: it failed to build.
+    lazy: HashMap<&'static str, std::sync::OnceLock<Option<wgpu::ComputePipeline>>>,
+    /// The kernels' module and pipeline layout the lazy kernels are built from.
+    kernel_module: wgpu::ShaderModule,
+    kernel_layout: wgpu::PipelineLayout,
     /// Effect kernels that failed to build, and why (their effects render on the CPU).
-    unavailable: Vec<(&'static str, String)>,
+    unavailable: Mutex<Vec<(&'static str, String)>>,
     display_bgl: wgpu::BindGroupLayout,
     display: wgpu::ComputePipeline,
     /// The display texture's next mip level from the one above (`display.wgsl` `mip`).
@@ -1296,9 +1305,10 @@ impl GpuContext {
                 })
             })
         };
-        // The compositor's own kernels are required; an effect kernel that doesn't build is
-        // left out, and its effects render on the CPU (see `Enc::take_missing`).
-        let mut pipelines = ENTRIES
+        // The compositor's own kernels are required; an effect kernel is built when first used
+        // (`GpuContext::kernel`), and one that doesn't build is left out: its effects render on
+        // the CPU (see `Enc::take_missing`).
+        let pipelines = ENTRIES
             .iter()
             .chain(crate::adv3d::SKY_KERNELS)
             .map(|e| (e, &layout))
@@ -1306,6 +1316,7 @@ impl GpuContext {
             .map(|(e, layout)| Ok((*e, build(e, layout)?)))
             .collect::<Result<HashMap<_, _>, String>>()?;
         let mut unavailable = vec![];
+        let mut lazy = HashMap::new();
         for e in EFFECT_ENTRIES
             .iter()
             .chain(TEST_ENTRIES)
@@ -1333,21 +1344,13 @@ impl GpuContext {
             .chain(crate::fx_shadowstudio::KERNELS)
             .chain(crate::fx_styles::KERNELS)
         {
-            match build(e, &layout) {
-                Ok(p) => {
-                    pipelines.insert(*e, p);
-                }
-                Err(why) => {
-                    log::warn!("gpu {name}: kernel {e} unavailable, its effects render on the CPU: {why}");
-                    unavailable.push((*e, why));
-                }
-            }
+            lazy.insert(*e, std::sync::OnceLock::new());
         }
         log::info!(
-            "gpu {name}: {} compute kernels built in {:.1} s ({} unavailable)",
+            "gpu {name}: {} compositor kernels built in {:.1} s; {} effect kernels build when first used",
             pipelines.len(),
             compile_start.elapsed().as_secs_f64(),
-            unavailable.len()
+            lazy.len()
         );
         let dmodule = init_resource(&device, "display shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1429,9 +1432,12 @@ impl GpuContext {
             bgl,
             bgl_ext,
             pipelines,
+            lazy,
+            kernel_module: module,
+            kernel_layout: layout,
             fusion: Default::default(),
             yuv,
-            unavailable,
+            unavailable: Mutex::new(unavailable),
             display_bgl,
             display,
             display_mip,
@@ -1849,15 +1855,98 @@ impl GpuContext {
     /// Readbacks (GPU → CPU) are possible: waited for natively, or deferred (a browser
     /// worker, [`crate::deferred`]). Impossible on the browser's main thread.
     /// Effect kernels the device couldn't build, with why: their effects render on the CPU.
-    pub fn unavailable_kernels(&self) -> &[(&'static str, String)] {
-        &self.unavailable
+    /// (Effect kernels are built when first used: one not built yet isn't listed.)
+    pub fn unavailable_kernels(&self) -> Vec<(&'static str, String)> {
+        self.unavailable.lock().map(|u| u.clone()).unwrap_or_default()
+    }
+
+    /// Kernel `entry`: a compositor kernel, or an effect kernel built now if this is its first
+    /// use (another thread asking for it meanwhile waits for the same build). `None`: unknown,
+    /// or it failed to build (logged once, listed in [`Self::unavailable_kernels`]).
+    pub(crate) fn kernel(&self, entry: &str) -> Option<&wgpu::ComputePipeline> {
+        if let Some(p) = self.pipelines.get(entry) {
+            return Some(p);
+        }
+        let (name, cell) = self.lazy.get_key_value(entry)?;
+        cell.get_or_init(|| self.build_kernel(name)).as_ref()
+    }
+
+    /// Whether `entry` is a kernel of this context (built or not).
+    fn knows_kernel(&self, entry: &str) -> bool {
+        self.pipelines.contains_key(entry) || self.lazy.contains_key(entry)
+    }
+
+    fn build_kernel(&self, e: &'static str) -> Option<wgpu::ComputePipeline> {
+        // Metal keeps the serial `box_h` (see `GpuContext::new`).
+        let entry = if self.metal && e == "box_h" { "box_h_serial" } else { e };
+        let built = init_resource(&self.device, e, || {
+            self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(e),
+                layout: Some(&self.kernel_layout),
+                module: &self.kernel_module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        match built {
+            Ok(p) => {
+                self.static_pipeline_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(p)
+            }
+            Err(why) => {
+                log::warn!("gpu {}: kernel {e} unavailable, its effects render on the CPU: {why}", self.name);
+                self.unavailable.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((e, why));
+                None
+            }
+        }
+    }
+
+    /// Build every effect kernel not built yet (a startup worker, after the compositor is in
+    /// use: frames build the ones they need themselves meanwhile), on up to `threads` threads.
+    /// Returns (kernels built now, kernels that failed).
+    pub fn warm_kernels(&self, threads: usize) -> (usize, usize) {
+        let todo: Vec<&'static str> = self.lazy.iter().filter(|(_, c)| c.get().is_none()).map(|(e, _)| *e).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let failed = std::sync::atomic::AtomicUsize::new(0);
+        let work = || {
+            loop {
+                if self.check_health().is_err() {
+                    return;
+                }
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(e) = todo.get(i) else { return };
+                if self.kernel(e).is_none() {
+                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::scope(|s| {
+            for _ in 1..threads.clamp(1, 8) {
+                let spawned = std::thread::Builder::new().name("effectcraft-gpu-kernels".into()).spawn_scoped(s, work);
+                if spawned.is_err() {
+                    break;
+                }
+            }
+            work();
+        });
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = threads;
+            work();
+        }
+        let built = next.load(std::sync::atomic::Ordering::Relaxed).min(todo.len());
+        let failed = failed.load(std::sync::atomic::Ordering::Relaxed);
+        (built.saturating_sub(failed), failed)
     }
 
     /// Leave kernel `entry` out, as if it had failed to build (tests of the CPU fallback).
     #[cfg(test)]
     pub(crate) fn drop_kernel(&mut self, entry: &'static str) {
         self.pipelines.remove(entry);
-        self.unavailable.push((entry, "dropped by a test".into()));
+        self.lazy.insert(entry, std::sync::OnceLock::from(None));
+        self.unavailable.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((entry, "dropped by a test".into()));
     }
 
     /// Bytes of readback staging buffers kept for reuse (tests).
@@ -3173,8 +3262,9 @@ impl<'g> Enc<'g> {
             self.dispatch_views(entry, pipe, &bank.bgl, p, views, data, groups, None, None);
             return;
         }
-        let Some(pipe) = g.pipelines.get(entry) else {
-            if !g.unavailable.iter().any(|(e, _)| *e == entry) {
+        let Some(pipe) = g.kernel(entry) else {
+            // A kernel that failed to build was logged then.
+            if !g.knows_kernel(entry) {
                 log::error!("gpu: no kernel {entry}");
             }
             self.missing = true;
@@ -3388,7 +3478,7 @@ impl<'g> Enc<'g> {
 
     /// Whether the kernel `entry` built on this device.
     pub(crate) fn has_kernel(&self, entry: &str) -> bool {
-        self.g.pipelines.contains_key(entry)
+        self.g.kernel(entry).is_some()
     }
 
     /// Per-pixel kernel over `out`'s size (16×16 workgroups).
@@ -4612,5 +4702,36 @@ mod upload_budget_tests {
         assert_eq!(g.upload_stats(), (0, 0));
         assert!(a.get(1).is_some() && b.get(2).is_some());
         assert_eq!((a.retained_stats().live_bytes, b.retained_stats().live_bytes), (16, 16));
+    }
+}
+
+#[cfg(test)]
+mod lazy_kernel_tests {
+    use super::*;
+
+    /// #6 (1 Nov 2026): a new context builds only the compositor's own kernels; an effect
+    /// kernel builds the first time it is asked for (once, however many threads ask), and
+    /// `warm_kernels` builds the rest in the background. Before, all ~250 were built before the
+    /// compositor could be used (over two minutes on a busy Mac with a cold shader cache).
+    #[test]
+    fn effect_kernels_build_on_first_use_and_warm_in_the_background() {
+        let Ok(ctx) = pollster::block_on(GpuContext::request()) else { return };
+        let start = ctx.static_pipeline_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(ctx.lazy.len() > 100, "the effect kernels wait: {}", ctx.lazy.len());
+        assert!(ctx.lazy.values().all(|c| c.get().is_none()), "none built with the context");
+        assert!(ctx.pipelines.len() < 40, "only the compositor's own: {}", ctx.pipelines.len());
+        // Asked for from several threads at once: one build.
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| assert!(ctx.kernel("pointwise").is_some()));
+            }
+        });
+        assert_eq!(ctx.static_pipeline_count.load(std::sync::atomic::Ordering::Relaxed), start + 1);
+        assert!(ctx.kernel("no_such_kernel").is_none());
+        let (built, failed) = ctx.warm_kernels(3);
+        assert_eq!(built + failed, ctx.lazy.len() - 1, "all but the one built already");
+        assert_eq!(failed, ctx.unavailable_kernels().iter().filter(|(e, _)| *e != "yuv").count());
+        assert!(ctx.lazy.values().all(|c| c.get().is_some()), "every effect kernel tried");
+        assert_eq!(ctx.warm_kernels(3), (0, 0), "nothing left");
     }
 }

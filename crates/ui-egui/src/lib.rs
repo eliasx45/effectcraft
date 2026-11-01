@@ -587,8 +587,9 @@ pub struct EffectcraftApp {
     gpu_startup: Option<gpu_startup::Pending<effectcraft_gpu::Gpu>>,
     #[cfg(not(target_arch = "wasm32"))]
     gpu_prewarm: gpu_startup::Latest<(u64, effectcraft_project::ItemId)>,
+    /// When the GPU compositor's startup job began (logged once it is in use).
     #[cfg(not(target_arch = "wasm32"))]
-    gpu_startup_key: Option<(u64, effectcraft_project::ItemId)>,
+    gpu_startup_began: Option<web_time::Instant>,
     gpu_failures: Option<gpu_failure::GpuFailureBridge>,
     gpu_failure_applied: Option<bool>,
     /// CR1: compositors set up again after a failure on a device of their own (at most
@@ -732,7 +733,7 @@ impl EffectcraftApp {
             #[cfg(not(target_arch = "wasm32"))]
             gpu_prewarm: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
-            gpu_startup_key: None,
+            gpu_startup_began: None,
             gpu_failures: None,
             gpu_failure_applied: None,
             gpu_rebuilds: 0,
@@ -1266,22 +1267,24 @@ impl EffectcraftApp {
                 let (adapter, device, queue, wake) = (rs.adapter.clone(), rs.device.clone(), rs.queue.clone(), ctx.clone());
                 let share = self.zero_copy.share(&self.session.prefs);
                 let off_window = self.compositor_off_window;
-                let project = self.session.freeze_preview_project();
-                let comp = self.session.active_comp_id();
-                self.gpu_startup_key = comp.map(|comp| (self.session.revision, comp));
-                let time = self.session.time();
+                self.gpu_startup_began = Some(web_time::Instant::now());
                 match gpu_startup::Pending::start(
                     move || {
+                        // #6 (1 Nov 2026): the compositor is handed over as soon as its device and
+                        // own kernels are up. Its effect kernels, optional pipelines and the
+                        // project's effect sequences warmed here first used to take minutes on a
+                        // busy Mac with a cold shader cache (never done within 120 s in 4 of 5
+                        // measured `mcp --ui` starts), and every frame rendered on the CPU until
+                        // then. They now build in the background once it is in use
+                        // (`warm_gpu_in_background`), and frames build what they need first.
+                        let t0 = web_time::Instant::now();
                         let gpu = compositor_gpu(&adapter, device, queue, share, off_window)?;
                         // Unified memory sizes its texture pool by RAM (RT9a). Off the UI thread;
                         // not on Windows, where reading it starts PowerShell (the memory watch
                         // passes it on there).
                         #[cfg(not(target_os = "windows"))]
                         gpu.context().set_system_memory(effectcraft_engine::sysinfo::memory().map_or(0, |m| m.total));
-                        gpu.warm_pipelines()?;
-                        if let Some(comp) = comp {
-                            log::debug!("GPU startup project warmup: {:?}", gpu.warm_project(&project, comp, time));
-                        }
+                        log::info!("GPU compositor set up in {:.1} s", t0.elapsed().as_secs_f64());
                         Ok(gpu)
                     },
                     move || wake.request_repaint(),
@@ -1333,17 +1336,45 @@ impl EffectcraftApp {
                 g.context().set_cache_budget(self.session.prefs.cache_budgets(self.session.sys_memory).layer);
                 g.context().set_half_intermediates(self.session.prefs.previews.half_float_effects);
                 self.session.accel = Some(Arc::new(g.clone()));
-                self.gpu = Some(g);
                 #[cfg(not(target_arch = "wasm32"))]
-                {
-                    self.gpu_prewarm = gpu_startup::Latest::completed(self.gpu_startup_key.take());
-                }
+                self.warm_gpu_in_background(&g);
+                self.gpu = Some(g);
                 self.wgpu = Some(rs.clone());
             }
             Err(reason) => {
                 log::info!("GPU compositor unavailable: {reason}");
                 self.session.accel_note = Some(format!("GPU compositor unavailable: {reason}"));
             }
+        }
+    }
+
+    /// #6: the compositor just came into use: build its effect kernels and optional pipelines
+    /// on a worker of their own (frames build the ones they need first), logging how long that
+    /// took. The open comp's effect sequences warm next to it ([`Self::prewarm_gpu_project`],
+    /// at the next UI frame).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn warm_gpu_in_background(&mut self, gpu: &effectcraft_gpu::Gpu) {
+        if let Some(t0) = self.gpu_startup_began.take() {
+            log::info!("GPU compositor in use {:.1} s after its startup began; its kernels and pipelines warm in the background", t0.elapsed().as_secs_f64());
+        }
+        // A new compositor warms the open comp again (its pipelines are its own).
+        self.gpu_prewarm = gpu_startup::Latest::default();
+        let gpu = gpu.clone();
+        let warm = gpu_startup::Pending::start(
+            move || {
+                let t0 = web_time::Instant::now();
+                let warmed = gpu.warm_pipelines();
+                match &warmed {
+                    Ok(()) => log::info!("GPU warm-up: kernels and pipelines built {:.1} s after the compositor came into use", t0.elapsed().as_secs_f64()),
+                    Err(e) => log::warn!("GPU warm-up stopped after {:.1} s: {e}", t0.elapsed().as_secs_f64()),
+                }
+                warmed
+            },
+            || {},
+        );
+        // Its result isn't waited for: the receiver goes, the worker finishes on its own.
+        if let Err(e) = warm {
+            log::warn!("GPU warm-up not started (kernels build when first used): {e}");
         }
     }
 
@@ -1367,7 +1398,9 @@ impl EffectcraftApp {
         self.gpu_prewarm.request(
             key,
             move || {
-                log::debug!("GPU project warmup: {:?}", gpu.warm_project(&project, comp, time));
+                let t0 = web_time::Instant::now();
+                let report = gpu.warm_project(&project, comp, time);
+                log::debug!("GPU project warmup in {:.1} s: {report:?}", t0.elapsed().as_secs_f64());
                 Ok(())
             },
             move || wake.request_repaint(),

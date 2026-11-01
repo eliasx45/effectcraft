@@ -52,6 +52,9 @@ fn warmup_failure_is_cached_and_cpu_path_remains_available() {
     assert!(gpu.is_ok() || std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"));
     let Ok(gpu) = gpu else { return };
     assert!(gpu.ctx.adv3d.set(Err("synthetic pipeline failure".into())).is_ok());
+    // The effect kernels warm first (#6: built on first use); the failed optional pipeline
+    // then adds nothing, however often it is warmed.
+    gpu.ctx.warm_kernels(2);
     let count = gpu.static_pipeline_count();
     for _ in 0..2 {
         assert_eq!(gpu.warm_pipelines(), Err("synthetic pipeline failure".into()));

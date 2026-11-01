@@ -145,10 +145,18 @@ pub struct DisplayFrame {
 }
 
 impl Gpu {
-    /// Compile optional static pipelines through the same single-flight cells used by frames.
-    /// Call from a native startup worker; dynamic effect sequences compile separately.
+    /// Compile the effect kernels and optional static pipelines through the same single-flight
+    /// cells used by frames. Call from a native worker once the compositor is in use (frames
+    /// build what they need meanwhile); dynamic effect sequences compile separately.
     pub fn warm_pipelines(&self) -> Result<(), String> {
         self.ctx.check_health()?;
+        let t0 = web_time::Instant::now();
+        let (built, failed) = self.ctx.warm_kernels(3);
+        log::info!(
+            "gpu {}: {built} effect kernels built in {:.1} s in the background ({failed} unavailable)",
+            Accelerator::name(self),
+            t0.elapsed().as_secs_f64()
+        );
         crate::adv3d::warm(&self.ctx)?;
         crate::particles::warm(&self.ctx)?;
         if let Some(bank) = &self.ctx.codes {
