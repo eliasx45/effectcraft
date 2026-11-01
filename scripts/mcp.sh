@@ -72,11 +72,16 @@ elif [ "$main" = "$root" ] && stale; then
     # Serve the current binary now, rebuild once in the background.
     if take_lock; then
         echo "effectcraft mcp: sources changed, rebuilding in the background; reconnect to use the new build" >&2
+        # Started from a subshell that exits at once, so launchd adopts the build and reaps it. Started
+        # straight from here it would become the child of the server `exec` below, which never
+        # waits for it: one zombie per server for as long as its session lives.
         (
-            build >"$log" 2>&1
-            rm -rf "$lock"
-        ) </dev/null >/dev/null 2>&1 &
-        echo "$!" >"$lock/pid" 2>/dev/null
+            (
+                build >"$log" 2>&1
+                rm -rf "$lock"
+            ) </dev/null >/dev/null 2>&1 &
+            echo "$!" >"$lock/pid" 2>/dev/null
+        )
     fi
 fi
 
