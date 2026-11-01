@@ -768,8 +768,9 @@ fn processed_resident_bounded(
                 ) {
                     r.note_cpu(ctx, layer, crate::shapes_gpu::why_cpu(r, ctx, layer));
                 }
-                let buf = crate::prepass::resident_source(r, ctx, layer, key, clip)?;
-                (e.g.upload_image(&buf.img)?, buf.offset, buf.scale)
+                let src = crate::prepass::resident_source(r, ctx, layer, key, clip)?;
+                let buf = src.buf();
+                (e.g.upload_image_coded(&buf.img, src.codes8())?, buf.offset, buf.scale)
             }
         };
         let (sw, sh) = (src.width, src.height);

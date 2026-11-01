@@ -7,18 +7,17 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use effectcraft_effects::Buf;
 use effectcraft_project::Layer;
 use effectcraft_render::cache::GpuStage;
 use effectcraft_render::prepass::prefetch_slot;
-use effectcraft_render::{ContentClip, EvalCtx, Renderer};
+use effectcraft_render::{ContentClip, EvalCtx, Renderer, ResidentSource};
 
 use crate::context::Enc;
 
 thread_local! {
     /// Resident sources produced ahead of the walk on this thread, by
     /// `effectcraft_render::prepass::prefetch_slot`.
-    static READY: RefCell<HashMap<u64, Buf>> = RefCell::new(HashMap::new());
+    static READY: RefCell<HashMap<u64, ResidentSource>> = RefCell::new(HashMap::new());
 }
 
 /// The sources one layer list's pre-pass left for the walk: dropped (with what the walk didn't
@@ -68,12 +67,13 @@ pub(crate) fn run<'a>(e: &Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&
     Prefetched { keys }
 }
 
-/// [`Renderer::resident_source`] of the layer whose content key is `key`: the pre-pass's buffer
-/// when it made one (the same call, so the same pixels), else rendered now.
-pub(crate) fn resident_source(r: &Renderer, ctx: &EvalCtx, layer: &Layer, key: u64, clip: ContentClip) -> Option<Buf> {
+/// [`Renderer::resident_source_coded`] of the layer whose content key is `key` (with its 8 bpc
+/// codes, for the upload): the pre-pass's when it made one (the same call, so the same pixels),
+/// else rendered now.
+pub(crate) fn resident_source(r: &Renderer, ctx: &EvalCtx, layer: &Layer, key: u64, clip: ContentClip) -> Option<ResidentSource> {
     let slot = prefetch_slot(ctx, layer, key);
     let ready = READY.try_with(|m| m.try_borrow_mut().ok().and_then(|mut m| m.remove(&slot))).ok().flatten();
-    ready.or_else(|| r.resident_source(ctx, layer, clip))
+    ready.or_else(|| r.resident_source_coded(ctx, layer, clip, true))
 }
 
 #[cfg(test)]
@@ -214,6 +214,37 @@ mod tests {
                         _ => panic!("{depth:?} gpu {gpu_backend} frame {i}: rendered only one way"),
                     }
                 }
+            }
+        }
+    }
+
+    /// A resident source's 8 bpc codes made in its rounding pass go up as they are and give the
+    /// texture the plain upload makes (which packs the image again), bit for bit; codes of
+    /// the wrong length are ignored; 16 bpc and float images upload as before.
+    #[test]
+    fn coded_uploads_match_plain_uploads() {
+        let Some(g) = gpu() else { return };
+        let mut e = crate::context::Enc::new(&g.ctx);
+        let bits = |img: &Image| img.data.iter().flatten().map(|v| v.to_bits()).collect::<Vec<u32>>();
+        for (w, h) in [(1u32, 1u32), (37, 19), (300, 230)] {
+            let raw = crate::tests::pattern(w + h, w, h);
+            let mut q8 = raw.clone();
+            let codes = effectcraft_render::color::quantize8_codes(&mut q8).unwrap();
+            let plain = g.ctx.upload_image(&q8).unwrap();
+            let coded = g.ctx.upload_image_coded(&q8, Some(&codes)).unwrap();
+            assert_eq!(coded.levels, Some(255.0), "{w}×{h}: went up as codes");
+            assert_eq!(plain.levels, coded.levels);
+            assert!(bits(&e.download(&coded).unwrap()) == bits(&q8), "{w}×{h}: the quantised floats");
+            assert!(bits(&e.download(&coded).unwrap()) == bits(&e.download(&plain).unwrap()), "{w}×{h}");
+            let short = g.ctx.upload_image_coded(&q8, codes.get(1..)).unwrap();
+            assert!(bits(&e.download(&short).unwrap()) == bits(&q8), "{w}×{h}: wrong-length codes ignored");
+            let mut q16 = raw.clone();
+            effectcraft_render::color::quantize(&mut q16, 32768.0);
+            for img in [&q16, &raw] {
+                let a = g.ctx.upload_image(img).unwrap();
+                let b = g.ctx.upload_image_coded(img, None).unwrap();
+                assert_eq!(a.levels, b.levels);
+                assert!(bits(&e.download(&b).unwrap()) == bits(&e.download(&a).unwrap()), "{w}×{h} 16/32 bpc");
             }
         }
     }

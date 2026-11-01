@@ -383,4 +383,97 @@ mod against_two_pass {
             }
         }
     }
+
+    /// The single round-and-pack pass (`color::quantize8_codes`, 1 Nov 2026) is the two passes
+    /// it replaces on the GPU walk's resident sources: the old quantise then the old packing,
+    /// bit for bit (the image and its codes), on 0, 1, over 1, negatives, NaN, infinities,
+    /// subnormals, colour over alpha, noise, every (colour, alpha) code pair with the halfway
+    /// values between them, and band edges (65 536 pixels a band).
+    #[test]
+    fn quantize8_codes_is_the_two_passes() {
+        let check = |src: &Image, what: &str| {
+            let full = PxRect { x0: 0, y0: 0, x1: src.width, y1: src.height };
+            let mut old = src.clone();
+            old_quantize(&mut old, full, 255.0);
+            let want = old_pack(&old.data, 255.0, |k| k as u8).unwrap_or_else(|| panic!("{what}: a quantised image packs"));
+            let mut new = src.clone();
+            let codes = crate::color::quantize8_codes(&mut new).unwrap_or_else(|| panic!("{what}: codes"));
+            assert_eq!(bits(&new), bits(&old), "{what}: pixels");
+            assert!(codes == want, "{what}: codes");
+            assert_eq!(codes8(&new.data).as_deref(), Some(&codes[..]), "{what}: what the upload would have packed");
+            // And the image is what the plain 8 bpc pass leaves.
+            let mut plain = src.clone();
+            pipe(BitDepth::Bpc8).quantize(&mut plain);
+            assert_eq!(bits(&plain), bits(&new), "{what}: pipe quantise");
+        };
+        let sizes = [(1, 1), (3, 5), (17, 13), (1921, 3), (300, 260), (65_535, 1), (65_536, 1), (65_537, 1), (256, 513)];
+        for (si, &(w, h)) in sizes.iter().enumerate() {
+            check(&image(w, h, 300 + si as u32), &format!("{w}×{h}"));
+        }
+        // Every alpha code with every colour code at and between the grid's values.
+        let mut data = Vec::new();
+        for ka in 0..=255u32 {
+            let a = ka as f32 / 255.0;
+            for kc in 0..=255u32 {
+                let c = kc as f32 / 255.0;
+                data.push([c, (kc as f32 + 0.5) / 255.0, (kc as f32 - 0.5) / 255.0, a]);
+                data.push([c * a, c, 1.0 - c, (ka as f32 + 0.5) / 255.0]);
+            }
+        }
+        let n = data.len() as u32;
+        check(&Image { width: n, height: 1, data: data.clone() }, "code pairs");
+        check(&Image { width: 512, height: n / 512, data }, "code pairs 2D");
+        // Specials in every lane.
+        let sp = specials();
+        let data: Vec<[f32; 4]> = sp.iter().flat_map(|&v| [[v, 0.5, 0.25, 1.0], [0.25, v, v, 0.75], [0.0, 0.0, 0.0, v], [v, v, v, v]]).collect();
+        check(&Image { width: data.len() as u32, height: 1, data }, "specials");
+    }
+}
+
+/// The resident source the GPU walk uploads (`Renderer::resident_source_coded`): at 8 bpc its
+/// codes come out of the rounding pass and are exactly what the upload packed before
+/// (`codes8` of the buffer); 16 and 32 bpc make no codes. Every depth gives the same buffer as
+/// `resident_source`, bit for bit.
+#[test]
+fn resident_source_codes_at_8bpc_only_same_pixels_every_depth() {
+    use effectcraft_color::Label;
+    use effectcraft_project::build::{self, Ids};
+    use effectcraft_project::{BitDepth, Comp, ItemKind, LayerSource, Project};
+    use effectcraft_time::{FrameRate, Tick};
+
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+        let mut p = Project::default();
+        p.settings.bit_depth = depth;
+        let comp = Comp::new(64, 48, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut l = build::layer(&mut p, &comp, "Shape", LayerSource::Shape, (64, 48), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        // Anti-aliased edges and an off-grid colour: real rounding to do.
+        let ellipse = build::shape_ellipse(&mut ids, [37.0, 29.0], [0.0, 0.0]);
+        let fill = build::shape_fill(&mut ids, [0.9, 0.4, 0.13, 0.7]);
+        let g = build::shape_group(&mut ids, "Ellipse", vec![ellipse, fill]);
+        p.next_id = next;
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+        let ctx = r.eval_ctx(cid, Tick::ZERO).unwrap();
+        let layer = &p.comp(cid).unwrap().layers[0];
+        let clip = crate::ContentClip::default();
+        let plain = r.resident_source(&ctx, layer, clip).unwrap();
+        let coded = r.resident_source_coded(&ctx, layer, clip, true).unwrap();
+        let b = coded.buf();
+        assert_eq!(bits(b), bits(&plain), "{depth:?}");
+        assert_eq!((b.img.width, b.img.height, b.offset, b.scale), (plain.img.width, plain.img.height, plain.offset, plain.scale), "{depth:?}");
+        assert!(plain.img.data.iter().any(|p| p[3] > 0.0 && p[3] < 1.0), "{depth:?}: has edges");
+        match depth {
+            BitDepth::Bpc8 => {
+                let want = crate::packed::codes8(&plain.img.data).unwrap();
+                assert!(coded.codes8() == Some(&want[..]), "8 bpc: the codes the upload packed");
+                assert_eq!(coded.bytes(), plain.img.data.len() * 20);
+            }
+            _ => assert!(coded.codes8().is_none(), "{depth:?}: no codes"),
+        }
+        assert!(r.resident_source_coded(&ctx, layer, clip, false).unwrap().codes8().is_none(), "{depth:?}: codes only when asked");
+    }
 }

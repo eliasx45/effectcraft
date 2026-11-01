@@ -264,6 +264,35 @@ fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
     });
 }
 
+/// [`quantize`] at 8 bpc that also hands back the pixels' integer codes (what
+/// [`crate::packed::codes8`] would make of the result, so a GPU upload doesn't read the image
+/// again), both written in the same pass over each band. `None` when the codes can't be
+/// allocated; the image is quantised either way.
+#[allow(clippy::manual_clamp)] // max/min map NaN to 0; clamp would keep NaN
+pub fn quantize8_codes(img: &mut Image) -> Option<Vec<[u8; 4]>> {
+    const L: f32 = 255.0;
+    let mut codes = Vec::new();
+    if codes.try_reserve_exact(img.data.len()).is_err() {
+        quantize(img, L);
+        return None;
+    }
+    codes.resize(img.data.len(), [0u8; 4]);
+    let inv = 1.0 / L;
+    codes.par_chunks_mut(QUANTIZE_BAND).zip(img.data.par_chunks_mut(QUANTIZE_BAND)).for_each(|(d, s)| {
+        for (d, p) in d.iter_mut().zip(s.iter_mut()) {
+            // `quantize_px`'s steps with the integers kept: `round_half_up(v) * inv` is
+            // `k as f32 * inv` (v is in 0..=255.5 after the clamp, so `k` fits a byte).
+            let ka = (p[3].max(0.0).min(1.0) * L + 0.5) as u32;
+            let a = ka as f32 * inv;
+            let hi = [a, a, a, 1.0];
+            let k: [u32; 4] = std::array::from_fn(|c| (p[c].max(0.0).min(hi[c]) * L + 0.5) as u32);
+            *p = k.map(|k| k as f32 * inv);
+            *d = k.map(|k| k as u8);
+        }
+    });
+    Some(codes)
+}
+
 /// Convert premultiplied pixels (on straight colour).
 pub fn convert(img: &mut Image, c: &Conversion) {
     img.data.par_iter_mut().for_each(|p| {

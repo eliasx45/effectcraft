@@ -42,7 +42,7 @@ pub use footage::{
 };
 pub(crate) use fx::comp_scene;
 pub use fx::{effect_canvas_extent, effect_canvas_extent_in, effect_points_in_comp_space, effect_space_follows_comp_size};
-pub use layer_buf::{ContentClip, GpuStylesKey, StyledLayer};
+pub use layer_buf::{ContentClip, GpuStylesKey, ResidentSource, StyledLayer};
 pub use motion_blur::adaptive_samples;
 pub use placement::Placement;
 pub use renderer::{ContextChain, LayerTimes, LayerTiming, RenderOpts, Renderer, SHARP_MAX_PIXELS, TakenTimes, extended_region, render_frame, roi_inside};

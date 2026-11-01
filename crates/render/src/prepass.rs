@@ -21,7 +21,7 @@ use effectcraft_effects::Buf;
 use effectcraft_project::{Layer, LayerSource, Quality};
 use rayon::prelude::*;
 
-use crate::layer_buf::ContentClip;
+use crate::layer_buf::{ContentClip, ResidentSource};
 use crate::motion_blur::MotionMemo;
 use crate::{EvalCtx, Renderer, styles};
 
@@ -103,10 +103,17 @@ impl<'a> Renderer<'a> {
     /// `size` canvas) is about to ask for and the layer cache doesn't hold. `resident`: the GPU
     /// walk keeps plain layers resident (its `draw_ordinary_resident`), and already holds what
     /// `resident(content key, slot)` answers `true` for; those layers' sources come back as
-    /// ([`prefetch_slot`], buffer) for it to take instead of calling [`Self::resident_source`].
+    /// ([`prefetch_slot`], source with its 8 bpc codes) for it to take instead of calling
+    /// [`Self::resident_source_coded`].
     /// Production stops once a quarter of the cache budget is spent; the walk renders the rest
     /// itself.
-    pub fn prefetch(&self, ctx: &EvalCtx<'a>, visible: &[&'a Layer], size: (u32, u32), resident: Option<&dyn Fn(u64, u64) -> bool>) -> Vec<(u64, Buf)> {
+    pub fn prefetch(
+        &self,
+        ctx: &EvalCtx<'a>,
+        visible: &[&'a Layer],
+        size: (u32, u32),
+        resident: Option<&dyn Fn(u64, u64) -> bool>,
+    ) -> Vec<(u64, ResidentSource)> {
         let Some(cache) = self.cache else { return vec![] };
         if OFF.load(Ordering::Relaxed) || visible.len() < 2 {
             return vec![];
@@ -142,7 +149,7 @@ impl<'a> Renderer<'a> {
             if spent >= budget {
                 break;
             }
-            let made: Vec<(usize, Option<(u64, Buf)>)> =
+            let made: Vec<(usize, Option<(u64, ResidentSource)>)> =
                 part.par_iter().map(|j| self.timed(ctx, j.layer(), || crate::eval::with_transform_memo(self.project, || self.produce(ctx, *j)))).collect();
             PRODUCED.fetch_add(part.len() as u64, Ordering::Relaxed);
             for (bytes, r) in made {
@@ -195,7 +202,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// Run one job: the bytes it made, and a resident source with its slot.
-    fn produce(&self, ctx: &EvalCtx<'a>, job: Job<'a>) -> (usize, Option<(u64, Buf)>) {
+    fn produce(&self, ctx: &EvalCtx<'a>, job: Job<'a>) -> (usize, Option<(u64, ResidentSource)>) {
         let bytes = |b: &Buf| b.img.data.len().saturating_mul(std::mem::size_of::<effectcraft_raster::Px>());
         match job {
             Job::Styled(l) => {
@@ -204,8 +211,9 @@ impl<'a> Renderer<'a> {
                 (bytes(&st.body).saturating_add(passes), None)
             }
             Job::Matte(l) => (self.matte_buf(ctx, l).map_or(0, |b| bytes(&b)), None),
-            Job::Resident(l, key, clip) => match self.resident_source(ctx, l, clip) {
-                Some(b) => (bytes(&b), Some((prefetch_slot(ctx, l, key), b))),
+            // The GPU walk uploads it: its 8 bpc codes come out of the rounding pass.
+            Job::Resident(l, key, clip) => match self.resident_source_coded(ctx, l, clip, true) {
+                Some(s) => (s.bytes(), Some((prefetch_slot(ctx, l, key), s))),
                 None => (0, None),
             },
         }

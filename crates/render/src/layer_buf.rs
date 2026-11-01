@@ -13,10 +13,41 @@ use std::sync::Arc;
 /// `Renderer::content_cache_key_noted`).
 type ContentKey = (Option<u64>, Option<u64>, ContentClip);
 
+/// [`Renderer::resident_source_coded`]: a layer's resident source and, at 8 bpc, its integer
+/// codes ([`crate::packed::codes8`] of the buffer, made while it was rounded). Neither changes
+/// after it is made, so the codes always stand for the buffer's pixels.
+#[derive(Debug)]
+pub struct ResidentSource {
+    buf: Buf,
+    codes8: Option<Vec<[u8; 4]>>,
+}
+
+impl ResidentSource {
+    /// The buffer.
+    pub fn buf(&self) -> &Buf {
+        &self.buf
+    }
+    /// Its 8 bpc codes, when they were made with it.
+    pub fn codes8(&self) -> Option<&[[u8; 4]]> {
+        self.codes8.as_deref()
+    }
+    /// The bytes it holds (the buffer and its codes).
+    pub fn bytes(&self) -> usize {
+        let px = self.buf.img.data.len().saturating_mul(std::mem::size_of::<effectcraft_raster::Px>());
+        px.saturating_add(self.codes8.as_ref().map_or(0, |c| c.len().saturating_mul(4)))
+    }
+}
+
 impl<'a> Renderer<'a> {
     /// Source → masks, clamped/quantised to the project depth. `clip`: only that window of a
     /// shape layer's buffer (see [`Self::shape_clip`]).
     fn masked_source(&self, ctx: &EvalCtx, layer: &Layer, clip: Option<Window>) -> Option<Buf> {
+        self.masked_source_coded(ctx, layer, clip, false).map(|(b, _)| b)
+    }
+
+    /// [`Self::masked_source`]; `codes`: at 8 bpc, also the buffer's integer codes, made in
+    /// the same pass as its rounding ([`color::quantize8_codes`]).
+    fn masked_source_coded(&self, ctx: &EvalCtx, layer: &Layer, clip: Option<Window>, codes: bool) -> Option<(Buf, Option<Vec<[u8; 4]>>)> {
         let _profile = crate::profile::span("layer_raster");
         let mut buf = match (self.content_times(ctx, layer), clip, &layer.source) {
             (Some(times), ..) => self.blurred_source(ctx, layer, &times)?,
@@ -36,10 +67,15 @@ impl<'a> Renderer<'a> {
         };
         // A solid is filled with a quantised colour: only masks can take it off the grid.
         let solid = matches!(layer.source, LayerSource::Solid { .. });
+        let mut made = None;
         if masks::apply(ctx, layer, &mut buf, self.mask_blur(ctx, layer)) || !solid {
-            self.pipe.quantize(&mut buf.img);
+            if codes && self.pipe.levels == Some(255.0) {
+                made = color::quantize8_codes(&mut buf.img);
+            } else {
+                self.pipe.quantize(&mut buf.img);
+            }
         }
-        Some(buf)
+        Some((buf, made))
     }
 
     /// Fully processed layer buffer (source → masks → effects → layer styles, flattened).
@@ -174,9 +210,15 @@ impl<'a> Renderer<'a> {
     /// Source and masks rebased into effect space, exactly as the CPU content producer, in the
     /// window `clip` that came with the layer's key ([`Self::resident_content`]).
     pub fn resident_source(&self, ctx: &EvalCtx, layer: &Layer, clip: ContentClip) -> Option<Buf> {
-        let mut buf = self.masked_source(ctx, layer, clip.win)?;
+        self.resident_source_coded(ctx, layer, clip, false).map(|s| s.buf)
+    }
+
+    /// [`Self::resident_source`]; `codes`: at 8 bpc, with the buffer's integer codes made in
+    /// the same pass as its rounding, for the GPU to upload without reading the buffer again.
+    pub fn resident_source_coded(&self, ctx: &EvalCtx, layer: &Layer, clip: ContentClip, codes: bool) -> Option<ResidentSource> {
+        let (mut buf, codes8) = self.masked_source_coded(ctx, layer, clip.win, codes)?;
         buf.rebase(crate::fx::fx_origin(ctx, layer, false));
-        Some(buf)
+        Some(ResidentSource { buf, codes8 })
     }
 
     /// Bare footage also gets its source-time key, without enabling unsafe effect caching.

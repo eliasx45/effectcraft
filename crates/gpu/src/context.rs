@@ -2359,19 +2359,27 @@ impl GpuContext {
     /// grid (every layer buffer of an 8/16 bpc project) goes up as its integer codes, a quarter
     /// or half of the bytes, and is expanded on the GPU to the identical floats.
     pub fn upload_image(&self, img: &Image) -> Option<GpuImage> {
-        self.upload_image_keeping(img, false).map(|(g, _)| g)
+        self.upload_image_keeping(img, false, None).map(|(g, _)| g)
+    }
+
+    /// [`GpuContext::upload_image`] of an image whose 8 bpc codes were made with it
+    /// ([`effectcraft_render::color::quantize8_codes`]): they go up as they are, so the image isn't
+    /// read again to pack it. `codes8` must be [`effectcraft_render::packed::codes8`] of `img`
+    /// (a different length is ignored).
+    pub fn upload_image_coded(&self, img: &Image, codes8: Option<&[[u8; 4]]>) -> Option<GpuImage> {
+        self.upload_image_keeping(img, false, codes8).map(|(g, _)| g)
     }
 
     /// [`GpuContext::upload_image`], also handing back the 8 bpc codes it uploaded when `keep`
-    /// (to retain as a [`PackedImage`]).
-    fn upload_image_keeping(&self, img: &Image, keep: bool) -> Option<(GpuImage, Option<wgpu::Texture>)> {
+    /// (to retain as a [`PackedImage`]). `codes8`: see [`GpuContext::upload_image_coded`].
+    fn upload_image_keeping(&self, img: &Image, keep: bool, codes8: Option<&[[u8; 4]]>) -> Option<(GpuImage, Option<wgpu::Texture>)> {
         let _profile = effectcraft_render::profile::span("upload");
         if !self.fits(img.width, img.height) {
             return None;
         }
         // A free pooled texture: every encoder that could read its old pixels is submitted.
         let (mut g, _) = self.pooled_for_encoder(img.width, img.height, None, None);
-        if let Some((levels, kept)) = self.upload_packed(img, &g, keep) {
+        if let Some((levels, kept)) = self.upload_packed(img, &g, keep, codes8) {
             // Every value is on that grid (clamped and quantised), so quantising is a no-op.
             g.levels = Some(levels);
             return Some((g, kept));
@@ -2389,12 +2397,21 @@ impl GpuContext {
     /// [`GpuContext::upload_image`] of an image on the 8 or 16 bpc grid into `out`: the grid's
     /// levels (`None`: off the grid, or no kernel; nothing was written).
     /// `keep`: also hand back the 8 bpc codes texture (see [`GpuContext::upload_codes`]).
-    fn upload_packed(&self, img: &Image, out: &GpuImage, keep: bool) -> Option<(f32, Option<wgpu::Texture>)> {
+    /// `codes8`: the image's 8 bpc codes when already made (see [`GpuContext::upload_image_coded`]).
+    fn upload_packed(&self, img: &Image, out: &GpuImage, keep: bool, codes8: Option<&[[u8; 4]]>) -> Option<(f32, Option<wgpu::Texture>)> {
         if self.yuv.is_none() || img.width == 0 || img.height == 0 {
             return None;
         }
-        if let Some(codes) = effectcraft_render::packed::codes8(&img.data) {
-            return self.upload_codes(out, wgpu::TextureFormat::Rgba8Uint, bytemuck::cast_slice(&codes), 4, LEVELS_8, keep).map(|kept| (LEVELS_8, kept));
+        let made;
+        let codes8 = match codes8.filter(|c| c.len() == img.data.len()) {
+            Some(c) => Some(c),
+            None => {
+                made = effectcraft_render::packed::codes8(&img.data);
+                made.as_deref()
+            }
+        };
+        if let Some(codes) = codes8 {
+            return self.upload_codes(out, wgpu::TextureFormat::Rgba8Uint, bytemuck::cast_slice(codes), 4, LEVELS_8, keep).map(|kept| (LEVELS_8, kept));
         }
         if cfg!(target_endian = "little")
             && let Some(codes) = effectcraft_render::packed::codes16(&img.data)
@@ -2551,7 +2568,7 @@ impl GpuContext {
             return Some(Uploaded::Packed(packed));
         }
         let keep = owner.is_some() && packed_retention();
-        let (img, codes) = self.upload_image_keeping(&buf.img, keep)?;
+        let (img, codes) = self.upload_image_keeping(&buf.img, keep, None)?;
         if let Some(owner) = owner {
             match codes.and_then(|c| code_image(c, &self.generation)) {
                 Some(codes) => {
