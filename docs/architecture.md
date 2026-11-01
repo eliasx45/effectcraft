@@ -298,7 +298,9 @@ Light comps (a few small layers, which the CPU composites only within their boun
 the CPU instead of paying for full-frame passes and a readback. A GPU frame walks the comp like
 `draw_comp`: cached layer buffers are uploaded once per buffer, then transformed with the CPU's
 sampling (nearest, bilinear, Catmull-Rom bicubic, the same minification pre-filter), motion-blur
-sub-samples are accumulated, and track mattes, Preserve Transparency, layer style passes,
+sub-samples are accumulated, and track mattes (a shape, text or solid matte's content is made
+resident on the device like a plain layer's, rasterised there and kept while unchanged:
+`walk::matte_image`), Preserve Transparency, layer style passes,
 knockout, all 38 blend modes (a WGSL port of `color::blend`), the 8/16 bpc clamp-and-quantise steps
 and colour-space conversions run on the GPU. Classic 3D runs composite on the GPU too
 (`gpu::classic3d`): the render crate prepares the planes (`Renderer::prepare_3d_run`: layer buffers

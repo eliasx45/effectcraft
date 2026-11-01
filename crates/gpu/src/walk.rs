@@ -548,12 +548,35 @@ fn precomp_resident_enabled() -> bool {
 /// Ordinary plain layers retain layer-space Processed pixels. Styles and precomps
 /// keep their existing paths; keys declined by dependency analysis are not retained.
 fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32) -> Option<Option<()>> {
+    if styles::active(ctx, layer) {
+        return None;
+    }
+    let (image, keep) = processed_resident(e, r, ctx, layer, false)?;
+    let result = composite_processed(e, r, ctx, layer, canvas, opacity, image.clone());
+    if result == Some(Some(())) {
+        keep_processed(e, r, ctx, layer, keep, image);
+    }
+    result
+}
+
+/// The claim on a Processed key [`processed_resident`] made the image for: kept by
+/// [`keep_processed`] once the image is drawn.
+struct KeepProcessed {
+    key: u64,
+    flight: effectcraft_render::cache::FlightGuard,
+    intent: Option<effectcraft_render::disk_cache::LayerWriteIntent>,
+}
+
+/// A plain (not precomp) layer's Processed pixels on the GPU: source → masks → effects, in
+/// layer space and the working space, before Layer Styles (what `Renderer::content_buf` and
+/// `Renderer::matte_buf` give on the CPU). The retained image, else the CPU/disk cache's
+/// buffer uploaded, else made here (a shape, text or solid layer rasterised by `shapes_gpu`,
+/// other sources from the CPU) with the claim to keep it once drawn. `render_anyway`: when this
+/// thread already holds the key's claim (`Claim::Render`), make it here without keeping it
+/// instead of leaving the layer to the CPU. `None`: not here (draw it the usual way).
+fn processed_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, render_anyway: bool) -> Option<(SourceImage, Option<KeepProcessed>)> {
     use effectcraft_render::cache::{Claim, GpuStage};
-    if !ordinary_resident_enabled()
-        || !e.can_retain_resident()
-        || styles::active(ctx, layer)
-        || matches!(layer.source, effectcraft_project::LayerSource::Comp { .. })
-    {
+    if !ordinary_resident_enabled() || !e.can_retain_resident() || matches!(layer.source, effectcraft_project::LayerSource::Comp { .. }) {
         return None;
     }
     let cache = r.cache?;
@@ -567,7 +590,7 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
     };
     if let Some(image) = resident {
         let _profile = effectcraft_render::profile::span("ordinary_resident_hit");
-        return composite_processed(e, r, ctx, layer, canvas, opacity, image);
+        return Some((image, None));
     }
     // Reuse ordinary CPU/disk hits. An image from another device is materialized
     // through its own guarded callback, never bound to this encoder's device.
@@ -581,9 +604,11 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
             Claim::Render => {
                 // A GPU-only producer wakes the same flight without a CPU cache entry.
                 if let Some(image) = e.resident(key, GpuStage::Processed) {
-                    return composite_processed(e, r, ctx, layer, canvas, opacity, image);
+                    return Some((image, None));
                 }
-                return None;
+                if !render_anyway {
+                    return None;
+                }
             }
         }
     }
@@ -612,18 +637,18 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         let (img, offset, scale) = fx.finish()?;
         SourceImage { img: img.into(), offset: [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale], scale }
     };
-    let result = composite_processed(e, r, ctx, layer, canvas, opacity, image.clone());
-    if result == Some(Some(()))
-        && let Some(flight) = flight
-    {
-        // Unique animated versions are transient. Held values and repeated visits
-        // can reuse their exact key after the bounded doorkeeper sees it twice.
-        if r.resident_content_animated(ctx, layer) && !cache.admit_repeated_gpu_content(key) {
-            return result;
-        }
-        e.keep_resident(key, image, flight, intent);
+    Some((image, flight.map(|flight| KeepProcessed { key, flight, intent })))
+}
+
+/// Retain `image` (made by [`processed_resident`] under `keep`'s claim) once it was drawn.
+fn keep_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, keep: Option<KeepProcessed>, image: SourceImage) {
+    let (Some(KeepProcessed { key, flight, intent }), Some(cache)) = (keep, r.cache) else { return };
+    // Unique animated versions are transient. Held values and repeated visits
+    // can reuse their exact key after the bounded doorkeeper sees it twice.
+    if r.resident_content_animated(ctx, layer) && !cache.admit_repeated_gpu_content(key) {
+        return;
     }
-    result
+    e.keep_resident(key, image, flight, intent);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -961,16 +986,7 @@ fn composite_iso_with(
         let (w, h) = canvas.size();
         let mimg = match matte_img.filter(|i| (i.width, i.height) == (w, h)) {
             Some(i) => i,
-            None => {
-                let mut mimg = e.zeros(w, h);
-                if m.is_active_at(ctx.time)
-                    && let Some(mb) = r.matte_buf(ctx, m)
-                {
-                    let mo = ctx.opacity(m) as f32;
-                    mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;
-                }
-                mimg
-            }
+            None => matte_image(e, r, ctx, m, w, h)?,
         };
         let mut matted = take_float(e, &mut iso)?;
         ops::matte_in(e, &mut matted, &mimg, kind, reach);
@@ -986,19 +1002,50 @@ fn track_matte(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut img:
     let Some((m, kind)) = r.track_matte(ctx, layer) else { return Some(img) };
     let mimg = match matte_img.filter(|i| (i.width, i.height) == (img.width, img.height)) {
         Some(i) => i,
-        None => {
-            let mut mimg = e.zeros(img.width, img.height);
-            if m.is_active_at(ctx.time)
-                && let Some(mb) = r.matte_buf(ctx, m)
-            {
-                let mo = ctx.opacity(m) as f32;
-                mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;
-            }
-            mimg
-        }
+        None => matte_image(e, r, ctx, m, img.width, img.height)?,
     };
     ops::matte_in(e, &mut img, &mimg, kind, None);
     Some(img)
+}
+
+/// Track mattes whose content [`matte_image`] took from the GPU (the tests check that path ran).
+#[cfg(test)]
+pub(crate) static MATTES_ON_GPU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The track matte layer `m` placed in a `w` × `h` comp canvas at its own opacity
+/// (`Renderer::matte_image_at`). Its content (source → masks → effects, before Layer Styles:
+/// `Renderer::matte_buf`) is made resident on the GPU like a plain layer's
+/// ([`processed_resident`]: a shape, text or solid matte rasterises there and stays while
+/// unchanged, instead of being drawn on the CPU and uploaded every frame); precomp mattes and
+/// a walk that can't keep images resident take `matte_buf` from the CPU as before. Drawn onto
+/// a blank image of this encoder's own, so the warp only touches the matte's bounds.
+fn matte_image(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, m: &Layer, w: u32, h: u32) -> Option<GpuImage> {
+    let mo = ctx.opacity(m) as f32;
+    if !m.is_active_at(ctx.time) || mo <= 0.0 {
+        return Some(e.zeros(w, h));
+    }
+    let _profile = effectcraft_render::profile::span("track_matte");
+    let on_gpu = if effectcraft_render::prepass::gpu_mattes() { processed_resident(e, r, ctx, m, true) } else { None };
+    if let Some((image, keep)) = on_gpu {
+        #[cfg(test)]
+        MATTES_ON_GPU.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut mimg: Pixels = e.image(w, h).into();
+        if image.img.width() > 0 && image.img.height() > 0 {
+            // The placement only reads the buffer's size, offset and scale.
+            let shape = Buf { img: Image { width: image.img.width(), height: image.img.height(), data: Vec::new() }, offset: image.offset, scale: image.scale };
+            place_src_in(e, r, ctx, m, &shape, image.img.clone(), &mut mimg, BlendMode::Normal, mo, None)?;
+        }
+        keep_processed(e, r, ctx, m, keep, image);
+        return mimg.float(e);
+    }
+    let Some(mb) = r.matte_buf(ctx, m) else { return Some(e.zeros(w, h)) };
+    if !effectcraft_render::prepass::gpu_mattes() {
+        // As before (A/B): onto the shared blank, a full-frame pass.
+        return place(e, r, ctx, m, &mb, &e.zeros(w, h), BlendMode::Normal, mo, None);
+    }
+    let mut mimg: Pixels = e.image(w, h).into();
+    place_in(e, r, ctx, m, &mb, &mut mimg, BlendMode::Normal, mo, None)?;
+    mimg.float(e)
 }
 
 /// Draw a processed layer buffer onto `target` (transform, motion blur sub-samples), quantising

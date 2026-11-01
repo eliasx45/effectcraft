@@ -49,6 +49,14 @@ pub fn prefetch_slot(ctx: &EvalCtx, layer: &Layer, key: u64) -> u64 {
     crate::cache::derive(crate::cache::derive(k, layer.id.0), ctx.time.0 as u64)
 }
 
+/// Whether the GPU walk makes track mattes resident on the device (`walk::matte_image` in
+/// `effectcraft-gpu`; `EFFECTCRAFT_GPU_MATTES=0`: the CPU draws them and they are uploaded, as
+/// before 1 Nov 2026, for A/B). Read once per process.
+pub fn gpu_mattes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EFFECTCRAFT_GPU_MATTES").as_deref() != Ok("0"))
+}
+
 /// One buffer the walk will ask for.
 #[derive(Clone, Copy)]
 enum Job<'l> {
@@ -156,7 +164,8 @@ impl<'a> Renderer<'a> {
         if self.off_canvas(ctx, layer, size, &MotionMemo::default()) {
             return [None, None];
         }
-        let matte = self.track_matte(ctx, layer).map(|(m, _)| m).filter(|m| m.is_active_at(ctx.time) && rasterised(m) && !has_effects(m)).map(Job::Matte);
+        let matte =
+            self.track_matte(ctx, layer).map(|(m, _)| m).filter(|m| m.is_active_at(ctx.time) && rasterised(m)).and_then(|m| self.matte_job(ctx, m, resident));
         if !rasterised(layer) {
             return [matte, None];
         }
@@ -169,6 +178,20 @@ impl<'a> Renderer<'a> {
         // Already cached: the walk's lookup is the only one (a pre-pass lookup would count a
         // second use and take the entry off probation early).
         [matte, (!has_effects(layer) && !self.styled_blend_held(ctx, layer)).then_some(Job::Styled(layer))]
+    }
+
+    /// The job for the track matte layer `m`. The GPU walk's resident path (`resident`) makes a
+    /// matte's content resident as a plain layer's (`walk::matte_image`), so it gets the
+    /// resident source (skipped when the GPU rasterises or holds it); otherwise
+    /// [`Self::matte_buf`], for a matte without effects.
+    fn matte_job(&self, ctx: &EvalCtx<'a>, m: &'a Layer, resident: bool) -> Option<Job<'a>> {
+        if resident
+            && gpu_mattes()
+            && let Some((key, clip)) = self.resident_content(ctx, m)
+        {
+            return Some(Job::Resident(m, key, clip));
+        }
+        (!has_effects(m)).then_some(Job::Matte(m))
     }
 
     /// Run one job: the bytes it made, and a resident source with its slot.

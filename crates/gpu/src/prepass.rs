@@ -47,8 +47,10 @@ impl Drop for Prefetched {
 pub(crate) fn run<'a>(e: &Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: (u32, u32), resident: bool) -> Prefetched {
     let resident = resident && e.can_retain_resident();
     let held = |slot: u64| READY.try_with(|m| m.try_borrow().map(|m| m.contains_key(&slot)).unwrap_or(true)).unwrap_or(true);
-    // Shape and text layers the walk rasterises on the GPU (`shapes_gpu`): no CPU raster ahead.
-    let gpu_shapes: Vec<&Layer> = visible.iter().copied().filter(|l| crate::shapes_gpu::eligible(r, ctx, l)).collect();
+    // Shape and text layers the walk rasterises on the GPU (`shapes_gpu`), the track mattes
+    // they read included (`walk::matte_image`): no CPU raster ahead.
+    let mattes = visible.iter().filter(|_| effectcraft_render::prepass::gpu_mattes()).filter_map(|l| r.track_matte(ctx, l).map(|(m, _)| m));
+    let gpu_shapes: Vec<&Layer> = visible.iter().copied().chain(mattes).filter(|l| crate::shapes_gpu::eligible(r, ctx, l)).collect();
     let on_gpu = |key: u64, slot: u64| gpu_shapes.iter().any(|l| prefetch_slot(ctx, l, key) == slot);
     let have = |key: u64, slot: u64| held(slot) || e.has_resident(key, GpuStage::Processed) || on_gpu(key, slot);
     let made = r.prefetch(ctx, visible, canvas, resident.then_some(&have as &dyn Fn(u64, u64) -> bool));
@@ -119,7 +121,9 @@ mod tests {
         }
         let mut next = p.next_id;
         let mut ids = Ids(&mut next);
-        for i in 0..4 {
+        // (Two layer-styled shapes: the CPU pre-pass styles them. The text matte below is
+        // rasterised by the GPU walk now, so it is no pre-pass job: 1 Nov 2026.)
+        for i in 0..5 {
             let mut l = build::layer(&mut p, &comp, "Shape", LayerSource::Shape, (320, 180), None);
             let items = vec![
                 build::shape_rect(&mut ids, [70.0, 40.0], [-30.0, 0.0], 8.0),
@@ -135,7 +139,7 @@ mod tests {
                     m.prop_mut("feather").unwrap().value = Value::Vec2([8.0, 8.0]);
                     l.props.sub_mut("masks").unwrap().children.push(m.into());
                 }
-                2 => {
+                2 | 4 => {
                     effectcraft_project::styles::add_style(&mut l, &mut ids, "dropShadow", &comp.global_light, true).unwrap();
                 }
                 3 => {

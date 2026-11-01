@@ -721,6 +721,8 @@ mod tests_layer_times;
 #[cfg(test)]
 mod tests_masks_gpu;
 #[cfg(test)]
+mod tests_matte_gpu;
+#[cfg(test)]
 mod tests_particles;
 #[cfg(test)]
 mod tests_plane3d;
