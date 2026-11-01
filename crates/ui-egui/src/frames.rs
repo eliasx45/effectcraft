@@ -48,6 +48,7 @@ use rayon::prelude::*;
 mod codec;
 #[cfg(test)]
 mod codec_tests;
+mod disk_soon;
 mod fingerprint;
 mod frame_keys;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -287,6 +288,10 @@ struct DiskPlan {
     target: Option<(Arc<DiskCache>, u128)>,
     /// Written as soon as it is compressed ([`Cache::attach_packed`]), not only when it leaves RAM.
     now: bool,
+    /// A viewer frame: written once the viewer is quiet ([`disk_soon`]: not while scrubbing),
+    /// or when it leaves RAM if that comes first (a GPU texture is read back for it then).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    soon: bool,
 }
 
 /// What a finished frame is stored with besides its pixels ([`Worker::finish_stored`]).
@@ -402,6 +407,10 @@ struct Cache {
     /// cache's write queue was full).
     spilled: u64,
     spill_dropped: u64,
+    /// GPU frames marked for the disk ([`DiskPlan::soon`]) that left RAM before they were
+    /// written: read back by the next worker or the [`disk_soon`] thread (the cache has no GPU).
+    #[cfg(not(target_arch = "wasm32"))]
+    soon_readbacks: Vec<(Arc<DisplayFrame>, Arc<DiskCache>, u128)>,
     /// Frames the disk read-ahead brought in ahead of the playhead ([`Worker::read_ahead`]).
     read_ahead: u64,
     /// The shared cache budget, when the caches share one ([`Frames::share`]): told `bytes` and
@@ -437,6 +446,8 @@ impl Cache {
             codec,
             spilled: 0,
             spill_dropped: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            soon_readbacks: Vec::new(),
             read_ahead: 0,
             share: None,
         }
@@ -804,7 +815,9 @@ impl Cache {
     /// there (its compressed bytes as they are, or its pixels, which the disk cache's writer
     /// compresses). A full write queue drops it rather than wait. A GPU texture is read back
     /// and compressed ahead of eviction, while the headroom allows ([`Cache::trim_raw`]); one
-    /// still without compressed bytes when it leaves isn't read back for it (dropped).
+    /// still without compressed bytes when it leaves isn't read back for it (dropped), unless
+    /// it is a viewer frame waiting to be written ([`DiskPlan::soon`]): that one is read back
+    /// for the disk ([`Cache::soon_readbacks`]).
     fn spill(&mut self, k: &FrameKey) {
         let Some(slot) = self.map.get(k) else { return };
         let Some((dc, dk)) = slot.disk.target.clone() else { return };
@@ -818,6 +831,15 @@ impl Cache {
                 let room = dc.has_room(n);
                 if room {
                     dc.put_frame(dk, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
+                }
+                room
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            (None, Some(FrameImage::Gpu(f))) if slot.disk.soon => {
+                let room = self.soon_readbacks.len() < disk_soon::MAX_READBACKS;
+                if room {
+                    let f = f.clone();
+                    self.soon_readbacks.push((f, dc, dk));
                 }
                 room
             }
@@ -895,6 +917,11 @@ impl Cache {
                 self.prints.rename(k, orphan);
                 moved.insert(*k, orphan);
             } else {
+                // A viewer frame still waiting for the disk goes there now: an undo finds it by
+                // its content key, as when it was written the moment it was shown.
+                if self.map.get(k).is_some_and(|s| s.disk.soon) {
+                    self.spill(k);
+                }
                 self.remove(k);
             }
         }
@@ -1353,6 +1380,9 @@ pub struct Frames {
     /// ([`Worker::read_ahead`]).
     #[cfg(not(target_arch = "wasm32"))]
     read_ahead: Arc<ReadAhead>,
+    /// Writes viewer frames to the disk cache once the viewer is quiet ([`disk_soon`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    disk_soon: Arc<disk_soon::DiskSoon>,
 }
 
 /// Disk read-ahead threads at most ([`Worker::read_ahead`]): a 1080p frame reads and decodes in
@@ -1503,6 +1533,8 @@ impl Default for Frames {
             warmup: warmup::Warmup::default(),
             #[cfg(not(target_arch = "wasm32"))]
             read_ahead: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            disk_soon: Arc::default(),
         }
     }
 }
@@ -2481,6 +2513,11 @@ impl Frames {
         if urgent && let Ok(mut c) = self.cache.lock() {
             c.scale = Some(key.scale);
         }
+        // Scrubbing (even over cached frames): viewer frames wait to be written to disk.
+        #[cfg(not(target_arch = "wasm32"))]
+        if urgent {
+            self.disk_soon.viewer_asked();
+        }
         let cached = if over_draft { self.is_exact(&key) } else { self.is_cached(&key) };
         if cached || self.failed(&key) {
             return;
@@ -2645,6 +2682,8 @@ impl Frames {
             resident: self.resident.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             read_ahead: self.read_ahead.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            disk_soon: self.disk_soon.clone(),
         }
     }
 
@@ -2812,7 +2851,7 @@ fn request_content_key(
 /// Whether a freshly rendered frame goes to the disk cache: only frames that were expensive to
 /// render, and no prefetch frame while more prefetch is queued (playback and RAM preview keep the
 /// workers busy; there compression would slow the frames being waited for). The viewer's frame
-/// is kept whenever it was expensive.
+/// is kept whenever it was expensive, written once the viewer is quiet ([`disk_soon`]).
 fn keep_on_disk(render: std::time::Duration, urgent: bool, prefetch_queued: usize) -> bool {
     render >= DISK_MIN_RENDER && (urgent || prefetch_queued == 0)
 }
@@ -2848,6 +2887,8 @@ struct Worker {
     resident: Arc<resident::Resident>,
     #[cfg(not(target_arch = "wasm32"))]
     read_ahead: Arc<ReadAhead>,
+    #[cfg(not(target_arch = "wasm32"))]
+    disk_soon: Arc<disk_soon::DiskSoon>,
 }
 
 /// What finishing a frame needs besides its pixels (see [`Worker::publish`]).
@@ -3125,6 +3166,14 @@ impl Worker {
         let backlog = self.queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent && !j.disk_only).count()).unwrap_or(0);
         let expensive = !disk_hit && render_time >= DISK_MIN_RENDER;
         let now = !disk_hit && keep_on_disk(render_time, job.urgent, backlog);
+        // Q1: the viewer's frame isn't read back, compressed and written while the user scrubs
+        // (16-23 % of all CPU on Elias's comp): it waits for a quiet moment ([`disk_soon`]), or
+        // goes when it leaves RAM.
+        #[cfg(not(target_arch = "wasm32"))]
+        let soon = now && job.urgent && tail.disk.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let soon = false;
+        let now = now && !soon;
         let compress = self.cache.lock().is_ok_and(|c| c.compress);
         // Compressed in RAM, the codec writes it from the bytes RAM keeps once it is compressed;
         // otherwise it is written here.
@@ -3133,10 +3182,20 @@ impl Worker {
             Origin::Disk(p) => p,
             Origin::Rendered => None,
         };
-        let plan = DiskPlan { target: if expensive && !written_here { tail.disk.clone() } else { None }, now: now && compress };
+        let plan = DiskPlan { target: if expensive && !written_here { tail.disk.clone() } else { None }, now: now && compress, soon };
         // Publish the shared frame and wake the viewer first; the disk cache's writer thread
         // compresses and writes the same snapshot.
         self.finish_stored(job.key, job.urgent, ci.clone(), tail.t0, job.print, Some(job.seq), Stored { disk: plan, packed });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if soon {
+                self.disk_soon.wake(self, job.src.gpu.as_ref().filter(|_| ci.is_gpu()));
+            }
+            // Marked GPU frames pushed out of RAM by this one are read back for the disk.
+            if let Some(gpu) = &job.src.gpu {
+                self.soon_readbacks(gpu);
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if compress && let Some(gpu) = &job.src.gpu {
             // A GPU frame written to disk now is compressed now (from a read-back); any other
@@ -3153,7 +3212,11 @@ impl Worker {
                 FrameImage::Cpu(img) => dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone())),
                 // A frame shown from its texture (RT10e) is read back for the disk cache only.
                 #[cfg(not(target_arch = "wasm32"))]
-                FrameImage::Gpu(f) => self.read_back_for_disk(&job.src, f, dc.clone(), *k),
+                FrameImage::Gpu(f) => {
+                    if let Some(gpu) = &job.src.gpu {
+                        self.read_back_for_disk(gpu, f, dc.clone(), *k);
+                    }
+                }
                 #[cfg(target_arch = "wasm32")]
                 FrameImage::Gpu(_) => {}
             }
@@ -3166,8 +3229,7 @@ impl Worker {
     /// RT10e: read a resident frame back on the landing thread and put it in the disk cache
     /// (skipped when too many readbacks are in flight: the frame just isn't cached on disk).
     #[cfg(not(target_arch = "wasm32"))]
-    fn read_back_for_disk(&self, src: &RenderSource, f: &Arc<DisplayFrame>, dc: Arc<DiskCache>, k: u128) {
-        let Some(gpu) = &src.gpu else { return };
+    fn read_back_for_disk(&self, gpu: &Gpu, f: &Arc<DisplayFrame>, dc: Arc<DiskCache>, k: u128) {
         let (w, h) = (f.width, f.height);
         let land: landing::Land = Box::new(move |bytes, _| {
             if let Some(img) = bytes.and_then(|b| display_color_image(w, h, &b)) {

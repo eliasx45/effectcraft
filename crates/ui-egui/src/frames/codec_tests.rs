@@ -268,7 +268,7 @@ fn evicted_frames_spill_to_disk_and_read_back_identical() {
         f.set_compress(compress, 0);
         let worth = image(96, 54, 1);
         let cheap = image(96, 54, 2);
-        let disk = DiskPlan { target: Some((dc.clone(), 0xfeed)), now: false };
+        let disk = DiskPlan { target: Some((dc.clone(), 0xfeed)), now: false, soon: false };
         {
             let mut c = f.cache.lock().unwrap();
             c.insert_stored(key(0), FrameImage::Cpu(worth.clone()), Stored { disk, packed: None });
@@ -312,7 +312,7 @@ fn frames_written_now_go_to_disk_from_the_compressed_bytes() {
     let f = Frames::default();
     f.set_compress(true, 0);
     let img = image(80, 45, 9);
-    let disk = DiskPlan { target: Some((dc.clone(), 0xbeef)), now: true };
+    let disk = DiskPlan { target: Some((dc.clone(), 0xbeef)), now: true, soon: false };
     f.cache.lock().unwrap().insert_stored(key(0), FrameImage::Cpu(img.clone()), Stored { disk, packed: None });
     settle(&f);
     dc.flush();
@@ -397,4 +397,148 @@ fn queued_frames_on_disk_are_read_ahead_instead_of_rendered() {
     let FrameImage::Cpu(shown) = shown else { panic!("CPU frame") };
     assert_eq!(shown.as_raw(), &on_disk.rgba[..]);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A source for publishing frames by hand ([`Worker::publish`]): nothing renders.
+#[cfg(not(target_arch = "wasm32"))]
+fn hand_source(dc: &Arc<DiskCache>) -> RenderSource {
+    let s = effectcraft_engine::Session::default();
+    RenderSource {
+        freeze_feedback: Default::default(),
+        project: s.project.clone(),
+        footage: Arc::new(effectcraft_engine::render::NoFootage),
+        expr: None,
+        layer_cache: Arc::new(LayerCache::new(64 << 20)),
+        gpu: None,
+        gpu_display: false,
+        disk: Some(dc.clone()),
+    }
+}
+
+/// The viewer's frame `frame`, published as if it took 40 ms to render (worth keeping on disk).
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_viewer_frame(f: &Frames, src: &RenderSource, dc: &Arc<DiskCache>, frame: i64, img: Arc<egui::ColorImage>) {
+    let job = Job {
+        key: key(frame),
+        src: src.clone(),
+        comp: ItemId(1),
+        t: Tick::ZERO,
+        opts: RenderOpts::default(),
+        urgent: true,
+        disk_only: false,
+        idle: false,
+        seq: 1000 + frame as u64,
+        epoch: 0,
+        on_gpu: None,
+        retry: None,
+        cancel: Arc::default(),
+        print: None,
+    };
+    let t0 = web_time::Instant::now().checked_sub(std::time::Duration::from_millis(40)).unwrap();
+    let tail = Tail { t0, service_start: t0, ticket: None, disk: Some((dc.clone(), 0x5c00 + frame as u128)) };
+    f.worker().publish(&job, FrameImage::Cpu(img), &tail, Origin::Rendered, std::time::Duration::ZERO);
+}
+
+/// Q1 (1 Nov 2026): while the user scrubs, the expensive viewer frames are neither compressed
+/// nor written (they used to be, each the moment it was shown: 16-23 % of all CPU on Elias's
+/// comp); once the viewer is quiet every one of them reaches the disk, with the pixels shown,
+/// compression on and off.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn scrubbed_viewer_frames_reach_the_disk_once_the_viewer_is_quiet() {
+    for compress in [true, false] {
+        let dir = tmpdir(if compress { "soon-packed" } else { "soon-raw" });
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let f = Frames::default();
+        f.set_compress(compress, 0);
+        let src = hand_source(&dc);
+        let frames: Vec<_> = (0..12).map(|i| image(96, 54, 20 + i)).collect();
+        // Scrubbing: every frame was asked for by the viewer just now.
+        for (i, img) in frames.iter().enumerate() {
+            f.disk_soon.viewer_asked();
+            publish_viewer_frame(&f, &src, &dc, i as i64, img.clone());
+        }
+        {
+            let c = f.cache.lock().unwrap();
+            assert_eq!(c.codec.queued(), (0, 0), "nothing compressed while scrubbing (compress {compress})");
+            assert!(c.packing.is_empty());
+            assert_eq!(c.map.values().filter(|s| s.disk.soon && s.disk.target.is_some()).count(), 12, "all marked for the disk");
+        }
+        dc.flush();
+        assert_eq!(dc.stats().entries, 0, "nothing written while scrubbing (compress {compress})");
+        assert!(!f.worker().quiet(std::time::Instant::now()), "the viewer just asked");
+        // The thread writes them about a second after the last viewer frame.
+        let t0 = std::time::Instant::now();
+        while dc.stats().entries < 12 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "written once quiet: {} of 12", dc.stats().entries);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            dc.flush();
+        }
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(500), "not before the viewer was quiet");
+        settle(&f);
+        for (i, img) in frames.iter().enumerate() {
+            assert_eq!(dc.get_frame(0x5c00 + i as u128).unwrap().rgba, img.as_raw(), "frame {i} as shown (compress {compress})");
+            let c = f.cache.lock().unwrap();
+            let slot = c.map.get(&key(i as i64)).unwrap();
+            assert!(!slot.disk.soon && slot.disk.target.is_none(), "nothing left to write or spill");
+        }
+        assert_counts(&f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A marked viewer frame pushed out of RAM before the viewer was quiet goes to disk on its way
+/// out, compressed or not; a frame in a backlog that never empties still goes after
+/// [`disk_soon::MAX_WAIT`], but never while a viewer frame waits.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn marked_viewer_frames_spill_when_evicted_and_wait_for_the_viewer() {
+    for compress in [true, false] {
+        let dir = tmpdir(if compress { "soon-spill-packed" } else { "soon-spill-raw" });
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let f = Frames::default();
+        f.set_compress(compress, 0);
+        let img = image(96, 54, 7);
+        let disk = DiskPlan { target: Some((dc.clone(), 0xa11)), now: false, soon: true };
+        f.disk_soon.viewer_asked();
+        f.cache.lock().unwrap().insert_stored(key(0), FrameImage::Cpu(img.clone()), Stored { disk, packed: None });
+        settle(&f);
+        dc.flush();
+        assert!(!dc.contains(disk_cache::Kind::Frame, 0xa11));
+        f.set_budget(0);
+        dc.flush();
+        assert!(f.cache.lock().unwrap().map.is_empty());
+        assert_eq!(dc.get_frame(0xa11).unwrap().rgba, img.as_raw(), "spilled as shown (compress {compress})");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let f = Frames::default();
+    let w = f.worker();
+    assert!(w.quiet(std::time::Instant::now()), "the viewer never asked, nothing queued");
+    f.disk_soon.viewer_asked();
+    let now = std::time::Instant::now();
+    assert!(!w.quiet(now));
+    assert!(w.quiet(now + disk_soon::QUIET));
+    let src = hand_source(&DiskCache::open(tmpdir("soon-quiet"), 1 << 20).unwrap());
+    let job = |urgent: bool| Job {
+        key: key(5),
+        src: src.clone(),
+        comp: ItemId(1),
+        t: Tick::ZERO,
+        opts: RenderOpts::default(),
+        urgent,
+        disk_only: false,
+        idle: false,
+        seq: 7,
+        epoch: 0,
+        on_gpu: None,
+        retry: None,
+        cancel: Arc::default(),
+        print: None,
+    };
+    f.queue.lock().unwrap().jobs.push(job(false));
+    assert!(!w.quiet(now + disk_soon::QUIET), "prefetch queued");
+    assert!(w.quiet(now + disk_soon::MAX_WAIT), "a backlog that never empties");
+    f.queue.lock().unwrap().jobs[0] = job(true);
+    assert!(!w.quiet(now + disk_soon::MAX_WAIT * 2), "never while a viewer frame waits");
+    let _ = std::fs::remove_dir_all(tmpdir("soon-quiet"));
 }
