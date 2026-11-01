@@ -294,6 +294,10 @@ pub struct MemoryStats {
     pub media_budget: Option<u64>,
     /// Decoded footage by file: (path, bytes, frames), most bytes first.
     pub media_files: Vec<(String, usize, usize)>,
+    /// Fix 3: decoded pictures held in hardware decoder surfaces for the GPU, and their bytes
+    /// (the cached ones are in `categories.media` too; the rest are the decoders' recent frames).
+    pub media_surface_frames: u64,
+    pub media_surface_bytes: u64,
     /// comp → layer → effect (`tree` only).
     pub comps: Vec<Row>,
     /// Buffers no comp is known for (`tree` only).
@@ -334,6 +338,8 @@ pub fn stats(s: &Session, tree: bool) -> MemoryStats {
         media_frames: media.frames as u64,
         media_budget: s.footage.cache_budget().map(|b| b as u64),
         media_files: media.by_file,
+        media_surface_frames: media.surface_frames as u64,
+        media_surface_bytes: media.surface_bytes as u64,
         preview,
         comps,
         unattributed,

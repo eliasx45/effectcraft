@@ -12,7 +12,8 @@ use effectcraft_render::FloatCurve;
 use filmcraft_color::{Matrix, Range};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use rayon::prelude::*;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// How to turn a (colour, alpha) sample into a premultiplied pixel.
 #[derive(Clone, Copy, Debug)]
@@ -138,6 +139,23 @@ pub(crate) fn frame_rows(f: &VideoFrame, op: AlphaOp, y0: usize, out: &mut [Px])
 /// so the picture differs from the full-depth one by at most about one 8-bit step. `None` for
 /// frames that are 8-bit (or RGBA, or float) already: they are kept as they are.
 pub(crate) fn frame_to_8bit(f: &VideoFrame) -> Option<VideoFrame> {
+    frame_to_8bit_on(f, Bands::Rayon)
+}
+
+/// How [`to_u8`] spreads a plane over threads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bands {
+    /// Rayon's pool, into a new plane.
+    Rayon,
+    /// This thread, into a recycled plane ([`crate::recycle`]): for a CPU copy made on demand
+    /// (Fix 3), which runs inside a lazy cell that rayon workers may be waiting on (a rayon join
+    /// there could run another band of the same frame on this thread: a re-entrant
+    /// initialisation).
+    Here,
+}
+
+/// [`frame_to_8bit`], its planes made as `bands` says.
+fn frame_to_8bit_on(f: &VideoFrame, bands: Bands) -> Option<VideoFrame> {
     let PixelData::Yuv16 { planes, chroma, bits, alpha } = &f.data else { return None };
     let bits = (*bits).clamp(8, 16);
     let max = (1u32 << bits) - 1;
@@ -145,30 +163,55 @@ pub(crate) fn frame_to_8bit(f: &VideoFrame) -> Option<VideoFrame> {
     let half = (1u32 << shift) >> 1;
     // Limited range scales by 2^(bits-8) (16..235 at 8 bits is 64..940 at 10); full range by
     // max / 255 around the chroma midpoint. Alpha is always full range.
-    let full = |v: u16| ((u32::from(v).min(max) * 255 + max / 2) / max).min(255) as u8;
-    let limited = |v: u16| ((u32::from(v).min(max) + half) >> shift).min(255) as u8;
+    let full = move |v: u16| ((u32::from(v).min(max) * 255 + max / 2) / max).min(255) as u8;
+    // (in 16 bits, as `(min(v, max) + half) >> shift` in 32 cannot pass 16 bits: 8 samples a
+    // NEON instruction, the same value; `shift` is at most 8, and a wrapping shift has no
+    // per-sample overflow check in builds with overflow checks, which kept the loop scalar)
+    let (max16, half16) = (u16::try_from(max).unwrap_or(u16::MAX), u16::try_from(half).unwrap_or(0));
+    let limited = move |v: u16| v.min(max16).saturating_add(half16).wrapping_shr(shift).min(255) as u8;
     let mid = 1i64 << (bits - 1);
-    let full_chroma = |v: u16| (128 + ((i64::from(v).min(i64::from(max)) - mid) * 255 + i64::from(max / 2)).div_euclid(i64::from(max))).clamp(0, 255) as u8;
+    let full_chroma =
+        move |v: u16| (128 + ((i64::from(v).min(i64::from(max)) - mid) * 255 + i64::from(max / 2)).div_euclid(i64::from(max))).clamp(0, 255) as u8;
     let planes = match f.color.range {
-        Range::Limited => [to_u8(&planes[0], limited), to_u8(&planes[1], limited), to_u8(&planes[2], limited)],
-        Range::Full => [to_u8(&planes[0], full), to_u8(&planes[1], full_chroma), to_u8(&planes[2], full_chroma)],
+        Range::Limited => [to_u8(&planes[0], limited, bands), to_u8(&planes[1], limited, bands), to_u8(&planes[2], limited, bands)],
+        Range::Full => [to_u8(&planes[0], full, bands), to_u8(&planes[1], full_chroma, bands), to_u8(&planes[2], full_chroma, bands)],
     };
-    let alpha = alpha.as_ref().map(|a| to_u8(a, full));
+    // alpha at the decoders' own depths divides by a constant (a multiply the compiler
+    // vectorises) instead of by `max`
+    let alpha = alpha.as_ref().map(|a| match bits {
+        10 => to_u8(a, full_at::<1023>, bands),
+        12 => to_u8(a, full_at::<4095>, bands),
+        _ => to_u8(a, full, bands),
+    });
     Some(VideoFrame { width: f.width, height: f.height, data: PixelData::Yuv8 { planes, chroma: *chroma, alpha }, color: f.color, par: f.par, pts: f.pts })
+}
+
+/// A full-range sample of `MAX` (2^bits − 1) at 8 bits, rounded: `frame_to_8bit`'s `full`.
+#[inline(always)]
+fn full_at<const MAX: u32>(v: u16) -> u8 {
+    ((u32::from(v).min(MAX) * 255 + MAX / 2) / MAX).min(255) as u8
 }
 
 /// `f` of every sample of a plane, in parallel bands. Each band is a plain loop over the plane
 /// with `f` inlined, which the compiler vectorises (the limited-range rounding is a min, an add
 /// and a shift); it was a parallel iterator over single samples through a `dyn Fn`, 43–57 % of
 /// all CPU time while previews decoded 1080p ProRes 4444 at 8 bits (1 Nov 2026 profile).
-fn to_u8(p: &[u16], f: impl Fn(u16) -> u8 + Sync) -> Arc<Vec<u8>> {
+fn to_u8(p: &[u16], f: impl Fn(u16) -> u8 + Sync, bands: Bands) -> Arc<Vec<u8>> {
     const BAND: usize = 1 << 18;
-    let mut out = vec![0u8; p.len()];
-    out.par_chunks_mut(BAND).zip(p.par_chunks(BAND)).for_each(|(o, s)| {
+    let band = |o: &mut [u8], s: &[u16]| {
         for (o, v) in o.iter_mut().zip(s) {
             *o = f(*v);
         }
-    });
+    };
+    if bands == Bands::Rayon {
+        let mut out = vec![0u8; p.len()];
+        out.par_chunks_mut(BAND).zip(p.par_chunks(BAND)).for_each(|(o, s)| band(o, s));
+        return Arc::new(out);
+    }
+    // (on this thread: the loop is vectorised, ~0.1-0.3 ms a 1080p plane; helper threads
+    // started per plane cost more than that on a loaded machine)
+    let mut out = crate::recycle::take8(p.len());
+    band(&mut out, p);
     Arc::new(out)
 }
 
@@ -177,9 +220,221 @@ fn to_u8(p: &[u16], f: impl Fn(u16) -> u8 + Sync) -> Arc<Vec<u8>> {
 /// Y'CbCr is 1.5 bytes a pixel, 10-bit 3) or a still's 8 / 16-bit RGBA, instead of 16 bytes a
 /// pixel of f32.
 pub(crate) enum Packed {
-    Video { frame: Arc<VideoFrame>, op: AlphaOp },
-    Rgba8 { width: u32, height: u32, data: Vec<u8>, op: AlphaOp },
-    Rgba16 { width: u32, height: u32, data: Vec<u16>, op: AlphaOp },
+    Video {
+        frame: Arc<VideoFrame>,
+        op: AlphaOp,
+    },
+    Rgba8 {
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+        op: AlphaOp,
+    },
+    Rgba16 {
+        width: u32,
+        height: u32,
+        data: Vec<u16>,
+        op: AlphaOp,
+    },
+    /// Fix 3: a hardware-decoded picture kept in its decoder's surface; its CPU samples are made
+    /// when a CPU reader first asks ([`Lazy`]).
+    Resident(Box<Lazy>),
+}
+
+/// CPU copies made on demand of a media pool's frames kept in decoder surfaces ([`Lazy`]): the
+/// bytes they hold now (counted with the pool's cache) and how many were made.
+#[derive(Debug, Default)]
+pub(crate) struct LazyMeter {
+    pub(crate) bytes: AtomicUsize,
+    pub(crate) copies: AtomicU64,
+}
+
+/// Milliseconds since the first call (never 0), for [`Lazy::hint`].
+pub(crate) fn now_ms() -> u64 {
+    static EPOCH: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+    u64::try_from(EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX).saturating_add(1)
+}
+
+/// Fix 3 (1 Nov 2026): a hardware-decoded picture left in its decoder's surface
+/// ([`crate::hw::ResidentFrame`]), with no CPU samples until a CPU reader asks for them.
+///
+/// The GPU compositor reads it from the surface ([`effectcraft_render::FramePixels::gpu_yuv`]:
+/// a view without samples, keyed by the stand-in's luma allocation), at full depth or, for
+/// Decode Footage at 8 Bits (`eight`), rounded to 8 bits in its shader exactly as
+/// [`frame_to_8bit`] rounds. Everything else (CPU renders, CPU-only layer work, Save Frame,
+/// thumbnails, `yuv()` for a GPU that can't read the surface) asks for the CPU frame
+/// ([`Lazy::cpu`]): copied out of the surface (and rounded to 8 bits) once, into recycled
+/// buffers ([`crate::recycle`]), kept with this frame, and the same samples a decode that
+/// copied at once gave, so the pixels are identical either way.
+pub(crate) struct Lazy {
+    /// The decoder's stand-in for the picture: size, layout, colour (its planes hold no
+    /// samples); its luma allocation keys the surface and stays alive with this frame.
+    stand_in: Arc<VideoFrame>,
+    picture: Arc<dyn crate::hw::ResidentFrame>,
+    op: AlphaOp,
+    /// Kept at 8 bits (Decode Footage at 8 Bits): the CPU copy is rounded, the GPU rounds.
+    eight: bool,
+    cpu: OnceLock<Option<VideoFrame>>,
+    meter: Arc<LazyMeter>,
+    /// When a CPU copy of a frame of this movie was last made ([`now_ms`]; the media pool
+    /// copies the movie's next frames at decode for a while then).
+    hint: Arc<AtomicU64>,
+}
+
+impl Lazy {
+    pub(crate) fn new(stand_in: Arc<VideoFrame>, picture: Arc<dyn crate::hw::ResidentFrame>, op: AlphaOp, meter: Arc<LazyMeter>, hint: Arc<AtomicU64>) -> Self {
+        Self { stand_in, picture, op, eight: false, cpu: OnceLock::new(), meter, hint }
+    }
+
+    /// The stand-in's layout: chroma, depth of the decoder's samples, alpha.
+    fn layout(&self) -> Option<(Chroma, u32, bool)> {
+        match &self.stand_in.data {
+            PixelData::Yuv16 { chroma, bits, alpha, .. } => Some((*chroma, *bits, alpha.is_some())),
+            _ => None,
+        }
+    }
+
+    /// The frame at 8 bits (the GPU rounds; a CPU copy is rounded when made). `None`: it is
+    /// already, or the GPU can't round it (only limited-range 10 / 12-bit pictures, as Fix 2).
+    fn to_8bit(&self) -> Option<Lazy> {
+        let (_, bits, _) = self.layout()?;
+        if self.eight || !matches!(bits, 10 | 12) || self.stand_in.color.range != Range::Limited {
+            return None;
+        }
+        Some(Lazy {
+            stand_in: self.stand_in.clone(),
+            picture: self.picture.clone(),
+            op: self.op,
+            eight: true,
+            cpu: OnceLock::new(),
+            meter: self.meter.clone(),
+            hint: self.hint.clone(),
+        })
+    }
+
+    /// The CPU frame, made now the first time (`None`: the copy failed; logged).
+    pub(crate) fn cpu(&self) -> Option<&VideoFrame> {
+        self.cpu.get_or_init(|| self.make()).as_ref()
+    }
+
+    /// Whether the CPU frame was made.
+    #[cfg(test)]
+    pub(crate) fn made(&self) -> bool {
+        self.cpu.get().is_some_and(Option::is_some)
+    }
+
+    /// Whether it is kept at 8 bits.
+    #[cfg(test)]
+    pub(crate) fn is_eight(&self) -> bool {
+        self.eight
+    }
+
+    fn make(&self) -> Option<VideoFrame> {
+        let _profile = effectcraft_render::profile::span("resident_copy");
+        let (chroma, bits, alpha) = self.layout()?;
+        let f = &self.stand_in;
+        let (sx, sy) = chroma.shifts();
+        let n = (f.width as usize).saturating_mul(f.height as usize);
+        let cn = (f.width as usize).div_ceil(1 << sx).saturating_mul((f.height as usize).div_ceil(1 << sy));
+        let reuse = crate::hw::Planes16 {
+            y: crate::recycle::take16(n),
+            cb: crate::recycle::take16(cn),
+            cr: crate::recycle::take16(cn),
+            alpha: alpha.then(|| crate::recycle::take16(n)),
+        };
+        let p = match self.picture.planes(reuse) {
+            Ok(p) if p.y.len() == n && p.cb.len() == cn && p.cr.len() == cn && p.alpha.as_ref().map(Vec::len) == alpha.then_some(n) => p,
+            Ok(_) => {
+                log::warn!("media: a frame kept on the GPU came back with planes of the wrong size");
+                return None;
+            }
+            Err(e) => {
+                log::warn!("media: a frame kept on the GPU could not be copied out: {e}");
+                return None;
+            }
+        };
+        let full = VideoFrame {
+            width: f.width,
+            height: f.height,
+            data: PixelData::Yuv16 { planes: [Arc::new(p.y), Arc::new(p.cb), Arc::new(p.cr)], chroma, bits, alpha: p.alpha.map(Arc::new) },
+            color: f.color,
+            par: f.par,
+            pts: f.pts,
+        };
+        let out = if self.eight {
+            let e = frame_to_8bit_on(&full, Bands::Here);
+            // (the full-depth copy goes back for the next one)
+            crate::recycle::frame(full);
+            e
+        } else {
+            Some(full)
+        };
+        if let Some(o) = &out {
+            self.meter.bytes.fetch_add(o.byte_size(), Ordering::Relaxed);
+            self.meter.copies.fetch_add(1, Ordering::Relaxed);
+            self.hint.store(now_ms(), Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// The view the GPU reads from the surface (no samples: [`View::surface`]).
+    fn gpu_view(&self) -> Option<effectcraft_render::yuv::View<'_>> {
+        use effectcraft_render::yuv::Samples;
+        let (chroma, bits, alpha) = self.layout()?;
+        let PixelData::Yuv16 { planes, .. } = &self.stand_in.data else { return None };
+        let (empty, bits) = if self.eight { (Samples::U8(&[]), 8) } else { (Samples::U16(&[]), bits) };
+        let f = &self.stand_in;
+        let mut v = native_view(f.width, f.height, chroma, bits, f.color, self.op, [empty; 3], alpha.then_some(empty))?;
+        v.surface = Some(planes[0].as_ptr() as usize);
+        Some(v)
+    }
+}
+
+impl Drop for Lazy {
+    fn drop(&mut self) {
+        if let Some(Some(f)) = self.cpu.take() {
+            self.meter.bytes.fetch_sub(f.byte_size().min(self.meter.bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+            crate::recycle::frame(f);
+        }
+    }
+}
+
+/// The native YUV view of a `width`×`height` picture (`chroma`, `bits`, `color`, alpha as `op`
+/// interprets it) over `samples` (rows packed); `None` for a layout the GPU decode doesn't take.
+#[allow(clippy::too_many_arguments)]
+fn native_view<'a>(
+    width: u32,
+    height: u32,
+    chroma: Chroma,
+    bits: u32,
+    color: filmcraft_color::ColorInfo,
+    op: AlphaOp,
+    samples: [effectcraft_render::yuv::Samples<'a>; 3],
+    alpha: Option<effectcraft_render::yuv::Samples<'a>>,
+) -> Option<effectcraft_render::yuv::View<'a>> {
+    use effectcraft_render::yuv::{ChromaSiting, Coefficients, Plane, View};
+    let (sx, sy) = chroma.shifts();
+    if sx > 1 || sy > 1 {
+        return None;
+    }
+    let cw = width.div_ceil(1 << sx);
+    let ch = height.div_ceil(1 << sy);
+    let plane = |samples, w, h| Plane { samples, width: w, height: h, stride: w as usize };
+    let planes = [plane(samples[0], width, height), plane(samples[1], cw, ch), plane(samples[2], cw, ch)];
+    let k = Yuv::new(color.matrix, color.range, bits);
+    Some(View {
+        width,
+        height,
+        planes,
+        alpha: alpha.map(|a| plane(a, width, height)),
+        bits,
+        subsampling: [sx, sy],
+        siting: ChromaSiting::Centered,
+        coefficients: Coefficients { luma: [k.y_off, k.y_scale], chroma: [k.c_off, k.c_scale], rgb: [k.cr_r, k.cr_g, k.cb_g, k.cb_b] },
+        alpha_mode: op.mode,
+        matte: op.matte,
+        surface: None,
+    })
 }
 
 impl Packed {
@@ -187,6 +442,7 @@ impl Packed {
         match self {
             Packed::Video { frame, .. } => (frame.width, frame.height),
             Packed::Rgba8 { width, height, .. } | Packed::Rgba16 { width, height, .. } => (*width, *height),
+            Packed::Resident(l) => (l.stand_in.width, l.stand_in.height),
         }
     }
 
@@ -206,6 +462,13 @@ impl Packed {
                 op: *op,
             }),
             Packed::Rgba8 { .. } => None,
+            // Fix 3: the GPU rounds; a CPU copy, when one is made, is rounded then
+            Packed::Resident(l) => match l.to_8bit() {
+                Some(e) => Some(Packed::Resident(Box::new(e))),
+                // (a layout the GPU can't round: rounded on the CPU now, as before)
+                None if !l.eight => l.cpu().and_then(frame_to_8bit).map(|f| Packed::Video { frame: Arc::new(f), op: l.op }),
+                None => None,
+            },
         }
     }
 
@@ -220,6 +483,8 @@ impl Packed {
             },
             Packed::Rgba8 { data, .. } => data.len(),
             Packed::Rgba16 { data, .. } => data.len() * 2,
+            // the surface (a CPU copy made later is counted by its pool's [`LazyMeter`])
+            Packed::Resident(l) => l.picture.bytes(),
         }
     }
 
@@ -227,6 +492,11 @@ impl Packed {
     pub(crate) fn rows(&self, y0: usize, out: &mut [Px]) {
         match self {
             Packed::Video { frame, op } => frame_rows(frame, *op, y0, out),
+            Packed::Resident(l) => {
+                if let Some(f) = l.cpu() {
+                    frame_rows(f, l.op, y0, out);
+                }
+            }
             Packed::Rgba8 { width, data, op, .. } => {
                 let w = *width as usize;
                 for (r, row) in out.chunks_mut(w.max(1)).enumerate() {
@@ -253,6 +523,10 @@ impl Packed {
 
     /// The whole picture as an [`Image`].
     pub(crate) fn to_image(&self) -> Image {
+        if let Packed::Resident(l) = self {
+            // (the CPU copy made once, before the bands that read it)
+            l.cpu();
+        }
         let (w, h) = self.size();
         let mut img = Image::new(w, h);
         if w == 0 || h == 0 {
@@ -265,8 +539,13 @@ impl Packed {
 
 impl effectcraft_render::FramePixels for Packed {
     fn yuv(&self) -> Option<effectcraft_render::yuv::View<'_>> {
-        use effectcraft_render::yuv::{ChromaSiting, Coefficients, Plane, Samples, View};
-        let Self::Video { frame, op } = self else { return None };
+        use effectcraft_render::yuv::Samples;
+        let (frame, op) = match self {
+            Self::Video { frame, op } => (&**frame, *op),
+            // Fix 3: the CPU samples, made now the first time
+            Self::Resident(l) => (l.cpu()?, l.op),
+            _ => return None,
+        };
         let (samples, alpha, chroma, bits) = match &frame.data {
             PixelData::Yuv8 { planes, chroma, alpha } => {
                 (planes.each_ref().map(|p| Samples::U8(&p[..])), alpha.as_ref().map(|p| Samples::U8(&p[..])), *chroma, 8)
@@ -276,29 +555,14 @@ impl effectcraft_render::FramePixels for Packed {
             }
             _ => return None,
         };
-        let (sx, sy) = chroma.shifts();
-        if sx > 1 || sy > 1 {
-            return None;
+        native_view(frame.width, frame.height, chroma, bits, frame.color, op, samples, alpha)
+    }
+    fn gpu_yuv(&self) -> Option<effectcraft_render::yuv::View<'_>> {
+        match self {
+            // Fix 3: read from the surface, no CPU copy
+            Self::Resident(l) => l.gpu_view(),
+            _ => self.yuv(),
         }
-        let (width, height) = (frame.width, frame.height);
-        let cw = width.div_ceil(1 << sx);
-        let ch = height.div_ceil(1 << sy);
-        let plane = |samples, w, h| Plane { samples, width: w, height: h, stride: w as usize };
-        let planes = [plane(samples[0], width, height), plane(samples[1], cw, ch), plane(samples[2], cw, ch)];
-        let k = Yuv::new(frame.color.matrix, frame.color.range, bits);
-        Some(View {
-            width,
-            height,
-            planes,
-            alpha: alpha.map(|a| plane(a, width, height)),
-            bits,
-            subsampling: [sx, sy],
-            siting: ChromaSiting::Centered,
-            coefficients: Coefficients { luma: [k.y_off, k.y_scale], chroma: [k.c_off, k.c_scale], rgb: [k.cr_r, k.cr_g, k.cb_g, k.cb_b] },
-            alpha_mode: op.mode,
-            matte: op.matte,
-            surface: None,
-        })
     }
     fn size(&self) -> (u32, u32) {
         Packed::size(self)
@@ -956,6 +1220,199 @@ mod tests {
                     let want = &old.data[y0 * f.width as usize..(y0 + rows) * f.width as usize];
                     assert!(band[..want.len()].iter().zip(want).all(|(p, q)| p.map(f32::to_bits) == q.map(f32::to_bits)), "band at {y0}");
                 }
+            }
+        }
+    }
+
+    /// A hardware picture kept in its surface, as a test double: the planes it copies out, and
+    /// how many times it was asked.
+    struct Held {
+        planes: crate::hw::Planes16,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::hw::ResidentFrame for Held {
+        fn planes(&self, reuse: crate::hw::Planes16) -> std::result::Result<crate::hw::Planes16, String> {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            // (writes into the buffers it is given when they fit, as the platform's copy does)
+            let fill = |mut v: Vec<u16>, src: &[u16]| {
+                if v.len() < src.len() {
+                    v = vec![0; src.len()];
+                }
+                v.truncate(src.len());
+                v.copy_from_slice(src);
+                v
+            };
+            Ok(crate::hw::Planes16 {
+                y: fill(reuse.y, &self.planes.y),
+                cb: fill(reuse.cb, &self.planes.cb),
+                cr: fill(reuse.cr, &self.planes.cr),
+                alpha: self.planes.alpha.as_ref().map(|a| fill(reuse.alpha.unwrap_or_default(), a)),
+            })
+        }
+        fn bytes(&self) -> usize {
+            1234
+        }
+    }
+
+    /// Fix 3: a frame kept in its decoder's surface gives the GPU a view without samples (keyed
+    /// by its stand-in's luma allocation), at full depth or 8 bits; a CPU reader gets exactly the
+    /// pixels of the frame copied at decode (and its 8-bit rounding), copied out once; the copy is
+    /// counted while it lives and its buffers come back when it goes.
+    #[test]
+    fn frames_kept_on_the_gpu_are_copied_once_and_match_the_copied_frame() {
+        let (w, h) = (37u32, 21u32);
+        let n = (w * h) as usize;
+        for (chroma, cn, alpha) in [(Chroma::C444, n, true), (Chroma::C422, (w.div_ceil(2) * h) as usize, false)] {
+            let bits = if chroma == Chroma::C444 { 12 } else { 10 };
+            let planes = crate::hw::Planes16 {
+                y: noise16(n, 1, bits).to_vec(),
+                cb: noise16(cn, 2, bits).to_vec(),
+                cr: noise16(cn, 3, bits).to_vec(),
+                alpha: alpha.then(|| noise16(n, 4, bits).to_vec()),
+            };
+            let copied = Arc::new(frame(
+                w,
+                h,
+                PixelData::Yuv16 {
+                    planes: [Arc::new(planes.y.clone()), Arc::new(planes.cb.clone()), Arc::new(planes.cr.clone())],
+                    chroma,
+                    bits,
+                    alpha: planes.alpha.clone().map(Arc::new),
+                },
+                filmcraft_color::ColorInfo::REC709,
+            ));
+            // the decoder's stand-in: a short luma plane, zero planes for the rest
+            let stand_in = Arc::new(frame(
+                w,
+                h,
+                PixelData::Yuv16 {
+                    planes: [Arc::new(Vec::with_capacity(1)), Arc::new(vec![0; n + cn]), Arc::new(vec![0; cn])],
+                    chroma,
+                    bits,
+                    alpha: alpha.then(|| Arc::new(vec![0; n])),
+                },
+                filmcraft_color::ColorInfo::REC709,
+            ));
+            assert!(crate::hw::is_stand_in(&stand_in) && !crate::hw::is_stand_in(&copied));
+            let held = Arc::new(Held { planes, asked: Default::default() });
+            let meter = Arc::new(LazyMeter::default());
+            let op = AlphaOp::new(AlphaMode::Straight, [0.0; 3]);
+            let lazy = Packed::Resident(Box::new(Lazy::new(stand_in.clone(), held.clone(), op, meter.clone(), Arc::default())));
+            let video = Packed::Video { frame: copied.clone(), op };
+            assert_eq!(lazy.bytes(), 1234, "the cache counts the surface");
+            assert_eq!(lazy.size(), (w, h));
+            // the GPU: no samples, the stand-in's key, the same layout and coefficients
+            let g = effectcraft_render::FramePixels::gpu_yuv(&lazy).expect("a GPU view");
+            let v = effectcraft_render::FramePixels::yuv(&video).expect("the copied frame's view");
+            let PixelData::Yuv16 { planes: sp, .. } = &stand_in.data else { panic!("a planar stand-in") };
+            assert_eq!(g.surface, Some(sp[0].as_ptr() as usize));
+            assert!(g.planes.iter().all(|p| p.samples.is_empty()) && g.validate() == Ok(0));
+            assert_eq!(
+                (g.bits, g.subsampling, g.alpha.is_some(), g.coefficients.luma, g.coefficients.chroma),
+                (v.bits, v.subsampling, v.alpha.is_some(), v.coefficients.luma, v.coefficients.chroma)
+            );
+            assert_eq!(held.asked.load(Ordering::Relaxed), 0, "nothing copied for the GPU");
+            // a CPU reader: the same pixels, copied once
+            assert_bit_exact(&lazy.to_image(), &video.to_image(), "CPU pixels");
+            let mut band = vec![[0.0; 4]; w as usize * 2];
+            lazy.rows(4, &mut band);
+            assert_eq!(held.asked.load(Ordering::Relaxed), 1, "copied once");
+            let Packed::Resident(l) = &lazy else { panic!("kept on the GPU") };
+            assert!(l.made());
+            assert_eq!(meter.bytes.load(Ordering::Relaxed), copied.byte_size(), "the copy is counted");
+            assert_eq!(meter.copies.load(Ordering::Relaxed), 1);
+            let cpu_view = effectcraft_render::FramePixels::yuv(&lazy).expect("CPU view");
+            assert!(cpu_view.surface.is_none() && cpu_view.validate().is_ok());
+            // Decode Footage at 8 Bits: the GPU rounds (an 8-bit view of the same surface), a
+            // CPU reader gets exactly frame_to_8bit's samples
+            let eight = lazy.to_8bit().expect("8-bit");
+            let eight_video = video.to_8bit().expect("8-bit copied frame");
+            let g8 = effectcraft_render::FramePixels::gpu_yuv(&eight).expect("8-bit GPU view");
+            let v8 = effectcraft_render::FramePixels::yuv(&eight_video).expect("8-bit view");
+            assert_eq!(g8.surface, g.surface, "the same surface");
+            assert!(matches!(g8.planes[0].samples, effectcraft_render::yuv::Samples::U8(_)));
+            assert_eq!((g8.bits, g8.coefficients.luma, g8.coefficients.chroma), (8, v8.coefficients.luma, v8.coefficients.chroma));
+            assert!(eight.to_8bit().is_none(), "8-bit already");
+            assert_eq!(held.asked.load(Ordering::Relaxed), 1, "rounding for the GPU copies nothing");
+            assert_bit_exact(&eight.to_image(), &eight_video.to_image(), "8-bit CPU pixels");
+            assert_eq!(held.asked.load(Ordering::Relaxed), 2);
+            assert_eq!(meter.bytes.load(Ordering::Relaxed), copied.byte_size() + copied.byte_size() / 2, "both copies counted");
+            drop((lazy, eight));
+            assert_eq!(meter.bytes.load(Ordering::Relaxed), 0, "copies gone with their frames");
+        }
+    }
+
+    /// The 16-bit limited-range rounding and the constant-depth alpha scaling give the 32-bit
+    /// formulas' values for every sample at every depth.
+    #[test]
+    fn eight_bit_rounding_formulas_agree_for_every_sample() {
+        for bits in 9u32..=16 {
+            let max = (1u32 << bits) - 1;
+            let shift = bits - 8;
+            let half = (1u32 << shift) >> 1;
+            let (max16, half16) = (max as u16, half as u16);
+            for v in 0..=u16::MAX {
+                let old = ((u32::from(v).min(max) + half) >> shift).min(255) as u8;
+                assert_eq!(v.min(max16).saturating_add(half16).wrapping_shr(shift).min(255) as u8, old, "{bits} bits, {v}");
+                let full = ((u32::from(v).min(max) * 255 + max / 2) / max).min(255) as u8;
+                match bits {
+                    10 => assert_eq!(full_at::<1023>(v), full),
+                    12 => assert_eq!(full_at::<4095>(v), full),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The 8-bit rounding of CPU copies made on demand (on the calling thread) gives what the rayon one gives.
+    #[test]
+    fn eight_bit_rounding_on_this_thread_matches() {
+        for (n, range) in [(5usize, Range::Limited), ((1 << 20) + 77, Range::Limited), ((1 << 20) + 3, Range::Full)] {
+            let f = frame(
+                n as u32,
+                1,
+                PixelData::Yuv16 {
+                    planes: [noise16(n, 1, 12), noise16(n, 2, 12), noise16(n, 3, 12)],
+                    chroma: Chroma::C444,
+                    bits: 12,
+                    alpha: Some(noise16(n, 4, 12)),
+                },
+                filmcraft_color::ColorInfo { range, ..filmcraft_color::ColorInfo::REC709 },
+            );
+            let (a, b) = (frame_to_8bit_on(&f, Bands::Rayon).expect("8-bit"), frame_to_8bit_on(&f, Bands::Here).expect("8-bit"));
+            let (PixelData::Yuv8 { planes: pa, alpha: aa, .. }, PixelData::Yuv8 { planes: pb, alpha: ab, .. }) = (&a.data, &b.data) else { panic!("8-bit") };
+            assert_eq!(pa, pb, "{n} samples, {range:?}");
+            assert_eq!(aa, ab);
+        }
+    }
+
+    /// `cargo test -p effectcraft-media --lib bench_eight_bit -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_eight_bit_rounding() {
+        let n = 1920 * 1080;
+        let f = frame(
+            1920,
+            1080,
+            PixelData::Yuv16 {
+                planes: [noise16(n, 1, 12), noise16(n, 2, 12), noise16(n, 3, 12)],
+                chroma: Chroma::C444,
+                bits: 12,
+                alpha: Some(noise16(n, 4, 12)),
+            },
+            filmcraft_color::ColorInfo::REC709,
+        );
+        for _ in 0..3 {
+            for bands in [Bands::Rayon, Bands::Here] {
+                let t = std::time::Instant::now();
+                for _ in 0..20 {
+                    let e = frame_to_8bit_on(&f, bands).expect("8-bit");
+                    if bands == Bands::Here {
+                        crate::recycle::frame(e);
+                    }
+                }
+                eprintln!("{} {:?}", if bands == Bands::Rayon { "rayon" } else { "here " }, t.elapsed() / 20);
             }
         }
     }

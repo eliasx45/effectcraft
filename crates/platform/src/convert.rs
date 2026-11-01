@@ -10,7 +10,7 @@
 //! same, sample for sample (the tests compare against the old per-sample code).
 
 /// Planar samples of one picture.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Planes {
     pub y: Vec<u16>,
     pub cb: Vec<u16>,
@@ -126,20 +126,38 @@ fn run<'o>(bands: Vec<Band<'o>>, job: impl Fn(Band<'o>) -> Result<(), String> + 
     })
 }
 
+/// `v` as a plane of `n` samples, every one of which the caller overwrites: reused as it is when
+/// it holds `n` samples (or a few more), so its pages are already there (Fix 3's buffer pool: a
+/// fresh 4K plane costs the kernel zero-filling 16 MB of new pages as it is written); otherwise a
+/// new allocation (`vec![0; n]` is calloc: fresh zeroed pages, not a pass that writes zeros).
+fn fit(mut v: Vec<u16>, n: usize) -> Vec<u16> {
+    if v.len() >= n && v.len() <= n.saturating_add(n / 4) {
+        v.truncate(n);
+        v
+    } else {
+        vec![0; n]
+    }
+}
+
 /// Tri-planar `s4as` (`kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar`: a Y' plane, an
 /// interleaved Cb Cr plane at full width and an alpha plane, 16-bit little-endian, video-range
 /// Y'CbCr in the high bits, full-range alpha) to 12-bit 4:4:4 planes; alpha only when `alpha`.
+#[cfg(test)]
 pub(crate) fn unpack_s4as(luma: Rows, chroma: Rows, a: Option<Rows>, w: usize, h: usize) -> Result<Planes, String> {
-    let n = w.checked_mul(h).ok_or("picture size overflows")?;
-    unpack_s4as_on(luma, chroma, a, w, h, threads_for(n.saturating_mul(if a.is_some() { 4 } else { 3 })))
+    unpack_s4as_into(luma, chroma, a, w, h, Planes::default())
 }
 
-/// [`unpack_s4as`] on `threads` threads.
-fn unpack_s4as_on(luma: Rows, chroma: Rows, a: Option<Rows>, w: usize, h: usize, threads: usize) -> Result<Planes, String> {
+/// [`unpack_s4as`] into `reuse`'s buffers where they fit ([`fit`]).
+pub(crate) fn unpack_s4as_into(luma: Rows, chroma: Rows, a: Option<Rows>, w: usize, h: usize, reuse: Planes) -> Result<Planes, String> {
     let n = w.checked_mul(h).ok_or("picture size overflows")?;
-    // `vec![0; n]` is calloc: fresh zeroed pages, not a pass that writes zeros.
-    let (mut y, mut cb, mut cr) = (vec![0u16; n], vec![0u16; n], vec![0u16; n]);
-    let mut alpha = a.map(|_| vec![0u16; n]);
+    unpack_s4as_on(luma, chroma, a, w, h, threads_for(n.saturating_mul(if a.is_some() { 4 } else { 3 })), reuse)
+}
+
+/// [`unpack_s4as_into`] on `threads` threads.
+fn unpack_s4as_on(luma: Rows, chroma: Rows, a: Option<Rows>, w: usize, h: usize, threads: usize, reuse: Planes) -> Result<Planes, String> {
+    let n = w.checked_mul(h).ok_or("picture size overflows")?;
+    let (mut y, mut cb, mut cr) = (fit(reuse.y, n), fit(reuse.cb, n), fit(reuse.cr, n));
+    let mut alpha = a.map(|_| fit(reuse.alpha.unwrap_or_default(), n));
     if w == 0 {
         return Ok(Planes { y, cb, cr, alpha });
     }
@@ -165,17 +183,23 @@ fn unpack_s4as_on(luma: Rows, chroma: Rows, a: Option<Rows>, w: usize, h: usize,
 /// Biplanar `x422` (`kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange`: a Y' plane and an
 /// interleaved Cb Cr plane at half width, 10-bit samples in the high bits of 16-bit words) to
 /// 10-bit 4:2:2 planes.
+#[cfg(test)]
 pub(crate) fn unpack_x422(luma: Rows, chroma: Rows, w: usize, h: usize) -> Result<Planes, String> {
-    let n = w.checked_mul(h).ok_or("picture size overflows")?;
-    unpack_x422_on(luma, chroma, w, h, threads_for(n.saturating_mul(2)))
+    unpack_x422_into(luma, chroma, w, h, Planes::default())
 }
 
-/// [`unpack_x422`] on `threads` threads.
-fn unpack_x422_on(luma: Rows, chroma: Rows, w: usize, h: usize, threads: usize) -> Result<Planes, String> {
+/// [`unpack_x422`] into `reuse`'s buffers where they fit ([`fit`]).
+pub(crate) fn unpack_x422_into(luma: Rows, chroma: Rows, w: usize, h: usize, reuse: Planes) -> Result<Planes, String> {
+    let n = w.checked_mul(h).ok_or("picture size overflows")?;
+    unpack_x422_on(luma, chroma, w, h, threads_for(n.saturating_mul(2)), reuse)
+}
+
+/// [`unpack_x422_into`] on `threads` threads.
+fn unpack_x422_on(luma: Rows, chroma: Rows, w: usize, h: usize, threads: usize, reuse: Planes) -> Result<Planes, String> {
     let cw = w.div_ceil(2);
     let n = w.checked_mul(h).ok_or("picture size overflows")?;
     let cn = cw.checked_mul(h).ok_or("picture size overflows")?;
-    let (mut y, mut cb, mut cr) = (vec![0u16; n], vec![0u16; cn], vec![0u16; cn]);
+    let (mut y, mut cb, mut cr) = (fit(reuse.y, n), fit(reuse.cb, cn), fit(reuse.cr, cn));
     if w == 0 {
         return Ok(Planes { y, cb, cr, alpha: None });
     }
@@ -328,7 +352,7 @@ mod tests {
                     let want = reference::unpack_s4as(l, c, a, w, h).unwrap();
                     assert_eq!(unpack_s4as(l, c, a, w, h).unwrap(), want, "{w}x{h} pad {pad} alpha {with_alpha}");
                     for t in [1, 2, 3, 4, 7, 100] {
-                        assert_eq!(unpack_s4as_on(l, c, a, w, h, t).unwrap(), want, "{w}x{h} pad {pad} alpha {with_alpha} {t} threads");
+                        assert_eq!(unpack_s4as_on(l, c, a, w, h, t, Planes::default()).unwrap(), want, "{w}x{h} pad {pad} alpha {with_alpha} {t} threads");
                     }
                 }
             }
@@ -346,9 +370,34 @@ mod tests {
                 let want = reference::unpack_x422(l, c, w, h).unwrap();
                 assert_eq!(unpack_x422(l, c, w, h).unwrap(), want, "{w}x{h} pad {pad}");
                 for t in [1, 2, 3, 4, 7, 100] {
-                    assert_eq!(unpack_x422_on(l, c, w, h, t).unwrap(), want, "{w}x{h} pad {pad} {t} threads");
+                    assert_eq!(unpack_x422_on(l, c, w, h, t, Planes::default()).unwrap(), want, "{w}x{h} pad {pad} {t} threads");
                 }
             }
+        }
+    }
+
+    /// Fix 3's buffer pool: buffers of an earlier picture (other samples, a little longer, or
+    /// the wrong size) give exactly the planes fresh ones give, and are reused when they fit.
+    #[test]
+    fn reused_buffers_give_the_same_planes() {
+        let (w, h) = (37usize, 11usize);
+        let (luma, chroma, alpha) = (noise(w * 2 * h, 8), noise(w * 4 * h, 9), noise(w * 2 * h, 10));
+        let (l, c, a) = (Rows { data: &luma, stride: w * 2 }, Rows { data: &chroma, stride: w * 4 }, Rows { data: &alpha, stride: w * 2 });
+        let want = unpack_s4as(l, c, Some(a), w, h).unwrap();
+        let n = w * h;
+        for len in [n, n + 3, n / 2, 3 * n] {
+            let dirty = || vec![0xabcd_u16; len];
+            let reuse = Planes { y: dirty(), cb: dirty(), cr: dirty(), alpha: Some(dirty()) };
+            let ptr = reuse.y.as_ptr();
+            for t in [1, 3] {
+                let got = unpack_s4as_on(l, c, Some(a), w, h, t, reuse.clone()).unwrap();
+                assert_eq!(got, want, "s4as into buffers of {len}, {t} threads");
+            }
+            let got = unpack_s4as_into(l, c, Some(a), w, h, reuse).unwrap();
+            assert_eq!(got.y.as_ptr() == ptr, len == n || len == n + 3, "buffers of {len} samples reused only when they fit");
+            let want422 = unpack_x422(l, Rows { data: &chroma, stride: w.div_ceil(2) * 4 }, w, h).unwrap();
+            let reuse = Planes { y: dirty(), cb: dirty(), cr: dirty(), alpha: None };
+            assert_eq!(unpack_x422_into(l, Rows { data: &chroma, stride: w.div_ceil(2) * 4 }, w, h, reuse).unwrap(), want422, "x422 into buffers of {len}");
         }
     }
 
@@ -359,9 +408,9 @@ mod tests {
         let w = 1 << 16;
         let (l, c) = (Rows { data: &all, stride: w * 2 }, Rows { data: &chroma, stride: w * 4 });
         let a = Some(l);
-        assert_eq!(unpack_s4as_on(l, c, a, w, 1, 1).unwrap(), reference::unpack_s4as(l, c, a, w, 1).unwrap());
+        assert_eq!(unpack_s4as_on(l, c, a, w, 1, 1, Planes::default()).unwrap(), reference::unpack_s4as(l, c, a, w, 1).unwrap());
         let c422 = Rows { data: &chroma, stride: w * 2 };
-        assert_eq!(unpack_x422_on(l, c422, w, 1, 1).unwrap(), reference::unpack_x422(l, c422, w, 1).unwrap());
+        assert_eq!(unpack_x422_on(l, c422, w, 1, 1, Planes::default()).unwrap(), reference::unpack_x422(l, c422, w, 1).unwrap());
     }
 
     #[test]
@@ -371,12 +420,12 @@ mod tests {
         let short = noise(w * 4 * (h - 1), 7);
         let (l, c) = (Rows { data: &luma, stride: w * 2 }, Rows { data: &short, stride: w * 4 });
         for t in [1, 2, 4] {
-            assert!(unpack_s4as_on(l, c, None, w, h, t).is_err(), "{t} threads");
-            assert!(unpack_s4as_on(l, Rows { data: &luma, stride: w * 2 }, Some(l), w, h, t).is_err(), "short chroma, {t} threads");
-            assert!(unpack_x422_on(Rows { data: &luma[..w * 2 * (h - 1)], stride: w * 2 }, c, w, h, t).is_err(), "{t} threads");
+            assert!(unpack_s4as_on(l, c, None, w, h, t, Planes::default()).is_err(), "{t} threads");
+            assert!(unpack_s4as_on(l, Rows { data: &luma, stride: w * 2 }, Some(l), w, h, t, Planes::default()).is_err(), "short chroma, {t} threads");
+            assert!(unpack_x422_on(Rows { data: &luma[..w * 2 * (h - 1)], stride: w * 2 }, c, w, h, t, Planes::default()).is_err(), "{t} threads");
         }
         // an empty picture is fine
-        assert_eq!(unpack_s4as_on(l, c, Some(l), 0, 5, 4).unwrap().y, Vec::<u16>::new());
-        assert_eq!(unpack_x422_on(l, c, 3, 0, 4).unwrap().cb, Vec::<u16>::new());
+        assert_eq!(unpack_s4as_on(l, c, Some(l), 0, 5, 4, Planes::default()).unwrap().y, Vec::<u16>::new());
+        assert_eq!(unpack_x422_on(l, c, 3, 0, 4, Planes::default()).unwrap().cb, Vec::<u16>::new());
     }
 }

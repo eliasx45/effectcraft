@@ -13,7 +13,7 @@ use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
 use image::metadata::Orientation;
 
-use crate::convert::{AlphaOp, Packed, frame_to_image, pack_dynamic, turned};
+use crate::convert::{AlphaOp, Lazy, LazyMeter, Packed, frame_to_image, pack_dynamic, turned};
 use crate::gif_anim::{self, Anim};
 use crate::{MediaError, Result};
 
@@ -148,9 +148,16 @@ struct Lru {
     /// The shared cache budget, when the caches share one ([`MediaPool::share`]): told the
     /// bytes and the oldest use after every change.
     share: Option<ShareLink>,
+    /// Fix 3: CPU copies made on demand of cached frames kept in decoder surfaces (their bytes
+    /// count with the cache's, [`Lru::held`]; an entry's own bytes are its surface's).
+    lazy: Arc<LazyMeter>,
 }
 
 impl Lru {
+    /// Bytes held: the entries', and the CPU copies made of them since ([`Lru::lazy`]).
+    fn held(&self) -> usize {
+        self.bytes.saturating_add(self.lazy.bytes.load(Ordering::Relaxed))
+    }
     fn tick(&mut self) -> u64 {
         self.clock = effectcraft_render::cache::shared::stamp_after(self.clock);
         self.clock
@@ -158,7 +165,7 @@ impl Lru {
     /// Tell the shared budget the bytes held and the oldest use (two atomic stores).
     fn report(&self) {
         if let Some(l) = &self.share {
-            l.report(self.bytes as u64, self.order.first_key_value().map(|(s, _)| *s));
+            l.report(self.held() as u64, self.order.first_key_value().map(|(s, _)| *s));
         }
     }
     fn get(&mut self, k: &Key) -> Option<Pixels> {
@@ -192,7 +199,7 @@ impl Lru {
     }
     /// Evict least-recently-used frames until within `budget` (the newest frame always stays).
     fn evict(&mut self, budget: usize) {
-        while self.bytes > budget && self.map.len() > 1 {
+        while self.held() > budget && self.map.len() > 1 {
             let Some((_, k)) = self.order.pop_first() else { break };
             if let Some(e) = self.map.remove(&k) {
                 self.bytes -= e.bytes;
@@ -242,6 +249,8 @@ pub struct PoolStats {
     pub bytes: usize,
     /// Movie and audio files opened (each path once, however many callers ask for it at once).
     pub opened: u64,
+    /// Fix 3: CPU copies made on demand of frames kept in hardware decoder surfaces.
+    pub copies: u64,
 }
 
 #[derive(Default)]
@@ -603,6 +612,26 @@ struct Inner {
     /// The disk cache decoded stills that are slow to decode are kept in between sessions
     /// ([`MediaPool::set_still_cache`]; `None` = off).
     stills: Mutex<Option<Arc<effectcraft_render::disk_cache::DiskCache>>>,
+    /// Fix 3: preview reads of movies on a hardware decoder may leave their pictures in the
+    /// decoder's surface, for the GPU to read there ([`MediaPool::set_resident_frames`]; on).
+    resident: AtomicBool,
+    /// Fix 3: the CPU copies made of frames kept in surfaces (shared with the cache's [`Lru`]).
+    lazy: Arc<LazyMeter>,
+    /// Fix 3: per movie, when a CPU reader last needed a copy of one of its frames kept in a
+    /// surface ([`crate::convert::now_ms`]): for [`CPU_READS_FOR`] after, its frames are copied
+    /// at decode (as before), so footage the CPU reads anyway isn't held twice.
+    cpu_reads: Mutex<HashMap<Arc<str>, Arc<AtomicU64>>>,
+}
+
+/// After a CPU reader needed a copy of a movie's frame kept in a decoder surface, that movie's
+/// frames are copied at decode for this long (milliseconds; Fix 3).
+const CPU_READS_FOR: u64 = 10_000;
+
+/// A decoded movie frame: FilmCraft's, or a stand-in for a picture a hardware decoder kept in its
+/// surface (Fix 3: the picture, and the movie's [`Inner::cpu_reads`] hint).
+pub(crate) struct Decoded {
+    frame: Arc<filmcraft_frame::VideoFrame>,
+    resident: Option<(Arc<dyn crate::hw::ResidentFrame>, Arc<AtomicU64>)>,
 }
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
@@ -677,13 +706,15 @@ impl MediaPool {
 
     /// A pool whose frame cache holds at most `bytes` of decoded frames.
     pub fn with_budget(bytes: usize) -> Self {
+        let lazy = Arc::new(LazyMeter::default());
+        let cache = CacheState { lru: Lru { lazy: lazy.clone(), ..Lru::default() }, ..CacheState::default() };
         let inner = Arc::new(Inner {
             sources: Mutex::default(),
             files: Mutex::default(),
             models: Mutex::default(),
             psds: Mutex::default(),
             gifs: Mutex::default(),
-            cache: Mutex::default(),
+            cache: Mutex::new(cache),
             done: Condvar::new(),
             budget: AtomicU64::new(bytes as u64),
             read_ahead: AtomicBool::new(cfg!(not(target_arch = "wasm32"))),
@@ -701,6 +732,9 @@ impl MediaPool {
             conform_failed: Mutex::default(),
             problems: Mutex::default(),
             stills: Mutex::default(),
+            resident: AtomicBool::new(true),
+            lazy: lazy.clone(),
+            cpu_reads: Mutex::default(),
         });
         let twin = Some(Arc::new(Self { inner: inner.clone(), exact: true, twin: None }));
         Self { inner, exact: false, twin }
@@ -811,9 +845,18 @@ impl MediaPool {
             misses: i.misses.load(Ordering::Relaxed),
             prefetched: i.prefetched.load(Ordering::Relaxed),
             frames: c.lru.map.len(),
-            bytes: c.lru.bytes,
+            bytes: c.lru.held(),
             opened: i.opened.load(Ordering::Relaxed),
+            copies: i.lazy.copies.load(Ordering::Relaxed),
         }
+    }
+
+    /// Fix 3: let preview reads of movies on a hardware decoder leave their pictures in the
+    /// decoder's surface, for the GPU compositor to read there, a CPU copy made only when
+    /// something asks for CPU pixels (on by default; it needs a platform layer that keeps
+    /// surfaces, [`crate::hw::ResidentHooks`]). Off: every picture is copied out at decode.
+    pub fn set_resident_frames(&self, on: bool) {
+        self.inner.resident.store(on, Ordering::Relaxed);
     }
 
     /// The frame cache by file (the Memory panel): the lock is held to copy (path, bytes) out,
@@ -828,14 +871,24 @@ impl MediaPool {
         }
         let mut by_file: Vec<(String, usize, usize)> = by.into_iter().map(|(p, (b, n))| (p.to_string(), b, n)).collect();
         by_file.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        effectcraft_render::FootageCacheUsage { bytes: entries.iter().map(|e| e.1).fold(0usize, usize::saturating_add), frames: entries.len(), by_file }
+        // (CPU copies made later of frames kept in decoder surfaces count too, and the idle
+        // buffers kept for the next copies; Fix 3)
+        let copies = self.inner.lazy.bytes.load(Ordering::Relaxed).saturating_add(crate::recycle::idle_bytes());
+        let (surface_frames, surface_bytes) = crate::hw::resident_usage();
+        effectcraft_render::FootageCacheUsage {
+            bytes: entries.iter().map(|e| e.1).fold(copies, usize::saturating_add),
+            frames: entries.len(),
+            by_file,
+            surface_frames,
+            surface_bytes,
+        }
     }
 
     /// Drop every cached frame (decoders stay open).
     pub fn clear_frames(&self) {
         let mut c = lock(&self.inner.cache);
         // (the shared budget's link stays)
-        c.lru = Lru { share: c.lru.share.take(), ..Lru::default() };
+        c.lru = Lru { share: c.lru.share.take(), lazy: c.lru.lazy.clone(), ..Lru::default() };
         c.lru.report();
         c.last.clear();
         // Running decode-aheads stop.
@@ -843,6 +896,9 @@ impl MediaPool {
         drop(c);
         // Decoded GIFs sit outside the frame budget; Purge frees them too.
         lock(&self.inner.gifs).clear();
+        // Fix 3: pictures held in decoder surfaces for frames now gone, and idle copy buffers
+        crate::hw::sweep_resident();
+        crate::recycle::clear();
     }
 
     /// Drop every cached frame and decoder.
@@ -850,6 +906,8 @@ impl MediaPool {
         self.clear_frames();
         lock(&self.inner.sources).map.clear();
         lock(&self.inner.problems).clear();
+        // (the decoders' own frame caches went with their sources)
+        crate::hw::sweep_resident();
     }
 
     /// Movie and audio files open now.
@@ -1612,7 +1670,7 @@ impl Inner {
                 None => match base.media_t.filter(|_| !gif_anim::is_animated(footage)) {
                     Some(mt) => {
                         let (frame, turn) = self.video_frame(&base.key.path, base.key.hw, mt, detached)?;
-                        video_pixels(frame, AlphaOp::of(footage, loc.float), turn)
+                        self.video_pixels(frame, AlphaOp::of(footage, loc.float), turn)
                     }
                     None => self.decode(&base, footage, detached)?,
                 },
@@ -1664,7 +1722,7 @@ impl Inner {
             }
             Some(mt) => {
                 let (frame, turn) = self.video_frame(path, loc.key.hw, mt, detached)?;
-                Ok(video_pixels(frame, op, turn))
+                Ok(self.video_pixels(frame, op, turn))
             }
         }
     }
@@ -1720,22 +1778,74 @@ impl Inner {
     /// The decoded movie frame of `path` at media time `mt`, from the source that may decode on
     /// a hardware decoder (`hw`, previews) or the one that decodes exactly. `detached`: a movie
     /// not open already is opened for this frame only.
-    fn video_frame(&self, path: &Arc<str>, hw: bool, mt: Tick, detached: bool) -> Result<(Arc<filmcraft_frame::VideoFrame>, Orientation)> {
+    ///
+    /// Fix 3: a preview read of a movie this pool keeps open may leave the hardware decoder's
+    /// picture in its surface (unless a CPU reader needed copies of this movie's frames lately,
+    /// [`CPU_READS_FOR`]); the frame then comes with the picture ([`Decoded::resident`]).
+    fn video_frame(&self, path: &Arc<str>, hw: bool, mt: Tick, detached: bool) -> Result<(Decoded, Orientation)> {
+        let hint = (hw && !detached).then(|| self.cpu_reads(path));
+        let resident = self.resident.load(Ordering::Relaxed)
+            && hint.as_ref().is_some_and(|h| {
+                let at = h.load(Ordering::Relaxed);
+                at == 0 || crate::convert::now_ms().saturating_sub(at) >= CPU_READS_FOR
+            });
         // Every decoder FilmCraft creates for this read (the source's first, its spare decoders
         // for parallel intra frames, a private one for a nested request) is made on this thread
         // inside this scope: the hardware factory declines outside a preview read.
         let _hw = crate::hw::scope(hw);
+        let _resident = crate::hw::resident_scope(resident);
         let (src, turn) = match detached {
             false => self.opened(path, hw),
-            true => self.open_source(path, hw).or_else(|| {
-                let mem = lock(&self.files).get(&**path).cloned();
-                let turn = movie_turn(path, mem.as_deref());
-                crate::open::open_source(path, mem).ok().map(|(s, _)| (s, turn))
-            }),
+            true => self.open_source(path, hw).or_else(|| self.open_detached(path)),
         }
         .ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
-        let frame = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
-        Ok((frame, turn))
+        let at = FrameRequest::full(filmcraft_time::Tick(mt.0));
+        let frame = src.video_frame(at).map_err(MediaError::from)?;
+        if let Some(picture) = crate::hw::resident_of(&frame) {
+            let hint = hint.unwrap_or_default();
+            return Ok((Decoded { frame, resident: Some((picture, hint)) }, turn));
+        }
+        if crate::hw::is_stand_in(&frame) {
+            // A stand-in whose picture is gone (the decoder's cache outlived it): its planes hold
+            // no samples. The frame is decoded again on a source of its own, copied at decode.
+            log::debug!("media: {path}: a frame kept on the GPU was gone; decoding it again");
+            let _copy = crate::hw::resident_scope(false);
+            let (src, _) = self.open_source(path, hw).or_else(|| self.open_detached(path)).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
+            let frame = src.video_frame(at).map_err(MediaError::from)?;
+            if crate::hw::is_stand_in(&frame) {
+                return Err(MediaError::Decode(format!("{path}: a frame kept on the GPU could not be decoded again")));
+            }
+            return Ok((Decoded { frame, resident: None }, turn));
+        }
+        Ok((Decoded { frame, resident: None }, turn))
+    }
+
+    /// `path` opened for one read, from the bytes registered for it or the file.
+    fn open_detached(&self, path: &Arc<str>) -> Option<(SharedSource, Orientation)> {
+        let mem = lock(&self.files).get(&**path).cloned();
+        let turn = movie_turn(path, mem.as_deref());
+        crate::open::open_source(path, mem).ok().map(|(s, _)| (s, turn))
+    }
+
+    /// The [`Inner::cpu_reads`] hint of the movie at `path`.
+    fn cpu_reads(&self, path: &Arc<str>) -> Arc<AtomicU64> {
+        let mut m = lock(&self.cpu_reads);
+        if m.len() >= 4096 && !m.contains_key(path) {
+            m.clear();
+        }
+        m.entry(path.clone()).or_default().clone()
+    }
+
+    /// A decoded movie frame as cached pixels ([`video_pixels`]; a picture kept in its decoder's
+    /// surface becomes a [`Lazy`] frame).
+    fn video_pixels(&self, d: Decoded, op: AlphaOp, turn: Orientation) -> Pixels {
+        let Some((picture, hint)) = d.resident else { return video_pixels(d.frame, op, turn) };
+        let lazy = Lazy::new(d.frame, picture, op, self.lazy.clone(), hint);
+        match turn {
+            Orientation::NoTransforms => Pixels::Packed(Arc::new(Packed::Resident(Box::new(lazy)))),
+            // (turned on the CPU: copied out now)
+            _ => Pixels::Float(Arc::new(turned(Packed::Resident(Box::new(lazy)).to_image(), turn))),
+        }
     }
 }
 
@@ -2279,6 +2389,7 @@ mod tests {
                 Packed::Video { frame, .. } => (matches!(frame.data, filmcraft_frame::PixelData::Yuv8 { .. }), p.bytes()),
                 Packed::Rgba8 { .. } => (true, p.bytes()),
                 Packed::Rgba16 { .. } => (false, p.bytes()),
+                Packed::Resident(l) => (l.is_eight(), p.bytes()),
             },
             other => (false, other.bytes()),
         }
@@ -2486,30 +2597,6 @@ mod tests {
         assert!(u <= 4 + MAX_AHEAD, "the window ends at {u}, not near frame 3");
     }
 
-    #[test]
-    fn frame_index_loops_and_clamps() {
-        let r = FrameRate::FPS_30;
-        assert_eq!(Inner::frame_index(r, r.tick_of(-3), 10, 1), 0);
-        assert_eq!(Inner::frame_index(r, r.tick_of(4), 10, 1), 4);
-        assert_eq!(Inner::frame_index(r, r.tick_of(25), 10, 1), 9);
-        assert_eq!(Inner::frame_index(r, r.tick_of(25), 10, 3), 5);
-        assert_eq!(Inner::frame_index(r, r.tick_of(45), 10, 3), 9);
-        assert_eq!(Inner::frame_count(r, Tick(2 * TICKS_PER_SECOND)), 60);
-    }
-
-    #[test]
-    fn saved_vector_crop_has_distinct_media_cache_key() {
-        let mut footage = Footage {
-            path: "art.ai".into(),
-            kind: FootageKind::Still,
-            layer: Some(effectcraft_project::SourceLayer { index: 1, name: "Art".into(), crop_bounds: Some([0.0, 0.0, 20.0, 40.0]), ..Default::default() }),
-            ..Default::default()
-        };
-        let before = Inner::locate(&footage, Tick::ZERO, FloatCurve::Srgb).key;
-        footage.layer.as_mut().unwrap().crop_bounds = Some([1.0, 0.0, 21.0, 40.0]);
-        assert!(before != Inner::locate(&footage, Tick::ZERO, FloatCurve::Srgb).key);
-    }
-
     /// Q2: while nothing plays, preview reads that jump around (scrubbing) decode nothing ahead
     /// (each read within 32 frames of the last one started a 32-frame decode-ahead), the
     /// viewer's click and the two frames it prefetches after it don't either, a run of forward
@@ -2580,6 +2667,30 @@ mod tests {
             r = Reads::after(Some(r), raw);
             assert_eq!((r.last, r.head, r.run), (raw, head, run), "after {raw}");
         }
+    }
+
+    #[test]
+    fn frame_index_loops_and_clamps() {
+        let r = FrameRate::FPS_30;
+        assert_eq!(Inner::frame_index(r, r.tick_of(-3), 10, 1), 0);
+        assert_eq!(Inner::frame_index(r, r.tick_of(4), 10, 1), 4);
+        assert_eq!(Inner::frame_index(r, r.tick_of(25), 10, 1), 9);
+        assert_eq!(Inner::frame_index(r, r.tick_of(25), 10, 3), 5);
+        assert_eq!(Inner::frame_index(r, r.tick_of(45), 10, 3), 9);
+        assert_eq!(Inner::frame_count(r, Tick(2 * TICKS_PER_SECOND)), 60);
+    }
+
+    #[test]
+    fn saved_vector_crop_has_distinct_media_cache_key() {
+        let mut footage = Footage {
+            path: "art.ai".into(),
+            kind: FootageKind::Still,
+            layer: Some(effectcraft_project::SourceLayer { index: 1, name: "Art".into(), crop_bounds: Some([0.0, 0.0, 20.0, 40.0]), ..Default::default() }),
+            ..Default::default()
+        };
+        let before = Inner::locate(&footage, Tick::ZERO, FloatCurve::Srgb).key;
+        footage.layer.as_mut().unwrap().crop_bounds = Some([1.0, 0.0, 21.0, 40.0]);
+        assert!(before != Inner::locate(&footage, Tick::ZERO, FloatCurve::Srgb).key);
     }
 
     #[test]

@@ -15,6 +15,7 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 thread_local! {
     static ALLOWED: Cell<bool> = const { Cell::new(false) };
@@ -63,7 +64,7 @@ pub fn available() -> bool {
 /// from the surface too instead of uploading its planes (Fix 2, 1 Nov 2026).
 pub type EightBitHook = fn(full: &filmcraft_frame::VideoFrame, eight_bit: &filmcraft_frame::VideoFrame);
 
-static EIGHT_BIT: std::sync::OnceLock<EightBitHook> = std::sync::OnceLock::new();
+static EIGHT_BIT: OnceLock<EightBitHook> = OnceLock::new();
 
 /// Install the platform's [`EightBitHook`] (once; later calls are ignored).
 pub fn set_eight_bit_hook(f: EightBitHook) {
@@ -84,6 +85,114 @@ pub fn round_to_8bit(f: &filmcraft_frame::VideoFrame) -> Option<filmcraft_frame:
 pub(crate) fn rounded_to_8bit(full: &filmcraft_frame::VideoFrame, eight_bit: &filmcraft_frame::VideoFrame) {
     if let Some(f) = EIGHT_BIT.get() {
         f(full, eight_bit);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix 3 (1 Nov 2026): frames kept on the GPU, their CPU copy made on demand.
+// ---------------------------------------------------------------------------------------------
+
+thread_local! {
+    static RESIDENT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a hardware decode running on this thread may leave its picture in the decoder's
+/// surface ([`ResidentFrame`]) instead of copying it out: only inside the media pool's own reads
+/// of a movie it keeps open (see [`resident_scope`]); everything else (proxies, thumbnails of
+/// files outside the project, exports, which never decode on the hardware anyway) gets planes.
+pub fn resident_allowed() -> bool {
+    RESIDENT.with(Cell::get)
+}
+
+/// Restores the previous [`resident_allowed`] value of this thread when dropped.
+#[must_use = "the flag is restored when the scope is dropped"]
+pub(crate) struct ResidentScope {
+    prev: bool,
+}
+
+impl Drop for ResidentScope {
+    fn drop(&mut self) {
+        RESIDENT.with(|a| a.set(self.prev));
+    }
+}
+
+/// Hardware decodes on this thread may (`on`) or may not leave pictures in their surface until
+/// the scope is dropped.
+pub(crate) fn resident_scope(on: bool) -> ResidentScope {
+    ResidentScope { prev: RESIDENT.with(|a| a.replace(on)) }
+}
+
+/// Planar samples in the layout of FilmCraft's decoders (`u16` planes, `bits` significant bits),
+/// for a [`ResidentFrame`] to copy itself into.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Planes16 {
+    pub y: Vec<u16>,
+    pub cb: Vec<u16>,
+    pub cr: Vec<u16>,
+    pub alpha: Option<Vec<u16>>,
+}
+
+/// A decoded picture the hardware decoder left in its surface (Fix 3): the GPU reads it there
+/// (`effectcraft_gpu::surface`, keyed by its stand-in frame's luma allocation), and a CPU
+/// reader asks for its samples, which are copied out then.
+///
+/// The decoder hands FilmCraft a *stand-in* frame for it: the picture's size, layout and
+/// colour, with planes that don't hold its samples (a short luma plane, the allocation that keys
+/// the surface, and shared zero planes so the frame's byte size is the picture's and FilmCraft's
+/// GOP cache keeps as many as before). [`resident_of`] finds the picture behind a stand-in; the
+/// media pool never lets a stand-in's planes be read ([`is_stand_in`]).
+pub trait ResidentFrame: Send + Sync {
+    /// The picture's samples, as the decoder would have copied them, written into `reuse`'s
+    /// buffers where their lengths fit (the media pool recycles them; every sample is
+    /// overwritten).
+    fn planes(&self, reuse: Planes16) -> std::result::Result<Planes16, String>;
+    /// Bytes the surface holds.
+    fn bytes(&self) -> usize;
+}
+
+/// What a platform layer that leaves hardware pictures in their surfaces installs.
+#[derive(Clone, Copy)]
+pub struct ResidentHooks {
+    /// The picture behind a stand-in frame (`None`: not a stand-in, or one whose picture is gone).
+    pub resolve: fn(&filmcraft_frame::VideoFrame) -> Option<Arc<dyn ResidentFrame>>,
+    /// Let go of the pictures whose stand-ins are all gone (after a purge).
+    pub sweep: fn(),
+    /// Pictures held in surfaces now, and their bytes (cached or not).
+    pub usage: fn() -> (usize, usize),
+}
+
+static RESIDENT_HOOKS: OnceLock<ResidentHooks> = OnceLock::new();
+
+/// Install the platform's [`ResidentHooks`] (once; later calls are ignored).
+pub fn set_resident_hooks(h: ResidentHooks) {
+    let _ = RESIDENT_HOOKS.set(h);
+}
+
+/// The picture behind the stand-in frame `f` ([`ResidentFrame`]).
+pub(crate) fn resident_of(f: &filmcraft_frame::VideoFrame) -> Option<Arc<dyn ResidentFrame>> {
+    (RESIDENT_HOOKS.get()?.resolve)(f)
+}
+
+/// Let go of pictures nothing refers to any more ([`ResidentHooks::sweep`]).
+pub(crate) fn sweep_resident() {
+    if let Some(h) = RESIDENT_HOOKS.get() {
+        (h.sweep)();
+    }
+}
+
+/// Pictures kept in decoder surfaces now and their bytes ([`ResidentHooks::usage`]).
+pub fn resident_usage() -> (usize, usize) {
+    RESIDENT_HOOKS.get().map_or((0, 0), |h| (h.usage)())
+}
+
+/// Whether `f` is a stand-in ([`ResidentFrame`]): planar Y'CbCr whose luma plane is shorter than
+/// the picture. No decoder makes such a frame otherwise; its planes must never be read.
+pub(crate) fn is_stand_in(f: &filmcraft_frame::VideoFrame) -> bool {
+    let n = (f.width as usize).saturating_mul(f.height as usize);
+    match &f.data {
+        filmcraft_frame::PixelData::Yuv16 { planes, .. } => planes[0].len() < n,
+        filmcraft_frame::PixelData::Yuv8 { planes, .. } => planes[0].len() < n,
+        _ => false,
     }
 }
 

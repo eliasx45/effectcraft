@@ -159,6 +159,11 @@ pub struct FootageCacheUsage {
     pub frames: usize,
     /// Per file: (path, bytes, frames), most bytes first.
     pub by_file: Vec<(String, usize, usize)>,
+    /// Fix 3: decoded pictures held in hardware decoder surfaces for the GPU (no CPU copy), and
+    /// their bytes: the cached ones are counted in `bytes` too; the rest are held by the
+    /// decoders' own caches of recent frames.
+    pub surface_frames: usize,
+    pub surface_bytes: usize,
 }
 
 pub trait FootageSource: Send + Sync {

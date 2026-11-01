@@ -27,7 +27,8 @@
 //! the media pool, caches and every CPU path are unchanged. Hardware pictures (H.264 / HEVC and
 //! ProRes) also keep their decoder surface for a while ([`surfaces`]): on Metal the GPU compositor
 //! samples it directly instead of uploading the planes (`effectcraft_gpu::surface`, FFI in
-//! `metal_surface`).
+//! `metal_surface`). Fix 3: ProRes pictures the media pool reads for previews stay in their
+//! surface with no CPU copy until a CPU reader asks for one ([`resident`]).
 //!
 //! [`register`] also installs the VideoToolbox ProRes encoder ([`prores_enc`], Fix 4) behind
 //! `effectcraft_media::prores_enc`: ProRes exports and proxies encode on the media engines, and
@@ -61,6 +62,8 @@ mod prores_pack;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod qos;
+#[cfg(target_os = "macos")]
+pub mod resident;
 #[cfg(target_os = "macos")]
 pub mod surfaces;
 #[cfg(target_os = "macos")]
@@ -105,6 +108,13 @@ pub fn register() -> Availability {
             effectcraft_gpu::surface::set_surface_import(surfaces::import);
             // ...also when previews keep footage at 8 bits (the pool rounds each frame)
             effectcraft_media::hw::set_eight_bit_hook(surfaces::rounded_to_8bit);
+            // Fix 3: hardware ProRes pictures stay in their surface, copied out only when a CPU
+            // reader asks (`resident`)
+            effectcraft_media::hw::set_resident_hooks(effectcraft_media::hw::ResidentHooks {
+                resolve: resident::resolve,
+                sweep: resident::sweep,
+                usage: resident::usage,
+            });
         }
         effectcraft_media::hw::set_available(prores || nal);
         // Fix 4: ProRes exports and proxies encode on the media engines, falling back to

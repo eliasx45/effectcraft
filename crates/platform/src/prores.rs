@@ -18,8 +18,9 @@ use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use filmcraft_isobmff::{CodecConfig, SampleEntry};
 use filmcraft_prores::{AlphaType, ChromaFormat, FrameHeader, Interlace};
 
-use crate::surfaces;
+use crate::convert::Planes;
 use crate::videotoolbox::{self, S4AS, Session, X422};
+use crate::{resident, surfaces};
 
 /// Hardware sessions alive at once (all formats).
 pub const MAX_SESSIONS: usize = 4;
@@ -213,8 +214,10 @@ impl VtProResDecoder {
             return Err(format!("frame header ({}x{}) doesn't match the sample entry", hdr.width, hdr.height));
         }
         let alpha = hdr.alpha != AlphaType::None && self.chroma == ChromaFormat::Yuv444;
+        // Fix 3: a read the GPU will likely take from the surface leaves the picture there
+        let defer = resident::wanted();
         let session = acquire(f)?;
-        let decoded = match session.decode(sample, alpha) {
+        let decoded = match session.decode(sample, alpha, defer) {
             Ok(p) => {
                 release(f, session);
                 p
@@ -222,18 +225,24 @@ impl VtProResDecoder {
             Err(e) => {
                 discard(session);
                 // Surfaces held for the GPU might have drained the decoder's buffer pool: let
-                // them go, and don't count this failure towards giving the stream up.
-                if surfaces::shed() > 0 {
+                // the ones held for a while go, copy pictures out for a while instead of holding
+                // more (Fix 3; the held ones leave with their frames), and don't count this
+                // failure towards giving the stream up.
+                let held = resident::held();
+                if held > 0 {
+                    resident::pressure();
+                }
+                if surfaces::shed() > 0 || held > 0 {
                     return Err(format!("{e}{SHED}"));
                 }
                 return Err(e);
             }
         };
-        let planes = decoded.planes;
         let (chroma, bits) = match self.chroma {
             ChromaFormat::Yuv422 => (Chroma::C422, 10),
             ChromaFormat::Yuv444 => (Chroma::C444, 12),
         };
+        let subsampling = if chroma == Chroma::C444 { [0, 0] } else { [1, 0] };
         // the software decoder's colour (filmcraft_codecs::video::ProResDecoder)
         let mut color = filmcraft_color::ColorInfo::REC709;
         if let Some(m) = filmcraft_color::Matrix::from_code(hdr.color.matrix) {
@@ -242,10 +251,21 @@ impl VtProResDecoder {
         if let Some(t) = filmcraft_color::Transfer::from_code(hdr.color.transfer) {
             color.transfer = t;
         }
+        let (planes, surface) = match decoded.planes {
+            Some(planes) => (planes, decoded.surface),
+            None => {
+                let surface = decoded.surface.ok_or("VideoToolbox kept no picture")?;
+                let picture = resident::Resident::new(surface, f.pixel_format, (f.width, f.height), bits, subsampling, alpha);
+                match resident::stand_in(picture, chroma, color) {
+                    Ok(frame) => return Ok(frame),
+                    // no room to hold it: copied out now, as before
+                    Err(picture) => (picture.copy(Planes::default())?, Some(picture.into_surface())),
+                }
+            }
+        };
         let y = Arc::new(planes.y);
         // Fix 2: the GPU may read this picture from the decoder's surface instead of uploading it
-        if let Some(surface) = decoded.surface {
-            let subsampling = if chroma == Chroma::C444 { [0, 0] } else { [1, 0] };
+        if let Some(surface) = surface.filter(|_| surfaces::enabled()) {
             let layout = surfaces::Layout { size: (f.width, f.height), bits, subsampling, alpha: planes.alpha.is_some(), eight_from: 0 };
             surfaces::keep(surfaces::Luma::U16(Arc::downgrade(&y)), layout, (0, 0), surface);
         }

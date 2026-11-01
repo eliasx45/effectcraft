@@ -23,9 +23,11 @@
 //! the GPU rounds the surface's samples to 8 bits exactly as `frame_to_8bit` does, so the 8-bit
 //! frame isn't uploaded either.
 //!
-//! For Fix 3 (frames that stay on the GPU, a CPU copy only on demand): the registry is the one
-//! place that owns decoded surfaces and their memory; a frame type carrying its surface would
-//! replace the luma-address key and the budget would then cover the frame itself.
+//! Fix 3 (1 Nov 2026): a preview read of a ProRes movie the media pool keeps open leaves the
+//! picture in its surface with no CPU copy at all ([`crate::resident`]); those pictures are found
+//! here too ([`import`] asks `resident` first), owned by their frames, not by this registry. This
+//! registry keeps the surfaces of pictures that were copied at decode (H.264 / HEVC, and ProRes
+//! when `resident` declined).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -235,7 +237,11 @@ pub fn import(device: &wgpu::Device, key: SurfaceKey) -> Option<ImportedPlanes> 
         }
         return None;
     }
-    let (surface, origin, eight_from) = find(&key)?;
+    // Fix 3: a picture held in its surface (no CPU copy), or one kept beside its CPU copy
+    let (surface, origin, eight_from) = match crate::resident::find(&key) {
+        Some((surface, eight_from)) => (surface, (0, 0), eight_from),
+        None => find(&key)?,
+    };
     match metal_surface::import(device, &surface, key, origin, eight_from) {
         Ok(p) => Some(p),
         Err(why) => {

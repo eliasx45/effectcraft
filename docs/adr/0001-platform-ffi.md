@@ -209,3 +209,58 @@ containment rules:
   too (owner, 2026-11-01: "go hw"): a proxy of a sparse keyed 1080p 4444 clip built 2.8x faster
   (88 vs 31 fps) but is ~1.9x bigger (373 vs 200 KB a frame) than the software encoder's at the
   source's density, which still applies to frames the software fallback writes.
+
+## Amendment (2026-11-01): hardware frames stay on the GPU, CPU copy on demand (Fix 3)
+
+**Status:** accepted (2026-11-01, approved by the project owner, Elias, as "Fix 3" of his ProRes
+plan).
+
+After Fix 2 the GPU read hardware ProRes pictures from VideoToolbox's surface, but every
+picture was still copied out into CPU planes on the decoder's callback thread and, with Decode
+Footage at 8 Bits, rounded to 8 bits on the CPU, whether or not anything read those planes. Now a
+preview read leaves the picture in its surface and the CPU copy is made only when something asks
+for CPU pixels:
+
+- `videotoolbox` decodes with a *defer* flag (the frame refcon carries it with the alpha flag):
+  the callback checks the buffer (format, size, planes) and retains it, no copy;
+  `copy_surface` copies a kept buffer out later (same `convert` code, so the same samples).
+- Safe module `resident`: the picture (`Resident`) is held in a registry keyed by the luma
+  allocation of a *stand-in* `VideoFrame` handed to FilmCraft (FilmCraft's `PixelData` has no
+  surface variant): the picture's size, layout and colour, a luma plane shorter than the picture
+  (so the media pool knows a stand-in and never reads its planes), and shared zero "ballast"
+  planes (one virtual allocation per length) so its byte size is the picture's and FilmCraft's
+  GOP cache bounds it as before. A picture lives while its stand-in does. Bounded by bytes
+  (8 GiB default, `resident::set_budget`); past it, or for 5 s after a hardware decode failed
+  while pictures were held, or with `EFFECTCRAFT_RESIDENT_FRAMES=0`, decodes copy at once as
+  before. Holding never blocks a decode (VideoToolbox gives each picture a new buffer).
+- `effectcraft_media::hw::ResidentHooks` (resolve, sweep, usage) is how the media pool, which
+  owns all FilmCraft frames, turns a stand-in into a cache frame (`convert::Lazy`): only its own
+  reads of movies it keeps open may defer (`hw::resident_scope`; proxies, thumbnails of other
+  files and exports, which never use the hardware, get planes). `effectcraft_render::FramePixels`
+  gained `gpu_yuv()`: a view without samples and a surface key (`yuv::View::surface`), which the
+  GPU's native decode reads through the same importer as Fix 2; `yuv()` / `rows()` (CPU renders,
+  CPU-only layer work, Save Frame, thumbnails, a GPU that can't read the surface) make the CPU
+  copy once, into recycled plane buffers (`media::recycle`), rounded to 8 bits on scoped threads
+  when the frame is kept at 8 bits. Pictures are bit-identical to the copy-at-decode path on both
+  the GPU (Fix 2's shader rounding) and the CPU (the same copy code). After a CPU copy of a
+  movie's frame its next frames are copied at decode for 10 s, so footage the CPU reads anyway
+  isn't held twice.
+- Memory: a cached frame counts its surface; a CPU copy made later counts too. `memory.stats`
+  reports `mediaSurfaceFrames` / `mediaSurfaceBytes` (pictures held in surfaces, cached or in the
+  decoders' own caches). At 8 bits a cached frame holds its full-depth surface: twice the bytes
+  of the 8-bit CPU copy it replaced, so the same budget caches about half as many frames.
+- Measured 1 Nov 2026 (`crates/platform/examples/resident_bench.rs`: media pool preview read
+  + GPU native decode per frame, decode-ahead off, whole-process CPU time, dev profile at opt 3,
+  M1 Max at load average 65–370 from other agents, so ranges over runs): 1080p 4444+alpha full
+  depth 4.7–5.2 → 1.5–1.8 ms CPU a frame (wall 8.0–9.1 → 6.0–7.0 ms); at 8 bits 6.9 → 1.8 ms
+  CPU (15.5–16.0 with the rounding as it was before this change; wall 14–18 → 5.3–8 ms); 4K
+  4444+alpha full depth 13.9–17.9 → 2.6–3.2 ms CPU (wall 17–29 → 13–18 ms), at 8 bits 25.5
+  (50–54 before) → 2.3–3.6 ms CPU (wall 27–71 → 13–19 ms); 4K 422 HQ 7.4 → 2.0 ms full depth,
+  27.8 → 1.9 ms at 8 bits. Every GPU read came from the surface, no CPU copy made. A CPU copy
+  on demand into recycled buffers vs fresh pages: 1080p 4444+alpha 1.7–2.4 → 0.6–1.2 ms, 4K
+  5.3–8.8 → 1.6–3.3 ms. The 8-bit rounding loop (`convert::frame_to_8bit`) was not vectorised in
+  builds with overflow checks (a checked shift per sample); a wrapping shift makes it 0.75 ms on
+  one thread for a 1080p 4444+alpha frame (6.6 ms before); release builds, the app's, are not
+  affected by the overflow checks.
+- H.264 / HEVC keep copying at decode (Fix 2's surfaces): their decoders feed FilmCraft's GOP
+  cache with reordering and replay, and their 8-bit NV12 copy is cheap.

@@ -40,6 +40,11 @@ impl Surface {
         Surface(unsafe { CFRetained::retain(NonNull::from(pb)) })
     }
 
+    /// The pixel buffer (to copy its samples out on demand: Fix 3).
+    pub(crate) fn buffer(&self) -> &CVImageBuffer {
+        &self.0
+    }
+
     /// The bytes of its planes (what holding it costs).
     pub(crate) fn bytes(&self) -> usize {
         let pb: &CVImageBuffer = &self.0;

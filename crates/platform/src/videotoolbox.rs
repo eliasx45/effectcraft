@@ -71,12 +71,19 @@ struct Shared {
     out: Mutex<Option<Result<Decoded, String>>>,
 }
 
-/// A decoded picture: its planar copy, and the decoder's buffer itself when the GPU shares
-/// surfaces ([`surfaces::enabled`]).
+/// A decoded picture: its planar copy (`None` when the decode was asked to defer it, Fix 3: the
+/// samples are copied out of `surface` when something asks for them, [`copy_surface`]), and the
+/// decoder's buffer itself when the GPU shares surfaces ([`surfaces::enabled`]) or the copy was
+/// deferred.
 pub(crate) struct Decoded {
-    pub planes: Planes,
+    pub planes: Option<Planes>,
     pub surface: Option<Surface>,
 }
+
+/// Frame refcon flags (the refcon is not a pointer): the picture's alpha is wanted; the copy is
+/// deferred.
+const WANT_ALPHA: usize = 1;
+const DEFER: usize = 2;
 
 /// A hardware ProRes decompression session for one fourcc, size and output format. Dropping it
 /// invalidates the session before the callback state is freed.
@@ -119,8 +126,9 @@ unsafe extern "C-unwind" fn output_callback(
     // SAFETY: `refcon` is the `Shared` the session was created with; it lives in a `Box` owned by
     // the `Session`, which invalidates the session (no more callbacks) before freeing it.
     let shared = unsafe { &*(refcon as *const Shared) };
-    // the frame refcon is not a pointer: it says whether the picture's alpha is wanted
-    let alpha = !frame_refcon.is_null();
+    // the frame refcon is not a pointer: it carries flags
+    let flags = frame_refcon.addr();
+    let (alpha, defer) = (flags & WANT_ALPHA != 0, flags & DEFER != 0);
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if status != 0 {
             return Err(format!("VideoToolbox decode error {status}"));
@@ -131,8 +139,13 @@ unsafe extern "C-unwind" fn output_callback(
         // SAFETY: VideoToolbox passes a valid image buffer that stays alive for the duration of
         // the callback; we only borrow it here.
         let pb = unsafe { image.as_ref() };
-        let planes = copy_out(pb, shared, alpha)?;
-        Ok(Decoded { planes, surface: surfaces::enabled().then(|| Surface::retain(pb)) })
+        if defer {
+            // Fix 3: no copy now; the buffer is kept and copied from when something asks
+            check(pb, shared.pixel_format, shared.width, shared.height, alpha)?;
+            return Ok(Decoded { planes: None, surface: Some(Surface::retain(pb)) });
+        }
+        let planes = copy_out(pb, shared.pixel_format, shared.width, shared.height, alpha, Planes::default())?;
+        Ok(Decoded { planes: Some(planes), surface: surfaces::enabled().then(|| Surface::retain(pb)) })
     }));
     let r = r.unwrap_or_else(|_| Err("panic while reading a decoded picture".into()));
     *shared.out.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
@@ -176,27 +189,45 @@ fn rows<'l>(pb: &CVImageBuffer, _lock: &'l Locked<'_>, i: usize) -> Result<Rows<
     Ok(Rows { data, stride })
 }
 
-/// Copy a decoded buffer into planes.
-fn copy_out(pb: &CVImageBuffer, s: &Shared, alpha: bool) -> Result<Planes, String> {
+/// Whether a decoded buffer is the picture asked for: `pixel_format`, `width`×`height`, with the
+/// planes its format has (and copies out without surprises later).
+fn check(pb: &CVImageBuffer, pixel_format: u32, width: usize, height: usize, alpha: bool) -> Result<(), String> {
     let fmt = CVPixelBufferGetPixelFormatType(pb);
-    if fmt != s.pixel_format {
+    if fmt != pixel_format {
         return Err(format!("unexpected decoded pixel format {fmt:#x}"));
     }
     let (bw, bh) = (CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb));
-    if (bw, bh) != (s.width, s.height) {
-        return Err(format!("decoded picture is {bw}x{bh}, expected {}x{}", s.width, s.height));
+    if (bw, bh) != (width, height) {
+        return Err(format!("decoded picture is {bw}x{bh}, expected {width}x{height}"));
     }
-    let lock = Locked::new(pb)?;
-    let planes = match fmt {
-        S4AS if CVPixelBufferGetPlaneCount(pb) == 3 => {
-            let a = if alpha { Some(rows(pb, &lock, 2)?) } else { None };
-            convert::unpack_s4as(rows(pb, &lock, 0)?, rows(pb, &lock, 1)?, a, s.width, s.height)
-        }
-        X422 if CVPixelBufferGetPlaneCount(pb) == 2 => convert::unpack_x422(rows(pb, &lock, 0)?, rows(pb, &lock, 1)?, s.width, s.height),
+    let planes = CVPixelBufferGetPlaneCount(pb);
+    match fmt {
+        S4AS if planes == 3 => Ok(()),
+        X422 if planes == 2 && !alpha => Ok(()),
         _ => Err("decoded picture has an unexpected plane count".into()),
+    }
+}
+
+/// Copy a decoded buffer into planes, into `reuse`'s buffers where they fit (Fix 3's buffer pool:
+/// no fresh pages to fault in).
+fn copy_out(pb: &CVImageBuffer, pixel_format: u32, width: usize, height: usize, alpha: bool, reuse: Planes) -> Result<Planes, String> {
+    check(pb, pixel_format, width, height, alpha)?;
+    let lock = Locked::new(pb)?;
+    let planes = match pixel_format {
+        S4AS => {
+            let a = if alpha { Some(rows(pb, &lock, 2)?) } else { None };
+            convert::unpack_s4as_into(rows(pb, &lock, 0)?, rows(pb, &lock, 1)?, a, width, height, reuse)
+        }
+        _ => convert::unpack_x422_into(rows(pb, &lock, 0)?, rows(pb, &lock, 1)?, width, height, reuse),
     };
     drop(lock);
     planes
+}
+
+/// Fix 3: copy a kept decoded buffer (a deferred picture: `pixel_format` [`S4AS`] or [`X422`],
+/// `width`×`height`, alpha when `alpha`) into planes, as the output callback would have.
+pub(crate) fn copy_surface(s: &Surface, pixel_format: u32, width: usize, height: usize, alpha: bool, reuse: Planes) -> Result<Planes, String> {
+    copy_out(s.buffer(), pixel_format, width, height, alpha, reuse)
 }
 
 impl Session {
@@ -240,14 +271,16 @@ impl Session {
         Ok(Session { session, format, shared })
     }
 
-    /// Decode one ProRes frame (synchronously) into planes; alpha only when `alpha`.
-    pub(crate) fn decode(&self, sample: &[u8], alpha: bool) -> Result<Decoded, String> {
+    /// Decode one ProRes frame (synchronously) into planes; alpha only when `alpha`. `defer`
+    /// (Fix 3): no copy, the decoded buffer is handed back for a copy on demand.
+    pub(crate) fn decode(&self, sample: &[u8], alpha: bool, defer: bool) -> Result<Decoded, String> {
         let buffer = sample_buffer(sample, 0, &self.format)?;
         *self.shared.out.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let mut info = VTDecodeInfoFlags(0);
-        let frame_refcon = if alpha { NonNull::<c_void>::dangling().as_ptr() } else { std::ptr::null_mut() };
+        let flags = if alpha { WANT_ALPHA } else { 0 } | if defer { DEFER } else { 0 };
+        let frame_refcon: *mut c_void = std::ptr::without_provenance_mut(flags);
         // SAFETY: the session and sample buffer are valid (VideoToolbox retains the sample buffer
-        // for as long as it needs it); the frame refcon is not a pointer, it carries a flag.
+        // for as long as it needs it); the frame refcon is not a pointer, it carries flags.
         let status = unsafe { self.session.decode_frame(&buffer, VTDecodeFrameFlags(0), frame_refcon, &mut info) };
         if status != 0 {
             return Err(format!("VTDecompressionSessionDecodeFrame failed ({status})"));
