@@ -41,6 +41,21 @@ fn warp_blend_at(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_q(vec2<i32>(x, y), warp_blend_px(x, y, d), P.f[3].z, P.f[3].w);
 }
 
+// `warp_blend` over a window of the canvas only: `out` and `aux` are that window (its top-left
+// canvas pixel u[1].xy), each pixel the full pass's canvas pixel there (an adjustment layer's
+// footprint and track matte, `adjust_window`).
+@compute @workgroup_size(16, 16)
+fn warp_blend_win(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    if (i32(gid.x) >= dims.x || i32(gid.y) >= dims.y) {
+        return;
+    }
+    let x = i32(P.u[1].x + gid.x);
+    let y = i32(P.u[1].y + gid.y);
+    let d = textureLoad(aux, vec2<i32>(gid.xy), 0);
+    store_q(vec2<i32>(gid.xy), warp_blend_px(x, y, d), P.f[3].z, P.f[3].w);
+}
+
 // One `warp_blend` pixel: the value stored at (x, y) over the canvas pixel `d0`.
 fn warp_blend_px(x: i32, y: i32, d0: vec4<f32>) -> vec4<f32> {
     let mode = P.u[0].x;

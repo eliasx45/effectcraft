@@ -1102,15 +1102,36 @@ fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
         return None;
     }
     let opacity = r.layer_opacity(ctx, layer);
-    let Some(foot) = r.adjustment_footprint(ctx, layer) else { return Some(()) };
+    // An adjustment solid without masks: its footprint (all ones) is made here, not built on
+    // the CPU and uploaded (every frame when it isn't cached).
+    let foot = match crate::adjust_window::plain_footprint(r, layer) {
+        Some(shape) => Footprint::Ones(shape),
+        None => match r.adjustment_footprint(ctx, layer) {
+            Some(buf) => Footprint::Cpu(buf),
+            None => return Some(()),
+        },
+    };
     let (w, h) = canvas.size();
-    let matte = place(e, r, ctx, layer, &foot, &e.zeros(w, h), BlendMode::Normal, 1.0, None)?;
-    let (matte, matte_reach) = track_matte(e, r, ctx, layer, matte, None)?;
+    let foot_px = foot.pixels(e)?;
+    let mut matte_src = match r.track_matte(ctx, layer) {
+        Some((m, _)) => Some(matte_source(e, r, ctx, m)?),
+        None => None,
+    };
     // A footprint over a small part of the comp: the effects run only on the window they can
-    // change (the same pixels), else on the whole comp below.
-    if crate::adjust_window::draw(e, r, ctx, layer, &foot, &matte, matte_reach, canvas, opacity).is_some() {
+    // change (the same pixels; footprint and matte made only there), else on the whole comp.
+    if crate::adjust_window::draw(e, r, ctx, layer, &foot, &foot_px, &mut matte_src, canvas, opacity).is_some() {
         return Some(());
     }
+    let mut matte: Pixels = e.zeros(w, h).into();
+    place_src_in(e, r, ctx, layer, foot.shape(), foot_px, &mut matte, BlendMode::Normal, 1.0, None)?;
+    // The matte from its content made above (unless the window used it).
+    let mimg = match (r.track_matte(ctx, layer), matte_src.take()) {
+        (Some((m, _)), Some(Some(src))) => Some(matte_full(e, r, ctx, m, src, w, h)?.0),
+        (Some(_), Some(None)) => Some(e.zeros(w, h)),
+        _ => None,
+    };
+    let matte = matte.float(e)?;
+    let matte = track_matte(e, r, ctx, layer, matte, mimg)?;
     let pipe = r.pipe();
     // 8 bpc codes stay codes: the first effects and the mix read them.
     let comp = canvas.clone();
@@ -1190,16 +1211,15 @@ fn composite_iso_with(
 }
 
 /// `Renderer::apply_track_matte`: `img` (comp-sized) times the layer's track matte, if it has
-/// one; `matte_img` as in [`composite_iso_with`]. Also where the matte image can be non-zero
-/// (`None`: no matte, or not known).
-fn track_matte(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut img: GpuImage, matte_img: Option<GpuImage>) -> Option<(GpuImage, Option<Bounds>)> {
-    let Some((m, kind)) = r.track_matte(ctx, layer) else { return Some((img, None)) };
-    let (mimg, reach) = match matte_img.filter(|i| (i.width, i.height) == (img.width, img.height)) {
-        Some(i) => (i, None),
-        None => matte_image_in(e, r, ctx, m, img.width, img.height)?,
+/// one; `matte_img` as in [`composite_iso_with`].
+fn track_matte(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut img: GpuImage, matte_img: Option<GpuImage>) -> Option<GpuImage> {
+    let Some((m, kind)) = r.track_matte(ctx, layer) else { return Some(img) };
+    let mimg = match matte_img.filter(|i| (i.width, i.height) == (img.width, img.height)) {
+        Some(i) => i,
+        None => matte_image(e, r, ctx, m, img.width, img.height)?,
     };
     ops::matte_in(e, &mut img, &mimg, kind, None);
-    Some((img, reach))
+    Some(img)
 }
 
 /// Track mattes whose content [`matte_image`] took from the GPU (the tests check that path ran).
@@ -1214,62 +1234,129 @@ pub(crate) static MATTES_ON_GPU: std::sync::atomic::AtomicUsize = std::sync::ato
 /// a walk that can't keep images resident take `matte_buf` from the CPU as before. Drawn onto
 /// a blank image of this encoder's own, so the warp only touches the matte's bounds.
 fn matte_image(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, m: &Layer, w: u32, h: u32) -> Option<GpuImage> {
-    matte_image_in(e, r, ctx, m, w, h).map(|(img, _)| img)
+    match matte_source(e, r, ctx, m)? {
+        Some(src) => matte_full(e, r, ctx, m, src, w, h).map(|(img, _)| img),
+        None => Some(e.zeros(w, h)),
+    }
 }
 
-/// [`matte_image`], and the part of the canvas outside which it is clear (`None`: not known).
-fn matte_image_in(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, m: &Layer, w: u32, h: u32) -> Option<(GpuImage, Option<Bounds>)> {
+/// A track matte layer's content on the GPU, ready to place ([`matte_image`]).
+pub(crate) struct MatteSource {
+    /// The buffer's size, offset and scale (no pixels).
+    pub(crate) shape: Buf,
+    pub(crate) img: Pixels,
+    pub(crate) opacity: f32,
+    /// Made here: kept once drawn ([`keep_processed`]).
+    keep: Option<(Option<KeepProcessed>, SourceImage)>,
+    /// The A/B path without GPU mattes: drawn onto the shared blank, a full-frame pass.
+    shared_blank: bool,
+}
+
+/// The content of track matte layer `m` ([`matte_image`]): resident on the GPU, else its CPU
+/// buffer uploaded. `Some(None)`: the matte is clear (inactive, transparent, no content).
+pub(crate) fn matte_source(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, m: &Layer) -> Option<Option<MatteSource>> {
     let mo = ctx.opacity(m) as f32;
     if !m.is_active_at(ctx.time) || mo <= 0.0 {
-        return Some((e.zeros(w, h), Some([0; 4])));
+        return Some(None);
     }
     let _profile = effectcraft_render::profile::span("track_matte");
     let on_gpu = if effectcraft_render::prepass::gpu_mattes() { processed_resident(e, r, ctx, m, true) } else { None };
     if let Some((image, keep)) = on_gpu {
         #[cfg(test)]
         MATTES_ON_GPU.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut mimg: Pixels = e.image(w, h).into();
-        let mut reach = [0; 4];
-        if image.img.width() > 0 && image.img.height() > 0 {
-            // The placement only reads the buffer's size, offset and scale.
-            let shape = Buf { img: Image { width: image.img.width(), height: image.img.height(), data: Vec::new() }, offset: image.offset, scale: image.scale };
-            reach = place_src_in(e, r, ctx, m, &shape, image.img.clone(), &mut mimg, BlendMode::Normal, mo, None)?;
-        }
+        // The placement only reads the buffer's size, offset and scale.
+        let shape = Buf { img: Image { width: image.img.width(), height: image.img.height(), data: Vec::new() }, offset: image.offset, scale: image.scale };
+        let img = image.img.clone();
+        return Some(Some(MatteSource { shape, img, opacity: mo, keep: Some((keep, image)), shared_blank: false }));
+    }
+    let Some(mb) = r.matte_buf(ctx, m) else { return Some(None) };
+    if mb.img.is_empty() {
+        return Some(None);
+    }
+    let img = e.upload_pixels(&mb)?;
+    let shape = Buf { img: Image { width: mb.img.width, height: mb.img.height, data: Vec::new() }, offset: mb.offset, scale: mb.scale };
+    Some(Some(MatteSource { shape, img, opacity: mo, keep: None, shared_blank: !effectcraft_render::prepass::gpu_mattes() }))
+}
+
+/// `src` placed on a `w` × `h` canvas, and the part of it the warp may have changed (outside
+/// it the image is clear). Onto a blank image of this encoder's own, so the warp only touches
+/// the matte's bounds.
+pub(crate) fn matte_full(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, m: &Layer, src: MatteSource, w: u32, h: u32) -> Option<(GpuImage, Bounds)> {
+    let MatteSource { shape, img, opacity, keep, shared_blank } = src;
+    let mut mimg: Pixels = if shared_blank { e.zeros(w, h) } else { e.image(w, h) }.into();
+    let mut reach = [0; 4];
+    if img.width() > 0 && img.height() > 0 {
+        reach = place_src_in(e, r, ctx, m, &shape, img, &mut mimg, BlendMode::Normal, opacity, None)?;
+    }
+    if let Some((keep, image)) = keep {
         keep_processed(e, r, ctx, m, keep, image);
-        return Some((mimg.float(e)?, Some(reach)));
     }
-    let Some(mb) = r.matte_buf(ctx, m) else { return Some((e.zeros(w, h), Some([0; 4]))) };
-    if !effectcraft_render::prepass::gpu_mattes() {
-        // As before (A/B): onto the shared blank, a full-frame pass.
-        return Some((place(e, r, ctx, m, &mb, &e.zeros(w, h), BlendMode::Normal, mo, None)?, None));
-    }
-    let mut mimg: Pixels = e.image(w, h).into();
-    let reach = place_in(e, r, ctx, m, &mb, &mut mimg, BlendMode::Normal, mo, None)?;
-    Some((mimg.float(e)?, Some(reach)))
+    Some((mimg.float(e)?, reach))
 }
 
-/// Draw a processed layer buffer onto `target` (transform, motion blur sub-samples), quantising
-/// the result to `levels` when set.
-#[allow(clippy::too_many_arguments)]
-fn place(
-    e: &mut Enc,
-    r: &Renderer,
-    ctx: &EvalCtx,
-    layer: &Layer,
-    buf: &Arc<Buf>,
-    target: &GpuImage,
-    mode: BlendMode,
-    opacity: f32,
-    levels: Option<f32>,
-) -> Option<GpuImage> {
-    let mut out: Pixels = target.clone().into();
-    place_in(e, r, ctx, layer, buf, &mut out, mode, opacity, levels)?;
-    out.float(e)
+/// [`matte_full`]'s pixels over the window `win` of the `w` × `h` canvas only (one placement, no
+/// motion-blur sub-samples; `None` otherwise).
+pub(crate) fn matte_window(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, m: &Layer, src: MatteSource, (w, h): (u32, u32), win: Bounds) -> Option<GpuImage> {
+    let pl = r.placement(ctx, m, &src.shape);
+    let [mat] = pl.matrices.as_slice() else { return None };
+    let img = ops::warp_window(e, &src.img, mat, pl.sampling, src.opacity, pl.seed, (w, h), win)?;
+    if let Some((keep, image)) = src.keep {
+        keep_processed(e, r, ctx, m, keep, image);
+    }
+    Some(img)
 }
 
-/// [`place`] onto `target` itself (in place over the layer's bounds when the encoder owns it:
-/// `ops::warp_q_in`). Returns the pixels it may have changed: outside them `target` is as it
-/// was.
+/// Keep `src` (made here) without drawing it.
+pub(crate) fn matte_keep(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, m: &Layer, src: MatteSource) {
+    if let Some((keep, image)) = src.keep {
+        keep_processed(e, r, ctx, m, keep, image);
+    }
+}
+
+/// Where [`matte_full`] may draw `src`: its placements' bounds on the `w` × `h` canvas.
+pub(crate) fn matte_reach(r: &Renderer, ctx: &EvalCtx, m: &Layer, src: &MatteSource, (w, h): (u32, u32)) -> Bounds {
+    placed_bounds(r, ctx, m, &src.shape, src.img.size(), (w, h))
+}
+
+/// The canvas pixels `place_src_in` may change placing a `size` image shaped like `shape` (no
+/// quantising, not a stencil mode).
+pub(crate) fn placed_bounds(r: &Renderer, ctx: &EvalCtx, layer: &Layer, shape: &Buf, size: (u32, u32), (w, h): (u32, u32)) -> Bounds {
+    if size.0 == 0 || size.1 == 0 {
+        return [0; 4];
+    }
+    r.placement(ctx, layer, shape).matrices.iter().fold([0; 4], |u, m| ops::union(u, ops::warp_bounds((w, h), size, m)))
+}
+
+/// An adjustment layer's footprint ([`draw_adjustment`]).
+pub(crate) enum Footprint {
+    /// Its solid's whole rectangle, all ones, made on the GPU (the buffer's shape, no pixels).
+    Ones(Buf),
+    /// Built on the CPU (masks, other sources).
+    Cpu(Arc<Buf>),
+}
+
+impl Footprint {
+    pub(crate) fn shape(&self) -> &Buf {
+        match self {
+            Footprint::Ones(b) => b,
+            Footprint::Cpu(b) => b,
+        }
+    }
+
+    /// Its pixels on the GPU: ones filled by this encoder (once a frame per size), or the CPU
+    /// buffer uploaded.
+    fn pixels(&self, e: &mut Enc) -> Option<Pixels> {
+        match self {
+            Footprint::Ones(b) => Some(crate::adjust_window::ones(e, b.img.width, b.img.height).into()),
+            Footprint::Cpu(b) => e.upload_pixels(b),
+        }
+    }
+}
+
+/// Draw a processed layer buffer onto `target` itself (transform, motion blur sub-samples),
+/// quantising the result to `levels` when set (in place over the layer's bounds when the
+/// encoder owns it: `ops::warp_q_in`). Returns the pixels it may have changed: outside them
+/// `target` is as it was.
 #[allow(clippy::too_many_arguments)]
 fn place_in(
     e: &mut Enc,

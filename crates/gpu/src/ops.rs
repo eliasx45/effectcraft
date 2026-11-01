@@ -337,6 +337,47 @@ fn warp_onto(
     Some(out)
 }
 
+/// [`warp_px_in`] of `src` (Normal, no quantising) onto a blank `canvas`-sized image, made only
+/// over its window `win` `[x0, y0, x1, y1)`: a `win`-sized image holding the very pixels the
+/// full pass leaves there (`warp_blend_win`). `None`: the kernel isn't there.
+pub(crate) fn warp_window(
+    e: &mut Enc,
+    src: &Pixels,
+    m: &Mat3,
+    sampling: Sampling,
+    opacity: f32,
+    seed: u32,
+    canvas: (u32, u32),
+    win: Bounds,
+) -> Option<GpuImage> {
+    let (ww, wh) = (win[2].saturating_sub(win[0]), win[3].saturating_sub(win[1]));
+    let blank = e.zeros(ww, wh);
+    if src.width() == 0 || src.height() == 0 || opacity <= 0.0 {
+        return Some(blank);
+    }
+    if !has(e, "warp_blend_win", codes::Io { src: false, aux: false, out: false }) {
+        return None;
+    }
+    let Some((img, inv)) = sampled(e, src, m) else { return Some(blank) };
+    // The layer's bounds on the whole canvas, as the full pass has them.
+    let [x0, y0, x1, y1] = warp_bounds(canvas, src.size(), m);
+    if x0 >= x1 || y0 >= y1 {
+        return Some(blank);
+    }
+    let mut p = Params::default();
+    p.u[0] = [mode_id(BlendMode::Normal), sampling_id(sampling), seed, 0];
+    p.u[1] = [win[0], win[1], 0, 0];
+    let r = rows(&inv);
+    p.f[0] = r[0];
+    p.f[1] = r[1];
+    p.f[2] = r[2];
+    p.f[3] = [opacity, 1.0, 0.0, 0.0];
+    p.f[4] = [x0 as f32, y0 as f32, x1 as f32, y1 as f32];
+    let out = e.scratch(ww, wh);
+    codes::pixels(e, "warp_blend_win", &p, &img, Some(&Pixels::Float(blank)), &Pixels::Float(out.clone()), None);
+    Some(out)
+}
+
 /// `warp_blend` in place: only the layer's bounds `[x0, y0, x1, y1)` of the canvas `dst` are
 /// read and written (`warp_blend_at`), with the same per-pixel arithmetic and quantisation as
 /// the full pass, which writes the pixels outside the bounds back unchanged. `false` (nothing

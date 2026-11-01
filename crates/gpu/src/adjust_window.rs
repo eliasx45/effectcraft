@@ -27,6 +27,7 @@ use crate::codes::Pixels;
 use crate::context::{Enc, GpuImage};
 use crate::effects::{GpuFx, box_radii, dims_xy};
 use crate::ops;
+use crate::walk::{self, Footprint, MatteSource};
 
 /// The window of the comp the effects running now see ([`Enc::fx_frame`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,13 +226,9 @@ fn tiles(lo: i64, hi: i64, full: i64, blocks: usize, sharp: bool) -> (i64, i64) 
     (all.partition_point(|&t| t < first) as i64, all.partition_point(|&t| t <= last) as i64)
 }
 
-/// Where `buf` lands on the canvas when `layer` places it (every motion-blur sub-sample),
-/// grown by what resampling reads; `None` when not known (a perspective transform).
-fn placed(r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf: &Buf) -> Option<Rect> {
-    placed_part(r, ctx, layer, buf, Rect::from_size(f64::from(buf.img.width), f64::from(buf.img.height)))
-}
-
-/// [`placed`] of the part `src` of `buf` (buffer pixels).
+/// Where the part `src` (buffer pixels) of `buf` lands on the canvas when `layer` places it
+/// (every motion-blur sub-sample), grown by what resampling reads; `None` when not known (a
+/// perspective transform).
 fn placed_part(r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf: &Buf, src: Rect) -> Option<Rect> {
     if buf.img.is_empty() || src.is_empty() || src.width() <= 0.0 || src.height() <= 0.0 {
         return Some(Rect::new(0.0, 0.0, 0.0, 0.0));
@@ -284,34 +281,34 @@ fn alpha_bounds(buf: &Arc<Buf>) -> Option<Rect> {
 }
 
 /// The part of a `w`×`h` canvas where the adjustment layer's footprint × track matte can be
-/// non-zero (`None`: not known). `matte_reach`: where the walk's track matte image can be
-/// non-zero, when it knows.
-fn shown(r: &Renderer, ctx: &EvalCtx, layer: &Layer, foot: &Arc<Buf>, matte_reach: Option<ops::Bounds>, (w, h): (u32, u32)) -> Option<Span> {
-    let mut win = placed(r, ctx, layer, foot)?;
+/// non-zero: where the walk would draw them (`None`: not known).
+fn shown(
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    foot: &Footprint,
+    foot_size: (u32, u32),
+    matte: Option<&Option<MatteSource>>,
+    (w, h): (u32, u32),
+) -> Option<Span> {
+    let rect = |b: ops::Bounds| Rect::new(f64::from(b[0]), f64::from(b[1]), f64::from(b[2]), f64::from(b[3]));
+    let mut win = rect(walk::placed_bounds(r, ctx, layer, foot.shape(), foot_size, (w, h)));
     // Masks (the footprint is the whole solid with its masks applied): where it isn't clear.
-    let masked = layer.props.sub("masks").is_some_and(|m| !m.children.is_empty());
-    if masked && win.width() * win.height() * 5.0 > f64::from(w) * f64::from(h) * 3.0 {
-        win = match alpha_bounds(foot) {
-            Some(part) => placed_part(r, ctx, layer, foot, part)?,
+    if let Footprint::Cpu(buf) = foot
+        && layer.masks().is_some_and(|m| !m.children.is_empty())
+        && win.width() * win.height() * 5.0 > f64::from(w) * f64::from(h) * 3.0
+    {
+        win = match alpha_bounds(buf) {
+            Some(part) => win.intersect(&placed_part(r, ctx, layer, buf, part)?),
             None => return Some([0; 4]),
         };
     }
-    if let Some((m, kind)) = r.track_matte(ctx, layer)
+    if let (Some((m, kind)), Some(src)) = (r.track_matte(ctx, layer), matte)
         && matches!(kind, MatteKind::Alpha | MatteKind::Luma)
     {
-        // Clear outside the matte layer (an inverted matte is opaque there): where the walk
-        // drew it, else (not known) the matte's CPU buffer placed.
-        let matte = match matte_reach {
-            Some([x0, y0, x1, y1]) => Rect::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1)),
-            None => {
-                let visible = m.is_active_at(ctx.time) && ctx.opacity(m) as f32 > 0.0;
-                match r.matte_buf(ctx, m).filter(|_| visible) {
-                    Some(mb) => placed(r, ctx, m, &mb)?,
-                    None => Rect::new(0.0, 0.0, 0.0, 0.0),
-                }
-            }
-        };
-        win = win.intersect(&matte);
+        // Clear outside the matte layer (an inverted matte is opaque there).
+        let matte = src.as_ref().map_or([0; 4], |src| walk::matte_reach(r, ctx, m, src, (w, h)));
+        win = win.intersect(&rect(matte));
     }
     let win = win.intersect(&Rect::from_size(f64::from(w), f64::from(h)));
     if win.is_empty() || win.width() <= 0.0 || win.height() <= 0.0 {
@@ -319,6 +316,26 @@ fn shown(r: &Renderer, ctx: &EvalCtx, layer: &Layer, foot: &Arc<Buf>, matte_reac
     }
     let win = win.round_out();
     Some([win.x0 as i64, win.y0 as i64, win.x1 as i64, win.y1 as i64])
+}
+
+/// An adjustment solid's footprint when the GPU makes it (all ones: no CPU buffer to build and
+/// upload), see `Renderer::adjustment_footprint_shape`.
+pub(crate) fn plain_footprint(r: &Renderer, layer: &Layer) -> Option<Buf> {
+    if !enabled() {
+        return None;
+    }
+    r.adjustment_footprint_shape(layer)
+}
+
+/// A `w`×`h` image of ones, filled by this encoder (once per frame and size).
+pub(crate) fn ones(e: &mut Enc, w: u32, h: u32) -> GpuImage {
+    if let Some(o) = e.ones.as_ref().filter(|o| (o.width, o.height) == (w, h)) {
+        return o.clone();
+    }
+    let img = e.scratch(w, h);
+    e.fill(&img, 1.0);
+    e.ones = Some(img.clone());
+    img
 }
 
 /// `src`'s `w`×`h` region at (`x`, `y`) as a new image (codes stay codes).
@@ -357,8 +374,8 @@ fn put(e: &mut Enc, canvas: &mut Pixels, part: &GpuImage, x: u32, y: u32) -> Opt
 }
 
 /// [`crate::walk`]'s adjustment layer through a window of the comp (see the module docs):
-/// `foot` is its footprint, `matte` its footprint × track matte on the whole canvas (a track
-/// matte clear outside `matte_reach`, when known). `None` (the canvas unchanged) when the
+/// `foot` is its footprint (`foot_px` its pixels on the GPU), `matte` its track matte's content
+/// (taken once it is drawn: the walk then makes it again). `None` (the canvas unchanged) when the
 /// whole comp must run instead.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw(
@@ -366,9 +383,9 @@ pub(crate) fn draw(
     r: &Renderer,
     ctx: &EvalCtx,
     layer: &Layer,
-    foot: &Arc<Buf>,
-    matte: &GpuImage,
-    matte_reach: Option<ops::Bounds>,
+    foot: &Footprint,
+    foot_px: &Pixels,
+    matte: &mut Option<Option<MatteSource>>,
     canvas: &mut Pixels,
     opacity: f32,
 ) -> Option<()> {
@@ -376,14 +393,23 @@ pub(crate) fn draw(
         return None;
     }
     let (w, h) = canvas.size();
-    if (matte.width, matte.height) != (w, h) {
-        return None;
+    // One placement each (motion-blur sub-samples: the whole comp).
+    if r.placement(ctx, layer, foot.shape()).matrices.len() != 1 {
+        return declined(layer, "a motion-blurred footprint");
     }
-    let Some(out) = shown(r, ctx, layer, foot, matte_reach, (w, h)) else {
+    if let (Some((m, _)), Some(Some(src))) = (r.track_matte(ctx, layer), matte.as_ref())
+        && r.placement(ctx, m, &src.shape).matrices.len() != 1
+    {
+        return declined(layer, "a motion-blurred track matte");
+    }
+    let Some(out) = shown(r, ctx, layer, foot, foot_px.size(), matte.as_ref(), (w, h)) else {
         return declined(layer, "footprint or matte bounds not known");
     };
     if out[0] >= out[2] || out[1] >= out[3] {
         // The matte is clear everywhere: the comp below stays as it is.
+        if let (Some((m, _)), Some(Some(src))) = (r.track_matte(ctx, layer), matte.take()) {
+            walk::matte_keep(e, r, ctx, m, src);
+        }
         #[cfg(test)]
         WINDOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Some(());
@@ -400,6 +426,24 @@ pub(crate) fn draw(
     // A window over most of the comp saves little: the whole comp in one go.
     if ww == 0 || wh == 0 || u64::from(ww) * u64::from(wh) * 5 > u64::from(w) * u64::from(h) * 3 {
         return declined(layer, "the window covers most of the comp");
+    }
+    let win = [x, y, x + ww, y + wh];
+    // The footprint × track matte over the window only (the pixels the walk makes there).
+    let pl = r.placement(ctx, layer, foot.shape());
+    let [fm] = pl.matrices.as_slice() else { return None };
+    let Some(mut fp) = ops::warp_window(e, foot_px, fm, pl.sampling, 1.0, pl.seed, (w, h), win) else {
+        return declined(layer, "no windowed warp kernel");
+    };
+    if let Some((m, kind)) = r.track_matte(ctx, layer) {
+        let mimg = match matte.take() {
+            Some(Some(src)) => match walk::matte_window(e, r, ctx, m, src, (w, h), win) {
+                Some(img) => img,
+                None => return declined(layer, "the track matte can't be drawn in a window"),
+            },
+            Some(None) => e.zeros(ww, wh),
+            None => return None,
+        };
+        ops::matte_in(e, &mut fp, &mimg, kind, None);
     }
     let pipe = r.pipe();
     // 8 bpc codes stay codes: the first effects and the mix read them.
@@ -430,8 +474,7 @@ pub(crate) fn draw(
     if let Some(c) = pipe.to_blend() {
         adjusted = ops::convert(e, &adjusted, &c);
     }
-    let m = e.crop(matte, x, y, ww, wh);
-    let mixed = ops::adjust_mix(e, &comp, &adjusted, &m, opacity);
+    let mixed = ops::adjust_mix(e, &comp, &adjusted, &fp, opacity);
     put(e, canvas, &mixed, x, y)?;
     log::trace!("adjustment {:?}: effects on a {ww}x{wh} window of the {w}x{h} comp at ({x}, {y})", layer.name);
     #[cfg(test)]

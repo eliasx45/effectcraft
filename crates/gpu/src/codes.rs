@@ -459,7 +459,7 @@ fn function(src: &str, name: &str) -> Result<String, String> {
 
 /// Entry points of a variant.
 fn entries(io: Io) -> Vec<&'static str> {
-    let mut e = vec!["warp_blend", "warp_blend_at", "blend_full", "blend_full_at"];
+    let mut e = vec!["warp_blend", "warp_blend_at", "warp_blend_win", "blend_full", "blend_full_at"];
     if io == (Io { src: false, aux: false, out: true }) {
         e.extend(["quantize", "clear"]);
     }

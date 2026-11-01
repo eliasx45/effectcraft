@@ -465,6 +465,24 @@ impl<'a> Renderer<'a> {
         Some(foot)
     }
 
+    /// An adjustment layer's footprint when it is its solid's whole rectangle, every pixel
+    /// `[1.0; 4]` (an adjustment solid without masks): the buffer's size, offset and scale
+    /// without its pixels (empty `data`), as [`Self::adjustment_footprint`] would make it. An
+    /// accelerator can then make it itself instead of uploading a comp-sized buffer. `None`:
+    /// another footprint (masks, another source).
+    pub fn adjustment_footprint_shape(&self, layer: &Layer) -> Option<Buf> {
+        let effectcraft_project::LayerSource::Solid { item } = &layer.source else { return None };
+        if !layer.switches.adjustment || layer.masks().is_some_and(|m| !m.children.is_empty()) {
+            return None;
+        }
+        let effectcraft_project::ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
+        // As `Renderer::source`'s adjustment solid.
+        let s = self.solid_scale(sol.width, sol.height);
+        let w = ((sol.width as f64 * s).ceil() as u32).max(1);
+        let h = ((sol.height as f64 * s).ceil() as u32).max(1);
+        Some(Buf { img: Image { width: w, height: h, data: Vec::new() }, offset: [0.0; 2], scale: s })
+    }
+
     /// Draw one 2D layer into `canvas` on the CPU (any kind: adjustment, wireframe, styled…).
     pub fn draw_layer_cpu(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image) {
         self.draw_layer(ctx, layer, canvas, false);

@@ -41,6 +41,7 @@ const EFFECT_ENTRIES: &[&str] = &[
     "shadow_combine",
     "pointwise",
     "warp_blend_at",
+    "warp_blend_win",
     "warp_accum_at",
     "blend_full_at",
     "matte_at",
@@ -2852,6 +2853,8 @@ pub(crate) struct Enc<'g> {
     /// The effects running now see a window of the comp, not all of it (an adjustment layer,
     /// `adjust_window`): blur blocks and Mosaic tiles stay on the comp's grid.
     pub(crate) fx_frame: Option<crate::adjust_window::Frame>,
+    /// An image of ones this encoder filled (adjustment solids' footprints, `adjust_window`).
+    pub(crate) ones: Option<GpuImage>,
 }
 
 /// Submitted encoder ids an [`Enc`] remembers for [`Enc::owns`] (older ones lose in-place).
@@ -3071,6 +3074,7 @@ impl<'g> Enc<'g> {
             cell: Default::default(),
             half: false,
             fx_frame: None,
+            ones: None,
             #[cfg(feature = "profile")]
             timestamps: None,
         }
@@ -3220,7 +3224,7 @@ impl<'g> Enc<'g> {
     }
 
     /// Set every pixel of `img` to `v`.
-    fn fill(&mut self, img: &GpuImage, v: f32) {
+    pub(crate) fn fill(&mut self, img: &GpuImage, v: f32) {
         let mut p = Params::default();
         p.f[0] = [v; 4];
         let dummy = self.g.dummy.clone();
