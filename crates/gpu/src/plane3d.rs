@@ -179,7 +179,7 @@ fn finish(e: &mut Enc, shape: Buf, img: GpuImage) -> Result<(Buf, GpuImage), &'s
 /// `Image::alpha_bounds` of a GPU image (pixels with alpha over 1e-6): one row each per
 /// thread (`sty_bounds`), the per-row spans read back. `Some(None)` = nothing visible; `None` =
 /// the device failed.
-fn alpha_bounds(e: &mut Enc, img: &GpuImage) -> Result<Option<(u32, u32, u32, u32)>, &'static str> {
+pub(crate) fn alpha_bounds(e: &mut Enc, img: &GpuImage) -> Result<Option<(u32, u32, u32, u32)>, &'static str> {
     // A flag left by earlier work on this encoder isn't this step's (as `fx_styles::render`).
     e.take_missing();
     if !e.g.fits(img.height, 1) {

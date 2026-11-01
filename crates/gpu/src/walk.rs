@@ -396,13 +396,13 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
 #[cfg(test)]
 pub(crate) static STYLED_ON_GPU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// An animated layer with Layer Styles the GPU renders (`fx_styles`): its content (from the
-/// layer cache) cropped to its visible part, uploaded once, styled by kernels and placed like
-/// the CPU path's passes and body (knockout, track matte / Preserve Transparency, channel
-/// switches); the CPU path styles it on the CPU and uploads every pass. `Err`: the CPU path
-/// draws it, with why it styles there (`Renderer::gpu_styles`: a style the GPU doesn't render,
-/// named, or a revisited frame; `Err(None)`: no styles, or cached ones); `Ok(None)`: the GPU
-/// failed.
+/// An animated layer with Layer Styles the GPU renders (`fx_styles`): its content made on the
+/// device ([`draw_styled_resident`]), or else from the layer cache, cropped to its visible part
+/// and uploaded once; styled by kernels and placed like the CPU path's passes and body
+/// (knockout, track matte / Preserve Transparency, channel switches); the CPU path styles it on
+/// the CPU and uploads every pass. `Err`: the CPU path draws it, with why it styles there
+/// (`Renderer::gpu_styles_begin` / `gpu_style_prep`: a style the GPU doesn't render, named, or a
+/// revisited frame; `Err(None)`: no styles, or cached ones); `Ok(None)`: the GPU failed.
 fn draw_styled_gpu(
     e: &mut Enc,
     r: &Renderer,
@@ -414,7 +414,11 @@ fn draw_styled_gpu(
     if !styles::active(ctx, layer) {
         return Err(None);
     }
-    let (buf, plan) = r.gpu_styles(ctx, layer)?;
+    let keyed = r.gpu_styles_begin(ctx, layer)?;
+    if let Some(done) = draw_styled_resident(e, r, ctx, layer, canvas, opacity, keyed) {
+        return done;
+    }
+    let (buf, plan) = r.gpu_styles_content(ctx, layer, keyed)?;
     // A missing kernel on a healthy device: the CPU styles it.
     let failed = |e: &mut Enc| if e.g.check_health().is_ok() { Err(Some(effectcraft_render::cpu_why::LAYER_STYLES)) } else { Ok(None) };
     let Some(src) = e.upload_buf(&buf) else { return failed(e) };
@@ -435,6 +439,96 @@ fn draw_styled_gpu(
     // The placement only reads the buffer's size, offset and scale.
     let shape = Buf { img: Image { width: buf.img.width, height: buf.img.height, data: Vec::new() }, offset: buf.offset, scale: buf.scale };
     Ok(composite_styled_gpu(e, r, ctx, layer, canvas, opacity, &shape, &passes, body, content))
+}
+
+/// Styled layers [`draw_styled_resident`] styled from content made on the device (tests).
+#[cfg(test)]
+pub(crate) static STYLED_RESIDENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Tests: make styled layers' content the old way (on the CPU, effects read back) to compare.
+#[cfg(test)]
+pub(crate) static NO_STYLED_RESIDENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `EFFECTCRAFT_GPU_STYLED_RESIDENT=0` makes a styled layer's content on the CPU again (A/B).
+fn styled_resident_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if NO_STYLED_RESIDENT.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    *ENABLED.get_or_init(|| std::env::var("EFFECTCRAFT_GPU_STYLED_RESIDENT").map_or(true, |value| value != "0"))
+}
+
+/// [`draw_styled_gpu`] with the layer's content kept on the device ([`processed_resident`]:
+/// the retained image, the layer cache's uploaded, or made there: shape raster, masks, effects),
+/// its alpha bounds found by a kernel, cropped and padded by a texture copy and styled in place.
+/// The usual way makes the content on the CPU, reads every GPU effect run back, crops it there
+/// and uploads it again: a card whose Noise changes every frame (Elias's Tapa card bodies:
+/// Noise + Bevel Alpha + Inner Shadow) did that every frame. Same pixels: the same content
+/// (the resident path's, under the same content key), the same plan and crop
+/// (`Renderer::gpu_style_prep`), the same kernels. `None`: make it the usual way (no layer
+/// cache or key, a precomp, a step the GPU can't do, the content another thread is making);
+/// `Some(Err(why))`: a style the GPU doesn't render; `Some(Ok(None))`: the GPU failed.
+fn draw_styled_resident(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    canvas: &mut Pixels,
+    opacity: f32,
+    keyed: effectcraft_render::GpuStylesKey,
+) -> Option<Result<Option<()>, Option<effectcraft_render::cpu_why::CpuWhy>>> {
+    if !styled_resident_enabled() || !e.g.can_wait() {
+        return None;
+    }
+    let _profile = effectcraft_render::profile::span("styled_resident");
+    // The same content key the usual way styles under.
+    keyed.key()?;
+    // A device failure fails the frame; anything else goes back to the usual way.
+    let fallback = |e: &mut Enc| if e.g.check_health().is_ok() { None } else { Some(Ok(None)) };
+    let Some((image, keep)) = processed_resident(e, r, ctx, layer, false) else { return fallback(e) };
+    let Some(img) = image.img.float(e) else { return fallback(e) };
+    let (w, h) = (img.width, img.height);
+    if w == 0 || h == 0 {
+        return fallback(e);
+    }
+    let Ok(bounds) = crate::plane3d::alpha_bounds(e, &img) else { return fallback(e) };
+    let prep = match r.gpu_style_prep(ctx, layer, [w, h], image.offset, image.scale, bounds) {
+        Ok(prep) => prep,
+        Err(why) => return Some(Err(why)),
+    };
+    let [x0, y0, x1, y1] = prep.region;
+    let (pw, ph) = (prep.shape.img.width, prep.shape.img.height);
+    if !e.g.fits(pw, ph) || x1 > w || y1 > h || x0 >= x1 || y0 >= y1 {
+        return fallback(e);
+    }
+    // A fresh zeroed image of its own (the content may be the retained one; `Enc::zeros` is
+    // shared and must never be written).
+    let src = e.image(pw, ph);
+    e.copy_region_to(&img, &src, x0, y0, x1 - x0, y1 - y0, prep.pad, prep.pad);
+    drop(img);
+    let Some(st) = crate::fx_styles::render(e, &src, &prep.plan) else { return fallback(e) };
+    #[cfg(test)]
+    {
+        STYLED_ON_GPU.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STYLED_RESIDENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let (mut passes, mut body, mut content) = (st.passes, st.body, src);
+    if let Some(c) = r.pipe().to_blend() {
+        for (p, _) in passes.iter_mut() {
+            *p = ops::convert(e, p, &c);
+        }
+        body = ops::convert(e, &body, &c);
+        // Only Knockout reads the content.
+        if styles::blending(ctx, layer).knockout > 0 {
+            content = ops::convert(e, &content, &c);
+        }
+    }
+    let result = composite_styled_gpu(e, r, ctx, layer, canvas, opacity, &prep.shape, &passes, body, content);
+    if result.is_some() {
+        keep_processed(e, r, ctx, layer, keep, image);
+    }
+    Some(Ok(result))
 }
 
 /// [`draw_styled_gpu`]'s composite: the CPU styled branch of `draw_layer` on GPU images.

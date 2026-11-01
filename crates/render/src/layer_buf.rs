@@ -357,11 +357,21 @@ impl<'a> Renderer<'a> {
     /// mark in the layer cache; the next one styles it on the CPU and caches the result, so
     /// scrubbing back over it costs no styling at all.
     pub fn gpu_styles(&self, ctx: &EvalCtx, layer: &Layer) -> Result<(Arc<Buf>, crate::styles::GpuStyles), Option<crate::cpu_why::CpuWhy>> {
+        let keyed = self.gpu_styles_begin(ctx, layer)?;
+        self.gpu_styles_content(ctx, layer, keyed)
+    }
+
+    /// The first half of [`Self::gpu_styles`]: whether the accelerator styles this frame (the
+    /// same `Err`s; a first visit leaves its mark), and the content key it then styles, so an
+    /// accelerator can make the content itself (keep it on the device: a card whose Noise
+    /// changes every frame no longer reads its effects back, crops on the CPU and uploads them
+    /// again) and plan the styles with [`Self::gpu_style_prep`].
+    pub fn gpu_styles_begin(&self, ctx: &EvalCtx, layer: &Layer) -> Result<GpuStylesKey, Option<crate::cpu_why::CpuWhy>> {
         if self.layer_is_static(ctx, layer) && self.styles_are_static(ctx, layer) {
             return Err(None);
         }
-        let (content, ckey) = self.content_buf_timed(ctx, layer, None, None).ok_or(None)?;
-        if let (Some(c), Some(k)) = (self.cache, ckey.map(|k| cache::styles_key(ctx, layer, k))) {
+        let keyed = self.content_cache_key_noted(ctx, layer);
+        if let (Some(c), Some(k)) = (self.cache, keyed.0.map(|k| cache::styles_key(ctx, layer, k))) {
             if c.peek(k).is_some() {
                 return Err(None);
             }
@@ -373,20 +383,38 @@ impl<'a> Renderer<'a> {
                 keep.insert(mark, Arc::new(Buf { img: effectcraft_raster::Image::new(1, 1), offset: [0.0; 2], scale: 1.0 }));
             }
         }
-        let size = source_size(self.project, layer);
-        let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-        // Only the plan's own reason names the styles; one left before it (by the content's
-        // planners) stays for its caller.
-        let pending = crate::cpu_why::take();
-        let prep = crate::styles::gpu_prepare(ctx, layer, &content, layer_size);
-        let why = crate::cpu_why::take();
-        if let Some(p) = pending {
-            crate::cpu_why::declined(p);
-        }
-        match prep {
-            Some((buf, plan)) => Ok((Arc::new(buf), plan)),
-            None => Err(Some(why.unwrap_or(crate::cpu_why::LAYER_STYLES))),
-        }
+        Ok(GpuStylesKey { keyed })
+    }
+
+    /// The second half of [`Self::gpu_styles`]: the content made on the CPU (its effects read
+    /// back from the accelerator), cropped and padded for the styles.
+    pub fn gpu_styles_content(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        keyed: GpuStylesKey,
+    ) -> Result<(Arc<Buf>, crate::styles::GpuStyles), Option<crate::cpu_why::CpuWhy>> {
+        let (content, _) = self.content_buf_timed(ctx, layer, None, Some(keyed.keyed)).ok_or(None)?;
+        let layer_size = styles_layer_size(self, ctx, layer);
+        let prep = planned_styles(|| crate::styles::gpu_prepare(ctx, layer, &content, layer_size))?;
+        Ok((Arc::new(prep.0), prep.1))
+    }
+
+    /// [`crate::styles::gpu_prepare_shape`] for content an accelerator made itself (see
+    /// [`Self::gpu_styles_begin`]): its size, offset, scale and alpha bounds; the same plan and
+    /// crop [`Self::gpu_styles_content`] makes from the CPU's content. `Err(why)`: a style the
+    /// accelerator can't render.
+    pub fn gpu_style_prep(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        dims: [u32; 2],
+        offset: [f64; 2],
+        scale: f64,
+        bounds: Option<(u32, u32, u32, u32)>,
+    ) -> Result<crate::styles::GpuStylePrep, Option<crate::cpu_why::CpuWhy>> {
+        let layer_size = styles_layer_size(self, ctx, layer);
+        planned_styles(|| crate::styles::gpu_prepare_shape(ctx, layer, dims, offset, scale, bounds, layer_size, None))
     }
 
     /// The layer with its styles: exterior passes and body (cached per pass).
@@ -654,6 +682,45 @@ fn samples_pixels(g: &PropGroup) -> bool {
         Node::Prop(p) => p.expr.as_ref().is_some_and(|e| e.text.contains("sampleImage")),
         Node::Group(sub) => samples_pixels(sub),
     })
+}
+
+/// The content key [`Renderer::gpu_styles_begin`] found, for the second half of the styling
+/// ([`Renderer::gpu_styles_content`] or the accelerator's own content).
+#[derive(Clone, Copy, Debug)]
+pub struct GpuStylesKey {
+    keyed: ContentKey,
+}
+
+impl GpuStylesKey {
+    /// The layer's content key (`None` without a layer cache).
+    pub fn key(&self) -> Option<u64> {
+        self.keyed.0
+    }
+
+    /// The window that key stands for ([`Renderer::resident_content`]).
+    pub fn clip(&self) -> ContentClip {
+        self.keyed.2
+    }
+}
+
+/// The layer size Layer Styles measure against (a gradient aligned with the layer): its
+/// source's, or the comp's for a layer without one.
+fn styles_layer_size(r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> [f64; 2] {
+    let size = source_size(r.project, layer);
+    if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] }
+}
+
+/// A style plan, `Err` with why it can't be made on the accelerator. Only the plan's own
+/// reason names the styles; one left before it (by the content's planners) stays for its
+/// caller.
+fn planned_styles<T>(plan: impl FnOnce() -> Option<T>) -> Result<T, Option<crate::cpu_why::CpuWhy>> {
+    let pending = crate::cpu_why::take();
+    let prep = plan();
+    let why = crate::cpu_why::take();
+    if let Some(p) = pending {
+        crate::cpu_why::declined(p);
+    }
+    prep.ok_or(Some(why.unwrap_or(crate::cpu_why::LAYER_STYLES)))
 }
 
 /// The window of a layer's buffer its content key stands for (see [`Renderer::resident_content`]):

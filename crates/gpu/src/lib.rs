@@ -738,6 +738,9 @@ mod tests_shape_clip;
 mod tests_shapes_gpu;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
+mod tests_styled_resident;
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests_styles_static;
 #[cfg(test)]
 mod tests_text_gpu;
