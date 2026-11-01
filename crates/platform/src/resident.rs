@@ -22,7 +22,15 @@
 //! watched weakly, and pictures whose stand-in is gone leave at the next decode or [`sweep`].
 //!
 //! **Bounds; never stalling.** Held pictures are bounded by bytes ([`budget`],
-//! [`DEFAULT_BUDGET`]): past it a decode copies its picture out as before. VideoToolbox gives each
+//! [`DEFAULT_BUDGET`]): past it a decode copies its picture out as before. Pictures only a
+//! decoder's own cache of recent frames still holds (*spare*: FilmCraft's GOP cache keeps the last
+//! 64 frames of each movie, and the media pool let go of these or never took them) are counted in
+//! the media pool's share of the cache budget and are the first to go when it needs room
+//! ([`spare_bytes`], [`shed_spare`]); each decoder keeps at most [`SPARE_PER_DECODER`] of them, all
+//! together at most an eighth of the [`budget`] (Elias, 1 Nov 2026: macOS can't compress GPU
+//! memory and swaps it whole; on 30 Oct an embedded EffectCraft had 28 GB of GPU memory swapped
+//! out and renders waited 77 of 88 ms). A frame whose spare picture went is decoded again when
+//! read (~2-3 ms). VideoToolbox gives each
 //! picture a new buffer while earlier ones are held, so holding never blocks a decode; if a
 //! hardware decode fails while pictures are held, decodes copy their pictures out for
 //! [`PRESSURE_FOR`] ([`pressure`]) and the held ones leave with their frames (their caches evict
@@ -42,10 +50,12 @@ use crate::convert::Planes;
 use crate::metal_surface::Surface;
 use crate::videotoolbox;
 
-/// Bytes of pictures held in surfaces at once by default (about 120 4K ProRes 4444 + alpha
-/// pictures, 480 at 1080p). FilmCraft's GOP cache keeps the last 64 frames of each open movie
-/// (what it kept as CPU planes before), the media pool what its budget allows.
-pub const DEFAULT_BUDGET: usize = 8 << 30;
+/// Bytes of pictures held in surfaces at once by default (about 60 4K ProRes 4444 + alpha
+/// pictures, 240 at 1080p; Elias, 1 Nov 2026: 4 GiB, not 8). The media pool holds what its
+/// budget allows, decoders' caches only a few spare ones ([`SPARE_PER_DECODER`]).
+pub const DEFAULT_BUDGET: usize = 4 << 30;
+/// Spare pictures (held only by a decoder's cache of recent frames) each decoder keeps at most.
+pub const SPARE_PER_DECODER: usize = 8;
 /// After a hardware decode failed while pictures were held, decodes copy their pictures out for
 /// this long.
 pub const PRESSURE_FOR: Duration = Duration::from_secs(5);
@@ -60,6 +70,17 @@ static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static COPIED: AtomicU64 = AtomicU64::new(0);
 /// Pictures left in their surface at decode so far.
 static KEPT: AtomicU64 = AtomicU64::new(0);
+/// Spare pictures let go so far (their frames are decoded again when read).
+static SHED: AtomicU64 = AtomicU64::new(0);
+/// Bytes of spare pictures at the last look (see [`spare_bytes`]).
+static SPARE_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Decoders that held pictures (ids, see [`Resident::new`]).
+static DECODER_IDS: AtomicU64 = AtomicU64::new(1);
+
+/// A new id for a decoder whose pictures are held here.
+pub(crate) fn decoder_id() -> u64 {
+    DECODER_IDS.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A decoded picture left in its VideoToolbox buffer.
 pub(crate) struct Resident {
@@ -72,14 +93,24 @@ pub(crate) struct Resident {
     subsampling: [u32; 2],
     alpha: bool,
     bytes: usize,
+    /// The decoder that made it ([`decoder_id`]).
+    decoder: u64,
 }
 
 impl Resident {
     /// The picture `surface` holds: `pixel_format` ([`videotoolbox::S4AS`] / [`videotoolbox::X422`]),
-    /// `width`×`height`, `bits` deep, alpha when `alpha`.
-    pub(crate) fn new(surface: Surface, pixel_format: u32, (width, height): (u32, u32), bits: u32, subsampling: [u32; 2], alpha: bool) -> Self {
+    /// `width`×`height`, `bits` deep, alpha when `alpha`, made by `decoder` ([`decoder_id`]).
+    pub(crate) fn new(
+        surface: Surface,
+        pixel_format: u32,
+        (width, height): (u32, u32),
+        bits: u32,
+        subsampling: [u32; 2],
+        alpha: bool,
+        decoder: u64,
+    ) -> Self {
         let bytes = surface.bytes();
-        Self { surface, pixel_format, width, height, bits, subsampling, alpha, bytes }
+        Self { surface, pixel_format, width, height, bits, subsampling, alpha, bytes, decoder }
     }
 
     /// Copy the samples out (what the decoder's callback did before Fix 3).
@@ -108,12 +139,24 @@ struct Entry {
     /// The stand-in's luma allocation (its address is the key).
     luma: Weak<Vec<u16>>,
     picture: Arc<Resident>,
+    /// Order of arrival.
+    seq: u64,
+}
+
+impl Entry {
+    /// Only the registry holds the picture: no frame of the media pool has it, only the stand-in
+    /// in a decoder's cache of recent frames. (Checked under the registry's lock, which every new
+    /// reference ([`resolve`]) is made under.)
+    fn spare(&self) -> bool {
+        Arc::strong_count(&self.picture) == 1
+    }
 }
 
 #[derive(Default)]
 struct Registry {
     entries: HashMap<usize, Entry>,
     bytes: usize,
+    seq: u64,
     /// Shared zero planes by length (see [`stand_in`]).
     ballast: HashMap<usize, Weak<Vec<u16>>>,
 }
@@ -131,7 +174,57 @@ impl Registry {
         });
         self.bytes = self.entries.values().map(|e| e.picture.bytes).fold(0, usize::saturating_add);
         self.ballast.retain(|_, w| w.strong_count() > 0);
+        self.count_spare();
         gone
+    }
+
+    /// Bytes of spare pictures now (also stored for [`spare_bytes`]).
+    fn count_spare(&self) -> usize {
+        let n = self.entries.values().filter(|e| e.spare()).map(|e| e.picture.bytes).fold(0, usize::saturating_add);
+        SPARE_BYTES.store(n, Ordering::Relaxed);
+        n
+    }
+
+    /// Take out the entry at `key`.
+    fn take(&mut self, key: usize, gone: &mut Vec<Arc<Resident>>) -> usize {
+        let Some(e) = self.entries.remove(&key) else { return 0 };
+        let b = e.picture.bytes;
+        self.bytes = self.bytes.saturating_sub(b);
+        SHED.fetch_add(1, Ordering::Relaxed);
+        gone.push(e.picture);
+        b
+    }
+
+    /// Let spare pictures go: each decoder keeps its newest [`SPARE_PER_DECODER`], all together
+    /// at most `bound` bytes (oldest first).
+    fn trim(&mut self, bound: usize, gone: &mut Vec<Arc<Resident>>) {
+        let mut spare: Vec<(u64, u64, usize, usize)> =
+            self.entries.iter().filter(|(_, e)| e.spare()).map(|(k, e)| (e.picture.decoder, e.seq, *k, e.picture.bytes)).collect();
+        // newest first within each decoder
+        spare.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        let mut keep = Vec::with_capacity(spare.len());
+        let mut run = (u64::MAX, 0usize);
+        for s in spare {
+            run = if run.0 == s.0 { (s.0, run.1.saturating_add(1)) } else { (s.0, 1) };
+            if run.1 > SPARE_PER_DECODER {
+                self.take(s.2, gone);
+            } else {
+                // (each decoder's newest stays: the media pool is about to take it)
+                keep.push((s, run.1 == 1));
+            }
+        }
+        // then the oldest overall, past the byte bound
+        keep.sort_unstable_by_key(|(s, _)| s.1);
+        let mut bytes = keep.iter().map(|(s, _)| s.3).fold(0, usize::saturating_add);
+        for (s, newest) in keep {
+            if bytes <= bound {
+                break;
+            }
+            if !newest {
+                bytes = bytes.saturating_sub(self.take(s.2, gone));
+            }
+        }
+        SPARE_BYTES.store(bytes, Ordering::Relaxed);
     }
 
     /// The shared zero plane of `len` samples.
@@ -223,11 +316,15 @@ pub(crate) fn stand_in(picture: Resident, chroma: Chroma, color: filmcraft_color
         let bits = picture.bits;
         r.bytes = r.bytes.saturating_add(picture.bytes);
         let picture = Arc::new(picture);
-        if let Some(old) = r.entries.insert(key, Entry { luma: Arc::downgrade(&luma), picture }) {
+        r.seq = r.seq.saturating_add(1);
+        let seq = r.seq;
+        if let Some(old) = r.entries.insert(key, Entry { luma: Arc::downgrade(&luma), picture, seq }) {
             // (a dead entry at a reused address)
             r.bytes = r.bytes.saturating_sub(old.picture.bytes);
             gone.push(old.picture);
         }
+        // (the new picture is spare until the media pool takes it, and the newest of its decoder)
+        r.trim(spare_bound(), &mut gone);
         VideoFrame {
             width,
             height,
@@ -283,6 +380,44 @@ pub fn usage() -> (usize, usize) {
     (n, bytes)
 }
 
+/// The byte bound of spare pictures: an eighth of the [`budget`].
+fn spare_bound() -> usize {
+    budget() / 8
+}
+
+/// Bytes of spare pictures (held only by decoders' caches of recent frames) at the last look:
+/// counted in the media pool's share of the cache budget (`ResidentHooks::spare`).
+pub fn spare_bytes() -> usize {
+    SPARE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Let the oldest spare picture go (the cache budget needs room): its bytes, 0 when there is
+/// none (`ResidentHooks::shed`). Its frame is decoded again when read.
+pub fn shed_spare() -> usize {
+    let mut gone = Vec::new();
+    let freed = {
+        let mut r = registry();
+        // (each decoder's newest stays: the media pool may be about to take it)
+        let mut newest: HashMap<u64, u64> = HashMap::new();
+        for e in r.entries.values() {
+            let n = newest.entry(e.picture.decoder).or_default();
+            *n = (*n).max(e.seq);
+        }
+        let oldest = r
+            .entries
+            .iter()
+            .filter(|(_, e)| e.spare() && newest.get(&e.picture.decoder) != Some(&e.seq))
+            .min_by_key(|(_, e)| e.seq)
+            .map(|(k, _)| *k);
+        let freed = oldest.map_or(0, |k| r.take(k, &mut gone));
+        r.count_spare();
+        freed
+    };
+    // (released outside the lock)
+    drop(gone);
+    freed
+}
+
 /// Pictures held now (no sweep).
 pub(crate) fn held() -> usize {
     registry().entries.len()
@@ -291,6 +426,11 @@ pub(crate) fn held() -> usize {
 /// Pictures left in their surface at decode, and pictures copied out of one on demand, so far.
 pub fn counters() -> (u64, u64) {
     (KEPT.load(Ordering::Relaxed), COPIED.load(Ordering::Relaxed))
+}
+
+/// Spare pictures let go so far ([`shed_spare`], [`SPARE_PER_DECODER`]).
+pub fn shed_count() -> u64 {
+    SHED.load(Ordering::Relaxed)
 }
 
 /// The held picture the GPU asks for (`key.luma`: a stand-in's key), and the depth the frame

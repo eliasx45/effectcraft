@@ -159,6 +159,12 @@ pub struct ResidentHooks {
     pub sweep: fn(),
     /// Pictures held in surfaces now, and their bytes (cached or not).
     pub usage: fn() -> (usize, usize),
+    /// Bytes of *spare* pictures: held only by decoders' caches of recent frames (no frame of the
+    /// pool has them). The pool counts them in its share of the cache budget (Fix 3 follow-up,
+    /// 1 Nov 2026: GPU memory must not sit outside the budget).
+    pub spare: fn() -> usize,
+    /// Let the oldest spare picture go: its bytes (0: none). Its frame is decoded again when read.
+    pub shed: fn() -> usize,
 }
 
 static RESIDENT_HOOKS: OnceLock<ResidentHooks> = OnceLock::new();
@@ -178,6 +184,16 @@ pub(crate) fn sweep_resident() {
     if let Some(h) = RESIDENT_HOOKS.get() {
         (h.sweep)();
     }
+}
+
+/// Bytes of spare pictures ([`ResidentHooks::spare`]).
+pub(crate) fn spare_resident() -> usize {
+    RESIDENT_HOOKS.get().map_or(0, |h| (h.spare)())
+}
+
+/// Let the oldest spare picture go ([`ResidentHooks::shed`]): its bytes.
+pub(crate) fn shed_resident() -> usize {
+    RESIDENT_HOOKS.get().map_or(0, |h| (h.shed)())
 }
 
 /// Pictures kept in decoder surfaces now and their bytes ([`ResidentHooks::usage`]).

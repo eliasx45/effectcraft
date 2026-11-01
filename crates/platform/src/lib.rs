@@ -114,6 +114,8 @@ pub fn register() -> Availability {
                 resolve: resident::resolve,
                 sweep: resident::sweep,
                 usage: resident::usage,
+                spare: resident::spare_bytes,
+                shed: resident::shed_spare,
             });
         }
         effectcraft_media::hw::set_available(prores || nal);

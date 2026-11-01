@@ -8,7 +8,10 @@
 //!   frame copied out exactly once, the pixels of a frame copied at decode;
 //! - the cache counts the surface, then the copy; exports (the exact view) never see one;
 //! - past the held-pictures budget, or after a hardware failure, frames are copied at decode as
-//!   before; pictures leave with their frames.
+//!   before; pictures leave with their frames;
+//! - pictures only a decoder's cache of recent frames holds (spare) are capped per decoder,
+//!   counted in the pool's budget and let go first; a frame whose picture went is decoded again
+//!   with the same pixels.
 //!
 //! macOS with a hardware ProRes decoder and a GPU; elsewhere it notes why and passes. Its own
 //! test binary: surfaces, held pictures and their counters are process-wide.
@@ -24,20 +27,25 @@ use effectcraft_project::{EightBit, Footage, ItemId};
 use effectcraft_render::FootageSource;
 use effectcraft_time::Tick;
 
-/// An ffmpeg ProRes movie (`profile`, `pix_fmt`) generated once; `None` without ffmpeg.
+/// An ffmpeg ProRes movie (`profile`, `pix_fmt`, 0.25 s) generated once; `None` without ffmpeg.
 fn ffmpeg_clip(name: &str, profile: &str, pix_fmt: &str, alpha: bool) -> Option<std::path::PathBuf> {
+    ffmpeg_clip_of(name, profile, pix_fmt, alpha, "0.25")
+}
+
+/// [`ffmpeg_clip`], `seconds` long.
+fn ffmpeg_clip_of(name: &str, profile: &str, pix_fmt: &str, alpha: bool, seconds: &str) -> Option<std::path::PathBuf> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/fixtures/platform");
     let path = dir.join(name);
     if !path.exists() {
         std::fs::create_dir_all(&dir).ok()?;
         let tmp = dir.join(format!("tmp-{}-{name}", std::process::id()));
         let src = if alpha {
-            "testsrc2=size=352x198:rate=24:duration=0.25,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='255*X/W'"
+            format!("testsrc2=size=352x198:rate=24:duration={seconds},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='255*X/W'")
         } else {
-            "testsrc2=size=352x198:rate=24:duration=0.25"
+            format!("testsrc2=size=352x198:rate=24:duration={seconds}")
         };
         let st = std::process::Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", src, "-c:v", "prores_ks", "-profile:v", profile, "-pix_fmt", pix_fmt])
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", &src, "-c:v", "prores_ks", "-profile:v", profile, "-pix_fmt", pix_fmt])
             .arg(&tmp)
             .status()
             .ok()?;
@@ -112,6 +120,56 @@ fn prores_frames_stay_on_the_gpu_until_a_cpu_reader_asks() {
     if let Some((name, path)) = clips.first() {
         bounds(&gpu, name, &effectcraft_media::probe(path).expect("probe"));
     }
+    if let Some(path) = ffmpeg_clip_of("prores_ks_422hq_352x198_1s.mov", "3", "yuv422p10le", false, "1") {
+        spare(&effectcraft_media::probe(&path).expect("probe"));
+    }
+}
+
+/// Spare pictures (only the decoder's cache of recent frames holds them; FilmCraft keeps 64):
+/// at most [`resident::SPARE_PER_DECODER`] per decoder, counted in the pool's budget and let go
+/// first when it needs room; a frame whose picture went is decoded again, the same pixels.
+fn spare(footage: &Footage) {
+    let name = "1 s 422 HQ";
+    let n = 16;
+    let p = pool(EightBit::Off, true);
+    let reference = pool(EightBit::Off, false);
+    let kept = (0..n).filter(|i| p.frame_pixels(ItemId(1), footage, at(footage, *i)).is_some_and(|px| px.gpu_yuv().is_some_and(|v| v.surface.is_some()))).count();
+    if kept < n as usize {
+        eprintln!("{name}: {kept} of {n} frames kept on the GPU: spare pictures not checked");
+        return;
+    }
+    assert!(resident::usage().0 >= n as usize, "{name}: the pool holds all {n}");
+    // the pool lets its frames go; the decoder's cache still holds them, as spare pictures
+    p.clear_frames();
+    let shed = resident::shed_count();
+    let _ = p.frame_pixels(ItemId(1), footage, at(footage, n));
+    let (held, _) = resident::usage();
+    // (the pool's newest frame, and the decoder's newest spare ones)
+    assert!(held <= 1 + resident::SPARE_PER_DECODER, "{name}: {held} pictures held after the pool let go");
+    assert!(resident::shed_count() >= shed + (n as u64 - resident::SPARE_PER_DECODER as u64), "{name}: the older spare pictures went");
+    let spare = resident::spare_bytes();
+    assert!(spare > 0, "{name}: spare pictures are counted");
+    assert!(p.stats().bytes >= spare, "{name}: in the pool's budget ({} < {spare})", p.stats().bytes);
+
+    // a frame whose picture went (frame 0: the decoder's cache still has its stand-in) is decoded
+    // again: the pixels of a frame copied at decode
+    let t = at(footage, 0);
+    let img = p.frame(ItemId(1), footage, t).expect("frame decoded again");
+    let want = reference.frame(ItemId(1), footage, t).expect("reference");
+    assert_same(&img.data, &want.data, &format!("{name}: frame 0 decoded again"));
+    let started = std::time::Instant::now();
+    p.clear_frames();
+    let _ = p.frame_pixels(ItemId(1), footage, at(footage, 1)).expect("frame 1 decoded again");
+    eprintln!("{name}: a frame whose picture went decoded again in {:.2} ms", started.elapsed().as_secs_f64() * 1e3);
+
+    // the budget needs room: spare pictures go first
+    let before = resident::spare_bytes();
+    let small = MediaPool::with_budget(1);
+    small.set_hardware_decoding(true);
+    small.set_read_ahead(false);
+    let _ = small.frame_pixels(ItemId(1), footage, at(footage, 2));
+    assert!(resident::spare_bytes() < before.max(1), "{name}: spare pictures shed for the budget ({before} -> {})", resident::spare_bytes());
+    drop((small, p, reference));
 }
 
 /// One frame through a pool that keeps it on the GPU, against one that copies it at decode.
@@ -124,7 +182,13 @@ fn check(gpu: &effectcraft_gpu::Gpu, what: &str, footage: &Footage, eight: Eight
     let px = p.frame_pixels(ItemId(1), footage, t).expect("frame");
     let view = px.gpu_yuv().expect("a native view");
     if view.surface.is_none() || effectcraft_platform::stats().fallbacks != fallbacks {
-        eprintln!("{what}: decoded in software or copied at decode: not compared");
+        eprintln!(
+            "{what}: decoded in software or copied at decode: not compared (held {:?} of {} bytes, fallbacks {} -> {})",
+            resident::usage(),
+            resident::budget(),
+            fallbacks,
+            effectcraft_platform::stats().fallbacks
+        );
         return false;
     }
     let copies = |p: &MediaPool| p.stats().copies;
@@ -151,10 +215,13 @@ fn check(gpu: &effectcraft_gpu::Gpu, what: &str, footage: &Footage, eight: Eight
     let rv = r.yuv().expect("reference view");
     assert!(rv.surface.is_none(), "{what}: the reference holds CPU samples");
     let (_, b) = gpu.decode_yuv(rv, false, true).expect("reference uploaded");
-    assert_same(&a.expect("read back").data, &b.expect("read back").data, &format!("{what}: GPU picture"));
+    let b = b.expect("read back");
+    assert_same(&a.expect("read back").data, &b.data, &format!("{what}: GPU picture"));
 
     // memory: the cache counts the surface, then the copy
-    let held = p.stats().bytes;
+    // (the pool's own frames: spare pictures of earlier pools' decoders count in its budget too)
+    let own = |p: &MediaPool| p.stats().bytes.saturating_sub(resident::spare_bytes());
+    let held = own(&p);
     let pixels = (footage.width as usize) * (footage.height as usize);
     assert!(held >= pixels * 2, "{what}: the surface is counted ({held} bytes)");
     let usage = p.cache_usage();
@@ -173,7 +240,7 @@ fn check(gpu: &effectcraft_gpu::Gpu, what: &str, footage: &Footage, eight: Eight
     // the CPU view uploaded is the same picture too (what a GPU that can't read the surface does)
     let (_, c) = gpu.decode_yuv(cpu_view, false, true).expect("CPU planes uploaded");
     assert_same(&c.expect("read back").data, &b_again(gpu, &reference, footage, t), &format!("{what}: uploaded copy"));
-    assert!(p.stats().bytes > held, "{what}: the copy is counted ({} -> {})", held, p.stats().bytes);
+    assert!(own(&p) > held, "{what}: the copy is counted ({} -> {})", held, own(&p));
 
     // exports read the exact view: never a frame kept on the GPU
     let exact = p.exact().frame_pixels(ItemId(1), footage, t).expect("exact frame");

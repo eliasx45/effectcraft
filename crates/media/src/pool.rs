@@ -154,9 +154,11 @@ struct Lru {
 }
 
 impl Lru {
-    /// Bytes held: the entries', and the CPU copies made of them since ([`Lru::lazy`]).
+    /// Bytes held: the entries', the CPU copies made of them since ([`Lru::lazy`]), and the
+    /// spare pictures decoders' caches still hold in surfaces ([`crate::hw::spare_resident`]:
+    /// GPU memory counts in the budget too, and goes first when it needs room).
     fn held(&self) -> usize {
-        self.bytes.saturating_add(self.lazy.bytes.load(Ordering::Relaxed))
+        self.bytes.saturating_add(self.lazy.bytes.load(Ordering::Relaxed)).saturating_add(crate::hw::spare_resident())
     }
     fn tick(&mut self) -> u64 {
         self.clock = effectcraft_render::cache::shared::stamp_after(self.clock);
@@ -199,7 +201,14 @@ impl Lru {
     }
     /// Evict least-recently-used frames until within `budget` (the newest frame always stays).
     fn evict(&mut self, budget: usize) {
-        while self.held() > budget && self.map.len() > 1 {
+        while self.held() > budget {
+            // spare pictures in surfaces first (each shed one is counted out at once)
+            if crate::hw::spare_resident() > 0 && crate::hw::shed_resident() > 0 {
+                continue;
+            }
+            if self.map.len() <= 1 {
+                break;
+            }
             let Some((_, k)) = self.order.pop_first() else { break };
             if let Some(e) = self.map.remove(&k) {
                 self.bytes -= e.bytes;
@@ -210,6 +219,12 @@ impl Lru {
     /// The least recently used frame, for the shared budget (the newest frame always stays):
     /// the bytes freed.
     fn evict_oldest(&mut self) -> usize {
+        // spare pictures in surfaces first
+        let spare = crate::hw::shed_resident();
+        if spare > 0 {
+            self.report();
+            return spare;
+        }
         if self.map.len() <= 1 {
             return 0;
         }
@@ -1810,7 +1825,8 @@ impl Inner {
             // no samples. The frame is decoded again on a source of its own, copied at decode.
             log::debug!("media: {path}: a frame kept on the GPU was gone; decoding it again");
             let _copy = crate::hw::resident_scope(false);
-            let (src, _) = self.open_source(path, hw).or_else(|| self.open_detached(path)).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
+            // (not the open source: its cache would give the same stand-in back)
+            let (src, _) = self.open_detached(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
             let frame = src.video_frame(at).map_err(MediaError::from)?;
             if crate::hw::is_stand_in(&frame) {
                 return Err(MediaError::Decode(format!("{path}: a frame kept on the GPU could not be decoded again")));

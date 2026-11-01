@@ -159,6 +159,8 @@ pub struct VtProResDecoder {
     /// Hardware decodes that failed in a row (see [`GIVE_UP_AFTER`]).
     failures: u32,
     warned: bool,
+    /// Its id for the pictures it leaves in surfaces (Fix 3: each decoder keeps a few spare ones).
+    id: u64,
 }
 
 impl VtProResDecoder {
@@ -187,6 +189,7 @@ impl VtProResDecoder {
             fail: false,
             failures: 0,
             warned: false,
+            id: resident::decoder_id(),
         })
     }
 
@@ -255,7 +258,7 @@ impl VtProResDecoder {
             Some(planes) => (planes, decoded.surface),
             None => {
                 let surface = decoded.surface.ok_or("VideoToolbox kept no picture")?;
-                let picture = resident::Resident::new(surface, f.pixel_format, (f.width, f.height), bits, subsampling, alpha);
+                let picture = resident::Resident::new(surface, f.pixel_format, (f.width, f.height), bits, subsampling, alpha, self.id);
                 match resident::stand_in(picture, chroma, color) {
                     Ok(frame) => return Ok(frame),
                     // no room to hold it: copied out now, as before
