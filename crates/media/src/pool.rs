@@ -250,8 +250,8 @@ struct CacheState {
     /// Frames being decoded right now and the thread decoding each (requests for them wait
     /// instead of decoding again).
     inflight: HashMap<Key, ThreadId>,
-    /// Last frame index requested per movie (sequential-read detection).
-    last: HashMap<Arc<str>, i64>,
+    /// The reads of each movie so far (sequential-read detection).
+    last: HashMap<Arc<str>, Reads>,
     /// Sequential decode-ahead per movie.
     ahead: HashMap<Arc<str>, Ahead>,
     /// Decode-ahead runners started (each runner's id).
@@ -281,9 +281,57 @@ struct Ahead {
     runner: Option<u64>,
 }
 
+/// How a read may start or extend a movie's decode-ahead ([`Inner::schedule`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Order {
+    /// Never (a single frame: thumbnails, tests).
+    Single,
+    /// A preview while nothing plays (scrubbing, stepping, Cache Frames When Idle): only a run
+    /// of small forward steps decodes ahead, as far as the run is long; a jump or a step back
+    /// calls the decode-ahead off (Q2, 1 Nov 2026: decode-ahead started by any read within 32
+    /// frames, backward too, was 43-57 % of the CPU while scrubbing a ProRes 4444 presenter,
+    /// mostly frames nobody read).
+    Paused,
+    /// Playback and exports: any read within [`SEQ_SLACK`] of the previous one (parallel
+    /// workers read neighbouring frames out of order).
+    Playing,
+}
+
+/// The reads of a movie so far: the last one, the furthest frame a run of small forward steps
+/// reached, and how many steps the run has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Reads {
+    last: i64,
+    head: i64,
+    run: i64,
+}
+
+impl Reads {
+    /// After a read of frame `raw`: a step of 1..=[`PAUSED_STEP`] past the head goes on with the
+    /// run, a read at most [`PAUSED_BEHIND`] behind it (parallel workers out of order, a frame
+    /// read again) leaves it as it is, any other read starts a new run there.
+    fn after(prev: Option<Reads>, raw: i64) -> Reads {
+        let Some(p) = prev else { return Reads { last: raw, head: raw, run: 0 } };
+        let d = raw.saturating_sub(p.head);
+        match d {
+            1..=PAUSED_STEP => Reads { last: raw, head: raw, run: p.run.saturating_add(1) },
+            _ if (-PAUSED_BEHIND..=0).contains(&d) => Reads { last: raw, ..p },
+            _ => Reads { last: raw, head: raw, run: 0 },
+        }
+    }
+}
+
 /// Requests within this many frames of the previous request of the same movie read it in order
 /// (parallel export workers ask for neighbouring frames out of order).
 const SEQ_SLACK: i64 = 32;
+/// While nothing plays ([`Order::Paused`]): a step forward of at most this many frames from the
+/// furthest frame read goes on with a run of reads in order …
+const PAUSED_STEP: i64 = 4;
+/// … a read at most this far behind it leaves the run as it is …
+const PAUSED_BEHIND: i64 = 8;
+/// … and a run of this many steps decodes ahead, twice as many frames as the run has steps (up
+/// to the window): a click and the viewer's two prefetched frames after it decode nothing more.
+const PAUSED_RUN: i64 = 3;
 /// At most this many frames are decoded ahead of a reader …
 const MAX_AHEAD: i64 = 32;
 /// … and at most this share (1 / n) of the frame-cache budget.
@@ -523,6 +571,9 @@ struct Inner {
     /// Settings ▸ Previews ▸ Hardware Video Decoding: preview reads of ProRes footage may use a
     /// registered hardware decoder (off by default; the exact view never does).
     hardware: AtomicBool,
+    /// A preview plays now ([`MediaPool::set_playing`]): preview reads decode ahead as exports
+    /// do ([`Order::Playing`]), not only after a run of forward steps ([`Order::Paused`]).
+    playing: AtomicBool,
     /// Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits ([`EightBit`] as its index in
     /// [`EightBit::ALL`]): where movie and image-sequence frames deeper than 8 bits are kept at
     /// 8 bits (a new pool: off; the app's setting: previews and exports by default; Interpret
@@ -637,6 +688,7 @@ impl MediaPool {
             budget: AtomicU64::new(bytes as u64),
             read_ahead: AtomicBool::new(cfg!(not(target_arch = "wasm32"))),
             hardware: AtomicBool::new(false),
+            playing: AtomicBool::new(false),
             // (full depth until the app applies its setting, whose default is previews and exports)
             eight_bit: AtomicU8::new(eight_bit_index(EightBit::Off)),
             hits: AtomicU64::new(0),
@@ -659,6 +711,19 @@ impl MediaPool {
     /// [`MediaPool::exact`] view never does.
     pub fn set_hardware_decoding(&self, on: bool) {
         self.inner.hardware.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether a preview plays now (the viewer tells it every frame). While one plays, preview
+    /// reads decode ahead like exports; while none does (scrubbing, stepping), only a run of
+    /// small forward steps does, and a jump calls a movie's decode-ahead off ([`Order`]).
+    pub fn set_playing(&self, on: bool) {
+        self.inner.playing.store(on, Ordering::Relaxed);
+    }
+
+    /// How a read of this view orders decode-ahead: exports (the exact view) and playing
+    /// previews read in order, other previews in runs of forward steps.
+    fn order(&self) -> Order {
+        if self.exact || self.inner.playing.load(Ordering::Relaxed) { Order::Playing } else { Order::Paused }
     }
 
     /// Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits: keep 10 / 12 / 16-bit movie and
@@ -831,7 +896,7 @@ impl MediaPool {
 
     /// Decode (or fetch from cache) the frame of `footage` at source time `t`.
     pub fn frame_at(&self, footage: &Footage, t: Tick) -> Result<Arc<Image>> {
-        Ok(Inner::pixels_at(&self.inner, footage, t, true, None, self.hw_for(footage), self.lite_for(footage), FloatCurve::Srgb)?.image())
+        Ok(Inner::pixels_at(&self.inner, footage, t, Order::Playing, None, self.hw_for(footage), self.lite_for(footage), FloatCurve::Srgb)?.image())
     }
 
     /// Settings ▸ Disk ▸ Conformed Audio Folder: write each footage file's decoded audio there
@@ -1194,7 +1259,8 @@ impl Inner {
 
     #[cfg(test)]
     fn frame_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool) -> Result<Arc<Image>> {
-        Ok(self.pixels_at(footage, t, playback, None, false, false, FloatCurve::Srgb)?.image())
+        let order = if playback { Order::Playing } else { Order::Single };
+        Ok(self.pixels_at(footage, t, order, None, false, false, FloatCurve::Srgb)?.image())
     }
 
     /// Where the frame of `footage` at `t` comes from, resampled for `preview` when the footage's
@@ -1220,7 +1286,7 @@ impl Inner {
         self: &Arc<Self>,
         footage: &Footage,
         t: Tick,
-        playback: bool,
+        order: Order,
         preview: Option<Preview>,
         hw: bool,
         lite: bool,
@@ -1233,8 +1299,8 @@ impl Inner {
         let raw = footage.frame_rate.frame_at(t);
         let mut c = lock(&self.cache);
         // a movie read in order: decode the next frames ahead
-        if playback && loc.media_t.is_some() && !footage.codec.eq_ignore_ascii_case("gif") && self.read_ahead.load(Ordering::Relaxed) {
-            self.schedule(&mut c, footage, preview, float, &loc.key, raw);
+        if order != Order::Single && loc.media_t.is_some() && !footage.codec.eq_ignore_ascii_case("gif") && self.read_ahead.load(Ordering::Relaxed) {
+            self.schedule(&mut c, footage, preview, float, &loc.key, raw, order);
         }
         let me = std::thread::current().id();
         // (last progress seen, when it was seen): rayon workers stop waiting without progress
@@ -1305,16 +1371,46 @@ impl Inner {
         Ok(px)
     }
 
-    /// A read of frame `raw` (key `key`) of a movie: when it follows the previous read closely,
-    /// extend the movie's decode-ahead past it (starting a runner when none is running).
-    fn schedule(self: &Arc<Self>, c: &mut CacheState, footage: &Footage, preview: Option<Preview>, float: FloatCurve, key: &Key, raw: i64) {
-        let prev = c.last.insert(key.path.clone(), raw);
-        if !prev.is_some_and(|p| p != raw && p.abs_diff(raw) <= SEQ_SLACK.unsigned_abs()) {
-            return;
-        }
+    /// A read of frame `raw` (key `key`) of a movie: when it follows the previous reads in order
+    /// (as `order` says), extend the movie's decode-ahead past it (starting a runner when none is
+    /// running). While nothing plays, a read that ends a run of forward steps (a jump, a step
+    /// back) calls the movie's decode-ahead off: nobody reads the frames it would decode.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule(self: &Arc<Self>, c: &mut CacheState, footage: &Footage, preview: Option<Preview>, float: FloatCurve, key: &Key, raw: i64, order: Order) {
+        let prev = c.last.get(&key.path).copied();
+        let reads = Reads::after(prev, raw);
+        c.last.insert(key.path.clone(), reads);
+        // While nothing plays: at most this many frames ahead (twice the run's steps).
+        let run_window = match order {
+            Order::Single => return,
+            Order::Playing => {
+                if !prev.is_some_and(|p| p.last != raw && p.last.abs_diff(raw) <= SEQ_SLACK.unsigned_abs()) {
+                    return;
+                }
+                None
+            }
+            Order::Paused => {
+                if reads.run == 0 {
+                    if let Some(a) = c.ahead.get_mut(&key.path)
+                        && a.next < a.until
+                    {
+                        // The runner stops after the frames it decodes now; readers waiting for
+                        // the frames after them decode them themselves.
+                        a.until = a.next;
+                        self.done.notify_all();
+                    }
+                    return;
+                }
+                if reads.run < PAUSED_RUN || reads.head != raw {
+                    return;
+                }
+                Some(reads.run.saturating_mul(2))
+            }
+        };
         let estimate = (footage.width as usize).saturating_mul(footage.height as usize).saturating_mul(3) / 2 + 64;
         let frame_bytes = c.ahead.get(&key.path).filter(|a| same_stream(&a.stream, key)).map_or(estimate, |a| a.frame_bytes).max(1);
         let window = i64::try_from(self.budget() / AHEAD_SHARE / frame_bytes).unwrap_or(MAX_AHEAD).min(MAX_AHEAD);
+        let window = run_window.map_or(window, |n| window.min(n));
         if window < 1 {
             return;
         }
@@ -1684,6 +1780,9 @@ impl FootageSource for MediaPool {
     fn set_hardware_decoding(&self, on: bool) {
         MediaPool::set_hardware_decoding(self, on);
     }
+    fn set_playing(&self, on: bool) {
+        MediaPool::set_playing(self, on);
+    }
     fn set_eight_bit(&self, mode: EightBit) {
         MediaPool::set_eight_bit(self, mode);
     }
@@ -1792,13 +1891,13 @@ impl Drop for RunnerStop {
 }
 
 impl MediaPool {
-    /// The pixels of `footage` at `t` for the renderer (playback read-ahead on), logged and
-    /// `None` when they can't be decoded.
+    /// The pixels of `footage` at `t` for the renderer (decoding ahead as [`MediaPool::order`]
+    /// says), logged and `None` when they can't be decoded.
     fn pixels(&self, footage: &Footage, t: Tick, preview: Option<Preview>, float: FloatCurve) -> Option<Pixels> {
         if footage.missing {
             return None;
         }
-        match Inner::pixels_at(&self.inner, footage, t, true, preview, self.hw_for(footage), self.lite_for(footage), float) {
+        match Inner::pixels_at(&self.inner, footage, t, self.order(), preview, self.hw_for(footage), self.lite_for(footage), float) {
             Ok(px) => Some(px),
             // nobody wants the frame any more (`cancellable`): not an error
             Err(MediaError::Cancelled) => None,
@@ -2409,6 +2508,78 @@ mod tests {
         let before = Inner::locate(&footage, Tick::ZERO, FloatCurve::Srgb).key;
         footage.layer.as_mut().unwrap().crop_bounds = Some([1.0, 0.0, 21.0, 40.0]);
         assert!(before != Inner::locate(&footage, Tick::ZERO, FloatCurve::Srgb).key);
+    }
+
+    /// Q2: while nothing plays, preview reads that jump around (scrubbing) decode nothing ahead
+    /// (each read within 32 frames of the last one started a 32-frame decode-ahead), the
+    /// viewer's click and the two frames it prefetches after it don't either, a run of forward
+    /// steps decodes twice its steps ahead, and a jump calls that off. While a preview plays,
+    /// two reads in order decode a whole window ahead, as before.
+    #[test]
+    fn scrubbing_decodes_ahead_only_for_runs_of_forward_steps() {
+        let n = 200;
+        let bytes: Arc<[u8]> = prores_movie(16, 16, n).into();
+        let path = "/mem/scrub.mov";
+        let footage = crate::probe::probe_bytes(path, bytes.clone()).unwrap();
+        let at = |i: u32| footage.frame_rate.tick_of(i64::from(i)) + Tick(footage.frame_rate.frame_duration().0 / 2);
+        let pool = MediaPool::new();
+        pool.add_bytes(path, bytes);
+        let read = |i: u32| assert!(pool.pixels(&footage, at(i), None, FloatCurve::Srgb).is_some(), "frame {i}");
+        let ahead = || lock(&pool.inner.cache).ahead.get(path).map(|a| (a.next, a.until));
+        let settle = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let c = lock(&pool.inner.cache);
+                if c.ahead.get(path).is_none_or(|a| a.runner.is_none()) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "decode-ahead stops");
+                drop(pool.inner.done.wait_timeout(c, std::time::Duration::from_millis(20)));
+            }
+        };
+
+        // scrubbing back and forth within 32 frames
+        for i in [100, 110, 95, 120, 118, 105, 130] {
+            read(i);
+        }
+        // a click and the viewer's two prefetched frames after it
+        for i in [40, 41, 42] {
+            read(i);
+        }
+        assert_eq!(ahead(), None, "nothing decodes ahead");
+        // stepping on: the third step decodes 2 × 3 frames ahead
+        read(43);
+        assert_eq!(ahead().map(|a| a.1), Some(43 + 1 + 6));
+        // a jump calls it off: the runner stops after the frames it decodes now
+        read(150);
+        let (next, until) = ahead().unwrap();
+        assert!(until <= next, "called off: {next}..{until}");
+        settle();
+        let ahead_frames = pool.stats().prefetched;
+        assert!(ahead_frames <= 6, "decoded ahead: {ahead_frames}");
+
+        // a preview plays: two reads in order decode a whole window ahead
+        pool.set_playing(true);
+        read(60);
+        read(61);
+        assert_eq!(ahead().map(|a| a.1), Some(61 + 1 + MAX_AHEAD));
+        settle();
+        // exports (the exact view) read in order whatever plays
+        pool.set_playing(false);
+        assert_eq!(pool.exact().order(), Order::Playing);
+        assert_eq!(pool.order(), Order::Paused);
+    }
+
+    /// Q2: a run of reads in order while nothing plays: small forward steps go on with it, reads
+    /// a little behind its head (parallel workers) leave it, anything else starts a new one.
+    #[test]
+    fn reads_in_order_form_runs() {
+        let mut r = Reads::after(None, 10);
+        assert_eq!(r, Reads { last: 10, head: 10, run: 0 });
+        for (raw, head, run) in [(11, 11, 1), (13, 13, 2), (12, 13, 2), (13, 13, 2), (17, 17, 3), (9, 17, 3), (8, 8, 0), (13, 13, 0), (12, 13, 0)] {
+            r = Reads::after(Some(r), raw);
+            assert_eq!((r.last, r.head, r.run), (raw, head, run), "after {raw}");
+        }
     }
 
     #[test]

@@ -242,6 +242,10 @@ pub trait FootageSource: Send + Sync {
     /// Settings ▸ Previews ▸ Hardware Video Decoding: let previews decode footage on a hardware
     /// decoder (visually identical, not bit-exact). Sources without one ignore it.
     fn set_hardware_decoding(&self, _on: bool) {}
+    /// Whether a preview plays now (the viewer says so every frame): a source that decodes
+    /// movie frames ahead of the reads does it during playback, and while none plays only for
+    /// reads in order (scrubbing jumps around). Sources that decode nothing ahead ignore it.
+    fn set_playing(&self, _on: bool) {}
     /// Settings ▸ Memory & CPU ▸ Decode Footage at 8 Bits: keep footage frames deeper than 8
     /// bits at 8 bits per channel in previews, in previews and exports (the [`Self::exact`] view
     /// too), or nowhere (half the memory; Interpret Footage overrides it per item). Sources that
@@ -362,6 +366,9 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn set_hardware_decoding(&self, on: bool) {
         self.inner.set_hardware_decoding(on)
+    }
+    fn set_playing(&self, on: bool) {
+        self.inner.set_playing(on)
     }
     fn set_eight_bit(&self, mode: effectcraft_project::EightBit) {
         self.inner.set_eight_bit(mode)

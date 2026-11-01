@@ -1964,6 +1964,7 @@ impl EffectcraftApp {
     pub fn stop(&mut self) {
         let was = std::mem::replace(&mut self.playback.playing, false);
         self.frames.set_playhead(None);
+        self.session.footage.set_playing(false);
         #[cfg(not(target_arch = "wasm32"))]
         self.frames.warm_ahead(None);
         #[cfg(not(target_arch = "wasm32"))]
@@ -2067,6 +2068,8 @@ impl EffectcraftApp {
         }
         let fr = c.frame_rate;
         let plan = self.playback.plan.filter(|_| self.playback.playing);
+        // Movies decode ahead while a preview plays; while none does, only for reads in order.
+        self.session.footage.set_playing(plan.is_some_and(|p| p.video));
         let (wa, wb) = match plan {
             Some(p) => (p.start, p.end),
             None => (fr.frame_at(c.work_area.0), fr.frame_at(c.work_area.1 - c.frame_duration())),
