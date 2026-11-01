@@ -10,12 +10,14 @@
 // paints the draws over it in order, from its 16 × 16 tile's list (Normal, as `shapes::paint` /
 // `text::paint_coverage`). Draws come in groups (motion-blur sub-samples of a text layer): each
 // group is composited on its own and the groups summed with their weights (`accumulate_warp`).
-// A batch too large for one `acc` is split; `state` carries the pixels between batches.
+// A batch too large for one `acc` is split; `state` carries the pixels between batches (the
+// first batch starts from nothing: a layer drawn in one batch binds a placeholder).
 
 struct Batch {
     // image width, image height, tiles across, rows in this batch
     n: vec4<u32>,
-    // first edge, edge count, workgroups across in `sh_cov`, flags (1: groups, 2: last batch)
+    // first edge, edge count, workgroups across in `sh_cov`, flags (1: groups, 2: last batch,
+    // 4: first batch)
     e: vec4<u32>,
     // where the tile ranges and the tile lists start in `index`, workgroups across in `sh_accum`
     t: vec4<u32>,
@@ -315,10 +317,12 @@ fn sh_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
     // group (batches split between groups) and `sum` carries on.
     var cur = vec4<f32>(0.0);
     var sum = vec4<f32>(0.0);
-    if (groups) {
-        sum = state[i];
-    } else {
-        cur = state[i];
+    if ((B.e.w & 4u) == 0u) {
+        if (groups) {
+            sum = state[i];
+        } else {
+            cur = state[i];
+        }
     }
     var g = 0xffffffffu;
     var wt = 0.0;

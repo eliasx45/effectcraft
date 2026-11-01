@@ -1042,6 +1042,10 @@ pub struct GpuStylePrep {
     pub pad: u32,
     /// The styled buffer's size, offset and scale (no pixels).
     pub shape: Buf,
+    /// The styles read the content's exact alpha bounds (a Gradient Overlay aligned with the
+    /// layer spans them): planned from looser bounds (a region holding all the content), they
+    /// would differ. Every other style gives the same pixels from any region holding it all.
+    pub exact_bounds: bool,
 }
 
 /// Alpha bounds `b` (x0, y0, x1, y1) cut to `view` grown by `margin` pixels (whole pixels,
@@ -1237,5 +1241,6 @@ pub fn gpu_prepare_shape(
         bevel,
         field,
     };
-    Some(GpuStylePrep { plan, region, pad, shape })
+    let exact_bounds = styles.gradient.as_ref().is_some_and(|g| g.align);
+    Some(GpuStylePrep { plan, region, pad, shape, exact_bounds })
 }

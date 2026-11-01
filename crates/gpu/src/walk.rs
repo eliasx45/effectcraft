@@ -445,6 +445,10 @@ fn draw_styled_gpu(
 #[cfg(test)]
 pub(crate) static STYLED_RESIDENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Styled layers whose content's alpha bounds [`draw_styled_resident`] read back (tests).
+#[cfg(test)]
+pub(crate) static BOUNDS_READ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Tests: make styled layers' content the old way (on the CPU, effects read back) to compare.
 #[cfg(test)]
 pub(crate) static NO_STYLED_RESIDENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -486,14 +490,33 @@ fn draw_styled_resident(
     keyed.key()?;
     // A device failure fails the frame; anything else goes back to the usual way.
     let fallback = |e: &mut Enc| if e.g.check_health().is_ok() { None } else { Some(Ok(None)) };
-    let Some((image, keep)) = processed_resident(e, r, ctx, layer, false) else { return fallback(e) };
+    let Some((image, keep, known)) = processed_resident_bounded(e, r, ctx, layer, false) else { return fallback(e) };
     let Some(img) = image.img.float(e) else { return fallback(e) };
     let (w, h) = (img.width, img.height);
     if w == 0 || h == 0 {
         return fallback(e);
     }
-    let Ok(bounds) = crate::plane3d::alpha_bounds(e, &img) else { return fallback(e) };
-    let prep = match r.gpu_style_prep(ctx, layer, [w, h], image.offset, image.scale, bounds) {
+    let key = keyed.key()?;
+    let plan = |bounds| r.gpu_style_prep(ctx, layer, [w, h], image.offset, image.scale, bounds);
+    // The content's alpha bounds without waiting for the GPU where they are known: exact ones
+    // (the CPU's buffer, an earlier readback of this content), else a region holding all of it
+    // (its source's, through effects that keep alpha where it was): the styles give the same
+    // pixels from it, unless they read the exact bounds. Else read back from the GPU (a wait
+    // for everything queued so far), and remembered for this content.
+    let exact = known.filter(|k| k.exact).map(|k| k.bounds).or_else(|| known_bounds(key));
+    let loose = known.filter(|k| !k.exact).map(|k| k.bounds);
+    let mut prep = match exact.or(loose) {
+        Some(b) => plan(b),
+        None => Err(None),
+    };
+    if exact.is_none() && !prep.as_ref().is_ok_and(|p| !p.exact_bounds) {
+        let Ok(bounds) = crate::plane3d::alpha_bounds(e, &img) else { return fallback(e) };
+        #[cfg(test)]
+        BOUNDS_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        remember_bounds(key, bounds);
+        prep = plan(bounds);
+    }
+    let prep = match prep {
         Ok(prep) => prep,
         Err(why) => return Some(Err(why)),
     };
@@ -669,6 +692,28 @@ struct KeepProcessed {
 /// thread already holds the key's claim (`Claim::Render`), make it here without keeping it
 /// instead of leaving the layer to the CPU. `None`: not here (draw it the usual way).
 fn processed_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, render_anyway: bool) -> Option<(SourceImage, Option<KeepProcessed>)> {
+    processed_resident_bounded(e, r, ctx, layer, render_anyway).map(|(image, keep, _)| (image, keep))
+}
+
+/// Alpha bounds of a Processed image (x0, y0, x1, y1; `None`: nothing visible), known without
+/// reading the image back.
+#[derive(Clone, Copy, Debug)]
+struct KnownBounds {
+    bounds: Option<(u32, u32, u32, u32)>,
+    /// `Image::alpha_bounds` itself; else a region holding every visible pixel.
+    exact: bool,
+}
+
+/// [`processed_resident`], and the image's alpha bounds when they are known without a readback:
+/// exact from the CPU's buffer, or loose from a source made here whose effects keep alpha where
+/// it was ([`keeps_alpha`]): every visible pixel lies in the source's rectangle.
+fn processed_resident_bounded(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    render_anyway: bool,
+) -> Option<(SourceImage, Option<KeepProcessed>, Option<KnownBounds>)> {
     use effectcraft_render::cache::{Claim, GpuStage};
     if !ordinary_resident_enabled() || !e.can_retain_resident() || matches!(layer.source, effectcraft_project::LayerSource::Comp { .. }) {
         return None;
@@ -684,7 +729,7 @@ fn processed_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, r
     };
     if let Some(image) = resident {
         let _profile = effectcraft_render::profile::span("ordinary_resident_hit");
-        return Some((image, None));
+        return Some((image, None, None));
     }
     // Reuse ordinary CPU/disk hits. An image from another device is materialized
     // through its own guarded callback, never bound to this encoder's device.
@@ -698,7 +743,7 @@ fn processed_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, r
             Claim::Render => {
                 // A GPU-only producer wakes the same flight without a CPU cache entry.
                 if let Some(image) = e.resident(key, GpuStage::Processed) {
-                    return Some((image, None));
+                    return Some((image, None, None));
                 }
                 if !render_anyway {
                     return None;
@@ -706,8 +751,9 @@ fn processed_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, r
             }
         }
     }
-    let image = if let Some(buf) = cpu {
-        SourceImage { img: e.upload_pixels(&buf)?, offset: buf.offset, scale: buf.scale }
+    let (image, known) = if let Some(buf) = cpu {
+        let known = KnownBounds { bounds: buf.img.alpha_bounds(), exact: true };
+        (SourceImage { img: e.upload_pixels(&buf)?, offset: buf.offset, scale: buf.scale }, Some(known))
     } else {
         let _profile = effectcraft_render::profile::span("ordinary_resident_produce");
         // A shape layer rasterises here (`shapes_gpu`), else its source comes from the CPU.
@@ -726,12 +772,53 @@ fn processed_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, r
                 (e.g.upload_image(&buf.img)?, buf.offset, buf.scale)
             }
         };
+        let (sw, sh) = (src.width, src.height);
         let mut fx = crate::effects::GpuFx::new(e, src, at, bs, r.pipe().levels);
         let origin = r.run_layer_effects_in(ctx, layer, &mut fx, clip);
         let (img, offset, scale) = fx.finish()?;
-        SourceImage { img: img.into(), offset: [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale], scale }
+        // The source's rectangle where the effects left it (same scale: buffer pixels moved by
+        // the change of offset), cut to the image.
+        let known = (scale == bs && keeps_alpha(layer)).then(|| {
+            let (dx, dy) = (offset[0] - at[0], offset[1] - at[1]);
+            let lo = |v: f64, n: u32| v.floor().clamp(0.0, f64::from(n)) as u32;
+            let hi = |v: f64, n: u32| v.ceil().clamp(0.0, f64::from(n)) as u32;
+            let (x0, y0) = (lo(dx, img.width), lo(dy, img.height));
+            let (x1, y1) = (hi(dx + f64::from(sw), img.width), hi(dy + f64::from(sh), img.height));
+            KnownBounds { bounds: (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1)), exact: false }
+        });
+        (SourceImage { img: img.into(), offset: [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale], scale }, known)
     };
-    Some((image, flight.map(|flight| KeepProcessed { key, flight, intent })))
+    Some((image, flight.map(|flight| KeepProcessed { key, flight, intent }), known))
+}
+
+/// Effects that leave alpha as it was and pixels where they were (they only change colour
+/// where the layer is visible): Noise, Bevel Alpha, the expression controls. With only these,
+/// the visible pixels after the effect stack are within the source's rectangle.
+fn keeps_alpha(layer: &Layer) -> bool {
+    const KEEP: &[&str] = &["ec.noise.noise", "ec.perspective.bevelalpha"];
+    let Some(fx) = layer.effects() else { return true };
+    fx.children.iter().all(|c| match c {
+        effectcraft_project::Node::Group(g) => KEEP.contains(&g.match_id.as_str()) || g.match_id.starts_with("ec.control."),
+        effectcraft_project::Node::Prop(_) => false,
+    })
+}
+
+/// Alpha bounds read back from the GPU, by content key (a key stands for the same pixels): a
+/// held layer whose styles animate reads them once. Bounded: cleared when full.
+type ReadBounds = std::collections::HashMap<u64, Option<(u32, u32, u32, u32)>>;
+static READ_BOUNDS: std::sync::Mutex<Option<ReadBounds>> = std::sync::Mutex::new(None);
+
+fn known_bounds(key: u64) -> Option<Option<(u32, u32, u32, u32)>> {
+    READ_BOUNDS.lock().ok()?.as_ref()?.get(&key).copied()
+}
+
+fn remember_bounds(key: u64, bounds: Option<(u32, u32, u32, u32)>) {
+    let Ok(mut m) = READ_BOUNDS.lock() else { return };
+    let m = m.get_or_insert_with(ReadBounds::new);
+    if m.len() >= 4096 {
+        m.clear();
+    }
+    m.insert(key, bounds);
 }
 
 /// Retain `image` (made by [`processed_resident`] under `keep`'s claim) once it was drawn.

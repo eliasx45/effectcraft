@@ -5,11 +5,14 @@
 //! content is made, cropped and styled on the device. The frames must match the old way's (the
 //! same content, plan and kernels) and the CPU's, at 8, 16 and 32 bpc, Full and Half, with
 //! linear blending, an exterior pass with Knockout, and a card cut by the comp's edge; the grain
-//! still moves from frame to frame; and the content is no longer read back.
+//! still moves from frame to frame; and the content is no longer read back. Its alpha bounds
+//! aren't read back either (no wait for the GPU) where the source's rectangle holds them (Noise
+//! and Bevel Alpha keep alpha): only after a Gaussian Blur or for a Gradient Overlay aligned with
+//! the layer (it reads the exact bounds), and a held layer reads them once.
 
 use std::sync::atomic::Ordering;
 
-use effectcraft_keyframe::Value;
+use effectcraft_keyframe::{Gradient, Keyframe, Value};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::styles::{self as st, BLENDING, GROUP};
 use effectcraft_project::{BitDepth, Layer, LayerSource};
@@ -18,7 +21,7 @@ use effectcraft_render::{Backend, LayerCache, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 
 use crate::tests::{Pattern, Scene, check, diff, gpu, n, set, tolerance, v3};
-use crate::walk::{NO_STYLED_RESIDENT, STYLED_RESIDENT};
+use crate::walk::{BOUNDS_READ, NO_STYLED_RESIDENT, STYLED_RESIDENT};
 
 const MULTIPLY: u32 = 3;
 
@@ -41,6 +44,24 @@ enum Variant {
     Exterior,
     /// Blend Colors Using 1.0 Gamma.
     Linear,
+    /// A Gradient Overlay aligned with the layer (reads the exact alpha bounds).
+    Gradient,
+    /// A Gaussian Blur first (it grows alpha: bounds read back).
+    Blurred,
+    /// No Noise (content held) and a blur, the Inner Shadow animated: the bounds are read at most
+    /// once.
+    Held,
+}
+
+impl Variant {
+    /// Its styled content's alpha bounds are read back from the GPU (frames out of 3).
+    fn reads_bounds(self) -> std::ops::RangeInclusive<usize> {
+        match self {
+            Variant::Gradient | Variant::Blurred => 3..=3,
+            Variant::Held => 0..=1,
+            _ => 0..=0,
+        }
+    }
 }
 
 /// Over footage, a rotated rounded-rectangle card with Noise (colour, clipped) and Bevel Alpha,
@@ -62,7 +83,12 @@ fn card(depth: BitDepth, v: Variant) -> Scene {
         set(&mut l, "transform/position", v3(14.0, 52.0));
         set(&mut l, "transform/scale", Value::Vec3([150.0, 140.0, 100.0]));
     }
-    s.effect(&mut l, "ec.noise.noise", &[("amount", n(30.0)), ("color", Value::Bool(true)), ("clip", Value::Bool(true))]);
+    if matches!(v, Variant::Blurred | Variant::Held) {
+        s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(3.0))]);
+    }
+    if !matches!(v, Variant::Held) {
+        s.effect(&mut l, "ec.noise.noise", &[("amount", n(30.0)), ("color", Value::Bool(true)), ("clip", Value::Bool(true))]);
+    }
     s.effect(&mut l, "ec.perspective.bevelalpha", &[("edgeThickness", n(2.0)), ("lightAngle", n(-60.0)), ("lightIntensity", n(0.4))]);
     style(
         &mut s,
@@ -70,6 +96,19 @@ fn card(depth: BitDepth, v: Variant) -> Scene {
         "innerShadow",
         &[("blendMode", Value::Enum(MULTIPLY)), ("color", Value::Color([0.02, 0.07, 0.15, 1.0])), ("opacity", n(60.0)), ("distance", n(0.0)), ("size", n(9.0))],
     );
+    if matches!(v, Variant::Held) {
+        let path = format!("{GROUP}/innerShadow/size");
+        l.props.prop_mut(&path).unwrap().keys = vec![Keyframe::new(Tick::ZERO, n(4.0)), Keyframe::new(Tick::from_seconds_f64(0.1), n(14.0))];
+    }
+    if matches!(v, Variant::Gradient) {
+        let g = Gradient {
+            colors: vec![(0.0, [1.0, 0.2, 0.1, 1.0]), (1.0, [0.2, 0.3, 1.0, 1.0])],
+            color_midpoints: vec![0.5],
+            opacities: vec![(0.0, 1.0), (1.0, 0.6)],
+            opacity_midpoints: vec![0.5],
+        };
+        style(&mut s, &mut l, "gradientOverlay", &[("colors", Value::Gradient(Box::new(g))), ("alignWithLayer", Value::Bool(true)), ("opacity", n(50.0))]);
+    }
     if matches!(v, Variant::Exterior) {
         style(&mut s, &mut l, "dropShadow", &[("size", n(5.0)), ("distance", n(3.0))]);
         set(&mut l, &format!("{GROUP}/{BLENDING}/advancedBlending/knockout"), Value::Enum(1));
@@ -79,35 +118,42 @@ fn card(depth: BitDepth, v: Variant) -> Scene {
 }
 
 /// Frames 0, 1 and 2 on the GPU through one layer cache (as the viewer plays), the content made
-/// on the device or, `old`, the old way; with how many layers styled from device-made content
-/// and the bytes read back.
-fn play(s: &Scene, o: RenderOpts, old: bool) -> Option<(Vec<Image>, usize, u64)> {
+/// on the device or, `old`, the old way; with how many layers styled from device-made content,
+/// the bytes read back and how many alpha bounds were.
+fn play(s: &Scene, o: RenderOpts, old: bool) -> Option<(Vec<Image>, usize, u64, usize)> {
     let g = gpu()?;
     let cache = LayerCache::default();
     let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..o });
     r.accel = Some(g);
     r.cache = Some(&cache);
     NO_STYLED_RESIDENT.store(old, Ordering::Relaxed);
-    let (resident, read) = (STYLED_RESIDENT.load(Ordering::Relaxed), g.ctx.transfer_stats().readback_bytes);
+    let (resident, read, bounds) = (STYLED_RESIDENT.load(Ordering::Relaxed), g.ctx.transfer_stats().readback_bytes, BOUNDS_READ.load(Ordering::Relaxed));
     let frames = (0..3).map(|f| g.render(&r, s.cid, s.comp.frame_rate.tick_of(f)).expect("the GPU renders the frame")).collect();
     NO_STYLED_RESIDENT.store(false, Ordering::Relaxed);
     let resident = STYLED_RESIDENT.load(Ordering::Relaxed).saturating_sub(resident);
-    Some((frames, resident, g.ctx.transfer_stats().readback_bytes.saturating_sub(read)))
+    let bounds = BOUNDS_READ.load(Ordering::Relaxed).saturating_sub(bounds);
+    Some((frames, resident, g.ctx.transfer_stats().readback_bytes.saturating_sub(read), bounds))
 }
 
 #[test]
 fn card_bodies_style_on_the_gpu_from_content_kept_there() {
     for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
-        for v in [Variant::Card, Variant::Cut, Variant::Exterior, Variant::Linear] {
+        for v in [Variant::Card, Variant::Cut, Variant::Exterior, Variant::Linear, Variant::Gradient, Variant::Blurred, Variant::Held] {
             for scale in [1.0, 0.5] {
                 let label = format!("{v:?} {depth:?} at {scale}");
                 let s = card(depth, v);
                 let o = RenderOpts { scale, ..Default::default() };
-                let Some((new, resident, new_read)) = play(&s, o, false) else { return };
-                let (old, old_resident, old_read) = play(&s, o, true).unwrap();
-                assert_eq!(resident, 3, "{label}: the card's content was made on the device every frame");
+                let Some((new, resident, new_read, bounds_read)) = play(&s, o, false) else { return };
+                let (old, old_resident, old_read, _) = play(&s, o, true).unwrap();
+                assert!(v.reads_bounds().contains(&bounds_read), "{label}: alpha bounds read back {bounds_read} times of 3");
+                // (Held: its first frame may come before the content is held.)
+                let made = if matches!(v, Variant::Held) { 2..=3 } else { 3..=3 };
+                assert!(made.contains(&resident), "{label}: the card was styled from content kept on the device {resident} times of 3");
                 assert_eq!(old_resident, 0, "{label}: the old way still runs when asked for");
-                assert!(new_read < old_read, "{label}: the content is no longer read back ({new_read} vs {old_read} bytes)");
+                assert!(
+                    new_read < old_read || (matches!(v, Variant::Held) && new_read <= old_read),
+                    "{label}: the content is no longer read back ({new_read} vs {old_read} bytes)"
+                );
                 let tol = tolerance(depth);
                 for (f, (a, b)) in new.iter().zip(&old).enumerate() {
                     let mut d = diff(b, a, tol);
@@ -119,9 +165,9 @@ fn card_bodies_style_on_the_gpu_from_content_kept_there() {
                     d.quantized = depth != BitDepth::Bpc32;
                     check(&format!("{label}, frame {f}: kept on the GPU vs the CPU"), Some(d), 0.002);
                 }
-                // The grain moves: frame 1's card differs from frame 0's.
+                // The grain moves (or, held, the shadow): frame 1's card differs from frame 0's.
                 let moved = new[0].data.iter().zip(&new[1].data).filter(|(p, q)| p != q).count();
-                assert!(moved > 100, "{label}: the Noise grain still changes every frame ({moved} pixels changed)");
+                assert!(moved > 100, "{label}: the card still changes every frame ({moved} pixels changed)");
             }
         }
     }

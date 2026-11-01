@@ -332,13 +332,11 @@ pub(crate) fn raster(e: &mut Enc, plan: &RasterPlan) -> Option<GpuImage> {
     let edge_buf = g.buffer_init(Some("shape edges"), bytemuck::cast_slice(&edges), storage);
     let draw_buf = g.buffer_init(Some("shape draws"), &records, storage);
     let grad_buf = g.buffer_init(Some("shape gradients"), bytemuck::cast_slice(&grad), storage);
-    // The pixels between batches; new buffers start zeroed.
-    let state = g.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("shape layer"),
-        size: u64::from(w) * u64::from(h) * 16,
-        usage: storage,
-        mapped_at_creation: false,
-    });
+    // The pixels between batches; new buffers start zeroed. One batch (most layers) reads and
+    // writes none of it: a placeholder instead of an image-sized buffer to allocate and clear
+    // every frame (a 1000 x 700 card: 11 MB).
+    let state_bytes = if batches.len() > 1 { u64::from(w) * u64::from(h) * 16 } else { 16 };
+    let state = g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("shape layer"), size: state_bytes, usage: storage, mapped_at_creation: false });
     let out = e.scratch(w, h);
     let tiles = [w.div_ceil(TILE), h.div_ceil(TILE)];
     let n_tiles = tiles[0] as usize * tiles[1] as usize;
@@ -382,7 +380,7 @@ pub(crate) fn raster(e: &mut Enc, plan: &RasterPlan) -> Option<GpuImage> {
         if u64::from(accum_groups.div_ceil(accum_across)) > max_groups || u64::from(rows.max(1).div_ceil(cov_across)) > max_groups {
             return None;
         }
-        let flags = u32::from(groups) | (u32::from(bi == last) << 1);
+        let flags = u32::from(groups) | (u32::from(bi == last) << 1) | (u32::from(bi == 0) << 2);
         let words: [u32; 12] = [w, h, tiles[0], rows, e0, en, cov_across, flags, tile_at, list_at, accum_across, 0];
         let mut uniform = [0u8; BATCH_BYTES];
         for (dst, x) in uniform.as_chunks_mut::<4>().0.iter_mut().zip(words) {
