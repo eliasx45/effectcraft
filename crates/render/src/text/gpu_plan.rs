@@ -7,9 +7,10 @@
 //! composited Normal in drawing order. The accelerator walks them with its shape kernels.
 //!
 //! [`Renderer::text_raster_plan`] declines (`None`: the CPU renders the layer) for masks the
-//! GPU can't apply ([`crate::masks::gpu_plan`]), Blur and Gradient Fill animators (per-pixel colour, blurred
-//! patches), Inter-Character Blending other than Normal, masks tiny-skia would tile and runaway
-//! edge counts.
+//! GPU can't apply ([`crate::masks::gpu_plan`]), characters a Blur or Gradient Fill animator
+//! blurs or fills at the frame (blurred patches, per-pixel colour; idle ones don't count),
+//! Inter-Character Blending other than Normal, masks tiny-skia would tile and runaway edge
+//! counts.
 
 use std::borrow::Cow;
 
@@ -95,15 +96,24 @@ impl Renderer<'_> {
     }
 }
 
-/// No animator that blurs or paints a gradient (present at all: the cheap test can't evaluate
-/// them), and Normal inter-character blending.
+/// Normal inter-character blending, and no character blurred or gradient-filled at the context
+/// time. Blur animators whose Blur is 0 there blur nothing (each adds |Blur × selection|);
+/// otherwise, and with a Gradient Fill animator, the laid-out characters tell (the geometry is
+/// remembered for the frame, so the plan and a CPU render reuse it on this thread). Text presets
+/// carry both kinds of animator, idle at most frames (Q5).
 fn plain_paint(ctx: &EvalCtx, layer: &Layer, text: &PropGroup) -> bool {
-    let animated = text.sub("animators").is_some_and(|a| {
-        a.groups().any(|g| g.enabled && g.sub("properties").is_some_and(|p| p.get("blur").is_some() || p.get("gradientFillColors").is_some()))
-    });
     let blend_idx = text.sub("moreOptions").map(|m| ctx.e(layer, m, "interCharBlend")).unwrap_or(0) as usize;
     let blend = effectcraft_project::build::INTER_CHAR_BLEND_MODES.get(blend_idx).and_then(|n| BlendMode::from_name(n)).unwrap_or_default();
-    !animated && blend == BlendMode::Normal
+    if blend != BlendMode::Normal {
+        return false;
+    }
+    let may_paint = text.sub("animators").is_some_and(|a| {
+        a.groups()
+            .filter(|g| g.enabled)
+            .filter_map(|g| g.sub("properties"))
+            .any(|p| p.get("gradientFillColors").is_some() || p.get("blur").is_some_and(|b| ctx.value(layer, b).as_vec2() != [0.0; 2]))
+    });
+    !may_paint || text_geom(ctx, layer).is_none_or(|g| g.glyphs.iter().all(|g| g.xf.blur == [0.0; 2] && g.fills.is_none()))
 }
 
 /// [`super::render`] at scale `s` (then cropped to `window`, `[x, y, w, h]`) as a plan.
@@ -170,8 +180,9 @@ fn whole(geom: &TextGeom, s: f64) -> Result<Option<Whole>, ()> {
         };
         let Some(pb) = effectcraft_path::bounds(&paths) else { continue };
         let blur = [g.xf.blur[0] * s, g.xf.blur[1] * s];
-        // Blurred patches and per-pixel gradient colour stay on the CPU.
-        if blur[0] > 0.05 || blur[1] > 0.05 || (!stroke && g.fills.is_some()) {
+        // Blurred patches and per-pixel gradient colour stay on the CPU (blurred as there:
+        // above 0.05 px, or not a number).
+        if !(blur[0] <= 0.05 && blur[1] <= 0.05) || (!stroke && g.fills.is_some()) {
             crate::cpu_why::declined(crate::cpu_why::TEXT_BLUR);
             return Err(());
         }

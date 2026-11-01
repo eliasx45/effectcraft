@@ -33,6 +33,16 @@ fn animator(sc: &mut Scene, l: &mut Layer, kinds: &[&str]) {
     l.props.group_mut("text/animators").unwrap().children.push(g.into());
 }
 
+/// A Gradient Fill animator (default stops) and its range selector.
+fn gradient_animator(sc: &mut Scene, l: &mut Layer) {
+    let mut next = sc.p.next_id;
+    let mut ids = Ids(&mut next);
+    let props = build::text_gradient_fill_props(&mut ids);
+    let g = build::text_animator(&mut ids, "Gradient", props);
+    sc.p.next_id = next;
+    l.props.group_mut("text/animators").unwrap().children.push(g.into());
+}
+
 fn text(sc: &mut Scene, name: &str, doc: TextDoc) -> Layer {
     let mut l = build::layer(&mut sc.p, &sc.comp, name, LayerSource::Text, (97, 61), None);
     set(&mut l, "text/sourceText", Value::Text(Box::new(doc)));
@@ -99,6 +109,11 @@ fn scene(depth: BitDepth) -> Scene {
     set(&mut title, "text/animators/#1/properties/fillColor", Value::Color([0.9, 0.3, 0.1, 1.0]));
     set(&mut title, "text/animators/#1/selectors/#1/end", Value::Scalar(40.0));
     keys(&mut title, "text/animators/#1/selectors/#1/offset", Value::Scalar(-40.0), Value::Scalar(100.0));
+    // A Blur animator at 0 px and a Gradient Fill animator selecting nothing (an empty range),
+    // as text presets carry them while idle: the GPU still draws the title (Q5).
+    animator(&mut sc, &mut title, &["blur"]);
+    gradient_animator(&mut sc, &mut title);
+    set(&mut title, "text/animators/#3/selectors/#1/end", Value::Scalar(0.0));
     sc.push(title);
     sc
 }
@@ -170,7 +185,7 @@ fn frames_with_gpu_rasterised_text_match_the_cpu() {
     }
 }
 
-/// What the plan can't reproduce stays on the CPU: Blur and Gradient Fill animators, other
+/// What the plan can't reproduce stays on the CPU: characters a Blur animator blurs, other
 /// Inter-Character Blending modes (masks no longer: MASK-GPU2).
 #[test]
 fn text_the_gpu_cannot_match_stays_on_the_cpu() {
@@ -185,7 +200,10 @@ fn text_the_gpu_cannot_match_stays_on_the_cpu() {
     let comp = sc.p.comp_mut(sc.cid).unwrap();
     for l in comp.layers.iter_mut() {
         match l.name.as_str() {
-            "Title" => l.props.group_mut("text/animators").unwrap().children.push(blur.clone().into()),
+            "Title" => {
+                l.props.group_mut("text/animators").unwrap().children.push(blur.clone().into());
+                set(l, "text/animators/#4/properties/blur", Value::Vec2([2.0, 2.0]));
+            }
             "Line" => set(l, "text/moreOptions/interCharBlend", Value::Enum(multiply)),
             "Plain" => l.props.sub_mut("masks").unwrap().children.push(mask.clone().into()),
             _ => {}
@@ -207,6 +225,37 @@ fn text_the_gpu_cannot_match_stays_on_the_cpu() {
     let (_, clip) = r.resident_content(&ctx, big).expect("keyed");
     let plan = r.text_raster_plan(&ctx, big, clip).expect("plain text plans");
     assert!(!plan.draws.is_empty(), "the big word draws");
+}
+
+/// A Blur or Gradient Fill animator sends a text layer to the CPU only at the frames it blurs or
+/// gradient-fills characters (Q5, 1 Nov 2026: caption presets carry both, idle most of the time,
+/// and every frame of them was drawn on the CPU).
+#[test]
+fn text_blur_and_gradient_animators_go_to_the_cpu_only_while_they_paint() {
+    let mut sc = scene(BitDepth::Bpc8);
+    let comp = sc.p.comp_mut(sc.cid).unwrap();
+    let title = comp.layers.iter_mut().find(|l| l.name == "Title").unwrap();
+    // Blur 0 px at 0 s, 4 px from 1 s on.
+    keys(title, "text/animators/#2/properties/blur", Value::Vec2([0.0, 0.0]), Value::Vec2([4.0, 4.0]));
+    let mut gradient = sc.p.clone();
+    let comp = gradient.comp_mut(sc.cid).unwrap();
+    let title = comp.layers.iter_mut().find(|l| l.name == "Title").unwrap();
+    title.props.prop_mut("text/animators/#2/properties/blur").unwrap().keys.clear();
+    // The gradient selects the characters from 0.5 s on.
+    keys(title, "text/animators/#3/selectors/#1/end", Value::Scalar(0.0), Value::Scalar(0.0));
+    title.props.prop_mut("text/animators/#3/selectors/#1/end").unwrap().keys[1] = Keyframe::new(s(0.5), Value::Scalar(100.0));
+    for (p, label) in [(&sc.p, "blur"), (&gradient, "gradient")] {
+        for (t, gpu) in [(0.0, true), (1.2, false)] {
+            let cache = LayerCache::default();
+            let mut r = Renderer::new(p, &Pattern, RenderOpts::default());
+            r.cache = Some(&cache);
+            let ctx = r.eval_ctx(sc.cid, s(t)).unwrap();
+            let layer = ctx.comp.layers.iter().find(|l| l.name == "Title").unwrap();
+            assert_eq!(r.text_raster_eligible(&ctx, layer), gpu, "{label} at {t} s");
+            let (_, clip) = r.resident_content(&ctx, layer).expect("keyed");
+            assert_eq!(r.text_raster_plan(&ctx, layer, clip).is_some(), gpu, "{label} at {t} s: plan");
+        }
+    }
 }
 
 /// A motion-blurred title whose characters animate within the shutter (TEXT-GPU2): its source is
