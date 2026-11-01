@@ -776,3 +776,67 @@ fn stacked_fill_color_animators_blend_in_order() {
     }
     assert!(ramp.windows(2).all(|w| w[0].0[1] < w[1].0[1]) && ramp[0].0[1] < 0.2 && ramp[3].0[1] > 0.4, "{ramp:?}");
 }
+
+/// An expression engine that records which properties it evaluates, and runs Expression
+/// Selectors as selecting every unit fully (counting the runs).
+#[derive(Default)]
+struct Recorder {
+    evaluated: std::sync::Mutex<Vec<String>>,
+    selector_runs: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::ExprHost for Recorder {
+    fn eval(&self, _: &EvalCtx, _: &Layer, prop: &effectcraft_project::Property, value: &Value) -> Result<Value, String> {
+        self.evaluated.lock().unwrap().push(prop.match_id.clone());
+        Ok(value.clone())
+    }
+    fn eval_text_selector(&self, _: &EvalCtx, _: &Layer, _: &effectcraft_project::Property, _: usize, _: usize, _: [f64; 3]) -> Result<[f64; 3], String> {
+        self.selector_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok([100.0; 3])
+    }
+}
+
+/// Q4 (1 Nov 2026): text presets carry a dozen animators, most idle at any frame. One whose
+/// properties change nothing at their values (Position 0, Scale 100 %, Blur 0) is skipped
+/// before its Expression Selector runs per unit, and one selecting nothing doesn't evaluate its
+/// properties; the characters come out exactly as without them.
+#[test]
+fn idle_animators_are_skipped_and_change_nothing() {
+    let (mut p, cid, comp) = setup(400, 200);
+    let mut l = text_layer(&mut p, &comp, doc("Idle words here", 30.0));
+    let working = animator(&mut p, &mut l, &["position", "rotation"], &["range"]);
+    set(&mut l, &format!("text/animators/#{working}/properties/position"), Value::Vec3([0.0, -10.0, 0.0]));
+    set(&mut l, &format!("text/animators/#{working}/properties/rotation"), Value::Scalar(12.0));
+    set(&mut l, &format!("text/animators/#{working}/selectors/#1/end"), Value::Scalar(60.0));
+    let only_working = l.clone();
+    // Idle by its values, under an Expression Selector.
+    let idle = animator(&mut p, &mut l, &["position", "scale", "blur", "tracking"], &["expression"]);
+    l.props.prop_mut(&format!("text/animators/#{idle}/selectors/#1/amount")).unwrap().expr =
+        Some(effectcraft_project::Expression { text: "textIndex * 10".into(), enabled: true });
+    // Selecting nothing (an empty range): Opacity 0 (not idle) and a Position driven by an
+    // expression.
+    let empty = animator(&mut p, &mut l, &["opacity", "position"], &["range"]);
+    set(&mut l, &format!("text/animators/#{empty}/selectors/#1/end"), Value::Scalar(0.0));
+    set(&mut l, &format!("text/animators/#{empty}/properties/opacity"), Value::Scalar(0.0));
+    l.props.prop_mut(&format!("text/animators/#{empty}/properties/position")).unwrap().expr =
+        Some(effectcraft_project::Expression { text: "value".into(), enabled: true });
+    let geom = |layer: &Layer, host: &Recorder| {
+        let mut q = p.clone();
+        q.comp_mut(cid).unwrap().layers = vec![layer.clone()].into();
+        let c = q.comp(cid).unwrap();
+        let ctx = EvalCtx { expr: Some(host as &dyn crate::ExprHost), ..EvalCtx::new(&q, cid, c, Tick::from_seconds_f64(0.5)) };
+        let g = text_geom(&ctx, c.layers.get(0).unwrap()).unwrap();
+        g.glyphs.iter().map(|x| format!("{:?} {:?}", x.path(), x.xf)).collect::<Vec<_>>()
+    };
+    let host = Recorder::default();
+    let want = geom(&only_working, &host);
+    let host = Recorder::default();
+    assert_eq!(geom(&l, &host), want, "idle animators change nothing");
+    assert_eq!(host.selector_runs.load(std::sync::atomic::Ordering::Relaxed), 0, "the idle animator's selector didn't run");
+    assert!(!host.evaluated.lock().unwrap().iter().any(|m| m == "position"), "the empty animator's Position wasn't evaluated");
+    // Not idle once a property does something: its selector runs and the characters change.
+    set(&mut l, &format!("text/animators/#{idle}/properties/scale"), Value::Vec3([150.0, 150.0, 100.0]));
+    let host = Recorder::default();
+    assert_ne!(geom(&l, &host), want);
+    assert!(host.selector_runs.load(std::sync::atomic::Ordering::Relaxed) > 0);
+}

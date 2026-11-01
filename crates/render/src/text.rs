@@ -453,6 +453,43 @@ fn gradient_groups(based: Option<BasedOn>, sel: &[[f64; 3]], lay: &TextLayout, a
     out
 }
 
+/// Do an animator's properties `props` leave every glyph as it is, at their values at the
+/// context time, under any finite selection `k`? Each adds `value × k` (Position, Rotation,
+/// Tracking, Blur…: idle at 0), scales by `1 + (value / 100 − 1) × k` (Scale, Opacity: idle at
+/// 100 %), or is read only with another (Tracking Type, a gradient's type and ends without its
+/// colours). Colours, Line Anchor, Character Value / Range / Alignment, Skew Axis, font axes and
+/// unknown properties set or blend a value at any selection: not idle.
+fn idle_properties(ctx: &EvalCtx, layer: &Layer, props: &PropGroup) -> bool {
+    props.props().all(|p| {
+        let at = |x: f64| ctx.value(layer, p).components().iter().all(|v| *v == x);
+        match p.match_id.as_str() {
+            "trackingType" | "gradientType" | "gradientStart" | "gradientEnd" => true,
+            "position" | "anchor" | "rotation" | "rotationX" | "rotationY" | "skew" | "fillHue" | "fillSaturation" | "fillBrightness" | "strokeHue"
+            | "strokeSaturation" | "strokeBrightness" | "strokeWidth" | "tracking" | "lineSpacing" | "characterOffset" | "blur" => at(0.0),
+            "scale" | "opacity" | "fillOpacity" | "strokeOpacity" => at(100.0),
+            _ => false,
+        }
+    })
+}
+
+/// Is every selection `anim`'s selectors can make at the context time a finite number (so idle
+/// properties times it change nothing, see [`idle_properties`])? Range Selectors with finite
+/// parameters give finite values; Expression Selectors give the engine's results, finite (it
+/// rejects others), or their static Amount when the script fails; Wiggly Selectors aren't asked.
+fn finite_selection(ctx: &EvalCtx, layer: &Layer, anim: &PropGroup) -> bool {
+    let Some(sels) = anim.sub("selectors") else { return true };
+    sels.groups().filter(|g| g.enabled).all(|sel| match sel.match_id.as_str() {
+        "rangeSelector" => {
+            ["start", "end", "offset"].iter().all(|m| ctx.f(layer, sel, m, 0.0).is_finite())
+                && sel.sub("advanced").is_none_or(|a| ["amount", "smoothness", "easeHigh", "easeLow"].iter().all(|m| ctx.f(layer, a, m, 0.0).is_finite()))
+        }
+        "expressionSelector" => sel.get("amount").is_none_or(|_| ctx.v3(layer, sel, "amount", [100.0; 3]).iter().all(|x| x.is_finite())),
+        "wigglySelector" => false,
+        // Not a selector `animator_selection` reads.
+        _ => true,
+    })
+}
+
 /// Evaluate animators for every glyph.
 pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &TextLayout) -> Vec<CharXf> {
     animate(ctx, layer, text, lay).xfs
@@ -466,7 +503,19 @@ fn animate(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &TextLayout) -> 
     let mut groups: Vec<(u64, Vec<usize>)> = vec![];
     for anim in anims.groups().filter(|g| g.enabled) {
         let Some(props) = anim.sub("properties") else { continue };
+        // Text presets carry a dozen animators, most of them idle at any frame (Q4). One whose
+        // properties change nothing at their values now (Position 0, Scale 100 %…), whatever
+        // its selection, is skipped before its selectors run (an Expression Selector runs its
+        // script once per character, word or line).
+        if idle_properties(ctx, layer, props) && finite_selection(ctx, layer, anim) {
+            continue;
+        }
         let sel = animator_selection(ctx, layer, anim, lay);
+        // Selecting nothing at this time, it changes no glyph either (the loop below skips every
+        // one, and a gradient groups none).
+        if sel.iter().all(|k3| k3.iter().all(|x| *x == 0.0)) {
+            continue;
+        }
         let grad = props.get("gradientFillColors").and_then(|p| match ctx.value(layer, p) {
             Value::Gradient(g) => Some(*g),
             _ => None,
