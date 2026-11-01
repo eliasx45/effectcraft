@@ -33,32 +33,50 @@ enum Packed {
 const L8: f32 = 255.0;
 const L16: f32 = 32768.0;
 
-/// `v` as an integer level `k` with `k as f32 * inv` bitwise equal to `v` (`None` off the grid,
-/// out of range, negative zero or NaN).
+/// Pixels per band of work: a band costs far more than handing it to a thread, and a buffer
+/// that is off the grid stops after the bands already running.
+const BAND: usize = 1 << 16;
+
+/// The integer codes of an 8 bpc grid image: `k` with `k as f32 * (1.0 / 255.0)` bitwise equal
+/// to each value, or `None` when a value is off that grid (out of range, negative zero, NaN) or
+/// the codes can't be allocated. Shared by the layer cache's packing and the GPU upload.
+pub fn codes8(data: &[Px]) -> Option<Vec<[u8; 4]>> {
+    codes(data, L8, |k| k as u8)
+}
+
+/// [`codes8`] on the 16 bpc grid (After Effects' 32768 levels).
+pub fn codes16(data: &[Px]) -> Option<Vec<[u16; 4]>> {
+    codes(data, L16, |k| k as u16)
+}
+
+/// One band's codes, the check folded into a flag instead of a branch per value, so the loop
+/// vectorises. Whether every value was on the grid (`dst` holds garbage otherwise).
 #[inline(always)]
-fn level(v: f32, levels: f32, inv: f32) -> Option<u32> {
-    if !(0.0..=1.0).contains(&v) {
-        return None;
+fn codes_band<T: Copy>(dst: &mut [[T; 4]], src: &[Px], levels: f32, inv: f32, conv: &impl Fn(u32) -> T) -> bool {
+    let mut ok = true;
+    for (d, p) in dst.iter_mut().zip(src) {
+        for c in 0..4 {
+            let v = p[c];
+            // Same rounding as `color::quantize_px` (on the grid v is non-negative, so the cast
+            // rounds half up; NaN and negatives saturate to 0 and then fail the checks).
+            let k = (v * levels + 0.5) as u32;
+            ok &= (0.0..=1.0).contains(&v) & ((k as f32 * inv).to_bits() == v.to_bits());
+            d[c] = conv(k);
+        }
     }
-    // Same rounding as `color::quantize_px` (non-negative, so the cast rounds half up).
-    let k = (v * levels + 0.5) as u32;
-    ((k as f32 * inv).to_bits() == v.to_bits()).then_some(k)
+    ok
 }
 
 // One pixel allocation per attempt: collecting Option<Vec<_>> in parallel can
 // retain per-worker chunks while allocating a second final vector. That peak would
 // exceed the cache's pending packed-output reservation. Task/allocator overhead is
 // not pixel storage; final actual vector capacity is checked again on publication.
-fn pack_with<T: Copy + Default + Send>(data: &[Px], levels: f32, conv: impl Fn(u32) -> T + Sync + Send) -> Option<Vec<[T; 4]>> {
+fn codes<T: Copy + Default + Send>(data: &[Px], levels: f32, conv: impl Fn(u32) -> T + Sync + Send) -> Option<Vec<[T; 4]>> {
     let mut out = Vec::new();
     out.try_reserve_exact(data.len()).ok()?;
     out.resize(data.len(), [T::default(); 4]);
     let inv = 1.0 / levels;
-    out.par_iter_mut().zip(data.par_iter()).try_for_each(|(dst, p)| {
-        let k = [level(p[0], levels, inv)?, level(p[1], levels, inv)?, level(p[2], levels, inv)?, level(p[3], levels, inv)?];
-        *dst = k.map(&conv);
-        Some(())
-    })?;
+    out.par_chunks_mut(BAND).zip(data.par_chunks(BAND)).try_for_each(|(d, s)| codes_band(d, s, levels, inv, &conv).then_some(()))?;
     Some(out)
 }
 
@@ -66,9 +84,9 @@ impl PackedBuf {
     /// `buf` packed losslessly, or `None` when a value is not on the 8 or 16 bpc grid.
     pub(crate) fn pack(buf: &Buf) -> Option<PackedBuf> {
         let px = &buf.img.data;
-        let data = match pack_with(px, L8, |k| k as u8) {
+        let data = match codes8(px) {
             Some(d) => Packed::U8(d),
-            None => Packed::U16(pack_with(px, L16, |k| k as u16)?),
+            None => Packed::U16(codes16(px)?),
         };
         Some(PackedBuf { width: buf.img.width, height: buf.img.height, offset: buf.offset, scale: buf.scale, data })
     }

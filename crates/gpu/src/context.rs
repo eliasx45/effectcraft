@@ -553,31 +553,6 @@ impl Transfers {
 const LEVELS_8: f32 = 255.0;
 const LEVELS_16: f32 = 32768.0;
 
-/// `data` as integer codes `k` with `k as f32 * (1.0 / levels)` bitwise equal to each value, the
-/// layer cache's lossless packing (`effectcraft_render::packed`), or `None` when a value is off
-/// that grid, out of range, negative zero or NaN (or the codes can't be allocated).
-fn pack_codes<T: Copy + Default + Send>(data: &[[f32; 4]], levels: f32, conv: impl Fn(u32) -> T + Sync + Send) -> Option<Vec<[T; 4]>> {
-    use rayon::prelude::*;
-    let inv = 1.0 / levels;
-    let level = |v: f32| -> Option<T> {
-        if !(0.0..=1.0).contains(&v) {
-            return None;
-        }
-        let k = (v * levels + 0.5) as u32;
-        ((k as f32 * inv).to_bits() == v.to_bits()).then(|| conv(k))
-    };
-    let mut out = Vec::new();
-    out.try_reserve_exact(data.len()).ok()?;
-    out.resize(data.len(), [T::default(); 4]);
-    out.par_chunks_mut(4096).zip(data.par_chunks(4096)).try_for_each(|(dst, src)| {
-        for (d, p) in dst.iter_mut().zip(src) {
-            *d = [level(p[0])?, level(p[1])?, level(p[2])?, level(p[3])?];
-        }
-        Some(())
-    })?;
-    Some(out)
-}
-
 fn tex_bytes(t: &wgpu::Texture) -> usize {
     (t.width() as usize).saturating_mul(t.height() as usize).saturating_mul(t.format().block_copy_size(None).unwrap_or(16) as usize)
 }
@@ -2221,11 +2196,11 @@ impl GpuContext {
         if self.yuv.is_none() || img.width == 0 || img.height == 0 {
             return None;
         }
-        if let Some(codes) = pack_codes(&img.data, LEVELS_8, |k| k as u8) {
+        if let Some(codes) = effectcraft_render::packed::codes8(&img.data) {
             return self.upload_codes(out, wgpu::TextureFormat::Rgba8Uint, bytemuck::cast_slice(&codes), 4, LEVELS_8, keep).map(|kept| (LEVELS_8, kept));
         }
         if cfg!(target_endian = "little")
-            && let Some(codes) = pack_codes(&img.data, LEVELS_16, |k| k as u16)
+            && let Some(codes) = effectcraft_render::packed::codes16(&img.data)
         {
             return self.upload_codes(out, wgpu::TextureFormat::Rgba16Uint, bytemuck::cast_slice(&codes), 8, LEVELS_16, false).map(|_| (LEVELS_16, None));
         }
@@ -2249,7 +2224,7 @@ impl GpuContext {
             return None;
         }
         let _profile = effectcraft_render::profile::span("upload");
-        let codes = pack_codes(&img.data, LEVELS_8, |k| k as u8)?;
+        let codes = effectcraft_render::packed::codes8(&img.data)?;
         let (g, _) = self.pooled_format(img.width, img.height, crate::codes::FORMAT, None, None);
         let row = img.width.checked_mul(4)?;
         let bytes: &[u8] = bytemuck::cast_slice(&codes);

@@ -224,11 +224,10 @@ pub fn quantize(img: &mut Image, levels: f32) {
 #[inline(always)]
 fn quantize_px(p: &mut [f32; 4], levels: f32, inv: f32) {
     let a = round_half_up(p[3].max(0.0).min(1.0) * levels) * inv;
-    let hi = [a, a, a, a];
-    for c in 0..3 {
-        p[c] = round_half_up(p[c].max(0.0).min(hi[c]) * levels) * inv;
-    }
-    p[3] = a;
+    // The same steps on all four lanes (alpha against 1, giving `a` again), so a pixel is one
+    // vector operation per step.
+    let hi = [a, a, a, 1.0];
+    *p = std::array::from_fn(|c| round_half_up(p[c].max(0.0).min(hi[c]) * levels) * inv);
 }
 
 /// `v` (0..=65 535) rounded half up. The same either way; the fastest on each target: x86-64's
@@ -239,7 +238,12 @@ fn round_half_up(v: f32) -> f32 {
     if cfg!(target_arch = "wasm32") { (v + 0.5).floor() } else { (v + 0.5) as u32 as f32 }
 }
 
-/// [`quantize`] restricted to a rectangle (already clamped to the image), row-parallel.
+/// Pixels per band of [`quantize_rect`]'s work: a band costs far more than handing it to a
+/// thread (one task per row spent much of a 1080p pass scheduling).
+const QUANTIZE_BAND: usize = 1 << 16;
+
+/// [`quantize`] restricted to a rectangle (already clamped to the image), in parallel bands of
+/// whole rows.
 fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
     if r.x0 >= r.x1 || r.y0 >= r.y1 {
         return;
@@ -247,9 +251,15 @@ fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
     let inv = 1.0 / levels;
     let w = img.width as usize;
     let (x0, x1) = (r.x0 as usize, r.x1 as usize);
-    img.data[r.y0 as usize * w..r.y1 as usize * w].par_chunks_mut(w).for_each(|row| {
-        for p in &mut row[x0..x1] {
-            quantize_px(p, levels, inv);
+    let Some(rows) = img.data.get_mut(r.y0 as usize * w..r.y1 as usize * w) else { return };
+    let band = w.saturating_mul((QUANTIZE_BAND / w).max(1));
+    if x0 == 0 && x1 == w {
+        rows.par_chunks_mut(band).for_each(|b| b.iter_mut().for_each(|p| quantize_px(p, levels, inv)));
+        return;
+    }
+    rows.par_chunks_mut(band).for_each(|b| {
+        for row in b.chunks_exact_mut(w) {
+            row.get_mut(x0..x1).into_iter().flatten().for_each(|p| quantize_px(p, levels, inv));
         }
     });
 }
