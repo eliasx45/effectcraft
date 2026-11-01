@@ -974,6 +974,11 @@ pub struct GpuContext {
     lazy: HashMap<&'static str, std::sync::OnceLock<Option<wgpu::ComputePipeline>>>,
     /// The kernels' module and pipeline layout the lazy kernels are built from.
     kernel_module: wgpu::ShaderModule,
+    /// The kernels parsed, to build each from a module of its own ([`kernel_ir`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    kernel_ir: Option<Arc<naga::Module>>,
+    #[cfg(target_arch = "wasm32")]
+    kernel_ir: Option<Arc<()>>,
     kernel_layout: wgpu::PipelineLayout,
     /// Effect kernels that failed to build, and why (their effects render on the CPU).
     unavailable: Mutex<Vec<(&'static str, String)>>,
@@ -1049,6 +1054,101 @@ pub(crate) fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wg
         ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format, view_dimension: wgpu::TextureViewDimension::D2 },
         count: None,
     }
+}
+
+/// One module per kernel, holding only what that kernel uses (native).
+///
+/// The platform caches compiled kernels by the code it is handed (Metal: the MSL wgpu writes
+/// for one entry point). wgpu drops the other entry points and unused functions from it, but
+/// keeps every named module constant of all ~30 kernel files: measured 1 Nov 2026, adding one
+/// unused `const` anywhere made all 24 probed kernels miss the cache (6.1 s instead of 64 ms;
+/// `lazy_kernel_tests::shader_cache_probe`), so any such edit recompiled all ~250 kernels at
+/// the next launch. Here each kernel's module also loses the constants it doesn't use: an edit
+/// recompiles only the kernels it changes. Any failure falls back to the shared module.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod kernel_ir {
+    use naga::compact::{KeepUnused, compact};
+
+    /// The kernels' source, parsed and validated (`None`: the shared module is used).
+    pub(crate) fn parse(src: &str) -> Option<naga::Module> {
+        let module = naga::front::wgsl::parse_str(src).map_err(|e| log::info!("gpu: per-kernel modules off: {}", e.emit_to_string(src))).ok()?;
+        let mut v = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all());
+        v.validate(&module).map_err(|e| log::info!("gpu: per-kernel modules off: {e}")).ok()?;
+        Some(module)
+    }
+
+    /// `module` with only entry point `entry` and what it uses (`None`: no such entry point, or
+    /// naga failed on it).
+    pub(crate) fn only(module: &naga::Module, entry: &str) -> Option<naga::Module> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut m = module.clone();
+            m.entry_points.retain(|ep| ep.name == entry);
+            if m.entry_points.is_empty() {
+                return None;
+            }
+            compact(&mut m, KeepUnused::No);
+            // `compact` keeps named constants: unname the unused ones, and compact again drops
+            // them (bounded: each round unnames at least one).
+            for _ in 0..8 {
+                let used = used_constants(&m);
+                let mut unnamed = false;
+                for (h, c) in m.constants.iter_mut() {
+                    if c.name.is_some() && !used.contains(&h) {
+                        c.name = None;
+                        unnamed = true;
+                    }
+                }
+                if !unnamed {
+                    break;
+                }
+                compact(&mut m, KeepUnused::No);
+            }
+            Some(m)
+        }))
+        .ok()
+        .flatten()
+    }
+
+    /// Constants an expression of a function, an entry point or a module-level initializer
+    /// names.
+    fn used_constants(m: &naga::Module) -> std::collections::HashSet<naga::Handle<naga::Constant>> {
+        let named = |exprs: &naga::Arena<naga::Expression>| {
+            exprs
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    naga::Expression::Constant(c) => Some(*c),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut used = std::collections::HashSet::new();
+        for (_, f) in m.functions.iter() {
+            used.extend(named(&f.expressions));
+        }
+        for ep in &m.entry_points {
+            used.extend(named(&ep.function.expressions));
+        }
+        used.extend(named(&m.global_expressions));
+        used
+    }
+}
+
+/// The module to build kernel `entry` from: its own one ([`kernel_ir`]), else `shared`.
+#[cfg(not(target_arch = "wasm32"))]
+fn kernel_module(device: &wgpu::Device, ir: Option<&naga::Module>, entry: &str, shared: &wgpu::ShaderModule) -> wgpu::ShaderModule {
+    let Some(m) = ir.and_then(|ir| kernel_ir::only(ir, entry)) else { return shared.clone() };
+    init_resource(device, entry, || {
+        device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(entry), source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(m)) })
+    })
+    .unwrap_or_else(|e| {
+        log::info!("gpu: kernel {entry} from the shared module: {e}");
+        shared.clone()
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn kernel_module(_: &wgpu::Device, _: Option<&()>, _: &str, shared: &wgpu::ShaderModule) -> wgpu::ShaderModule {
+    shared.clone()
 }
 
 /// The compositor's kernel source: every `shaders/*.wgsl` the kernels' module is built from
@@ -1293,13 +1393,18 @@ impl GpuContext {
         // Metal compiles with fast math, which reassociates the staged `box_h`'s running sums
         // differently from the serial kernel's (a few ulps apart), so Metal keeps the serial one.
         let metal = info.backend == wgpu::Backend::Metal;
+        #[cfg(not(target_arch = "wasm32"))]
+        let kernel_ir = kernel_ir::parse(&kernel_source()).map(Arc::new);
+        #[cfg(target_arch = "wasm32")]
+        let kernel_ir: Option<Arc<()>> = None;
         let build = |e: &'static str, layout: &wgpu::PipelineLayout| {
             let entry = if metal && e == "box_h" { "box_h_serial" } else { e };
+            let own = kernel_module(&device, kernel_ir.as_deref(), entry, &module);
             init_resource(&device, e, || {
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(e),
                     layout: Some(layout),
-                    module: &module,
+                    module: &own,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
                     cache: None,
@@ -1435,6 +1540,7 @@ impl GpuContext {
             pipelines,
             lazy,
             kernel_module: module,
+            kernel_ir,
             kernel_layout: layout,
             fusion: Default::default(),
             yuv,
@@ -1880,11 +1986,12 @@ impl GpuContext {
     fn build_kernel(&self, e: &'static str) -> Option<wgpu::ComputePipeline> {
         // Metal keeps the serial `box_h` (see `GpuContext::new`).
         let entry = if self.metal && e == "box_h" { "box_h_serial" } else { e };
+        let own = kernel_module(&self.device, self.kernel_ir.as_deref(), entry, &self.kernel_module);
         let built = init_resource(&self.device, e, || {
             self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(e),
                 layout: Some(&self.kernel_layout),
-                module: &self.kernel_module,
+                module: &own,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
                 cache: None,
@@ -4741,5 +4848,106 @@ mod lazy_kernel_tests {
         assert_eq!(failed, ctx.unavailable_kernels().iter().filter(|(e, _)| *e != "yuv").count());
         assert!(ctx.lazy.values().all(|c| c.get().is_some()), "every effect kernel tried");
         assert_eq!(ctx.warm_kernels(3), (0, 0), "nothing left");
+    }
+
+    /// How the platform's shader cache treats the kernels (measurement, not a check): the same
+    /// source, the source plus an unused kernel or constant (an edit elsewhere in the module), and
+    /// renamed kernels (new code: a guaranteed cache miss).
+    /// `cargo test -p effectcraft-gpu --lib shader_cache_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing probe"]
+    fn shader_cache_probe() {
+        let t0 = std::time::Instant::now();
+        let Ok(ctx) = pollster::block_on(GpuContext::request()) else { return };
+        eprintln!("context with its compositor kernels: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
+        let t0 = std::time::Instant::now();
+        let (built, failed) = ctx.warm_kernels(3);
+        eprintln!("background warm: {built} effect kernels ({failed} failed) in {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
+        let entries: Vec<&str> =
+            EFFECT_ENTRIES.iter().chain(crate::fx_color::KERNELS).chain(crate::fx_stylize::KERNELS).copied().filter(|e| *e != "box_h").take(24).collect();
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.as_nanos() % 1_000_000_007);
+        let time = |label: &str, src: String, rename: bool| {
+            let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
+            let t0 = std::time::Instant::now();
+            for e in &entries {
+                let name = if rename { format!("{e}_{nonce}") } else { (*e).to_string() };
+                let _ = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: Some(&ctx.kernel_layout),
+                    module: &module,
+                    entry_point: Some(&name),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+            }
+            eprintln!("{label}: {} kernels in {:.0} ms", entries.len(), t0.elapsed().as_secs_f64() * 1000.0);
+        };
+        time("same source", kernel_source(), false);
+        time("plus an unused kernel", kernel_source() + &format!("\n@compute @workgroup_size(1) fn probe_{nonce}() {{}}\n"), false);
+        time("plus an unused constant", kernel_source() + &format!("\nconst PROBE_{nonce}: f32 = {}.0;\n", nonce % 1000), false);
+        let mut renamed = kernel_source();
+        for e in &entries {
+            renamed = renamed.replace(&format!("fn {e}("), &format!("fn {e}_{nonce}("));
+        }
+        time("renamed (new code)", renamed.clone(), true);
+        time("renamed again (now cached)", renamed, true);
+        // Per-kernel modules (what the context builds since): an unused constant no longer
+        // reaches the kernels' code.
+        let per_kernel = |label: &str, src: String| {
+            let Some(ir) = kernel_ir::parse(&src) else { panic!("parses") };
+            let t0 = std::time::Instant::now();
+            for e in &entries {
+                let module = kernel_module(&ctx.device, Some(&ir), e, &ctx.kernel_module);
+                let _ = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: Some(&ctx.kernel_layout),
+                    module: &module,
+                    entry_point: Some(e),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+            }
+            eprintln!("{label}: {} kernels in {:.0} ms", entries.len(), t0.elapsed().as_secs_f64() * 1000.0);
+        };
+        per_kernel("per-kernel modules, same source", kernel_source());
+        per_kernel("per-kernel modules, plus another unused constant", kernel_source() + &format!("\nconst PROBE2_{nonce}: f32 = {}.0;\n", nonce % 977));
+        let t0 = std::time::Instant::now();
+        let ir = kernel_ir::parse(&kernel_source());
+        eprintln!("parsing + validating the kernels' source: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
+        assert!(ir.is_some());
+    }
+
+    /// Kernels built from their own modules render bit for bit what the shared module's do,
+    /// for every GPU effect at its defaults, at 8 and 32 bpc.
+    #[test]
+    fn per_kernel_modules_render_the_same_pixels() {
+        use crate::tests::{Pattern, Scene};
+        use effectcraft_project::BitDepth;
+        use effectcraft_render::{Backend, RenderOpts, Renderer};
+        crate::tests::hold_gpu_lock();
+        let Ok(own) = pollster::block_on(GpuContext::request()) else { return };
+        let Ok(mut shared) = pollster::block_on(GpuContext::request()) else { return };
+        assert!(own.kernel_ir.is_some(), "the kernels parse");
+        shared.kernel_ir = None;
+        let (own, shared) = (crate::Gpu::from_context(own), crate::Gpu::from_context(shared));
+        for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+            for id in effectcraft_effects::GPU_EFFECTS {
+                let mut scene = Scene::new(depth);
+                let mut layer = scene.footage(24, 16);
+                scene.effect(&mut layer, id, &[]);
+                scene.push(layer);
+                let frame = |g: &crate::Gpu| {
+                    let mut r = Renderer::new(&scene.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..Default::default() });
+                    r.accel = Some(g);
+                    g.render(&r, scene.cid, effectcraft_time::Tick::ZERO).map(|i| i.data)
+                };
+                let (a, b) = (frame(&own), frame(&shared));
+                assert!(
+                    a.as_ref().zip(b.as_ref()).is_none_or(|(a, b)| a.iter().zip(b).all(|(p, q)| p.map(f32::to_bits) == q.map(f32::to_bits))),
+                    "{id} {depth:?}"
+                );
+                assert_eq!(a.is_some(), b.is_some(), "{id} {depth:?}");
+            }
+        }
     }
 }

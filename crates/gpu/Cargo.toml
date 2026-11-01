@@ -30,6 +30,10 @@ web-time = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = { workspace = true }
+# Each kernel is compiled from a module holding only what it uses (`context::kernel_ir`), so the
+# platform's shader cache keeps it across edits to other kernels. Same naga as wgpu's.
+naga = { version = "30.0.1", features = ["wgsl-in"] }
+wgpu = { workspace = true, features = ["naga-ir"] }
 
 [dev-dependencies]
 effectcraft-text = { workspace = true }
