@@ -10,8 +10,10 @@
 //! them and the QuickTime sample entry stays the same.
 //!
 //! Hardware frames are not bit-identical to the software encoder's (a different quantiser
-//! choice, Apple's own rate control). Elias approved that for exports (1 Nov 2026, "Fix 4"):
-//! encoding is lossy either way, and decoding stays exact (`crate::hw`).
+//! choice, Apple's own rate control). Elias approved hardware encoding ("Fix 4", 1 Nov 2026);
+//! using its frames in exports although they differ from the software encoder's was decided
+//! while implementing it (encoding is lossy either way, PSNR within 0.5 dB of software), open
+//! for him to revisit. Decoding stays exact (`crate::hw`).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -82,13 +84,12 @@ impl ProResEncoder {
     /// An encoder for `cfg`, using hardware when available.
     ///
     /// The hardware encoder keeps Apple's own data rate (VideoToolbox has no rate setting for
-    /// ProRes), so a configuration asking for less than the profile's nominal rate stays in
-    /// software: preview proxies of sparse keyed clips are coded at the source's own density so
-    /// they decode faster, and a hardware proxy of `p1080_4444a.mov` was 373 KB a frame where the
-    /// software one at the source's rate was 200 KB (1 Nov 2026).
+    /// ProRes): a `cfg.bits_per_mb` only applies to frames the software encoder writes. Elias
+    /// chose hardware for proxies too (1 Nov 2026, "go hw"): a hardware proxy of
+    /// `p1080_4444a.mov` built 2.8x faster (88 vs 31 fps) but was 373 KB a frame where the
+    /// software one at the source's density was 200 KB.
     pub fn new(cfg: EncoderConfig) -> ProResEncoder {
-        let hardware = cfg.bits_per_mb.is_none_or(|b| b >= cfg.profile.nominal_bits_per_mb());
-        ProResEncoder { sw: filmcraft_prores::Encoder::with_config(cfg), failures: Arc::new(AtomicU32::new(0)), hardware }
+        ProResEncoder { sw: filmcraft_prores::Encoder::with_config(cfg), failures: Arc::new(AtomicU32::new(0)), hardware: true }
     }
 
     /// The same, never using the hardware encoder (exact, reproducible output).
@@ -238,13 +239,21 @@ mod tests {
         register(failing);
     }
 
+    /// Proxies set a data rate below the profile's nominal one (a sparse keyed clip's density);
+    /// they still use the hardware (Elias, 1 Nov 2026: "go hw"), and the rate still applies to
+    /// the frames the software encoder writes.
     #[test]
-    fn a_lower_data_rate_than_nominal_stays_in_software() {
-        let (mut cfg, _) = frame(true);
+    fn a_lower_data_rate_than_nominal_still_uses_the_hardware() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut cfg, f) = frame(true);
         assert!(ProResEncoder::new(cfg.clone()).hardware);
-        cfg.bits_per_mb = Some(cfg.profile.nominal_bits_per_mb());
-        assert!(ProResEncoder::new(cfg.clone()).hardware, "the nominal rate is the hardware's own");
         cfg.bits_per_mb = Some(cfg.profile.nominal_bits_per_mb() / 3);
-        assert!(!ProResEncoder::new(cfg).hardware, "a sparse proxy's rate");
+        register(good);
+        let mut e = ProResEncoder::new(cfg.clone());
+        assert!(e.tries_hardware(), "a sparse proxy's rate");
+        assert_eq!(&e.encode(&f).unwrap()[12..16], b"test", "the hardware frame was written");
+        register(failing);
+        let data = ProResEncoder::new(cfg.clone()).encode(&f).unwrap();
+        assert_eq!(data, filmcraft_prores::Encoder::with_config(cfg).encode(&f).unwrap(), "fallback at the asked rate");
     }
 }

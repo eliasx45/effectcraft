@@ -199,9 +199,13 @@ containment rules:
   asked (size, chroma, alpha, colour), and stops asking after 3 failures in a row. Both write
   ordinary ProRes frames with the same sample entry.
 - **Not bit-identical**: unlike decoding (previews only), encoded frames reach exported files.
-  Encoding is lossy either way and the owner accepted the hardware encoder's output for exports.
+  The owner approved hardware encoding; using its (not bit-identical) output for exports was a
+  decision taken during implementation, since encoding is lossy either way, open for him to
+  revisit.
   Measured 1 Nov 2026 (bench `crates/platform/examples/prores_enc_bench.rs`): PSNR of the
   decoded hardware frames against the source within 0.5 dB of the software encoder's on every
   plane. `EFFECTCRAFT_SOFTWARE_PRORES_ENCODE=1` keeps every encode in software.
-- The hardware has Apple's own data rate (no rate property for ProRes), so an encoder asked for
-  less than the profile's nominal rate (proxies of sparse keyed clips) stays in software.
+- The hardware has Apple's own data rate (no rate property for ProRes). Preview proxies use it
+  too (owner, 2026-11-01: "go hw"): a proxy of a sparse keyed 1080p 4444 clip built 2.8x faster
+  (88 vs 31 fps) but is ~1.9x bigger (373 vs 200 KB a frame) than the software encoder's at the
+  source's density, which still applies to frames the software fallback writes.

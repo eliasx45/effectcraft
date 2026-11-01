@@ -165,9 +165,9 @@ fn build_from(source: &SharedSource, src: &str, out: &Path, divisor: u32, cancel
     }
     cfg.color = color;
     cfg.encode_alpha = has_alpha;
-    // The hardware encoder when this Mac has one and the rate is the profile's nominal one (Fix 4;
-    // `ProResEncoder::new`: a sparser source's proxy stays in software at the source's density);
-    // any frame the hardware fails is encoded in software.
+    // The hardware encoder when this Mac has one (Fix 4; Elias, 1 Nov: "go hw", accepting ~1.9x
+    // bigger proxies for ~2.8x faster builds: the hardware keeps Apple's own rate, `bits_per_mb`
+    // applies to the frames it fails, which the software encoder writes).
     let enc = crate::prores_enc::ProResEncoder::new(cfg);
 
     let tmp: PathBuf = {
