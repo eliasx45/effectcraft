@@ -28,6 +28,10 @@
 //! decoder surface for a while ([`surfaces`]): on Metal the GPU compositor samples it directly
 //! instead of uploading the planes (`effectcraft_gpu::surface`, FFI in `metal_surface`).
 //!
+//! [`register`] also installs the VideoToolbox ProRes encoder ([`prores_enc`], Fix 4) behind
+//! `effectcraft_media::prores_enc`: ProRes exports and proxies encode on the media engines, and
+//! any frame the hardware declines or fails is encoded by FilmCraft's encoder.
+//!
 //! [`background_thread`] lowers a thread to background quality of service (macOS), for the
 //! threads Cache Frames When Idle renders on.
 //!
@@ -50,6 +54,10 @@ pub mod nal;
 #[cfg(target_os = "macos")]
 pub mod prores;
 #[cfg(target_os = "macos")]
+pub mod prores_enc;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod prores_pack;
+#[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod qos;
 #[cfg(target_os = "macos")]
@@ -57,6 +65,9 @@ pub mod surfaces;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod videotoolbox;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod videotoolbox_enc;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod videotoolbox_nal;
@@ -90,6 +101,12 @@ pub fn register() -> Availability {
             effectcraft_gpu::surface::set_surface_import(surfaces::import);
         }
         effectcraft_media::hw::set_available(prores || nal);
+        // Fix 4: ProRes exports and proxies encode on the media engines, falling back to
+        // FilmCraft's encoder per frame (`prores_enc`). EFFECTCRAFT_SOFTWARE_PRORES_ENCODE=1 keeps
+        // them in software.
+        if std::env::var_os("EFFECTCRAFT_SOFTWARE_PRORES_ENCODE").is_none_or(|v| v.is_empty() || v == "0") {
+            effectcraft_media::prores_enc::register(prores_enc::encode);
+        }
         match (prores, nal) {
             (true, true) => Availability::Available("VideoToolbox ProRes, H.264, HEVC"),
             (true, false) => Availability::Available("VideoToolbox ProRes"),

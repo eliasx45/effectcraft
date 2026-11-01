@@ -233,6 +233,52 @@ fn prores_4444_with_alpha() {
     }
 }
 
+/// The encoder ids in the frame headers of a ProRes movie's samples.
+fn prores_encoder_ids(path: &Path) -> Vec<[u8; 4]> {
+    let file = std::fs::File::open(path).expect("open");
+    let mp4 = filmcraft_isobmff::open(&file).expect("parse");
+    let ti = mp4.track_of_kind(filmcraft_isobmff::TrackKind::Video).expect("video track");
+    (0..mp4.tracks[ti].samples.len())
+        .map(|i| filmcraft_prores::header::FrameHeader::parse(&mp4.read_sample(&file, ti, i).expect("sample")).expect("frame header").0.encoder_id)
+        .collect()
+}
+
+/// A stand-in hardware encoder: FilmCraft's own, with another encoder id.
+fn stand_in_hardware(cfg: &filmcraft_prores::EncoderConfig, f: &filmcraft_prores::Frame) -> Result<Vec<u8>, String> {
+    let mut c = cfg.clone();
+    c.encoder_id = *b"hwen";
+    filmcraft_prores::Encoder::with_config(c).encode(f).map_err(|e| e.to_string())
+}
+
+fn failing_hardware(_: &filmcraft_prores::EncoderConfig, _: &filmcraft_prores::Frame) -> Result<Vec<u8>, String> {
+    Err("no hardware ProRes encoder".into())
+}
+
+/// Fix 4 (1 Nov 2026): ProRes exports go through the registered hardware encoder (VideoToolbox
+/// on a Mac with ProRes engines) and fall back to the software encoder when it fails; either way
+/// the movie decodes, with alpha.
+#[test]
+fn prores_export_uses_the_hardware_encoder_and_falls_back() {
+    let d = out_dir("prores_hw");
+    let (p, cid) = project(None);
+    let om = OutputModule { channels: Channels::Rgba, prores_profile: ProResProfile::P4444, ..OutputModule::for_format(OutputFormat::ProRes) };
+    for (name, hw, id) in
+        [("hw.mov", stand_in_hardware as effectcraft_media::prores_enc::HardwareEncode, *b"hwen"), ("fallback.mov", failing_hardware, *b"fmcr")]
+    {
+        effectcraft_media::prores_enc::register(hw);
+        let path = d.join(name);
+        run(&p, cid, &NoFootage, &om, &path);
+        let ids = prores_encoder_ids(&path);
+        assert_eq!(ids.len() as u64, FRAMES, "{name}");
+        assert!(ids.iter().all(|i| *i == id), "{name}: {:?}", ids.iter().map(|i| String::from_utf8_lossy(i).to_string()).collect::<Vec<_>>());
+        let f = effectcraft_media::probe(&path).expect("probe");
+        let img = MediaPool::new().frame_at(&f, f.frame_rate.tick_of(7)).expect("decode");
+        assert!(px(&img, 2, 2)[3] < 0.02, "{name}: corner transparent: {:?}", px(&img, 2, 2));
+        let c = px(&img, W / 2, H / 2);
+        assert!(c[3] > 0.98 && c[0] > 0.95 && c[1] < 0.05, "{name}: centre opaque red: {c:?}");
+    }
+}
+
 fn check_still_dir(dir: &Path, ext: &str, tol: f32, alpha: bool) {
     for k in 0..FRAMES {
         let path = sequence_path(&dir.join(format!("f_[#####].{ext}")).to_string_lossy(), k as i64);

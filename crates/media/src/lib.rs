@@ -28,6 +28,7 @@ pub use layered::vector_doc;
 mod pool;
 pub mod preview_stream;
 mod probe;
+pub mod prores_enc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy_build;
 pub mod proxy_h264;

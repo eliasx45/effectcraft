@@ -21,6 +21,8 @@ effectcraft-time = { workspace = true }
 effectcraft-project = { workspace = true }
 effectcraft-raster = { workspace = true }
 effectcraft-render = { workspace = true }
+# ProRes encodes through effectcraft_media::prores_enc (the hardware encoder hook, Fix 4).
+effectcraft-media = { workspace = true }
 filmcraft-h264enc = { workspace = true }
 filmcraft-prores = { workspace = true }
 filmcraft-aac = { workspace = true }
@@ -37,7 +39,6 @@ thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
-effectcraft-media = { workspace = true }
 effectcraft-effects = { workspace = true }
 effectcraft-color = { workspace = true }
 filmcraft-opus = { workspace = true }

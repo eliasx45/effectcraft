@@ -141,3 +141,39 @@ need an upload to reach the GPU compositor on Metal. The fourth job of this crat
 - The decoder still copies each picture into planar samples (FilmCraft's frame type, its GOP
   cache and every CPU path need them); dropping that copy would need a surface-carrying variant
   of `filmcraft_frame::PixelData` upstream.
+
+## Amendment (2026-11-01): hardware ProRes encoding (Fix 4)
+
+**Status:** accepted (2026-11-01, approved by the project owner, Elias, as "Fix 4" of his ProRes
+plan).
+
+ProRes exports (File ▸ Export, the Render Queue, pre-renders) and preview proxies encoded every
+frame with FilmCraft's pure-Rust encoder on the CPU: about 3 fps for a 4K ProRes 4444 + alpha
+frame stream on one encoder (6 fps on four threads) on the owner's M1 Max, which has ProRes
+encode engines. The fifth job of this crate is hardware **ProRes encoding**, under the same
+containment rules:
+
+- FFI module `videotoolbox_enc` (`#[allow(unsafe_code)]`, every block with `// SAFETY:`; the
+  output callback runs under `catch_unwind`): a `VTCompressionSession` per fourcc, size, colour
+  description and alpha choice, hardware encoder required
+  (`kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder`), fed the encoder's own
+  source formats from its IOSurface buffer pool (`s4as` for 4444 / 4444 XQ, `sv22` for the 422
+  family), colour tags set as session properties, alpha coded only when asked
+  (`kVTCodecPropertyKey_PreserveAlphaChannel`). One frame is encoded synchronously at a time per
+  session.
+- Safe code around it: `prores_pack` (FilmCraft's planar `u16` frame into those buffers) and
+  `prores_enc` (a pool of at most 4 sessions shared by the threads that encode; a format whose
+  session can't be created is not tried again for 30 s).
+- The hook is `effectcraft_media::prores_enc` (FilmCraft has no encoder registry): `register`
+  installs the hardware encode function at startup (`effectcraft_platform::register`), and every
+  ProRes writer encodes through `ProResEncoder`, which writes the software encoder's frame
+  whenever the hardware declines, fails, or returns a frame whose header doesn't match what was
+  asked (size, chroma, alpha, colour), and stops asking after 3 failures in a row. Both write
+  ordinary ProRes frames with the same sample entry.
+- **Not bit-identical**: unlike decoding (previews only), encoded frames reach exported files.
+  Encoding is lossy either way and the owner accepted the hardware encoder's output for exports.
+  Measured 1 Nov 2026 (bench `crates/platform/examples/prores_enc_bench.rs`): PSNR of the
+  decoded hardware frames against the source within 0.5 dB of the software encoder's on every
+  plane. `EFFECTCRAFT_SOFTWARE_PRORES_ENCODE=1` keeps every encode in software.
+- The hardware has Apple's own data rate (no rate property for ProRes), so an encoder asked for
+  less than the profile's nominal rate (proxies of sparse keyed clips) stays in software.

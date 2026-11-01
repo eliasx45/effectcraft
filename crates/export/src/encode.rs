@@ -30,6 +30,15 @@ pub(crate) struct Packet {
 pub(crate) trait VideoEncoder {
     fn sample_entry(&self) -> SampleEntry;
     fn encode(&mut self, rgba: &[u8], index: u64) -> Result<Vec<Packet>>;
+    /// Encode a batch of frames (the first at `first`), in order. Encoders that can encode
+    /// frames independently do them in parallel.
+    fn encode_batch(&mut self, frames: &[Vec<u8>], first: u64) -> Result<Vec<Packet>> {
+        let mut out = Vec::new();
+        for (k, px) in frames.iter().enumerate() {
+            out.extend(self.encode(px, first + k as u64)?);
+        }
+        Ok(out)
+    }
     fn flush(&mut self) -> Result<Vec<Packet>>;
     /// Edit-list media start (B-frame delay) in the track timescale.
     fn media_start(&self) -> Option<i64> {
@@ -119,8 +128,14 @@ pub(crate) fn rgba_to_yuv420(rgba: &[u8], w: usize, h: usize, y: &mut Vec<u8>, u
 
 // ---------------------------------------------------------------- ProRes
 
+/// Frames a ProRes export encodes at once (one hardware session each: `effectcraft_platform`'s
+/// pool holds 4; a 4K 4444 frame's planes are ~66 MB).
+const PRORES_PARALLEL: usize = 4;
+
+/// ProRes through `effectcraft_media::prores_enc`: VideoToolbox's hardware encoder on a Mac with
+/// ProRes engines, FilmCraft's software encoder for any frame it doesn't take or fails on.
 struct ProRes {
-    enc: filmcraft_prores::Encoder,
+    enc: effectcraft_media::prores_enc::ProResEncoder,
     profile: filmcraft_prores::Profile,
     w: u32,
     h: u32,
@@ -147,18 +162,13 @@ impl ProRes {
         let alpha = channels == Channels::Rgba;
         let mut cfg = filmcraft_prores::EncoderConfig::new(profile, w, h);
         cfg.encode_alpha = alpha;
-        ProRes { enc: filmcraft_prores::Encoder::with_config(cfg), profile, w, h, alpha }
+        ProRes { enc: effectcraft_media::prores_enc::ProResEncoder::new(cfg), profile, w, h, alpha }
     }
     fn is_444(&self) -> bool {
         matches!(self.profile, filmcraft_prores::Profile::P4444 | filmcraft_prores::Profile::P4444Xq)
     }
-}
-
-impl VideoEncoder for ProRes {
-    fn sample_entry(&self) -> SampleEntry {
-        SampleEntry::prores(FourCc(self.profile.fourcc()), self.w as u16, self.h as u16)
-    }
-    fn encode(&mut self, rgba: &[u8], _index: u64) -> Result<Vec<Packet>> {
+    /// The encoder's input for one RGBA8 frame: 10-bit BT.709 Y'CbCr (+ alpha).
+    fn frame(&self, rgba: &[u8]) -> filmcraft_prores::Frame {
         let chroma = if self.is_444() { filmcraft_prores::ChromaFormat::Yuv444 } else { filmcraft_prores::ChromaFormat::Yuv422 };
         let mut fr = filmcraft_prores::Frame::new(self.w, self.h, chroma, 10, self.alpha);
         rgba_to_yuv_10(rgba, self.w as usize, self.h as usize, self.is_444(), &mut fr.y, &mut fr.cb, &mut fr.cr);
@@ -167,8 +177,35 @@ impl VideoEncoder for ProRes {
                 *d = ((s[3] as u32 * 1023 + 127) / 255) as u16;
             }
         }
+        fr
+    }
+}
+
+impl VideoEncoder for ProRes {
+    fn sample_entry(&self) -> SampleEntry {
+        SampleEntry::prores(FourCc(self.profile.fourcc()), self.w as u16, self.h as u16)
+    }
+    fn encode(&mut self, rgba: &[u8], _index: u64) -> Result<Vec<Packet>> {
+        let fr = self.frame(rgba);
         let data = self.enc.encode(&fr).map_err(enc)?;
         Ok(vec![Packet { data, key: true, cto: 0 }])
+    }
+    fn encode_batch(&mut self, frames: &[Vec<u8>], _first: u64) -> Result<Vec<Packet>> {
+        let mut out = Vec::with_capacity(frames.len());
+        for chunk in frames.chunks(PRORES_PARALLEL) {
+            let this = &*self;
+            let done: Vec<Result<Vec<u8>>> = chunk
+                .par_iter()
+                .map(|px| {
+                    let fr = this.frame(px);
+                    this.enc.clone().encode(&fr).map_err(enc)
+                })
+                .collect();
+            for data in done {
+                out.push(Packet { data: data?, key: true, cto: 0 });
+            }
+        }
+        Ok(out)
     }
     fn flush(&mut self) -> Result<Vec<Packet>> {
         Ok(vec![])
@@ -274,10 +311,7 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         // Encode the first batch before creating tracks: encoders finalise their config on frame 1.
         let first_end = batch.min(total);
         let first: Vec<Vec<u8>> = batches.next().await?.map(|(_, _, f)| f).unwrap_or_default();
-        let mut pending = Vec::new();
-        for (k, px) in first.iter().enumerate() {
-            pending.extend(venc.encode(px, k as u64)?);
-        }
+        let pending = venc.encode_batch(&first, 0)?;
         drop(first);
         st.advance(first_end)?;
 
@@ -359,10 +393,8 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         write_video(&mut mux, pending)?;
         write_audio_until(&mut mux, frame_end_time(first_end), &mut cursor)?;
         while let Some((i, end, frames)) = batches.next().await? {
-            for (k, px) in frames.iter().enumerate() {
-                let ps = venc.encode(px, i + k as u64)?;
-                write_video(&mut mux, ps)?;
-            }
+            let ps = venc.encode_batch(&frames, i)?;
+            write_video(&mut mux, ps)?;
             write_audio_until(&mut mux, frame_end_time(end), &mut cursor)?;
             st.advance(end - i)?;
         }

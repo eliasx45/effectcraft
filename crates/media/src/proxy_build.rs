@@ -165,7 +165,10 @@ fn build_from(source: &SharedSource, src: &str, out: &Path, divisor: u32, cancel
     }
     cfg.color = color;
     cfg.encode_alpha = has_alpha;
-    let enc = filmcraft_prores::Encoder::with_config(cfg);
+    // The hardware encoder when this Mac has one and the rate is the profile's nominal one (Fix 4;
+    // `ProResEncoder::new`: a sparser source's proxy stays in software at the source's density);
+    // any frame the hardware fails is encoded in software.
+    let enc = crate::prores_enc::ProResEncoder::new(cfg);
 
     let tmp: PathBuf = {
         let mut name = out.file_name().map(|n| n.to_os_string()).unwrap_or_default();
