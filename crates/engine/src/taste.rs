@@ -825,7 +825,13 @@ pub fn classify(ctx: &EvalCtx, l: &Layer, m: &str, prop: &Property, i: usize) ->
     // Off the frame: the content boxes of what the layer places (itself, a rig's children), or
     // for a layer with none to measure, its own Position.
     let gone = |t: Tick, v: &KValue| out_of_frame(ctx, l, t, false).unwrap_or_else(|| m == "position" && off_frame(comp, l, v));
-    if hidden(comp, l, t0, frame) || (is_pos && gone(t0, &a.value)) {
+    // Hidden on the frame before the move starts (its in point is the move's first key, or an
+    // opacity fade starts a frame early): the layer appears with the move, so it is an entrance
+    // even though its first key is on screen. The shelf's snap entrances (`appearAt`: opaque
+    // from the first frame, 55 → 100 % on Expo Out 1) read as on → on and blocked (2 Nov 2026,
+    // L2's badge). Not at the comp's start, where a cut lands mid-move.
+    let appears = t0 - frame >= Tick::ZERO && hidden(comp, l, t0 - frame, frame);
+    if hidden(comp, l, t0, frame) || appears || (is_pos && gone(t0, &a.value)) {
         return MoveType::Entrance;
     }
     // A move that runs into or past the layer's out point is cut there. Still on screen on its

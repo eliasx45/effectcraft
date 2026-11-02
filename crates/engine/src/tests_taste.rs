@@ -726,3 +726,33 @@ fn reference_eases_become_candidates_that_only_elias_approves() {
     assert_eq!(pos["referenceEase"]["status"], "approved", "{pos:#}");
     assert!(pos["message"].as_str().unwrap().contains("outside the usual range"), "{pos:#}");
 }
+
+#[test]
+fn a_move_that_starts_as_the_layer_appears_is_an_entrance() {
+    // L2 (2 Nov 2026): a badge opaque from its first frame (in point on its first key) growing
+    // 55 → 100 % on Expo Out 1 read as an on → on move and blocked.
+    let (mut s, cid, l) = comp();
+    s.execute_checked("layer.timing", json!({"layers": [l], "in": 1.0})).unwrap();
+    key(&mut s, l, "transform/scale", 1.0, json!([55.0, 55.0, 100.0]));
+    key(&mut s, l, "transform/scale", 1.0 + 18.0 / 30.0, json!([100.0, 100.0, 100.0]));
+    ease(&mut s, cid, l, "transform/scale", 0, (0.0, 0.1), (0.0, 100.0));
+    // A row sliding in whose fade starts one frame before the slide.
+    let row = s.execute("layer.newSolid", json!({"name": "Row", "width": 400, "height": 60, "color": "#236197"})).unwrap()["layer"].as_u64().unwrap();
+    key(&mut s, row, "transform/position", 2.0, json!([900.0, 300.0]));
+    key(&mut s, row, "transform/position", 2.0 + 18.0 / 30.0, json!([960.0, 300.0]));
+    ease(&mut s, cid, row, "transform/position", 0, (0.0, 0.1), (0.0, 100.0));
+    key(&mut s, row, "transform/opacity", 2.0 - 1.0 / 30.0, json!(0.0));
+    key(&mut s, row, "transform/opacity", 2.0 + 7.0 / 30.0, json!(100.0));
+    let r = check(&mut s);
+    let of = |l: u64, path: &str| moves(&r).into_iter().find(|m| m["layer"] == l && m["path"] == path).unwrap_or_else(|| panic!("no {path} on {l}: {r:#}"));
+    for (layer, path) in [(l, "transform/scale"), (row, "transform/position")] {
+        let m = of(layer, path);
+        assert_eq!((m["moveType"].as_str(), m["mark"].as_str()), (Some("entrance"), Some("✅")), "{m:#}");
+    }
+    // Visible the frame before (a layer on screen from the comp's start, moving later): on → on.
+    let (mut s, cid, l) = comp();
+    key(&mut s, l, "transform/scale", 1.0, json!([55.0, 55.0, 100.0]));
+    key(&mut s, l, "transform/scale", 1.6, json!([100.0, 100.0, 100.0]));
+    ease(&mut s, cid, l, "transform/scale", 0, (0.0, 0.1), (0.0, 100.0));
+    assert_eq!(only(&check(&mut s), "transform/scale")["moveType"], "move");
+}
