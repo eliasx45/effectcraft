@@ -102,3 +102,24 @@ fn commands_cap_sizes_at_30000_px() {
     let f = s.project.items.values().find_map(|i| if let ItemKind::Footage(f) = &i.kind { Some(f.clone()) } else { None }).unwrap();
     assert_eq!((f.width, f.height, f.frame_rate), (limits::MAX_SIZE, 8, FrameRate::FPS_29_97));
 }
+
+#[test]
+fn comp_sizes_round_to_whole_pixels_and_bad_sizes_are_refused() {
+    // L3 (2 Nov 2026): 840 × 1306.6667 made an 840 × 1080 comp without a word.
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Strip", "width": 840, "height": 1306.6667})).unwrap();
+    let c = s.active_comp().unwrap();
+    assert_eq!((c.width, c.height), (840, 1307));
+    s.execute("comp.settings", json!({"width": 639.4, "height": 360.5})).unwrap();
+    let c = s.active_comp().unwrap();
+    assert_eq!((c.width, c.height), (639, 361));
+    // A size that isn't a number of pixels is an error that names it, and changes nothing.
+    for bad in [json!({"height": "1306"}), json!({"width": -20})] {
+        let e = s.execute("comp.settings", bad.clone()).unwrap_err().to_string();
+        assert!(e.contains("a size in pixels"), "{bad}: {e}");
+        let e = s.execute("comp.new", bad.clone()).unwrap_err().to_string();
+        assert!(e.contains("a size in pixels"), "{bad}: {e}");
+    }
+    let c = s.active_comp().unwrap();
+    assert_eq!((c.width, c.height), (639, 361));
+}

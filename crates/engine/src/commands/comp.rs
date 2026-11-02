@@ -24,11 +24,13 @@ fn check_rate(p: &Value, cmd: &str) -> Result<()> {
 /// ([`super::layer::comp_sized_fx_layers`], read before the change).
 fn apply_settings(c: &mut Comp, p: &Value, comp_sized: &[LayerId]) {
     let (ow, oh) = (c.width, c.height);
-    if let Some(w) = p.get("width").and_then(Value::as_u64) {
-        c.width = limits::size(w).max(4);
+    // A fractional size (840 × 1306.6667 from a ratio) rounds to whole pixels; it used to be
+    // ignored, leaving the 1080 default (2 Nov 2026, L3).
+    if let Some(w) = p.get("width").and_then(Value::as_f64) {
+        c.width = limits::size_f64(w).max(4);
     }
-    if let Some(h) = p.get("height").and_then(Value::as_u64) {
-        c.height = limits::size(h).max(4);
+    if let Some(h) = p.get("height").and_then(Value::as_f64) {
+        c.height = limits::size_f64(h).max(4);
     }
     // Advanced › Anchor: where the old frame sits in the resized one (0 = top left … 4 = center …
     // 8 = bottom right). Unparented layers (and all their position keys) move by that offset;
@@ -103,8 +105,22 @@ fn apply_settings(c: &mut Comp, p: &Value, comp_sized: &[LayerId]) {
     }
 }
 
+/// `width` / `height` must be numbers of pixels when given: a string or a negative size used to
+/// be dropped without a word, keeping the old (or default 1920 × 1080) size.
+fn check_size(p: &Value, cmd: &str) -> Result<()> {
+    for key in ["width", "height"] {
+        match p.get(key) {
+            None | Some(Value::Null) => {}
+            Some(v) if v.as_f64().is_some_and(|x| x.is_finite() && x >= 0.0) => {}
+            Some(v) => return Err(bad(cmd, format!("{key}: a size in pixels (a number from 1 to {}), not {v}", limits::MAX_SIZE))),
+        }
+    }
+    Ok(())
+}
+
 fn new_comp(s: &mut Session, p: &Value) -> Result<Value> {
     check_rate(p, "comp.new")?;
+    check_size(p, "comp.new")?;
     let name = str_p(p, "name").unwrap_or("Comp 1").to_string();
     let rate = rate_p(p).unwrap_or(FrameRate::FPS_29_97);
     let mut c = Comp::new(1920, 1080, rate, rate.snap_nearest(Tick::from_seconds_f64(10.0)));
@@ -127,6 +143,7 @@ fn new_comp(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn settings(s: &mut Session, p: &Value) -> Result<Value> {
     check_rate(p, "comp.settings")?;
+    check_size(p, "comp.settings")?;
     let cid = comp_id(s, p)?;
     s.edit("Composition Settings", None, |proj, _| {
         if let Some(n) = str_p(p, "name")
