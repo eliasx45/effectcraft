@@ -963,3 +963,39 @@ fn gpu_plan_covers_distance_field_styles_and_names_what_it_declines() {
     assert_eq!(why, Some(crate::cpu_why::CpuWhy::named(crate::cpu_why::STYLE_TOO_WIDE.why, "Stroke")));
     assert_eq!(why.map(|w| w.text()).as_deref(), Some("layer style Stroke reaches farther than the GPU's distance field"));
 }
+
+/// AE 2026 (2 Nov 2026, measured over black and white backdrops in Normal mode): with Color Type ▸
+/// Gradient and the default Colors, a glow runs from opaque white at full intensity to black;
+/// an Outer Glow fades out below intensity ~0.24, an Inner Glow does not (the whole inside turns
+/// black). EffectCraft's default was pale yellow fading to transparent.
+#[test]
+fn default_glow_gradient_is_opaque_white_to_black() {
+    let (p, cid) = scene([0.0, 0.0, 1.0], Some([0.5; 3]), |p, c, l| {
+        add(p, c, l, "outerGlow");
+        set(l, "outerGlow/colorType", Value::Enum(1));
+        set(l, "outerGlow/blendMode", Value::Enum(NORMAL));
+        set(l, "outerGlow/opacity", Value::Scalar(100.0));
+        set(l, "outerGlow/size", Value::Scalar(20.0));
+    });
+    let img = render(&p, cid);
+    // Just outside the layer's right edge (x = 120): near white and neutral, not pale yellow.
+    let e = img.straight(121, 50);
+    assert!(e[0] > 0.7 && (e[0] - e[2]).abs() < 0.05, "edge {e:?}");
+    // Further out the black end darkens the grey backdrop…
+    let darkest = (121..145).map(|x| img.straight(x, 50)[0]).fold(1.0f32, f32::min);
+    assert!(darkest < 0.4, "the gradient's black end shows: {darkest}");
+    // …and beyond the glow the backdrop is untouched.
+    assert!(near(img.straight(160, 50)[0], img.straight(195, 50)[0], 0.01));
+
+    let (p, cid) = scene([0.0, 0.0, 1.0], Some([0.5; 3]), |p, c, l| {
+        add(p, c, l, "innerGlow");
+        set(l, "innerGlow/colorType", Value::Enum(1));
+        set(l, "innerGlow/blendMode", Value::Enum(NORMAL));
+        set(l, "innerGlow/opacity", Value::Scalar(100.0));
+        set(l, "innerGlow/size", Value::Scalar(5.0));
+    });
+    let img = render(&p, cid);
+    // The middle of the 40 px layer, beyond the 5 px glow: the gradient's black, fully opaque.
+    let m = img.straight(100, 50);
+    assert!(m[0] < 0.05 && m[1] < 0.05 && m[2] < 0.05 && m[3] > 0.99, "inside {m:?}");
+}

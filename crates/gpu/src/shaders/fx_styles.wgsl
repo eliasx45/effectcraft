@@ -87,8 +87,9 @@ fn sty_grad(t0: f32) -> vec4<f32> {
 }
 
 // styles::glow_color: (colour, alpha) of a glow intensity. f[0].xyz colour, f[2].x range,
-// f[1].w jitter, u[0].w bit 0 gradient.
-fn sty_glow_color(v0: f32, p: vec2<i32>) -> vec4<f32> {
+// f[1].w jitter, u[0].w bit 0 gradient; `outer`: an Outer Glow's gradient fades out below
+// intensity 0.24 (styles::OUTER_GRADIENT_FADE), an Inner Glow's does not.
+fn sty_glow_color(v0: f32, p: vec2<i32>, outer: bool) -> vec4<f32> {
     let v = powz(clamp(v0, 0.0, 1.0), 0.5 / P.f[2].x);
     if ((P.u[0].w & 1u) == 0u) {
         return vec4<f32>(P.f[0].xyz, v);
@@ -98,7 +99,8 @@ fn sty_glow_color(v0: f32, p: vec2<i32>) -> vec4<f32> {
         j = (sty_noise(p, 77u) - 0.5) * P.f[1].w;
     }
     let c = sty_grad(1.0 - v + j);
-    return vec4<f32>(c.xyz, c.w * min(v * 8.0, 1.0));
+    let fade = select(1.0, min(v / 0.24, 1.0), outer);
+    return vec4<f32>(c.xyz, c.w * fade);
 }
 
 // The planes styles blur: (alpha, 1 − alpha, 0, alpha) of the content.
@@ -158,7 +160,7 @@ fn sty_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
         if ((P.u[0].w & 32u) != 0u) {
             v = textureLoad(src, p, 0).x;
         }
-        let g = sty_glow_color(v, p);
+        let g = sty_glow_color(v, p, true);
         c = g.xyz;
         a = sty_noisy(g.w * P.f[0].w * (1.0 - textureLoad(aux, p, 0).w), P.f[1].z, p, seed ^ 0x5a5au);
     }
@@ -239,7 +241,7 @@ fn sty_body(@builtin(global_invocation_id) gid: vec3<u32>) {
             v = textureLoad(aux, p, 0).x;
         }
         let e = select(v, 1.0 - v, (flags & 8u) != 0u);
-        let g = sty_glow_color(e, p);
+        let g = sty_glow_color(e, p, false);
         c = g.xyz;
         a = sty_noisy(g.w * P.f[0].w, P.f[1].z, p, seed ^ 0x3c3cu);
     } else if (kind == 4u) {

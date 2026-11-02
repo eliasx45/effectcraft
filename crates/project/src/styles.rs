@@ -153,10 +153,12 @@ fn gradient(ids: &mut Ids, g: Gradient) -> Property {
     ids.prop("colors", "Colors", Value::gradient(g)).with_ui(ParamUi::Gradient)
 }
 
-/// The default glow gradient: the glow colour fading to transparent.
+/// The default glow gradient (Color Type ▸ Gradient): opaque white to black. AE 2026, measured
+/// 2 Nov 2026 over black and white backdrops in Normal mode: the glow's colour runs from white at
+/// full intensity to black at none, fully opaque (Inner Glow paints the whole interior black), for
+/// Outer and Inner Glow alike; the default Color stays pale yellow (255, 255, 190).
 fn glow_gradient() -> Gradient {
-    let c = [1.0, 1.0, 190.0 / 255.0, 1.0];
-    Gradient { colors: vec![(0.0, c), (1.0, c)], opacities: vec![(0.0, 1.0), (1.0, 0.0)], ..Default::default() }
+    Gradient { colors: vec![(0.0, [1.0, 1.0, 1.0, 1.0]), (1.0, [0.0, 0.0, 0.0, 1.0])], opacities: vec![(0.0, 1.0), (1.0, 1.0)], ..Default::default() }
 }
 
 /// Global Light properties as they appear on a layer (copied from the comp's setting).

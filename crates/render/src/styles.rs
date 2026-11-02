@@ -566,15 +566,22 @@ fn pass_image(w: usize, h: usize, f: impl Fn(usize, usize) -> ([f32; 3], f32) + 
     img
 }
 
-/// Glow intensity → (colour, alpha) for colour or gradient glows.
-fn glow_color(o: Org, g: &Glow, v: f32, x: usize, y: usize) -> ([f32; 3], f32) {
+/// Intensity below which an Outer Glow's gradient fades out: its alpha is the gradient's opacity
+/// times min(intensity / this, 1). AE 2026, measured 2 Nov 2026 with the default (opaque)
+/// gradient: alpha = 4.17 × the Color-type glow's alpha up to 1 (0.235 → 0.99, 0.149 → 0.62,
+/// 0.082 → 0.35, 0.035 → 0.15). An Inner Glow's gradient has no such fade (it fills the inside).
+const OUTER_GRADIENT_FADE: f32 = 0.24;
+
+/// Glow intensity → (colour, alpha) for colour or gradient glows (`outer`: an Outer Glow).
+fn glow_color(o: Org, g: &Glow, v: f32, x: usize, y: usize, outer: bool) -> ([f32; 3], f32) {
     let v = v.clamp(0.0, 1.0).powf((0.5 / g.range) as f32);
     match &g.gradient {
         None => (g.color, v),
         Some(gr) => {
             let j = if g.jitter > 0.0 { (o.noise(x, y, 77) - 0.5) * g.jitter } else { 0.0 };
             let c = gr.sample((1.0 - v + j) as f64);
-            ([c[0], c[1], c[2]], c[3] * (v * 8.0).min(1.0))
+            let fade = if outer { (v / OUTER_GRADIENT_FADE).min(1.0) } else { 1.0 };
+            ([c[0], c[1], c[2]], c[3] * fade)
         }
     }
 }
@@ -667,7 +674,7 @@ pub(crate) fn render_in(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size:
         let v = glow_intensity(&alpha, &d, gl, s, false);
         let img = pass_image(w, h, |x, y| {
             let i = y * w + x;
-            let (c, a) = glow_color(o, gl, v.data[i], x, y);
+            let (c, a) = glow_color(o, gl, v.data[i], x, y, true);
             // The glow sits outside the content (knocked out under it).
             (c, noisy(o, a * gl.opacity * (1.0 - alpha.data[i]), gl.noise, x, y, seed ^ 0x5a5a))
         });
@@ -722,7 +729,7 @@ pub(crate) fn render_in(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size:
         blend_clipped(o, &mut body, &alpha, gl.mode, seed, |x, y| {
             let i = y * w + x;
             let e = if gl.center { 1.0 - v.data[i] } else { v.data[i] };
-            let (c, a) = glow_color(o, gl, e, x, y);
+            let (c, a) = glow_color(o, gl, e, x, y, false);
             (c, noisy(o, a * gl.opacity, gl.noise, x, y, seed ^ 0x3c3c))
         });
     }
