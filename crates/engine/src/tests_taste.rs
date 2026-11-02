@@ -538,3 +538,37 @@ fn a_precomp_is_on_screen_where_its_content_is_not_where_its_comp_rectangle_is()
     let m = only(&check(&mut s), "transform/position");
     assert_eq!(m["moveType"], "move", "{m:#}");
 }
+
+#[test]
+fn orbits_and_drifts_through_the_whole_layer_are_continuous_and_only_warn() {
+    // 2 Nov 2026 (editzena TR): an orbit ring's rotation (keys long before the layer starts and
+    // after it ends) read as an entrance "not started yet" and blocked; so did a linear drift.
+    let (mut s, cid, ring) = comp();
+    s.execute_checked("layer.timing", json!({"layers": [ring], "in": 1.0, "out": 3.0})).unwrap();
+    key(&mut s, ring, "transform/rotation", 0.5, json!(0.0));
+    key(&mut s, ring, "transform/rotation", 3.5, json!(360.0));
+    ease(&mut s, cid, ring, "transform/rotation", 0, (0.0, 50.0), (0.0, 50.0));
+    // A linear drift from the layer's first frame to past its last.
+    let glow = s.execute("layer.newSolid", json!({"name": "Glow", "width": 300, "height": 300, "color": "#3355ff"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute_checked("layer.timing", json!({"layers": [glow], "in": 1.0, "out": 3.0})).unwrap();
+    key(&mut s, glow, "transform/position", 1.0, json!([900.0, 540.0]));
+    key(&mut s, glow, "transform/position", 3.2, json!([1000.0, 540.0]));
+    // An entrance whose first key is before the in point but which lands while on screen: unchanged.
+    let card = s.execute("layer.newSolid", json!({"name": "Late", "width": 300, "height": 100, "color": "#ff3355"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute_checked("layer.timing", json!({"layers": [card], "in": 1.0, "out": 3.0})).unwrap();
+    key(&mut s, card, "transform/position", 0.9, json!([960.0, 640.0]));
+    key(&mut s, card, "transform/position", 1.5, json!([960.0, 540.0]));
+    ease(&mut s, cid, card, "transform/position", 0, (0.0, 0.1), (0.0, 100.0));
+
+    let r = check(&mut s);
+    let of = |l: u64| moves(&r).into_iter().find(|m| m["layer"] == l).unwrap_or_else(|| panic!("no move on {l}: {r:#}"));
+    let m = of(ring);
+    assert_eq!(m["moveType"], "continuous", "{m:#}");
+    assert_ne!(m["verdict"], "off", "its peak and landing aren't seen: {m:#}");
+    let m = of(glow);
+    assert_eq!(m["moveType"], "continuous", "{m:#}");
+    assert_eq!(m["verdict"], "off", "linear is still reported: {m:#}");
+    assert_eq!(m["blocking"], false, "warn only: {m:#}");
+    assert_eq!(of(card)["moveType"], "entrance", "{r:#}");
+    assert_eq!(r["clean"], true, "{r:#}");
+}

@@ -72,12 +72,17 @@ pub enum MoveType {
     /// view moves. Peaks like an on-screen move, has no speed cap (camera units aren't frame
     /// pixels) and warns only until Elias approves camera curves.
     Camera,
+    /// A move the viewer never sees start or stop: its keys reach past the layer's first or last
+    /// frame on screen and cover all of it (an orbit, a spin, an ambient drift or zoom). Its peak
+    /// and landing aren't seen, so only the hard fails and the speed cap apply; warn-only until
+    /// Elias approves curves for it.
+    Continuous,
     /// Any other animated property: only the hard fails apply.
     Other,
 }
 
 impl MoveType {
-    pub const ALL: [MoveType; 9] = [
+    pub const ALL: [MoveType; 10] = [
         MoveType::Entrance,
         MoveType::Exit,
         MoveType::Move,
@@ -86,6 +91,7 @@ impl MoveType {
         MoveType::ScalePop,
         MoveType::Scrub,
         MoveType::Camera,
+        MoveType::Continuous,
         MoveType::Other,
     ];
 
@@ -99,6 +105,7 @@ impl MoveType {
             MoveType::ScalePop => "scale-pop",
             MoveType::Scrub => "scrub",
             MoveType::Camera => "camera",
+            MoveType::Continuous => "continuous",
             MoveType::Other => "other",
         }
     }
@@ -113,6 +120,7 @@ impl MoveType {
             MoveType::ScalePop => "scale pop from 0",
             MoveType::Scrub => "scrub / wipe (one-axis scale from an edge)",
             MoveType::Camera => "camera move (a camera or the null rig that drives it)",
+            MoveType::Continuous => "continuous move (runs through the layer's whole time on screen: an orbit, a spin, a drift)",
             MoveType::Other => "other property, or a layer with no pixels of its own",
         }
     }
@@ -764,6 +772,18 @@ pub fn classify(ctx: &EvalCtx, l: &Layer, m: &str, prop: &Property, i: usize) ->
     if drawn_parts(comp, l).is_empty() {
         return MoveType::Other;
     }
+    // Running through the layer's whole time on screen (keys past at least one end): an orbit
+    // ring and its counter-rotations, an ambient zoom (editzena TR, keys at f−154 and f333 on a
+    // 0–185 layer) read as entrances "not started yet" and blocked (2 Nov 2026).
+    {
+        let frame = comp.frame_rate.frame_duration();
+        let (t0, t1) = (l.comp_time(a.time), l.comp_time(b.time));
+        let first = l.in_point.max(Tick::ZERO);
+        let last = l.out_point.min(comp.duration) - frame;
+        if last >= first && t0 <= first && t1 >= last && (t0 < first || t1 > last) {
+            return MoveType::Continuous;
+        }
+    }
     if m == "opacity" {
         return if first(&cb) >= first(&ca) { MoveType::FadeIn } else { MoveType::FadeOut };
     }
@@ -1031,7 +1051,7 @@ fn judge(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, 
             _ => {}
         }
         let cap = r.sharp_cap(frames);
-        if kind != MoveType::Other && kind != MoveType::ScalePop && shape.sharpness > cap {
+        if !matches!(kind, MoveType::Other | MoveType::ScalePop | MoveType::Continuous) && shape.sharpness > cap {
             j.problems.push(format!(
                 "too sharp for {frames:.0} frames: its fastest frame is {:.1}× the average (cap {cap:.1}×; {:.0} % of the way in one frame)",
                 shape.sharpness,
