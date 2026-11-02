@@ -124,6 +124,10 @@ pub(crate) fn coerce_for(pr: &Property, cur: &KValue, v: &Value, cmd: &str) -> R
             (KValue::Enum(_), _) => "an option index (0-based)".into(),
             (KValue::Text(_) | KValue::Str(_), _) => "a string".into(),
             (KValue::Layer(_), _) => "a layer id (or null)".into(),
+            (KValue::Path(_), _) => {
+                "{vertices: [[x, y]…], inTangents?, outTangents? ([[x, y]…] relative to their vertex, one per vertex; default [0, 0]), closed? (default true)}"
+                    .into()
+            }
             _ => format!("a {} value as get_property returns it", cur.kind_name()),
         };
         return Err(bad(cmd, format!("can't use {v} for {} (`{id}`, a {} property); expected {expected}", pr.name, cur.kind_name())));

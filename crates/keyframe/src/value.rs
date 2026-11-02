@@ -226,6 +226,50 @@ fn sample_stops<T: Copy>(stops: &[(f64, T)], midpoints: &[f64], t: f64, lerp: im
     stops.last().map(|s| s.1)
 }
 
+/// A shape path written the way people (and agents) write it, like After Effects' `Shape` object:
+/// `{vertices: [[x, y]…], inTangents?, outTangents?, closed?}`, the tangents also as `in_tangents` /
+/// `out_tangents` (relative to their vertex, missing = `[0, 0]` corners), `closed` defaulting to
+/// true as in After Effects, and the stored `{t: "Path", v: {…}}` form with either spelling.
+/// `None` when it isn't one (a tangent list of another length than the vertices included).
+/// Before 2 Nov 2026 only the snake_case form with every field given was taken.
+pub fn shape_path_json(j: &serde_json::Value) -> Option<ShapePath> {
+    use serde_json::Value as J;
+    let o = j.as_object()?;
+    if o.get("t").and_then(J::as_str) == Some("Path")
+        && let Some(v) = o.get("v")
+    {
+        return shape_path_json(v);
+    }
+    fn points(j: &J) -> Option<Vec<[f64; 2]>> {
+        j.as_array()?
+            .iter()
+            .map(|p| match p.as_array().map(Vec::as_slice) {
+                Some([x, y, ..]) => Some([x.as_f64().filter(|v| v.is_finite())?, y.as_f64().filter(|v| v.is_finite())?]),
+                _ => None,
+            })
+            .collect()
+    }
+    let vertices = points(o.get("vertices")?)?;
+    let n = vertices.len();
+    let tangents = |camel: &str, snake: &str| -> Option<Vec<[f64; 2]>> {
+        match o.get(camel).or_else(|| o.get(snake)).filter(|v| !v.is_null()) {
+            None => Some(vec![[0.0; 2]; n]),
+            Some(t) => points(t).filter(|t| t.len() == n),
+        }
+    };
+    let in_tangents = tangents("inTangents", "in_tangents")?;
+    let out_tangents = tangents("outTangents", "out_tangents")?;
+    let closed = match o.get("closed") {
+        None | Some(J::Null) => true,
+        Some(c) => c.as_bool()?,
+    };
+    let feather = match o.get("feather") {
+        None | Some(J::Null) => Vec::new(),
+        Some(f) => serde_json::from_value(f.clone()).ok()?,
+    };
+    Some(ShapePath { vertices, in_tangents, out_tangents, closed, feather })
+}
+
 /// A gradient written the way people (and agents) write it: `{colors: [[pos, color]…],
 /// opacities?: [[pos, alpha]…]}`, `[[pos, color]…]` or `[color, color…]` (evenly spaced), where a
 /// colour is `"#rrggbb"` or `[r, g, b, a?]` (0–1). Opacity stops default to the colours' alpha.
@@ -492,7 +536,14 @@ impl Value {
                 }
             }
             Value::Layer(_) => Some(Value::Layer(j.as_u64())),
-            Value::Path(_) => serde_json::from_value::<ShapePath>(j.clone()).ok().map(Value::path).or_else(|| serde_json::from_value::<Value>(j.clone()).ok()),
+            Value::Path(_) => serde_json::from_value::<ShapePath>(j.clone())
+                .ok()
+                .or_else(|| shape_path_json(j))
+                .map(|mut p| {
+                    p.fit_tangents();
+                    Value::path(p)
+                })
+                .or_else(|| serde_json::from_value::<Value>(j.clone()).ok().filter(|v| matches!(v, Value::Path(_)))),
             Value::Gradient(_) => serde_json::from_value::<Value>(j.clone())
                 .ok()
                 .filter(|v| matches!(v, Value::Gradient(_)))
@@ -537,5 +588,43 @@ mod gradient_tests {
         assert_eq!(Value::gradient(Gradient::default()).coerce_json(&json), Some(Value::gradient(g.clone())));
         let Value::Gradient(mid) = Value::gradient(g).lerp(&Value::gradient(Gradient::default()), 0.5) else { panic!("gradient") };
         assert_eq!(mid.color_midpoints[0], 0.375);
+    }
+}
+
+#[cfg(test)]
+mod shape_path_json_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn path(j: serde_json::Value) -> Option<ShapePath> {
+        Value::path(ShapePath::default()).coerce_json(&j).and_then(|v| v.as_path().cloned())
+    }
+
+    #[test]
+    fn plain_shape_objects_in_either_spelling_become_paths() {
+        let want = ShapePath {
+            vertices: vec![[0.0, 0.0], [50.0, 0.0], [50.0, 50.0]],
+            in_tangents: vec![[0.0, 0.0], [-5.0, 0.0], [0.0, 0.0]],
+            out_tangents: vec![[0.0, 0.0], [5.0, 0.0], [0.0, 0.0]],
+            closed: false,
+            feather: vec![],
+        };
+        let v = json!([[0, 0], [50, 0], [50, 50]]);
+        let (i, o) = (json!([[0, 0], [-5, 0], [0, 0]]), json!([[0, 0], [5, 0], [0, 0]]));
+        assert_eq!(path(json!({"vertices": v, "inTangents": i, "outTangents": o, "closed": false})), Some(want.clone()));
+        assert_eq!(path(json!({"vertices": v, "in_tangents": i, "out_tangents": o, "closed": false})), Some(want.clone()));
+        assert_eq!(path(json!({"t": "Path", "v": {"vertices": v, "inTangents": i, "outTangents": o, "closed": false}})), Some(want));
+        // Missing tangents are corners; a missing `closed` is closed (After Effects' Shape default).
+        let p = path(json!({"vertices": v})).unwrap();
+        assert!(p.closed && p.in_tangents == vec![[0.0; 2]; 3] && p.out_tangents == vec![[0.0; 2]; 3]);
+    }
+
+    #[test]
+    fn malformed_paths_are_refused() {
+        assert_eq!(path(json!({"vertices": [[0, 0], [1, 1]], "inTangents": [[0, 0]]})), None);
+        assert_eq!(path(json!({"vertices": [[0, 0], ["a", 1]]})), None);
+        assert_eq!(path(json!({"vertices": [[0, 0]], "closed": "yes"})), None);
+        assert_eq!(path(json!({"points": [[0, 0]]})), None);
+        assert_eq!(Value::path(ShapePath::default()).coerce_json(&json!({"t": "Scalar", "v": 1.0})), None);
     }
 }
