@@ -74,8 +74,19 @@ pub fn capped_list<'a>(items: impl IntoIterator<Item = &'a str>, cap: usize) -> 
     if all.len() > cap { format!("{shown}, … ({} more)", all.len() - cap) } else { shown }
 }
 
-/// The suffix of an unknown-command error: the closest command ids.
+/// Ids agents guess for a command that After Effects (and so EffectCraft) names after its menu
+/// item, and the command to use instead. Commands mirror the menus, so these stay hints, not
+/// second commands (2 Nov 2026, H2 looked for `layer.delete`).
+const GUESSED: &[(&[&str], &str)] = &[(
+    &["layer.delete", "layer.remove", "layers.delete", "layer.clear", "comp.deleteLayer", "comp.removeLayer"],
+    "`edit.clear {comp?, layers: [id|name|#n]}` (Edit ▸ Clear, the Delete key) deletes layers",
+)];
+
+/// The suffix of an unknown-command error: the command a guessed id means, or the closest ids.
 pub(crate) fn command_hint(id: &str) -> String {
+    if let Some((_, use_instead)) = GUESSED.iter().find(|(ids, _)| ids.iter().any(|g| g.eq_ignore_ascii_case(id))) {
+        return format!("; {use_instead}");
+    }
     let ids = crate::commands::command_specs().iter().map(|c| c.id);
     let s = did_you_mean(id, ids);
     if s.is_empty() { "; list them with command.list {filter}".into() } else { s }
@@ -103,6 +114,16 @@ mod tests {
         let mut s = crate::Session::default();
         let e = s.execute("layer.newSoild", json!({})).unwrap_err().to_string();
         assert!(e.contains("did you mean") && e.contains("`layer.newSolid`"), "{e}");
+        // A guessed id for a menu command names it (H2 looked for layer.delete).
+        let e = s.execute("layer.delete", json!({"layers": [1]})).unwrap_err().to_string();
+        assert!(e.contains("`edit.clear {comp?, layers"), "{e}");
+        // ...and that command deletes the layer named.
+        s.execute("comp.new", json!({"name": "C", "width": 100, "height": 100})).unwrap();
+        let a = s.execute("layer.newSolid", json!({})).unwrap()["layer"].as_u64().unwrap();
+        let b = s.execute("layer.newSolid", json!({})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("edit.clear", json!({"layers": [a]})).unwrap();
+        let left: Vec<u64> = s.active_comp().unwrap().layers.iter().map(|l| l.id.0).collect();
+        assert_eq!(left, vec![b]);
     }
 
     /// A comp with a solid carrying Levels; returns the layer id.
