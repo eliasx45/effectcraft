@@ -20,9 +20,24 @@
 //! it differs from the nearest approved curve); one that fails is [`Verdict::Off`] ❌. A ❌ blocks
 //! a handover only once its move type has [`Rules::block_at`] approved curves; before that it
 //! warns. Curves live in a [`Profile`] (built in, plus his approvals and ⏳ candidates in the
-//! config store's [`PROFILE_FILE`]); only he approves one (`taste.approve`).
+//! config store's [`PROFILE_FILE`]); only he approves one (`taste.approve`). A move with the shape
+//! of a curve he approved for its type is ✅ even outside the usual peak and landing ranges: his
+//! approval of that shape outranks the ranges learned from his comps (2 Nov 2026: reference eases
+//! he approves widen the profile).
+//!
+//! **Rebuild mode** (2 Nov 2026, Elias approved): a comp that rebuilds a reference animation
+//! carries the reference editor's fitted ease per move ([`effectcraft_project::rebuild`],
+//! `taste.rebuild`). Each move with that evidence is judged against it instead: ✅ when its ease
+//! matches the reference fit within the rebuild's tolerance, ❌ (blocking) when it drifted, 🟡
+//! when it matches but the fit itself is loose ([`LOOSE_FIT`]); the profile's verdict is kept as
+//! info ([`RefJudged`]). Moves without evidence are judged as usual. A move whose ease came from a
+//! reference (its layer's or comp's comment carries [`REFERENCE_TAG`], or rebuild evidence) also
+//! says which profile curve has its shape and that curve's status ([`EaseSource`]): the ⏳
+//! candidates `taste.rebuild` files from reference eases, which join the profile once Elias
+//! approves them.
 
 use effectcraft_keyframe::{Interp, Keyframe, Value as KValue, side_ease, spatial_segment_length};
+use effectcraft_project::rebuild::{FitError, Rebuild, RefMove};
 use effectcraft_project::{Comp, Layer, LayerId, Property, Uid};
 use effectcraft_render::EvalCtx;
 use effectcraft_time::Tick;
@@ -516,6 +531,10 @@ pub struct Judged {
     pub nearest: Option<(String, String, f64)>,
     pub problems: Vec<String>,
     pub message: String,
+    /// In a rebuild comp, the move judged against its reference fit (then `verdict` is that one).
+    pub reference: Option<RefJudged>,
+    /// For a move whose ease came from a reference: the profile curve with its shape and status.
+    pub ease_source: Option<EaseSource>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -898,6 +917,8 @@ pub fn check(profile: &Profile, ctx: &EvalCtx, only: Option<&[LayerId]>, start: 
         return (out, false);
     }
     let frame = 1.0 / fps;
+    let rebuild = comp.rebuild.as_deref();
+    let comp_tagged = ctx.project.item(ctx.comp_id).is_some_and(|i| tagged(&i.comment));
     for l in comp.layers.iter() {
         if only.is_some_and(|ids| !ids.contains(&l.id)) {
             continue;
@@ -932,7 +953,18 @@ pub fn check(profile: &Profile, ctx: &EvalCtx, only: Option<&[LayerId]>, start: 
                     }
                     continue;
                 }
-                out.push(judge(profile, ctx, l, p, &path, i, fps));
+                let mut j = judge(profile, ctx, l, p, &path, i, fps);
+                if let Some(rb) = rebuild
+                    && let Some((n, ev)) = evidence(rb, l, &path, i, j.t0, fps)
+                {
+                    let dv = normalised(p, i).map(|x| x.2).unwrap_or(0.0);
+                    against_reference(profile, rb, n, ev, dv, &mut j);
+                }
+                if comp_tagged || tagged(&l.comment) || j.reference.is_some() {
+                    let why = if j.reference.is_some() { "rebuild evidence" } else { "reference ease tag" };
+                    ease_source(profile, &mut j, why);
+                }
+                out.push(j);
             }
         }
     }
@@ -961,6 +993,8 @@ fn base(comp: &Comp, l: &Layer, p: &Property, path: &str, i: usize, j: usize, fp
         nearest: None,
         problems: vec![],
         message: String::new(),
+        reference: None,
+        ease_source: None,
     }
 }
 
@@ -1031,23 +1065,24 @@ fn judge(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, 
     j.shape = Some(shape);
     let pos = shape.peak_pos;
     let linear = j.problems.iter().any(|x| x.starts_with("linear"));
+    // Peak position and landing are the shape's own: a shape Elias approved for this move type
+    // passes them whatever the ranges say (below).
+    let mut shaped: Vec<String> = vec![];
     if !linear {
         match kind {
             MoveType::Entrance if pos > r.entrance_peak_max => {
-                j.problems.push(format!("peaks at {pos:.0} % of the move: entrances peak in the first {:.0} %", r.entrance_peak_max))
+                shaped.push(format!("peaks at {pos:.0} % of the move: entrances peak in the first {:.0} %", r.entrance_peak_max))
             }
-            MoveType::Exit if pos < r.exit_peak_min => j.problems.push(format!("peaks at {pos:.0} %: exits peak after {:.0} %", r.exit_peak_min)),
+            MoveType::Exit if pos < r.exit_peak_min => shaped.push(format!("peaks at {pos:.0} %: exits peak after {:.0} %", r.exit_peak_min)),
             MoveType::Move | MoveType::Scrub | MoveType::Camera if pos < r.move_peak.0 || pos > r.move_peak.1 => {
                 let what = match kind {
                     MoveType::Scrub => "scrubs",
                     MoveType::Camera => "camera moves (judged like on-screen moves)",
                     _ => "on-screen moves",
                 };
-                j.problems.push(format!("peaks at {pos:.0} %: {what} peak between {:.0} and {:.0} %", r.move_peak.0, r.move_peak.1))
+                shaped.push(format!("peaks at {pos:.0} %: {what} peak between {:.0} and {:.0} %", r.move_peak.0, r.move_peak.1))
             }
-            MoveType::FadeIn if pos > r.fade_in_peak_max => {
-                j.problems.push(format!("peaks at {pos:.0} %: fade-ins peak in the first {:.0} %", r.fade_in_peak_max))
-            }
+            MoveType::FadeIn if pos > r.fade_in_peak_max => shaped.push(format!("peaks at {pos:.0} %: fade-ins peak in the first {:.0} %", r.fade_in_peak_max)),
             _ => {}
         }
         let cap = r.sharp_cap(frames);
@@ -1059,7 +1094,7 @@ fn judge(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, 
             ));
         }
         if kind == MoveType::Entrance && shape.tail10 < r.entrance_tail_min / 100.0 * frames - 0.5 {
-            j.problems.push(format!(
+            shaped.push(format!(
                 "lands too soon: {:.0} of its {frames:.0} frames on the last 10 % of the way (entrances settle for at least {:.0} % of their frames)",
                 shape.tail10, r.entrance_tail_min
             ));
@@ -1080,6 +1115,8 @@ fn judge(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, 
     // The shape against his curves.
     let mine: Vec<&Curve> = profile.approved_for(kind).collect();
     let near_mine = nearest(&mine, ease, secs);
+    let waived = if near_mine.is_some_and(|(_, d)| d <= r.match_within) { std::mem::take(&mut shaped) } else { vec![] };
+    j.problems.append(&mut shaped);
     let pool = candidates(profile, kind);
     // The fix only ever suggests a curve approved for this move type.
     j.nearest = near_mine.map(|(c, d)| (c.id.clone(), c.name.clone(), (d * 10.0).round() / 10.0));
@@ -1091,7 +1128,12 @@ fn judge(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, 
         if let Some((c, d)) = near_mine.filter(|(_, d)| *d <= r.match_within) {
             j.verdict = Verdict::Approved;
             j.curve = Some(c.name.clone());
-            j.message = format!("{name}: {} {}", Verdict::Approved.mark(), if d < 0.5 { c.name.clone() } else { format!("{} ({d:.1} % off)", c.name) });
+            let over = if waived.is_empty() {
+                String::new()
+            } else {
+                format!(" (Elias approved this shape for {} moves, outside the usual range: {})", kind.id(), waived.join("; "))
+            };
+            j.message = format!("{name}: {} {}{over}", Verdict::Approved.mark(), if d < 0.5 { c.name.clone() } else { format!("{} ({d:.1} % off)", c.name) });
             return j;
         }
         if kick {
@@ -1176,4 +1218,212 @@ pub fn unmatched_curves(profile: &Profile, comps: &[(&str, EvalCtx)], max_groups
     }
     groups.sort_by_key(|g| std::cmp::Reverse(g.uses));
     groups
+}
+
+// ---------------------------------------------------------------- rebuild mode
+
+/// The tag (in a layer's or a comp's comment) of parts whose eases came from a reference: their
+/// moves say which profile curve has their shape and its status ([`EaseSource`]).
+pub const REFERENCE_TAG: &str = "reference ease";
+/// A reference fit looser than this (RMS, % of the move's travel) is weak evidence: a move
+/// matching it is 🟡, not ✅.
+pub const LOOSE_FIT: f64 = 10.0;
+
+/// Whether a comment carries [`REFERENCE_TAG`] (any case).
+pub fn tagged(comment: &str) -> bool {
+    comment.to_ascii_lowercase().contains(REFERENCE_TAG)
+}
+
+/// A move of a rebuild comp judged against its reference fit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefJudged {
+    /// The rebuild's evidence entry (index into its `moves`).
+    pub evidence: usize,
+    /// The rebuild's name ([`Rebuild::label`]).
+    pub name: String,
+    /// The fitted curve in words: a curve's name, `custom out 40 % / in 91 %`, `linear`.
+    pub curve: String,
+    /// The fitted ease at this move's length (normalised).
+    pub ease: (Side, Side),
+    /// Largest progress gap between the keyed ease and the fit (%).
+    pub gap: f64,
+    pub tolerance: f64,
+    pub fit: Option<FitError>,
+    /// The fit's RMS in percent of the move's travel.
+    pub fit_pct: Option<f64>,
+    /// What Elias's profile alone says (info only in rebuild mode).
+    pub profile: Verdict,
+    pub profile_problems: Vec<String>,
+    pub profile_message: String,
+}
+
+/// The profile curve (any status) with a move's shape, for moves whose ease came from a reference.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EaseSource {
+    /// Why it is tracked: `reference ease tag` or `rebuild evidence`.
+    pub why: &'static str,
+    /// The nearest profile curve within `matchWithin` and the gap (%); None: not filed yet.
+    pub curve: Option<(Curve, f64)>,
+}
+
+fn valid_side(s: Side) -> bool {
+    s.speed.is_finite() && s.influence.is_finite() && s.influence > 0.0 && s.influence <= 100.0
+}
+
+fn ease_words(o: Side, i: Side) -> String {
+    let side = |s: Side| if s.speed.abs() < 0.005 { format!("{:.0} %", s.influence) } else { format!("{:.0} % at {:.2}×", s.influence, s.speed) };
+    format!("custom out {} / in {}", side(o), side(i))
+}
+
+/// The ease a reference fit gives a move of `secs` seconds, and its words.
+pub fn reference_ease(profile: &Profile, m: &RefMove, secs: f64) -> Result<((Side, Side), String), String> {
+    if let Some(e) = m.ease {
+        let (o, i) = (side(e.out.speed, e.out.influence), side(e.inn.speed, e.inn.influence));
+        if !valid_side(o) || !valid_side(i) {
+            return Err("`ease` needs out/in {speed, influence (0, 100]}".into());
+        }
+        return Ok(((o, i), ease_words(o, i)));
+    }
+    let g = m.graph.trim();
+    if g.is_empty() {
+        return Err("no `graph` or `ease`".into());
+    }
+    if let Some(rest) = g.strip_prefix("free:") {
+        let mut it = rest.split(':').map(|x| x.trim().parse::<f64>().ok());
+        let (Some(Some(a)), Some(Some(b)), None) = (it.next(), it.next(), it.next()) else {
+            return Err(format!("{g:?}: write free:<out>:<in>, influences as fractions (free:0.40:0.91)"));
+        };
+        // fit_graph.py writes fractions; percents are taken too.
+        let pct = |x: f64| if x <= 1.0 { x * 100.0 } else { x };
+        let (o, i) = (side(0.0, pct(a)), side(0.0, pct(b)));
+        if !valid_side(o) || !valid_side(i) {
+            return Err(format!("{g:?}: influences are fractions in (0, 1]"));
+        }
+        return Ok(((o, i), ease_words(o, i)));
+    }
+    if squash(g) == "linear" {
+        return Ok(((side(1.0, 100.0 / 3.0), side(1.0, 100.0 / 3.0)), "linear".into()));
+    }
+    let c = profile.find(g).ok_or_else(|| format!("no curve {g:?} in the profile (taste.profile lists them), and not free:<out>:<in> or linear"))?;
+    Ok((c.at(secs), c.name.clone()))
+}
+
+fn path_matches(ev: &str, path: &str) -> bool {
+    let ev = ev.trim();
+    let k = squash(ev.strip_prefix("layer/").unwrap_or(ev));
+    !k.is_empty() && (k == squash(path) || path.rsplit('/').next().is_some_and(|last| squash(last) == k))
+}
+
+fn layer_matches(ev: &str, l: &Layer) -> bool {
+    let ev = ev.trim();
+    ev == l.name || ev.eq_ignore_ascii_case(&l.name) || ev.strip_prefix('#').and_then(|x| x.parse::<u64>().ok()) == Some(l.id.0)
+}
+
+/// The rebuild's evidence for move `i` (first key at comp second `t0`) of `path` on `l`.
+pub fn evidence<'a>(rb: &'a Rebuild, l: &Layer, path: &str, i: usize, t0: f64, fps: f64) -> Option<(usize, &'a RefMove)> {
+    rb.moves.iter().enumerate().take(effectcraft_project::rebuild::MAX_MOVES).find(|(_, m)| {
+        layer_matches(&m.layer, l)
+            && path_matches(&m.path, path)
+            && match (m.key, m.frame) {
+                (Some(k), _) => k == i,
+                (None, Some(f)) => f.is_finite() && (t0 * fps - f).abs() <= 1.0 + 1e-6,
+                (None, None) => true,
+            }
+    })
+}
+
+/// Judge `j` against its reference fit `ev` (entry `n` of `rb`); `dv` is the move's value change.
+fn against_reference(profile: &Profile, rb: &Rebuild, n: usize, ev: &RefMove, dv: f64, j: &mut Judged) {
+    // An expression drives it, or no ease could be read: the profile's verdict stands.
+    let Some(ease) = j.ease else { return };
+    let secs = (j.t1 - j.t0).abs().max(1e-9);
+    let name = rb.label();
+    let what = format!("{} {} ({})", j.layer_name, j.property, j.kind.id());
+    let (fitted, curve) = match reference_ease(profile, ev, secs) {
+        Ok(x) => x,
+        Err(e) => {
+            j.message = format!("{} (rebuild of {name}: its fit for this move can't be read: {e})", j.message);
+            return;
+        }
+    };
+    let tolerance = rb.tolerance.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(profile.rules.match_within);
+    let gap = distance(ease, fitted);
+    let fit = ev.fit.clone().filter(|f| f.rms.is_finite() && f.rms >= 0.0);
+    let fit_pct = fit.as_ref().map(|f| if f.unit.trim() == "%" { f.rms } else { f.rms / dv.abs().max(1e-9) * 100.0 });
+    let fit_words = fit.as_ref().map(|f| format!("; fit RMS {:.1} {}", f.rms, if f.unit.trim() == "%" { "%" } else { f.unit.trim() })).unwrap_or_default();
+    let info = if j.problems.is_empty() {
+        format!("Elias's profile (info only): {} in his ranges", j.verdict.mark())
+    } else {
+        format!("Elias's profile (info only): {} {}", j.verdict.mark(), j.problems.join("; "))
+    };
+    let r = RefJudged {
+        evidence: n,
+        name: name.clone(),
+        curve: curve.clone(),
+        ease: fitted,
+        gap: (gap * 10.0).round() / 10.0,
+        tolerance,
+        fit,
+        fit_pct: fit_pct.map(|p| (p * 10.0).round() / 10.0),
+        profile: j.verdict,
+        profile_problems: std::mem::take(&mut j.problems),
+        profile_message: j.message.clone(),
+    };
+    if gap <= tolerance {
+        j.blocking = false;
+        match fit_pct.filter(|p| *p > LOOSE_FIT) {
+            Some(p) => {
+                j.verdict = Verdict::Close;
+                j.message = format!(
+                    "{what}: 🟡 matches reference {name} ({curve}, {gap:.1} % off), but the fit itself is loose (RMS {p:.0} % of the travel): check it against the reference by eye. {info}"
+                );
+            }
+            None => {
+                j.verdict = Verdict::Approved;
+                j.curve = Some(format!("reference {name}: {curve}"));
+                j.message = format!("{what}: ✅ matches reference {name}: {curve} ({gap:.1} % off{fit_words}). {info}");
+            }
+        }
+    } else {
+        j.verdict = Verdict::Off;
+        j.blocking = true;
+        j.problems.push(format!("drifted from the reference fit: {gap:.0} % off {curve} (tolerance {tolerance:.0} %)"));
+        j.message = format!(
+            "{what}: ❌ drifted from reference {name}: {gap:.0} % off its fit, {curve} ({}). Fix: taste.apply {{layer: {}, path: \"{}\", key: {}, curve: \"reference\"}} puts the fitted ease back. {info}",
+            differs(ease, fitted),
+            j.at.layer.0,
+            j.path,
+            j.at.key
+        );
+    }
+    j.reference = Some(r);
+}
+
+/// Which profile curve (any status) has `j`'s shape; the message says its status.
+fn ease_source(profile: &Profile, j: &mut Judged, why: &'static str) {
+    let secs = (j.t1 - j.t0).abs().max(1e-9);
+    let curve = j.ease.and_then(|e| {
+        profile
+            .curves
+            .iter()
+            .map(|c| (c, distance(e, c.at(secs))))
+            .filter(|(_, d)| *d <= profile.rules.match_within)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(c, d)| (c.clone(), (d * 10.0).round() / 10.0))
+    });
+    let note = match &curve {
+        Some((c, _)) if c.status == Status::Candidate => {
+            format!(" Reference ease: ⏳ candidate {} ({}), waiting for Elias (taste.approve {{id: \"{}\"}}, from him).", c.name, c.source, c.id)
+        }
+        Some((c, _)) => format!(" Reference ease: {} {} ({}).", c.status.mark(), c.name, c.status.id()),
+        None if j.ease.is_some() => " Reference ease: not filed yet (taste.rebuild files a rebuild's fits, taste.propose one move).".into(),
+        None => String::new(),
+    };
+    j.message.push_str(&note);
+    j.ease_source = Some(EaseSource { why, curve });
+}
+
+/// Evidence entries of `rb` no judged move in `moves` used.
+pub fn unused_evidence(rb: &Rebuild, moves: &[Judged]) -> Vec<usize> {
+    (0..rb.moves.len()).filter(|n| !moves.iter().any(|m| m.reference.as_ref().is_some_and(|r| r.evidence == *n))).collect()
 }

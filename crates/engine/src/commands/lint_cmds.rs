@@ -404,11 +404,15 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
                 (crate::taste::Verdict::Off, false) => lint::Severity::Warning,
                 _ => lint::Severity::Info,
             };
-            let fix = m
-                .nearest
-                .as_ref()
-                .map(|(id, _, _)| format!(" Fix: taste.apply {{layer: {}, path: \"{}\", key: {}, curve: \"{id}\"}}.", m.at.layer.0, m.path, m.at.key))
-                .unwrap_or_default();
+            // A rebuild's drifted move goes back to its reference fit (its message names it).
+            let fix = if m.reference.is_some() {
+                String::new()
+            } else {
+                m.nearest
+                    .as_ref()
+                    .map(|(id, _, _)| format!(" Fix: taste.apply {{layer: {}, path: \"{}\", key: {}, curve: \"{id}\"}}.", m.at.layer.0, m.path, m.at.key))
+                    .unwrap_or_default()
+            };
             occurrences.push((
                 Tick::from_seconds_f64(m.t0),
                 lint::Finding { rule: "off-taste", severity, layer: m.at.layer, other: None, inner: None, message: format!("{}{fix}", m.message), fix: None },

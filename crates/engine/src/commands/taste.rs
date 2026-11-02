@@ -4,8 +4,13 @@
 //! draws a property's value and speed graphs as a PNG, `taste.profile` lists the curves and
 //! rules, `taste.learn` finds curves in his comps the profile doesn't know, `taste.propose`
 //! files a ⏳ candidate, and `taste.approve` (Elias only, never an agent client) approves or
-//! rejects one. The lint rule `off-taste` (`render.lint`) runs the same check.
+//! rejects one. `taste.rebuild` marks a comp as a rebuild of a reference and stores the reference
+//! editor's fitted ease per move (rebuild mode, [`crate::taste`]); its fits become ⏳ candidates
+//! tagged `reference <name>`. The lint rule `off-taste` (`render.lint`) runs the same check.
 
+use std::sync::Arc;
+
+use effectcraft_project::rebuild as taste_rebuild;
 use effectcraft_project::{ItemId, LayerId};
 use effectcraft_render::EvalCtx;
 use effectcraft_time::Tick;
@@ -98,14 +103,57 @@ pub(crate) fn move_json(s: &Session, cid: ItemId, m: &Judged) -> Value {
     }
     if let Some((id, name, d)) = &m.nearest {
         o["nearest"] = json!({"id": id, "name": name, "gap": d});
-        if m.verdict != Verdict::Approved {
+        if m.verdict != Verdict::Approved && m.reference.is_none() {
             o["fix"] = fix_call(cid, m, id);
         }
+    }
+    if let Some(r) = &m.reference {
+        let mut j = json!({
+            "name": r.name, "curve": r.curve,
+            "ease": {"out": side_json(r.ease.0), "in": side_json(r.ease.1)},
+            "gap": r.gap, "tolerance": r.tolerance, "evidence": r.evidence,
+            "profile": {"verdict": r.profile.id(), "mark": r.profile.mark(), "problems": r.profile_problems, "message": r.profile_message},
+        });
+        if let Some(f) = &r.fit {
+            j["fit"] = serde_json::to_value(f).unwrap_or(Value::Null);
+        }
+        if let Some(p) = r.fit_pct {
+            j["fitPct"] = json!(p);
+        }
+        o["reference"] = j;
+        if m.verdict == Verdict::Off {
+            o["fix"] = fix_call(cid, m, "reference");
+        }
+    }
+    if let Some(e) = &m.ease_source {
+        o["referenceEase"] = match &e.curve {
+            Some((c, gap)) => json!({
+                "why": e.why, "status": c.status.id(), "mark": c.status.mark(),
+                "id": c.id, "name": c.name, "source": c.source, "gap": gap,
+            }),
+            None => json!({"why": e.why, "status": "none", "mark": "", "note": "no profile curve has this shape yet"}),
+        };
     }
     if !m.problems.is_empty() {
         o["problems"] = json!(m.problems);
     }
     o
+}
+
+/// A rebuild comp's state for replies: its reference and how its evidence was used by `moves`.
+fn rebuild_json(rb: &taste_rebuild::Rebuild, moves: &[Judged]) -> Value {
+    let judged: Vec<&Judged> = moves.iter().filter(|m| m.reference.is_some()).collect();
+    let n = |v: Verdict| judged.iter().filter(|m| m.verdict == v).count();
+    let unused: Vec<Value> = taste::unused_evidence(rb, moves)
+        .into_iter()
+        .filter_map(|i| rb.moves.get(i).map(|m| json!({"evidence": i, "layer": m.layer, "path": m.path, "key": m.key, "frame": m.frame})))
+        .collect();
+    json!({
+        "reference": rb.reference, "name": rb.label(), "tolerance": rb.tolerance,
+        "evidence": rb.moves.len(), "judged": judged.len(),
+        "matched": n(Verdict::Approved), "loose": n(Verdict::Close), "drifted": n(Verdict::Off),
+        "unmatched": unused,
+    })
 }
 
 /// The comp range of `p` (`start`/`end` comp seconds; default the whole comp).
@@ -138,6 +186,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     let (mut moves, truncated) =
         taste::check(&prof, &EvalCtx::new(&s.project, cid, comp, Tick::ZERO), only.as_deref(), start, end, b_p(p, "all").unwrap_or(false));
     let (ok, close, off, blocking) = taste::summary(&moves);
+    let rebuild = comp.rebuild.as_deref().map(|rb| rebuild_json(rb, &moves));
     if b_p(p, "problemsOnly").unwrap_or(false) {
         moves.retain(|m| m.verdict != Verdict::Approved);
     }
@@ -157,6 +206,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
         "moves": list,
         "moveTypes": per_type,
         "blockAt": prof.rules.block_at,
+        "rebuild": rebuild,
     }))
 }
 
@@ -186,7 +236,28 @@ pub(crate) fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         * l.stretch.abs()
         / 100.0;
     let want = str_p(p, "curve").unwrap_or("nearest");
-    let curve: Curve = if taste::squash(want) == "nearest" {
+    let curve: Curve = if taste::squash(want) == "reference" {
+        // Rebuild mode: the reference editor's fitted ease for this move.
+        let (moves, _) = taste::check(&prof, &EvalCtx::new(&s.project, cid, comp, Tick::ZERO), Some(&[lid]), f64::MIN, f64::MAX, true);
+        let m = moves
+            .iter()
+            .find(|m| m.at.uid == uid && m.at.key == key)
+            .ok_or_else(|| bad(C, "that key pair isn't a move (its value doesn't change, or it holds)"))?;
+        let r =
+            m.reference.as_ref().ok_or_else(|| bad(C, "no reference fit for this move: the comp isn't a rebuild, or taste.rebuild has no evidence for it"))?;
+        Curve {
+            id: "reference".into(),
+            name: format!("reference {}: {}", r.name, r.curve),
+            out: r.ease.0,
+            inn: r.ease.1,
+            roles: vec![m.kind],
+            status: Status::Approved,
+            family: None,
+            source: format!("reference {}", r.name),
+            note: String::new(),
+            said: String::new(),
+        }
+    } else if taste::squash(want) == "nearest" {
         let (moves, _) = taste::check(&prof, &EvalCtx::new(&s.project, cid, comp, Tick::ZERO), Some(&[lid]), f64::MIN, f64::MAX, true);
         let m = moves
             .iter()
@@ -288,7 +359,11 @@ fn propose(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(C, "missing `name`"))?.to_string();
     let mut roles = roles_p(p, C)?;
     let (out, inn, source) = if p.get("out").is_some() {
-        (side_p(p, "out", C)?, side_p(p, "in", C)?, str_p(p, "source").unwrap_or("proposed").to_string())
+        let source = match str_p(p, "reference").map(str::trim).filter(|r| !r.is_empty()) {
+            Some(r) => format!("reference {r}"),
+            None => str_p(p, "source").unwrap_or("proposed").to_string(),
+        };
+        (side_p(p, "out", C)?, side_p(p, "in", C)?, source)
     } else {
         let (cid, lid, uid) = prop_ref(s, p, C)?;
         let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
@@ -300,7 +375,12 @@ fn propose(s: &mut Session, p: &Value) -> Result<Value> {
             roles.push(m.kind);
         }
         let comp_name = s.project.item(cid).map(|i| i.name.clone()).unwrap_or_default();
-        (o, i, format!("{comp_name} › {} › {} @ {:.2} s", m.layer_name, m.path, m.t0))
+        let at = format!("{comp_name} › {} › {} @ {:.2} s", m.layer_name, m.path, m.t0);
+        let source = match str_p(p, "reference").map(str::trim).filter(|r| !r.is_empty()) {
+            Some(r) => format!("reference {r} ({at})"),
+            None => at,
+        };
+        (o, i, source)
     };
     if roles.is_empty() {
         return Err(bad(C, "pass `roles` (the move types it is for)"));
@@ -418,6 +498,177 @@ fn learn(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// Whether two evidence entries name the same move (a newer one replaces the older).
+fn same_move(a: &taste_rebuild::RefMove, b: &taste_rebuild::RefMove) -> bool {
+    a.layer.trim().eq_ignore_ascii_case(b.layer.trim())
+        && taste::squash(a.path.trim_start_matches("layer/")) == taste::squash(b.path.trim_start_matches("layer/"))
+        && a.key == b.key
+        && a.frame == b.frame
+}
+
+fn rebuild(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "taste.rebuild";
+    let cid = comp_id(s, p)?;
+    let old = s.project.comp(cid).ok_or(EngineError::NoComp)?.rebuild.clone();
+    if b_p(p, "clear").unwrap_or(false) {
+        if old.is_some() {
+            s.edit("Clear Rebuild", None, |proj, _| {
+                proj.comp_mut(cid).ok_or(EngineError::NoComp)?.rebuild = None;
+                Ok(())
+            })?;
+        }
+        return Ok(json!({"comp": cid.0, "rebuild": null, "message": "not a rebuild: every move is judged against Elias's profile"}));
+    }
+    // The evidence: `file` (the same JSON), then the params on top.
+    let mut doc = match str_p(p, "file") {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| bad(C, format!("can't read {path}: {e}")))?;
+            let v: Value = serde_json::from_str(&text).map_err(|e| bad(C, format!("{path} is not rebuild JSON: {e}")))?;
+            if !v.is_object() {
+                return Err(bad(C, format!("{path} holds a JSON object {{reference, name?, tolerance?, moves}}")));
+            }
+            v
+        }
+        None => json!({}),
+    };
+    for k in ["reference", "name", "tolerance", "moves"] {
+        if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
+            doc[k] = v.clone();
+        }
+    }
+    let given = doc.as_object().is_some_and(|o| !o.is_empty());
+    let (prof, _) = profile(s);
+    let mut rb: taste_rebuild::Rebuild = match (&old, given) {
+        (None, false) => return Err(bad(C, "the comp isn't a rebuild yet: pass `reference` and `moves` (or `file`)")),
+        (Some(o), _) => (**o).clone(),
+        (None, true) => taste_rebuild::Rebuild::default(),
+    };
+    if b_p(p, "replace").unwrap_or(false) {
+        rb.moves.clear();
+    }
+    if let Some(r) = doc.get("reference").filter(|v| !v.is_null()) {
+        rb.reference = r.as_str().map(str::trim).filter(|r| !r.is_empty()).ok_or_else(|| bad(C, "`reference` is the reference's path or URL"))?.to_string();
+    }
+    if let Some(n) = doc.get("name").filter(|v| !v.is_null()) {
+        rb.name = n.as_str().ok_or_else(|| bad(C, "`name` is text"))?.trim().to_string();
+    }
+    if let Some(t) = doc.get("tolerance").filter(|v| !v.is_null()) {
+        let t =
+            t.as_f64().filter(|t| t.is_finite() && *t > 0.0 && *t <= 50.0).ok_or_else(|| bad(C, "`tolerance` is a percent of the move's progress (0, 50]"))?;
+        rb.tolerance = Some(t);
+    }
+    if let Some(m) = doc.get("moves").filter(|v| !v.is_null()) {
+        let incoming: Vec<taste_rebuild::RefMove> = serde_json::from_value(m.clone())
+            .map_err(|e| bad(C, format!("`moves` is a list of {{layer, path, key?|frame?, graph|ease, fit?, samples?, note?}}: {e}")))?;
+        for m in incoming {
+            rb.moves.retain(|x| !same_move(x, &m));
+            rb.moves.push(m);
+        }
+    }
+    if rb.reference.trim().is_empty() {
+        return Err(bad(C, "missing `reference` (the reference's path or URL)"));
+    }
+    if rb.moves.len() > taste_rebuild::MAX_MOVES {
+        return Err(bad(C, format!("at most {} moves", taste_rebuild::MAX_MOVES)));
+    }
+    let wrong: Vec<String> = rb
+        .moves
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            if m.layer.trim().is_empty() || m.path.trim().is_empty() {
+                return Some(format!("moves[{i}]: needs `layer` (its name) and `path` (transform/position)"));
+            }
+            taste::reference_ease(&prof, m, 1.0).err().map(|e| format!("moves[{i}] ({} {}): {e}", m.layer, m.path))
+        })
+        .take(8)
+        .collect();
+    if !wrong.is_empty() {
+        return Err(bad(C, wrong.join("; ")));
+    }
+    if given && old.as_deref() != Some(&rb) {
+        let stored = Arc::new(rb.clone());
+        s.edit("Set Rebuild Evidence", None, |proj, _| {
+            proj.comp_mut(cid).ok_or(EngineError::NoComp)?.rebuild = Some(stored);
+            Ok(())
+        })?;
+    }
+    // Judge the comp against it (every animated property: evidence may name any).
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let (moves, _) = taste::check(&prof, &EvalCtx::new(&s.project, cid, comp, Tick::ZERO), None, f64::MIN, f64::MAX, true);
+    let comp_name = s.project.item(cid).map(|i| i.name.clone()).unwrap_or_default();
+    // Its fits become ⏳ candidates tagged `reference <name>` (Elias approves them).
+    let label = rb.label();
+    let (mut saved, mut known, mut skipped) = (vec![], vec![], Value::Null);
+    if b_p(p, "candidates").unwrap_or(true) {
+        let (_, mut stored) = profile(s);
+        let mut cur = Profile::with(&stored);
+        let mut added = false;
+        for m in moves.iter() {
+            let Some(r) = &m.reference else { continue };
+            let secs = (m.t1 - m.t0).abs().max(1e-9);
+            let near = cur.curves.iter().map(|c| (c, taste::distance(r.ease, c.at(secs)))).min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((c, d)) = near.filter(|(_, d)| *d <= cur.rules.match_within) {
+                known.push(json!({"layerName": m.layer_name, "path": m.path, "key": m.at.key, "id": c.id, "name": c.name, "status": c.status.id(), "gap": (d * 10.0).round() / 10.0}));
+                continue;
+            }
+            let (o, i) = r.ease;
+            let base = format!("ref-{}-{}-{:.0}-{:.0}", taste::squash(&label), m.kind.id(), o.influence, i.influence);
+            let id =
+                (0..100).map(|n| if n == 0 { base.clone() } else { format!("{base}-{n}") }).find(|id| !cur.curves.iter().any(|c| &c.id == id)).unwrap_or(base);
+            let c = Curve {
+                id: id.clone(),
+                name: format!("Ref {label}: {} {}", m.kind.id(), r.curve),
+                out: o,
+                inn: i,
+                roles: vec![m.kind],
+                status: Status::Candidate,
+                family: None,
+                source: format!("reference {label}"),
+                note: format!(
+                    "fitted from {} for {comp_name} › {} › {} @ {:.2} s{}",
+                    rb.reference,
+                    m.layer_name,
+                    m.path,
+                    m.t0,
+                    r.fit.as_ref().map(|f| format!(", fit RMS {:.1} {}", f.rms, f.unit)).unwrap_or_default()
+                ),
+                said: String::new(),
+            };
+            saved.push(curve_json(&cur, &c));
+            stored.curves.push(c.clone());
+            cur.curves.push(c);
+            added = true;
+        }
+        if added && let Err(e) = save(s, &stored, C) {
+            skipped = json!(e.to_string());
+            saved.clear();
+        }
+    }
+    let (ok, close, off, blocking) = taste::summary(&moves);
+    let rebuild = rebuild_json(&rb, &moves);
+    let list: Vec<Value> = moves.iter().filter(|m| m.reference.is_some()).map(|m| move_json(s, cid, m)).collect();
+    let message = format!(
+        "{comp_name} is a rebuild of {label}: {} of {} evidence moves judged against their fit (✅ {} · 🟡 {} · ❌ {}){}; {} ⏳ candidate(s) filed",
+        rebuild["judged"],
+        rb.moves.len(),
+        rebuild["matched"],
+        rebuild["loose"],
+        rebuild["drifted"],
+        if rebuild["unmatched"].as_array().is_some_and(|u| !u.is_empty()) { ", some evidence matches no keyed move (see unmatched)" } else { "" },
+        saved.len()
+    );
+    Ok(json!({
+        "comp": cid.0,
+        "compName": comp_name,
+        "rebuild": rebuild,
+        "moves": list,
+        "candidates": {"saved": saved, "known": known, "skipped": skipped},
+        "summary": {"approved": ok, "close": close, "off": off, "blocking": blocking, "line": format!("✅ {ok} · 🟡 {close} · ❌ {off} ({blocking} blocking)")},
+        "message": message,
+    }))
+}
+
 fn graph(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "taste.graph";
     let out = str_p(p, "out").ok_or_else(|| bad(C, "missing `out` (a .png path)"))?;
@@ -464,7 +715,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "taste.check",
             "Taste Check",
-            "{comp?, layers?|layer? (default every layer), start? (comp s), end? (comp s), all? (also other animated properties: hard fails only; default position, scale, rotation, opacity), problemsOnly? (leave out ✅ moves)} → {comp, compName, summary {approved, close, off, blocking, line}, clean (no blocking ❌), truncated, moves: [{layer, layerName, path, property, key (the move's first key, 0-based), from/to {time, tc, frame}, frames, moveType (entrance|exit|move|fade-in|fade-out|scale-pop|scrub|camera (a camera or its null rig: on → on criteria, no speed cap, warn only until camera curves are approved)|continuous (keys past the layer's first or last frame on screen, covering all of it: an orbit, a drift; hard fails + speed cap only, warn only)|other (other properties, and layers with no pixels: hard fails only)), verdict (approved|close|off), mark (✅|🟡|❌), blocking, message, ease {out, in} (normalised speed, influence %), criteria {peakPosition %, sharpness (fastest frame ÷ average), tail10Frames (frames on the last 10 % of the travel), pxPerFrame?, framePerFrame? (% of the comp width per frame)}, curve? (the approved curve it matches), nearest? {id, name, gap %}, fix? {command: taste.apply, params}, problems?}], moveTypes: [{moveType, approvedCurves, blocks}], blockAt}. Judges every keyframed move against Elias's ease profile: ❌ = linear, Easy Ease 33/33, a speed jump at a key, baked one-key-per-frame, or outside his learned ranges (peak position per move type, peak sharpness for its length, speed cap in % of the frame per frame, entrance landing length); 🟡 = in range but not one of his approved curves; ✅ = an approved curve for that move type. A ❌ blocks handover only when its move type has blockAt approved curves.",
+            "{comp?, layers?|layer? (default every layer), start? (comp s), end? (comp s), all? (also other animated properties: hard fails only; default position, scale, rotation, opacity), problemsOnly? (leave out ✅ moves)} → {comp, compName, summary {approved, close, off, blocking, line}, clean (no blocking ❌), truncated, moves: [{layer, layerName, path, property, key (the move's first key, 0-based), from/to {time, tc, frame}, frames, moveType (entrance|exit|move|fade-in|fade-out|scale-pop|scrub|camera (a camera or its null rig: on → on criteria, no speed cap, warn only until camera curves are approved)|continuous (keys past the layer's first or last frame on screen, covering all of it: an orbit, a drift; hard fails + speed cap only, warn only)|other (other properties, and layers with no pixels: hard fails only)), verdict (approved|close|off), mark (✅|🟡|❌), blocking, message, ease {out, in} (normalised speed, influence %), criteria {peakPosition %, sharpness (fastest frame ÷ average), tail10Frames (frames on the last 10 % of the travel), pxPerFrame?, framePerFrame? (% of the comp width per frame)}, curve? (the approved curve it matches), nearest? {id, name, gap %}, fix? {command: taste.apply, params}, problems?, reference? (rebuild mode: {name, curve, ease, gap %, tolerance, evidence, fit?, fitPct?, profile {verdict, mark, problems, message}: what Elias's profile alone says, info only}), referenceEase? ({why, status: approved|candidate|rejected|none, mark, id?, name?, source?, gap?}: for layers or comps whose comment carries the `reference ease` tag, and moves with rebuild evidence: the profile curve with this shape and its status)}], moveTypes: [{moveType, approvedCurves, blocks}], blockAt, rebuild? ({reference, name, tolerance, evidence, judged, matched, loose, drifted, unmatched: evidence no move in the range used})}. Judges every keyframed move against Elias's ease profile: ❌ = linear, Easy Ease 33/33, a speed jump at a key, baked one-key-per-frame, or outside his learned ranges (peak position per move type, peak sharpness for its length, speed cap in % of the frame per frame, entrance landing length; a shape he approved for the move type passes the peak and landing ranges); 🟡 = in range but not one of his approved curves; ✅ = an approved curve for that move type. A ❌ blocks handover only when its move type has blockAt approved curves. Rebuild mode (a comp marked with taste.rebuild): a move with reference evidence is ✅ when its ease matches the reference fit within the rebuild's tolerance, 🟡 when it matches a loose fit (RMS > 10 % of the travel), ❌ blocking when it drifted (fix: taste.apply curve reference); moves without evidence are judged as usual.",
             check
         ),
         cmd!(
@@ -472,9 +723,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Taste Curve",
             [],
             None,
-            "{comp?, layer, path|prop, key? (the move's first key, 0-based; default when the property has 2 keys), curve? (a curve id or name from taste.profile, or nearest (default): the nearest approved curve for its move type)} → {comp, layer, path, property, key, curve, curveName, status, out, in, message, after (the move judged again)}. Puts the curve on keys key → key + 1 (out of the first, in of the second), keeping values and times; Expo In-Out's influences follow the move's length. One undo step.",
+            "{comp?, layer, path|prop, key? (the move's first key, 0-based; default when the property has 2 keys), curve? (a curve id or name from taste.profile, nearest (default): the nearest approved curve for its move type, or reference: the move's reference fit in a rebuild comp)} → {comp, layer, path, property, key, curve, curveName, status, out, in, message, after (the move judged again)}. Puts the curve on keys key → key + 1 (out of the first, in of the second), keeping values and times; Expo In-Out's influences follow the move's length. One undo step.",
             has_comp,
             apply
+        ),
+        cmd!(
+            "taste.rebuild",
+            "Mark as Rebuild of a Reference",
+            [],
+            None,
+            "{comp?, reference (the reference's path or URL), name? (short: \"kunal TR\"; default its file name), tolerance? (largest progress gap %, default the profile's matchWithin 5), moves: [{layer (name, or #id), path (transform/position; layer/… and position also match), key? (the move's first key, 0-based) | frame? (comp frame of its first key, ±1) (neither: every move of the property), graph (a profile curve name or id, fit_graph.py's free:<out>:<in> with influences as fractions, or linear) | ease {out {speed, influence}, in {…}} (normalised speed, influence %), fit? {rms, worst?, unit: px (the property's units, as fit_graph.py prints) | % (of the travel)}, samples? (the measured samples' file), note?}], file? (a JSON file with the same fields; params win), replace? (drop the stored moves first; default merge: a move for the same layer, path and key/frame replaces the old one), candidates? (default true: file each fit no profile curve has as a ⏳ candidate tagged source `reference <name>`), clear? (true: no longer a rebuild)} → {comp, compName, rebuild {reference, name, tolerance, evidence, judged, matched, loose, drifted, unmatched}, moves (the moves with evidence, as taste.check), candidates {saved, known, skipped}, summary, message}. Marks the comp as a rebuild of a reference: taste.check, the off-taste lint and handover.check then judge each move with evidence against its reference fit instead of Elias's profile (his rules become info). Saved with the comp (survives save/load and copying the comp). With only `comp`, reports the stored state. One undo step.",
+            has_comp,
+            rebuild
         ),
         query!(
             "taste.profile",
@@ -485,7 +745,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "taste.propose",
             "Propose Taste Curve",
-            "{name, roles? ([entrance|exit|move|fade-in|fade-out|scale-pop]), out? {speed, influence}, in? {speed, influence} (normalised speed, influence %), source?, note? | comp?, layer, path|prop, key? (read the curve from that move; roles default to its move type)} → {curve, nearest, message}. Files a ⏳ candidate: it is not used for ✅ until Elias approves it.",
+            "{name, roles? ([entrance|exit|move|fade-in|fade-out|scale-pop]), out? {speed, influence}, in? {speed, influence} (normalised speed, influence %), source?, note? | comp?, layer, path|prop, key? (read the curve from that move; roles default to its move type), reference? (the reference's name: tags it source `reference <name>`)} → {curve, nearest, message}. Files a ⏳ candidate: it is not used for ✅ until Elias approves it.",
             propose
         ),
         query!(

@@ -572,3 +572,157 @@ fn orbits_and_drifts_through_the_whole_layer_are_continuous_and_only_warn() {
     assert_eq!(of(card)["moveType"], "entrance", "{r:#}");
     assert_eq!(r["clean"], true, "{r:#}");
 }
+
+// ---------------------------------------------------------------- rebuild mode (2 Nov 2026)
+
+/// An on → on slide of the card, 520 px right over 20 frames from frame 30, with these eases.
+fn slide(s: &mut Session, cid: ItemId, l: u64, out: (f64, f64), inn: (f64, f64)) {
+    key(s, l, "transform/position", 1.0, json!([700.0, 540.0]));
+    key(s, l, "transform/position", 1.0 + 20.0 / 30.0, json!([1220.0, 540.0]));
+    ease(s, cid, l, "transform/position", 0, out, inn);
+}
+
+/// Marks the active comp as a rebuild of "kunal TR" whose editor slid the card with a custom
+/// out 20 % / in 75 % (peaks at 19 %: outside his on → on range), as fit_graph.py --free fits it.
+fn mark_rebuild(s: &mut Session) -> Value {
+    s.execute_checked(
+        "taste.rebuild",
+        json!({
+            "reference": "/refs/kunal/TR.mp4", "name": "kunal TR",
+            "moves": [{"layer": "Card", "path": "layer/transform/position", "frame": 30, "graph": "free:0.20:0.75",
+                       "fit": {"rms": 3.0, "worst": 7.5, "unit": "px"}, "samples": "fit/card_x.json"}],
+        }),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_rebuild_that_matches_its_reference_is_approved_and_ready() {
+    let (mut s, cid, l) = comp();
+    slide(&mut s, cid, l, (0.0, 20.0), (0.0, 75.0));
+    // His rules alone: an on → on move peaking at 19 % is ❌ and blocks.
+    let before = only(&check(&mut s), "transform/position");
+    assert_eq!((before["moveType"].as_str(), before["verdict"].as_str(), before["blocking"].as_bool()), (Some("move"), Some("off"), Some(true)), "{before:#}");
+    let r = mark_rebuild(&mut s);
+    assert_eq!(r["rebuild"]["matched"], 1, "{r:#}");
+    assert_eq!(r["rebuild"]["unmatched"], json!([]), "{r:#}");
+    let c = check(&mut s);
+    assert_eq!(c["rebuild"]["name"], "kunal TR", "{c:#}");
+    let pos = only(&c, "transform/position");
+    assert_eq!(pos["verdict"], "approved", "{pos:#}");
+    assert_eq!(pos["blocking"], false);
+    assert!(pos["curve"].as_str().unwrap().starts_with("reference kunal TR"), "{pos:#}");
+    assert!(pos["reference"]["gap"].as_f64().unwrap() < 1.0, "{pos:#}");
+    // His profile's verdict is kept, as info.
+    assert_eq!(pos["reference"]["profile"]["verdict"], "off", "{pos:#}");
+    assert!(pos["message"].as_str().unwrap().contains("info only"), "{pos:#}");
+    assert!(pos.get("fix").is_none(), "{pos:#}");
+    assert_eq!(c["clean"], true, "{c:#}");
+    // The off-taste lint and the handover gate judge it the same way.
+    let lint = s.execute_checked("render.lint", json!({"start": 0.9, "end": 1.8, "rules": ["off-taste"]})).unwrap();
+    assert_eq!(lint["clean"], true, "{lint:#}");
+    let h = s.execute_checked("handover.check", json!({})).unwrap();
+    assert!(h["blocking"].as_array().unwrap().iter().all(|b| b["source"] != "taste"), "{h:#}");
+    assert_eq!(h["ready"], true, "{h:#}");
+    assert_eq!(h["rebuild"]["matched"], 1, "{h:#}");
+    // Saved with the comp: survives save/load (and goes along when the comp is copied).
+    let comp = s.project.comp(cid).unwrap();
+    let back: effectcraft_project::Comp = serde_json::from_value(serde_json::to_value(comp).unwrap()).unwrap();
+    assert_eq!(back.rebuild, comp.rebuild);
+    assert_eq!(back.rebuild.as_ref().unwrap().moves[0].fit.as_ref().unwrap().rms, 3.0);
+}
+
+#[test]
+fn a_rebuild_move_that_drifted_from_its_reference_is_off_and_blocks() {
+    let (mut s, cid, l) = comp();
+    slide(&mut s, cid, l, (0.0, 20.0), (0.0, 75.0));
+    mark_rebuild(&mut s);
+    // The agent "fixed" it to a 50/50 ease: fine by his rules, not what the reference did.
+    ease(&mut s, cid, l, "transform/position", 0, (0.0, 50.0), (0.0, 50.0));
+    let pos = only(&check(&mut s), "transform/position");
+    assert_eq!(pos["verdict"], "off", "{pos:#}");
+    assert_eq!(pos["blocking"], true, "{pos:#}");
+    assert!(pos["message"].as_str().unwrap().contains("drifted from reference kunal TR"), "{pos:#}");
+    assert_ne!(pos["reference"]["profile"]["verdict"], "off", "{pos:#}");
+    let h = s.execute_checked("handover.check", json!({})).unwrap();
+    assert_eq!(h["ready"], false, "{h:#}");
+    assert!(h["blocking"].as_array().unwrap().iter().any(|b| b["source"] == "taste" && b["reference"]["curve"].is_string()), "{h:#}");
+    // The fix puts the fitted ease back.
+    assert_eq!(pos["fix"]["params"]["curve"], "reference", "{pos:#}");
+    let r = s.execute_checked(pos["fix"]["command"].as_str().unwrap(), pos["fix"]["params"].clone()).unwrap();
+    assert_eq!(r["after"]["verdict"], "approved", "{r:#}");
+}
+
+#[test]
+fn a_comp_that_is_not_a_rebuild_is_judged_as_before() {
+    let (mut s, cid, l) = comp();
+    slide(&mut s, cid, l, (0.0, 20.0), (0.0, 75.0));
+    let c = check(&mut s);
+    assert!(c["rebuild"].is_null(), "{c:#}");
+    let pos = only(&c, "transform/position");
+    assert_eq!((pos["verdict"].as_str(), pos["blocking"].as_bool()), (Some("off"), Some(true)), "{pos:#}");
+    assert!(pos.get("reference").is_none() && pos.get("referenceEase").is_none(), "{pos:#}");
+    assert_eq!(pos["fix"]["params"]["curve"], pos["nearest"]["id"], "{pos:#}");
+    // Evidence for another layer leaves the card to his rules, and says it matched nothing.
+    let r = s
+        .execute_checked(
+            "taste.rebuild",
+            json!({"reference": "/refs/kunal/TR.mp4", "moves": [{"layer": "Other", "path": "transform/position", "graph": "free:0.20:0.75"}], "candidates": false}),
+        )
+        .unwrap();
+    assert_eq!(r["rebuild"]["unmatched"].as_array().unwrap().len(), 1, "{r:#}");
+    assert_eq!(r["rebuild"]["name"], "TR", "named after the reference's file: {r:#}");
+    assert_eq!(only(&check(&mut s), "transform/position")["verdict"], "off");
+    // Cleared: not a rebuild any more, one undo step brings it back.
+    mark_rebuild(&mut s);
+    assert_eq!(only(&check(&mut s), "transform/position")["verdict"], "approved");
+    s.execute_checked("taste.rebuild", json!({"clear": true})).unwrap();
+    let c = check(&mut s);
+    assert!(c["rebuild"].is_null(), "{c:#}");
+    assert_eq!(only(&c, "transform/position")["verdict"], "off");
+    assert!(s.execute("edit.undo", json!({})).is_ok());
+    assert_eq!(only(&check(&mut s), "transform/position")["verdict"], "approved");
+    // Unknown curves and missing fields are refused with what's wrong.
+    let e = s.execute_checked("taste.rebuild", json!({"moves": [{"layer": "Card", "path": "transform/position", "graph": "Nope"}]})).unwrap_err();
+    assert!(e.to_string().contains("no curve \"Nope\""), "{e}");
+}
+
+#[test]
+fn reference_eases_become_candidates_that_only_elias_approves() {
+    let (mut s, cid, l) = comp();
+    slide(&mut s, cid, l, (0.0, 20.0), (0.0, 75.0));
+    let r = mark_rebuild(&mut s);
+    let saved = &r["candidates"]["saved"][0];
+    assert_eq!(saved["status"], "candidate", "{r:#}");
+    assert_eq!(saved["source"], "reference kunal TR", "{r:#}");
+    assert_eq!(saved["roles"], json!(["move"]), "{r:#}");
+    let id = saved["id"].as_str().unwrap().to_string();
+    // Asked again, it's known, not filed twice.
+    let again = s.execute_checked("taste.rebuild", json!({})).unwrap();
+    assert_eq!(again["candidates"]["saved"], json!([]), "{again:#}");
+    assert_eq!(again["candidates"]["known"][0]["id"], id, "{again:#}");
+    // The rebuild's move says its ease is a ⏳ candidate.
+    assert_eq!(only(&check(&mut s), "transform/position")["referenceEase"]["status"], "candidate");
+
+    // Elias's own edit uses the part (its layer carries the `reference ease` tag).
+    s.execute("comp.new", json!({"name": "Edit", "width": 1920, "height": 1080, "frameRate": 30, "duration": 10})).unwrap();
+    let edit = s.active_comp_id().unwrap();
+    let part = s.execute("layer.newSolid", json!({"name": "Part", "width": 400, "height": 200, "color": "#236197"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute_checked("layer.setComment", json!({"layers": [part], "comment": "reference ease: kunal TR"})).unwrap();
+    slide(&mut s, edit, part, (0.0, 20.0), (0.0, 75.0));
+    let pos = only(&check(&mut s), "transform/position");
+    assert_eq!(pos["verdict"], "off", "not approved yet: {pos:#}");
+    assert_eq!(pos["referenceEase"]["status"], "candidate", "{pos:#}");
+    assert_eq!(pos["referenceEase"]["id"], id.as_str(), "{pos:#}");
+    assert!(pos["message"].as_str().unwrap().contains("waiting for Elias"), "{pos:#}");
+    // An agent can't approve it.
+    let e = s.execute_checked("taste.approve", json!({"id": id, "said": "looks fine", "client": "claude"})).unwrap_err();
+    assert!(e.to_string().contains("only Elias approves"), "{e}");
+    assert_eq!(only(&check(&mut s), "transform/position")["verdict"], "off");
+    // He approves it: it joins his profile like any approved curve, early peak and all.
+    s.execute_checked("taste.approve", json!({"id": id, "said": "yes, keep kunal's slide"})).unwrap();
+    let pos = only(&check(&mut s), "transform/position");
+    assert_eq!(pos["verdict"], "approved", "{pos:#}");
+    assert_eq!(pos["referenceEase"]["status"], "approved", "{pos:#}");
+    assert!(pos["message"].as_str().unwrap().contains("outside the usual range"), "{pos:#}");
+}

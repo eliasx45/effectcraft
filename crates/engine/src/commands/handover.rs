@@ -1,7 +1,9 @@
 //! The handover gate (A/B round 3): a client's last `taste.check` and `render.lint` are
 //! remembered, and its own edits after them to layers in the range they covered make
 //! `agent.notices` say once that they are stale; `handover.check` runs both over the comp's
-//! animated range and says whether the comp is ready to hand over.
+//! animated range and says whether the comp is ready to hand over. In a rebuild comp
+//! (`taste.rebuild`) the taste half judges moves with reference evidence against their reference
+//! fit, so a faithful rebuild of an early-peaking reference can be ready.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -182,6 +184,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
         let entry = json!({
             "source": "taste", "layer": m["layer"], "layerName": m["layerName"], "path": m["path"],
             "time": m["from"]["time"], "until": m["to"]["time"], "mark": m["mark"], "message": m["message"], "fix": m["fix"],
+            "reference": m.get("reference").map(|r| json!({"curve": r["curve"], "gap": r["gap"], "tolerance": r["tolerance"]})),
         });
         if m["blocking"] == true {
             blocking.push(entry);
@@ -223,6 +226,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
         "taste": taste["summary"]["line"],
         "lint": lint["counts"],
         "stale": stale,
+        "rebuild": taste.get("rebuild").cloned().unwrap_or(Value::Null),
         "text": text,
     }))
 }
@@ -231,7 +235,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![query!(
         "handover.check",
         "Handover Check",
-        "{comp?, start? (comp s), end? (comp s; default the animated range: first to last keyframed move, else the work area), step? (lint sampling, s)} → {ready, comp, compName, range {start, end}, counts {blocking, warnings}, blocking: [...], warnings: [...] (each {source: taste|lint, layer, layerName, time, until, message, fix?, path?|rule?}; at most 30 each), taste (summary line), lint (counts), stale (layers changed since the client's checks), text}. Runs taste.check and render.lint over the comp's animated range in one call: ready is false while a blocking taste ❌ or a lint error remains. Run it last, after the final edit, before handing a comp over.",
+        "{comp?, start? (comp s), end? (comp s; default the animated range: first to last keyframed move, else the work area), step? (lint sampling, s)} → {ready, comp, compName, range {start, end}, counts {blocking, warnings}, blocking: [...], warnings: [...] (each {source: taste|lint, layer, layerName, time, until, message, fix?, path?|rule?}; at most 30 each), taste (summary line), lint (counts), stale (layers changed since the client's checks), rebuild? (taste.check's rebuild block when the comp is a rebuild of a reference), text}. Runs taste.check and render.lint over the comp's animated range in one call: ready is false while a blocking taste ❌ or a lint error remains. In a rebuild comp (taste.rebuild) moves with reference evidence are judged against their reference fit (❌ = drifted from it), the rest against Elias's profile. Run it last, after the final edit, before handing a comp over.",
         check
     )]
 }

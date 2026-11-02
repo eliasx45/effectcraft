@@ -14,6 +14,7 @@ pub mod layers;
 pub mod limits;
 pub mod matchnames;
 pub mod props;
+pub mod rebuild;
 pub mod render_queue;
 pub mod render_templates;
 pub mod sequence;
@@ -587,6 +588,11 @@ pub struct Comp {
     /// speech. Draws nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speech: Option<std::sync::Arc<speech::SpeechMap>>,
+    /// A rebuild of a reference animation (`taste.rebuild`): the reference and the reference
+    /// editor's fitted ease per move, which the taste check judges those moves against. Draws
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild: Option<std::sync::Arc<rebuild::Rebuild>>,
 }
 
 /// A viewer guide line: vertical guides sit at an x position, horizontal ones at a y position.
@@ -664,6 +670,7 @@ impl Comp {
             essential: None,
             resolution: Resolution::Auto,
             speech: None,
+            rebuild: None,
         }
     }
     /// Whether the composition has a frame at its time `t`: nested, it shows nothing before it
@@ -1020,6 +1027,7 @@ impl Comp {
             essential,
             resolution: _,
             speech: _,
+            rebuild: _,
         } = self;
         *width == o.width
             && *height == o.height
@@ -1060,6 +1068,7 @@ impl Comp {
         if !self.hide_shy
             && self.resolution.is_auto()
             && self.speech.is_none()
+            && self.rebuild.is_none()
             && self.layers.iter().all(|l| l.switches == l.switches.pixels())
             && (with_markers || (self.markers.iter().all(is_timing_marker) && self.layers.iter().all(|l| l.markers.is_empty())))
         {
@@ -1069,6 +1078,7 @@ impl Comp {
         c.hide_shy = false;
         c.resolution = Resolution::Auto;
         c.speech = None;
+        c.rebuild = None;
         if !with_markers {
             c.markers.retain(is_timing_marker);
         }
