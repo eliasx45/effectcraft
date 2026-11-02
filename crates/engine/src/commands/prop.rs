@@ -379,6 +379,37 @@ pub(crate) fn proportional_share(index: usize, count: usize) -> f64 {
     }
 }
 
+/// `prop.set` with `expression` (2 Nov 2026: agents wrote `{path, expression}` and got "missing
+/// `value`"): the expression goes on the property as `prop.setExpression` puts it, after the
+/// value when there is one too, as one undo step. Only the named property (`path` / `prop`).
+fn set_or_expression(s: &mut Session, p: &Value) -> Result<Value> {
+    let Some(expr) = p.get("expression") else { return set_selected(s, p) };
+    if !(expr.is_string() || expr.is_null()) {
+        return Err(bad("prop.set", format!("`expression` must be a string (\"\" or null removes it), got {expr}")));
+    }
+    // Validates the target first, so an unknown property fails before anything changes.
+    prop_ref(s, p, "prop.set")?;
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        for k in ["value", "time", "timeBase", "selected", "offset", "proportional"] {
+            o.remove(k);
+        }
+    }
+    if p.get("value").is_none() {
+        return set_expr(s, &q);
+    }
+    let mut q_value = p.clone();
+    if let Some(o) = q_value.as_object_mut() {
+        o.remove("expression");
+        o.remove("enabled");
+    }
+    super::app_more::grouped(s, "Change Property", |s| {
+        let value = set_selected(s, &q_value)?;
+        let expression = set_expr(s, &q)?;
+        Ok(json!({"value": value, "expression": expression}))
+    })
+}
+
 /// `prop.set`; with `selected`, also on the other selected layers: the same value, or with
 /// `offset` (a scrub) the same change from each layer's own value. With `offset` and
 /// `proportional` (Proportional Scrubbing) each layer takes [`proportional_share`] of the change
@@ -1455,9 +1486,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Property Value",
             [],
             None,
-            "{layer?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers, and, with the CTI on one of several selected keys of the property, those keys by the same change), offset? (them by the same change), proportional? (with offset: Proportional Scrubbing, each layer by its share in selection order, the first none, the last all)}",
+            "{layer?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers, and, with the CTI on one of several selected keys of the property, those keys by the same change), offset? (them by the same change), proportional? (with offset: Proportional Scrubbing, each layer by its share in selection order, the first none, the last all), expression? (also sets the property's expression, as prop.setExpression; without value only the expression), enabled?}",
             has_layers,
-            set_selected
+            set_or_expression
         ),
         cmd!("prop.toggleAnimation", "Toggle Stopwatch", [], None, "{layer?, path|prop, value?, merge?, selected?}", has_layers, toggle_anim_selected),
         cmd!("prop.addKey", "Add Keyframe", [], None, "{layer?, path|prop, time? (layer s by default), timeBase?: layer|comp, value?}", has_layers, add_key),
