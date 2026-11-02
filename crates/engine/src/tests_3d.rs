@@ -265,3 +265,21 @@ fn layout_panes_choose_their_view() {
     let old: Views3D = serde_json::from_value(json!({"current": "Front"})).unwrap();
     assert_eq!((old.current, old.pane(0), old.pane(1), old.pane(2)), (View3D::Front, View3D::Top, View3D::Front, View3D::Right));
 }
+
+#[test]
+fn new_one_node_camera_with_a_position_looks_straight_ahead() {
+    // AE 2026 (2 Nov 2026): a one-node camera has no point of interest; moving it off-centre
+    // keeps Orientation [0,0,0]. `layer.newCamera {type: oneNode, position}` used to convert a
+    // two-node camera aimed at the comp centre, which tilted every 3D layer in perspective.
+    let mut s = session();
+    let id = s.execute("layer.newCamera", json!({"type": "oneNode", "position": [100, 60, -1000]})).unwrap()["layer"].as_u64().unwrap();
+    let l = s.active_comp().unwrap().layers.iter().find(|l| l.id.0 == id).unwrap().clone();
+    assert_eq!(l.auto_orient, AutoOrient::Off);
+    assert!(!effectcraft_render::three_d::camera::is_two_node(&l));
+    assert_eq!(prop(&s, id, "transform/orientation").as_vec3(), [0.0, 0.0, 0.0]);
+    assert_eq!(prop(&s, id, "transform/position").as_vec3(), [100.0, 60.0, -1000.0]);
+    // A two-node camera asked for at the same place still aims at its point of interest.
+    let two = s.execute("layer.newCamera", json!({"type": "twoNode", "position": [100, 60, -1000]})).unwrap()["layer"].as_u64().unwrap();
+    let l = s.active_comp().unwrap().layers.iter().find(|l| l.id.0 == two).unwrap().clone();
+    assert!(effectcraft_render::three_d::camera::is_two_node(&l));
+}

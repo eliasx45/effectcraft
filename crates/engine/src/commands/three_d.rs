@@ -135,6 +135,13 @@ fn new_camera(s: &mut Session, p: &Value) -> Result<Value> {
     let t = time_p(s, p, Some(&comp));
     let id = s.edit("New Camera", None, |proj, st| {
         let mut l = build::layer(proj, &comp, &name, LayerSource::Camera, (comp.width, comp.height), None);
+        // A new camera is made as the type asked, not converted from the default two-node
+        // camera: a one-node camera has no point of interest and starts at Orientation 0, so a
+        // `position` never turns it towards the comp centre (AE 2026, checked 2 Nov 2026: a
+        // one-node camera moved off-centre keeps Orientation [0,0,0] and looks straight ahead).
+        if let Some(two) = two_node_p(p) {
+            l.auto_orient = if two { AutoOrient::TowardsPointOfInterest } else { AutoOrient::Off };
+        }
         apply_camera(&mut l, &comp, p, t, "layer.newCamera")?;
         insert_layer(proj, st, cid, l)
     })?;
