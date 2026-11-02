@@ -197,3 +197,23 @@ fn layer_at_deep_names_the_layer_inside_a_precomp() {
     assert!(r["layer"].is_null(), "{r}");
     assert_eq!(r["path"].as_array().map(Vec::len), Some(1), "{r}");
 }
+
+#[test]
+fn bounds_find_a_layer_whose_comp_is_not_active() {
+    // H2 (2 Nov 2026): the shelf's srcW() asks layer.bounds about a precomp's text layer by id
+    // while the main comp is active; it got "no layer N".
+    let mut s = comp();
+    let inner = solid(&mut s, "Inner", 100, 50, "#ff0000");
+    let pre = s.active_comp_id().unwrap().0;
+    s.execute("comp.new", json!({"name": "Main", "width": 400, "height": 300, "frameRate": 25, "duration": 2})).unwrap();
+    s.execute("comp.close", json!({"comp": pre})).unwrap();
+    let r = s.execute("layer.bounds", json!({"layers": [inner]})).unwrap();
+    assert_eq!((r["comp"].as_u64(), r["layers"][0]["id"].as_u64()), (Some(pre), Some(inner)), "{r}");
+    assert_eq!(r["layers"][0]["source"]["width"].as_f64(), Some(100.0), "{r}");
+    // Without layers it is still the active comp; a name is still looked up there only.
+    let r = s.execute("layer.bounds", json!({})).unwrap();
+    assert_ne!(r["comp"].as_u64(), Some(pre), "{r}");
+    assert!(s.execute("layer.bounds", json!({"layers": ["Inner"]})).is_err());
+    // layer.motion reads the same way.
+    assert!(s.execute("layer.motion", json!({"layer": inner})).is_ok());
+}

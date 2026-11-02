@@ -4,7 +4,7 @@
 //! share.
 
 use effectcraft_geom::vec2;
-use effectcraft_project::{Comp, Layer, LayerId};
+use effectcraft_project::{Comp, ItemId, Layer, LayerId};
 use effectcraft_render::{EvalCtx, RenderOpts, Renderer};
 use serde_json::{Value, json};
 
@@ -37,6 +37,31 @@ pub(super) fn named_layers(comp: &Comp, p: &Value, cmd: &str) -> Result<Vec<Laye
     }
 }
 
+/// The comp a layer query reads: `comp` when given, else the active comp, unless the layers it
+/// names by id are not all there but are all in one other comp (a precomp that isn't open or
+/// active): then that comp. Layer ids are unique in a project, so this never picks another
+/// layer (2 Nov 2026, H2: the shelf's `srcW()` measured a precomp's text layer while the main
+/// comp was active and got "no layer N").
+pub(super) fn query_comp(s: &Session, p: &Value) -> Result<ItemId> {
+    if p.get("comp").is_some_and(|v| !v.is_null()) {
+        return comp_id(s, p);
+    }
+    let ids: Vec<LayerId> = match p.get("layers").or_else(|| p.get("layer")) {
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).map(LayerId).collect(),
+        Some(v) => v.as_u64().map(LayerId).into_iter().collect(),
+        None => vec![],
+    };
+    let holds = |c: &Comp| ids.iter().all(|id| c.layer(*id).is_some());
+    if ids.is_empty() || s.active_comp_id().and_then(|a| s.project.comp(a)).is_some_and(holds) {
+        return comp_id(s, p);
+    }
+    let mut owners = s.project.items.values().filter(|i| i.as_comp().is_some_and(holds)).map(|i| i.id);
+    match (owners.next(), owners.next()) {
+        (Some(id), None) => Ok(id),
+        _ => comp_id(s, p),
+    }
+}
+
 /// A renderer with the session's footage, expressions, layer cache and preferences.
 pub(super) fn renderer(s: &Session, opts: RenderOpts) -> Renderer<'_> {
     let opts = RenderOpts { nested_switches: s.prefs.general.switches_affect_nested_comps, draft_shadows: s.prefs.three_d.realtime_shadows, ..opts };
@@ -53,7 +78,7 @@ const MAX_OVERLAP_LAYERS: usize = 256;
 
 fn layer_bounds(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "layer.bounds";
-    let cid = comp_id(s, p)?;
+    let cid = query_comp(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let t = time_p(s, p, Some(comp));
     let ids = named_layers(comp, p, C)?;
@@ -310,7 +335,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "layer.bounds",
             "Layer Bounds",
-            "{comp?, time?|frame?, layers?: [id|name|#n] (default every layer), pixels? (also measure the drawn pixels: masks, effects, styles), overlaps? (pairwise overlaps of the visible layers)} → per layer: visible + why, comp-space bounds [x,y,w,h], corners, center, anchorInComp, onScreen fraction, source rect",
+            "{comp? (default the active comp, or the one comp holding every layer id in `layers`), time?|frame?, layers?: [id|name|#n] (default every layer), pixels? (also measure the drawn pixels: masks, effects, styles), overlaps? (pairwise overlaps of the visible layers)} → per layer: visible + why, comp-space bounds [x,y,w,h], corners, center, anchorInComp, onScreen fraction, source rect",
             layer_bounds
         ),
     ]

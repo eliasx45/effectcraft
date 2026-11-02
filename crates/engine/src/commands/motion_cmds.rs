@@ -8,8 +8,8 @@ use effectcraft_render::RenderOpts;
 use effectcraft_time::Tick;
 use serde_json::Value;
 
-use super::layout_cmds::{named_layers, renderer};
-use super::{CommandSpec, bad, comp_id, no_layer, resolve_layer};
+use super::layout_cmds::{named_layers, query_comp, renderer};
+use super::{CommandSpec, bad, no_layer, resolve_layer};
 use crate::{EngineError, Result, Session, motion, query};
 
 /// `start` / `end` / `step` (seconds) → the range to sample: default the whole comp
@@ -39,7 +39,7 @@ fn range_p(comp: &Comp, p: &Value, cmd: &str) -> Result<(Tick, Tick, Tick)> {
 }
 
 fn run(s: &Session, p: &Value, cmd: &str, ids: impl FnOnce(&Comp) -> Result<Vec<LayerId>>) -> Result<Value> {
-    let cid = comp_id(s, p)?;
+    let cid = query_comp(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let ids = ids(comp)?;
     let (start, end, step) = range_p(comp, p, cmd)?;
