@@ -1046,12 +1046,65 @@ fn set_parent(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// `layer.timing`'s ops, and for each the timing params it reads (any other one is an error, not
+/// silently ignored).
+const TIMING_OPS: [(&str, &[&str]); 7] = [
+    ("set", &["delta", "start", "in", "out", "inDelta", "outDelta"]),
+    ("moveInToTime", &["time", "in"]),
+    ("moveOutToTime", &["time", "out"]),
+    ("moveInToStart", &[]),
+    ("moveOutToEnd", &[]),
+    ("trimInToTime", &["time", "in"]),
+    ("trimOutToTime", &["time", "out"]),
+];
+const TIMING_PARAMS: [&str; 7] = ["delta", "start", "in", "out", "inDelta", "outDelta", "time"];
+
+/// Checks `layer.timing`'s params and returns the op and, for the `…ToTime` ops, the time to go
+/// to: `time`, or the end it moves (`in` / `out`), in comp seconds; else the current time.
+/// Before 2 Nov 2026 `{op: "trimInToTime", in: 1}` trimmed to the current time (a no-op at 0, and
+/// `trimOutToTime` cut the layer to one frame) and an unknown op was silently ignored.
+fn timing_op(s: &Session, p: &Value) -> Result<(String, Option<Tick>)> {
+    const C: &str = "layer.timing";
+    let op = str_p(p, "op").unwrap_or("set");
+    let names = || TIMING_OPS.iter().map(|(o, _)| *o).collect::<Vec<_>>().join(" | ");
+    let Some((op, reads)) = TIMING_OPS.iter().find(|(o, _)| *o == op) else {
+        return Err(bad(C, format!("unknown op `{op}`; use one of: {}", names())));
+    };
+    if let Some(k) = TIMING_PARAMS.iter().find(|k| p.get(**k).is_some_and(|v| !v.is_null()) && !reads.contains(*k)) {
+        let what = if reads.is_empty() {
+            "no time params".to_string()
+        } else {
+            format!("only {}", reads.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(" or "))
+        };
+        return Err(bad(C, format!("op `{op}` doesn't use `{k}` (it takes {what}; seconds)")));
+    }
+    for k in TIMING_PARAMS {
+        if let Some(v) = p.get(k).filter(|v| !v.is_null())
+            && !v.as_f64().is_some_and(f64::is_finite)
+        {
+            return Err(bad(C, format!("`{k}` must be a number of seconds, got {v}")));
+        }
+    }
+    if *op == "set" && !reads.iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+        return Err(bad(C, "nothing to change: give `in`, `out`, `start`, `delta`, `inDelta` or `outDelta` (seconds), or an `op`"));
+    }
+    let given: Vec<f64> = reads.iter().filter_map(|k| f_p(p, k)).collect();
+    let to = match given.as_slice() {
+        [] => None,
+        [t] => Some(Tick::from_seconds_f64(*t)),
+        [a, b, ..] if (a - b).abs() < 1e-9 => Some(Tick::from_seconds_f64(*a)),
+        _ if *op == "set" => None,
+        _ => return Err(bad(C, format!("op `{op}`: give `time` or `{}`, not both", reads.get(1).copied().unwrap_or("in")))),
+    };
+    Ok((op.to_string(), if *op == "set" { None } else { to.or(Some(s.time())) }))
+}
+
 fn timing(s: &mut Session, p: &Value) -> Result<Value> {
+    let (op, to) = timing_op(s, p)?;
     let (cid, ids) = layers_p(s, p)?;
-    let t = s.time();
-    let op = str_p(p, "op").unwrap_or("set").to_string();
     // Layer times stay on frame boundaries of the comp (as in AE).
     let fr = s.project.comp(cid).ok_or(EngineError::NoComp)?.frame_rate;
+    let t = to.map(|t| fr.snap_nearest(t)).unwrap_or_else(|| s.time());
     let snap = |k: &str| f_p(p, k).map(|v| fr.snap_nearest(Tick::from_seconds_f64(v)));
     let (delta, start, inp, outp) = (snap("delta"), snap("start"), snap("in"), snap("out"));
     // `inDelta` / `outDelta`: move each layer's In / Out point by the same amount (the Timeline's
@@ -2017,7 +2070,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Layer Timing",
             [],
             None,
-            "{layers?, op?: moveInToTime|moveOutToTime|moveInToStart|moveOutToEnd|trimInToTime|trimOutToTime, delta?, start?, in?, out?, inDelta?, outDelta? (seconds, per layer), merge?}",
+            "{layers?, op?: set (default)|moveInToTime|moveOutToTime|moveInToStart|moveOutToEnd|trimInToTime|trimOutToTime, delta?, start?, in?, out?, inDelta?, outDelta? (seconds, per layer; set), time? (comp s, the …ToTime ops; also `in` for moveIn/trimIn, `out` for moveOut/trimOut; default the current time), merge?} (a param the op doesn't use is an error)",
             has_layers,
             timing
         ),
