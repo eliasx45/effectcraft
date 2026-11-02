@@ -68,7 +68,7 @@ pub fn anchor_in_comp(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
 
 /// Layer → comp after the Transform effects the layer's children follow (Children Follow): the
 /// box and anchor are where those effects put the pixels, as the viewer draws them.
-fn box_to_comp(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
+pub(crate) fn box_to_comp(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
     let m = ctx.layer_to_comp(layer).0;
     ctx.follow_fx_2d(layer).map_or(m, |f| m * f)
 }

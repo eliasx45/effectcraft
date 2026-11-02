@@ -514,3 +514,27 @@ fn moves_cut_by_the_out_point_and_slides_behind_a_matte_read_as_the_viewer_sees_
     assert_eq!(of(gone)["moveType"], "exit", "{r:#}");
     assert_eq!(of(bar)["moveType"], "entrance", "hidden by its matte at the first key: {r:#}");
 }
+
+#[test]
+fn a_precomp_is_on_screen_where_its_content_is_not_where_its_comp_rectangle_is() {
+    // 2 Nov 2026: a 3D precomp whose nested comp is bigger than its content was judged by the
+    // whole nested rectangle, so a card entering from below read as an on-screen move.
+    let (mut s, cid, card) = comp();
+    s.execute_checked("prop.set", json!({"layer": card, "path": "transform/position", "value": [960.0, 940.0]})).unwrap();
+    let r = s.execute_checked("layer.precompose", json!({"layers": [card], "name": "Card Comp", "mode": "move"})).unwrap();
+    let pre = r["layer"].as_u64().unwrap_or_else(|| panic!("{r}"));
+    s.execute_checked("layer.setSwitch", json!({"layers": [pre], "switch": "threeD", "value": true})).unwrap();
+    // At 1440 the nested frame's top 180 px overlap the comp's bottom; the card (nested y 840–1040)
+    // sits at comp y 1740–1940, below the frame.
+    key(&mut s, pre, "transform/position", 1.0, json!([960.0, 1440.0, 0.0]));
+    key(&mut s, pre, "transform/position", 1.6, json!([960.0, 540.0, 0.0]));
+    ease(&mut s, cid, pre, "transform/position", 0, (0.0, 0.1), (0.0, 100.0));
+    let m = only(&check(&mut s), "transform/position");
+    assert_eq!(m["moveType"], "entrance", "{m:#}");
+    assert_eq!(m["verdict"], "approved", "{m:#}");
+    // Starting where the card itself is half in the frame, it is an on-screen move again.
+    let pr = Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(pre)).unwrap().props.prop_mut("transform/position").unwrap();
+    pr.keys[0].value = effectcraft_keyframe::Value::Vec3([960.0, 680.0, 0.0]);
+    let m = only(&check(&mut s), "transform/position");
+    assert_eq!(m["moveType"], "move", "{m:#}");
+}

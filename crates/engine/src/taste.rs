@@ -622,6 +622,67 @@ fn drawn_parts<'a>(comp: &'a Comp, l: &'a Layer) -> Vec<&'a Layer> {
     out
 }
 
+/// How many precomps deep [`content_polys`] looks.
+const MAX_NEST: usize = 4;
+/// Most nested layers [`content_polys`] measures per call.
+const MAX_NESTED_LAYERS: usize = 256;
+
+/// Where the pixels of `x` (a layer of `c`'s comp) land in comp space: its content box through
+/// its transform and the active camera, or, for a precomp, the boxes of what its nested comp
+/// draws at that time (clipped to the nested frame unless Collapse Transformations is on), not
+/// the whole nested rectangle. A 1920×1080 card comp with the card at its bottom overlapped the
+/// frame while the card itself was still below it (2 Nov 2026). Empty when the precomp draws
+/// nothing then; `None` when it can't be measured.
+fn content_polys(c: &EvalCtx, x: &Layer, depth: usize, budget: &mut usize) -> Option<Vec<Vec<[f64; 2]>>> {
+    let ok = |q: &[[f64; 2]]| q.iter().flatten().all(|v| v.is_finite());
+    let own = || crate::layout::layer_geometry(c, x).filter(|g| g.projected && ok(&g.corners)).map(|g| vec![g.corners.to_vec()]);
+    let effectcraft_project::LayerSource::Comp { item } = x.source else { return own() };
+    let Some(nc) = c.project.comp(item) else { return own() };
+    if depth >= MAX_NEST {
+        return own();
+    }
+    let nctx = EvalCtx { comp_id: item, comp: nc, time: c.nested_time(x), ..*c };
+    let m = crate::layout::box_to_comp(c, x);
+    let (nw, nh) = (nc.width as f64, nc.height as f64);
+    let nframe = [[0.0, 0.0], [nw, 0.0], [nw, nh], [0.0, nh]];
+    let mut out = vec![];
+    let mut unmeasured = false;
+    for il in &nc.layers {
+        if *budget == 0 {
+            return own();
+        }
+        *budget -= 1;
+        let matte_source = nc.layers.iter().any(|o| o.track_matte.is_some_and(|t| t.layer == il.id));
+        if matte_source || il.switches.adjustment || !shows(nc, il) || !crate::layout::visibility(&nctx, il).0 {
+            continue;
+        }
+        let Some(polys) = content_polys(&nctx, il, depth + 1, budget) else {
+            unmeasured = true;
+            continue;
+        };
+        for poly in polys {
+            let poly = if x.switches.collapse { poly } else { crate::layout::clip_convex(&poly, &nframe) };
+            let mut front = true;
+            let mapped: Vec<[f64; 2]> = poly
+                .iter()
+                .map(|p| {
+                    let (q, k) = crate::layout::to_comp(&m, *p);
+                    front &= k;
+                    q
+                })
+                .collect();
+            if !front || !ok(&mapped) {
+                return own();
+            }
+            if mapped.len() >= 3 {
+                out.push(mapped);
+            }
+        }
+    }
+    // Something drawn that couldn't be measured: the nested rectangle is the safe answer.
+    if unmeasured && out.is_empty() { own() } else { Some(out) }
+}
+
 /// Whether nothing `l` places shows at comp time `ct`: every drawn part is off (in/out point,
 /// opacity 0) or its content box, as projected through the active camera, lies wholly outside
 /// the frame or (for a layer under an alpha or luma track matte) outside the matte's box. `None`
@@ -636,21 +697,24 @@ fn out_of_frame(ctx: &EvalCtx, l: &Layer, ct: Tick, past_cut: bool) -> Option<bo
     let cut_only = |why: &[&str]| why.iter().all(|r| *r == "before its in point" || *r == "at or after its out point");
     let quad = |x: &Layer| crate::layout::layer_geometry(&c, x).filter(|g| g.projected && g.corners.iter().flatten().all(|v| v.is_finite())).map(|g| g.corners);
     let mut measured = false;
+    let mut budget = MAX_NESTED_LAYERS;
     for x in parts {
         let (vis, why) = crate::layout::visibility(&c, x);
         if !vis && !(past_cut && cut_only(&why)) {
             continue;
         }
-        let Some(corners) = quad(x) else { continue };
+        let Some(polys) = content_polys(&c, x, 0, &mut budget) else { continue };
         measured = true;
-        let mut seen = crate::layout::clip_convex(&corners, &frame);
         // What a matte hides isn't on screen (a slide inside a pill window, a rise from behind a line).
         let matte = x.track_matte.filter(|m| matches!(m.kind, MatteKind::Alpha | MatteKind::Luma)).and_then(|m| ctx.comp.layer(m.layer)).and_then(|m| quad(m));
-        if let Some(m) = matte {
-            seen = crate::layout::clip_convex(&seen, &m);
-        }
-        if crate::layout::polygon_area(&seen) > 1.0 {
-            return Some(false);
+        for poly in polys {
+            let mut seen = crate::layout::clip_convex(&poly, &frame);
+            if let Some(m) = &matte {
+                seen = crate::layout::clip_convex(&seen, m);
+            }
+            if crate::layout::polygon_area(&seen) > 1.0 {
+                return Some(false);
+            }
         }
     }
     measured.then_some(true)
