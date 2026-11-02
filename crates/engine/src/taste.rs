@@ -534,9 +534,16 @@ impl Verdict {
     }
 }
 
-/// Properties the criteria apply to (by match id); others get the hard fails only.
+/// Properties the criteria apply to (by match id); others get the hard fails only. Separated
+/// dimensions are `positionX` / `positionY` / `positionZ` (until 2 Nov 2026 the list named
+/// `xPosition`…, which no property has, so separated Position moves were never judged).
 fn checked_match(m: &str) -> bool {
-    matches!(m, "position" | "xPosition" | "yPosition" | "zPosition" | "scale" | "rotation" | "zRotation" | "opacity")
+    matches!(m, "position" | "positionX" | "positionY" | "positionZ" | "scale" | "rotation" | "opacity")
+}
+
+/// A Position property: whole or one separated dimension.
+fn is_position(m: &str) -> bool {
+    m == "position" || m == "positionX" || m == "positionY" || m == "positionZ"
 }
 
 /// The opacity (%) of `l` at its layer time `t`.
@@ -703,7 +710,7 @@ pub fn classify(ctx: &EvalCtx, l: &Layer, m: &str, prop: &Property, i: usize) ->
     }
     let frame = comp.frame_rate.frame_duration();
     let (t0, t1) = (l.comp_time(a.time), l.comp_time(b.time));
-    let is_pos = m == "position" || m.ends_with("Position");
+    let is_pos = is_position(m);
     // Off the frame: the content boxes of what the layer places (itself, a rig's children), or
     // for a layer with none to measure, its own Position.
     let gone = |t: Tick, v: &KValue| out_of_frame(ctx, l, t).unwrap_or_else(|| m == "position" && off_frame(comp, l, v));
@@ -957,7 +964,8 @@ fn judge(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, 
     }
     // The speed cap is in frame pixels: a camera's travel isn't (its depth decides what that does
     // on screen), and a layer with no pixels moves nothing.
-    if (m == "position" || m.ends_with("Position")) && !matches!(kind, MoveType::Camera | MoveType::Other) {
+    // Z travel is depth, not frame pixels.
+    if is_position(m) && m != "positionZ" && !matches!(kind, MoveType::Camera | MoveType::Other) {
         let pct = shape.peak_share * dv / (comp.width.max(1) as f64) * 100.0;
         j.px_per_frame = Some((shape.peak_share * dv * 10.0).round() / 10.0);
         j.frame_pct = Some((pct * 10.0).round() / 10.0);

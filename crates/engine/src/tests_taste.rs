@@ -457,3 +457,22 @@ fn camera_rigs_are_camera_moves_and_layers_without_pixels_are_not_elements() {
     let prof = s.execute_checked("taste.profile", json!({})).unwrap();
     assert!(prof.to_string().contains("\"camera\""), "the camera move type is listed: {prof:#}");
 }
+
+#[test]
+fn separated_position_moves_are_judged() {
+    // 2 Nov 2026: the property list named `xPosition`, which no property has (separated Position
+    // is `positionX` / `positionY` / `positionZ`), so a move on X Position was never judged.
+    let (mut s, cid, l) = comp();
+    s.execute_checked("prop.separateDimensions", json!({"layer": l, "value": true})).unwrap();
+    key(&mut s, l, "transform/positionX", 1.0, json!(700.0));
+    key(&mut s, l, "transform/positionX", 2.0, json!(1220.0));
+    let r = check(&mut s);
+    let m = only(&r, "transform/positionX");
+    assert_eq!(m["moveType"], "move", "{m:#}");
+    assert!(m["problems"][0].as_str().unwrap().starts_with("linear"), "{m:#}");
+    assert!(m["criteria"]["framePerFrame"].as_f64().is_some(), "X travel is frame pixels: {m:#}");
+    let (o, i) = builtin_profile().find("expo-in-out-elias").unwrap().at(1.0);
+    ease(&mut s, cid, l, "transform/positionX", 0, (o.speed, o.influence), (i.speed, i.influence));
+    let m = only(&check(&mut s), "transform/positionX");
+    assert_eq!(m["verdict"], "approved", "{m:#}");
+}
