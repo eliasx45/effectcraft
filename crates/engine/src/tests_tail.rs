@@ -534,3 +534,49 @@ fn set_text_selected_applies_to_every_selected_text_layer() {
     assert_eq!(font(&s, ids[1]).size, 50.0);
     assert_eq!(font(&s, ids[0]).size, 40.0);
 }
+
+/// Match ids of a contents list, top to bottom.
+fn contents_order(s: &Session, lid: u64, path: &str) -> Vec<String> {
+    let l = s.active_comp().unwrap().layer(LayerId(lid)).unwrap();
+    l.props
+        .group(path)
+        .unwrap()
+        .children
+        .iter()
+        .filter_map(|c| match c {
+            effectcraft_project::Node::Group(g) => Some(g.match_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// AE 2026 (2 Nov 2026): Add ▸ Gradient Fill (and Fill, Trim Paths, Rectangle…) puts the new
+/// item after the leading shapes, above the first fill, stroke or operator, so a gradient fill
+/// added to a filled shape draws on top of its solid Fill. ExtendScript's addProperty() appends.
+/// EffectCraft appended, which left a kit-added gradient fill invisible under the Fill.
+#[test]
+fn add_shape_item_goes_where_the_add_menu_puts_it() {
+    let mut s = comp(200, 200);
+    let lid = s.execute("layer.newShape", json!({"kind": "rect", "size": [80, 60], "fill": "#ff0000", "strokeWidth": 0})).unwrap()["layer"].as_u64().unwrap();
+    let group = "contents/group/contents";
+    let before = contents_order(&s, lid, group);
+    assert_eq!(before.first().map(String::as_str), Some("rect"), "{before:?}");
+    let r = s.execute("layer.addShapeItem", json!({"layer": lid, "kind": "gfill", "group": "contents/group"})).unwrap();
+    let after = contents_order(&s, lid, group);
+    assert_eq!(&after[..2], ["rect", "gfill"], "above the Fill: {after:?}");
+    assert_eq!(r["path"], "contents/group/contents/gfill", "{r}");
+    // Another shape goes after the leading shapes too (above the gradient fill).
+    s.execute("layer.addShapeItem", json!({"layer": lid, "kind": "ellipse", "group": "contents/group"})).unwrap();
+    assert_eq!(&contents_order(&s, lid, group)[..3], ["rect", "ellipse", "gfill"]);
+    // append: at the end, as addProperty().
+    s.execute("layer.addShapeItem", json!({"layer": lid, "kind": "trim", "group": "contents/group", "append": true})).unwrap();
+    assert_eq!(contents_order(&s, lid, group).last().map(String::as_str), Some("trim"));
+    // At the layer's root (only the group there): after the group.
+    s.execute("layer.addShapeItem", json!({"layer": lid, "kind": "fill"})).unwrap();
+    assert_eq!(contents_order(&s, lid, "contents"), ["group", "fill"]);
+    // The gradient is drawn on top: the centre is no longer the solid red.
+    let cid = s.active_comp_id().unwrap();
+    let img = s.render(cid, s.time(), Default::default());
+    let c = img.get(100, 100);
+    assert!(c[3] > 0.99 && !(c[0] > 0.99 && c[1] < 0.01 && c[2] < 0.01), "the gradient fill shows: {c:?}");
+}

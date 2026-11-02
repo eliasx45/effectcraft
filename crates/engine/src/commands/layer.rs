@@ -1565,6 +1565,9 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
         ),
         v => v.and_then(Value::as_u64),
     };
+    // `append`: at the end of the contents, as ExtendScript's addProperty() does; otherwise where
+    // the Add ▸ menu puts it (see [`add_menu_index`]).
+    let append = b_p(p, "append").unwrap_or(false);
     let uid = s.edit("Add Shape Item", None, |proj, _| {
         let mut next = proj.next_id;
         let mut ids = Ids(&mut next);
@@ -1591,7 +1594,9 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
         let g = new_shape_item(&mut ids, &kind).ok_or_else(|| bad("layer.addShapeItem", format!("unknown kind `{kind}`")))?;
         let uid = g.uid;
         proj.next_id = next;
-        shape_item_target(proj, cid, lid, group_uid)?.children.push(g.into());
+        let target = shape_item_target(proj, cid, lid, group_uid)?;
+        let at = if append { target.children.len() } else { add_menu_index(target) };
+        target.children.insert(at.min(target.children.len()), g.into());
         Ok(uid)
     })?;
     // The new item's property path, ready for prop.set / add_keyframe (`contents/trim#2/end`).
@@ -1618,6 +1623,21 @@ pub(crate) fn new_shape_item(ids: &mut Ids, kind: &str) -> Option<PropGroup> {
         "repeater" => build::shape_repeater(ids, 3.0, [100.0, 0.0]),
         k => build::shape_simple_op(ids, k)?,
     })
+}
+
+/// Where After Effects' Add ▸ menu puts a new item in a contents list: just after the leading
+/// run of shapes (groups and Rectangle / Ellipse / Polystar / Path items), i.e. above the first
+/// fill, stroke or path operation, so a Gradient Fill added to a filled shape draws on top of
+/// the solid Fill (items higher in the list render on top). AE 2026, checked 2 Nov 2026:
+/// [Rect, Fill] + Gradient Fill → [Rect, G-Fill, Fill]; [Rect, Ellipse, Fill] + Gradient Fill or
+/// Rectangle → after the Ellipse; [Rect, Fill, Ellipse] → [Rect, G-Fill, Fill, Ellipse];
+/// [Fill, Rect] → [G-Fill, Fill, Rect]; Trim Paths and Fill go to the same place.
+fn add_menu_index(contents: &PropGroup) -> usize {
+    contents
+        .children
+        .iter()
+        .position(|c| matches!(c, Node::Group(g) if !matches!(g.match_id.as_str(), "group" | "rect" | "ellipse" | "star" | "path")))
+        .unwrap_or(contents.children.len())
 }
 
 /// The contents a new shape item goes into: the shape group `group_uid` (its Contents), else the
@@ -2147,7 +2167,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add (Shape)",
             [],
             None,
-            "{layer?, kind: group|rect|ellipse|star|polygon|path|fill|stroke|gfill|gstroke|trim|repeater|round|offset|pucker|twist|zigzag|wiggle|merge|frontColor|bevelColor|sideColor|backColor, group?: uid|path} → {uid, path} (frontColor…backColor: the group's Front / Bevel / Side / Back item, which colours that surface of every extruded paint in the group in Advanced 3D)",
+            "{layer?, kind: group|rect|ellipse|star|polygon|path|fill|stroke|gfill|gstroke|trim|repeater|round|offset|pucker|twist|zigzag|wiggle|merge|frontColor|bevelColor|sideColor|backColor, group?: uid|path, append?: bool} → {uid, path}; placed like the Add ▸ menu, above the first fill, stroke or operation (after the leading shapes), or at the end with append (ExtendScript addProperty) (frontColor…backColor: the group's Front / Bevel / Side / Back item, which colours that surface of every extruded paint in the group in Advanced 3D)",
             has_layers,
             add_shape_item
         ),

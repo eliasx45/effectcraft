@@ -632,6 +632,9 @@ build real projects through these interfaces; they are worked examples of everyt
 * **Use the paths replies give you**: `effect.apply` returns `{effects: [uid], paths:
   ["effects/#2"]}`; `layer.addShapeItem {kind, group?: uid|path}` returns `{uid, path}` (e.g.
   `contents/group/contents/gfill`), ready for `set_property`. `@uid` works as a whole path.
+  The new item goes where After Effects' Add ▸ menu puts it: after the leading shapes, above the
+  first fill, stroke or operator, so a `gfill` added to a filled shape draws on top of its Fill;
+  `append: true` puts it at the end instead (ExtendScript `addProperty`).
 * **One call, one undo step**: `batch {"steps":[{"command":"layer.newShape","params":{"kind":"ellipse","name":"Ring"}},{"command":"layer.addShapeItem","params":{"layer":"$1.layer","kind":"trim"}},{"command":"prop.addKey","params":{"layer":"$1.layer","path":"transform/opacity","time":0,"value":0}}]}`
   (a string param that is exactly `"$N"` or `"$N.key"` is replaced; `$2.path` is the trim's path).
 * **Expressions**: `set_property`/`get_property` replies carry `evaluated` (what renders) next to
