@@ -2,7 +2,7 @@
 //!
 //! Every pair of neighbouring keys whose value changes is a *move*. It gets a move type from its
 //! layer ([`MoveType`]: an entrance from invisible or off the frame, an exit, an on-screen move,
-//! a fade, a scale pop from 0, a one-axis scrub from an edge) and is judged on five criteria learned from his finished comps (25 Oct 2026,
+//! a fade, a scale pop from 0, a one-axis scrub from an edge, a camera move) and is judged on five criteria learned from his finished comps (25 Oct 2026,
 //! 20-08 + 10-10: 730 moves plus 101 keys he changed after an agent handed a comp over):
 //!
 //! 1. **Peak position**: where the speed peaks in the move. Entrances peak early, exits late,
@@ -68,13 +68,26 @@ pub enum MoveType {
     /// One axis of Scale grows or shrinks from an anchor on the content's edge (a progress bar
     /// filling, a wipe): peaks like an on-screen move.
     Scrub,
+    /// The camera moves (a camera layer, or a null rig a camera is parented to): everything in
+    /// view moves. Peaks like an on-screen move, has no speed cap (camera units aren't frame
+    /// pixels) and warns only until Elias approves camera curves.
+    Camera,
     /// Any other animated property: only the hard fails apply.
     Other,
 }
 
 impl MoveType {
-    pub const ALL: [MoveType; 8] =
-        [MoveType::Entrance, MoveType::Exit, MoveType::Move, MoveType::FadeIn, MoveType::FadeOut, MoveType::ScalePop, MoveType::Scrub, MoveType::Other];
+    pub const ALL: [MoveType; 9] = [
+        MoveType::Entrance,
+        MoveType::Exit,
+        MoveType::Move,
+        MoveType::FadeIn,
+        MoveType::FadeOut,
+        MoveType::ScalePop,
+        MoveType::Scrub,
+        MoveType::Camera,
+        MoveType::Other,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -85,6 +98,7 @@ impl MoveType {
             MoveType::FadeOut => "fade-out",
             MoveType::ScalePop => "scale-pop",
             MoveType::Scrub => "scrub",
+            MoveType::Camera => "camera",
             MoveType::Other => "other",
         }
     }
@@ -98,7 +112,8 @@ impl MoveType {
             MoveType::FadeOut => "fade out",
             MoveType::ScalePop => "scale pop from 0",
             MoveType::Scrub => "scrub / wipe (one-axis scale from an edge)",
-            MoveType::Other => "other property",
+            MoveType::Camera => "camera move (a camera or the null rig that drives it)",
+            MoveType::Other => "other property, or a layer with no pixels of its own",
         }
     }
 
@@ -552,10 +567,39 @@ fn hidden(comp: &Comp, l: &Layer, ct: Tick, frame: Tick) -> bool {
     is_null && !kids.is_empty() && kids.iter().all(|c| invisible(c, ct, frame))
 }
 
+/// Whether `x` puts pixels on screen: a picture layer (not a null, camera or light) that renders
+/// (Video on, not a guide), or one whose alpha or luma mattes another layer (a matte's Video is
+/// off, but moving it reveals).
+fn shows(comp: &Comp, x: &Layer) -> bool {
+    x.source.is_av() && !x.switches.guide && (x.switches.video || comp.layers.iter().any(|o| o.track_matte.is_some_and(|m| m.layer == x.id)))
+}
+
+/// Whether `l` is a camera or drives one: a camera is parented to it, directly or further down
+/// (a camera rig of stacked nulls).
+fn drives_camera(comp: &Comp, l: &Layer) -> bool {
+    if l.is_camera() {
+        return true;
+    }
+    let mut frontier = vec![l.id];
+    let mut seen = 0usize;
+    for _ in 0..MAX_DEPTH {
+        if frontier.is_empty() || seen >= MAX_CHILDREN {
+            return false;
+        }
+        let kids: Vec<&Layer> = comp.layers.iter().filter(|c| c.parent.is_some_and(|p| frontier.contains(&p))).take(MAX_CHILDREN).collect();
+        if kids.iter().any(|c| c.is_camera()) {
+            return true;
+        }
+        seen += kids.len();
+        frontier = kids.iter().map(|c| c.id).collect();
+    }
+    false
+}
+
 /// The drawn layers whose place `l` sets: `l` itself when it has a picture, and every layer
 /// parented to it (directly or further down) that has one.
 fn drawn_parts<'a>(comp: &'a Comp, l: &'a Layer) -> Vec<&'a Layer> {
-    let drawn = |x: &Layer| x.source.is_av() && x.switches.video && !x.switches.guide;
+    let drawn = |x: &Layer| shows(comp, x);
     let mut out: Vec<&Layer> = if drawn(l) { vec![l] } else { vec![] };
     let mut frontier = vec![l.id];
     let mut seen = 0usize;
@@ -631,6 +675,16 @@ pub fn classify(ctx: &EvalCtx, l: &Layer, m: &str, prop: &Property, i: usize) ->
     let (Some(a), Some(b)) = (prop.keys.get(i), prop.keys.get(i + 1)) else { return MoveType::Other };
     let (ca, cb) = (a.value.components(), b.value.components());
     let first = |c: &[f64]| c.first().copied().unwrap_or(0.0);
+    // A camera or its rig: everything in view moves, nothing enters or leaves by it (the KTR /
+    // editzena camera nulls read as entrances, exits and on-screen moves, 2 Nov 2026).
+    if drives_camera(comp, l) {
+        return if checked_match(m) && m != "opacity" && m != "scale" { MoveType::Camera } else { MoveType::Other };
+    }
+    // No pixels of its own and nothing drawn under it (a lone null, a guide, a switched-off
+    // layer): nothing on screen moves, so it isn't judged as an element.
+    if drawn_parts(comp, l).is_empty() {
+        return MoveType::Other;
+    }
     if m == "opacity" {
         return if first(&cb) >= first(&ca) { MoveType::FadeIn } else { MoveType::FadeOut };
     }
@@ -873,8 +927,12 @@ fn judge(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, 
                 j.problems.push(format!("peaks at {pos:.0} % of the move: entrances peak in the first {:.0} %", r.entrance_peak_max))
             }
             MoveType::Exit if pos < r.exit_peak_min => j.problems.push(format!("peaks at {pos:.0} %: exits peak after {:.0} %", r.exit_peak_min)),
-            MoveType::Move | MoveType::Scrub if pos < r.move_peak.0 || pos > r.move_peak.1 => {
-                let what = if kind == MoveType::Scrub { "scrubs" } else { "on-screen moves" };
+            MoveType::Move | MoveType::Scrub | MoveType::Camera if pos < r.move_peak.0 || pos > r.move_peak.1 => {
+                let what = match kind {
+                    MoveType::Scrub => "scrubs",
+                    MoveType::Camera => "camera moves (judged like on-screen moves)",
+                    _ => "on-screen moves",
+                };
                 j.problems.push(format!("peaks at {pos:.0} %: {what} peak between {:.0} and {:.0} %", r.move_peak.0, r.move_peak.1))
             }
             MoveType::FadeIn if pos > r.fade_in_peak_max => {
@@ -897,7 +955,9 @@ fn judge(profile: &Profile, ctx: &EvalCtx, l: &Layer, p: &Property, path: &str, 
             ));
         }
     }
-    if m == "position" || m.ends_with("Position") {
+    // The speed cap is in frame pixels: a camera's travel isn't (its depth decides what that does
+    // on screen), and a layer with no pixels moves nothing.
+    if (m == "position" || m.ends_with("Position")) && !matches!(kind, MoveType::Camera | MoveType::Other) {
         let pct = shape.peak_share * dv / (comp.width.max(1) as f64) * 100.0;
         j.px_per_frame = Some((shape.peak_share * dv * 10.0).round() / 10.0);
         j.frame_pct = Some((pct * 10.0).round() / 10.0);

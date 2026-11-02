@@ -410,3 +410,50 @@ fn align_peak_keeps_an_approved_curve() {
         assert_ne!(after["from"], before["from"], "{mode}: the keys moved: {a:#}");
     }
 }
+
+#[test]
+fn camera_rigs_are_camera_moves_and_layers_without_pixels_are_not_elements() {
+    // 2 Nov 2026 (kunal-TR, editzena TL/BR rebuilds): the camera nulls (null → null → camera)
+    // were judged as element entrances / exits / on-screen moves and blocked the handover.
+    let (mut s, cid, card) = comp();
+    let cam = s.execute_checked("layer.newCamera", json!({"name": "Cam", "preset": "50mm"})).unwrap()["layer"].as_u64().unwrap();
+    let rig = s.execute_checked("layer.newNull", json!({"name": "Cam X"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute_checked("layer.setSwitch", json!({"layers": [rig], "switch": "threeD", "value": true})).unwrap();
+    s.execute_checked("prop.set", json!({"layer": rig, "path": "transform/anchor", "value": [0.0, 0.0, 0.0]})).unwrap();
+    s.execute_checked("prop.set", json!({"layer": rig, "path": "transform/position", "value": [0.0, 0.0, 0.0]})).unwrap();
+    s.execute_checked("layer.setParent", json!({"layers": [cam], "parent": rig})).unwrap();
+    // A pan 400 px left: the rig's Position leaves the comp rectangle (it read as an exit).
+    key(&mut s, rig, "transform/position", 1.0, json!([0.0, 0.0, 0.0]));
+    key(&mut s, rig, "transform/position", 2.0, json!([-400.0, 0.0, 0.0]));
+    // Peaks at 26 %, outside the on → on band: a ❌ that only warns.
+    ease(&mut s, cid, rig, "transform/position", 0, (0.0, 39.9), (0.0, 90.9));
+    // The camera layer's own move.
+    key(&mut s, cam, "transform/position", 1.0, json!([960.0, 540.0, -2666.7]));
+    key(&mut s, cam, "transform/position", 2.0, json!([960.0, 540.0, -2000.0]));
+    // A null with nothing under it, and a guide layer: no pixels on screen.
+    let lone = s.execute_checked("layer.newNull", json!({"name": "Lone"})).unwrap()["layer"].as_u64().unwrap();
+    key(&mut s, lone, "transform/position", 1.0, json!([960.0, 540.0]));
+    key(&mut s, lone, "transform/position", 2.0, json!([2400.0, 540.0]));
+    s.execute_checked("layer.setSwitch", json!({"layers": [card], "switch": "guide", "value": true})).unwrap();
+    key(&mut s, card, "transform/position", 1.0, json!([960.0, 540.0]));
+    key(&mut s, card, "transform/position", 2.0, json!([960.0, 1600.0]));
+
+    let r = check(&mut s);
+    let of = |l: u64| moves(&r).into_iter().find(|m| m["layer"] == l).unwrap_or_else(|| panic!("no move on {l}: {r:#}"));
+    let m = of(rig);
+    assert_eq!(m["moveType"], "camera", "{m:#}");
+    assert_eq!(m["verdict"], "off", "{m:#}");
+    assert_eq!(m["blocking"], false, "no approved camera curves yet: warn only: {m:#}");
+    assert!(m["message"].as_str().unwrap().contains("camera moves"), "{m:#}");
+    assert!(m["criteria"].get("framePerFrame").is_none(), "no speed cap in frame pixels for a camera: {m:#}");
+    assert_eq!(of(cam)["moveType"], "camera", "{r:#}");
+    assert_eq!(of(cam)["blocking"], false, "{r:#}");
+    for l in [lone, card] {
+        let m = of(l);
+        assert_eq!(m["moveType"], "other", "{m:#}");
+        assert_eq!(m["blocking"], false, "{m:#}");
+    }
+    assert_eq!(r["clean"], true, "nothing blocks: {r:#}");
+    let prof = s.execute_checked("taste.profile", json!({})).unwrap();
+    assert!(prof.to_string().contains("\"camera\""), "the camera move type is listed: {prof:#}");
+}
