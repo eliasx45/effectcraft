@@ -153,13 +153,16 @@ pub(crate) fn stale_notice(s: &mut Session, client: &str) -> Option<String> {
     Some(format!("keys changed since your last {} (layers {}{more}); rerun before handover (handover_check)", which.join("/"), shown.join(", ")))
 }
 
-/// The comp's animated range: the first to the last keyframed move taste.check found, else the
-/// work area.
+/// The comp's animated range: the first to the last keyframed move taste.check found (every
+/// move, ✅ ones too, within the comp's duration), else the work area. It used to be read from
+/// the problem moves only, so it shrank as moves were fixed and the lint half then missed the
+/// rest of the comp (2 Nov 2026, L3: 0.667–6.607 s, then 5.138–6.607 s on the same comp).
 fn animated_range(s: &Session, cid: ItemId, taste: &Value) -> (f64, f64) {
     let moves = taste.get("moves").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     let t = |m: &Value, k: &str| m.get(k).and_then(|v| v.get("time")).and_then(Value::as_f64);
-    let start = moves.iter().filter_map(|m| t(m, "from")).fold(f64::INFINITY, f64::min);
-    let end = moves.iter().filter_map(|m| t(m, "to")).fold(f64::NEG_INFINITY, f64::max);
+    let duration = s.project.comp(cid).map_or(f64::INFINITY, |c| c.duration.seconds());
+    let start = moves.iter().filter_map(|m| t(m, "from")).fold(f64::INFINITY, f64::min).max(0.0);
+    let end = moves.iter().filter_map(|m| t(m, "to")).fold(f64::NEG_INFINITY, f64::max).min(duration);
     if start.is_finite() && end.is_finite() && end >= start {
         return (start, end);
     }
@@ -169,7 +172,9 @@ fn animated_range(s: &Session, cid: ItemId, taste: &Value) -> (f64, f64) {
 /// `handover.check`: taste.check + render.lint over the animated range in one call.
 fn check(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
-    let taste = s.execute("taste.check", json!({"comp": cid.0, "problemsOnly": true, "start": f_p(p, "start"), "end": f_p(p, "end")}))?;
+    // Every move (not problemsOnly): the range comes from all of them; ✅ moves are left out of
+    // the lists below.
+    let taste = s.execute("taste.check", json!({"comp": cid.0, "start": f_p(p, "start"), "end": f_p(p, "end")}))?;
     let (auto_start, auto_end) = animated_range(s, cid, &taste);
     let start = f_p(p, "start").unwrap_or(auto_start);
     let end = f_p(p, "end").unwrap_or(auto_end).max(start);
@@ -182,7 +187,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     let lint = s.execute("render.lint", lint_p)?;
     let mut blocking = Vec::new();
     let mut warnings = Vec::new();
-    for m in taste.get("moves").and_then(Value::as_array).into_iter().flatten() {
+    for m in taste.get("moves").and_then(Value::as_array).into_iter().flatten().filter(|m| m["verdict"] != "approved") {
         let entry = json!({
             "source": "taste", "layer": m["layer"], "layerName": m["layerName"], "path": m["path"],
             "time": m["from"]["time"], "until": m["to"]["time"], "mark": m["mark"], "message": m["message"], "fix": m["fix"],

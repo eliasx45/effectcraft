@@ -756,3 +756,28 @@ fn a_move_that_starts_as_the_layer_appears_is_an_entrance() {
     ease(&mut s, cid, l, "transform/scale", 0, (0.0, 0.1), (0.0, 100.0));
     assert_eq!(only(&check(&mut s), "transform/scale")["moveType"], "move");
 }
+
+#[test]
+fn the_handover_range_is_every_move_not_only_the_problems() {
+    // L3 (2 Nov 2026): the automatic range came from the problem moves only, so it changed
+    // between runs as moves were fixed (0.667–6.607 s, then 5.138–6.607 s) and lint skipped the rest.
+    let (mut s, cid, l) = comp();
+    entrance(&mut s, cid, l, 18.0, (0.0, 0.1), (0.0, 100.0));
+    let other = s.execute("layer.newSolid", json!({"name": "Other", "width": 200, "height": 100, "color": "#236197"})).unwrap()["layer"].as_u64().unwrap();
+    key(&mut s, other, "transform/position", 3.0, json!([700.0, 300.0]));
+    key(&mut s, other, "transform/position", 3.5, json!([900.0, 300.0]));
+    let r = check(&mut s);
+    assert_eq!(only(&r, "transform/opacity")["verdict"], "approved", "{r:#}");
+    let slide: Vec<Value> = moves(&r).into_iter().filter(|m| m["layer"] == other).collect();
+    assert_ne!(slide[0]["verdict"], "approved", "{r:#}");
+    let h = s.execute_checked("handover.check", json!({})).unwrap();
+    assert_eq!(h["range"], json!({"start": 1.0, "end": 3.5}), "{h:#}");
+    // ✅ moves stay out of the lists.
+    let listed: Vec<&Value> = h["blocking"].as_array().unwrap().iter().chain(h["warnings"].as_array().unwrap()).filter(|e| e["source"] == "taste").collect();
+    assert!(!listed.is_empty() && listed.iter().all(|e| e["layer"] == other), "{h:#}");
+    // Fixed, the range stays the same.
+    let fix = slide[0]["fix"].clone();
+    s.execute_checked(fix["command"].as_str().unwrap(), fix["params"].clone()).unwrap();
+    let h = s.execute_checked("handover.check", json!({})).unwrap();
+    assert_eq!(h["range"], json!({"start": 1.0, "end": 3.5}), "{h:#}");
+}
