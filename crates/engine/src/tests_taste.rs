@@ -476,3 +476,41 @@ fn separated_position_moves_are_judged() {
     let m = only(&check(&mut s), "transform/positionX");
     assert_eq!(m["verdict"], "approved", "{m:#}");
 }
+
+#[test]
+fn moves_cut_by_the_out_point_and_slides_behind_a_matte_read_as_the_viewer_sees_them() {
+    // 2 Nov 2026 (editzena BR carousel, BL arrow): a move still on screen when the layer's out
+    // point cuts it read as an exit; a bar rising into a matte window read as an on-screen move.
+    let (mut s, cid, icon) = comp();
+    // A carousel: a null slides its icon 300 px left from 1 s to 3.67 s; the layers end at 3 s.
+    s.execute_checked("prop.set", json!({"layer": icon, "path": "transform/position", "value": [900.0, 300.0]})).unwrap();
+    let row = s.execute_checked("layer.newNull", json!({"name": "Row CTRL"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute_checked("prop.set", json!({"layer": row, "path": "transform/anchor", "value": [0.0, 0.0]})).unwrap();
+    s.execute_checked("prop.set", json!({"layer": row, "path": "transform/position", "value": [0.0, 0.0]})).unwrap();
+    s.execute_checked("layer.setParent", json!({"layers": [icon], "parent": row})).unwrap();
+    key(&mut s, row, "transform/position", 1.0, json!([0.0, 0.0]));
+    key(&mut s, row, "transform/position", 1.0 + 80.0 / 30.0, json!([-300.0, 0.0]));
+    let (o, i) = builtin_profile().find("expo-in-out-elias").unwrap().at(80.0 / 30.0);
+    ease(&mut s, cid, row, "transform/position", 0, (o.speed, o.influence), (i.speed, i.influence));
+    s.execute_checked("layer.timing", json!({"layers": [icon, row], "out": 3.0})).unwrap();
+    // The same slide carrying it out of the frame before the cut is still an exit.
+    let gone = s.execute("layer.newSolid", json!({"name": "Gone", "width": 100, "height": 100, "color": "#00ff00"})).unwrap()["layer"].as_u64().unwrap();
+    key(&mut s, gone, "transform/position", 1.0, json!([900.0, 800.0]));
+    key(&mut s, gone, "transform/position", 1.5, json!([2100.0, 800.0]));
+    s.execute_checked("layer.timing", json!({"layers": [gone], "out": 1.5})).unwrap();
+    // A bar rising into a 400×100 alpha-matte window: below it (hidden by the matte) at its first key.
+    let win = s.execute("layer.newSolid", json!({"name": "Window", "width": 400, "height": 100, "color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute_checked("prop.set", json!({"layer": win, "path": "transform/position", "value": [960.0, 800.0]})).unwrap();
+    let bar = s.execute("layer.newSolid", json!({"name": "Bar", "width": 400, "height": 100, "color": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute_checked("layer.setTrackMatte", json!({"layer": bar, "matte": win, "kind": "alpha"})).unwrap();
+    key(&mut s, bar, "transform/position", 2.0, json!([960.0, 960.0]));
+    key(&mut s, bar, "transform/position", 2.6, json!([960.0, 800.0]));
+
+    let r = check(&mut s);
+    let of = |l: u64| moves(&r).into_iter().find(|m| m["layer"] == l).unwrap_or_else(|| panic!("no move on {l}: {r:#}"));
+    let m = of(row);
+    assert_eq!(m["moveType"], "move", "cut while on screen, headed on screen: {m:#}");
+    assert_eq!(m["verdict"], "approved", "{m:#}");
+    assert_eq!(of(gone)["moveType"], "exit", "{r:#}");
+    assert_eq!(of(bar)["moveType"], "entrance", "hidden by its matte at the first key: {r:#}");
+}

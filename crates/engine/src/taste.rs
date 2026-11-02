@@ -623,25 +623,33 @@ fn drawn_parts<'a>(comp: &'a Comp, l: &'a Layer) -> Vec<&'a Layer> {
 }
 
 /// Whether nothing `l` places shows at comp time `ct`: every drawn part is off (in/out point,
-/// opacity 0) or its content box lies wholly outside the frame. `None` when that can't be told
-/// (no drawn part, or none with a content box).
-fn out_of_frame(ctx: &EvalCtx, l: &Layer, ct: Tick) -> Option<bool> {
+/// opacity 0) or its content box, as projected through the active camera, lies wholly outside
+/// the frame or (for a layer under an alpha or luma track matte) outside the matte's box. `None`
+/// when that can't be told (no drawn part, or none with a content box). With `past_cut`, a part
+/// is measured even outside its in/out points: where a move cut by the out point was headed.
+fn out_of_frame(ctx: &EvalCtx, l: &Layer, ct: Tick, past_cut: bool) -> Option<bool> {
+    use effectcraft_project::MatteKind;
     let parts = drawn_parts(ctx.comp, l);
     let c = ctx.at(ct);
     let (w, h) = (ctx.comp.width as f64, ctx.comp.height as f64);
     let frame = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+    let cut_only = |why: &[&str]| why.iter().all(|r| *r == "before its in point" || *r == "at or after its out point");
+    let quad = |x: &Layer| crate::layout::layer_geometry(&c, x).filter(|g| g.projected && g.corners.iter().flatten().all(|v| v.is_finite())).map(|g| g.corners);
     let mut measured = false;
     for x in parts {
-        if !crate::layout::visibility(&c, x).0 {
+        let (vis, why) = crate::layout::visibility(&c, x);
+        if !vis && !(past_cut && cut_only(&why)) {
             continue;
         }
-        let Some(g) = crate::layout::layer_geometry(&c, x) else { continue };
-        if !g.projected || !g.corners.iter().flatten().all(|v| v.is_finite()) {
-            continue;
-        }
+        let Some(corners) = quad(x) else { continue };
         measured = true;
-        let inside = crate::layout::polygon_area(&crate::layout::clip_convex(&g.corners, &frame));
-        if inside > 1.0 {
+        let mut seen = crate::layout::clip_convex(&corners, &frame);
+        // What a matte hides isn't on screen (a slide inside a pill window, a rise from behind a line).
+        let matte = x.track_matte.filter(|m| matches!(m.kind, MatteKind::Alpha | MatteKind::Luma)).and_then(|m| ctx.comp.layer(m.layer)).and_then(|m| quad(m));
+        if let Some(m) = matte {
+            seen = crate::layout::clip_convex(&seen, &m);
+        }
+        if crate::layout::polygon_area(&seen) > 1.0 {
             return Some(false);
         }
     }
@@ -713,12 +721,23 @@ pub fn classify(ctx: &EvalCtx, l: &Layer, m: &str, prop: &Property, i: usize) ->
     let is_pos = is_position(m);
     // Off the frame: the content boxes of what the layer places (itself, a rig's children), or
     // for a layer with none to measure, its own Position.
-    let gone = |t: Tick, v: &KValue| out_of_frame(ctx, l, t).unwrap_or_else(|| m == "position" && off_frame(comp, l, v));
+    let gone = |t: Tick, v: &KValue| out_of_frame(ctx, l, t, false).unwrap_or_else(|| m == "position" && off_frame(comp, l, v));
     if hidden(comp, l, t0, frame) || (is_pos && gone(t0, &a.value)) {
         return MoveType::Entrance;
     }
-    // The last frame of a layer that ends with its move counts as gone.
-    if hidden(comp, l, t1, frame) || (is_pos && gone(t1, &b.value)) || t1 + frame >= l.out_point {
+    // A move that runs into or past the layer's out point is cut there. Still on screen on its
+    // last shown frame and headed somewhere on screen (a pan, a carousel continuing past a
+    // precomp's end), it is on → on, not an exit: the editzena BR carousel and BL arrow read as
+    // exits (2 Nov 2026). Otherwise the last frame of a layer that ends with its move counts as gone.
+    let cut = t1 + frame >= l.out_point;
+    if cut {
+        let last = (l.out_point - frame).max(t0);
+        let on = |t: Tick, past: bool| out_of_frame(ctx, l, t, past) == Some(false);
+        if !hidden(comp, l, last, frame) && on(last, false) && on(t1, true) {
+            return MoveType::Move;
+        }
+    }
+    if hidden(comp, l, t1, frame) || (is_pos && gone(t1, &b.value)) || cut {
         return MoveType::Exit;
     }
     MoveType::Move
