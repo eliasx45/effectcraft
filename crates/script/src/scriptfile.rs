@@ -46,7 +46,12 @@ pub(crate) fn check_read(s: &Session, path: &Path, root: Option<&Path>) -> Resul
     if root.into_iter().chain(project.as_deref()).any(|d| path.starts_with(d)) {
         return Ok(());
     }
-    Err(format!("Unable to read {}: scripts can only load files from their own or the project's folder unless {GATE} is on", path.display()))
+    Err(format!(
+        "Unable to read {}: scripts can only load files from their own folder or {} unless {GATE} is on. {}",
+        path.display(),
+        crate::runtime::readable_place(s),
+        crate::runtime::gate_help()
+    ))
 }
 
 /// Read a script file as text (a UTF-8 byte order mark dropped), refusing files over

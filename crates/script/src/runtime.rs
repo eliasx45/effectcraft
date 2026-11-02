@@ -430,6 +430,26 @@ fn without_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
 
 pub(crate) const GATE: &str = "Preferences ▸ Scripting & Expressions ▸ Allow Scripts to Write Files and Access Network";
 
+/// Why the file gate exists and how to open it, appended to every refusal (2 Nov 2026: agents
+/// running `effectcraft-cli script --empty` couldn't tell the refusal was deliberate, nor how to
+/// allow a read; a script can't grant it to itself, #590).
+pub(crate) fn gate_help() -> String {
+    format!(
+        "This is deliberate: a script can't read your other files, write files or use the network unless you allow it, and it can't allow itself. \
+         To allow it: turn on {GATE}; headless, grant it before running the script: \
+         `effectcraft-cli run [P.ecproj | --empty] prefs.set '{{\"key\":\"scripting.allowScriptsWriteFiles\",\"value\":true}}' file.runScript '{{\"path\":\"/abs/script.jsx\"}}'`. \
+         For reads only, you can also keep the file in the project's folder."
+    )
+}
+
+/// The project's folder for a refusal: named, or why there's none.
+pub(crate) fn readable_place(s: &Session) -> String {
+    match project_dir(s) {
+        Some(d) => format!("the project's folder ({d})"),
+        None => "the project's folder (this project is unsaved, e.g. `--empty`, so it has none and no file can be read)".into(),
+    }
+}
+
 /// The file-access gate: reads under the project's folder are always allowed; other reads, all
 /// writes and listing other folders need the Allow Scripts to Write Files preference.
 fn check_access(s: &Session, path: &str, write: bool) -> Result<std::path::PathBuf, String> {
@@ -438,7 +458,7 @@ fn check_access(s: &Session, path: &str, write: bool) -> Result<std::path::PathB
         return Ok(p);
     }
     if write {
-        return Err(format!("Unable to write {path}: scripts can't write files unless {GATE} is on"));
+        return Err(format!("Unable to write {path}: scripts can't write files unless {GATE} is on. {}", gate_help()));
     }
     if let Some(dir) = project_dir(s) {
         let d = normalize(&dir);
@@ -446,7 +466,7 @@ fn check_access(s: &Session, path: &str, write: bool) -> Result<std::path::PathB
             return Ok(p);
         }
     }
-    Err(format!("Unable to access {path}: scripts can only read files in the project's folder unless {GATE} is on"))
+    Err(format!("Unable to access {path}: scripts can only read files in {} unless {GATE} is on. {}", readable_place(s), gate_help()))
 }
 
 /// Encode a binary script string as bytes, without silently corrupting code points outside

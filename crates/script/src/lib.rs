@@ -108,6 +108,9 @@ mod tests_ui_more;
 // #760: `$.evalFile` and `BridgeTalk`.
 #[cfg(test)]
 mod tests_evalfile;
+// The file gate's refusals explain themselves (2 Nov 2026).
+#[cfg(test)]
+mod tests_file_gate_help;
 // `/browser/…` is the web editor's file table, an absolute path on wasm; on Windows it has no
 // drive, so the script runtime resolves it under the current drive, where the host holds nothing.
 #[cfg(all(test, not(windows)))]
