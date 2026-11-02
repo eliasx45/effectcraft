@@ -22,7 +22,7 @@ use effectcraft_project::{ItemKind, Layer, LayerSource, LightKind, PrimitiveKind
 
 use super::shade::srgb_to_linear;
 use crate::three_d::camera::{CameraState, NEAR};
-use crate::three_d::compose::camera_for;
+use crate::three_d::compose::{camera_for, camera_for_sample};
 use crate::three_d::light::{LightState, Material as ClassicMaterial};
 use crate::{EvalCtx, Renderer};
 
@@ -1006,7 +1006,8 @@ pub(crate) fn build_at(r: &Renderer, ctx: &EvalCtx, sub: Option<&EvalCtx>, run: 
     let base = ctx;
     let at = sub.unwrap_or(ctx);
     let ctx = at;
-    let cam = camera_for(r, ctx);
+    // A sub-sample keeps the frame's camera layer, evaluated at the sample's time.
+    let cam = if sub.is_some() { camera_for_sample(r, base, ctx) } else { camera_for(r, ctx) };
     let lin = r.pipe.linear || r.pipe.linear_blend;
     let ssaa = ssaa_for(r, out);
     let mut b = Builder {

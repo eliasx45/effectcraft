@@ -139,14 +139,16 @@ impl<'a> Renderer<'a> {
             if self.through_lost || self.links().next().is_none() {
                 let at = ctx.at(ctx.time + Tick::from_seconds_f64(dt));
                 if own {
-                    return self.comp_matrix(&at, layer);
+                    // Through the frame's camera layer, evaluated at the sample's time.
+                    let (l2c, _) = at.layer_to_comp_in_shutter(layer, ctx);
+                    return self.outer.map_or(l2c, |o| o * l2c);
                 }
                 // Only the followed Transform effects of its parents move it.
                 let (l2c, _) = ctx.layer_to_comp_fx(layer, &at);
                 return self.outer.map_or(l2c, |o| o * l2c);
             }
             let (outer, t) = self.outer_at(ctx, dt);
-            let (l2c, _) = if own { ctx.at(t).layer_to_comp(layer) } else { ctx.layer_to_comp_fx(layer, &ctx.at(t)) };
+            let (l2c, _) = if own { ctx.at(t).layer_to_comp_in_shutter(layer, ctx) } else { ctx.layer_to_comp_fx(layer, &ctx.at(t)) };
             outer.map_or(l2c, |o| o * l2c)
         });
         self.place_matrix(l2c, buf)

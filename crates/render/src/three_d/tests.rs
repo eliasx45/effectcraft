@@ -654,3 +654,50 @@ fn coplanar_layers_keep_stack_order_under_a_moving_camera_with_motion_blur() {
         assert!(c[0] > 0.99 && c[2] < 0.01, "t={t}: {c:?}");
     }
 }
+
+/// A one-node camera layer 60 px right of the default camera, its In point at `in_frame`, in a
+/// comp with motion blur at shutter phase −90° (samples from a quarter frame before the frame),
+/// and a still, motion-blurred 3D solid at the comp centre.
+fn camera_from_frame(in_frame: i64) -> (Project, ItemId) {
+    let (mut p, cid, comp) = setup();
+    {
+        let c = p.comp_mut(cid).unwrap();
+        c.enable_motion_blur = true;
+        c.shutter_angle = 180.0;
+        c.shutter_phase = -90.0;
+    }
+    let mut cam = camera(&mut p, &comp);
+    cam.auto_orient = effectcraft_project::AutoOrient::Off;
+    set(&mut cam, "transform/position", Value::Vec3([160.0, 50.0, -zoom()]));
+    let start = Tick(comp.frame_rate.frame_duration().0 * in_frame);
+    cam.start_time = start;
+    cam.in_point = start;
+    let mut s = solid3(&mut p, &comp, [1.0, 0.0, 0.0], 20, 20, [100.0, 50.0, 0.0]);
+    s.switches.motion_blur = true;
+    push(&mut p, cid, cam);
+    push(&mut p, cid, s);
+    (p, cid)
+}
+
+#[test]
+fn shutter_samples_before_the_camera_in_point_keep_the_frame_camera() {
+    // AE 2026 (2 Nov 2026): on a camera layer's first frame with shutter phase −90°, the samples
+    // before its In point (before frame 0, or before a later In point) still look through it.
+    // EffectCraft switched those samples to the default camera and drew a ghost copy of every
+    // layer where the default camera sees it.
+    for in_frame in [0, 10] {
+        let (p, cid) = camera_from_frame(in_frame);
+        let t = Tick(p.comp(cid).unwrap().frame_rate.frame_duration().0 * in_frame);
+        let img = render_frame(&p, cid, t, 1.0);
+        // Through the camera layer (60 px right) the solid sits at x = 40, fully opaque.
+        let seen = img.get(40, 50);
+        assert!(seen[0] > 0.99 && seen[3] > 0.99, "in frame {in_frame}: through the camera {seen:?}");
+        // No ghost where the default camera would show it.
+        let ghost = img.get(100, 50);
+        assert!(ghost[3] < 0.01, "in frame {in_frame}: ghost {ghost:?}");
+    }
+    // The frame before a later In point still looks through the default camera.
+    let (p, cid) = camera_from_frame(10);
+    let img = render_frame(&p, cid, Tick(p.comp(cid).unwrap().frame_rate.frame_duration().0 * 9), 1.0);
+    assert!(img.get(100, 50)[3] > 0.99 && img.get(40, 50)[3] < 0.01);
+}

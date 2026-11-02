@@ -23,7 +23,7 @@ use effectcraft_raster::{Image, Px, hash_noise};
 use effectcraft_time::Tick;
 use rayon::prelude::*;
 
-use super::camera::{CameraState, NEAR, active_camera};
+use super::camera::{CameraState, NEAR, active_camera, shutter_camera};
 use super::light::{LightState, Material, lights_at, shade};
 use crate::{EvalCtx, Renderer};
 
@@ -162,7 +162,7 @@ pub(crate) fn plane_view(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, 
         } else {
             let f = phase + angle * i as f64 / (n - 1) as f64;
             let sub = ctx.at(ctx.time + Tick::from_seconds_f64(f * fd));
-            (camera_for(r, &sub), outer * sub.world_matrix(layer))
+            (camera_for_sample(r, ctx, &sub), outer * sub.world_matrix(layer))
         };
         if c.dof.is_some() {
             return None;
@@ -226,6 +226,19 @@ pub(crate) fn camera_for(r: &Renderer, ctx: &EvalCtx) -> CameraState {
     match r.opts.view {
         Some(v) if r.depth == 0 => v,
         _ => active_camera(ctx),
+    }
+}
+
+/// [`camera_for`] at the motion-blur sub-sample `sub` of the frame `ctx`: the frame's camera
+/// layer evaluated at the sample's time ([`shutter_camera`]), so samples before the camera's In
+/// point don't switch to the default camera.
+pub(crate) fn camera_for_sample(r: &Renderer, ctx: &EvalCtx, sub: &EvalCtx) -> CameraState {
+    if let Some(c) = r.collapse3d {
+        return c.cam;
+    }
+    match r.opts.view {
+        Some(v) if r.depth == 0 => v,
+        _ => shutter_camera(ctx, sub),
     }
 }
 
@@ -314,7 +327,7 @@ fn prepare_with<'a>(
             .filter_map(|i| {
                 let f = phase + angle * i as f64 / (n - 1) as f64;
                 let sub = ctx.at(ctx.time + Tick::from_seconds_f64(f * fd));
-                let c = camera_for(r, &sub);
+                let c = camera_for_sample(r, ctx, &sub);
                 let w = outer * sub.world_matrix(layer) * local;
                 // Depth from the frame's camera, as for unblurred layers: planes that stay
                 // coplanar keep their stack order while the camera moves.

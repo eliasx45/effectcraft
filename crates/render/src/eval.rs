@@ -324,18 +324,34 @@ impl<'a> EvalCtx<'a> {
         self.layer_to_comp_of(layer, self.world_matrix_fx(layer, fx))
     }
 
+    /// [`Self::layer_to_comp`] at a motion-blur sub-sample of the frame `frame` (this context is
+    /// the sample): a 3D layer is seen through the frame's camera layer evaluated at the sample's
+    /// time ([`crate::three_d::shutter_camera`]), never the default camera before its In point.
+    pub fn layer_to_comp_in_shutter(&self, layer: &Layer, frame: &EvalCtx) -> (Mat3, f64) {
+        let world = self.world_matrix(layer);
+        if !layer.is_3d() {
+            return self.layer_to_comp_of(layer, world);
+        }
+        let c = crate::three_d::shutter_camera(frame, self);
+        self.layer_to_comp_cam(layer, world, c.projection(self.comp.width as f64, self.comp.height as f64))
+    }
+
     fn layer_to_comp_of(&self, layer: &Layer, world: Mat4) -> (Mat3, f64) {
         if layer.is_3d() {
             let (cam, _, _) = self.camera();
-            let full = cam * world;
-            let anchor = layer.transform().map(|tr| self.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
-            let a = world.apply(Vec3::from(anchor));
-            let depth = cam.0[3][0] * a.x + cam.0[3][1] * a.y + cam.0[3][2] * a.z + cam.0[3][3];
-            (full.plane_to_mat3(), depth)
-        } else {
-            let m = &world.0;
-            (Mat3([[m[0][0], m[0][1], m[0][3]], [m[1][0], m[1][1], m[1][3]], [0.0, 0.0, 1.0]]), 0.0)
+            return self.layer_to_comp_cam(layer, world, cam);
         }
+        let m = &world.0;
+        (Mat3([[m[0][0], m[0][1], m[0][3]], [m[1][0], m[1][1], m[1][3]], [0.0, 0.0, 1.0]]), 0.0)
+    }
+
+    /// A 3D layer's layer → comp matrix and anchor depth through the view-projection `cam`.
+    fn layer_to_comp_cam(&self, layer: &Layer, world: Mat4, cam: Mat4) -> (Mat3, f64) {
+        let full = cam * world;
+        let anchor = layer.transform().map(|tr| self.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
+        let a = world.apply(Vec3::from(anchor));
+        let depth = cam.0[3][0] * a.x + cam.0[3][1] * a.y + cam.0[3][2] * a.z + cam.0[3][3];
+        (full.plane_to_mat3(), depth)
     }
     /// [`effect_bounds`] of a layer of this comp at this time. A shape layer's comp-sized bounds
     /// are centred on its anchor point rather than its origin: After Effects renders a shape

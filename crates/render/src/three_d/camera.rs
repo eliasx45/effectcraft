@@ -410,6 +410,19 @@ pub fn active_camera(ctx: &EvalCtx) -> CameraState {
     }
 }
 
+/// The camera of the motion-blur sub-sample `sub` of the frame `frame`: the camera layer active
+/// at the frame's time, evaluated at the sample's time (else the default camera). After Effects
+/// keeps the frame's camera for every sample (AE 2026, checked 2 Nov 2026): with shutter phase
+/// −90° the first frame of a camera layer (its In point at 0, or later) shows no copies of the
+/// layers seen through the default camera, nor does the frame after its Out point show copies
+/// seen through it. Picking the camera at each sample's time drew those "ghost" copies.
+pub fn shutter_camera(frame: &EvalCtx, sub: &EvalCtx) -> CameraState {
+    match frame.comp.active_camera(frame.time) {
+        Some(cam) => layer_camera(sub, cam),
+        None => default_camera(frame.comp.width as f64, frame.comp.height as f64),
+    }
+}
+
 // ---------------------------------------------------------------- 3D views
 
 /// The viewer's 3D views (View ▸ Switch 3D View).
