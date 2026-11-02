@@ -3,7 +3,8 @@
 //! renders the text-free backdrop `low-contrast` measures and the frames `exposed-edge` checks
 //! for empty pixels, walks the precomps for the nested rules, mixes the audio `off-beat` needs,
 //! reads the comp's speech map for `off-accent` (errors for the calling agent's own keys, from
-//! the undo history), measures keyed texts at their rest pose for `text-off-centre` and renders
+//! the undo history), measures keyed texts at their rest pose for `text-off-centre` (and, over a
+//! range, for `text-too-small`, precomps showing text too) and renders
 //! the comp's end without its base shot for `exit-at-cut`.
 
 use effectcraft_project::{ItemId, LayerId, LayerSource, Project};
@@ -167,8 +168,39 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         vec![]
     };
+    // Over a range, keyed texts and precomps (that may show text) are read for `text-too-small`
+    // at their rest pose, or where their layer is largest on screen when they never rest: the
+    // editzena TR phone's texts were "too small" at the zoom's first frame (2 Nov 2026).
+    let sized: Vec<(LayerId, Vec<Tick>)> = if set.on("text-too-small") && range {
+        comp.layers
+            .iter()
+            .filter(|l| matches!(l.source, LayerSource::Text | LayerSource::Comp { .. }))
+            .filter(|l| l.in_point.seconds() <= span.1 + 1e-9 && l.out_point.seconds() > span.0 && lint::chain_keyed(comp, l))
+            .map(|l| (l.id, lint::rest_poses(comp, l)))
+            .collect()
+    } else {
+        vec![]
+    };
+    // (layer, largest on-screen box area, when) over the samples.
+    let mut biggest: Vec<(LayerId, f64, Tick)> = vec![];
     for &t in &times {
         let Some(ctx) = r.eval_ctx(cid, t) else { continue };
+        for (lid, _) in &sized {
+            let Some(l) = comp.layer(*lid) else { continue };
+            if !layout::visibility(&ctx, l).0 {
+                continue;
+            }
+            let Some(g) = layout::layer_geometry(&ctx, l).filter(|g| g.projected) else { continue };
+            let area = layout::polygon_area(&g.corners);
+            if !area.is_finite() {
+                continue;
+            }
+            match biggest.iter_mut().find(|(b, _, _)| b == lid) {
+                Some(e) if area > e.1 => (e.1, e.2) = (area, t),
+                Some(_) => {}
+                None => biggest.push((*lid, area, t)),
+            }
+        }
         let backdrop = match &text_free {
             Some(tp) if lint::any_text_visible(&ctx) => Some(render_backdrop(s, tp, cid, t, scale, comp.background)),
             _ => None,
@@ -185,6 +217,36 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     occurrences.extend(lint::exposed_edges(comp, &coverage));
+    if !sized.is_empty() {
+        occurrences.retain(|(_, f)| f.rule != "text-too-small" || !sized.iter().any(|(l, _)| *l == f.layer));
+        let only = Settings { rules: vec!["text-too-small"], ..set.clone() };
+        let fps = comp.frame_rate.as_f64();
+        for (lid, poses) in &sized {
+            let Some(l) = comp.layer(*lid) else { continue };
+            // The rest pose where it is largest on screen (the landed pose, not the held first key
+            // of a pop); the latest of equals.
+            let area =
+                |ctx: &effectcraft_render::EvalCtx| layout::layer_geometry(ctx, l).filter(|g| g.projected).map_or(0.0, |g| layout::polygon_area(&g.corners));
+            let mut rest: Option<(Tick, effectcraft_render::EvalCtx, bool)> = None;
+            let mut best = f64::NEG_INFINITY;
+            for &t in poses {
+                let Some(ctx) = r.eval_ctx(cid, t).filter(|ctx| layout::visibility(ctx, l).0 && ctx.opacity(l) >= 0.99) else { continue };
+                let a = area(&ctx);
+                if a.is_finite() && a > best {
+                    best = a;
+                    rest = Some((t, ctx, true));
+                }
+            }
+            let largest = || biggest.iter().find(|(b, _, _)| b == lid).and_then(|&(_, _, t)| r.eval_ctx(cid, t).map(|ctx| (t, ctx, false)));
+            let Some((t, ctx, at_rest)) = rest.or_else(largest) else { continue };
+            let found = if matches!(l.source, LayerSource::Text) { lint::lint_at(&ctx, &only, None) } else { lint::lint_nested(&r, &ctx, &only) };
+            for mut f in found.into_iter().filter(|f| f.layer == *lid && f.rule == "text-too-small") {
+                let how = if at_rest { "at its rest pose" } else { "where it is largest on screen in the range (it never rests)" };
+                f.message.push_str(&format!(" (Measured {how}, {:.3} s, frame {:.0}.)", t.seconds(), t.seconds() * fps));
+                occurrences.push((t, f));
+            }
+        }
+    }
     if !rests.is_empty() {
         occurrences.retain(|(_, f)| f.rule != "text-off-centre" || !rests.iter().any(|(l, _)| *l == f.layer));
         let only = Settings { rules: vec!["text-off-centre"], ..set.clone() };

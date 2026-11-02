@@ -679,3 +679,33 @@ fn exit_at_cut_is_silent_on_his_finished_comps() {
         assert!(warned.is_empty(), "{}: {warned:#?}", r["compName"]);
     }
 }
+
+#[test]
+fn text_too_small_reads_keyed_text_at_its_rest_pose_not_mid_entrance() {
+    // 2 Nov 2026 (editzena TR): texts inside a precomp that zooms in were "too small" at the
+    // zoom's first frame, though legible once it lands.
+    let mut s = comp(3.0);
+    let key = |s: &mut Session, l: u64, path: &str, t: f64, v: Value| {
+        s.execute("prop.addKey", json!({"layer": l, "path": path, "value": v, "time": t, "timeBase": "comp"})).unwrap();
+    };
+    // 12 px text (minimum 6 here) popping from 20 % to 100 %: 2.4 px on its first frame.
+    let t = text(&mut s, "Pop", "Hello", 12.0, "#ffffff", [160.0, 60.0]);
+    key(&mut s, t, "transform/scale", 0.0, json!([20.0, 20.0]));
+    key(&mut s, t, "transform/scale", 0.6, json!([100.0, 100.0]));
+    // The same inside a precomp whose layer zooms 20 % → 100 % and never rests (keys past the comp).
+    let inner = text(&mut s, "Inside", "Hello", 12.0, "#ffffff", [160.0, 130.0]);
+    let r = s.execute("layer.precompose", json!({"layers": [inner], "name": "Phone", "mode": "move"})).unwrap();
+    let pre = r["layer"].as_u64().unwrap_or_else(|| panic!("{r}"));
+    key(&mut s, pre, "transform/scale", -0.5, json!([20.0, 20.0, 100.0]));
+    key(&mut s, pre, "transform/scale", 4.0, json!([100.0, 100.0, 100.0]));
+    let r = lint(&mut s, json!({"start": 0, "end": 2.9, "step": 0.2, "rules": ["text-too-small"]}));
+    assert!(of(&r, "text-too-small").is_empty(), "{r:#}");
+    // A single time still measures that frame.
+    assert_eq!(of(&lint(&mut s, json!({"time": 0, "rules": ["text-too-small"]})), "text-too-small").len(), 2);
+    // Too small at rest too (4 px): still reported, measured at its rest pose.
+    s.execute("layer.setText", json!({"layer": t, "size": 4.0})).unwrap();
+    let r = lint(&mut s, json!({"start": 0, "end": 2.9, "step": 0.2, "rules": ["text-too-small"]}));
+    let p = one(&r, "text-too-small");
+    assert_eq!(p["layer"].as_u64(), Some(t), "{p}");
+    assert!(p["message"].as_str().unwrap().contains("Measured at its rest pose"), "{p}");
+}

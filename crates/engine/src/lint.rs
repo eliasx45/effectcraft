@@ -35,6 +35,9 @@
 //!   outside its precomp's frame (which clips it unless Collapse Transformations is on).
 //!   Warning for text, info for other layers; the nested layer is [`Finding::inner`]. Text
 //!   inside precomps also gets `text-too-small` and `outside-title-safe`, measured the same way.
+//!   Over a range, `text-too-small` reads a text (or a precomp showing text) whose layer or
+//!   parents are keyed at its rest pose, like `text-off-centre`, or, when it never rests in the
+//!   comp, where its layer is largest on screen in the range: an entrance scale isn't its size.
 //! - `exposed-edge`: with the comp rendered (only at times its layers' boxes claim 90 % of the
 //!   frame, so overlay comps are skipped), an empty strip of at least 1 px along a frame edge
 //!   while at most a quarter of the frame is empty (a full-screen shot scaled or shaken off the
@@ -501,6 +504,21 @@ fn centre_move(ctx: &EvalCtx, l: &Layer, card: &[[f64; 2]; 4], off: [Option<f64>
     }
     let now = ctx.v3(l, tr, "position", [0.0; 3]);
     Some((now, [now[0] + local[0], now[1] + local[1], now[2]]))
+}
+
+/// Whether `l` or one of its parents has a property with two or more keys (its pose changes).
+pub fn chain_keyed(comp: &Comp, l: &Layer) -> bool {
+    let mut cur = Some(l);
+    for _ in 0..=64 {
+        let Some(c) = cur else { return false };
+        let mut keyed = false;
+        c.props.walk("", &mut |_, p| keyed |= p.keys.len() >= 2);
+        if keyed {
+            return true;
+        }
+        cur = c.parent.and_then(|id| comp.layer(id));
+    }
+    false
 }
 
 /// Most rest-pose candidates [`rest_poses`] returns.
