@@ -501,20 +501,20 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "speech.get",
             "Speech Map",
-            "{comp?, start? (s), end? (s), stressed?: true (list the stressed syllables' accents: where a speed-graph peak should land), accentLead? (frames before the stressed vowel, default 1)} → {words, syllables, stressed, …, list: [{word, start, end, frame, syllables: [{t, frame, vowel, stress}]}] | accents: [{word, onset, onsetFrame, vowel, vowelFrame, accent, accentFrame}]}",
+            "{comp?, start? (s), end? (s), stressed?: true (list the stressed syllables' accents: where a speed-graph peak should land), accentLead? (frames before the stressed vowel, default 1; never before the syllable's onset, so a syllable that starts on its vowel (\"order\", \"IBM\") has its accent on the vowel)} → {words, syllables, stressed, …, list: [{word, start, end, frame, syllables: [{t, frame, vowel, stress}]}] | accents: [{word, onset, onsetFrame, vowel, vowelFrame, accent, accentFrame}]}",
             get
         ),
         query!(
             "speech.accents",
             "Speed Peaks vs Accents",
-            "{comp?, layer?, start? (s), end? (s), accentLead? (frames, default 1)} → {peaks, hits, list: [{comp (the layer's comp: a precomp for nested moves), compName, via (precomp layer ids from this comp down, outermost first), layer, layerName, property, path, time, frame (this comp's), speed, word, onset, vowel, accent, accentFrame, offsetFrames (peak − accent; negative = early), hit (within 1 frame), alignPeak (keys.alignPeak params that land it on the accent)}], skipped (precomps not searched: time-remapped)}: every keyframed property's speed-graph peak, also inside precomps (mapped through each precomp layer's start and stretch; kept only where every precomp layer shows it), with its nearest stressed syllable; `layer` may be a precomp layer (everything in it)",
+            "{comp?, layer?, start? (s), end? (s), accentLead? (frames before the stressed vowel, default 1; never before the syllable's onset, so a syllable that starts on its vowel (\"order\", \"IBM\") has its accent on the vowel)} → {peaks, hits, list: [{comp (the layer's comp: a precomp for nested moves), compName, via (precomp layer ids from this comp down, outermost first), layer, layerName, property, path, time, frame (this comp's), speed, word, onset, vowel, accent, accentFrame, offsetFrames (peak − accent; negative = early), hit (within 1 frame), alignPeak (keys.alignPeak params that land it on the accent)}], skipped (precomps not searched: time-remapped)}: every keyframed property's speed-graph peak, also inside precomps (mapped through each precomp layer's start and stretch; kept only where every precomp layer shows it), with its nearest stressed syllable; `layer` may be a precomp layer (everything in it)",
             accents
         ),
         cmd!("speech.clear", "Remove Speech Map", [], None, "{comp?} (the comp's script stays)", always, clear),
         query!(
             "layer.words",
             "Layer Words",
-            "{comp?, layer? (default: the selected layer; the voice layer or any layer: the words said inside its in/out), accentLead? (frames, default 1)} → {comp, layer, name, voiceLayer, span: {in, out, inFrame, outFrame}, fps, count, truncated, words: [{index (in the speech map), word, start, end (comp s), frames: [start, end], stress? (comp frame where a peak should land: the stressed syllable's vowel − accentLead), stressTime?, syllable?, onsetFrame?}]}. The words belong to the voice layer: moving, trimming, duplicating or precomposing it carries them",
+            "{comp?, layer? (default: the selected layer; the voice layer or any layer: the words said inside its in/out), accentLead? (frames before the stressed vowel, default 1; never before the syllable's onset, so a syllable that starts on its vowel (\"order\", \"IBM\") has its accent on the vowel)} → {comp, layer, name, voiceLayer, span: {in, out, inFrame, outFrame}, fps, count, truncated, words: [{index (in the speech map), word, start, end (comp s), frames: [start, end], stress? (comp frame where a peak should land: the stressed syllable's vowel − accentLead, never before its onset), stressTime?, syllable?, onsetFrame?}]}. The words belong to the voice layer: moving, trimming, duplicating or precomposing it carries them",
             layer_words
         ),
         cmd!(
@@ -522,7 +522,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Find Word",
             [],
             None,
-            "{comp?, word (a word or a few said in a row; case and punctuation ignored), occurrence? (1-based, default 1), go? (default true: the playhead goes there), accentLead? (frames, default 1)} → {comp, word, index, occurrence, of (how many times it is said), time, frame (its stressed syllable's accent, else its start), stressed, start, end, words: [...as layer.words], occurrences: [start frames]}",
+            "{comp?, word (a word or a few said in a row; case and punctuation ignored), occurrence? (1-based, default 1), go? (default true: the playhead goes there), accentLead? (frames before the stressed vowel, default 1; never before the syllable's onset, so a syllable that starts on its vowel (\"order\", \"IBM\") has its accent on the vowel)} → {comp, word, index, occurrence, of (how many times it is said), time, frame (its stressed syllable's accent, else its start), stressed, start, end, words: [...as layer.words], occurrences: [start frames]}",
             has_comp,
             find
         ),

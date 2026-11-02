@@ -112,7 +112,7 @@ pub(crate) const APPEAR_PLAN: ToolDef = ToolDef {
         json!({"type": "object", "properties": {
             "comp": {"description": "Comp id or name (default the active comp)."},
             "layers": {"type": "array", "items": {}, "description": "Layers to plan: id, name or \"#n\", or {layer, words? (what it shows), occurrence? (1-based)}. Default: every text layer and layers whose name has a spoken word."},
-            "accentLead": {"type": "number", "minimum": 0, "description": "Frames before the stressed vowel the peak should land (default 1)."}
+            "accentLead": {"type": "number", "minimum": 0, "description": "Frames before the stressed vowel the peak should land (default 1), never before the syllable's onset: a syllable that starts on its vowel has its accent on the vowel."}
         }, "additionalProperties": false})
     },
     run: appear_plan,
