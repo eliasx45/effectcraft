@@ -300,12 +300,13 @@ fn lint_frame_and_get_comp_summarise_on_request() {
     }
     ok(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "BG"}}));
     // `summary: false`: every problem (too many for one reply: retained, fetched by get_result).
-    let full = ok(&mut s, "lint_frame", json!({"summary": false}));
+    // text-too-small is off by default since 2 Nov 2026: `rules: "all"` turns it on.
+    let full = ok(&mut s, "lint_frame", json!({"summary": false, "rules": "all"}));
     let total: u64 = ["error", "warning", "info"].iter().map(|k| full["counts"][k].as_u64().unwrap()).sum();
     assert!(total > 40, "{full}");
     assert!(full["result_id"].is_string(), "{full}");
     // Over 40 problems the default is the summary, which fits one reply.
-    let sum = ok(&mut s, "lint_frame", json!({}));
+    let sum = ok(&mut s, "lint_frame", json!({"rules": "all"}));
     assert_eq!(sum["summary"], true, "{sum}");
     assert_eq!(sum["total"], total, "{sum}");
     assert!(sum["problems"].as_array().unwrap().len() <= SUMMARY_PROBLEMS, "{sum}");

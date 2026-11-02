@@ -5,7 +5,8 @@
 //! reads the comp's speech map for `off-accent` (errors for the calling agent's own keys, from
 //! the undo history), measures keyed texts at their rest pose for `text-off-centre` (and, over a
 //! range, for `text-too-small`, precomps showing text too) and renders
-//! the comp's end without its base shot for `exit-at-cut`.
+//! the comp's end without its base shot for `exit-at-cut`. Without `rules` it runs
+//! [`lint::DEFAULT_RULES`] only, and info lines are left out unless `verbose: true`.
 
 use effectcraft_project::{ItemId, LayerId, LayerSource, Project};
 use effectcraft_render::{Backend, RenderOpts, Renderer};
@@ -106,12 +107,15 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 _ => return Err(bad(C, "`rules` is a list of rule ids")),
             };
-            set.rules = names
-                .iter()
-                .map(|n| lint::RULES.iter().find(|r| *r == n).copied().ok_or_else(|| bad(C, format!("unknown rule `{n}`; rules: {}", lint::RULES.join(", ")))))
-                .collect::<Result<_>>()?;
+            set.rules = lint::rule_set(&names).map_err(|e| bad(C, e))?;
         }
     }
+    // Info lines only when asked: on Elias's shipped work they were 1,400 of 1,905 lines and none
+    // was acted on (lint audit, 2 Nov 2026).
+    let verbose = match p.get("verbose").filter(|v| !v.is_null()) {
+        None => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad(C, format!("`verbose` is true or false, not {v}")))?,
+    };
     if let Some(v) = p.get("minTextPx").filter(|v| !v.is_null()) {
         set.min_text_px =
             v.as_f64().filter(|x| x.is_finite() && *x > 0.0).ok_or_else(|| bad(C, format!("`minTextPx` is a size in comp pixels (> 0), not {v}")))?;
@@ -439,7 +443,20 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
         occurrences.extend(lint::exit_at_cut(comp, &tail, full));
     }
 
-    let problems = lint::merge(occurrences);
+    let mut problems = lint::merge(occurrences);
+    let before = problems.len();
+    if !verbose {
+        problems.retain(|pr| pr.finding.severity != lint::Severity::Info);
+    }
+    if problems.len() < before {
+        notes.push(format!("{} info line(s) left out; verbose: true lists them", before - problems.len()));
+    }
+    if set.rules == lint::DEFAULT_RULES {
+        notes.push(format!(
+            "default rules only: {} (2 Nov 2026, Elias decided; the rest are off until the lint experiment). rules: \"all\" or a list of rule ids turns others on",
+            lint::DEFAULT_RULES.join(", ")
+        ));
+    }
     let count = |sev: lint::Severity| problems.iter().filter(|p| p.finding.severity == sev).count();
     let (errors, warnings, infos) = (count(lint::Severity::Error), count(lint::Severity::Warning), count(lint::Severity::Info));
     let list: Vec<Value> = problems
@@ -487,7 +504,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![query!(
         "render.lint",
         "Design Lint",
-        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: [text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|nested-cut-off|text-overlap|text-off-centre|hidden-visible|exposed-edge|off-beat|off-accent|off-taste|exit-at-cut] (default all), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner? {comp, layer, path} (a layer inside a precomp: `layer` is the precomp layer showing it), fix? {command, params} (the call that fixes it: text-off-centre)}], notes}",
+        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: \"all\" | \"default\" | rule id | [rule id|all|default] (rule ids: text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|nested-cut-off|text-overlap|text-off-centre|hidden-visible|exposed-edge|off-beat|off-accent|off-word|off-taste|exit-at-cut; default: text-off-centre, exposed-edge, exit-at-cut only, the rest off until the lint experiment, 2 Nov 2026), verbose? (bool, default false: info lines are left out), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner? {comp, layer, path} (a layer inside a precomp: `layer` is the precomp layer showing it), fix? {command, params} (the call that fixes it: text-off-centre)}], notes}",
         render_lint
     )]
 }

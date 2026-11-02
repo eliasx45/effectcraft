@@ -1619,14 +1619,17 @@ fn lint_frame_reports_design_problems() {
         call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 320, "height": 180, "frameRate": 25, "duration": 2}}));
         let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"width": 40, "height": 40}}))["layer"].clone();
         call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/position", "value": [0, 90]}));
+        // Info lines only with verbose (2 Nov 2026).
         let r = call_json(&mut s, "lint_frame", json!({"time": 0, "rules": ["cut-off"]}));
+        assert_eq!(r["problems"], json!([]), "{r}");
+        let r = call_json(&mut s, "lint_frame", json!({"time": 0, "rules": ["cut-off"], "verbose": true}));
         assert_eq!(r["problems"].as_array().unwrap().len(), 1, "{r}");
         let p = &r["problems"][0];
         assert_eq!((p["rule"].as_str(), p["severity"].as_str(), &p["layer"]), (Some("cut-off"), Some("info"), &l), "{r}");
         assert_eq!(r["clean"], true);
         assert_eq!(r["counts"], json!({"error": 0, "warning": 0, "info": 1}));
         // A range and snake_case thresholds; bad rules are tool errors.
-        let r = call_json(&mut s, "lint_frame", json!({"start": 0, "end": 1, "step": 0.5, "min_text_px": 10, "rules": "cut-off"}));
+        let r = call_json(&mut s, "lint_frame", json!({"start": 0, "end": 1, "step": 0.5, "min_text_px": 10, "rules": "cut-off", "verbose": true}));
         assert_eq!(r["times"], json!([0.0, 0.5, 1.0]), "{r}");
         assert_eq!((r["problems"][0]["time"].as_f64(), r["problems"][0]["until"].as_f64()), (Some(0.0), Some(1.0)), "{r}");
         let (c, err) = call(&mut s, "lint_frame", json!({"rules": ["nope"]}));

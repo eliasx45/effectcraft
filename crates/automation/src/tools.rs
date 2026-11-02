@@ -1371,6 +1371,11 @@ fn get_layout(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("layer.bounds", p)?)
 }
 
+/// `lint_frame`'s `rules` values: the rule ids plus the sets `all` and `default`.
+fn rule_names() -> Vec<&'static str> {
+    effectcraft_engine::lint::RULES.iter().copied().chain(["all", "default"]).collect()
+}
+
 fn lint_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
     let rules = match get(a, "rules") {
         Some(Value::String(r)) => Some(json!([r])),
@@ -1383,6 +1388,7 @@ fn lint_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
         ("end", get(a, "end")),
         ("step", get(a, "step")),
         ("rules", rules.as_ref()),
+        ("verbose", get(a, "verbose")),
         ("minTextPx", get(a, "min_text_px")),
         ("minContrast", get(a, "min_contrast")),
     ]);
@@ -1915,7 +1921,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "lint_frame",
-        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). Rules: text-too-small (on-screen font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio of text against what is under it under min_contrast, default 3:1), outside-title-safe (text), outside-action-safe, cut-off (partly outside the frame), text-overlap, hidden-visible (switched on but off-screen, transparent or covered), off-beat (keyframes and in points just missing the audio's beat), off-accent (speed-graph peaks just missing a stressed syllable of the comp's speech map, see speech.import / speech.accents), nested-cut-off (layers inside precomps measured in this comp's frame), text-off-centre (text vs its card/pill, measured at the text's rest pose; `fix` is the prop.set that centres it), exposed-edge (empty frame edges, transition gaps), exit-at-cut (a full-screen cutaway fading out into the comp's end or gone before it: hold to the end and hard-cut), off-word (a layer appearing more than 3 frames from the spoken word it shows, see appear_plan), off-taste (eases off Elias's profile, see taste_check). off-accent on keys you made is an error. Returns {clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner?, fix? {command, params}}]}; each message says what to fix. Run it before calling a design done.",
+        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). On by default (2 Nov 2026, Elias decided; the three rules that caught real agent mistakes, all warnings): text-off-centre (text vs its card/pill, measured at the text's rest pose; `fix` is the prop.set that centres it), exposed-edge (empty frame edges, transition gaps), exit-at-cut (a full-screen cutaway fading out into the comp's end or gone before it: hold to the end and hard-cut). Every other rule is off until the lint experiment decides which return: don't run them in normal work. To turn them on, pass rules: \"all\" or a list (\"default\" adds the three above): text-too-small (font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio under min_contrast, default 3:1), outside-title-safe, outside-action-safe, cut-off, nested-cut-off, text-overlap, hidden-visible, off-beat, off-accent (speed peaks just missing a stressed syllable; an error on keys you made), off-word (a layer appearing more than 3 frames from the word it shows), off-taste (eases off Elias's profile; taste_check runs the same check). Info lines are left out unless verbose: true. Returns {clean, counts, rules, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner?, fix? {command, params}}], notes}; each message says what to fix.",
         bridge_only: false,
         schema: || {
             schema(
@@ -1925,7 +1931,8 @@ static TOOLS: &[ToolDef] = &[
                     "start": {"type": "number", "description": "Range start, comp seconds (default 0 when end is given)."},
                     "end": {"type": "number", "description": "Range end, comp seconds (default the comp's duration when start is given)."},
                     "step": {"type": "number", "description": "Seconds between range samples (default 0.5)."},
-                    "rules": {"type": "array", "items": {"type": "string", "enum": effectcraft_engine::lint::RULES}, "description": "Only these rules (default all)."},
+                    "rules": {"type": "array", "items": {"type": "string", "enum": rule_names()}, "description": "Rules to run: rule ids, \"all\" (every rule) or \"default\" (text-off-centre, exposed-edge, exit-at-cut). Default: those three only; the rest are off until the lint experiment."},
+                    "verbose": {"type": "boolean", "description": "Also list info lines (default false: only warnings and errors)."},
                     "min_text_px": {"type": "number", "description": "Smallest legible font size on screen, comp pixels (default comp height / 30)."},
                     "min_contrast": {"type": "number", "description": "Smallest acceptable WCAG contrast ratio (default 3)."},
                     "summary": {"type": "boolean", "description": "true: counts per rule (`byRule`) and per layer (`byLayer`, top 10) plus the 10 worst problems instead of every problem. Default: on when there are more than 40 problems; false lists them all."}
@@ -1957,7 +1964,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "handover_check",
-        description: "The last check before handing a comp over (handover.check): taste_check + lint_frame over the comp's animated range (first to last keyframed move) in one call. Returns {ready, counts {blocking, warnings}, blocking: [...], warnings: [...] (each {source: taste|lint, layer, layerName, time, until, message, fix?}), range, taste, lint, stale, text}. `ready` is false while a blocking taste ❌ or a lint error remains; fix those, rerun, and hand over listing every remaining warning with its reason. In a rebuild comp (marked with taste.rebuild, see taste_check) moves with reference evidence are judged against their reference fit, so a faithful rebuild of an early-peaking reference can be ready; `rebuild` says how many matched, drifted or matched no move. Run it after your final edit: replies carry a one-time `notice` when your own edits changed layers your last taste_check / lint covered.",
+        description: "The last check before handing a comp over (handover.check): taste_check + lint_frame over the comp's animated range (first to last keyframed move) in one call. Its lint part runs the default rules only (text-off-centre, exposed-edge, exit-at-cut; warnings, so lint never blocks). Returns {ready, counts {blocking, warnings}, blocking: [...], warnings: [...] (each {source: taste|lint, layer, layerName, time, until, message, fix?}), range, taste, lint, stale, text}. `ready` is false while a blocking taste ❌ or a lint error remains; fix those, rerun, and hand over listing every remaining warning with its reason. In a rebuild comp (marked with taste.rebuild, see taste_check) moves with reference evidence are judged against their reference fit, so a faithful rebuild of an early-peaking reference can be ready; `rebuild` says how many matched, drifted or matched no move. Run it after your final edit: replies carry a one-time `notice` when your own edits changed layers your last taste_check / lint covered.",
         bridge_only: false,
         schema: || {
             schema(

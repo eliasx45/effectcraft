@@ -173,7 +173,9 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     let (auto_start, auto_end) = animated_range(s, cid, &taste);
     let start = f_p(p, "start").unwrap_or(auto_start);
     let end = f_p(p, "end").unwrap_or(auto_end).max(start);
-    let mut lint_p = json!({"comp": cid.0, "start": start, "end": end});
+    // The default lint rules only (text-off-centre, exposed-edge, exit-at-cut: warnings; 2 Nov 2026,
+    // Elias decided), so nothing else from lint can appear or block.
+    let mut lint_p = json!({"comp": cid.0, "start": start, "end": end, "rules": crate::lint::DEFAULT_RULES});
     if let Some(step) = f_p(p, "step") {
         lint_p["step"] = json!(step);
     }
@@ -235,7 +237,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![query!(
         "handover.check",
         "Handover Check",
-        "{comp?, start? (comp s), end? (comp s; default the animated range: first to last keyframed move, else the work area), step? (lint sampling, s)} → {ready, comp, compName, range {start, end}, counts {blocking, warnings}, blocking: [...], warnings: [...] (each {source: taste|lint, layer, layerName, time, until, message, fix?, path?|rule?}; at most 30 each), taste (summary line), lint (counts), stale (layers changed since the client's checks), rebuild? (taste.check's rebuild block when the comp is a rebuild of a reference), text}. Runs taste.check and render.lint over the comp's animated range in one call: ready is false while a blocking taste ❌ or a lint error remains. In a rebuild comp (taste.rebuild) moves with reference evidence are judged against their reference fit (❌ = drifted from it), the rest against Elias's profile. Run it last, after the final edit, before handing a comp over.",
+        "{comp?, start? (comp s), end? (comp s; default the animated range: first to last keyframed move, else the work area), step? (lint sampling, s)} → {ready, comp, compName, range {start, end}, counts {blocking, warnings}, blocking: [...], warnings: [...] (each {source: taste|lint, layer, layerName, time, until, message, fix?, path?|rule?}; at most 30 each), taste (summary line), lint (counts), stale (layers changed since the client's checks), rebuild? (taste.check's rebuild block when the comp is a rebuild of a reference), text}. Runs taste.check and render.lint (its default rules only: text-off-centre, exposed-edge, exit-at-cut, all warnings; the other lint rules are off until the lint experiment) over the comp's animated range in one call: ready is false while a blocking taste ❌ or a lint error remains. In a rebuild comp (taste.rebuild) moves with reference evidence are judged against their reference fit (❌ = drifted from it), the rest against Elias's profile. Run it last, after the final edit, before handing a comp over.",
         check
     )]
 }

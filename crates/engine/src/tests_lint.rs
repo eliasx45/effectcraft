@@ -54,6 +54,11 @@ fn clean_comp_has_no_problems() {
     assert_eq!(r["compName"], "Lint");
     assert_eq!(r["times"], json!([0.5]));
     assert_eq!(r["truncated"], false);
+    // Only the default rules ran (2 Nov 2026): no off-beat, so no audio note.
+    assert_eq!(r["rules"], json!(lint::DEFAULT_RULES), "{r}");
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("default rules only")), "{r}");
+    let r = lint(&mut s, json!({"time": 0.5, "rules": "all"}));
+    assert_eq!(r["problems"], json!([]), "{r:#}");
     assert!(r["notes"][0].as_str().unwrap().contains("no audible layers"), "{r}");
 }
 
@@ -126,7 +131,7 @@ fn safe_areas_and_cut_off() {
     let mut s = comp(2.0);
     // A title 20 px from the left edge: on screen but outside title safe (32 px per side).
     let t = text(&mut s, "Edge", "Hi", 24.0, "#ffffff", [20.0, 90.0]);
-    let r = lint(&mut s, json!({"time": 0}));
+    let r = lint(&mut s, json!({"time": 0, "rules": "all", "verbose": true}));
     let p = one(&r, "outside-title-safe");
     assert_eq!((p["severity"].as_str(), p["layer"].as_u64()), (Some("warning"), Some(t)), "{r:#}");
     assert!(p["message"].as_str().unwrap().contains("on the left"), "{p}");
@@ -136,13 +141,13 @@ fn safe_areas_and_cut_off() {
     // A box touching the left edge: outside action safe (16 px), not cut off.
     let b = solid(&mut s, "Box", 40, 40, "#ff0000");
     set(&mut s, b, "transform/position", json!([20.0, 90.0, 0.0]));
-    let r = lint(&mut s, json!({"time": 0}));
+    let r = lint(&mut s, json!({"time": 0, "rules": "all", "verbose": true}));
     let p = one(&r, "outside-action-safe");
     assert_eq!((p["severity"].as_str(), p["layer"].as_u64()), (Some("info"), Some(b)), "{r:#}");
     assert!(of(&r, "cut-off").is_empty(), "{r:#}");
     // Half off the left edge: cut off (info for a solid).
     set(&mut s, b, "transform/position", json!([0.0, 90.0, 0.0]));
-    let p = one(&lint(&mut s, json!({"time": 0})), "cut-off");
+    let p = one(&lint(&mut s, json!({"time": 0, "rules": "all", "verbose": true})), "cut-off");
     assert_eq!((p["severity"].as_str(), p["layer"].as_u64()), (Some("info"), Some(b)), "{p}");
     assert!(p["message"].as_str().unwrap().contains("50% of it is outside") && p["message"].as_str().unwrap().contains("left"), "{p}");
     // Cut-off text is a warning.
@@ -154,7 +159,7 @@ fn safe_areas_and_cut_off() {
     // A full-frame background is neither cut off nor outside the safe areas.
     let mut s = comp(2.0);
     let bg = solid(&mut s, "BG", 400, 300, "#204060");
-    let r = lint(&mut s, json!({"time": 0}));
+    let r = lint(&mut s, json!({"time": 0, "rules": "all", "verbose": true}));
     assert!(r["problems"].as_array().unwrap().iter().all(|p| p["layer"] != bg), "{r:#}");
 }
 
@@ -163,13 +168,13 @@ fn text_overlap_names_both_layers() {
     let mut s = comp(2.0);
     let a = text(&mut s, "One", "Hello", 24.0, "#ffffff", [160.0, 90.0]);
     let b = text(&mut s, "Two", "World", 24.0, "#ffffff", [165.0, 95.0]);
-    let r = lint(&mut s, json!({"time": 0}));
+    let r = lint(&mut s, json!({"time": 0, "rules": "all"}));
     let p = one(&r, "text-overlap");
     // The upper layer (created last) first, the other as `other`.
     assert_eq!((p["severity"].as_str(), p["layer"].as_u64(), p["other"].as_u64()), (Some("warning"), Some(b), Some(a)), "{p}");
     assert_eq!(p["otherName"], "One");
     set(&mut s, b, "transform/position", json!([160.0, 150.0, 0.0]));
-    assert!(of(&lint(&mut s, json!({"time": 0})), "text-overlap").is_empty());
+    assert!(of(&lint(&mut s, json!({"time": 0, "rules": "all"})), "text-overlap").is_empty());
 }
 
 #[test]
@@ -177,7 +182,7 @@ fn hidden_visible_reasons() {
     let mut s = comp(2.0);
     let off = solid(&mut s, "Away", 40, 40, "#ff0000");
     set(&mut s, off, "transform/position", json!([1000.0, 90.0, 0.0]));
-    let r = lint(&mut s, json!({"time": 0, "rules": ["hidden-visible"]}));
+    let r = lint(&mut s, json!({"time": 0, "rules": ["hidden-visible"], "verbose": true}));
     let p = one(&r, "hidden-visible");
     assert_eq!((p["severity"].as_str(), p["layer"].as_u64()), (Some("info"), Some(off)), "{p}");
     assert!(p["message"].as_str().unwrap().contains("entirely outside"), "{p}");
@@ -187,18 +192,18 @@ fn hidden_visible_reasons() {
 
     let faded = solid(&mut s, "Faded", 40, 40, "#ff0000");
     set(&mut s, faded, "transform/opacity", json!(0.0));
-    let p = one(&lint(&mut s, json!({"time": 0, "rules": ["hidden-visible"]})), "hidden-visible");
+    let p = one(&lint(&mut s, json!({"time": 0, "rules": ["hidden-visible"], "verbose": true})), "hidden-visible");
     assert!(p["layer"] == faded && p["message"].as_str().unwrap().contains("opacity is 0"), "{p}");
     s.execute("edit.clear", json!({"layers": [faded]})).unwrap();
 
     let under = solid(&mut s, "Under", 40, 40, "#ff0000");
     let cover = solid(&mut s, "Cover", 320, 180, "#000000");
-    let p = one(&lint(&mut s, json!({"time": 0, "rules": ["hidden-visible"]})), "hidden-visible");
+    let p = one(&lint(&mut s, json!({"time": 0, "rules": ["hidden-visible"], "verbose": true})), "hidden-visible");
     assert_eq!((p["layer"].as_u64(), p["other"].as_u64()), (Some(under), Some(cover)), "{p}");
     assert!(p["message"].as_str().unwrap().contains("covered by “Cover”"), "{p}");
     // A half-transparent cover hides nothing.
     set(&mut s, cover, "transform/opacity", json!(50.0));
-    assert!(of(&lint(&mut s, json!({"time": 0, "rules": ["hidden-visible"]})), "hidden-visible").is_empty());
+    assert!(of(&lint(&mut s, json!({"time": 0, "rules": ["hidden-visible"], "verbose": true})), "hidden-visible").is_empty());
 }
 
 #[test]
@@ -230,6 +235,8 @@ fn bad_params_are_errors() {
     let mut s = comp(2.0);
     for p in [
         json!({"rules": ["nope"]}),
+        json!({"rules": "nope"}),
+        json!({"verbose": "yes"}),
         json!({"time": 1, "start": 0}),
         json!({"start": 1, "end": 0}),
         json!({"start": 0, "step": 0}),
@@ -568,7 +575,8 @@ fn exit_at_cut_lets_overlays_fade_into_the_end() {
     let card = solid(&mut s, "Card", 120, 40, "#2060c0");
     key(&mut s, card, "transform/opacity", 1.0, json!(100.0));
     key(&mut s, card, "transform/opacity", 1.2, json!(0.0));
-    let p = one(&lint(&mut s, rules), "exit-at-cut");
+    assert!(of(&lint(&mut s, rules.clone()), "exit-at-cut").is_empty(), "info is left out unless verbose");
+    let p = one(&lint(&mut s, json!({"start": 0, "end": 2, "rules": ["exit-at-cut"], "verbose": true})), "exit-at-cut");
     assert_eq!(p["severity"], "info", "{p}");
 }
 
@@ -708,4 +716,107 @@ fn text_too_small_reads_keyed_text_at_its_rest_pose_not_mid_entrance() {
     let p = one(&r, "text-too-small");
     assert_eq!(p["layer"].as_u64(), Some(t), "{p}");
     assert!(p["message"].as_str().unwrap().contains("Measured at its rest pose"), "{p}");
+}
+
+/// 2 Nov 2026 (Elias decided, lint audit): only text-off-centre, exit-at-cut and exposed-edge run
+/// by default; the rest are off, not gone, and `rules: "all"` or a list turns them back on.
+#[test]
+fn only_the_three_kept_rules_run_by_default() {
+    assert_eq!(lint::DEFAULT_RULES, ["text-off-centre", "exposed-edge", "exit-at-cut"]);
+    assert!(lint::DEFAULT_RULES.iter().all(|r| lint::RULES.contains(r)));
+    assert_eq!(lint::rule_set(&["all"]).unwrap(), lint::RULES.to_vec());
+    assert_eq!(lint::rule_set(&["default"]).unwrap(), lint::DEFAULT_RULES.to_vec());
+    // RULES order, no repeats.
+    assert_eq!(lint::rule_set(&["exit-at-cut", "outside-title-safe", "exit-at-cut"]).unwrap(), vec!["outside-title-safe", "exit-at-cut"]);
+    assert_eq!(lint::rule_set(&["default", "off-beat"]).unwrap(), vec!["text-off-centre", "exposed-edge", "off-beat", "exit-at-cut"]);
+    assert!(lint::rule_set(&["nope"]).unwrap_err().contains("all, default"));
+
+    // A title 20 px from the left edge: only outside-title-safe would flag it. Default: nothing.
+    let mut s = comp(2.0);
+    solid(&mut s, "BG", 320, 180, "#102040");
+    let t = text(&mut s, "Edge", "Hi", 24.0, "#ffffff", [20.0, 90.0]);
+    let r = lint(&mut s, json!({"time": 0}));
+    assert_eq!(r["problems"], json!([]), "{r:#}");
+    assert_eq!((r["clean"].as_bool(), &r["counts"]), (Some(true), &json!({"error": 0, "warning": 0, "info": 0})), "{r:#}");
+    assert_eq!(r["rules"], json!(["text-off-centre", "exposed-edge", "exit-at-cut"]), "{r:#}");
+    let r = lint(&mut s, json!({"start": 0, "end": 2}));
+    assert_eq!(r["problems"], json!([]), "{r:#}");
+    // `rules: "all"` (string or list) brings it back; so does naming it.
+    for p in [json!({"time": 0, "rules": "all"}), json!({"time": 0, "rules": ["all"]}), json!({"time": 0, "rules": ["outside-title-safe"]})] {
+        let r = lint(&mut s, p.clone());
+        let hit = one(&r, "outside-title-safe");
+        assert_eq!((hit["severity"].as_str(), hit["layer"].as_u64()), (Some("warning"), Some(t)), "{p}: {r:#}");
+    }
+    assert_eq!(lint(&mut s, json!({"time": 0, "rules": "all"}))["rules"], json!(lint::RULES));
+}
+
+/// The kept rules still fire with the default set, as warnings (none blocks a handover).
+#[test]
+fn the_kept_rules_still_fire_by_default() {
+    let only_kept = |r: &Value| {
+        for p in r["problems"].as_array().unwrap() {
+            assert!(lint::DEFAULT_RULES.contains(&p["rule"].as_str().unwrap()), "{p}");
+            assert_eq!(p["severity"], "warning", "{p}");
+        }
+    };
+    // text-off-centre: a label 5 px above its pill's centre.
+    let mut s = comp(2.0);
+    solid(&mut s, "BG", 320, 180, "#102040");
+    let pill = solid(&mut s, "Pill", 120, 40, "#2060c0");
+    let t = s
+        .execute("layer.newText", json!({"name": "Price", "text": "Hello", "size": 20, "fill": "#ffffff", "position": [160.0, 96.0], "justify": "left"}))
+        .unwrap()["layer"]
+        .as_u64()
+        .unwrap();
+    let c = centre(&mut s, t);
+    set(&mut s, pill, "transform/position", json!([c[0] + 10.0, c[1] + 5.0, 0.0]));
+    let r = lint(&mut s, json!({"time": 0}));
+    let p = one(&r, "text-off-centre");
+    assert_eq!((p["severity"].as_str(), p["layer"].as_u64(), p["other"].as_u64()), (Some("warning"), Some(t), Some(pill)), "{p}");
+    only_kept(&r);
+
+    // exposed-edge: a full-screen shot 10 px short of the bottom.
+    let mut s = comp(2.0);
+    let shot = solid(&mut s, "Shot", 320, 170, "#808080");
+    set(&mut s, shot, "transform/position", json!([160.0, 85.0, 0.0]));
+    let r = lint(&mut s, json!({"time": 0}));
+    assert_eq!(one(&r, "exposed-edge")["layer"].as_u64(), Some(shot), "{r:#}");
+    only_kept(&r);
+
+    // exit-at-cut: a full-screen cutaway fading out into the cut.
+    let mut s = comp(2.0);
+    base_shot(&mut s);
+    let bg = solid(&mut s, "BG", 320, 180, "#102040");
+    let title = text(&mut s, "Title", "Hello", 24.0, "#ffffff", [160.0, 90.0]);
+    for l in [bg, title] {
+        key(&mut s, l, "transform/opacity", 1.64, json!(100.0));
+        key(&mut s, l, "transform/opacity", 1.96, json!(0.0));
+    }
+    let r = lint(&mut s, json!({"start": 0, "end": 2}));
+    assert_eq!(one(&r, "exit-at-cut")["severity"], "warning", "{r:#}");
+    assert!(r["problems"].as_array().unwrap().iter().all(|p| lint::DEFAULT_RULES.contains(&p["rule"].as_str().unwrap())), "{r:#}");
+}
+
+/// `handover.check` lints with the default set: an outside-title-safe text never shows up, an
+/// off-centre label is a warning, and lint blocks nothing.
+#[test]
+fn handover_lints_with_the_default_rules_only() {
+    let mut s = comp(2.0);
+    solid(&mut s, "BG", 320, 180, "#102040");
+    text(&mut s, "Edge", "Hi", 24.0, "#ffffff", [20.0, 90.0]);
+    let pill = solid(&mut s, "Pill", 120, 40, "#2060c0");
+    let t = s
+        .execute("layer.newText", json!({"name": "Price", "text": "Hello", "size": 20, "fill": "#ffffff", "position": [160.0, 96.0], "justify": "left"}))
+        .unwrap()["layer"]
+        .as_u64()
+        .unwrap();
+    let c = centre(&mut s, t);
+    set(&mut s, pill, "transform/position", json!([c[0] + 10.0, c[1] + 5.0, 0.0]));
+    let h = s.execute_checked("handover.check", json!({})).unwrap();
+    let lint_entries: Vec<&Value> =
+        h["blocking"].as_array().unwrap().iter().chain(h["warnings"].as_array().unwrap()).filter(|e| e["source"] == "lint").collect();
+    assert!(lint_entries.iter().all(|e| lint::DEFAULT_RULES.contains(&e["rule"].as_str().unwrap())), "{h:#}");
+    assert!(lint_entries.iter().any(|e| e["rule"] == "text-off-centre" && e["layer"].as_u64() == Some(t)), "{h:#}");
+    assert!(h["blocking"].as_array().unwrap().iter().all(|e| e["source"] != "lint"), "{h:#}");
+    assert_eq!(h["ready"], true, "{h:#}");
 }

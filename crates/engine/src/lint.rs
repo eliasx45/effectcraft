@@ -3,6 +3,12 @@
 //! catch the usual mistakes and say how to fix them. The command (sampling, rendering, audio) is
 //! `commands/lint_cmds.rs`; the rules are here.
 //!
+//! Only [`DEFAULT_RULES`] run unless asked (2 Nov 2026, Elias decided: lint is out of the agents'
+//! workflow except `text-off-centre`, `exit-at-cut` and `exposed-edge`, the three that caught real
+//! agent mistakes in the 25–26 Oct A/B; `plan/lint-audit-2026-11-02.md`). The others are off, not
+//! gone: `rules: "all"` (or a list, see [`rule_set`]) turns them back on for the lint experiment
+//! that decides which return. Info lines are left out unless `verbose: true`.
+//!
 //! The rules ([`RULES`]), checked at each sample time on the comp's own layers (precomps are
 //! one layer each, except for the nested rules; track-matte sources and adjustment layers are
 //! skipped):
@@ -98,6 +104,25 @@ pub const RULES: [&str; 15] = [
     "exit-at-cut",
 ];
 
+/// The rules a lint runs when it isn't given `rules` (report order): the three that caught real
+/// agent mistakes in the 25–26 Oct A/B (2 Nov 2026, Elias decided). The rest of [`RULES`] stay
+/// off until the lint experiment turns them back on (`rules: "all"` or a list).
+pub const DEFAULT_RULES: [&str; 3] = ["text-off-centre", "exposed-edge", "exit-at-cut"];
+
+/// The rule ids `names` asks for, in [`RULES`] order without repeats: rule ids, `"all"` (every
+/// rule) or `"default"` ([`DEFAULT_RULES`]). An unknown name is an error naming the valid ones.
+pub fn rule_set(names: &[&str]) -> Result<Vec<&'static str>, String> {
+    let mut on = vec![];
+    for n in names {
+        match *n {
+            "all" => on.extend(RULES),
+            "default" => on.extend(DEFAULT_RULES),
+            _ => on.push(RULES.iter().find(|r| *r == n).copied().ok_or_else(|| format!("unknown rule `{n}`; rules: all, default, {}", RULES.join(", ")))?),
+        }
+    }
+    Ok(RULES.into_iter().filter(|r| on.contains(r)).collect())
+}
+
 /// Most sample times one lint looks at; longer ranges are thinned evenly (`truncated`).
 pub const MAX_SAMPLES: usize = 120;
 /// Default spacing of range samples (seconds).
@@ -170,9 +195,9 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Every rule with the default thresholds for `comp`.
+    /// The default rules ([`DEFAULT_RULES`]) with the default thresholds for `comp`.
     pub fn new(comp: &Comp) -> Settings {
-        Settings { rules: RULES.to_vec(), min_text_px: comp.height as f64 / 30.0, min_contrast: 3.0, title_safe: 20.0, action_safe: 10.0 }
+        Settings { rules: DEFAULT_RULES.to_vec(), min_text_px: comp.height as f64 / 30.0, min_contrast: 3.0, title_safe: 20.0, action_safe: 10.0 }
     }
     pub fn on(&self, rule: &str) -> bool {
         self.rules.contains(&rule)
