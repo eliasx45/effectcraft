@@ -32,8 +32,10 @@ impl Default for WarpOpts {
     }
 }
 
-/// Box-filter halving (for minification).
-pub(crate) fn half(src: &Image) -> Image {
+/// Box-filter halving (for minification): pixel `i` of the result averages pixels `2i` and
+/// `2i + 1` of `src` (the last row and column repeat at an odd size), so a coordinate `x` of `src`
+/// is `x / 2` in the result.
+pub fn half(src: &Image) -> Image {
     let w = src.width.div_ceil(2).max(1);
     let h = src.height.div_ceil(2).max(1);
     let mut out = Image::new(w, h);

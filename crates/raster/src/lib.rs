@@ -24,7 +24,7 @@ pub use channels3d::AuxChannels;
 pub use sparse::{Sparse, gaussian_blur_sparse, resample_sparse};
 pub use warp::{
     MipChain, Sampling, WarpOpts, accumulate_warp, accumulate_warp_at, accumulate_warp_mips, composite_warp, composite_warp_at, composite_warp_mips,
-    composite_warp_reference, resample, warp_bounds,
+    composite_warp_reference, half, resample, warp_bounds,
 };
 
 pub type Px = [f32; 4];

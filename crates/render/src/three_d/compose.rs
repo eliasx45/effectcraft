@@ -89,7 +89,7 @@ impl Item<'_> {
 }
 
 /// Build the plane geometry of a layer for a camera.
-fn geo(cam: &CameraState, world: Mat4, b: [f64; 4], comp: (f64, f64), scale: f64, out: (u32, u32), off: (f64, f64)) -> Option<Geo> {
+pub(super) fn geo(cam: &CameraState, world: Mat4, b: [f64; 4], comp: (f64, f64), scale: f64, out: (u32, u32), off: (f64, f64)) -> Option<Geo> {
     // The output canvas may start at `off` (scaled comp pixels): region of interest / Extended
     // Viewer frames.
     let proj = Mat4::translate(vec3(-off.0, -off.1, 0.0)) * Mat4::scale(vec3(scale, scale, 1.0)) * cam.projection(comp.0, comp.1);
@@ -215,6 +215,44 @@ fn unproject(g: &Geo, sx: f64, sy: f64) -> Option<(f64, f64, f64)> {
         return None;
     }
     Some((u, v, z))
+}
+
+/// Layer units per output pixel of a plane at an output pixel centre: the square root of the
+/// area an output pixel covers on the plane (`None` behind the camera or edge-on).
+fn footprint(g: &Geo, sx: f64, sy: f64) -> Option<f64> {
+    let (u, v, _) = unproject(g, sx, sy)?;
+    let h = &g.hinv.0;
+    let qz = h[2][0] * sx + h[2][1] * sy + h[2][2];
+    // u = (h0·p) / qz: du/dx = (h00 − u·h20) / qz, and so on.
+    let (ux, uy) = ((h[0][0] - u * h[2][0]) / qz, (h[0][1] - u * h[2][1]) / qz);
+    let (vx, vy) = ((h[1][0] - v * h[2][0]) / qz, (h[1][1] - v * h[2][1]) / qz);
+    let a = (ux * vy - uy * vx).abs().sqrt();
+    a.is_finite().then_some(a)
+}
+
+/// Box halvings of a `size` buffer (`scale` buffer pixels per layer unit) that leave at most 2
+/// buffer pixels per output pixel where the plane is least shrunk, as the 2D warp picks its
+/// level (`raster::composite_warp`): measured at the corners and centre of every sub-sample's
+/// output bounds. 0 when it is nowhere shrunk that much, or when a sample point is behind the
+/// camera (a plane reaching past the near plane is drawn from its full buffer).
+pub(super) fn minify_levels(geos: &[Geo], scale: f64, size: (u32, u32)) -> u32 {
+    let mut least = f64::INFINITY;
+    for g in geos {
+        let [x0, y0, x1, y1] = g.bbox.map(|v| v as f64);
+        let points = [(x0 + 0.5, y0 + 0.5), (x1 - 0.5, y0 + 0.5), (x0 + 0.5, y1 - 0.5), (x1 - 0.5, y1 - 0.5), ((x0 + x1) / 2.0, (y0 + y1) / 2.0)];
+        for (sx, sy) in points {
+            let Some(f) = footprint(g, sx, sy) else { return 0 };
+            least = least.min(f * scale);
+        }
+    }
+    let (mut w, mut h) = size;
+    let mut k = 0;
+    while least.is_finite() && least > 2.0 && w > 1 && h > 1 && k < 24 {
+        (w, h) = (w.div_ceil(2), h.div_ceil(2));
+        least /= 2.0;
+        k += 1;
+    }
+    k
 }
 
 /// The camera a renderer uses at a context time (view override only for the top-level comp).
@@ -346,6 +384,25 @@ fn prepare_with<'a>(
         bbox = [bbox[0].min(g.bbox[0]), bbox[1].min(g.bbox[1]), bbox[2].max(g.bbox[2]), bbox[3].max(g.bbox[3])];
     }
     let mat = Material::of(ctx, layer);
+    // Minification: a plane shrunk on screen samples a box-filtered copy of its buffer, as a 2D
+    // layer's warp does, so thin detail (a logo's stripes in a small contact-sheet cell or a
+    // quarter-resolution preview) is averaged, not skipped between samples. Not for shadow
+    // casters (a shadow can be larger on screen than its caster), deferred depth of field (its
+    // radius map is the buffer's size) or pixel-less accelerator planes.
+    let lod = if plane_dof.is_none() && mat.casts_shadows == 0 && buf.img.data.len() == buf.img.width as usize * buf.img.height as usize {
+        minify_levels(&geos, buf.scale, (buf.img.width, buf.img.height))
+    } else {
+        0
+    };
+    if lod > 0 {
+        let mut img = effectcraft_raster::half(&buf.img);
+        for _ in 1..lod {
+            img = effectcraft_raster::half(&img);
+        }
+        let k = 0.5f64.powi(lod as i32);
+        buf = Arc::new(Buf { img, offset: [buf.offset[0] * k, buf.offset[1] * k], scale: buf.scale * k });
+        bounds = buf_bounds(&buf);
+    }
     Some(Item {
         layer,
         order,

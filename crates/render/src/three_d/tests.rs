@@ -701,3 +701,57 @@ fn shutter_samples_before_the_camera_in_point_keep_the_frame_camera() {
     let img = render_frame(&p, cid, Tick(p.comp(cid).unwrap().frame_rate.frame_duration().0 * 9), 1.0);
     assert!(img.get(100, 50)[3] > 0.99 && img.get(40, 50)[3] < 0.01);
 }
+
+// ---------------------------------------------------------------- minification
+
+/// A 3D precomp of thin white stripes (3 px every 7 px) shrunk to 10 %, beside the same layer in
+/// 2D: the 3D plane must be box-filtered like the 2D warp, not point-sampled (a small render of a
+/// shrunk logo showed fat bars or nothing at all: the contact-sheet "dropped layer", 2 Nov 2026).
+fn shrunk_stripes(three_d: bool) -> effectcraft_raster::Image {
+    let (mut p, cid, comp) = setup();
+    let inner = Comp::new(140, 140, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let iid = p.add_item("Stripes", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+    for x in (0..140).step_by(7) {
+        let sid = p.add_item("Stripe", Label::Red, None, ItemKind::Solid(Solid { color: [1.0; 3], width: 3, height: 140, pixel_aspect: 1.0 }));
+        let mut s = build::layer(&mut p, &inner, "Stripe", LayerSource::Solid { item: sid }, (3, 140), None);
+        set(&mut s, "transform/position", Value::Vec3([x as f64 + 1.5, 70.0, 0.0]));
+        p.comp_mut(iid).unwrap().layers.push(s);
+    }
+    let mut pre = build::layer(&mut p, &comp, "Stripes", LayerSource::Comp { item: iid }, (140, 140), None);
+    pre.switches.three_d = three_d;
+    set(&mut pre, "transform/scale", Value::Vec3([10.0, 10.0, 100.0]));
+    push(&mut p, cid, pre);
+    render(&p, cid)
+}
+
+#[test]
+fn shrunk_plane_is_filtered_like_2d() {
+    let (flat, plane) = (shrunk_stripes(false), shrunk_stripes(true));
+    // The layer covers x 93..107, y 43..57; its inside is 3/7 white on average.
+    for y in 45..55 {
+        for x in 95..105 {
+            let (a, b) = (flat.get(x, y)[3], plane.get(x, y)[3]);
+            assert!((a - b).abs() < 0.08, "({x}, {y}): 2D {a}, 3D {b}");
+            assert!((b - 3.0 / 7.0).abs() < 0.2, "({x}, {y}): 3D {b}");
+        }
+    }
+}
+
+#[test]
+fn minify_levels_follow_the_least_shrunk_point() {
+    let (mut p, cid, comp) = setup();
+    let l = solid3(&mut p, &comp, [1.0; 3], 40, 20, [100.0, 50.0, 0.0]);
+    push(&mut p, cid, l);
+    let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let layer = c.layers.first().unwrap();
+    let cam = compose::camera_for(&r, &ctx);
+    let world = ctx.world_matrix(layer);
+    let g = compose::geo(&cam, world, [0.0, 0.0, 40.0, 20.0], (W as f64, H as f64), 1.0, (W, H), (0.0, 0.0)).unwrap();
+    // At z = 0 one layer unit is one output pixel: 1 buffer px per unit needs no level, 10 need
+    // three (10 → 5 → 2.5 → 1.25), and a 1×1 buffer can't be halved.
+    assert_eq!(compose::minify_levels(std::slice::from_ref(&g), 1.0, (40, 20)), 0);
+    assert_eq!(compose::minify_levels(std::slice::from_ref(&g), 10.0, (400, 200)), 3);
+    assert_eq!(compose::minify_levels(std::slice::from_ref(&g), 10.0, (1, 1)), 0);
+}
