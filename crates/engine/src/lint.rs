@@ -65,7 +65,8 @@
 //!   last 300 frames. In a full-screen cutaway (its layers over the base shot, the footage with sound
 //!   at the bottom, cover the frame), layers fading, scaling or moving out into the last 2
 //!   frames, or everything gone before the end while the comp runs on: warning ("hold to the
-//!   end and hard-cut"). In an overlay comp only leaving early is noted (info).
+//!   end and hard-cut"). 3D layers are measured through the last frame's camera, so a camera
+//!   still moving into the cut is no exit. In an overlay comp only leaving early is noted (info).
 //! - `off-word`: a layer that shows a spoken word (its text, or a word in its name) appears
 //!   more than [`crate::appear::OFF_WORD_FRAMES`] frames from it: its entrance's speed peak misses
 //!   the word's accent, or a layer without an entrance doesn't start on the word
@@ -76,7 +77,7 @@
 //!   warning; a move in his range that isn't one of his approved curves is info. Precomps are
 //!   not searched (check them with `taste.check` on the precomp).
 
-use effectcraft_geom::{Mat3, vec2};
+use effectcraft_geom::{Mat3, Mat4, vec2};
 use effectcraft_project::{AlphaMode, Comp, ItemId, ItemKind, Layer, LayerId, LayerSource, Project};
 use effectcraft_raster::Image;
 use effectcraft_render::{EvalCtx, Renderer};
@@ -1231,14 +1232,34 @@ pub struct Tail {
 }
 
 /// How much of a layer shows: its on-screen box area (comp pixels) × its opacity (0 when it
-/// isn't drawn).
-fn presence(ctx: &EvalCtx, l: &Layer) -> f64 {
+/// isn't drawn). A 3D layer is seen through `cam` (the view-projection of the comp's last
+/// frame), so a camera still moving into the cut (a pull-back, a dolly) is no exit: only the
+/// layer's own fade, scale or move counts (2 Nov 2026, two builders' cards fully on screen on
+/// the last frame were flagged as moving out).
+fn presence(ctx: &EvalCtx, l: &Layer, cam: &Mat4) -> f64 {
     if !layout::visibility(ctx, l).0 {
         return 0.0;
     }
-    let Some(g) = layout::layer_geometry(ctx, l).filter(|g| g.projected) else { return 0.0 };
+    let corners = if l.is_3d() {
+        let Some(b) = effectcraft_render::content_bounds(ctx, l) else { return 0.0 };
+        let m = (*cam * ctx.world_matrix(l)).plane_to_mat3();
+        let m = ctx.follow_fx_2d(l).map_or(m, |f| m * f);
+        let mut projected = true;
+        let corners = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]].map(|p| {
+            let (q, ok) = layout::to_comp(&m, p);
+            projected &= ok;
+            q
+        });
+        if !projected {
+            return 0.0;
+        }
+        corners
+    } else {
+        let Some(g) = layout::layer_geometry(ctx, l).filter(|g| g.projected) else { return 0.0 };
+        g.corners
+    };
     let (w, h) = (ctx.comp.width as f64, ctx.comp.height as f64);
-    let a = ctx.opacity(l).clamp(0.0, 1.0) * layout::overlap_area(&g.corners, &[[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]]);
+    let a = ctx.opacity(l).clamp(0.0, 1.0) * layout::overlap_area(&corners, &[[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]]);
     if a.is_finite() { a } else { 0.0 }
 }
 
@@ -1272,10 +1293,12 @@ pub fn exit_tail(r: &Renderer, cid: ItemId) -> Option<Tail> {
         return None;
     }
     let mut pres = vec![Vec::with_capacity(n - first); over.len()];
+    // The last frame's camera: what the cut shows, held still over the tail.
+    let cam = r.eval_ctx(cid, frame(n - 1))?.camera().0;
     for k in first..n {
         let ctx = r.eval_ctx(cid, frame(k))?;
         for (row, l) in pres.iter_mut().zip(&over) {
-            row.push(presence(&ctx, l));
+            row.push(presence(&ctx, l, &cam));
         }
     }
     let end = n - first - 1;

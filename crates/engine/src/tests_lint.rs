@@ -558,6 +558,33 @@ fn exit_at_cut_full_screen_cutaway_holds_to_the_end() {
 }
 
 #[test]
+fn exit_at_cut_ignores_a_camera_still_moving_into_the_cut() {
+    // H2 / L2 (2 Nov 2026): a 3D card fully on screen on the last frame while the camera pulls
+    // back into the cut was flagged as "moving out". Only the layer's own exit counts.
+    let mut s = comp(2.0);
+    base_shot(&mut s);
+    solid(&mut s, "BG", 320, 180, "#102040");
+    let card = solid(&mut s, "Card", 120, 40, "#2060c0");
+    s.execute("layer.setSwitch", json!({"layer": card, "switch": "threeD", "value": true})).unwrap();
+    let cam = s.execute("layer.newCamera", json!({})).unwrap()["layer"].as_u64().unwrap();
+    let pos = s.execute("prop.get", json!({"layer": cam, "path": "transform/position"})).unwrap()["value"].clone();
+    let p: Vec<f64> = pos.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    // The camera pulls back to twice its distance over the last 0.4 s: the card ends at a quarter
+    // of its area, still fully on screen and opaque.
+    key(&mut s, cam, "transform/position", 1.56, json!([p[0], p[1], p[2]]));
+    key(&mut s, cam, "transform/position", 1.96, json!([p[0], p[1], p[2] * 2.0]));
+    let rules = json!({"start": 0, "end": 2, "rules": ["exit-at-cut"]});
+    let r = lint(&mut s, rules.clone());
+    assert!(r["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("a full-screen cutaway")), "{r:#}");
+    assert!(of(&r, "exit-at-cut").is_empty(), "{r:#}");
+    // The card shrinking on its own (100 → 20 %) into the cut is still an exit.
+    key(&mut s, card, "transform/scale", 1.64, json!([100.0, 100.0, 100.0]));
+    key(&mut s, card, "transform/scale", 1.96, json!([20.0, 20.0, 100.0]));
+    let p = one(&lint(&mut s, rules), "exit-at-cut");
+    assert!(p["message"].as_str().unwrap().contains("“Card”"), "{p}");
+}
+
+#[test]
 fn exit_at_cut_lets_overlays_fade_into_the_end() {
     // A card over the footage (an overlay): fading into the cut is right.
     let mut s = comp(2.0);
