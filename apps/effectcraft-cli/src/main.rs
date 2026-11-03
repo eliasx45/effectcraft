@@ -25,7 +25,7 @@
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
-//! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
+//! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE [--save-as F]   run an After Effects-style script
 //! effectcraft-cli replay SCRIPT.jsonl [--keep-going]        replay a repro script (docs/agents.md)
 //! effectcraft-cli mcp [--autosave] [--bridge [PORT] | --ui] [--all-tools] [--client NAME]  MCP server on stdio
 //! effectcraft-cli figma-bridge [--port 7789] [--control 9877] local endpoint for the Figma plug-in
@@ -137,9 +137,12 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   bench --ops [--small] [--layers N] [--comps N] [--footage N]
                                            everyday operations on a large generated project: startup, open,
                                            save, auto-save, edits + undo/redo, timeline, Project panel
-  script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
+  script FILE.jsx [F.ecproj] | --eval CODE [--save | --save-as F.ecproj]
+                                           run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
-                                           output and the result; errors exit 1 with file:line:col
+                                           output and the result; errors exit 1 with file:line:col;
+                                           --save / --save-as save the result only when the script
+                                           ran without an error (a failed script never overwrites a file)
   replay SCRIPT.jsonl [--keep-going] [--bless]
                                            replay a repro script headless (journal.export, crash repros):
                                            per-step ok/error and the first failure; exits 1 when a step
@@ -629,11 +632,18 @@ fn script_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
     };
     let mut b = backend(args, false)?;
     let r = b.exec("script.run", json!({"code": code, "name": name}))?;
-    let saved = maybe_save(&mut b, args)?;
+    let error = r.get("error").filter(|e| !e.is_null());
+    // A script that failed (a syntax error, or an error thrown part-way) leaves a project that is
+    // not what it meant to build: never let --save / --save-as replace a good file with it.
+    let wants_save = args.opt("--save-as").is_some() || args.flag("--save");
+    let saved = if error.is_none() { maybe_save(&mut b, args)? } else { None };
     if json_out {
         let mut o = r.clone();
         if let Some(p) = &saved {
             o["saved"] = json!(p);
+        } else if wants_save && error.is_some() {
+            o["saved"] = Value::Null;
+            o["notSaved"] = json!("the script failed, so the project file was left unchanged");
         }
         emit(&o, true);
     } else {
@@ -647,13 +657,16 @@ fn script_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
             note!("saved {p}");
         }
     }
-    if let Some(e) = r.get("error").filter(|e| !e.is_null()) {
+    if let Some(e) = error {
         let pos = match (e["line"].as_u64(), e["column"].as_u64()) {
             (Some(l), Some(c)) => format!(":{l}:{c}"),
             (Some(l), None) => format!(":{l}"),
             _ => String::new(),
         };
-        let msg = format!("{}{pos}: {}", e["file"].as_str().unwrap_or(&name), e["message"].as_str().unwrap_or("script error"));
+        let mut msg = format!("{}{pos}: {}", e["file"].as_str().unwrap_or(&name), e["message"].as_str().unwrap_or("script error"));
+        if wants_save {
+            msg.push_str("\nnot saved: the script failed, so the project file was left unchanged");
+        }
         if json_out {
             std::process::exit(1);
         }

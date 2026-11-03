@@ -306,6 +306,42 @@ fn script_file_and_eval() {
     assert!(err.contains(".jsxbin scripts are not supported: run the .jsx source") && !err.contains("SyntaxError"), "{err}");
 }
 
+/// `script --save-as` saves only a script that ran cleanly: a syntax error or a thrown error leaves
+/// an existing project file untouched (it used to be replaced by the half-built or empty project).
+#[test]
+fn script_save_as_is_skipped_when_the_script_fails() {
+    let proj = tmp("keep-me.ecproj");
+    let p = proj.to_str().unwrap();
+    let good = tmp("good.jsx");
+    std::fs::write(&good, "var c = app.project.items.addComp('Keep', 160, 90, 1, 2, 24);\nc.layers.addSolid([1, 0, 0], 'Red', 160, 90, 1);\n").unwrap();
+    ok_json(&["script", good.to_str().unwrap(), "--save-as", p]);
+    let before = std::fs::read(&proj).unwrap();
+    // A parse error (the builders' repro: a stray box-drawing line) and an error thrown after an edit.
+    let parse = tmp("parse-error.jsx");
+    std::fs::write(&parse, "var a = 1;\n}──\n").unwrap();
+    let thrown = tmp("thrown.jsx");
+    std::fs::write(&thrown, "app.project.items.addComp('Half', 160, 90, 1, 2, 24);\nthrow new Error('stop here');\n").unwrap();
+    for bad in [&parse, &thrown] {
+        let out = bin().args(["script", bad.to_str().unwrap(), "--save-as", p]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("not saved: the script failed"), "{err}");
+        assert_eq!(std::fs::read(&proj).unwrap(), before, "{bad:?} replaced the project");
+        let (code, v) = run_json(&["script", bad.to_str().unwrap(), "--save-as", p]);
+        assert_eq!(code, 1);
+        assert!(v["saved"].is_null() && v["notSaved"].is_string(), "{v}");
+        assert_eq!(std::fs::read(&proj).unwrap(), before, "{bad:?} replaced the project (--json)");
+    }
+    // `--save` back to the opened project is skipped the same way.
+    let out = bin().args(["script", thrown.to_str().unwrap(), p, "--save"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(std::fs::read(&proj).unwrap(), before, "--save replaced the project");
+    // The usage names the save options for `script`.
+    let help = bin().arg("--help").output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&help.stdout), String::from_utf8_lossy(&help.stderr));
+    assert!(text.lines().any(|l| l.contains("script FILE.jsx") && l.contains("--save-as")), "{text}");
+}
+
 /// `render --out` (#300): a relative path is relative to the working directory like `--project`,
 /// not to the project's folder (which doubled a path that already named it).
 #[test]
