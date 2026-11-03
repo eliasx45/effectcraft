@@ -648,10 +648,12 @@ mod tests {
     fn frame_on(ctx: &egui::Context, h: &mut Mini, events: Vec<Event>, m: ViewerMap) -> Frame {
         let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), events, ..Default::default() };
         let mut out = Frame::default();
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             h.auto.begin_frame();
             out = tools(h, ui, m, Options { id: egui::Id::new("card-tools"), space_pan: false });
-        });
+        })
+        .textures_delta
+        .clear();
         out
     }
 
@@ -671,12 +673,13 @@ mod tests {
     /// How many shapes a frame paints: with the tools (`tools`) or without them (the baseline).
     fn painted(ctx: &egui::Context, h: &mut Mini, with_tools: bool) -> usize {
         let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), ..Default::default() };
-        let out = ctx.run_ui(input, |ui| {
+        let mut out = ctx.run_ui(input, |ui| {
             h.auto.begin_frame();
             if with_tools {
                 let _ = tools(h, ui, map(), Options { id: egui::Id::new("card-tools"), space_pan: false });
             }
         });
+        out.textures_delta.clear();
         out.shapes.len()
     }
 
@@ -776,9 +779,11 @@ mod tests {
         let ctx = ctx();
         let key = |h: &mut Mini, key: egui::Key, modifiers: egui::Modifiers| {
             let input = egui::RawInput { events: vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }], ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            ctx.run_ui(input, |ui| {
                 crate::panels::timeline::keys::forward_shortcuts(h, ui.ctx(), crate::dock::PanelKind::Timeline);
-            });
+            })
+            .textures_delta
+            .clear();
             h.ui.tool
         };
         assert_eq!(key(&mut h, egui::Key::W, egui::Modifiers::NONE), Tool::Rotate);
@@ -1049,6 +1054,21 @@ mod tests {
         assert!((top.2.y + 10.0).abs() < 0.01 && (top.2.x - 50.0).abs() < 0.01, "{top:?}");
     }
 
+    /// A near-zero zoom draws a bounded ruler: the tick step is picked for a zoom of at least
+    /// 1e-6, and walking the whole comp-space span at 1e-30 ran out of memory (night run, 3 Nov).
+    #[test]
+    fn a_near_zero_zoom_draws_a_bounded_ruler() {
+        let (mut h, _, _) = mini();
+        let ctx = ctx();
+        h.ui.viewer.rulers = true;
+        let m = ViewerMap { origin: Pos2::ZERO, zoom: 1e-30, comp: [320.0, 180.0], area: Rect::from_min_size(Pos2::ZERO, vec2(1e-3, 1e-3)) };
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = tools(&mut h, ui, m, Options { id: egui::Id::new("tiny"), space_pan: false });
+        });
+        out.textures_delta.clear();
+        assert!(out.shapes.len() < 20_000, "{} shapes", out.shapes.len());
+    }
+
     /// Junk maps and pointer positions never panic and do nothing.
     #[test]
     fn junk_never_panics() {
@@ -1071,11 +1091,13 @@ mod tests {
             ] {
                 for at in [pos2(f32::NAN, 1.0), pos2(1e30, -1e30), pos2(5.0, 5.0)] {
                     let input = egui::RawInput { events: vec![Event::PointerMoved(at), button(at, true), button(at, false)], ..Default::default() };
-                    let _ = ctx.run_ui(input, |ui| {
+                    ctx.run_ui(input, |ui| {
                         let _ = tools(&mut h, ui, m, Options { id: egui::Id::new("junk"), space_pan: false });
                         view_overlays(&mut h, ui, m);
                         let _ = edit_text_at(&mut h, ui.ctx(), m, at);
-                    });
+                    })
+                    .textures_delta
+                    .clear();
                 }
             }
         }

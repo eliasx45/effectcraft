@@ -973,11 +973,12 @@ mod tests {
         let texture_id = texture.id();
         ctx.data_mut(|data| data.insert_temp(Id::new("effectcraft-tools-atlas"), Some((texture, true))));
         let icons = [super::Icon::Flowchart, super::Icon::Draft3D, super::Icon::Shy, super::Icon::FrameBlend, super::Icon::MotionBlur, super::Icon::Graph];
-        let output = ctx.run_ui(Default::default(), |ui| {
+        let mut output = ctx.run_ui(Default::default(), |ui| {
             for (i, icon) in icons.into_iter().enumerate() {
                 super::paint(ui.painter(), Rect::from_min_size(pos2(30.0 * i as f32, 0.0), vec2(13.44, 13.44)), icon, Color32::WHITE);
             }
         });
+        output.textures_delta.clear();
         let meshes: Vec<_> = output
             .shapes
             .iter()

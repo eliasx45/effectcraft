@@ -104,11 +104,12 @@ mod tests {
             ctx.data_mut(|data| data.insert_temp(egui::Id::new(("local-icon", name)), Some(texture)));
         }
         let tint = Color32::from_gray(100);
-        let output = ctx.run_ui(Default::default(), |ui| {
+        let mut output = ctx.run_ui(Default::default(), |ui| {
             for name in ["viewer-channel", "viewer-grid"] {
                 assert!(paint(ui.painter(), Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(18.0, 18.0)), name, tint));
             }
         });
+        output.textures_delta.clear();
         let colors: Vec<_> = output
             .shapes
             .iter()

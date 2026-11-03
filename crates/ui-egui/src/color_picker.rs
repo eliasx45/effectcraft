@@ -687,7 +687,7 @@ mod tests {
         let mut color = [0.2, 0.4, 0.6];
         for _ in 0..3 {
             let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            ctx.run_ui(input, |ui| {
                 let ctx = ui.ctx();
                 egui::Area::new(parent).order(egui::Order::Foreground).fixed_pos(pos2(80.0, 80.0)).show(ctx, |ui| {
                     ui.set_min_size(vec2(500.0, 400.0));
@@ -696,7 +696,9 @@ mod tests {
                 });
                 // A sample lands on the modal backdrop and raises that modal's layer.
                 ctx.move_to_top(parent_layer);
-            });
+            })
+            .textures_delta
+            .clear();
         }
         assert_eq!(ctx.layer_id_at(pos2(120.0, 130.0)), Some(popup_layer));
     }

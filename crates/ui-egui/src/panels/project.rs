@@ -1382,10 +1382,12 @@ mod tests {
 
     fn bare_frame(ctx: &egui::Context, host: &mut BareHost, events: Vec<egui::Event>) {
         let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 360.0))), events, ..Default::default() };
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             host.auto.begin_frame();
             show(host, ui, Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 360.0)));
-        });
+        })
+        .textures_delta
+        .clear();
     }
 
     fn click(ctx: &egui::Context, host: &mut BareHost, id: &str, double: bool) {

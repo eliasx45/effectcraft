@@ -384,11 +384,13 @@ mod tests {
     }
 
     fn frame(ctx: &egui::Context, host: &mut FakeHost, input: egui::RawInput) {
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             host.auto.begin_frame();
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 400.0));
             crate::panels::timeline::show(host, ui, rect);
-        });
+        })
+        .textures_delta
+        .clear();
     }
 
     /// EMBED1: the Timeline draws a frame (header, ruler, layer rows) against a host that is not
@@ -434,11 +436,13 @@ mod tests {
         let ctx = egui::Context::default();
         crate::theme::install_panel_fonts(&ctx);
         for _ in 0..2 {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
                 host.auto.begin_frame();
                 let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 600.0));
                 crate::panels::effect_controls::show(&mut host, ui, rect);
-            });
+            })
+            .textures_delta
+            .clear();
         }
         let props = host.auto.query_current("effectControls.prop.");
         assert!(!props.is_empty(), "the effect's properties drew");
@@ -458,7 +462,7 @@ mod tests {
         let press = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
         let input = egui::RawInput { events: vec![press(egui::Key::F9)], ..Default::default() };
         let mut ran = vec![];
-        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline)).textures_delta.clear();
         assert_eq!(ran, ["keys.easyEase"]);
         assert_eq!(host.commands, ["keys.easyEase"]);
     }
@@ -487,7 +491,7 @@ mod tests {
         let mut ran = vec![];
         let mut input = screen();
         input.events = vec![key(egui::Key::F3, egui::Modifiers::SHIFT)];
-        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline)).textures_delta.clear();
         assert_eq!(ran, ["timeline.graphEditor"]);
         assert!(host.ui.timeline.graph_editor, "Shift+F3 opened the Graph Editor");
         for _ in 0..3 {
@@ -497,7 +501,7 @@ mod tests {
         assert!(!host.auto.query_current("timeline.graph.key.").is_empty(), "the opacity keys drew in the graph");
         let mut input = screen();
         input.events = vec![key(egui::Key::F, egui::Modifiers::NONE)];
-        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline)).textures_delta.clear();
         assert_eq!(ran, ["timeline.graph.fit"]);
         {
             let _ids = super::super::ids::IdScope::enter(host.id_scope());
@@ -519,7 +523,7 @@ mod tests {
         let press = |key, modifiers, physical_key| egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers };
         let mut ran = vec![];
         let input = egui::RawInput { events: vec![press(egui::Key::P, egui::Modifiers::NONE, None)], ..Default::default() };
-        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline)).textures_delta.clear();
         assert_eq!(ran, ["timeline.reveal.position"]);
         assert_eq!(host.ui.timeline.reveal, ["position"]);
         host.invoke(&ctx, "timeline.revealAdd.opacity", json!({})).unwrap();
@@ -528,7 +532,7 @@ mod tests {
         host.invoke(&ctx, "timeline.collapseAll", json!({})).unwrap();
         assert!(host.ui.timeline.reveal.is_empty() && host.ui.timeline.layer_reveal.is_empty());
         let input = egui::RawInput { events: vec![press(egui::Key::Equals, egui::Modifiers::NONE, Some(egui::Key::Equals))], ..Default::default() };
-        let _ = ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline));
+        ctx.run_ui(input, |ui| ran = super::super::keys::forward_shortcuts(&mut host, ui.ctx(), crate::dock::PanelKind::Timeline)).textures_delta.clear();
         assert_eq!(ran, ["timeline.zoomIn"]);
         assert!(host.invoke(&ctx, "timeline.scrollToTime", json!({})).is_ok());
         assert!(host.ui.timeline.scroll_to.is_some());
@@ -578,7 +582,7 @@ mod tests {
         let mut armed = vec![];
         for pointer in [None, Some(PointerColor { rgb: [1.0, 0.0, 0.0], clicked: false }), Some(PointerColor { rgb: [1.0, 0.0, 0.0], clicked: true })] {
             host.pointer = pointer;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| armed.push(crate::panels::effect_controls::hosted_pick(&mut host, ui.ctx())));
+            ctx.run_ui(egui::RawInput::default(), |ui| armed.push(crate::panels::effect_controls::hosted_pick(&mut host, ui.ctx()))).textures_delta.clear();
         }
         assert_eq!(armed, [true, true, false], "armed until the click takes the sample");
         assert_eq!(host.commands, ["prop.set"]);
@@ -601,7 +605,7 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 520.0));
         let input = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
         let draw = |host: &mut FakeHost, input: egui::RawInput, which: u8| {
-            let _ = ctx.run_ui(input, |ui| {
+            ctx.run_ui(input, |ui| {
                 host.auto.begin_frame();
                 match which {
                     0 => crate::panels::text_panels::character(host, ui, rect),
@@ -609,7 +613,9 @@ mod tests {
                     2 => crate::panels::misc::markers(host, ui, rect),
                     _ => crate::panels::motion_library::show(host, ui, rect),
                 }
-            });
+            })
+            .textures_delta
+            .clear();
         };
         for which in 0..4 {
             draw(&mut host, input(), which);
@@ -639,10 +645,12 @@ mod tests {
         assert_eq!(d.comment, "Beat");
         let mut auto = Registry::default();
         let prefs = host.session.prefs.clone();
-        let _ = ctx.run_ui(input(), |ui| {
+        ctx.run_ui(input(), |ui| {
             let a = crate::panels::markers_ui::draw_dialog(ui, &mut d, &prefs, &mut auto, &host.tokens);
             assert_eq!(a, crate::panels::markers_ui::DialogAnswer::default());
-        });
+        })
+        .textures_delta
+        .clear();
         assert!(auto.find_current("dialog.marker.ok").is_some());
         // The Motion Library's own commands run on a host; other ids are not its.
         let r = crate::panels::motion_library::hosted_command(&mut host, &ctx, "motionLibrary.view", &json!({"query": "zoom"}));

@@ -25,16 +25,20 @@ fn the_resolution_chip_opens_and_never_panics() {
     let rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(84.0, 20.0));
     let id = egui::Id::new("card-res");
     for input in click(rect.center()) {
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let picked = resolution_chip(ui, rect, Resolution::Half, 0.5, &t, id);
             assert!(picked.is_none(), "a click on the chip opens it, picks nothing");
-        });
+        })
+        .textures_delta
+        .clear();
     }
     assert!(ctx.data(|d| d.get_temp::<bool>(id.with("pop").with("open"))).unwrap_or(false), "the list is open");
     for scale in [f64::NAN, 0.0, -1.0, 1e9] {
-        let _ = ctx.run_ui(RawInput::default(), |ui| {
+        ctx.run_ui(RawInput::default(), |ui| {
             let _ = resolution_chip(ui, rect, Resolution::Custom(7), scale, &t, id);
-        });
+        })
+        .textures_delta
+        .clear();
     }
 }
 
@@ -58,9 +62,11 @@ fn a_hosts_playback_says_whether_it_keeps_real_time() {
     let (label, rt) = slow.rate_label().unwrap();
     assert!(!rt && label.contains("not real-time"), "{label}");
     let ctx = egui::Context::default();
-    let _ = ctx.run_ui(RawInput::default(), |ui| {
+    ctx.run_ui(RawInput::default(), |ui| {
         let r = paint_rate(ui.painter(), pos2(300.0, 10.0), &label, rt);
         assert!(r.max.x <= 300.0 + 1e-3 && r.min.y == 10.0);
         let _ = paint_rate(ui.painter(), pos2(f32::NAN, 0.0), "x", true);
-    });
+    })
+    .textures_delta
+    .clear();
 }

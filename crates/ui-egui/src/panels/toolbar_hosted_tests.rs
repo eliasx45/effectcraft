@@ -69,10 +69,12 @@ fn run(h: &mut Mini, side: f32, inputs: Vec<RawInput>, works: Option<&dyn Fn(Too
     let ctx = egui::Context::default();
     let mut right = 0.0;
     for input in inputs {
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let opts = Options { side, id_scope: Some(egui::Id::new("card-row")), works, elsewhere: "Use it in EffectCraft." };
             right = tb::slots(h, ui, 0.0, side / 2.0, &opts);
-        });
+        })
+        .textures_delta
+        .clear();
     }
     right
 }
@@ -115,11 +117,13 @@ fn the_hosted_viewer_bar_draws_on_the_hosts_session() {
     let mut h = mini();
     let ctx = egui::Context::default();
     for zoom in [0.5_f32, f32::NAN, 0.0, 1e9] {
-        let _ = ctx.run_ui(RawInput::default(), |ui| {
+        ctx.run_ui(RawInput::default(), |ui| {
             let bar = Rect::from_min_size(pos2(0.0, 200.0), vec2(320.0, 30.0));
             let picked = super::viewer_tools::hosted_bar(&mut h, ui, bar, zoom);
             assert!(picked.is_none(), "nothing picked without a click");
-        });
+        })
+        .textures_delta
+        .clear();
     }
     for id in ["viewer.magnification", "viewer.resolution", "viewer.transparency", "viewer.roi", "viewer.grid", "viewer.fastPreviews", "viewer.timecode"] {
         assert!(h.auto.elements.iter().any(|e| e.id == id), "{id} is in the hosted bar");

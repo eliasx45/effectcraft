@@ -1403,6 +1403,7 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
     ("Conformed Audio Folder", "符合的音频文件夹"),
     ("Memory & CPU", "内存和 CPU"),
     ("RAM Reserved for Other Applications", "为其他应用程序保留的内存"),
+    ("Maximum Share of RAM for Caches", "缓存可占用的最大内存比例"),
     ("Cache Budgets", "缓存预算"),
     ("Layer Cache", "图层缓存"),
     ("Footage Frame Cache", "素材帧缓存"),
@@ -2207,6 +2208,7 @@ const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
     ("Conformed Audio Folder", "符合的音訊資料夾"),
     ("Memory & CPU", "記憶體和 CPU"),
     ("RAM Reserved for Other Applications", "為其他應用程式保留的記憶體"),
+    ("Maximum Share of RAM for Caches", "快取可佔用的最大記憶體比例"),
     ("Cache Budgets", "快取預算"),
     ("Layer Cache", "圖層快取"),
     ("Footage Frame Cache", "素材影格快取"),
@@ -4548,6 +4550,7 @@ mod tests {
         ("panels/tracker.rs", include_str!("../panels/tracker.rs")),
         ("panels/unsaved.rs", include_str!("../panels/unsaved.rs")),
         ("panels/viewer.rs", include_str!("../panels/viewer.rs")),
+        ("panels/viewer_menu.rs", include_str!("../panels/viewer_menu.rs")),
         ("panels/viewer_tools.rs", include_str!("../panels/viewer_tools.rs")),
         ("panels/viewers.rs", include_str!("../panels/viewers.rs")),
         // Text the interface draws but does not own: the settings pages and the viewer's channel

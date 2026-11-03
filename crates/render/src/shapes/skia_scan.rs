@@ -1680,7 +1680,12 @@ pub(crate) mod tests {
 
     fn check(paths: &[BezPath], m: &Mat3, w: u32, h: u32, rule: FillRule) {
         let cpu = effectcraft_path::fill_coverage(paths, m, w, h, rule);
-        let Scan::Edges(edges) = scan_edges(paths, m, w, h) else { panic!("edges expected") };
+        let scan = scan_edges(paths, m, w, h);
+        // A shape the transform carries wholly off the mask covers nothing either way.
+        if scan == Scan::Empty && cpu.data.iter().all(|&a| a == 0.0) {
+            return;
+        }
+        let Scan::Edges(edges) = scan else { panic!("edges expected") };
         let ours = coverage(&edges, w, h, rule);
         let bad: Vec<(usize, f32, f32)> = cpu.data.iter().zip(&ours).enumerate().filter(|(_, (a, b))| a != b).map(|(i, (a, b))| (i, *a, *b)).collect();
         // Exact but for a pixel whose four samples on its last sub-scanline come from two spans

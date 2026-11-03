@@ -139,6 +139,9 @@ pub(crate) fn draw_snap(ctx: &egui::Context, painter: &egui::Painter, map: &View
 
 /// Ruler thickness in points.
 pub(crate) const RULER: f32 = 16.0;
+/// At most this many ticks per ruler: the tick step is chosen for a zoom of at least 1e-6, so a
+/// smaller (junk) zoom would otherwise walk ~1e20 ticks and run out of memory painting them.
+const MAX_RULER_TICKS: i64 = 4096;
 
 /// The viewer area left for the image once the rulers (View ▸ Show Rulers) take their strips.
 pub(crate) fn inset(app: &dyn TimelineHost, area: Rect) -> Rect {
@@ -188,7 +191,8 @@ pub(crate) fn rulers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, map: &Viewer
     let pt = p.with_clip_rect(top);
     let (c0, c1) = (map.to_comp(top.left_top())[0], map.to_comp(top.right_top())[0]);
     let mut k = ((c0 - o[0]) / minor).floor() as i64;
-    while (o[0] + k as f64 * minor) <= c1 {
+    let end = k.saturating_add(MAX_RULER_TICKS);
+    while (o[0] + k as f64 * minor) <= c1 && k < end {
         let cx = o[0] + k as f64 * minor;
         let x = map.to_screen([cx, 0.0]).x;
         let major = ((k as f64 * minor) / step).round() * step - k as f64 * minor;
@@ -203,7 +207,8 @@ pub(crate) fn rulers(app: &mut dyn TimelineHost, ui: &mut egui::Ui, map: &Viewer
     let pl = p.with_clip_rect(left);
     let (r0, r1) = (map.to_comp(left.left_top())[1], map.to_comp(left.left_bottom())[1]);
     let mut k = ((r0 - o[1]) / minor).floor() as i64;
-    while (o[1] + k as f64 * minor) <= r1 {
+    let end = k.saturating_add(MAX_RULER_TICKS);
+    while (o[1] + k as f64 * minor) <= r1 && k < end {
         let cy = o[1] + k as f64 * minor;
         let y = map.to_screen([0.0, cy]).y;
         let major = ((k as f64 * minor) / step).round() * step - k as f64 * minor;

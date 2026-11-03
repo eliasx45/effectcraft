@@ -205,7 +205,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 157);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 161);
 }
 
 #[test]

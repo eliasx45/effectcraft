@@ -25,7 +25,7 @@ fn frame(ctx: &Context, zoom: f32, events: Vec<Event>, open: bool) -> (Option<Re
     let xf = TSTransform::new(vec2(100.0, 80.0), zoom);
     let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
     let mut drawn = false;
-    let _ = ctx.run_ui(input, |ui| {
+    ctx.run_ui(input, |ui| {
         ui.ctx().set_transform_layer(layer, xf);
         egui::Area::new(Id::new(CARD)).order(Order::Middle).fixed_pos(Pos2::ZERO).constrain(false).show(ui.ctx(), |ui| {
             let pid = Id::new(POP);
@@ -44,7 +44,9 @@ fn frame(ctx: &Context, zoom: f32, events: Vec<Event>, open: bool) -> (Option<Re
                 chosen
             });
         });
-    });
+    })
+    .textures_delta
+    .clear();
     let area = Id::new(POP).with("area");
     let shown = ctx.memory(|m| m.area_rect(area)).filter(|_| drawn).map(|r| match ctx.layer_transform_to_global(LayerId::new(Order::Foreground, area)) {
         Some(t) => t * r,
@@ -150,9 +152,10 @@ fn menu_rows_check_and_hover_blue_whatever_the_hosts_selection_colour() {
         };
         let mut out = vec![];
         for _ in 0..2 {
-            let o = ctx.run_ui(input.clone(), |ui| {
+            let mut o = ctx.run_ui(input.clone(), |ui| {
                 let _ = widgets::menu_check(ui, true, "Guides", row.width());
             });
+            o.textures_delta.clear();
             out = o
                 .shapes
                 .iter()
