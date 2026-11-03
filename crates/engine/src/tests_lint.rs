@@ -895,3 +895,50 @@ fn handover_lints_with_the_default_rules_only() {
     assert!(h["blocking"].as_array().unwrap().iter().all(|e| e["source"] != "lint"), "{h:#}");
     assert_eq!(h["ready"], true, "{h:#}");
 }
+
+#[test]
+fn text_off_centre_skips_documents_hidden_glows_and_centres_icons_with_their_text() {
+    // A page with three left-aligned rows from the top: a document column, not one block.
+    let mut s = comp(2.0);
+    let page = solid(&mut s, "Page", 200, 150, "#2060c0");
+    set(&mut s, page, "transform/position", json!([160.0, 90.0, 0.0]));
+    for (i, n) in ["Row 1", "Row 2", "Row 3"].iter().enumerate() {
+        text(&mut s, n, "Experience", 14.0, "#ffffff", [90.0, 30.0 + 20.0 * i as f64]);
+    }
+    let r = lint(&mut s, json!({"time": 0, "rules": ["text-off-centre"]}));
+    assert!(of(&r, "text-off-centre").is_empty(), "{r:#}");
+
+    // A soft glow under a full-frame panel is never the text's card.
+    let mut s = comp(2.0);
+    let glow = solid(&mut s, "Glow", 300, 160, "#3070ff");
+    set(&mut s, glow, "transform/position", json!([200.0, 100.0, 0.0]));
+    let panel = solid(&mut s, "Panel", 320, 180, "#102040");
+    let label = text(&mut s, "Label", "Hi", 20.0, "#ffffff", [160.0, 96.0]);
+    s.execute("layer.setText", json!({"layer": label, "justify": "center"})).unwrap();
+    let r = lint(&mut s, json!({"time": 0, "rules": ["text-off-centre"]}));
+    assert!(of(&r, "text-off-centre").is_empty(), "{r:#}");
+    // With the panel moved away the glow is its card, 40 px right of it.
+    set(&mut s, panel, "transform/position", json!([900.0, 90.0, 0.0]));
+    let r = lint(&mut s, json!({"time": 0, "rules": ["text-off-centre"]}));
+    assert_eq!(one(&r, "text-off-centre")["other"].as_u64(), Some(glow), "{r:#}");
+
+    // A pill with an icon left of the text: the pair is centred, the text alone is not.
+    let mut s = comp(2.0);
+    let pill = solid(&mut s, "Pill", 160, 40, "#2060c0");
+    let icon = solid(&mut s, "Icon", 24, 24, "#ffffff");
+    let t = text(&mut s, "Clock", "Hello", 20.0, "#ffffff", [160.0, 96.0]);
+    let c = centre(&mut s, t);
+    let b = s.execute("layer.bounds", json!({"layers": [t]})).unwrap();
+    let w = b["layers"][0]["bounds"][2].as_f64().unwrap_or_else(|| panic!("{b:#}"));
+    // Icon 8 px left of the text; the pill centred on icon + text.
+    let icon_x = c[0] - w / 2.0 - 8.0 - 12.0;
+    set(&mut s, icon, "transform/position", json!([icon_x, c[1], 0.0]));
+    set(&mut s, pill, "transform/position", json!([(icon_x - 12.0 + c[0] + w / 2.0) / 2.0, c[1], 0.0]));
+    s.execute("layer.setText", json!({"layer": t, "justify": "center"})).unwrap();
+    let r = lint(&mut s, json!({"time": 0, "rules": ["text-off-centre"]}));
+    assert!(of(&r, "text-off-centre").is_empty(), "{r:#}");
+    // With the icon moved off the pill the text alone is off its centre.
+    set(&mut s, icon, "transform/position", json!([20.0, 20.0, 0.0]));
+    let r = lint(&mut s, json!({"time": 0, "rules": ["text-off-centre"]}));
+    assert_eq!(one(&r, "text-off-centre")["other"].as_u64(), Some(pill), "{r:#}");
+}

@@ -31,8 +31,12 @@
 //! - `text-off-centre`: a text layer sits in a card (the smallest drawn non-text layer below it
 //!   whose box holds the text's, not a full-frame background) and its glyph box's centre is more
 //!   than 1.5 px off the card's centre, measured along the card's own axes: vertically when the
-//!   card is at most 3 text heights tall (a pill or one-line card), horizontally when the text
-//!   is centre-justified. Warning; `other` is the card. A text whose layer or parents are keyed
+//!   card is at most 3 text heights tall (a pill or one-line card) and holds fewer than 3 texts
+//!   (3 or more are a document or list column, rows from the top), horizontally when the text
+//!   is centre-justified. The search for the card stops at the first full-frame layer below the
+//!   text (nothing under a background is its card), and small non-text layers drawn on the card
+//!   (≤ half its area: an icon beside the text) are centred together with the text, so the
+//!   `fix` is only given for one text alone. Warning; `other` is the card. A text whose layer or parents are keyed
 //!   is measured at its rest pose ([`rest_poses`]: the latest keyframe where nothing of it moves
 //!   and it is fully visible), not mid-pop. The message gives the move in the layer's own
 //!   Position units and, for one text with a static Position, [`Finding::fix`] is the `prop.set`.
@@ -445,13 +449,19 @@ const CENTRE_TOL: f64 = 1.5;
 /// Vertical centring is checked when the card is at most this many times the text's height
 /// (a pill or a one-line card; text in a tall card is usually placed on purpose).
 const CENTRE_HEIGHTS: f64 = 3.0;
+/// `text-off-centre`: this many texts or more on one card are a document or list column, not
+/// one block placed in the card's middle: not checked vertically.
+const DOCUMENT_TEXTS: usize = 3;
+/// `text-off-centre`: a non-text layer at most this share of the card's area, drawn above it and
+/// inside it, is an icon centred together with the text.
+const ICON_SHARE: f64 = 0.5;
 
 /// How far the centre of the text's points (the corners of one or more text boxes) is from
 /// the card quad's centre along the card's own axes (`[right, down]` in comp pixels, so rotated
 /// cards work), for each axis that is checked: down when the card is at most
 /// [`CENTRE_HEIGHTS`] times the text's height, right when the text is centre-justified. `None`
 /// when nothing checked is off by more than [`CENTRE_TOL`].
-fn off_centre(text: &[[f64; 2]], card: &[[f64; 2]; 4], check_h: bool) -> Option<[Option<f64>; 2]> {
+fn off_centre(text: &[[f64; 2]], card: &[[f64; 2]; 4], check_h: bool, may_check_v: bool) -> Option<[Option<f64>; 2]> {
     let sub = |a: [f64; 2], b: [f64; 2]| [a[0] - b[0], a[1] - b[1]];
     let dot = |a: [f64; 2], b: [f64; 2]| a[0] * b[0] + a[1] * b[1];
     let (u, v) = (sub(card[1], card[0]), sub(card[3], card[0]));
@@ -466,7 +476,7 @@ fn off_centre(text: &[[f64; 2]], card: &[[f64; 2]; 4], check_h: bool) -> Option<
         ((lo + hi) / 2.0 - len / 2.0, hi - lo)
     };
     let ((dx, _), (dy, h)) = (along(u, lu), along(v, lv));
-    let check_v = lv <= h * CENTRE_HEIGHTS;
+    let check_v = may_check_v && lv <= h * CENTRE_HEIGHTS;
     let pick = |on: bool, x: f64| (on && x.is_finite() && x.abs() > CENTRE_TOL).then_some(x);
     let off = [pick(check_h, dx), pick(check_v, dy)];
     (off[0].is_some() || off[1].is_some()).then_some(off)
@@ -808,12 +818,15 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
     let mut off_card = vec![];
     if set.on("text-off-centre") {
         let texts: Vec<(usize, &Placed)> = placed.iter().enumerate().filter(|(_, p)| p.text && p.on_screen > EPS).collect();
-        // The card of a text: the smallest drawn layer below it whose box holds the text's.
+        // The card of a text: the smallest drawn layer below it whose box holds the text's. The
+        // search stops at the first full-frame layer below it (a background or panel): nothing
+        // under that can be the text's card (a soft backdrop glow hidden behind a panel, L3 r5).
         let card_of = |i: usize, p: &Placed| {
             placed
                 .iter()
                 .enumerate()
                 .skip(i + 1)
+                .take_while(|(_, c)| !c.full_frame)
                 .filter(|(_, c)| !c.text && !c.full_frame && c.area > p.area && layout::overlap_area(&p.corners, &c.corners) >= p.area * (1.0 - EPS))
                 .min_by(|a, b| a.1.area.total_cmp(&b.1.area))
                 .map(|(j, _)| j)
@@ -833,16 +846,27 @@ pub fn lint_at(ctx: &EvalCtx, set: &Settings, backdrop: Option<&Backdrop>) -> Ve
                 effectcraft_render::text::text_geom(ctx, p.layer)
                     .is_some_and(|g| matches!(g.doc.justify, effectcraft_keyframe::Justify::Center | effectcraft_keyframe::Justify::JustifyLastCenter))
             };
-            let pts: Vec<[f64; 2]> = group.iter().flat_map(|p| p.corners).collect();
-            let Some(off) = off_centre(&pts, &c.corners, group.iter().all(|p| centred(p))) else { continue };
+            // A glyph or icon drawn on the card beside the text is centred with it (a stopwatch
+            // and its clock in one pill, L3 r4): small non-text layers above the card, inside its box.
+            let icons: Vec<&Placed> = placed
+                .iter()
+                .take(card)
+                .filter(|o| !o.text && !o.full_frame && o.area <= c.area * ICON_SHARE && layout::overlap_area(&o.corners, &c.corners) >= o.area * (1.0 - EPS))
+                .collect();
+            let pts: Vec<[f64; 2]> = group.iter().flat_map(|p| p.corners).chain(icons.iter().flat_map(|o| o.corners)).collect();
+            // Three or more texts on one card are a document or a list (rows from the top, a
+            // left-aligned column): only a centred column is checked, and only across.
+            let column = group.len() >= DOCUMENT_TEXTS;
+            let Some(off) = off_centre(&pts, &c.corners, group.iter().all(|p| centred(p)), !column) else { continue };
             let Some(first) = group.first() else { continue };
-            let subject = match group.as_slice() {
+            let all: Vec<&Placed> = group.iter().copied().chain(icons.iter().copied()).collect();
+            let subject = match all.as_slice() {
                 [one] => name(one.layer),
                 more => format!("{} (together)", more.iter().map(|p| name(p.layer)).collect::<Vec<_>>().join(" and ")),
             };
-            let mut message = off_centre_message(&subject, group.len() > 1, &name(c.layer), off);
+            let mut message = off_centre_message(&subject, all.len() > 1, &name(c.layer), off);
             let mut fix = None;
-            if let [one] = group.as_slice()
+            if let [one] = all.as_slice()
                 && let Some((now, to)) = centre_move(ctx, one.layer, &c.corners, off)
             {
                 let units = match one.layer.parent.and_then(|p| comp.layer(p)) {
