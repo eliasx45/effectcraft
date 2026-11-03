@@ -247,7 +247,9 @@ fn accents(s: &mut Session, p: &Value) -> Result<Value> {
     let deep = lint::speed_peaks_deep(&s.project, cid, a, b);
     let peaks: Vec<_> = deep.peaks.into_iter().filter(|pk| only.is_none_or(|l| pk.via.first().map_or(pk.layer, |h| h.layer) == l)).collect();
     let matched = lint::match_accents(peaks, &map, fps, lead);
-    let hits = matched.iter().filter(|m| m.offset_frames.abs() <= 1.0 + 1e-6).count();
+    // Settles (a spring's swing back) belong to the move before them: not counted as peaks to hit.
+    let settles = matched.iter().filter(|m| m.peak.settle).count();
+    let hits = matched.iter().filter(|m| !m.peak.settle && m.offset_frames.abs() <= 1.0 + 1e-6).count();
     let list: Vec<Value> = matched
         .iter()
         .take(MAX_LIST)
@@ -280,7 +282,8 @@ fn accents(s: &mut Session, p: &Value) -> Result<Value> {
                 "accent": r3(m.target),
                 "accentFrame": (m.target * fps).round(),
                 "offsetFrames": r2(m.offset_frames),
-                "hit": m.offset_frames.abs() <= 1.0 + 1e-6,
+                "hit": !m.peak.settle && m.offset_frames.abs() <= 1.0 + 1e-6,
+                "settle": m.peak.settle,
                 "alignPeak": align,
             })
         })
@@ -288,8 +291,9 @@ fn accents(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "comp": cid.0,
         "accentLead": lead,
-        "peaks": matched.len(),
+        "peaks": matched.len() - settles,
         "hits": hits,
+        "settles": settles,
         "truncated": matched.len() > MAX_LIST,
         "skipped": deep.skipped,
         "list": list,
@@ -507,7 +511,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "speech.accents",
             "Speed Peaks vs Accents",
-            "{comp?, layer?, start? (s), end? (s), accentLead? (frames before the stressed vowel, default 1; never before the syllable's onset, so a syllable that starts on its vowel (\"order\", \"IBM\") has its accent on the vowel)} → {peaks, hits, list: [{comp (the layer's comp: a precomp for nested moves), compName, via (precomp layer ids from this comp down, outermost first), layer, layerName, property, path, time, frame (this comp's), speed, word, onset, vowel, accent, accentFrame, offsetFrames (peak − accent; negative = early), hit (within 1 frame), alignPeak (keys.alignPeak params that land it on the accent)}], skipped (precomps not searched: time-remapped)}: every keyframed property's speed-graph peak, also inside precomps (mapped through each precomp layer's start and stretch; kept only where every precomp layer shows it), with its nearest stressed syllable; `layer` may be a precomp layer (everything in it)",
+            "{comp?, layer?, start? (s), end? (s), accentLead? (frames before the stressed vowel, default 1; never before the syllable's onset, so a syllable that starts on its vowel (\"order\", \"IBM\") has its accent on the vowel)} → {peaks (moves to land; settles not counted), hits, settles (a spring's smaller swing back after an overshoot: part of the move before it, never a hit or miss), list: [{comp (the layer's comp: a precomp for nested moves), compName, via (precomp layer ids from this comp down, outermost first), layer, layerName, property, path, time, frame (this comp's), speed, word, onset, vowel, accent, accentFrame, offsetFrames (peak − accent; negative = early), hit (within 1 frame; never for a settle), settle, alignPeak (keys.alignPeak params that land it on the accent)}], skipped (precomps not searched: time-remapped)}: every keyframed property's speed-graph peak, also inside precomps (mapped through each precomp layer's start and stretch; kept only where every precomp layer shows it), with its nearest stressed syllable; `layer` may be a precomp layer (everything in it)",
             accents
         ),
         cmd!("speech.clear", "Remove Speech Map", [], None, "{comp?} (the comp's script stays)", always, clear),

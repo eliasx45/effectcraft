@@ -381,3 +381,42 @@ fn off_accent_on_the_agents_own_keys_is_an_error() {
     assert_eq!(r["problems"][0]["severity"], "warning", "{r:#}");
     assert_eq!(off_accent(&mut s)[0]["severity"], "warning");
 }
+
+#[test]
+fn a_springs_settle_is_part_of_its_move_not_a_peak_to_hit() {
+    // 100 → 160 by 1.5 s (peak ~1.25 on the accent), overshoot settles back to 150 by 1.8 s.
+    let (mut s, l) = comp();
+    for (t, v) in [(1.0, 100.0), (1.5, 160.0), (1.8, 150.0)] {
+        s.execute("prop.addKey", json!({"layer": l, "path": "transform/scale", "value": [v, v, 100.0], "time": t, "timeBase": "comp"})).unwrap();
+    }
+    let uid = s.active_comp().unwrap().layer(LayerId(l)).unwrap().props.prop("transform/scale").unwrap().uid;
+    let keys: Vec<Value> = [1.0, 1.5, 1.8].iter().map(|t| json!({"layer": l, "prop": uid, "time": t})).collect();
+    s.execute_checked("keys.select", json!({"keys": keys})).unwrap();
+    s.execute_checked("keys.easyEase", json!({})).unwrap();
+    let peaks = lint::speed_peaks(s.active_comp().unwrap(), 0.0, 4.0);
+    assert_eq!(peaks.iter().map(|p| p.settle).collect::<Vec<_>>(), [false, true], "{peaks:#?}");
+    let first = peaks[0].time;
+    // The accent on the main move's peak: 1 peak, 1 hit, the settle listed but not a miss.
+    s.execute("speech.import", json!({"map": map(first - 0.02, first + 0.04)})).unwrap();
+    let r = s.execute("speech.accents", json!({})).unwrap();
+    assert_eq!((r["peaks"].as_u64(), r["hits"].as_u64(), r["settles"].as_u64()), (Some(1), Some(1), Some(1)), "{r:#}");
+    let settle = r["list"].as_array().unwrap().iter().find(|p| p["settle"] == true).unwrap();
+    assert_eq!(settle["hit"], false, "{settle}");
+    // …and off-accent doesn't flag it.
+    assert!(off_accent(&mut s).is_empty(), "{:#?}", off_accent(&mut s));
+}
+
+#[test]
+fn a_move_all_the_way_back_or_a_bigger_one_is_not_a_settle() {
+    use effectcraft_keyframe::{Keyframe, Value as V};
+    let k = |t: f64, v: f64| Keyframe::new(Tick::from_seconds_f64(t), V::Scalar(v));
+    // Out and all the way back: a second move.
+    assert!(!lint::is_settle(&[k(0.0, 0.0), k(0.5, 100.0), k(0.8, 0.0)], 1));
+    // Same direction: a second move.
+    assert!(!lint::is_settle(&[k(0.0, 0.0), k(0.5, 100.0), k(0.8, 120.0)], 1));
+    // Back by 10 % within a second: a settle; after a 2 s rest: a move.
+    assert!(lint::is_settle(&[k(0.0, 0.0), k(0.5, 110.0), k(0.8, 100.0)], 1));
+    assert!(!lint::is_settle(&[k(0.0, 0.0), k(0.5, 110.0), k(2.5, 100.0)], 1));
+    // The first segment has nothing to settle.
+    assert!(!lint::is_settle(&[k(0.0, 0.0), k(0.5, 110.0)], 0));
+}

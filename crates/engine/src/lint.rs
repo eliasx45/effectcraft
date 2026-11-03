@@ -1760,6 +1760,38 @@ pub struct SpeedPeak {
     /// The precomp layers from the comp searched down to `comp`, outermost first (empty when
     /// `comp` is `None`). `time` is mapped through them.
     pub via: Vec<Hop>,
+    /// A spring's settle ([`is_settle`]): the smaller swing back after an overshoot. It is part
+    /// of the move before it, not a hit of its own, so `off-accent` and `speech.accents`' hit
+    /// count leave it out.
+    pub settle: bool,
+}
+
+/// Longest settle swing [`is_settle`] accepts (seconds): springs settle within a few frames.
+const SETTLE_MAX_S: f64 = 1.0;
+/// A settle travels at most this share of the move before it.
+const SETTLE_SHARE: f64 = 0.5;
+
+/// Whether the segment `i` → `i + 1` of `keys` settles the move before it: it reverses the
+/// direction of segment `i - 1` (a negative dot product of their value changes), travels at most
+/// [`SETTLE_SHARE`] of its distance and lasts at most [`SETTLE_MAX_S`]. The 110 → 100 of a
+/// 0 → 110 → 100 scale pop, and every smaller swing of a longer spring, are settles; a move out and
+/// all the way back, or one after a long rest, is not.
+pub fn is_settle(keys: &[effectcraft_keyframe::Keyframe], i: usize) -> bool {
+    let (Some(j), Some(b)) = (i.checked_sub(1), i.checked_add(1)) else { return false };
+    let (Some(p), Some(a), Some(b)) = (keys.get(j), keys.get(i), keys.get(b)) else { return false };
+    if p.out_interp == effectcraft_keyframe::Interp::Hold || (b.time.seconds() - a.time.seconds()) > SETTLE_MAX_S {
+        return false;
+    }
+    let (pv, av, bv) = (p.value.components(), a.value.components(), b.value.components());
+    if pv.len() != av.len() || av.len() != bv.len() || av.is_empty() {
+        return false;
+    }
+    let d1: Vec<f64> = av.iter().zip(&pv).map(|(x, y)| x - y).collect();
+    let d2: Vec<f64> = bv.iter().zip(&av).map(|(x, y)| x - y).collect();
+    let dot: f64 = d1.iter().zip(&d2).map(|(x, y)| x * y).sum();
+    let len = |d: &[f64]| d.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let (l1, l2) = (len(&d1), len(&d2));
+    dot.is_finite() && dot < 0.0 && l1 > 1e-9 && l2 <= SETTLE_SHARE * l1 + 1e-9
 }
 
 /// Where a peak lands on a stressed syllable: `lead` frames before its vowel, never before its
@@ -1835,7 +1867,8 @@ pub fn speed_peaks(comp: &Comp, start: f64, end: f64) -> Vec<SpeedPeak> {
                 if out.iter().any(|q| q.layer == l.id && q.path == path && (q.time - time).abs() < 1e-6) {
                     continue;
                 }
-                out.push(SpeedPeak { layer: l.id, path: path.to_string(), property: p.name.clone(), time, speed: top, comp: None, via: vec![] });
+                let settle = is_settle(&p.keys, i);
+                out.push(SpeedPeak { layer: l.id, path: path.to_string(), property: p.name.clone(), time, speed: top, comp: None, via: vec![], settle });
             }
         });
     }
@@ -2041,7 +2074,8 @@ pub fn off_accent(
     let deep = speed_peaks_deep(project, cid, start, end);
     for m in match_accents(deep.peaks, map, fps, lead) {
         let d = m.offset_frames;
-        if d.abs() <= 1.0 + 1e-6 || d.abs() > window + 1e-6 {
+        // A settle belongs to the move before it (that move's peak is the hit).
+        if m.peak.settle || d.abs() <= 1.0 + 1e-6 || d.abs() > window + 1e-6 {
             continue;
         }
         // The layer in `cid` the finding is on: the peak's own, or the outermost precomp layer.
