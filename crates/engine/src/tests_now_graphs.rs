@@ -16,15 +16,16 @@ fn key(s: &mut Session, comp: ItemId, l: u64, path: &str, t: f64, v: Value) {
     s.execute("prop.addKey", json!({"comp": comp.0, "layer": l, "path": path, "time": t, "value": v})).unwrap();
 }
 
-/// Main (10 s) holds Scene (a precomp starting at 2 s); Scene's "Pill" moves 0.5 → 1.5 s
-/// (Main 2.5 → 3.5 s); Main's own "Title" fades 3 → 4 s and its "Late" layer moves at 8 → 9 s.
+/// Main (10 s) holds Scene (a precomp starting at 2 s); Scene's "Pill" moves 0.6 → 1.6 s
+/// (Main 2.6 → 3.6 s; frames 15 and 40 at 25 fps: keys snap to frames, so 0.5 s became 0.48);
+/// Main's own "Title" fades 3 → 4 s and its "Late" layer moves at 8 → 9 s.
 fn board() -> (Session, ItemId, ItemId, u64, u64, u64, u64) {
     let mut s = Session::default();
     s.execute("comp.new", json!({"name": "Scene", "width": 320, "height": 180, "frameRate": 25, "duration": 4.0})).unwrap();
     let scene = s.active_comp_id().unwrap();
     let pill = solid(&mut s, "Pill");
-    key(&mut s, scene, pill, "transform/position", 0.5, json!([0.0, 90.0]));
-    key(&mut s, scene, pill, "transform/position", 1.5, json!([160.0, 90.0]));
+    key(&mut s, scene, pill, "transform/position", 0.6, json!([0.0, 90.0]));
+    key(&mut s, scene, pill, "transform/position", 1.6, json!([160.0, 90.0]));
     s.execute("comp.new", json!({"name": "MAIN", "width": 320, "height": 180, "frameRate": 25, "duration": 10.0})).unwrap();
     let main = s.active_comp_id().unwrap();
     let title = solid(&mut s, "Title");
@@ -57,12 +58,12 @@ fn lists_every_segment_touching_the_playhead_through_precomps() {
     let (mut s, main, scene, pre, pill, title, late) = board();
     let r = s.execute("nowGraphs.list", json!({"comp": main.0, "time": 3.2})).unwrap();
     let g = graphs(&r);
-    // The pill inside Scene (2.5 → 3.5 in MAIN) and the title (3 → 4); not Late (8 → 9).
+    // The pill inside Scene (2.6 → 3.6 in MAIN) and the title (3 → 4); not Late (8 → 9).
     assert_eq!(g.len(), 2, "{r:#}");
     let p = g.iter().find(|x| x["layer"] == pill).expect("the nested pill is listed");
     assert_eq!(p["comp"], scene.0);
     assert_eq!(p["topLayer"], pre, "it shows through the precomp layer in MAIN");
-    assert!((p["start"].as_f64().unwrap() - 2.5).abs() < 0.01 && (p["end"].as_f64().unwrap() - 3.5).abs() < 0.01, "MAIN seconds: {p:#}");
+    assert!((p["start"].as_f64().unwrap() - 2.6).abs() < 0.01 && (p["end"].as_f64().unwrap() - 3.6).abs() < 0.01, "MAIN seconds: {p:#}");
     assert_eq!(p["path"], "transform/position");
     let trail: Vec<&str> = p["trail"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
     assert_eq!(trail.first().copied(), Some("MAIN"));
@@ -185,7 +186,7 @@ fn junk_times_and_windows_never_panic() {
 #[test]
 fn segments_containing_the_playhead_come_first_and_objects_follow_the_order() {
     let (mut s, main, _, _, pill, title, _) = board();
-    // 3.8 s: the title's 3 → 4 fade contains it; the pill (2.5 → 3.5 in MAIN) ended 0.3 s before.
+    // 3.8 s: the title's 3 → 4 fade contains it; the pill (2.6 → 3.6 in MAIN) ended 0.2 s before.
     let r = s.execute("nowGraphs.list", json!({"comp": main.0, "time": 3.8})).unwrap();
     let g = graphs(&r);
     assert_eq!(g.len(), 2, "{r:#}");
@@ -200,7 +201,7 @@ fn segments_containing_the_playhead_come_first_and_objects_follow_the_order() {
     assert_eq!(r["frameRate"].as_f64(), Some(25.0));
     // keyTimes: the two keys in MAIN seconds, key first.
     let kt = g[1]["keyTimes"].as_array().unwrap();
-    assert!((kt[0].as_f64().unwrap() - 2.5).abs() < 0.01 && (kt[1].as_f64().unwrap() - 3.5).abs() < 0.01, "{:#}", g[1]);
+    assert!((kt[0].as_f64().unwrap() - 2.6).abs() < 0.01 && (kt[1].as_f64().unwrap() - 3.6).abs() < 0.01, "{:#}", g[1]);
 }
 
 #[test]
@@ -208,7 +209,7 @@ fn move_key_retimes_a_nested_key_in_the_outer_comps_frames_as_one_drag() {
     let (mut s, main, scene, _, pill, _, _) = board();
     let g = graphs(&s.execute("nowGraphs.list", json!({"comp": main.0, "time": 3.0})).unwrap());
     let p = g.iter().find(|x| x["layer"] == pill).unwrap().clone();
-    // Drag the pill's last key (MAIN 3.5 s) to 3.9, then 4.013 (snaps to MAIN's frame 4.0): Scene
+    // Drag the pill's last key (MAIN 3.6 s) to 3.9, then 4.013 (snaps to MAIN's frame 4.0): Scene
     // starts at 2 s in MAIN, so the key lands at Scene's 2.0 s (layer time).
     let held = keys_of(&s, scene, pill, "transform/position")[1].value.clone();
     let call = |t: f64| json!({"comp": p["comp"], "layer": p["layer"], "path": p["path"], "key": 1, "time": t, "top": main.0, "via": p["via"], "merge": "nowgraphs-key-1"});
@@ -218,7 +219,7 @@ fn move_key_retimes_a_nested_key_in_the_outer_comps_frames_as_one_drag() {
     assert!((r["layerTime"].as_f64().unwrap() - 2.0).abs() < 1e-6, "{r:#}");
     let k = keys_of(&s, scene, pill, "transform/position");
     assert!((k[1].time.seconds() - 2.0).abs() < 1e-6);
-    assert!((k[0].time.seconds() - 0.5).abs() < 1e-6, "the other key stays");
+    assert!((k[0].time.seconds() - 0.6).abs() < 1e-6, "the other key stays");
     assert_eq!(k[1].value, held, "the key keeps its value");
     // Listed again, the segment is longer.
     let g = graphs(&s.execute("nowGraphs.list", json!({"comp": main.0, "time": 3.0})).unwrap());
@@ -227,7 +228,7 @@ fn move_key_retimes_a_nested_key_in_the_outer_comps_frames_as_one_drag() {
     // The whole drag is one undo step.
     s.execute("edit.undo", json!({})).unwrap();
     let k = keys_of(&s, scene, pill, "transform/position");
-    assert!((k[1].time.seconds() - 1.5).abs() < 1e-6, "one undo puts it back");
+    assert!((k[1].time.seconds() - 1.6).abs() < 1e-6, "one undo puts it back");
 }
 
 #[test]

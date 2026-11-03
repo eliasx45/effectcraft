@@ -504,7 +504,11 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
             }
             if let Some(fix) = &f.fix {
                 let mut fix = fix.clone();
-                fix["params"]["comp"] = json!(cid.0);
+                // The comp the fix runs in: this one, unless the finding already names a precomp
+                // (off-word inside a scene precomp: its fix runs there, 3 Nov 2026).
+                if fix["params"].get("comp").is_none_or(Value::is_null) {
+                    fix["params"]["comp"] = json!(cid.0);
+                }
                 o["fix"] = fix;
             }
             o
