@@ -420,3 +420,20 @@ fn a_move_all_the_way_back_or_a_bigger_one_is_not_a_settle() {
     // The first segment has nothing to settle.
     assert!(!lint::is_settle(&[k(0.0, 0.0), k(0.5, 110.0)], 0));
 }
+
+#[test]
+fn a_layer_moving_two_properties_at_once_is_one_move() {
+    let (mut s, l) = comp();
+    scale_keys(&mut s, l, 1.0, 2.0, false);
+    for (t, v) in [(1.0, 0.0), (2.0, 100.0)] {
+        s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "value": v, "time": t, "timeBase": "comp"})).unwrap();
+    }
+    let uid = s.active_comp().unwrap().layer(LayerId(l)).unwrap().props.prop("transform/opacity").unwrap().uid;
+    let keys: Vec<Value> = [1.0, 2.0].iter().map(|t| json!({"layer": l, "prop": uid, "time": t})).collect();
+    s.execute_checked("keys.select", json!({"keys": keys})).unwrap();
+    s.execute_checked("keys.easyEase", json!({})).unwrap();
+    s.execute("speech.import", json!({"map": map(1.44, 1.56)})).unwrap();
+    let r = s.execute("speech.accents", json!({})).unwrap();
+    assert_eq!((r["peaks"].as_u64(), r["hits"].as_u64()), (Some(2), Some(2)), "{r:#}");
+    assert_eq!(r["moves"], json!({"count": 1, "hits": 1}), "{r:#}");
+}
