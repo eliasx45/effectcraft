@@ -108,6 +108,20 @@ fn write_geo(w: &mut Words, g: &PlaneGeo) {
     w.d([g.cam.eye.x, g.cam.eye.y, g.cam.eye.z, if g.cam.ortho { 1.0 } else { 0.0 }]);
     let f = g.cam.forward();
     w.d([f.x, f.y, f.z, 0.0]);
+    // Sub-sample depth along the frame camera's ray, (a·s) / (b·s), normalised like the
+    // homography (w = 1: present).
+    match g.ray_depth {
+        Some([a, b]) => {
+            let m = a.iter().chain(&b).fold(0.0f64, |m, v| m.max(v.abs()));
+            let k = if m > 0.0 { 1.0 / m } else { 1.0 };
+            w.d([a[0] * k, a[1] * k, a[2] * k, 1.0]);
+            w.d([b[0] * k, b[1] * k, b[2] * k, 0.0]);
+        }
+        None => {
+            w.d([0.0; 4]);
+            w.d([0.0; 4]);
+        }
+    }
 }
 
 fn write_light(w: &mut Words, l: &LightState) {
@@ -120,7 +134,7 @@ fn write_light(w: &mut Words, l: &LightState) {
 }
 
 const PLANE_BYTES: usize = 12 * 16;
-const GEO_BYTES: usize = 10 * 16;
+const GEO_BYTES: usize = 12 * 16;
 const LIGHT_BYTES: usize = 6 * 16;
 
 /// Composite a prepared Classic 3D run over `canvas`. `None` when it cannot run here (the

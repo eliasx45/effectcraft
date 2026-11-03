@@ -655,6 +655,41 @@ fn coplanar_layers_keep_stack_order_under_a_moving_camera_with_motion_blur() {
     }
 }
 
+#[test]
+fn coplanar_layers_keep_stack_order_on_a_turned_plane_under_a_panning_camera() {
+    // L3-hours-minutes (3 Nov 2026): a clock text over its motion-blurred pill body, both on
+    // one plane, vanished on some frames while the camera moved. A blurred plane's sub-samples
+    // look through the sample's camera, so on a plane turned to the view they hit another
+    // point than the frame camera's ray does, and its depth sorted it in front of (or behind)
+    // the unblurred layer on the same plane.
+    for to in [200.0, 0.0] {
+        let (mut p, cid, comp) = setup();
+        p.comp_mut(cid).unwrap().enable_motion_blur = true;
+        let mut cam = camera(&mut p, &comp);
+        cam.auto_orient = effectcraft_project::AutoOrient::Off;
+        let pr = cam.props.prop_mut("transform/position").unwrap();
+        // Through x = 100 (looking at the layers) at t = 0.5, panning 200 px/s either way.
+        pr.keys = vec![
+            effectcraft_keyframe::Keyframe::new(Tick::ZERO, Value::Vec3([200.0 - to, 50.0, -zoom()])),
+            effectcraft_keyframe::Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([to, 50.0, -zoom()])),
+        ];
+        let mut top = solid3(&mut p, &comp, [1.0, 0.0, 0.0], 40, 40, [100.0, 50.0, 0.0]);
+        let mut bottom = solid3(&mut p, &comp, [0.0, 0.0, 1.0], 160, 160, [100.0, 50.0, 0.0]);
+        for l in [&mut top, &mut bottom] {
+            set(l, "transform/rotationY", Value::Scalar(40.0));
+        }
+        bottom.switches.motion_blur = true;
+        push(&mut p, cid, cam);
+        push(&mut p, cid, top);
+        push(&mut p, cid, bottom);
+        let img = render_frame(&p, cid, Tick::from_seconds_f64(0.5), 1.0);
+        for x in [94, 100, 106] {
+            let c = img.get(x, 50);
+            assert!(c[0] > 0.99 && c[2] < 0.01, "pan to {to}, x={x}: {c:?}");
+        }
+    }
+}
+
 /// A one-node camera layer 60 px right of the default camera, its In point at `in_frame`, in a
 /// comp with motion blur at shutter phase −90° (samples from a quarter frame before the frame),
 /// and a still, motion-blurred 3D solid at the comp centre.

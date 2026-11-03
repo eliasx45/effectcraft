@@ -34,6 +34,12 @@ pub struct Geo {
     pub hinv: Mat3,
     /// Camera-space depth as a function of layer (u, v): `d0·u + d1·v + d2`.
     pub depth: [f64; 3],
+    /// Motion-blur sub-samples: the frame camera's depth of this plane along the output pixel's
+    /// ray, `(a·s) / (b·s)` with `s = (x, y, 1)`, used for the depth sort. The sample is seen
+    /// through its own camera, so on a plane turned to the view it covers a pixel at another
+    /// point than the frame camera's ray hits; measured there, a plane coplanar with an
+    /// unblurred one sorted in front of or behind it while the camera moved.
+    pub ray_depth: Option<[[f64; 3]; 2]>,
     /// Layer → world.
     pub world: Mat4,
     /// Unit world normal.
@@ -133,7 +139,24 @@ pub(super) fn geo(cam: &CameraState, world: Mat4, b: [f64; 4], comp: (f64, f64),
     if bbox[0] >= bbox[2] || bbox[1] >= bbox[3] {
         return None;
     }
-    Some(Geo { hinv, depth, world, normal, bbox, cam: *cam })
+    Some(Geo { hinv, depth, world, normal, bbox, cam: *cam, ray_depth: None })
+}
+
+/// [`Geo::ray_depth`] of the plane at `world` seen by `cam`: the plane's camera depth at the
+/// point the ray through an output pixel hits. `None` for an edge-on plane.
+fn ray_depth(cam: &CameraState, world: Mat4, comp: (f64, f64), scale: f64, off: (f64, f64)) -> Option<[[f64; 3]; 2]> {
+    let proj = Mat4::translate(vec3(-off.0, -off.1, 0.0)) * Mat4::scale(vec3(scale, scale, 1.0)) * cam.projection(comp.0, comp.1);
+    let h = (proj * world).plane_to_mat3();
+    let col = |j: usize| (h.0[0][j].powi(2) + h.0[1][j].powi(2) + h.0[2][j].powi(2)).sqrt();
+    if h.determinant().abs() <= 1e-10 * col(0) * col(1) * col(2) {
+        return None;
+    }
+    let r = h.inverse()?.0;
+    let cv = cam.view * world;
+    let d = [cv.0[2][0], cv.0[2][1], cv.0[2][3]];
+    // u = (r0·s) / (r2·s), v = (r1·s) / (r2·s): depth = d0·u + d1·v + d2 = (a·s) / (r2·s).
+    let a = [0, 1, 2].map(|j| d[0] * r[0][j] + d[1] * r[1][j] + d[2] * r[2][j]);
+    Some([a, r[2]])
 }
 
 /// The layer-space rectangle of `layer`'s plane an `out` canvas can show: the canvas corners
@@ -175,7 +198,7 @@ pub(crate) fn plane_view(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, 
             return None;
         }
         let cv = c.view * world;
-        let g = Geo { hinv: h.inverse()?, depth: [cv.0[2][0], cv.0[2][1], cv.0[2][3]], world, normal: plane_normal(world)?, bbox: [0; 4], cam: c };
+        let g = Geo { hinv: h.inverse()?, depth: [cv.0[2][0], cv.0[2][1], cv.0[2][3]], world, normal: plane_normal(world)?, bbox: [0; 4], cam: c, ray_depth: None };
         for (x, y) in [(0.0, 0.0), (ow, 0.0), (ow, oh), (0.0, oh)] {
             let (u, v, _) = unproject(&g, x, y)?;
             r_out = [r_out[0].min(u), r_out[1].min(v), r_out[2].max(u), r_out[3].max(v)];
@@ -213,6 +236,15 @@ fn unproject(g: &Geo, sx: f64, sy: f64) -> Option<(f64, f64, f64)> {
     let z = g.depth[0] * u + g.depth[1] * v + g.depth[2];
     if !g.cam.ortho && z < NEAR {
         return None;
+    }
+    // A sub-sample sorts by the frame camera's ray (kept only where that ray hits the plane in
+    // front of the camera).
+    if let Some([a, b]) = g.ray_depth {
+        let den = b[0] * sx + b[1] * sy + b[2];
+        let zr = (a[0] * sx + a[1] * sy + a[2]) / den;
+        if zr.is_finite() && (g.cam.ortho || (den > 0.0 && zr >= NEAR)) {
+            return Some((u, v, zr));
+        }
     }
     Some((u, v, z))
 }
@@ -367,11 +399,11 @@ fn prepare_with<'a>(
                 let sub = ctx.at(ctx.time + Tick::from_seconds_f64(f * fd));
                 let c = camera_for_sample(r, ctx, &sub);
                 let w = outer * sub.world_matrix(layer) * local;
-                // Depth from the frame's camera, as for unblurred layers: planes that stay
-                // coplanar keep their stack order while the camera moves.
+                // Depth from the frame's camera along the pixel's ray, as for unblurred layers:
+                // planes that stay coplanar keep their stack order while the camera moves.
                 geo(&c, w, bounds, comp, s, out, r.out_offset()).map(|g| {
                     let cv = cam.view * w;
-                    Geo { depth: [cv.0[2][0], cv.0[2][1], cv.0[2][3]], ..g }
+                    Geo { depth: [cv.0[2][0], cv.0[2][1], cv.0[2][3]], ray_depth: ray_depth(&cam, w, comp, s, r.out_offset()), ..g }
                 })
             })
             .collect()

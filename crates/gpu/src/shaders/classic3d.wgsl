@@ -53,6 +53,10 @@ struct Geo {
     eye: vec4<f32>,
     // Camera forward (xyz).
     fwd: vec4<f32>,
+    // Motion-blur sub-samples (ra.w = 1): depth along the frame camera's ray through the
+    // pixel = (ra.xyz·s) / (rb.xyz·s), s = (x, y, 1) (compose::Geo::ray_depth).
+    ra: vec4<f32>,
+    rb: vec4<f32>,
 }
 
 struct Light {
@@ -137,6 +141,16 @@ fn unproject(g: u32, sx: f32, sy: f32) -> vec4<f32> {
     let z = gm.depth.x * u + gm.depth.y * v + gm.depth.z;
     if (!ortho && z < NEAR3) {
         return vec4<f32>(0.0);
+    }
+    if (gm.ra.w > 0.5) {
+        let s = vec3<f32>(sx, sy, 1.0);
+        let den = dot(gm.rb.xyz, s);
+        if (den != 0.0) {
+            let zr = dot(gm.ra.xyz, s) / den;
+            if (ortho || (den > 0.0 && zr >= NEAR3)) {
+                return vec4<f32>(u, v, zr, 1.0);
+            }
+        }
     }
     return vec4<f32>(u, v, z, 1.0);
 }
