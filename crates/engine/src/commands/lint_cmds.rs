@@ -133,7 +133,10 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, "give either `time` (one comp time) or `start`/`end` (a range), not both"));
     }
     let duration = comp.duration.seconds();
-    let (times, truncated, span) = if range {
+    // A range longer than [`lint::MAX_SAMPLES`] samples is linted from its start up to the cap
+    // (never thinned), and the reply says so loudly: `clean` false, `warning`, `next`.
+    let mut cut: Option<Value> = None;
+    let (times, span) = if range {
         let (a, b) = (start.unwrap_or(0.0), end.unwrap_or(duration));
         if b < a {
             return Err(bad(C, format!("empty range: end ({b} s) is before start ({a} s)")));
@@ -144,15 +147,32 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
                 v.as_f64().filter(|x| x.is_finite() && *x >= 0.001).ok_or_else(|| bad(C, format!("`step` is seconds between samples (≥ 0.001), not {v}")))?
             }
         };
-        let (times, truncated) = lint::sample_times(comp, a, b, step, lint::MAX_SAMPLES);
-        (times, truncated, (a, b))
+        let (times, rest) = lint::sample_times(comp, a, b, step, lint::MAX_SAMPLES);
+        if let Some(rest) = rest {
+            let done = times.last().map_or(a, |t| t.seconds());
+            let mut next = match p {
+                Value::Object(o) => Value::Object(o.clone()),
+                _ => json!({}),
+            };
+            next["comp"] = json!(cid.0);
+            next["start"] = json!(rest.seconds());
+            next["end"] = json!(b);
+            next["step"] = json!(step);
+            let warning = format!(
+                "NOT the whole range: stopped after {} samples (the most one lint takes; step {step} s plus in points and keyframes). Linted {a:.3}–{done:.3} s of {a:.3}–{b:.3} s; the frames after {done:.3} s were not checked, so `clean` is false. Lint the rest with render.lint {next} (repeat with each reply's `next` until it has none), or use a larger step.",
+                times.len()
+            );
+            cut = Some(json!({"warning": warning, "lintedUntil": done, "next": next}));
+        }
+        (times, (a, b))
     } else {
         if let Some(v) = f_p(p, "time").filter(|t| !t.is_finite()) {
             return Err(bad(C, format!("`time` must be a finite number of seconds, not {v}")));
         }
         let t = time_p(s, p, Some(comp));
-        (vec![t], false, (t.seconds(), t.seconds()))
+        (vec![t], (t.seconds(), t.seconds()))
     };
+    let truncated = cut.is_some();
 
     let r = renderer(s, RenderOpts::default());
     let has_text = comp.layers.iter().any(|l| matches!(l.source, LayerSource::Text));
@@ -443,6 +463,9 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
         occurrences.extend(lint::exit_at_cut(comp, &tail, full));
     }
 
+    if let Some(w) = cut.as_ref().and_then(|c| c["warning"].as_str()) {
+        notes.insert(0, w.to_string());
+    }
     let mut problems = lint::merge(occurrences);
     let before = problems.len();
     if !verbose {
@@ -487,24 +510,32 @@ fn render_lint(s: &mut Session, p: &Value) -> Result<Value> {
             o
         })
         .collect();
-    Ok(json!({
+    let mut out = json!({
         "comp": cid.0,
         "compName": s.project.item(cid).map(|i| i.name.as_str()).unwrap_or(""),
         "times": times.iter().map(|t| t.seconds()).collect::<Vec<f64>>(),
         "truncated": truncated,
-        "clean": errors + warnings == 0,
+        // A run that didn't reach the end of its range is never clean: scripts that read only
+        // `clean` took a thinned 6.5 s lint as every frame checked (3 Nov 2026).
+        "clean": errors + warnings == 0 && !truncated,
         "counts": {"error": errors, "warning": warnings, "info": infos},
         "rules": set.rules,
         "problems": list,
         "notes": notes,
-    }))
+    });
+    if let Some(Value::Object(c)) = cut {
+        for (k, v) in c {
+            out[k.as_str()] = v;
+        }
+    }
+    Ok(out)
 }
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![query!(
         "render.lint",
         "Design Lint",
-        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; at most 120 samples), rules?: \"all\" | \"default\" | rule id | [rule id|all|default] (rule ids: text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|nested-cut-off|text-overlap|text-off-centre|hidden-visible|exposed-edge|off-beat|off-accent|off-word|off-taste|exit-at-cut; default: text-off-centre, exposed-edge, exit-at-cut only, the rest off until the lint experiment, 2 Nov 2026), verbose? (bool, default false: info lines are left out), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times, truncated, clean (no errors or warnings), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner? {comp, layer, path} (a layer inside a precomp: `layer` is the precomp layer showing it), fix? {command, params} (the call that fixes it: text-off-centre)}], notes}",
+        "{comp?, time? (s, default the current time) | start? (s), end? (s) (a range, sampled every step), step? (s, default 0.5; plus each layer's in point and keyframe times; every sample is linted, at most 1000 per call: a longer range is linted from its start up to the 1000th sample, never thinned), rules?: \"all\" | \"default\" | rule id | [rule id|all|default] (rule ids: text-too-small|low-contrast|outside-title-safe|outside-action-safe|cut-off|nested-cut-off|text-overlap|text-off-centre|hidden-visible|exposed-edge|off-beat|off-accent|off-word|off-taste|exit-at-cut; default: text-off-centre, exposed-edge, exit-at-cut only, the rest off until the lint experiment, 2 Nov 2026), verbose? (bool, default false: info lines are left out), minTextPx? (default comp height / 30), minContrast? (WCAG ratio, default 3), accentLead? (frames before the stressed vowel a speed peak should land, default 1), accentWindow? (frames: peaks this close to an accent but more than 1 off are flagged, default 4)} → {comp, compName, times (the sample times linted), truncated (the range had more than 1000 samples: only its start was linted), clean (no errors or warnings, and the whole range was linted: false when truncated), warning? (when truncated: what was and wasn't linted), lintedUntil? (s, when truncated: the last sample linted), next? (when truncated: the params of the render.lint call that lints the rest; repeat until a reply has no next), counts {error, warning, info}, problems: [{rule, severity, layer, layerName, time, until, message, other?, inner? {comp, layer, path} (a layer inside a precomp: `layer` is the precomp layer showing it), fix? {command, params} (the call that fixes it: text-off-centre)}], notes}",
         render_lint
     )]
 }

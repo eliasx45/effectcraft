@@ -124,8 +124,13 @@ pub fn rule_set(names: &[&str]) -> Result<Vec<&'static str>, String> {
     Ok(RULES.into_iter().filter(|r| on.contains(r)).collect())
 }
 
-/// Most sample times one lint looks at; longer ranges are thinned evenly (`truncated`).
-pub const MAX_SAMPLES: usize = 120;
+/// Most sample times one lint looks at: about 33 s at one sample per frame (29.97 fps). A longer
+/// range is linted up to there and says where to go on (`truncated`, `next`); the app answers a
+/// request within 60 s and a lint holds the session, so it can't be unbounded. Measured 3 Nov
+/// 2026 (default rules): about 2.5 ms a sample on a 6.5 s line comp, 20–25 ms on a 464 s MAIN of
+/// precomps (1000 samples there: about 25 s).
+/// It was 120 and thinned longer ranges evenly, which skipped frames while `clean` said true.
+pub const MAX_SAMPLES: usize = 1000;
 /// Default spacing of range samples (seconds).
 pub const DEFAULT_STEP: f64 = 0.5;
 /// Longest side of the backdrop render `low-contrast` measures (pixels).
@@ -1485,9 +1490,10 @@ pub fn merge(occurrences: Vec<(Tick, Finding)>) -> Vec<Problem> {
 
 /// Sample times of a range lint, `start`..=`end` seconds: every `step` seconds, both ends, each
 /// layer's in point and every keyframe (in comp time) inside the range, clamped to the comp's
-/// first and last frame and de-duplicated. More than `cap` are thinned evenly (and the flag is
-/// true).
-pub fn sample_times(comp: &Comp, start: f64, end: f64, step: f64, cap: usize) -> (Vec<Tick>, bool) {
+/// first and last frame and de-duplicated. More than `cap`: the first `cap` in time order, and
+/// the first time left out (where a follow-up lint starts). Never thinned: a thinned run skipped
+/// frames between its samples while reading as a whole-range lint (3 Nov 2026).
+pub fn sample_times(comp: &Comp, start: f64, end: f64, step: f64, cap: usize) -> (Vec<Tick>, Option<Tick>) {
     let last = (comp.duration - comp.frame_rate.frame_duration()).max(Tick::ZERO);
     let clamp = |t: Tick| t.clamp(Tick::ZERO, last);
     let inside = |t: f64| t >= start - 1e-9 && t <= end + 1e-9;
@@ -1514,11 +1520,11 @@ pub fn sample_times(comp: &Comp, start: f64, end: f64, step: f64, cap: usize) ->
     let close = Tick::from_seconds_f64(1e-6);
     all.dedup_by(|b, a| *b - *a < close);
     if all.len() <= cap || cap == 0 {
-        return (all, false);
+        return (all, None);
     }
-    let n = all.len();
-    let picked: Vec<Tick> = (0..cap).filter_map(|i| all.get(i * (n - 1) / (cap - 1).max(1)).copied()).collect();
-    (picked, true)
+    let rest = all.get(cap).copied();
+    all.truncate(cap);
+    (all, rest)
 }
 
 // ---------------------------------------------------------------- off-beat

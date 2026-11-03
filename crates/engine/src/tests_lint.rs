@@ -212,7 +212,7 @@ fn range_merges_occurrences() {
     let b = solid(&mut s, "Mover", 40, 40, "#ff0000");
     s.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "value": [160.0, 90.0, 0.0], "time": 0.0})).unwrap();
     s.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "value": [320.0, 90.0, 0.0], "time": 1.0})).unwrap();
-    let r = lint(&mut s, json!({"start": 0, "end": 2, "rules": ["cut-off"]}));
+    let r = lint(&mut s, json!({"start": 0, "end": 2, "rules": ["cut-off"], "verbose": true}));
     // Every 0.5 s, the end clamped to the last frame (1.96 s), keyframes at 0 and 1 s.
     assert_eq!(r["times"], json!([0.0, 0.5, 1.0, 1.5, 1.96]), "{r}");
     let p = one(&r, "cut-off");
@@ -221,13 +221,61 @@ fn range_merges_occurrences() {
     s.execute("prop.addKey", json!({"layer": b, "path": "transform/opacity", "value": 50.0, "time": 0.2})).unwrap();
     let r = lint(&mut s, json!({"start": 0, "end": 1, "rules": ["cut-off"]}));
     assert_eq!(r["times"], json!([0.0, 0.2, 0.5, 1.0]), "{r}");
-    // Long ranges are thinned to 120 samples.
-    let mut s = comp(10.0);
+}
+
+/// A lint over a long range at one sample per frame checks every frame, and a range over the cap
+/// is never thinned: it lints from the start, says `clean: false` and hands back the call that
+/// lints the rest. (3 Nov 2026: `render.lint {start: 0, end: 6.5066, step: 0.0333667}` on a
+/// 6.5 s line came back with 120 times spread over it, about one every 1.6 frames, and
+/// `clean: true`; scripts reading only `clean` took every frame as checked.)
+#[test]
+fn long_range_lints_every_frame_or_says_where_it_stopped() {
+    let frame = 0.04;
+    let samples = |r: &Value| r["times"].as_array().unwrap().iter().map(|t| t.as_f64().unwrap()).collect::<Vec<f64>>();
+    let gaps_ok = |t: &[f64]| t.windows(2).all(|w| w[1] - w[0] <= frame + 1e-6);
+
+    // The builder's case: a 6.5 s line at a 1-frame step. Every frame (0, 0.04 … 6.48) and the
+    // range end (6.5), nothing skipped, clean.
+    let mut s = comp(7.0);
     solid(&mut s, "Box", 40, 40, "#ff0000");
-    let r = lint(&mut s, json!({"start": 0, "end": 10, "step": 0.04, "rules": ["cut-off"]}));
-    assert_eq!((r["truncated"].as_bool(), r["times"].as_array().unwrap().len()), (Some(true), 120), "{r}");
-    assert_eq!(r["times"][0], 0.0);
-    assert_eq!(r["times"][119], 9.96);
+    let r = lint(&mut s, json!({"start": 0, "end": 6.5, "step": frame}));
+    let t = samples(&r);
+    assert_eq!((r["truncated"].as_bool(), r["clean"].as_bool(), t.len()), (Some(false), Some(true), 164), "{r}");
+    assert!(gaps_ok(&t) && t.first() == Some(&0.0) && t.last() == Some(&6.5), "{t:?}");
+    assert!(r.get("next").is_none() && r.get("warning").is_none(), "{r}");
+
+    // Over the cap (60 s at 25 fps = 1500 frames): the first MAX_SAMPLES frames in order, then
+    // stop, loudly. No problem was found, and it still isn't clean.
+    let mut s = comp(60.0);
+    solid(&mut s, "Box", 40, 40, "#ff0000");
+    let r = lint(&mut s, json!({"start": 0, "end": 60, "step": frame}));
+    let first = samples(&r);
+    assert_eq!(first.len(), lint::MAX_SAMPLES, "{r}");
+    assert!(gaps_ok(&first), "a truncated lint is contiguous, not thinned");
+    let done = first.last().copied().unwrap();
+    assert!((done - (lint::MAX_SAMPLES - 1) as f64 * frame).abs() < 1e-6, "{done}");
+    assert_eq!((r["truncated"].as_bool(), r["clean"].as_bool()), (Some(true), Some(false)), "{r}");
+    assert_eq!(r["counts"], json!({"error": 0, "warning": 0, "info": 0}), "{r}");
+    assert_eq!(r["lintedUntil"].as_f64(), Some(done), "{r}");
+    let warning = r["warning"].as_str().unwrap();
+    assert!(warning.contains("NOT the whole range") && warning.contains("step 0.04 s") && warning.contains("render.lint"), "{warning}");
+    assert_eq!(r["notes"][0].as_str(), Some(warning), "the warning leads the notes");
+    let next = r["next"].clone();
+    assert!((next["start"].as_f64().unwrap() - (done + frame)).abs() < 1e-6, "{next}");
+    assert_eq!((next["end"].as_f64(), next["step"].as_f64(), next["comp"].as_u64()), (Some(60.0), Some(frame), r["comp"].as_u64()), "{next}");
+
+    // `next` lints the rest: together the two calls cover every frame to the comp's last.
+    let r = lint(&mut s, next);
+    let rest = samples(&r);
+    assert_eq!((r["truncated"].as_bool(), r["clean"].as_bool()), (Some(false), Some(true)), "{r}");
+    assert!(r.get("next").is_none(), "{r}");
+    let all: Vec<f64> = first.iter().chain(&rest).copied().collect();
+    assert!(gaps_ok(&all) && all.len() == 1500 && all.last() == Some(&59.96), "{} samples, last {:?}", all.len(), all.last());
+
+    // handover.check passes the cut on as a warning with the call that lints the rest.
+    let h = s.execute_checked("handover.check", json!({"start": 0, "end": 60, "step": frame})).unwrap();
+    let w = h["warnings"].as_array().unwrap().iter().find(|w| w["rule"] == "truncated").cloned().unwrap_or_default();
+    assert_eq!((w["source"].as_str(), w["fix"]["command"].as_str()), (Some("lint"), Some("render.lint")), "{h:#}");
 }
 
 #[test]

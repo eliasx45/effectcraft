@@ -210,6 +210,11 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
             _ => {}
         }
     }
+    // A lint that stopped before the end of the range says so here too (it never blocks: the
+    // default lint rules are warnings), with the call that lints the rest.
+    if let Some(w) = lint.get("warning").and_then(Value::as_str) {
+        warnings.push(json!({"source": "lint", "rule": "truncated", "layer": null, "layerName": "", "time": lint["lintedUntil"], "until": end, "message": w, "fix": lint.get("next").map(|n| json!({"command": "render.lint", "params": n})).unwrap_or(Value::Null)}));
+    }
     let stale: Vec<String> = s.client.clone().map(|me| stale_layers(s, &me).into_iter().map(|(_, n)| n).collect()).unwrap_or_default();
     let ready = blocking.is_empty() && stale.is_empty();
     let (nb, nw) = (blocking.len(), warnings.len());

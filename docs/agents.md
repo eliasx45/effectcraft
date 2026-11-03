@@ -362,7 +362,10 @@ refactor that should change nothing gives `pass: true` with `psnr_db: "inf"`.
 `lint_frame` (engine command `render.lint`) checks a comp the way a designer would glance at it
 and lists what is wrong, in words an agent can act on. Run it before calling a design done:
 `lint_frame {}` checks the current frame, `lint_frame {"start":0,"end":5}` samples every 0.5 s
-(`step`) plus each layer's in point and keyframe time (at most 120 samples, else `truncated: true`).
+(`step`) plus each layer's in point and keyframe time. Every sample is linted, at most 1000 per call
+(about 33 s at one sample per frame); a longer range is linted from its start up to there (never
+thinned) and the reply has `truncated: true`, `clean: false`, a `warning` naming what wasn't checked
+and `next`, the params that lint the rest: repeat with each `next` until there is none.
 By default only `text-off-centre`, `exposed-edge` and `exit-at-cut` run (all warnings; 2 Nov 2026:
 the others are off until an experiment decides which return). `rules: "all"` or a list of rule ids
 (`"default"` adds those three) turns the others on; info lines show only with `verbose: true`.
