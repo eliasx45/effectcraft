@@ -141,6 +141,39 @@ fn nested_svg_percentages_use_the_nearest_viewport() {
     assert_eq!(px(&img, 55, 65)[3], 0.0);
 }
 
+/// A viewBox maps to the viewport as browsers draw it: its origin is subtracted, `meet` centres it
+/// (or `xMin`/`slice` as asked), and artwork outside the viewBox but inside the viewport stays
+/// visible. Illustrator/Inkscape logos (TD Bank: viewBox `-119 -106.5 360 250` in a 3.3:1 viewport)
+/// draw well past their viewBox and only show whole because of that letterboxing; a viewBox padded
+/// around the real artwork places it inside the padding.
+#[test]
+fn viewbox_origin_and_padding_map_like_browsers() {
+    let alpha = |svg: &str, x: u32, y: u32| {
+        let d = parse(svg.as_bytes()).unwrap();
+        let (w, h) = d.pixel_size();
+        px(&rasterize(&d, w, h, 1.0), x, y)[3]
+    };
+    // Non-zero origin, 2:1 viewBox in a 4:1 viewport: scale 1, centred 100 px right, so user x maps
+    // to x + 200 and y to y + 50. The rect left of the viewBox (user x -180..-120) is still drawn.
+    let shifted = r#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100" viewBox="-100 -50 200 100">
+        <rect x="-180" y="-40" width="60" height="80"/><rect x="0" y="0" width="20" height="20"/></svg>"#;
+    assert_eq!(alpha(shifted, 50, 50), 1.0, "artwork outside the viewBox, inside the viewport");
+    assert_eq!(alpha(shifted, 210, 60), 1.0, "user (10, 10)");
+    assert_eq!(alpha(shifted, 190, 60), 0.0);
+    assert_eq!(alpha(shifted, 10, 50), 0.0, "left of the artwork");
+    // xMinYMin: no centring offset, user x maps to x + 100.
+    let xmin = shifted.replace("viewBox=", "preserveAspectRatio=\"xMinYMin meet\" viewBox=");
+    assert_eq!(alpha(&xmin, 110, 60), 1.0);
+    assert_eq!(alpha(&xmin, 210, 60), 0.0);
+    // Padded square viewBox around artwork at user -100..100 × -50..50, drawn at 3x (width 900):
+    // the artwork lands at (50..250) × (100..200) × 3, with the padding empty and nothing cut.
+    let padded = r#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="900" viewBox="-150 -150 300 300">
+        <rect x="-100" y="-50" width="200" height="100"/></svg>"#;
+    for (x, y, a) in [(152, 302, 1.0), (748, 598, 1.0), (450, 450, 1.0), (148, 450, 0.0), (752, 450, 0.0), (450, 298, 0.0), (450, 602, 0.0)] {
+        assert_eq!(alpha(padded, x, y), a, "padded viewBox at ({x}, {y})");
+    }
+}
+
 #[test]
 fn non_finite_viewboxes_do_not_panic_or_produce_nan_geometry() {
     for attrs in ["viewBox=\"0 0 1e400 100\"", "viewBox=\"0 0 100 1e400\"", "viewBox=\"-1e400 0 100 100\""] {
