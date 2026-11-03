@@ -65,6 +65,10 @@ pub struct Task {
     started: web_time::Instant,
     result: Arc<Mutex<Option<Result<Apply, String>>>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The control-channel client that started it (`None`: the user). Its apply runs as that
+    /// client, as the starting command did: the undo step and edit feed are the client's and the
+    /// selection it sets is the client's cursor, not the user's.
+    client: Option<String>,
 }
 
 /// A finished job (kept for the Progress panel and agents).
@@ -143,7 +147,8 @@ impl Session {
         } else {
             Some(std::thread::Builder::new().name(format!("task-{kind}")).spawn(run).map_err(|e| crate::EngineError::Other(e.to_string()))?)
         };
-        self.tasks.push(Task { id, kind, label, ctl, started: web_time::Instant::now(), result, thread });
+        let client = self.client.clone();
+        self.tasks.push(Task { id, kind, label, ctl, started: web_time::Instant::now(), result, thread, client });
         if wait {
             let rec = self.finish_task(self.tasks.len() - 1);
             return match rec.status.as_str() {
@@ -163,7 +168,7 @@ impl Session {
         let cancelled = t.ctl.cancelled();
         let mut quiet = false;
         let (status, message, result) = match r {
-            Some(Ok(apply)) if !cancelled => match apply(self) {
+            Some(Ok(apply)) if !cancelled => match self.apply_as(t.client.take(), apply) {
                 // A task may say how it went (`toast`: "Imported 3 items"), or that it finished
                 // quietly (`quiet`: an agent's render).
                 Ok(mut v) => {
@@ -200,6 +205,18 @@ impl Session {
             self.job_log.remove(0);
         }
         rec
+    }
+
+    /// Run a finished task's apply as the client that started it. A task started by an agent
+    /// usually finishes later, on the frame loop (`poll_jobs`) where no client runs, so without
+    /// this its edit was the user's and moved the user's selection (`file.importProject` from
+    /// the control channel, which runs it with `wait: false`). Inline (`wait: true`) the client
+    /// is already in place.
+    fn apply_as(&mut self, client: Option<String>, apply: Apply) -> crate::Result<Value> {
+        match client {
+            Some(c) if self.client.as_deref() != Some(c.as_str()) => crate::agents::run_as(self, c, apply),
+            _ => apply(self),
+        }
     }
 
     /// Apply finished tasks. Frontends call this every frame while [`Session::tasks`] is not empty.

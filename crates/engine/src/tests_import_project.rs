@@ -223,3 +223,45 @@ fn opening_project_anchors_relative_footage_sequences_and_proxies() {
     assert_eq!(f.path, absolute);
     assert!(!opened.is_dirty());
 }
+
+/// Regression (3 Nov 2026): an agent's `file.importProject` over the control channel (which runs
+/// it with `wait: false` and replies when the job ends) was applied on the frame loop with no
+/// client: the undo step and edit feed said "user" and the imported folder became the user's
+/// Project panel selection. The apply runs as the client that started it.
+#[test]
+fn an_agents_import_is_the_agents_step_and_leaves_the_users_selection() {
+    let dir = out_dir("import-project-client");
+    let path = source_project(&dir);
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Host"})).unwrap();
+    let host = s.active_comp_id().unwrap();
+    s.state.project_selection = vec![host];
+    // As the control channel runs it: no `wait`, so `wait: false` and a job to wait for.
+    let started = crate::job_waiter::start(&mut s, "file.importProject", json!({"path": path, "client": "agent-import"})).unwrap();
+    assert!(matches!(started, crate::job_waiter::Started::Waiting(_)), "the import runs as a job");
+    // The job finishes on the frame loop, where no client runs.
+    s.wait_jobs();
+    assert!(s.client.is_none());
+    let rec = s.job_log.last().unwrap();
+    assert_eq!(rec.status, "done", "{}", rec.message);
+    let folder = ItemId(rec.result["folder"].as_u64().unwrap());
+    assert!(s.project.item(folder).is_some());
+    // The step is the agent's in the undo history and the edit feed.
+    assert_eq!(s.history.author(&s.project), Some("agent-import"));
+    let last = s.feed.since(0).last().unwrap();
+    assert_eq!(last.label, "Import Project");
+    assert_eq!(last.client.as_deref(), Some("agent-import"));
+    // The user's selection stays; the folder is selected in the agent's own cursor.
+    assert_eq!(s.state.project_selection, vec![host]);
+    assert_eq!(s.cursors.get("agent-import").unwrap().project_selection, vec![folder]);
+    // The agent can undo its own step.
+    s.execute_checked("edit.undo", json!({"client": "agent-import"})).unwrap();
+    assert!(s.project.item(folder).is_none());
+    // The user's own background import is still the user's.
+    let started = s.execute("file.importProject", json!({"path": path, "wait": false})).unwrap();
+    assert!(started["job"].is_string());
+    s.wait_jobs();
+    let folder = ItemId(s.job_log.last().unwrap().result["folder"].as_u64().unwrap());
+    assert_eq!(s.history.author(&s.project), None);
+    assert_eq!(s.state.project_selection, vec![folder]);
+}
