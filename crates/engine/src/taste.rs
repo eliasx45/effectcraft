@@ -733,7 +733,7 @@ fn out_of_frame(ctx: &EvalCtx, l: &Layer, ct: Tick, past_cut: bool) -> Option<bo
         let Some(polys) = content_polys(&c, x, 0, &mut budget) else { continue };
         measured = true;
         // What a matte hides isn't on screen (a slide inside a pill window, a rise from behind a line).
-        let matte = x.track_matte.filter(|m| matches!(m.kind, MatteKind::Alpha | MatteKind::Luma)).and_then(|m| ctx.comp.layer(m.layer)).and_then(|m| quad(m));
+        let matte = x.track_matte.filter(|m| matches!(m.kind, MatteKind::Alpha | MatteKind::Luma)).and_then(|m| ctx.comp.layer(m.layer)).and_then(quad);
         for poly in polys {
             let mut seen = crate::layout::clip_convex(&poly, &frame);
             if let Some(m) = &matte {

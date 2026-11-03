@@ -102,7 +102,8 @@ impl Feed {
         if self.entries.iter().skip(start).any(|e| e.client.as_deref() != client) {
             return;
         }
-        let last = self.entries.pop_back().expect("an entry from start on");
+        // `start` was found in the entries, so there is one to pop; never panic on a broken feed.
+        let Some(last) = self.entries.pop_back() else { return };
         self.entries.truncate(start);
         self.entries.push_back(Entry { revision: last.revision, client: last.client, label: label.to_string(), before: snap.clone(), after: last.after });
     }
