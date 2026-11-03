@@ -29,8 +29,8 @@
 //! carries the reference editor's fitted ease per move ([`effectcraft_project::rebuild`],
 //! `taste.rebuild`). Each move with that evidence is judged against it instead: ✅ when its ease
 //! matches the reference fit within the rebuild's tolerance, ❌ (blocking) when it drifted, 🟡
-//! when it matches but the fit itself is loose ([`LOOSE_FIT`]); the profile's verdict is kept as
-//! info ([`RefJudged`]). Moves without evidence are judged as usual. A move whose ease came from a
+//! when it matches but the fit itself is loose ([`LOOSE_FIT`], unless within [`LOOSE_FIT_PX`]);
+//! the profile's verdict is kept as info ([`RefJudged`]). Moves without evidence are judged as usual. A move whose ease came from a
 //! reference (its layer's or comp's comment carries [`REFERENCE_TAG`], or rebuild evidence) also
 //! says which profile curve has its shape and that curve's status ([`EaseSource`]): the ⏳
 //! candidates `taste.rebuild` files from reference eases, which join the profile once Elias
@@ -1234,6 +1234,9 @@ pub const REFERENCE_TAG: &str = "reference ease";
 /// A reference fit looser than this (RMS, % of the move's travel) is weak evidence: a move
 /// matching it is 🟡, not ✅.
 pub const LOOSE_FIT: f64 = 10.0;
+/// A fit within this many pixels (RMS, a px fit) is never loose: on a tiny move (≤ ~20 px) the
+/// measurement's own noise is more than 10 % of the travel.
+pub const LOOSE_FIT_PX: f64 = 2.0;
 
 /// Whether a comment carries [`REFERENCE_TAG`] (any case).
 pub fn tagged(comment: &str) -> bool {
@@ -1356,6 +1359,7 @@ fn against_reference(profile: &Profile, rb: &Rebuild, n: usize, ev: &RefMove, dv
     let gap = distance(ease, fitted);
     let fit = ev.fit.clone().filter(|f| f.rms.is_finite() && f.rms >= 0.0);
     let fit_pct = fit.as_ref().map(|f| if f.unit.trim() == "%" { f.rms } else { f.rms / dv.abs().max(1e-9) * 100.0 });
+    let px_tight = fit.as_ref().is_some_and(|f| f.unit.trim() != "%" && f.rms <= LOOSE_FIT_PX);
     let fit_words = fit.as_ref().map(|f| format!("; fit RMS {:.1} {}", f.rms, if f.unit.trim() == "%" { "%" } else { f.unit.trim() })).unwrap_or_default();
     let info = if j.problems.is_empty() {
         format!("Elias's profile (info only): {} in his ranges", j.verdict.mark())
@@ -1377,7 +1381,7 @@ fn against_reference(profile: &Profile, rb: &Rebuild, n: usize, ev: &RefMove, dv
     };
     if gap <= tolerance {
         j.blocking = false;
-        match fit_pct.filter(|p| *p > LOOSE_FIT) {
+        match fit_pct.filter(|p| *p > LOOSE_FIT && !px_tight) {
             Some(p) => {
                 j.verdict = Verdict::Close;
                 j.message = format!(

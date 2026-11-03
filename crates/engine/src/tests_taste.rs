@@ -781,3 +781,25 @@ fn the_handover_range_is_every_move_not_only_the_problems() {
     let h = s.execute_checked("handover.check", json!({})).unwrap();
     assert_eq!(h["range"], json!({"start": 1.0, "end": 3.5}), "{h:#}");
 }
+
+#[test]
+fn a_tiny_rebuild_move_fitted_within_two_px_is_not_loose() {
+    // A 15 px nudge: a 2 px RMS fit is 13 % of the travel (loose by %), but tight in pixels.
+    let (mut s, cid, l) = comp();
+    key(&mut s, l, "transform/position", 1.0, json!([700.0, 540.0]));
+    key(&mut s, l, "transform/position", 1.0 + 20.0 / 30.0, json!([715.0, 540.0]));
+    ease(&mut s, cid, l, "transform/position", 0, (0.0, 20.0), (0.0, 75.0));
+    let mark = |s: &mut Session, rms: f64| {
+        s.execute_checked(
+            "taste.rebuild",
+            json!({"reference": "/refs/kunal/TR.mp4", "name": "kunal TR", "replace": true,
+                   "moves": [{"layer": "Card", "path": "layer/transform/position", "frame": 30, "graph": "free:0.20:0.75",
+                              "fit": {"rms": rms, "unit": "px"}}]}),
+        )
+        .unwrap();
+    };
+    mark(&mut s, 2.0);
+    assert_eq!(only(&check(&mut s), "transform/position")["verdict"], "approved");
+    mark(&mut s, 3.0);
+    assert_eq!(only(&check(&mut s), "transform/position")["verdict"], "close");
+}
