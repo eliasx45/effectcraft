@@ -271,7 +271,16 @@ pub fn tools(host: &mut dyn TimelineHost, ui: &mut egui::Ui, map: ViewerMap, opt
     let over_vertex = hover.is_some_and(|h| vertex_at(&hits, h, true).or_else(|| vertex_at(&hits, h, false)).is_some());
     let over_key = hover.is_some_and(|h| key_hits.iter().any(|k| k.pos.distance(h) < 6.0));
     let over_guide = hover.and_then(|h| vt::guide_at(host, &comp, &map, h));
-    let held = ctx.input(|i| i.pointer.any_down()) && ui.ctx().is_being_dragged(opts.id);
+    // A press that began on the picture keeps it until release, also before egui calls it a drag
+    // (a pointer just past a vertex's grab radius but not yet past the click distance would
+    // otherwise drop the press, and the drag never starts).
+    let press_id = opts.id.with("press");
+    let down = ctx.input(|i| i.pointer.any_down());
+    let pressed_here = down && ui.data(|d| d.get_temp::<bool>(press_id)).unwrap_or(false);
+    if !down {
+        ui.data_mut(|d| d.remove::<bool>(press_id));
+    }
+    let held = down && (ui.ctx().is_being_dragged(opts.id) || pressed_here);
     out.owns = !opts.space_pan
         && (tool != Tool::Selection
             || gesture.is_some()
@@ -288,6 +297,9 @@ pub fn tools(host: &mut dyn TimelineHost, ui: &mut egui::Ui, map: ViewerMap, opt
         return out;
     }
     let resp = ui.interact(map.area, opts.id, Sense::click_and_drag());
+    if resp.is_pointer_button_down_on() {
+        ui.data_mut(|d| d.insert_temp(press_id, true));
+    }
     if resp.hovered() || resp.dragged() {
         let icon = match over_guide {
             Some((_, true)) if tool == Tool::Selection => CursorIcon::ResizeHorizontal,
@@ -778,7 +790,9 @@ mod tests {
         let (mut h, _, _) = mini();
         let ctx = ctx();
         let key = |h: &mut Mini, key: egui::Key, modifiers: egui::Modifiers| {
-            let input = egui::RawInput { events: vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }], ..Default::default() };
+            // Pressed and released: a press of a key still down is a repeat, which shortcuts ignore.
+            let events = [true, false].map(|pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }).into();
+            let input = egui::RawInput { events, ..Default::default() };
             ctx.run_ui(input, |ui| {
                 crate::panels::timeline::keys::forward_shortcuts(h, ui.ctx(), crate::dock::PanelKind::Timeline);
             })
