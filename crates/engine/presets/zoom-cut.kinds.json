@@ -36,8 +36,8 @@
     "z": "Z05",
     "who": "Moon Edits",
     "where": "0:09.67",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/05-moon-cut-zoomout-expo.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/05-moon-cut-zoomout-expo.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
    },
    "fps": "30",
    "cutFrame": 21,
@@ -102,8 +102,8 @@
     "z": "Z01",
     "who": "Kallaway",
     "where": "“I Blew Up” 0:36.62",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/01-kallaway-cut-zoomout-blur.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/01-kallaway-cut-zoomout-blur.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
    },
    "fps": "24000/1001",
    "cutFrame": 17,
@@ -193,8 +193,8 @@
     "z": "Z06",
     "who": "Moon Edits",
     "where": "1:00.27",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/06-moon-cut-pushin.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/06-moon-cut-pushin.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
    },
    "fps": "30",
    "cutFrame": 21,
@@ -265,8 +265,8 @@
     "z": "Z07",
     "who": "Ibrahim",
     "where": "0:15.00",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/07-ibrahim-zoomout-into-frame.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/07-ibrahim-zoomout-into-frame.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
    },
    "fps": "60000/1001",
    "cutFrame": 42,
@@ -365,8 +365,8 @@
     "z": "Z11",
     "who": "Andrew Nayebyan",
     "where": "0:24.58",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/refclips/11-nayebyan-card.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/refclips/11-nayebyan-card.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
    },
    "fps": "24",
    "cutFrame": 17,
@@ -455,8 +455,8 @@
     "z": "Z12",
     "who": "Andrew Nayebyan",
     "where": "1:02.38",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/refclips/12-nayebyan-map.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/refclips/12-nayebyan-map.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
    },
    "fps": "24",
    "cutFrame": 17,
@@ -554,8 +554,8 @@
     "z": "Z02",
     "who": "Kallaway",
     "where": "“90 days” 0:04.59",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/02-kallaway-zoom-through-cut.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/02-kallaway-zoom-through-cut.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
    },
    "fps": "24000/1001",
    "cutFrame": 18,
@@ -683,8 +683,8 @@
     "z": "Z03",
     "who": "Raijin",
     "where": "0:33.07",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/03-raijin-stretch-zoom-through.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/03-raijin-stretch-zoom-through.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
    },
    "fps": "30000/1001",
    "cutFrame": 22,
@@ -832,8 +832,8 @@
     "z": "Z04",
     "who": "Moon Edits",
     "where": "0:39.97",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/04-moon-matched-zoomout-blur.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/04-moon-matched-zoomout-blur.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
    },
    "fps": "30",
    "cutFrame": 28,
@@ -983,8 +983,8 @@
     "z": "Z08",
     "who": "Yung Siege",
     "where": "1:22.64",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/08-yungsiege-punch-jumpcut.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/08-yungsiege-punch-jumpcut.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
    },
    "fps": "25",
    "cutFrame": 21,
@@ -1089,8 +1089,8 @@
     "z": "Z09",
     "who": "Markov",
     "where": "0:04.62",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/09-markov-flash-zoom.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/C-flash/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/09-markov-flash-zoom.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/C-flash/scripts/build.jsx"
    },
    "fps": "24",
    "cutFrame": 16,
@@ -1245,8 +1245,8 @@
     "z": "Z10",
     "who": "Raijin",
     "where": "0:08.24",
-    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/10-raijin-white-flash-zoom.mp4",
-    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/C-flash/scripts/build.jsx"
+    "video": "The Vault/Rebuilds/hf-demos/zoom-research/clips/10-raijin-white-flash-zoom.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/zoom-versions/C-flash/scripts/build.jsx"
    },
    "fps": "30000/1001",
    "cutFrame": 21,
