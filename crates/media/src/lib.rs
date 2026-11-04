@@ -31,6 +31,7 @@ mod probe;
 pub mod prores_enc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy_build;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod proxy_h264;
 mod recycle;
 mod stream;

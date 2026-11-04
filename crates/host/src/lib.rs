@@ -23,6 +23,8 @@ impl Importer for MediaImporter {
     fn hardware_refuses(&self, footage: &Footage) -> bool {
         effectcraft_media::hw::refuses(&footage.codec, footage.width, footage.height)
     }
+    // Proxies are written to disk with threads: not in the browser (the trait's default refuses).
+    #[cfg(not(target_arch = "wasm32"))]
     fn build_proxy(&self, src: &str, out: &str, width: u32, height: u32, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<(), String> {
         let cancel = std::sync::atomic::AtomicBool::new(false);
         effectcraft_media::proxy_h264::build(src, std::path::Path::new(out), width, height, &cancel, &mut |d, t| {
