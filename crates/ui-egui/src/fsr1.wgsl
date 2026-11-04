@@ -215,6 +215,8 @@ fn rcas(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lobe_rgb = max(-hit_min, hit_max);
     let lobe = max(-RCAS_LIMIT, min(max(lobe_rgb.r, max(lobe_rgb.g, lobe_rgb.b)), 0.0)) * RCAS_SHARP;
     let rcp_l = 1.0 / (4.0 * lobe + 1.0);
-    let pix = (lobe * (b + d + h + f) + e) * rcp_l;
+    // Kept within the cross's range: an edge never rings past its two sides (the lobe limit
+    // alone only keeps 0..1; on Metal an edge's dark side came out 2 levels darker).
+    let pix = clamp((lobe * (b + d + h + f) + e) * rcp_l, min(mn4, e), max(mx4, e));
     textureStore(dst, p, vec4<f32>(min(saturate(pix), vec3<f32>(e4.a)), e4.a));
 }
