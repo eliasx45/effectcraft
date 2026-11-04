@@ -18,7 +18,7 @@ use effectcraft_engine::commands::annotate::{Mark, Tool, bbox};
 use effectcraft_engine::project::Comp;
 use effectcraft_engine::time::Tick;
 use egui::emath::TSTransform;
-use egui::{Color32, CornerRadius, Key, Modifiers, Pos2, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Color32, CornerRadius, Key, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
 use super::viewer::ViewerMap;
@@ -422,7 +422,7 @@ pub fn mark_box(
     let mut result = None;
     let text_id = egui::Id::new("viewer-annotate-note");
     // Enter adds (Shift+Enter is the field's new line), taken before the field sees it.
-    if ctx.memory(|m| m.has_focus(text_id)) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+    if ctx.memory(|m| m.has_focus(text_id)) && ctx.input_mut(take_plain_enter) {
         result = Some(true);
     }
     let card_bg = Color32::from_rgb(0x1f, 0x20, 0x23);
@@ -445,6 +445,15 @@ pub fn mark_box(
     ctx.data_mut(|m| m.insert_temp(size_id, shown.response.rect.size()));
     auto.add("viewer.annotate.box", shown.response.rect, if d.tool == Tool::Pen { "Drawing" } else { "Comment" });
     result
+}
+
+/// Takes a plain Enter press (no modifier on the key event). `consume_key(Modifiers::NONE, …)`
+/// matches leniently (Shift or Alt held still match), which made Shift+Enter add the note
+/// instead of breaking its line.
+fn take_plain_enter(i: &mut egui::InputState) -> bool {
+    let before = i.events.len();
+    i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.is_none()));
+    i.events.len() != before
 }
 
 /// The Pen bar's row height (its send button's size): every item is centred on it.
@@ -601,6 +610,7 @@ fn comment_card(ui: &mut egui::Ui, _t: &Tokens, d: &mut Draft, text_id: egui::Id
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::Modifiers;
 
     #[test]
     fn boxes_pop_in_and_out() {
@@ -641,6 +651,23 @@ mod tests {
         // Release: its position is the last sample, later moves are hover.
         let ev = vec![egui::Event::PointerMoved(pos2(4.0, 0.0)), press(6.0, 0.0, false), egui::Event::PointerMoved(pos2(50.0, 0.0))];
         assert_eq!(drag_samples(&ev), vec![pos2(4.0, 0.0), pos2(6.0, 0.0)]);
+    }
+
+    fn enter_taken(modifiers: Modifiers) -> bool {
+        let ctx = egui::Context::default();
+        let key = egui::Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers };
+        let input = egui::RawInput { events: vec![key], ..Default::default() };
+        let mut taken = false;
+        let mut out = ctx.run_ui(input, |ui| taken = ui.ctx().input_mut(take_plain_enter));
+        out.textures_delta.clear();
+        taken
+    }
+
+    #[test]
+    fn enter_adds_but_shift_enter_is_left_for_the_new_line() {
+        assert!(enter_taken(Modifiers::NONE));
+        assert!(!enter_taken(Modifiers::SHIFT), "Shift+Enter must reach the field (a new line)");
+        assert!(!enter_taken(Modifiers::ALT));
     }
 
     #[test]
