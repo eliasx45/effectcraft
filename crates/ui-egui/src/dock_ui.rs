@@ -291,11 +291,12 @@ impl EffectcraftApp {
         let mut dock = match maximized {
             Some(m) => {
                 // The whole panel group fills the area, its tabs too, so the other panels of the
-                // group stay one click away; the group's shown tab is the maximized panel.
-                let (panels, active) = self.ui.dock.group_of(m).filter(|_| !self.ui.maximized_solo).unwrap_or((vec![m], 0));
-                if let Some(shown) = panels.get(active).copied().filter(|q| *q != m) {
-                    self.ui.maximized = Some(shown);
-                }
+                // group stay one click away; the shown tab is the maximized panel (a tab click or
+                // show_panel in the group moves the maximize to its panel). Not the group's own
+                // shown panel: a stack's is its first open entry (Maximize on Properties showed
+                // Preview).
+                let (panels, _) = self.ui.dock.group_of(m).filter(|_| !self.ui.maximized_solo).unwrap_or((vec![m], 0));
+                let active = panels.iter().position(|q| *q == m).unwrap_or(0);
                 DockNode::Tabs { panels, active, small: self.ui.dock.small_tabs(m).unwrap_or(false) }
             }
             None => std::mem::replace(&mut self.ui.dock, DockNode::Tabs { panels: vec![], active: 0, small: false }),
@@ -380,6 +381,9 @@ impl EffectcraftApp {
         for a in actions {
             match a {
                 DockAction::Activate(p) => {
+                    if self.group_maximized(p) {
+                        self.ui.maximized = Some(p);
+                    }
                     let _ = self.dock_command(&ctx, Action::Activate { panel: p });
                 }
                 DockAction::ToggleStacked(p) => {
@@ -409,6 +413,9 @@ impl EffectcraftApp {
                 }
                 // The Timeline's comp tabs: show that comp / close its Timeline.
                 DockAction::ActivateDoc(p, id) => {
+                    if self.group_maximized(p) {
+                        self.ui.maximized = Some(p);
+                    }
                     let _ = self.dock_command(&ctx, Action::Activate { panel: p });
                     if self.session.state.active_comp.map(|c| c.0) != Some(id) {
                         let _ = crate::menus::invoke(self, &ctx, "comp.open", serde_json::json!({"comp": id}));

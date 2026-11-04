@@ -980,6 +980,10 @@ impl EffectcraftApp {
             self.os_windows.raise = Some(f.id);
         }
         self.raise_panel(p);
+        // Inside the maximized group, the maximize moves to it (its tab shows).
+        if self.group_maximized(p) {
+            self.ui.maximized = Some(p);
+        }
         self.ui.focused = p;
     }
 

@@ -756,3 +756,20 @@ fn maximizing_a_panel_keeps_its_groups_tabs_switchable() {
     h.state_mut().toggle_maximize(PanelKind::Project);
     assert_eq!(h.state().ui.maximized, None, "restored from any tab of the group");
 }
+
+/// Maximizing a panel of a stacked group shows that panel, not the stack's first open one (the
+/// night run, 4 Nov 2026: Maximize on Properties in the default right-hand stack showed Preview).
+#[test]
+fn maximizing_a_stacked_panel_shows_that_panel() {
+    let mut h = harness();
+    assert!(h.state().ui.dock.is_stacked(PanelKind::Properties), "Properties is in the default stack");
+    let (group, shown, _) = h.state().panel_group(PanelKind::Properties).expect("Properties is docked");
+    assert_ne!(group.get(shown), Some(&PanelKind::Properties), "the stack shows another panel first");
+    h.state_mut().toggle_maximize(PanelKind::Properties);
+    h.run_steps(3);
+    assert_eq!(h.state().ui.maximized, Some(PanelKind::Properties));
+    let other = group.iter().copied().find(|p| *p != PanelKind::Properties).expect("the stack has other panels");
+    h.state_mut().show_panel(other);
+    h.run_steps(3);
+    assert_eq!(h.state().ui.maximized, Some(other), "show_panel in the maximized group moves the maximize");
+}
