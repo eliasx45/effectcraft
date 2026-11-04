@@ -127,7 +127,7 @@ fn yuv420(f: &VideoFrame, w: u32, h: u32) -> Result<([Vec<u8>; 3], bool)> {
                 return Err(MediaError::Decode("proxy: short RGBA frame".into()));
             }
             let (mut y, mut cb, mut cr) = (vec![0u8; sw * sh], vec![0u8; sw * sh], vec![0u8; sw * sh]);
-            for (i, px) in rgba.chunks_exact(4).take(sw * sh).enumerate() {
+            for (i, px) in rgba.as_chunks::<4>().0.iter().take(sw * sh).enumerate() {
                 let (r, g, b) = (f32::from(px[0]) / 255.0, f32::from(px[1]) / 255.0, f32::from(px[2]) / 255.0);
                 let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
                 y[i] = (16.0 + 219.0 * l).round().clamp(0.0, 255.0) as u8;
@@ -155,7 +155,7 @@ pub fn build(src: &str, out: &Path, width: u32, height: u32, cancel: &AtomicBool
     let (source, _) = crate::open::open_source(src, None)?;
     let info = source.info();
     let v = info.video.as_ref().ok_or_else(|| MediaError::Unsupported(format!("{src}: no video")))?;
-    if width < 16 || height < 16 || width % 2 != 0 || height % 2 != 0 || width > v.width.max(16) || height > v.height.max(16) {
+    if width < 16 || height < 16 || !width.is_multiple_of(2) || !height.is_multiple_of(2) || width > v.width.max(16) || height > v.height.max(16) {
         return Err(MediaError::Unsupported(format!("proxy size {width}×{height} for a {}×{} movie", v.width, v.height)));
     }
     let (wq, hq) = (
