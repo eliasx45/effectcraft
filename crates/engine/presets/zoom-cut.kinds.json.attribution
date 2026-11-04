@@ -1,0 +1,7 @@
+asset:        zoom-cut.kinds.json
+title:        Zoom-cut transition kinds (kick, blur-settle, push-in, into-window, twos-card, twos-push, zoom-through, whip, zoom-out-through, punch, flash, white-flash): the numbers behind Animation ▸ Transitions ▸ Zoom Cut (transition.apply)
+author:       Elias (eliasx45)
+source:       original work (copied from Elias's motion-kit repo, shelf/transitions/zoom-cut.kinds.json, commit daa7b61, sha256 bf23f3f9c98b16a9…)
+license:      MIT OR Apache-2.0
+added:        2026-11-04 by eliasx45 (Claude Code agent, ZC1)
+notes:        Plain data: key times, values, ease names and effect settings Elias measured on published editors' cuts (timings and scales only, no footage or artwork) and approved on 4 Nov 2026. The source of truth is motion-kit's shelf table; this is a copy, read by crates/engine/src/commands/transition.rs with include_str!. Re-copy it (cp ~/Developer/motion-kit/shelf/transitions/zoom-cut.kinds.json here) whenever the shelf table changes; never edit it here.

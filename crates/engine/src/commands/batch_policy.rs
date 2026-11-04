@@ -148,6 +148,9 @@ pub fn atomic_supported(id: &str) -> bool {
         "layer.cascade",
         "card.make",
         "card.style",
+        // ZC1: document edits and nested document commands (precompose, new solids/shapes,
+        // masks, arrange, timing, blend mode), no files, prefs or network.
+        "transition.apply",
     ];
     const CURSOR: &[&str] = &[
         "time.set",
@@ -193,6 +196,7 @@ pub fn atomic_supported(id: &str) -> bool {
         "script.get",
         "card.styles",
         "graph.links",
+        "transition.kinds",
     ];
     DOCUMENT.contains(&id) || CURSOR.contains(&id) || INSPECTION.contains(&id)
 }

@@ -86,6 +86,8 @@ Screenshots of EffectCraft itself, rendered headlessly, showing only procedurall
   and checks, pulse rings, bokeh, light sweep): `crates/engine/presets/backgrounds.json` (sidecar `.attribution`).
 - Behaviors animation presets (22: wiggle, shake, float, orbit, bounce, drift, pendulum, spin, pulse, heartbeat, blink, strobe, flicker):
   `crates/engine/presets/behaviors.json` (sidecar `.attribution`).
+- Zoom-cut transition kinds (12 zoom cuts for Animation ▸ Transitions ▸ Zoom Cut, `transition.apply`; Elias's measured
+  data, copied from his motion-kit shelf): `crates/engine/presets/zoom-cut.kinds.json` (sidecar `.attribution`).
 - Sample scripts (File ▸ Scripts) and ScriptUI panel: `crates/engine/scripts/Rename Layers.jsx`,
   `crates/engine/scripts/Sort Layers by In Point.jsx`, `crates/engine/scripts/Create Null at Selected Layers.jsx`,
   `crates/engine/scripts/Render Queue Batch.jsx`, `crates/engine/scripts/ScriptUI Panels/Layer Tools.jsx`

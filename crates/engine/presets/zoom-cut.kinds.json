@@ -1,0 +1,1528 @@
+{
+ "about": "zoom-cut kinds: the numbers behind every version of the zoom-cut transition (motion-kit shelf/transitions/zoom-cut.jsx; EffectCraft transition.apply reads the same file). Measured on real editors' cuts (Rebuilds/hf-demos/zoom-research) and rebuilt in Rebuilds/hf-demos/zoom-versions (approved by Elias 4 Nov 2026). Plain data, no code.",
+ "schema": {
+  "time": "every t / in / out / land is SECONDS relative to the cut (the new layer's first frame); a caller snaps at + t to its comp's frames (round). One exception: an OLD-layer key at -1 reference frame or later (before the cut) goes on the last frame before the cut at any fps (a Launch out's peak on the last old frame; in seconds it would land 2 frames early at 60 fps and freeze that frame)",
+  "fps / cutFrame / frames": "the reference's frame rate (exact, as a fraction string), the cut's frame index and the length of the approved demo comp",
+  "layers": "old (outgoing shot), new (incoming shot) or window (into-window's window precomp): rest = the scale % the layer rests at; effects in stack order, each {name (the layer gets 'ZoomCut <kind> <name>'), effect id, set {param: value}, keys {param: track}, centre?}",
+  "track": "{t: [s], v: [values], ease: [one per segment: a Graph name | 'linear' | {out, in} custom influence % | {outSpeed, outInfluence, inSpeed, inInfluence} units/s], zoom? (a scale: multiplied by restScale / rest), offset? (a position added to the zoom centre), steps? ('twos': holds every 2 comp frames, phase: the cut shows the frame before it), fit? (evidence)}",
+  "centre": "the Transform effect's anchor = position, in px of a 1920x1080 layer (scaled to the layer's real size); default [960, 540]",
+  "restLayer": "the layer restScale overrides (default new)",
+  "comp": "comp settings the version needs (motion blur samples for the Transform shutter): raised, never lowered",
+  "overlays": "extra layers: solid / light (solid + Gradient Ramp) / adjustment, placed above 'new' or above both shots ('top'), px of a 1920x1080 comp",
+  "colours": "#rrggbb",
+  "energy": "calm | medium | high",
+  "land": "when the move has settled (s after the cut): the <id>-land hit",
+  "demo": "the approved demo's footage: old/new 'from' = source seconds shown at the layer's in-point, old 'in' = its in-point in reference frames from comp start; top = which shot is above"
+ },
+ "default": "kick",
+ "order": [
+  "kick",
+  "blur-settle",
+  "push-in",
+  "into-window",
+  "twos-card",
+  "twos-push",
+  "zoom-through",
+  "whip",
+  "zoom-out-through",
+  "punch",
+  "flash",
+  "white-flash"
+ ],
+ "kinds": {
+  "kick": {
+   "title": "Kick settle",
+   "reference": {
+    "z": "Z05",
+    "who": "Moon Edits",
+    "where": "0:09.67",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/05-moon-cut-zoomout-expo.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+   },
+   "fps": "30",
+   "cutFrame": 21,
+   "frames": 59,
+   "energy": "medium",
+   "land": 1.266667,
+   "looks": "The cut lands 245 % zoomed in, the next frame jumps to 190 % (one frame covers a third), then a long Expo Out settle to rest (~1.3 s). No blur.",
+   "use": "The default cut between two talking-head shots that needs a small punch: a topic change, the next point of a list.",
+   "layers": {
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          0.0,
+          0.033333,
+          1.333333
+         ],
+         "v": [
+          244.6,
+          189.8,
+          100
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)",
+          "Expo Out 1 (Elias)"
+         ],
+         "zoom": true,
+         "fit": {
+          "rms": 1.5,
+          "unit": "%",
+          "note": "measure.py → fit2.py, f1–f38, Expo Out 1 f1 → f40"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0,
+     "in": 0
+    },
+    "new": {
+     "from": 0
+    },
+    "top": "new"
+   }
+  },
+  "blur-settle": {
+   "title": "Blur settle",
+   "reference": {
+    "z": "Z01",
+    "who": "Kallaway",
+    "where": "“I Blew Up” 0:36.62",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/01-kallaway-cut-zoomout-blur.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+   },
+   "fps": "24000/1001",
+   "cutFrame": 17,
+   "frames": 47,
+   "energy": "medium",
+   "land": 1.084417,
+   "looks": "The cut lands on the new shot 3.5x zoomed in and heavily blurred; it pulls back to rest over ~1.1 s while the blur clears (sharp by ~1.1 s).",
+   "use": "A new topic or a reveal that should feel soft but big: the first shot of a new section, a calm talking head after a hook.",
+   "layers": {
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          0.417083,
+          1.126125
+         ],
+         "v": [
+          10,
+          0
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ],
+         "fit": {
+          "note": "fitted to the reference's per-frame sharpness (half sharp ~f17, sharp f26)"
+         }
+        }
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.083417,
+          1.167833
+         ],
+         "v": [
+          351.8,
+          100
+         ],
+         "ease": [
+          {
+           "out": 40,
+           "in": 100
+          }
+         ],
+         "zoom": true,
+         "fit": {
+          "rms": 0.9,
+          "unit": "%",
+          "note": "measure.py → fit2.py, fixed end 100 %; settles f26 like the reference"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0,
+     "in": 0
+    },
+    "new": {
+     "from": 0
+    },
+    "top": "new"
+   }
+  },
+  "push-in": {
+   "title": "Push-in settle",
+   "reference": {
+    "z": "Z06",
+    "who": "Moon Edits",
+    "where": "1:00.27",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/06-moon-cut-pushin.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+   },
+   "fps": "30",
+   "cutFrame": 21,
+   "frames": 50,
+   "energy": "calm",
+   "land": 0.833333,
+   "looks": "The new shot starts a little wide (77 %, edges mirrored so no frame edge shows) and pushes in to rest in under a second. No blur.",
+   "use": "A soft continuation: same topic, next sentence, a calmer beat after a busy one.",
+   "layers": {
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 150,
+        "outputHeight": 150,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.066667,
+          0.833333
+         ],
+         "v": [
+          75.9,
+          100
+         ],
+         "ease": [
+          "Quick launch · soft landing"
+         ],
+         "zoom": true,
+         "fit": {
+          "rms": 0.25,
+          "unit": "%",
+          "note": "measure.py → fit2.py"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0,
+     "in": 0
+    },
+    "new": {
+     "from": 0
+    },
+    "top": "new"
+   }
+  },
+  "into-window": {
+   "title": "Into window",
+   "reference": {
+    "z": "Z07",
+    "who": "Ibrahim",
+    "where": "0:15.00",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/07-ibrahim-zoomout-into-frame.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+   },
+   "fps": "60000/1001",
+   "cutFrame": 42,
+   "frames": 101,
+   "energy": "medium",
+   "land": 0.984317,
+   "looks": "The new shot appears inside a window (dark title bar, three dots) on a dark green background: it just fills the width on the cut frame (136 %), then shrinks to rest, rising a little as it shrinks.",
+   "use": "Show the next shot as a screen: 'here is the video', a source clip, a screen recording, a quote from another creator.",
+   "window": {
+    "size": [
+     1412,
+     796
+    ],
+    "topLeft": [
+     254,
+     140
+    ],
+    "bar": 58,
+    "barColour": "#111111",
+    "pivot": [
+     960,
+     765
+    ],
+    "dots": [
+     {
+      "name": "Red",
+      "colour": "#eb0004",
+      "x": 46
+     },
+     {
+      "name": "Yellow",
+      "colour": "#fcde09",
+      "x": 99
+     },
+     {
+      "name": "White",
+      "colour": "#ffffff",
+      "x": 152
+     }
+    ],
+    "dotSize": 20,
+    "dotY": 25,
+    "bg": {
+     "colour": "#02120f",
+     "corners": [
+      "#022a21",
+      "#010605",
+      "#01120f",
+      "#04382e"
+     ]
+    }
+   },
+   "layers": {
+    "window": {
+     "rest": 100,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        0.0,
+        0.016683,
+        1.234567
+       ],
+       "v": [
+        136.1,
+        128.9,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)",
+        "Expo Out 1 (Elias)"
+       ],
+       "zoom": true,
+       "fit": {
+        "rms": 0.4,
+        "unit": "%",
+        "note": "fitted to the window's edges per frame; within 0.5 % from f59 like the reference"
+       }
+      }
+     }
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0,
+     "in": 0
+    },
+    "new": {
+     "from": 0
+    },
+    "top": "new"
+   }
+  },
+  "twos-card": {
+   "title": "Card settle on twos",
+   "reference": {
+    "z": "Z11",
+    "who": "Andrew Nayebyan",
+    "where": "0:24.58",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/refclips/11-nayebyan-card.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+   },
+   "fps": "24",
+   "cutFrame": 17,
+   "frames": 48,
+   "energy": "medium",
+   "land": 3.041667,
+   "looks": "Steps on twos (a new picture every 2 frames): 3 frames at 156 % with a heavy zoom smear, then 135 % and a long Expo Out settle to rest, all at 12 steps a second.",
+   "use": "Stylised, ad / VSL energy: a product or card shot, a punchy section opener in a fast edit.",
+   "layers": {
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Smear",
+       "effect": "ec.blur.radial",
+       "set": {
+        "type": 1
+       },
+       "keys": {
+        "amount": {
+         "t": [
+          0.041667,
+          0.125
+         ],
+         "v": [
+          10,
+          0
+         ],
+         "ease": [
+          "linear"
+         ],
+         "steps": "twos"
+        }
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          0.041667,
+          0.125,
+          3.041667
+         ],
+         "v": [
+          156,
+          135.1,
+          100
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)",
+          "Expo Out 1 (Elias)"
+         ],
+         "zoom": true,
+         "steps": "twos",
+         "fit": {
+          "rms": 0.3,
+          "unit": "%",
+          "note": "on twos, f3–f57"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0,
+     "in": 0
+    },
+    "new": {
+     "from": 0
+    },
+    "top": "new"
+   }
+  },
+  "twos-push": {
+   "title": "Push-in on twos",
+   "reference": {
+    "z": "Z12",
+    "who": "Andrew Nayebyan",
+    "where": "1:02.38",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/refclips/12-nayebyan-map.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/A-cut-settle/scripts/build.jsx"
+   },
+   "fps": "24",
+   "cutFrame": 17,
+   "frames": 48,
+   "energy": "medium",
+   "land": 2.75,
+   "looks": "Steps on twos: 3 frames at 77 % (mirrored edges) with a heavy zoom smear, then 85 % and a long Expo Out push-in to rest at 12 steps a second.",
+   "use": "Stylised, ad / VSL energy like twos-card, but pushing in: a map, a screen, a detail you want the viewer to lean into.",
+   "layers": {
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 150,
+        "outputHeight": 150,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Smear",
+       "effect": "ec.blur.radial",
+       "set": {
+        "type": 1
+       },
+       "keys": {
+        "amount": {
+         "t": [
+          0.041667,
+          0.125
+         ],
+         "v": [
+          14,
+          0
+         ],
+         "ease": [
+          "linear"
+         ],
+         "steps": "twos"
+        }
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          0.041667,
+          0.125,
+          2.75
+         ],
+         "v": [
+          77,
+          85.4,
+          100
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)",
+          "Expo Out 1 (Elias)"
+         ],
+         "zoom": true,
+         "steps": "twos",
+         "fit": {
+          "rms": 0.15,
+          "unit": "%",
+          "note": "on twos, f3–f53"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0,
+     "in": 0
+    },
+    "new": {
+     "from": 0
+    },
+    "top": "new"
+   }
+  },
+  "zoom-through": {
+   "title": "Zoom through",
+   "reference": {
+    "z": "Z02",
+    "who": "Kallaway",
+    "where": "“90 days” 0:04.59",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/02-kallaway-zoom-through-cut.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
+   },
+   "fps": "24000/1001",
+   "cutFrame": 18,
+   "frames": 44,
+   "energy": "high",
+   "land": 0.458792,
+   "comp": {
+    "motionBlurSamples": 64,
+    "adaptiveSampleLimit": 256
+   },
+   "restLayer": "new",
+   "looks": "The old shot speeds up into the frame (100 → 110 %), the cut sits on its fastest frame, and the new shot carries on zooming in from 82 % of its rest, with a zoom smear that follows the speed and a short soft blur.",
+   "use": "Momentum: 'and then…', a jump forward in a story, two shots that belong to one thought.",
+   "layers": {
+    "old": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 360
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.291958,
+          -0.041708
+         ],
+         "v": [
+          100,
+          109.86
+         ],
+         "ease": [
+          "Launch out (Devin)"
+         ],
+         "zoom": true,
+         "fit": {
+          "note": "SIFT scale per frame → fit.py (B-zoom-through)"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "rest": 122.55,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 140,
+        "outputHeight": 140,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 360
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.041708,
+          0.458792
+         ],
+         "v": [
+          86.62,
+          122.55
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ],
+         "zoom": true,
+         "fit": {
+          "note": "SIFT scale per frame → fit.py (B-zoom-through)"
+         }
+        }
+       }
+      },
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          0.0,
+          0.5005
+         ],
+         "v": [
+          10,
+          0
+         ],
+         "ease": [
+          "Quick launch · soft landing"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0.734067,
+     "in": 0
+    },
+    "new": {
+     "from": 2.002
+    },
+    "top": "old"
+   }
+  },
+  "whip": {
+   "title": "Whip through",
+   "reference": {
+    "z": "Z03",
+    "who": "Raijin",
+    "where": "0:33.07",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/03-raijin-stretch-zoom-through.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 22,
+   "frames": 52,
+   "energy": "high",
+   "land": 0.467133,
+   "comp": {
+    "motionBlurSamples": 64,
+    "adaptiveSampleLimit": 256
+   },
+   "looks": "Not a zoom: both shots whip sideways. The old shot speeds off to the right (2 000 px in 8 frames) with a horizontal smear, the new one slides in from the left and settles (Expo Out 1). Mirrored edges fill what slides in.",
+   "use": "A change of place or time, a fast sequence of shots, 'meanwhile…'.",
+   "layers": {
+    "old": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 500,
+        "outputHeight": 100,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 180
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.266933,
+          0.0
+         ],
+         "v": [
+          [
+           0,
+           0
+          ],
+          [
+           1997,
+           0
+          ]
+         ],
+         "ease": [
+          "Launch out (Devin)"
+         ],
+         "offset": true,
+         "fit": {
+          "note": "SIFT shift per frame → fit.py (B-zoom-through)"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 300,
+        "outputHeight": 100,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 360
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.033367,
+          0.467133
+         ],
+         "v": [
+          [
+           -805,
+           0
+          ],
+          [
+           0,
+           0
+          ]
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ],
+         "offset": true,
+         "fit": {
+          "note": "SIFT shift per frame → fit.py (B-zoom-through)"
+         }
+        }
+       }
+      },
+      {
+       "name": "Smear",
+       "effect": "ec.blur.directional",
+       "set": {
+        "direction": 90
+       },
+       "keys": {
+        "length": {
+         "t": [
+          0.0,
+          0.3003
+         ],
+         "v": [
+          150,
+          0
+         ],
+         "ease": [
+          "Quick launch · soft landing"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0.734067,
+     "in": 0
+    },
+    "new": {
+     "from": 2.002
+    },
+    "top": "old"
+   }
+  },
+  "zoom-out-through": {
+   "title": "Zoom-out through",
+   "reference": {
+    "z": "Z04",
+    "who": "Moon Edits",
+    "where": "0:39.97",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/04-moon-matched-zoomout-blur.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
+   },
+   "fps": "30",
+   "cutFrame": 28,
+   "frames": 71,
+   "energy": "high",
+   "land": 1.266667,
+   "comp": {
+    "motionBlurSamples": 64,
+    "adaptiveSampleLimit": 256
+   },
+   "restLayer": "old",
+   "looks": "Both shots zoom OUT: the old one drifts back faster and faster (to 78 % of its rest) going soft, the cut lands on the new one at 141 % heavily defocused, and it keeps zooming out to rest as it sharpens.",
+   "use": "Stepping back: 'the bigger picture', zooming out of a detail, the end of a section.",
+   "layers": {
+    "old": {
+     "rest": 121,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 150,
+        "outputHeight": 150,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 360
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -1.2,
+          0.0
+         ],
+         "v": [
+          121,
+          94.66
+         ],
+         "ease": [
+          "Fast out"
+         ],
+         "zoom": true,
+         "fit": {
+          "note": "SIFT scale per frame → fit.py (B-zoom-through); keyed ×1.21 so f27 is 100 %"
+         }
+        }
+       }
+      },
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          -0.433333,
+          -0.033333
+         ],
+         "v": [
+          0,
+          40
+         ],
+         "ease": [
+          "Fast out"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 360
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.033333,
+          1.266667
+         ],
+         "v": [
+          151.22,
+          100
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ],
+         "zoom": true,
+         "fit": {
+          "note": "SIFT scale per frame → fit.py (B-zoom-through)"
+         }
+        }
+       }
+      },
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          0.0,
+          0.466667
+         ],
+         "v": [
+          45,
+          0
+         ],
+         "ease": [
+          "Quick launch · soft landing"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0.734067,
+     "in": -8
+    },
+    "new": {
+     "from": 2.002
+    },
+    "top": "old"
+   }
+  },
+  "punch": {
+   "title": "Punch through",
+   "reference": {
+    "z": "Z08",
+    "who": "Yung Siege",
+    "where": "1:22.64",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/08-yungsiege-punch-jumpcut.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/B-zoom-through/scripts/build.jsx"
+   },
+   "fps": "25",
+   "cutFrame": 21,
+   "frames": 43,
+   "energy": "medium",
+   "land": 0.28,
+   "comp": {
+    "motionBlurSamples": 64,
+    "adaptiveSampleLimit": 256
+   },
+   "restLayer": "new",
+   "looks": "A punch over a jump cut, anchored near the top of the frame so the head stays put: the old shot creeps in 6 %, the new one carries on 100 → 113.5 % in 7 frames. No blur.",
+   "use": "Jump cuts inside one take, emphasis on a word, 'and here's the thing'.",
+   "layers": {
+    "old": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.44,
+          -0.04
+         ],
+         "v": [
+          100,
+          106.0
+         ],
+         "ease": [
+          "Launch out (Devin)"
+         ],
+         "zoom": true,
+         "fit": {
+          "note": "SIFT scale per frame → fit.py (B-zoom-through)"
+         }
+        }
+       },
+       "centre": [
+        960,
+        25
+       ]
+      }
+     ]
+    },
+    "new": {
+     "rest": 113.49,
+     "effects": [
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          0.0,
+          0.28
+         ],
+         "v": [
+          100,
+          113.49
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ],
+         "zoom": true,
+         "fit": {
+          "note": "SIFT scale per frame → fit.py (B-zoom-through)"
+         }
+        }
+       },
+       "centre": [
+        960,
+        25
+       ]
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0.734067,
+     "in": 0
+    },
+    "new": {
+     "from": 2.002
+    },
+    "top": "old"
+   }
+  },
+  "flash": {
+   "title": "Flash zoom",
+   "reference": {
+    "z": "Z09",
+    "who": "Markov",
+    "where": "0:04.62",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/09-markov-flash-zoom.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/C-flash/scripts/build.jsx"
+   },
+   "fps": "24",
+   "cutFrame": 16,
+   "frames": 72,
+   "energy": "high",
+   "land": 1.666667,
+   "looks": "The cut lands on the new shot blown out (its own highlights bloom) and zoomed out to 62 % (mirrored edges); the flash fades in 7 frames while it pushes in to rest over ~1.7 s. The old shot creeps in 3.7 % before the cut.",
+   "use": "A big moment: a result, a hype line, the payoff after a build-up.",
+   "layers": {
+    "old": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 270
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.666667,
+          -0.041667
+         ],
+         "v": [
+          100,
+          103.3
+         ],
+         "ease": [
+          {
+           "outSpeed": 7.199999999999999,
+           "outInfluence": 33.3,
+           "inSpeed": 3.5999999999999996,
+           "inInfluence": 33.3
+          }
+         ],
+         "zoom": true
+        }
+       },
+       "centre": [
+        960,
+        540
+       ]
+      }
+     ]
+    },
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 200,
+        "outputHeight": 200,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 270
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.083333,
+          1.791667
+         ],
+         "v": [
+          46.8,
+          100
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ],
+         "zoom": true,
+         "fit": {
+          "rms": 0.56,
+          "unit": "%",
+          "note": "dense ECC scale track (C-flash); max 1.7 %"
+         }
+        }
+       },
+       "centre": [
+        1005,
+        400
+       ]
+      },
+      {
+       "name": "Flash",
+       "effect": "ec.color.exposure",
+       "keys": {
+        "master/exposure": {
+         "t": [
+          0.0,
+          0.291667
+         ],
+         "v": [
+          0.9,
+          0
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ]
+        }
+       }
+      },
+      {
+       "name": "Bloom",
+       "effect": "ec.stylize.glow",
+       "set": {
+        "threshold": 45,
+        "radius": 140
+       },
+       "keys": {
+        "intensity": {
+         "t": [
+          0.0,
+          0.291667
+         ],
+         "v": [
+          0.5,
+          0
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0.85,
+     "in": 0
+    },
+    "new": {
+     "from": 1.0
+    },
+    "top": "old"
+   }
+  },
+  "white-flash": {
+   "title": "White flash zoom",
+   "reference": {
+    "z": "Z10",
+    "who": "Raijin",
+    "where": "0:08.24",
+    "video": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-research/clips/10-raijin-white-flash-zoom.mp4",
+    "build": "/Users/elias/Downloads/1 - Work/3- Editing/The Vault/Rebuilds/hf-demos/zoom-versions/C-flash/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 21,
+   "frames": 90,
+   "energy": "high",
+   "land": 1.7017,
+   "looks": "The old shot speeds into a light (lavender haze from the left, a bloom, then near-white, in held steps); the hard cut hides under the white and the new shot comes out of it warm and soft at 77 %, sharpening and pushing in to rest over ~1.9 s.",
+   "use": "A chapter or time jump, a dreamy 'imagine…', the switch into a story or a memory.",
+   "layers": {
+    "old": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 270
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.7007,
+          -0.433767,
+          -0.033367
+         ],
+         "v": [
+          98.0,
+          99.5,
+          155
+         ],
+         "ease": [
+          {
+           "outSpeed": 5.0949,
+           "outInfluence": 33.3,
+           "inSpeed": 5.0949,
+           "inInfluence": 33.3
+          },
+          "Launch out (Devin)"
+         ],
+         "zoom": true,
+         "fit": {
+          "rms": 0.75,
+          "unit": "%",
+          "note": "ECC scale track to 113 % at C-7 (the rest is under the white)"
+         }
+        }
+       },
+       "centre": [
+        1095,
+        360
+       ]
+      }
+     ]
+    },
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 200,
+        "outputHeight": 200,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Zoom",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 270
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          0.0,
+          1.9019
+         ],
+         "v": [
+          77.3,
+          100
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ],
+         "zoom": true,
+         "fit": {
+          "rms": 0.31,
+          "unit": "%",
+          "note": "ECC scale track (C-flash); 99.9 % on C+49 like the reference"
+         }
+        }
+       },
+       "centre": [
+        960,
+        540
+       ]
+      },
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          0.0,
+          1.668333
+         ],
+         "v": [
+          26.8,
+          0
+         ],
+         "ease": [
+          {
+           "out": 1,
+           "in": 30
+          }
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "Warm cast",
+     "kind": "solid",
+     "colour": "#ffa040",
+     "blend": "Overlay",
+     "above": "new",
+     "in": 0.0,
+     "out": 0.9009,
+     "keys": {
+      "transform/opacity": {
+       "t": [
+        0.1001,
+        0.867533
+       ],
+       "v": [
+        45,
+        0
+       ],
+       "ease": [
+        {
+         "out": 5,
+         "in": 90
+        }
+       ]
+      }
+     }
+    },
+    {
+     "name": "Haze",
+     "kind": "light",
+     "blend": "Screen",
+     "above": "top",
+     "in": -0.4004,
+     "out": 0.0,
+     "ramp": {
+      "start": [
+       0,
+       380
+      ],
+      "startColor": "#e1e0f5",
+      "end": [
+       1150,
+       380
+      ],
+      "endColor": "#000000",
+      "shape": 1
+     }
+    },
+    {
+     "name": "Bloom glow",
+     "kind": "adjustment",
+     "above": "top",
+     "in": -0.233567,
+     "out": -0.133467,
+     "effects": [
+      {
+       "name": "Exposure",
+       "effect": "ec.color.exposure",
+       "set": {
+        "master/exposure": 0.3
+       }
+      },
+      {
+       "name": "Glow",
+       "effect": "ec.stylize.glow",
+       "set": {
+        "threshold": 78,
+        "radius": 160,
+        "intensity": 1.2
+       }
+      }
+     ]
+    },
+    {
+     "name": "Bloom",
+     "kind": "light",
+     "blend": "Screen",
+     "above": "top",
+     "in": -0.233567,
+     "out": -0.133467,
+     "ramp": {
+      "start": [
+       960,
+       800
+      ],
+      "startColor": "#fafaf8",
+      "end": [
+       960,
+       380
+      ],
+      "endColor": "#28283e",
+      "shape": 0
+     }
+    },
+    {
+     "name": "White",
+     "kind": "light",
+     "blend": "Screen",
+     "above": "top",
+     "in": -0.133467,
+     "out": 0.0,
+     "ramp": {
+      "start": [
+       960,
+       600
+      ],
+      "startColor": "#f6f6f9",
+      "end": [
+       960,
+       1700
+      ],
+      "endColor": "#d6d6e6",
+      "shape": 1
+     }
+    },
+    {
+     "name": "Cream",
+     "kind": "light",
+     "blend": "Screen",
+     "above": "top",
+     "in": 0.0,
+     "out": 0.066733,
+     "ramp": {
+      "start": [
+       960,
+       600
+      ],
+      "startColor": "#f8f7f8",
+      "end": [
+       960,
+       1700
+      ],
+      "endColor": "#d8d2da",
+      "shape": 1
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0.85,
+     "in": 0
+    },
+    "new": {
+     "from": 1.0
+    },
+    "top": "old"
+   }
+  }
+ }
+}

@@ -998,6 +998,20 @@ Animation
     Blur In | layer.applyTextPreset {"preset":"blurIn"}
     Jitter | layer.applyTextPreset {"preset":"jitter"}
     Drop In Lines | layer.applyTextPreset {"preset":"dropInLines"}
+  Transitions
+    Zoom Cut
+      Kick | transition.apply {"kind":"kick"}
+      Blur Settle | transition.apply {"kind":"blur-settle"}
+      Push-in Settle | transition.apply {"kind":"push-in"}
+      Into Window | transition.apply {"kind":"into-window"}
+      Card Settle on Twos | transition.apply {"kind":"twos-card"}
+      Push-in on Twos | transition.apply {"kind":"twos-push"}
+      Zoom Through | transition.apply {"kind":"zoom-through"}
+      Whip Through | transition.apply {"kind":"whip"}
+      Zoom-out Through | transition.apply {"kind":"zoom-out-through"}
+      Punch Through | transition.apply {"kind":"punch"}
+      Flash Zoom | transition.apply {"kind":"flash"}
+      White Flash Zoom | transition.apply {"kind":"white-flash"}
   ---
   Add Keyframe | anim.addKeyframe
   Toggle Hold Keyframe | keys.toggleHold
