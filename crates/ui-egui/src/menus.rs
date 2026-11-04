@@ -1696,7 +1696,11 @@ mod tests {
         let press_f = |app: &mut EffectcraftApp| {
             app.last_reveal = None;
             let raw = egui::RawInput {
-                events: vec![egui::Event::Key { key: egui::Key::F, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+                // Pressed and released: egui marks a press of a key still down as a repeat,
+                // which shortcuts ignore.
+                events: [true, false]
+                    .map(|pressed| egui::Event::Key { key: egui::Key::F, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE })
+                    .into(),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| handle_shortcuts(app, ui.ctx()));

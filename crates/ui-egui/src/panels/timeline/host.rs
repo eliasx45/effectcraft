@@ -519,6 +519,8 @@ mod tests {
     fn hosted_reveal_and_zoom_keys_run_without_the_app() {
         let mut host = host();
         super::super::hosted::install(&mut host.session);
+        // No selection: the reveal keys act on every layer (a new solid is selected).
+        host.session.state.selected_layers.clear();
         let ctx = egui::Context::default();
         let press = |key, modifiers, physical_key| egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers };
         let mut ran = vec![];

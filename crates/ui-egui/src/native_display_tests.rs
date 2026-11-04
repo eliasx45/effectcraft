@@ -119,8 +119,12 @@ fn native_display_bridge_matches_float_readback_and_survives_retirement() {
             }
             assert_eq!(mid.readbacks - before.readbacks, 1);
             assert_eq!(after.readbacks - mid.readbacks, 1);
+            // The bridge reads 8-bit pixels; the float path a quarter as many bytes more, except
+            // in an 8 bpc project, whose frames already read back at 8 bits.
+            let (old_bytes, new_bytes) = (mid.readback_bytes - before.readback_bytes, after.readback_bytes - mid.readback_bytes);
             if scale == 1.0 {
-                assert_eq!(mid.readback_bytes - before.readback_bytes, 4 * (after.readback_bytes - mid.readback_bytes));
+                let ratio = if depth == BitDepth::Bpc8 { 1 } else { 4 };
+                assert_eq!(old_bytes, ratio * new_bytes, "{depth:?}");
             }
         }
     }

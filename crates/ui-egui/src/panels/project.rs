@@ -1422,7 +1422,12 @@ mod tests {
         let folders = host.session.project.items.values().filter(|i| i.is_folder()).count();
         click(&ctx, &mut host, "project.newFolder", false);
         assert_eq!(host.session.project.items.values().filter(|i| i.is_folder()).count(), folders + 1);
-        // A double-click on the empty list asks the host to import.
+        // A double-click on the empty list asks the host to import. First 0.7 s pass (frames
+        // are 1/60 s): with the New Folder click less than 0.6 s before, egui counts a triple
+        // click, not a double one.
+        for _ in 0..42 {
+            bare_frame(&ctx, &mut host, vec![]);
+        }
         click(&ctx, &mut host, "project.empty", true);
         assert!(host.asked.iter().any(|(id, _)| id == "file.import"), "{:?}", host.asked);
     }
