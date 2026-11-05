@@ -1,0 +1,8 @@
+asset:        clip-move.kinds.json
+title:        Clip-move kinds (punch, zoom-ladder, chain, crop-reframe, retime, speed-ramp, freeze): the numbers behind Animation ▸ Clip Moves (clip.move)
+author:       Elias (eliasx45)
+source:       original work (copied from Elias's motion-kit repo, shelf/camera/clip-move.kinds.json, commit ba541a3, sha256 7937b6844e839f7f…)
+license:      MIT OR Apache-2.0
+added:        2026-11-05 by eliasx45 (Claude Code agent, CM1)
+notes:        Plain data: key times, framings (scale + subject point), crop rects, time-remap segments, ease names and beats of Elias's native EffectCraft rebuilds of the HyperFrames keyframes skill's "creator editing" rows (Rebuilds/hf-keyframes-demo, no footage or artwork), approved on 5 Nov 2026. The source of truth is motion-kit's shelf table; this is a copy, read by crates/engine/src/commands/clip_move.rs with include_str!. Re-copy it (cp ~/Developer/motion-kit/shelf/camera/clip-move.kinds.json here) whenever the shelf table changes; never edit it here.
+When re-copying, replace the local path prefix ".../The Vault/" with "The Vault/" (this repo is public; the paths are only labels, never read). Check: no local home-folder path is left in the copy (the test clip_move_menu_lists_the_7_kinds checks it).

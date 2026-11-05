@@ -86,14 +86,17 @@ Screenshots of EffectCraft itself, rendered headlessly, showing only procedurall
   and checks, pulse rings, bokeh, light sweep): `crates/engine/presets/backgrounds.json` (sidecar `.attribution`).
 - Behaviors animation presets (22: wiggle, shake, float, orbit, bounce, drift, pendulum, spin, pulse, heartbeat, blink, strobe, flicker):
   `crates/engine/presets/behaviors.json` (sidecar `.attribution`).
-- Zoom-cut transition kinds (12 zoom cuts for Animation ▸ Transitions ▸ Zoom Cut, `transition.apply`; Elias's measured
+- Zoom-cut transition kinds (13 zoom cuts for Animation ▸ Transitions ▸ Zoom Cut, `transition.apply`; Elias's measured
   data, copied from his motion-kit shelf): `crates/engine/presets/zoom-cut.kinds.json` (sidecar `.attribution`).
 - FX-cut transition kinds (15 FX cuts for Animation ▸ Transitions ▸ FX Cut, `transition.apply`; Elias's native
   rebuilds of the HyperFrames scene transitions, copied from his motion-kit shelf): `crates/engine/presets/fx-cut.kinds.json`
   (sidecar `.attribution`).
-- Scene-cut transition kinds (15 scene cuts for Animation ▸ Transitions ▸ Scene Cut, `transition.apply`; Elias's native
+- Scene-cut transition kinds (18 scene cuts for Animation ▸ Transitions ▸ Scene Cut, `transition.apply`; Elias's native
   rebuilds of the HyperFrames scene transitions, transitions-a, copied from his motion-kit shelf):
   `crates/engine/presets/scene-cut.kinds.json` (sidecar `.attribution`).
+- Clip-move kinds (7 one-shot moves for Animation ▸ Clip Moves, `clip.move`: punch, zoom-ladder, chain, crop-reframe,
+  retime, speed-ramp, freeze; Elias's native rebuilds of the HyperFrames keyframes demo, copied from his motion-kit shelf):
+  `crates/engine/presets/clip-move.kinds.json` (sidecar `.attribution`).
 - Sample scripts (File ▸ Scripts) and ScriptUI panel: `crates/engine/scripts/Rename Layers.jsx`,
   `crates/engine/scripts/Sort Layers by In Point.jsx`, `crates/engine/scripts/Create Null at Selected Layers.jsx`,
   `crates/engine/scripts/Render Queue Batch.jsx`, `crates/engine/scripts/ScriptUI Panels/Layer Tools.jsx`

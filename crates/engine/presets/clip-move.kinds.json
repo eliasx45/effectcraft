@@ -1,0 +1,738 @@
+{
+ "about": "clip-move kinds: the numbers behind every version of the clip-move part (motion-kit shelf/camera/clip-move.jsx): moves on ONE footage layer, the HyperFrames keyframes skill's 'creator editing' rows rebuilt natively in Rebuilds/hf-keyframes-demo (build.jsx, keyframes-demo.ecproj, renders/NN-*.mp4), approved by Elias 5 Nov 2026 ('good as built'; row 03 Ken Burns dropped, row 05 whip pan is zoom-cut whip-pan, rows 07 / 08 are scene-cut linear-wipe, point-iris, split-handoff). Plain data, no code.",
+ "schema": {
+  "time": "every t is SECONDS after `at` (the kind's first frame, frame 0 of the approved comp); a caller snaps at + t to its comp's frames (round), so any fps works",
+  "fps / frames": "the approved comp (hf-keyframes-demo, 29.97 fps) and its length",
+  "builtCentre": "[960, 440]: the subject point the framings and the square were built on (Dharya's face in the demo footage); a call's `centre` (default the frame centre [960, 540]) moves every framing point and mask rect by centre − builtCentre, then each is clamped back inside the frame",
+  "frame": "{t, v: [[scale %, [x, y]] (show point x, y of the 1920x1080 shot at the frame centre at that scale; clamped so no frame edge shows)], ease: [one per segment: a Graph name | 'linear' (the value holds or is untouched) | 'hold' (a hold keyframe: a one-frame jump at the next key)]}: a 'ClipMove <kind> Frame' Transform effect on the shot (anchor [0, 0], position + uniform scale keyed, a straight path), never the shot's own transform",
+  "mask": "{t, v: [[x0, y0, x1, y1] px of the 1920x1080 shot], ease}: a 'ClipMove <kind> Crop' rect mask on the shot (layer space), keyed",
+  "bg": "#rrggbb: a 'ClipMove <kind> BG' solid right below the shot while the mask crops it (a call's bg: false leaves what is under the shot)",
+  "remap": "{t, seg: [one per segment: {rate} (constant speed, × 1) | {hold: true} (a frozen frame: a hold keyframe) | {ramp: true} (the speed changes smoothly from speed[i] to speed[i + 1]: keys.velocity in / out = speed, influence % on both sides; the source advances by the mean speed × the segment)], speed?: [one per key], influence?}: time remapping on the shot's picture; before `at` and after the last key the picture plays at 1×; its sound stays at 1× on an audio-only copy",
+  "beats": "[{t, id, what, kind: start | peak | cut | land, marker? (a layer marker 'ClipMove <kind> <marker>' on the shot at markerAt, else at t)}]: the hits (<id>-<beat id>)",
+  "energy": "calm | medium | high"
+ },
+ "default": "punch",
+ "order": [
+  "punch",
+  "zoom-ladder",
+  "chain",
+  "crop-reframe",
+  "retime",
+  "speed-ramp",
+  "freeze"
+ ],
+ "kinds": {
+  "punch": {
+   "title": "Punch in / out",
+   "from": "HyperFrames keyframes skill, creator editing row 1 (Punch-in / punch-out)",
+   "reference": {
+    "n": "01",
+    "batch": "hf-keyframes-demo",
+    "comp": "01 Punch-in punch-out",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/01-punch-in-punch-out.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx",
+    "project": "The Vault/Rebuilds/hf-keyframes-demo/keyframes-demo.ecproj"
+   },
+   "fps": "30000/1001",
+   "frames": 120,
+   "energy": "high",
+   "looks": "The shot jumps 100 → 130 % on the subject (a one-frame hard punch-in at 0.9 s), jumps back out at 1.8 s, then punches in smoothly over 0.7 s (Expo In-Out) at 2.3 s and holds. Edges clamped: never a frame edge.",
+   "use": "Emphasis on a word or a beat in a talking head: hard punches on a joke or a hit word, the smooth one on a building point.",
+   "frame": {
+    "t": [
+     0.0,
+     0.9009,
+     1.8018,
+     2.3023,
+     3.003
+    ],
+    "v": [
+     [
+      100,
+      [
+       960,
+       540
+      ]
+     ],
+     [
+      130,
+      [
+       960,
+       440
+      ]
+     ],
+     [
+      100,
+      [
+       960,
+       540
+      ]
+     ],
+     [
+      100,
+      [
+       960,
+       540
+      ]
+     ],
+     [
+      130,
+      [
+       960,
+       440
+      ]
+     ]
+    ],
+    "ease": [
+     "hold",
+     "hold",
+     "hold",
+     "Expo In-Out (Elias)"
+    ]
+   },
+   "beats": [
+    {
+     "t": 0.9009,
+     "id": "in",
+     "what": "hard punch-in",
+     "kind": "cut"
+    },
+    {
+     "t": 1.8018,
+     "id": "out",
+     "what": "hard punch-out",
+     "kind": "cut"
+    },
+    {
+     "t": 2.3023,
+     "id": "smooth",
+     "what": "smooth punch-in starts",
+     "kind": "start"
+    },
+    {
+     "t": 2.65265,
+     "id": "smooth-peak",
+     "what": "smooth punch-in",
+     "kind": "peak"
+    },
+    {
+     "t": 3.003,
+     "id": "land",
+     "what": "punched in",
+     "kind": "land"
+    }
+   ],
+   "builtCentre": [
+    960,
+    440
+   ],
+   "demo": {
+    "file": "presenter-dharya-long.mp4",
+    "centre": [
+     960,
+     440
+    ]
+   }
+  },
+  "zoom-ladder": {
+   "title": "Zoom ladder",
+   "from": "HyperFrames keyframes skill, creator editing row 2 (Multi-state zoom)",
+   "reference": {
+    "n": "02",
+    "batch": "hf-keyframes-demo",
+    "comp": "02 Multi-state zoom",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/02-multi-state-zoom.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx",
+    "project": "The Vault/Rebuilds/hf-keyframes-demo/keyframes-demo.ecproj"
+   },
+   "fps": "30000/1001",
+   "frames": 120,
+   "energy": "medium",
+   "looks": "A pose ladder on one shot: wide 100 % → medium 130 % → close-up 160 % → an off-centre reframe at 115 %, each step 18–21 frames on Expo In-Out with 12–15 frame holds between. Edges clamped.",
+   "use": "A point that builds: each step closer as the line gets more personal or important, then a reframe to make room (for a graphic on the other side).",
+   "frame": {
+    "t": [
+     0.0,
+     0.5005,
+     1.1011,
+     1.5015,
+     2.1021,
+     2.6026,
+     3.3033
+    ],
+    "v": [
+     [
+      100,
+      [
+       960,
+       540
+      ]
+     ],
+     [
+      100,
+      [
+       960,
+       540
+      ]
+     ],
+     [
+      130,
+      [
+       960,
+       420
+      ]
+     ],
+     [
+      130,
+      [
+       960,
+       420
+      ]
+     ],
+     [
+      160,
+      [
+       960,
+       450
+      ]
+     ],
+     [
+      160,
+      [
+       960,
+       450
+      ]
+     ],
+     [
+      115,
+      [
+       1080,
+       540
+      ]
+     ]
+    ],
+    "ease": [
+     "linear",
+     "Expo In-Out (Elias)",
+     "linear",
+     "Expo In-Out (Elias)",
+     "linear",
+     "Expo In-Out (Elias)"
+    ]
+   },
+   "beats": [
+    {
+     "t": 0.8008,
+     "id": "medium",
+     "what": "wide → medium 130 %",
+     "kind": "peak"
+    },
+    {
+     "t": 1.8018,
+     "id": "close",
+     "what": "medium → close-up 160 %",
+     "kind": "peak"
+    },
+    {
+     "t": 2.95295,
+     "id": "reframe",
+     "what": "close-up → reframe 115 %",
+     "kind": "peak"
+    },
+    {
+     "t": 3.3033,
+     "id": "land",
+     "what": "reframed",
+     "kind": "land"
+    }
+   ],
+   "builtCentre": [
+    960,
+    440
+   ],
+   "demo": {
+    "file": "presenter-dharya-long.mp4",
+    "centre": [
+     960,
+     440
+    ]
+   }
+  },
+  "chain": {
+   "title": "Chained camera moves",
+   "from": "HyperFrames keyframes skill, creator editing row 4 (Chained camera moves)",
+   "reference": {
+    "n": "04",
+    "batch": "hf-keyframes-demo",
+    "comp": "04 Chained camera moves",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/04-chained-camera-moves.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx",
+    "project": "The Vault/Rebuilds/hf-keyframes-demo/keyframes-demo.ecproj"
+   },
+   "fps": "30000/1001",
+   "frames": 150,
+   "energy": "medium",
+   "looks": "Four labelled beats on one shot: push in to 140 % on the subject → pan right at 160 % → pan left and tilt down → pull back to 100 %, each 21–24 frames on Expo In-Out with ~12 frame holds; a layer marker names each beat. Edges clamped.",
+   "use": "A tour of one frame: what is on the left, what is on the right, then the whole picture (a screen recording, a desk, a whiteboard, a wide shot).",
+   "frame": {
+    "t": [
+     0.0,
+     0.4004,
+     1.1011,
+     1.5015,
+     2.2022,
+     2.6026,
+     3.3033,
+     3.7037,
+     4.5045
+    ],
+    "v": [
+     [
+      100,
+      [
+       960,
+       540
+      ]
+     ],
+     [
+      100,
+      [
+       960,
+       540
+      ]
+     ],
+     [
+      140,
+      [
+       960,
+       440
+      ]
+     ],
+     [
+      140,
+      [
+       960,
+       440
+      ]
+     ],
+     [
+      160,
+      [
+       1500,
+       520
+      ]
+     ],
+     [
+      160,
+      [
+       1500,
+       520
+      ]
+     ],
+     [
+      160,
+      [
+       560,
+       760
+      ]
+     ],
+     [
+      160,
+      [
+       560,
+       760
+      ]
+     ],
+     [
+      100,
+      [
+       960,
+       540
+      ]
+     ]
+    ],
+    "ease": [
+     "linear",
+     "Expo In-Out (Elias)",
+     "linear",
+     "Expo In-Out (Elias)",
+     "linear",
+     "Expo In-Out (Elias)",
+     "linear",
+     "Expo In-Out (Elias)"
+    ]
+   },
+   "beats": [
+    {
+     "t": 0.75075,
+     "id": "b1",
+     "what": "B1 · push in",
+     "kind": "peak",
+     "marker": "B1 · push in",
+     "markerAt": 0.4004
+    },
+    {
+     "t": 1.85185,
+     "id": "b2",
+     "what": "B2 · pan right",
+     "kind": "peak",
+     "marker": "B2 · pan right",
+     "markerAt": 1.5015
+    },
+    {
+     "t": 2.95295,
+     "id": "b3",
+     "what": "B3 · pan left + tilt down",
+     "kind": "peak",
+     "marker": "B3 · pan left + tilt down",
+     "markerAt": 2.6026
+    },
+    {
+     "t": 4.1041,
+     "id": "b4",
+     "what": "B4 · pull back",
+     "kind": "peak",
+     "marker": "B4 · pull back",
+     "markerAt": 3.7037
+    },
+    {
+     "t": 4.5045,
+     "id": "land",
+     "what": "pulled back",
+     "kind": "land"
+    }
+   ],
+   "builtCentre": [
+    960,
+    440
+   ],
+   "demo": {
+    "file": "presenter-dharya-long.mp4",
+    "centre": [
+     960,
+     440
+    ]
+   }
+  },
+  "crop-reframe": {
+   "title": "Crop reframe",
+   "from": "HyperFrames keyframes skill, creator editing row 6 (Crop and mask reframe)",
+   "reference": {
+    "n": "06",
+    "batch": "hf-keyframes-demo",
+    "comp": "06 Crop and mask reframe",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/06-crop-and-mask-reframe.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx",
+    "project": "The Vault/Rebuilds/hf-keyframes-demo/keyframes-demo.ecproj"
+   },
+   "fps": "30000/1001",
+   "frames": 120,
+   "energy": "calm",
+   "looks": "A mask on the shot reframes it without moving it: the full 16:9 frame closes to a 9:16 vertical strip (21 f, Expo In-Out), holds, then to a 1:1 square on the subject (21 f, Expo In-Out) and holds; a dark #08080b background behind.",
+   "use": "'Here's the vertical version', a format change, isolating the speaker before a graphic takes the freed space.",
+   "mask": {
+    "t": [
+     0.0,
+     0.6006,
+     1.3013,
+     2.002,
+     2.7027
+    ],
+    "v": [
+     [
+      0,
+      0,
+      1920,
+      1080
+     ],
+     [
+      0,
+      0,
+      1920,
+      1080
+     ],
+     [
+      656,
+      0,
+      1264,
+      1080
+     ],
+     [
+      656,
+      0,
+      1264,
+      1080
+     ],
+     [
+      660,
+      140,
+      1260,
+      740
+     ]
+    ],
+    "ease": [
+     "linear",
+     "Expo In-Out (Elias)",
+     "linear",
+     "Expo In-Out (Elias)"
+    ]
+   },
+   "bg": "#08080b",
+   "beats": [
+    {
+     "t": 0.95095,
+     "id": "strip",
+     "what": "16:9 → 9:16",
+     "kind": "peak"
+    },
+    {
+     "t": 2.35235,
+     "id": "square",
+     "what": "9:16 → 1:1 on the subject",
+     "kind": "peak"
+    },
+    {
+     "t": 2.7027,
+     "id": "land",
+     "what": "1:1",
+     "kind": "land"
+    }
+   ],
+   "builtCentre": [
+    960,
+    440
+   ],
+   "demo": {
+    "file": "presenter-dharya-long.mp4",
+    "centre": [
+     960,
+     440
+    ]
+   }
+  },
+  "retime": {
+   "title": "Constant retime",
+   "from": "HyperFrames keyframes skill, creator editing row 9 (Constant retime)",
+   "reference": {
+    "n": "09",
+    "batch": "hf-keyframes-demo",
+    "comp": "09 Constant retime",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/09-constant-retime.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx",
+    "project": "The Vault/Rebuilds/hf-keyframes-demo/keyframes-demo.ecproj"
+   },
+   "fps": "30000/1001",
+   "frames": 120,
+   "energy": "medium",
+   "looks": "The picture plays at 0.5× for 2 s, then jumps to 2× for 2 s (a hard change of speed, the picture continuous), then 1× again. Picture only: the sound stays at 1× on an audio copy, so after the move the picture runs 1 s ahead of it.",
+   "use": "Slow-mo on a moment worth seeing, then fast-forward through the boring part.",
+   "remap": {
+    "t": [
+     0.0,
+     2.002,
+     4.004
+    ],
+    "seg": [
+     {
+      "rate": 0.5
+     },
+     {
+      "rate": 2
+     }
+    ]
+   },
+   "beats": [
+    {
+     "t": 0.0,
+     "id": "slow",
+     "what": "0.5×",
+     "kind": "start"
+    },
+    {
+     "t": 2.002,
+     "id": "fast",
+     "what": "2×",
+     "kind": "cut"
+    },
+    {
+     "t": 4.004,
+     "id": "land",
+     "what": "back to 1×",
+     "kind": "land"
+    }
+   ],
+   "builtCentre": [
+    960,
+    440
+   ],
+   "demo": {
+    "file": "presenter-dharya-long.mp4"
+   }
+  },
+  "speed-ramp": {
+   "title": "Speed ramp",
+   "from": "HyperFrames keyframes skill, creator editing row 10 (Speed ramp)",
+   "reference": {
+    "n": "10",
+    "batch": "hf-keyframes-demo",
+    "comp": "10 Speed ramp",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/10-speed-ramp.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx",
+    "project": "The Vault/Rebuilds/hf-keyframes-demo/keyframes-demo.ecproj"
+   },
+   "fps": "30000/1001",
+   "frames": 137,
+   "energy": "high",
+   "looks": "Time remap with continuous speed: 1× → ramps down to 0.25× slow-mo in 0.5 s → holds 0.8 s → ramps up to 2.5× in 0.4 s → holds 0.6 s → back to 1× in 0.4 s (33 % influence on every key). Picture only: the sound stays at 1× on an audio copy (the picture ends 0.56 s ahead of it).",
+   "use": "A beat to savour (slow-mo on the action), then whoosh on to the next one; sport, product, b-roll.",
+   "remap": {
+    "t": [
+     0.0,
+     1.001,
+     1.5015,
+     2.3023,
+     2.7027,
+     3.3033,
+     3.7037,
+     4.5045
+    ],
+    "speed": [
+     1,
+     1,
+     0.25,
+     0.25,
+     2.5,
+     2.5,
+     1,
+     1
+    ],
+    "influence": 33.333,
+    "seg": [
+     {
+      "ramp": true
+     },
+     {
+      "ramp": true
+     },
+     {
+      "ramp": true
+     },
+     {
+      "ramp": true
+     },
+     {
+      "ramp": true
+     },
+     {
+      "ramp": true
+     },
+     {
+      "ramp": true
+     }
+    ]
+   },
+   "beats": [
+    {
+     "t": 1.001,
+     "id": "slow",
+     "what": "ramp to 0.25×",
+     "kind": "start"
+    },
+    {
+     "t": 1.5015,
+     "id": "slow-land",
+     "what": "0.25× slow-mo",
+     "kind": "land"
+    },
+    {
+     "t": 2.3023,
+     "id": "fast",
+     "what": "ramp to 2.5×",
+     "kind": "start"
+    },
+    {
+     "t": 2.7027,
+     "id": "fast-land",
+     "what": "2.5×",
+     "kind": "land"
+    },
+    {
+     "t": 3.3033,
+     "id": "back",
+     "what": "ramp back to 1×",
+     "kind": "start"
+    },
+    {
+     "t": 3.7037,
+     "id": "land",
+     "what": "1×",
+     "kind": "land"
+    }
+   ],
+   "builtCentre": [
+    960,
+    440
+   ],
+   "demo": {
+    "file": "presenter-dharya-long.mp4"
+   }
+  },
+  "freeze": {
+   "title": "Freeze / hold",
+   "from": "HyperFrames keyframes skill, creator editing row 11 (Freeze / hold)",
+   "reference": {
+    "n": "11",
+    "batch": "hf-keyframes-demo",
+    "comp": "11 Freeze hold",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/11-freeze-hold.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx",
+    "project": "The Vault/Rebuilds/hf-keyframes-demo/keyframes-demo.ecproj"
+   },
+   "fps": "30000/1001",
+   "frames": 150,
+   "energy": "calm",
+   "looks": "The shot plays 1.5 s, freezes on a frame for 1.5 s (a hold keyframe on the time remap: no zoom, flash or sound effect), then resumes at 1×. Picture only: the sound keeps playing through the freeze on an audio copy (the picture is 1.5 s behind it after).",
+   "use": "Freeze on a face or a moment to comment on it, a 'record scratch' beat, a freeze before a graphic lands.",
+   "remap": {
+    "t": [
+     0.0,
+     1.5015,
+     3.003,
+     5.005
+    ],
+    "seg": [
+     {
+      "rate": 1
+     },
+     {
+      "hold": true
+     },
+     {
+      "rate": 1
+     }
+    ]
+   },
+   "beats": [
+    {
+     "t": 1.5015,
+     "id": "freeze",
+     "what": "freeze",
+     "kind": "cut"
+    },
+    {
+     "t": 3.003,
+     "id": "resume",
+     "what": "resumes",
+     "kind": "start"
+    }
+   ],
+   "builtCentre": [
+    960,
+    440
+   ],
+   "demo": {
+    "file": "presenter-dharya-long.mp4"
+   }
+  }
+ }
+}

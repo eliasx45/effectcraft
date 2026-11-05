@@ -1048,6 +1048,14 @@ Animation
       Linear Wipe | transition.apply {"kind":"linear-wipe"}
       Point Iris | transition.apply {"kind":"point-iris"}
       Split-screen Handoff | transition.apply {"kind":"split-handoff"}
+  Clip Moves
+    Punch In / Out | clip.move {"kind":"punch"}
+    Zoom Ladder | clip.move {"kind":"zoom-ladder"}
+    Chained Camera Moves | clip.move {"kind":"chain"}
+    Crop Reframe | clip.move {"kind":"crop-reframe"}
+    Constant Retime | clip.move {"kind":"retime"}
+    Speed Ramp | clip.move {"kind":"speed-ramp"}
+    Freeze / Hold | clip.move {"kind":"freeze"}
   ---
   Add Keyframe | anim.addKeyframe
   Toggle Hold Keyframe | keys.toggleHold
