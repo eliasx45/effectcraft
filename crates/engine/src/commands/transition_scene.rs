@@ -1,7 +1,8 @@
-//! The scene cuts of `transition.apply` (Animation ▸ Transitions ▸ Scene Cut): Elias's 15 approved
+//! The scene cuts of `transition.apply` (Animation ▸ Transitions ▸ Scene Cut): Elias's 18 approved
 //! scene changes where the shots themselves move, open or dissolve (push-slide, vertical-push,
 //! elastic-push, squeeze, circle-iris, diamond-iris, diagonal-split, card-flip-3d, crossfade,
-//! blur-crossfade, focus-pull, color-dip, staggered-blocks, horizontal-blinds, vertical-blinds). A
+//! blur-crossfade, focus-pull, color-dip, staggered-blocks, horizontal-blinds, vertical-blinds, and from
+//! hf-keyframes-demo linear-wipe, point-iris, split-handoff). A
 //! port of motion-kit's shelf part `scene-cut` (`shelf/transitions/scene-cut.jsx`, verified against
 //! the approved renders at 24/25/29.97/59.94 and every `dir`); every number comes from the same data
 //! table, shipped here as `presets/scene-cut.kinds.json` (re-copied when the shelf table changes, see
@@ -14,7 +15,11 @@
 //! pivots, `hold` keys and straight paths, polygon mask paths, copies of a shot with their own trims
 //! or turned in 3-D (card-flip-3d, through the comp's camera), sized solids (the blinds' strips), a
 //! new shot that starts after the cut (color-dip) and the dark #08080b backing where the approved
-//! renders show it (squeeze, card-flip-3d, blur-crossfade, color-dip). The shots' transforms are
+//! renders show it (squeeze, card-flip-3d, blur-crossfade, color-dip). `stack: old-over-new` (linear-wipe,
+//! point-iris: a copy of the new shot uncovered over the old one) moves the old shot right above the
+//! new one; `centre` (point-iris) moves its circle and grows its last radius to still cover the frame;
+//! every copy of a shot must have picture over its whole span (split-handoff's copies carry both
+//! shots for 1.9 s). The shots' transforms are
 //! never touched; everything added is named `SceneCut <kind> …` and tagged `SceneCut <old>-><new>`.
 
 use std::sync::OnceLock;
@@ -277,19 +282,75 @@ impl Dir {
     }
 }
 
+/// Whether a scene cut takes a `centre` (the table's `centre`: point-iris).
+pub(super) fn takes_centre(kind: &str) -> bool {
+    kind_spec(kind).is_ok_and(|k| k.get("centre").is_some())
+}
+
+/// A scene cut's `centre`: [x, y] px of 1920×1080 (none: the kind as built).
+pub(super) fn centre_p(p: &Value) -> Result<Option<[f64; 2]>> {
+    match p.get("centre").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => {
+            pt(Some(v)).filter(|c| c[0].abs() <= 100_000.0 && c[1].abs() <= 100_000.0).map(Some).ok_or_else(|| bad(C, "`centre` is [x, y] (px of 1920×1080)"))
+        }
+    }
+}
+
+/// `centre` (the shelf's `scCentre_`): the kind's named overlay's mask circle goes to `c` (px of
+/// 1920×1080), and its last radius grows to the farthest frame corner + the table's margin when
+/// the table's would no longer cover the frame from there.
+fn centre_kind(kind: &str, k: &Value, c: [f64; 2]) -> Result<Value> {
+    let spec = k.get("centre").ok_or_else(|| bad(C, format!("{kind} takes no `centre`")))?;
+    let target = spec.get("overlay").and_then(Value::as_str).ok_or_else(|| bad(C, format!("{kind}: the table's centre names no overlay")))?;
+    let margin = spec.get("margin").and_then(Value::as_f64).filter(|m| m.is_finite()).unwrap_or(0.0);
+    let far = [[0.0, 0.0], [1920.0, 0.0], [0.0, 1080.0], [1920.0, 1080.0]].iter().map(|p: &[f64; 2]| (p[0] - c[0]).hypot(p[1] - c[1])).fold(0.0, f64::max);
+    let mut m = k.clone();
+    let mut done = false;
+    if let Some(Value::Array(ovs)) = m.get_mut("overlays") {
+        for ov in ovs.iter_mut() {
+            if ov.get("name").and_then(Value::as_str) != Some(target) {
+                continue;
+            }
+            let Some(mask) = ov.get_mut("mask").filter(|m| m.get("circle").is_some()) else { continue };
+            mask["circle"] = json!([c[0], c[1]]);
+            if let Some(Value::Array(vs)) = mask.get_mut("keys").and_then(|k| k.get_mut("radius")).and_then(|r| r.get_mut("v"))
+                && let Some(last) = vs.last_mut()
+            {
+                let r = last.as_f64().unwrap_or(0.0);
+                *last = json!(r.max((far + margin).ceil()));
+            }
+            done = true;
+        }
+    }
+    if !done {
+        return Err(bad(C, format!("{kind}: no circle overlay “{target}” for the centre")));
+    }
+    Ok(m)
+}
+
 /// A scene cut on the pair (the previous transition is gone already; `dir` checked already).
 pub(super) fn apply(s: &mut Session, p: &Value, kind: &str, cid: ItemId, old: LayerId, new: LayerId, removed: Removed) -> Result<Applied> {
     let k = kind_spec(kind)?;
-    let mut a = match dir_matrix(kind, p)? {
-        Some(m) => {
-            let mapped = Dir::new(m).kind(k, kind)?;
-            apply_family(s, Family::Scene, &mapped, p, kind, cid, old, new, removed)?
-        }
-        None => apply_family(s, Family::Scene, k, p, kind, cid, old, new, removed)?,
+    // The dir first, then the centre (as the shelf).
+    let mut k = match dir_matrix(kind, p)? {
+        Some(m) => Dir::new(m).kind(k, kind)?,
+        None => k.clone(),
     };
+    if let Some(c) = centre_p(p)? {
+        k = centre_kind(kind, &k, c)?;
+    }
+    let mut a = apply_family(s, Family::Scene, &k, p, kind, cid, old, new, removed)?;
     let dir = p.get("dir").filter(|v| !v.is_null()).cloned().or_else(|| k.get("dir").and_then(|d| d.get("default")).cloned()).unwrap_or(Value::Null);
+    let centre =
+        k.get("overlays").and_then(Value::as_array).zip(k.get("centre").and_then(|c| c.get("overlay")).and_then(Value::as_str)).and_then(|(ovs, name)| {
+            ovs.iter().find(|o| o.get("name").and_then(Value::as_str) == Some(name)).and_then(|o| o.get("mask")).and_then(|m| m.get("circle")).cloned()
+        });
     if let Some(o) = a.reply.as_object_mut() {
         o.insert("dir".into(), dir);
+        if let Some(c) = centre {
+            o.insert("centre".into(), c);
+        }
     }
     Ok(a)
 }

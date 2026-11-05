@@ -4,7 +4,7 @@
   "time": "every t / in / out / land is SECONDS relative to the cut (the new layer's first frame); a caller snaps at + t to its comp's frames (round). One exception: an OLD-layer key at -1 reference frame or later (before the cut) goes on the last frame before the cut at any fps (a Launch out's peak on the last old frame; in seconds it would land 2 frames early at 60 fps and freeze that frame)",
   "fps / cutFrame / frames": "the reference's frame rate (exact, as a fraction string), the cut's frame index and the length of the approved demo comp",
   "layers": "old (outgoing shot), new (incoming shot) or window (into-window's window precomp): rest = the scale % the layer rests at; effects in stack order, each {name (the layer gets 'ZoomCut <kind> <name>'), effect id, set {param: value}, keys {param: track}, centre?}",
-  "track": "{t: [s], v: [values], ease: [one per segment: a Graph name | 'linear' | {out, in} custom influence % | {outSpeed, outInfluence, inSpeed, inInfluence} units/s], zoom? (a scale: multiplied by restScale / rest), offset? (a position added to the zoom centre), steps? ('twos': holds every 2 comp frames, phase: the cut shows the frame before it), fit? (evidence)}",
+  "track": "{t: [s], v: [values], ease: [one per segment: a Graph name | 'linear' | {out, in} custom influence % | {outSpeed, outInfluence, inSpeed, inInfluence} units/s], zoom? (a scale: multiplied by restScale / rest), offset? (a position added to the zoom centre), steps? ('twos': holds every 2 comp frames, phase: the cut shows the frame before it), fit? (evidence), lead? (comp frames: the track is read that much later, by expression valueAtTime(time + lead · frameDuration); lead 0.5 on a Transform effect with its own shutter, which EffectCraft centres on the frame, opens the shutter ON the frame (phase 0): a shot's first frame already moves, its last frame ends on the cut)}",
   "centre": "the Transform effect's anchor = position, in px of a 1920x1080 layer (scaled to the layer's real size); default [960, 540]",
   "restLayer": "the layer restScale overrides (default new)",
   "comp": "comp settings the version needs (motion blur samples for the Transform shutter): raised, never lowered",
@@ -24,6 +24,7 @@
   "twos-push",
   "zoom-through",
   "whip",
+  "whip-pan",
   "zoom-out-through",
   "punch",
   "flash",
@@ -1520,6 +1521,131 @@
     },
     "new": {
      "from": 1.0
+    },
+    "top": "old"
+   }
+  },
+  "whip-pan": {
+   "title": "Whip pan",
+   "reference": {
+    "z": "K05",
+    "who": "hf-keyframes-demo",
+    "where": "05 Whip pan",
+    "video": "The Vault/Rebuilds/hf-keyframes-demo/renders/05-whip-pan.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 52,
+   "frames": 120,
+   "energy": "high",
+   "land": 0.333667,
+   "looks": "A straight pan: the old shot leaves to the left (1 920 px in 10 frames, Fast out: full speed on its last frame) and the new one comes in from the right (10 frames, Expo Out 1: full speed on its first frame), the same speed on both sides of the cut. Real motion blur (360°, the shutter opening on each frame), mirrored edges fill what slides in.",
+   "use": "A change of place, topic or time with energy: 'meanwhile', the next example, a quick jump to another shot.",
+   "layers": {
+    "old": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 300,
+        "outputHeight": 100,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Whip",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 360
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.333667,
+          0.0
+         ],
+         "v": [
+          [
+           0,
+           0
+          ],
+          [
+           -1920,
+           0
+          ]
+         ],
+         "ease": [
+          "Fast out"
+         ],
+         "offset": true,
+         "lead": 0.5,
+         "fit": {
+          "note": "as built in hf-keyframes-demo build.jsx (05 Whip pan), approved by Elias 5 Nov 2026 after his fix (10 f each side)"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "rest": 100,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 300,
+        "outputHeight": 100,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Whip",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 360
+       },
+       "keys": {
+        "position": {
+         "t": [
+          0.0,
+          0.333667
+         ],
+         "v": [
+          [
+           1920,
+           0
+          ],
+          [
+           0,
+           0
+          ]
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ],
+         "offset": true,
+         "lead": 0.5,
+         "fit": {
+          "note": "as built in hf-keyframes-demo build.jsx (05 Whip pan), approved by Elias 5 Nov 2026 after his fix (10 f each side)"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0,
+     "in": 0
+    },
+    "new": {
+     "from": 0
     },
     "top": "old"
    }

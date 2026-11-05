@@ -1006,6 +1006,60 @@ fn trim_times(specs: &[Value], depth: usize, out: &mut Vec<f64>) {
     }
 }
 
+/// A scene cut's copies of a shot have picture over their whole span (the shelf's `scCopyCheck_`,
+/// before any change): a copy of the old shot on screen before the old shot's in point, or a copy
+/// of the new shot on screen before its footage starts, would show a hole (split-handoff's copies
+/// carry both shots for the whole split).
+fn copy_check(s: &Session, kind: &str, k: &Value, cx: &Cx, ol: &Layer, nl: &Layer) -> Result<()> {
+    let fr = cx.fr;
+    let frame = |t: Tick| fr.frame_at(fr.snap_nearest(t));
+    let w0 = arr(k, "window").first().and_then(Value::as_f64).unwrap_or(0.0);
+    for sp in arr(k, "overlays").iter().take(MAX_ITEMS) {
+        if sp.get("kind").and_then(Value::as_str) != Some("copy") || sp.get("of").is_some() {
+            continue;
+        }
+        let in_f = cx.frame(sp.get("in").and_then(Value::as_f64).unwrap_or(w0))?;
+        let shots: Vec<&str> = match sp.get("shots").and_then(Value::as_array) {
+            Some(a) => a.iter().filter_map(Value::as_str).collect(),
+            None => vec!["old", "new"],
+        };
+        for role in shots {
+            if role == "old" && frame(ol.in_point) > in_f {
+                return Err(bad(
+                    C,
+                    format!(
+                        "{kind}: “{}” starts at {} s, but its copy is on screen from {} s: the old layer needs to start by then",
+                        ol.name,
+                        fmt_s(ol.in_point),
+                        fmt_s(fr.tick_of(in_f))
+                    ),
+                ));
+            }
+            if role == "new" {
+                let t_in = match sp.get("trim").and_then(|t| t.get("new")).and_then(|r| r.get("in")).and_then(Value::as_f64) {
+                    Some(t) => cx.frame(t)?,
+                    None => in_f,
+                };
+                let from = in_f.max(t_in);
+                if let Some(src) = source_start(s, nl)
+                    && frame(src) > from
+                {
+                    return Err(bad(
+                        C,
+                        format!(
+                            "{kind}: its copy of “{}” is on screen from {} s, but its footage starts at {} s: it needs that much footage before its in point",
+                            nl.name,
+                            fmt_s(fr.tick_of(from)),
+                            fmt_s(src)
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// An FX cut on the pair (the previous transition is gone already).
 pub(super) fn apply(s: &mut Session, p: &Value, kind: &str, cid: ItemId, old: LayerId, new: LayerId, removed: Removed) -> Result<Applied> {
     let k = kind_spec(kind)?;
@@ -1120,9 +1174,15 @@ pub(super) fn apply_family(
     // FX cuts: while both shots show, the old one is on top (the new one starts under it). Scene
     // cuts that slide or fade the new shot in over the old one (`stack: new-over-old`): the new one
     // goes right above the old one.
+    // Scene cuts that uncover a copy of the new shot over the old one, the new shot starting under it
+    // (`stack: old-over-new`: linear-wipe, point-iris): the old one goes right above it, as an FX cut.
     let new_below = comp.index_of(new) > comp.index_of(old);
-    let restack = fam == Family::Fx && new_in_f < old_out_f && !new_below;
-    let stack = fam == Family::Scene && k.get("stack").and_then(Value::as_str) == Some("new-over-old") && new_below;
+    let stack_kind = k.get("stack").and_then(Value::as_str);
+    let restack = (fam == Family::Fx || stack_kind == Some("old-over-new")) && new_in_f < old_out_f && !new_below;
+    let stack = fam == Family::Scene && stack_kind == Some("new-over-old") && new_below;
+    if fam == Family::Scene {
+        copy_check(s, kind, k, &cx, ol, nl)?;
+    }
     let (w, h) = (comp.width, comp.height);
     let title = k.get("title").and_then(Value::as_str).unwrap_or(kind).to_string();
     let reference = {
@@ -1236,7 +1296,7 @@ pub(super) fn apply_family(
     if let Some(o) = reply.as_object_mut() {
         match fam {
             Family::Fx => o.insert("restacked".into(), json!(restack)),
-            Family::Scene => o.insert("stacked".into(), json!(stack)),
+            Family::Scene => o.insert("stacked".into(), json!(stack || restack)),
         };
     }
     Ok(Applied {

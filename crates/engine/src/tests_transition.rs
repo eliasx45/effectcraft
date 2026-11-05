@@ -1,5 +1,6 @@
 //! `transition.apply` (Animation ▸ Transitions ▸ Zoom Cut / FX Cut / Scene Cut): Elias's 12 zoom
-//! cuts (ZC1), 15 FX cuts (ZC2) and 15 scene cuts (ZC3) from the motion-kit shelf tables.
+//! cuts (ZC1), 15 FX cuts (ZC2) and 15 scene cuts (ZC3) from the motion-kit shelf tables, and the
+//! keyframe-move kinds whip-pan, linear-wipe, point-iris and split-handoff (ZC5).
 
 use effectcraft_keyframe::Interp;
 use effectcraft_project::{ItemId, LayerId, LayerSource, Project};
@@ -9,8 +10,21 @@ use serde_json::{Value, json};
 use crate::Session;
 use crate::render::RenderOpts;
 
-const KINDS: [&str; 12] =
-    ["kick", "blur-settle", "push-in", "into-window", "twos-card", "twos-push", "zoom-through", "whip", "zoom-out-through", "punch", "flash", "white-flash"];
+const KINDS: [&str; 13] = [
+    "kick",
+    "blur-settle",
+    "push-in",
+    "into-window",
+    "twos-card",
+    "twos-push",
+    "zoom-through",
+    "whip",
+    "whip-pan",
+    "zoom-out-through",
+    "punch",
+    "flash",
+    "white-flash",
+];
 
 const FX_KINDS: [&str; 15] = [
     "light-leak",
@@ -30,7 +44,7 @@ const FX_KINDS: [&str; 15] = [
     "page-burn",
 ];
 
-const SCENE_KINDS: [&str; 15] = [
+const SCENE_KINDS: [&str; 18] = [
     "push-slide",
     "vertical-push",
     "elastic-push",
@@ -46,13 +60,16 @@ const SCENE_KINDS: [&str; 15] = [
     "staggered-blocks",
     "horizontal-blinds",
     "vertical-blinds",
+    "linear-wipe",
+    "point-iris",
+    "split-handoff",
 ];
 
 /// The scene cuts that move the new shot right above the old one.
 const STACK_KINDS: [&str; 4] = ["elastic-push", "crossfade", "blur-crossfade", "focus-pull"];
 
 /// The kinds with a track key at the cut itself (t = 0 in the table).
-const CUT_KEY: [&str; 8] = ["kick", "into-window", "zoom-through", "whip", "zoom-out-through", "punch", "flash", "white-flash"];
+const CUT_KEY: [&str; 9] = ["kick", "into-window", "zoom-through", "whip", "whip-pan", "zoom-out-through", "punch", "flash", "white-flash"];
 
 /// A 384×216 comp of `secs` seconds at `fps` with two full-frame solids meeting at `at` s: the
 /// old one (red, below) plays up to it, the new one (blue, above) from it.
@@ -292,7 +309,7 @@ fn the_selection_or_the_playhead_picks_the_pair() {
     assert_eq!(ids("zoom-cut"), KINDS);
     assert_eq!(ids("fx-cut"), FX_KINDS);
     assert_eq!(ids("scene-cut"), SCENE_KINDS);
-    assert_eq!(kinds.as_array().unwrap().len(), 42);
+    assert_eq!(kinds.as_array().unwrap().len(), 46);
 }
 
 #[test]
@@ -756,10 +773,13 @@ fn every_scene_kind_applies_at_29_97_and_24_fps() {
                 assert!(it.name.starts_with(&pre) && it.comment == format!("SceneCut {old}->{new}"), "{kind}: item “{}” “{}”", it.name, it.comment);
             }
             assert!(r["effects"].as_array().unwrap().len() + r["layers"].as_array().unwrap().len() > 0, "{kind}: nothing added");
-            // cut_at puts the new shot above the old one already: no layer moves in the order, and
-            // every in / out point the kind changed is in `moved`.
-            assert_eq!(r["stacked"], json!(false), "{kind}");
-            assert!(r["moved"].as_array().unwrap().iter().all(|m| m["what"] != json!("order")), "{kind}: {}", r["moved"]);
+            // cut_at puts the new shot above the old one already: no layer moves in the order (but
+            // linear-wipe and point-iris put the old one over it), and every in / out point the kind
+            // changed is in `moved`.
+            let restack = OLD_OVER_NEW.contains(&kind);
+            assert_eq!(r["stacked"], json!(restack), "{kind}");
+            assert_eq!(moved(&r, old, "order").len(), usize::from(restack), "{kind}: {}", r["moved"]);
+            assert!(moved(&r, new, "order").is_empty(), "{kind}: {}", r["moved"]);
             let (now_old, now_new) = (timing(&s, cid, old), timing(&s, cid, new));
             assert_eq!(moved(&r, new, "in").len(), usize::from(now_new.0 != time_new.0), "{kind}: {}", r["moved"]);
             assert_eq!(moved(&r, old, "out").len(), usize::from(now_old.1 != time_old.1), "{kind}: {}", r["moved"]);
@@ -770,6 +790,10 @@ fn every_scene_kind_applies_at_29_97_and_24_fps() {
             assert!(transition_effects(&s, cid, old).is_empty() && transition_effects(&s, cid, new).is_empty(), "{kind}: undo removes the effects");
             assert_eq!(s.project.items.len(), items_before, "{kind}: undo removes the added items");
             assert_eq!((timing(&s, cid, old), timing(&s, cid, new)), (time_old, time_new), "{kind}: undo restores the trims");
+            if restack {
+                let comp = s.project.comp(ItemId(cid)).unwrap();
+                assert!(comp.index_of(LayerId(new)) < comp.index_of(LayerId(old)), "{kind}: undo restores the order");
+            }
         }
     }
 }
@@ -841,9 +865,9 @@ fn every_dir_of_the_kinds_that_have_one_applies() {
             }
         }
     }
-    // push-slide, vertical-push, elastic-push, squeeze, staggered-blocks: 4 each; diagonal-split 4;
-    // the blinds 2 each; at two frame rates.
-    assert_eq!(n, 2 * (6 * 4 + 2 + 2));
+    // push-slide, vertical-push, elastic-push, squeeze, staggered-blocks, linear-wipe: 4 each;
+    // diagonal-split 4; the blinds 2 each; at two frame rates.
+    assert_eq!(n, 2 * (7 * 4 + 2 + 2));
 }
 
 #[test]
@@ -1438,4 +1462,179 @@ fn transitions_on_a_shared_shot_never_collide_or_touch_each_other() {
     pair(&mut s, b, c, "light-leak").unwrap();
     assert!(names(&s, b).iter().all(|n| !n.starts_with("SceneCut push-slide ")), "{:?}", names(&s, b));
     assert_eq!(names(&s, b).iter().filter(|n| n.starts_with("SceneCut crossfade ")).count(), 1, "{:?}", names(&s, b));
+}
+
+// ---------------------------------------------------------------- keyframe moves (ZC5)
+
+#[test]
+fn whip_pan_reads_its_track_half_a_frame_ahead_on_its_own_shutter() {
+    for fps in [29.97, 24.0] {
+        let (mut s, cid, old, new, _) = cut_at(fps, 10.0, 4.0);
+        let samples = s.project.comp(ItemId(cid)).unwrap().motion_blur_samples;
+        let r = apply(&mut s, cid, old, new, "whip-pan").unwrap();
+        let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+        let cut_f = r["cutFrame"].as_i64().unwrap();
+        let n = (0.333667 * fr.as_f64()).round() as i64;
+        for (l, want, xs) in [(old, [cut_f - n, cut_f], [192.0, 192.0 - 384.0]), (new, [cut_f, cut_f + n], [192.0 + 384.0, 192.0])] {
+            let layer = s.project.comp(ItemId(cid)).unwrap().layer(LayerId(l)).unwrap().clone();
+            let g = effect(&s, cid, l, "ZoomCut whip-pan Whip");
+            // Its own 360° shutter: the comp's shutter is never touched.
+            assert_eq!(g.prop("useCompositionShutterAngle").unwrap().value, effectcraft_project::Value::Bool(false), "{fps}");
+            assert_eq!(g.prop("shutterAngle").unwrap().value.components(), [360.0], "{fps}");
+            let pos = g.prop("position").unwrap();
+            let frames: Vec<i64> = pos.keys.iter().map(|k| fr.frame_at(layer.comp_time(k.time))).collect();
+            assert_eq!(frames, want, "{fps}: {} keys", layer.name);
+            let got: Vec<f64> = pos.keys.iter().map(|k| k.value.components()[0]).collect();
+            assert!((got[0] - xs[0]).abs() < 1e-6 && (got[1] - xs[1]).abs() < 1e-6, "{fps}: {got:?} vs {xs:?}");
+            // lead 0.5: read half a frame later, so the shutter opens on the frame.
+            assert_eq!(pos.expr.as_ref().map(|e| e.text.as_str()), Some("valueAtTime(time + 0.5 * thisComp.frameDuration)"), "{fps}");
+            // Mirrored edges fill what slides in.
+            let tile = effect(&s, cid, l, "ZoomCut whip-pan Mirror edges");
+            assert_eq!(tile.prop("outputWidth").unwrap().value.components(), [300.0]);
+        }
+        assert_eq!(s.project.comp(ItemId(cid)).unwrap().motion_blur_samples, samples, "the comp's settings stay");
+    }
+}
+
+/// The scene cuts that move the old shot right above the new one (a copy of the new shot is
+/// uncovered over it).
+const OLD_OVER_NEW: [&str; 2] = ["linear-wipe", "point-iris"];
+
+#[test]
+fn linear_wipe_and_point_iris_uncover_a_copy_of_the_new_shot_over_the_old_one() {
+    for kind in OLD_OVER_NEW {
+        for fps in [29.97, 24.0] {
+            let (mut s, cid, old, new, cut) = cut_at(fps, 10.0, 4.0);
+            let r = apply(&mut s, cid, old, new, kind).unwrap_or_else(|e| panic!("{kind} at {fps}: {e}"));
+            let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+            let start = r["cutFrame"].as_i64().unwrap() + (-0.7007 * fr.as_f64()).round() as i64;
+            assert_eq!(r["startFrame"].as_i64(), Some(start), "{kind} at {fps}");
+            // The new shot starts at the window's start, under the old one (moved right above it).
+            assert_eq!(fr.frame_at(timing(&s, cid, new).0), start, "{kind} at {fps}");
+            assert!((timing(&s, cid, old).1.seconds() - cut).abs() < 1e-9, "{kind}: the old shot still ends on the cut");
+            assert_eq!(r["stacked"], json!(true), "{kind}");
+            let comp = s.project.comp(ItemId(cid)).unwrap();
+            assert_eq!(comp.index_of(LayerId(old)).map(|i| i + 1), comp.index_of(LayerId(new)), "{kind}: the old shot right above the new one");
+            assert_eq!(moved(&r, old, "order").len(), 1, "{kind}: {}", r["moved"]);
+            // The copy: a precomp of the new shot from the window's start, on top, ending on the cut.
+            let name = if kind == "linear-wipe" { "SceneCut linear-wipe Wipe" } else { "SceneCut point-iris Iris" };
+            let c = layer_named(&s, cid, name);
+            assert_eq!(comp.index_of(c.id), Some(0), "{kind}: the copy is on top");
+            assert_eq!((fr.frame_at(c.in_point), fr.frame_at(c.out_point)), (start, r["cutFrame"].as_i64().unwrap()), "{kind}");
+            let LayerSource::Comp { item } = c.source else { panic!("a precomp") };
+            assert_eq!(s.project.comp(item).unwrap().layers.len(), 1, "{kind}: a copy of the new shot only");
+            let mp = c.masks().unwrap().groups().next().unwrap().prop("path").unwrap();
+            let frames: Vec<i64> = mp.keys.iter().map(|k| fr.frame_at(c.comp_time(k.time))).collect();
+            assert_eq!(frames, [start, r["cutFrame"].as_i64().unwrap()], "{kind} at {fps}");
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 2, "{kind}: undo");
+        }
+    }
+    // linear-wipe: a hard edge from the right edge (x 384 of a 384-wide comp) to the left one.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "linear-wipe").unwrap();
+    let mp = layer_named(&s, cid, "SceneCut linear-wipe Wipe").masks().unwrap().groups().next().unwrap().prop("path").unwrap().clone();
+    let xs = |k: &effectcraft_keyframe::Keyframe| {
+        let effectcraft_project::Value::Path(p) = &k.value else { panic!("a path key") };
+        p.vertices.iter().map(|v| v[0]).collect::<Vec<f64>>()
+    };
+    assert_eq!(xs(&mp.keys[0]), [384.0, 384.0, 384.0, 384.0]);
+    assert_eq!(xs(&mp.keys[1]), [0.0, 384.0, 384.0, 0.0]);
+    // dir right: from the left edge.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply_dir(&mut s, cid, old, new, "linear-wipe", "right").unwrap();
+    let mp = layer_named(&s, cid, "SceneCut linear-wipe Wipe").masks().unwrap().groups().next().unwrap().prop("path").unwrap().clone();
+    assert_eq!(xs(&mp.keys[0]), [0.0, 0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn point_iris_opens_where_centre_says_and_still_covers_the_frame() {
+    // The circle's top vertex: [cx, cy − r] (layer px of the 384×216 copy: 1920×1080 × 0.2).
+    let top = |s: &Session, cid: u64, key: usize| -> [f64; 2] {
+        let mp = layer_named(s, cid, "SceneCut point-iris Iris").masks().unwrap().groups().next().unwrap().prop("path").unwrap().clone();
+        let effectcraft_project::Value::Path(p) = &mp.keys[key].value else { panic!("a path key") };
+        p.vertices[0]
+    };
+    // Default: the demo face [960, 440], the table's last radius 1250 already covers the frame.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    let r = apply(&mut s, cid, old, new, "point-iris").unwrap();
+    assert_eq!(r["centre"], json!([960, 440]));
+    let t = top(&s, cid, 1);
+    assert!((t[0] - 192.0).abs() < 1e-6 && (t[1] - (88.0 - 250.0)).abs() < 1e-6, "{t:?}");
+    // A corner: the last radius grows to the farthest corner + 96 px (ceil(2067.1 + 96) = 2164).
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    let r = s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "point-iris", "centre": [100, 100]})).unwrap();
+    assert_eq!(r["centre"], json!([100.0, 100.0]));
+    let t0 = top(&s, cid, 0);
+    assert!((t0[0] - 20.0).abs() < 1e-6 && (t0[1] - (20.0 - 0.4)).abs() < 1e-6, "the circle opens at the centre: {t0:?}");
+    let t = top(&s, cid, 1);
+    assert!((t[0] - 20.0).abs() < 1e-6 && (t[1] - (20.0 - 2164.0 * 0.2)).abs() < 1e-6, "{t:?}");
+    // centre on a kind without it, or not a point: errors that change nothing.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    let before = s.project.clone();
+    let e = s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "squeeze", "centre": [100, 100]})).unwrap_err().to_string();
+    assert!(e.contains("point-iris") && e.contains("a scene cut"), "{e}");
+    assert!(s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "point-iris", "centre": "face"})).is_err());
+    assert!(s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "light-leak", "centre": [1, 2]})).is_err());
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project), "nothing changed");
+    // A zoom cut's centre still works.
+    assert!(s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "kick", "centre": [960, 400]})).is_ok());
+}
+
+#[test]
+fn split_handoff_slides_masked_copies_of_both_shots_and_trims_nothing() {
+    for fps in [29.97, 24.0] {
+        let (mut s, cid, old, new, _) = cut_at(fps, 10.0, 4.0);
+        let (o0, n0) = (timing(&s, cid, old), timing(&s, cid, new));
+        let r = apply(&mut s, cid, old, new, "split-handoff").unwrap_or_else(|e| panic!("{fps}: {e}"));
+        assert_eq!((timing(&s, cid, old), timing(&s, cid, new)), (o0, n0), "{fps}: no trims");
+        assert!(r["moved"].as_array().unwrap().is_empty(), "{fps}: {}", r["moved"]);
+        let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+        let cut_f = r["cutFrame"].as_i64().unwrap();
+        let start = cut_f + (-1.9019 * fr.as_f64()).round() as i64;
+        assert_eq!(r["startFrame"].as_i64(), Some(start));
+        for (name, shot_count) in [("SceneCut split-handoff Right", 1), ("SceneCut split-handoff Left", 1)] {
+            let c = layer_named(&s, cid, name);
+            let LayerSource::Comp { item } = c.source else { panic!("{name}: a precomp") };
+            assert_eq!(s.project.comp(item).unwrap().layers.len(), shot_count, "{name}");
+            assert_eq!((fr.frame_at(c.in_point), fr.frame_at(c.out_point)), (start, cut_f), "{fps}: {name}");
+            // Its slide (straight) and its mask: 5 keys on the comp's frames.
+            let pos = c.props.prop("transform/position").unwrap();
+            assert_eq!(pos.keys.len(), 5, "{name}");
+            assert!(pos.keys.iter().all(|k| !k.spatial_auto && k.spatial_in == [0.0; 3]), "{name}: a straight slide");
+            let mp = c.masks().unwrap().groups().next().unwrap().prop("path").unwrap();
+            assert_eq!(mp.keys.len(), 5, "{name}");
+        }
+        // The new shot's copy starts 1.9 s early, inside its precomp.
+        let right = layer_named(&s, cid, "SceneCut split-handoff Right");
+        let LayerSource::Comp { item } = right.source else { panic!() };
+        assert_eq!(fr.frame_at(s.project.comp(item).unwrap().layers.iter().next().unwrap().in_point), start, "{fps}");
+        let div = layer_named(&s, cid, "SceneCut split-handoff Divider");
+        assert_eq!(div.props.prop("transform/opacity").unwrap().value.components(), [90.0]);
+        assert_eq!(div.props.prop("transform/position").unwrap().keys.len(), 5);
+        // The Left copy's slide starts at its half: [−540, 0] from the centre of 384×216 → x 84.
+        let left = layer_named(&s, cid, "SceneCut split-handoff Left");
+        let x0 = left.props.prop("transform/position").unwrap().keys[0].value.components()[0];
+        assert!((x0 - (192.0 - 108.0)).abs() < 1e-6, "{x0}");
+    }
+    // The old shot must already play when its copy is on screen (1.9 s before the cut).
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    s.execute("layer.timing", json!({"layers": [old], "in": 3.0})).unwrap();
+    let before = s.project.clone();
+    let e = apply(&mut s, cid, old, new, "split-handoff").unwrap_err().to_string();
+    assert!(e.contains("needs to start by then"), "{e}");
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project), "nothing changed");
+    // Shots with sound keep it all: nothing is trimmed, so no copy.
+    let (mut s, cid, old, new, _) = cut_at_audio(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "split-handoff").unwrap();
+    assert!(keeps(&s, cid).is_empty());
+}
+
+#[test]
+fn keyframe_move_transitions_are_in_the_menus() {
+    let json = serde_json::to_string(crate::menus::menu_bar()).unwrap();
+    for kind in ["whip-pan", "linear-wipe", "point-iris", "split-handoff"] {
+        assert!(json.contains(&format!("{{\"kind\":\"{kind}\"}}")), "{kind} isn't in the menus");
+    }
+    assert!(!include_str!("../presets/zoom-cut.kinds.json").contains(concat!("/", "Users", "/")));
 }

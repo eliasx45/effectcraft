@@ -1008,6 +1008,7 @@ Animation
       Push-in on Twos | transition.apply {"kind":"twos-push"}
       Zoom Through | transition.apply {"kind":"zoom-through"}
       Whip Through | transition.apply {"kind":"whip"}
+      Whip Pan | transition.apply {"kind":"whip-pan"}
       Zoom-out Through | transition.apply {"kind":"zoom-out-through"}
       Punch Through | transition.apply {"kind":"punch"}
       Flash Zoom | transition.apply {"kind":"flash"}
@@ -1044,6 +1045,9 @@ Animation
       Staggered Blocks | transition.apply {"kind":"staggered-blocks"}
       Horizontal Blinds | transition.apply {"kind":"horizontal-blinds"}
       Vertical Blinds | transition.apply {"kind":"vertical-blinds"}
+      Linear Wipe | transition.apply {"kind":"linear-wipe"}
+      Point Iris | transition.apply {"kind":"point-iris"}
+      Split-screen Handoff | transition.apply {"kind":"split-handoff"}
   ---
   Add Keyframe | anim.addKeyframe
   Toggle Hold Keyframe | keys.toggleHold

@@ -6,7 +6,7 @@
   "window": "[start, end] of the whole transition (the <id>-start hit; `dur` scales every time by dur / (end − start))",
   "land": "when everything has settled (the <id>-land hit)",
   "shots": "{old: {out}, new: {in}}: where the shots are trimmed (default 0 = at); a negative new.in starts the new shot early (it needs that much footage before its in-point); a negative old.out ends the old shot early (a copy carries it); a positive new.in leaves a gap (color-dip: the dip colour)",
-  "stack": "new-over-old: the kind needs the new shot above the old one (it slides or fades in over it); the caller moves the new shot right above the old one when it is below. Absent = either order (the shots never overlap where it matters)",
+  "stack": "new-over-old: the kind needs the new shot above the old one (it slides or fades in over it); the caller moves the new shot right above the old one when it is below. Absent = either order (the shots never overlap where it matters); old-over-new: the kind needs the OLD shot above the new one while both play (the new shot starts early under it, a masked copy of the new shot on top reveals it); the caller moves the old shot right above the new one when it is below",
   "dir": "{default, maps: {dir: [[a, b], [c, d]]}}: the kind's data is written for `default`; another dir maps every geometric value with its 2×2 matrix in centred, normalised frame coords (u = x / 1920 − 0.5, v = y / 1080 − 0.5; [u', v'] = M · [u, v]): absolute points (positions, pivots, mask circle centres, mask polygon vertices) x' = (u' + 0.5) · 1920, y' = (v' + 0.5) · 1080; offsets [dx, dy] → M · [dx / 1920, dy / 1080] · [1920, 1080]; when M swaps the axes (M[0][0] = 0), every effect param named …Width ↔ …Height (scaleWidth ↔ scaleHeight, outputWidth ↔ outputHeight) and rect sizes [w, h] → [h · 1920 / 1080, w · 1080 / 1920]. A kind without `dir` takes none (an error)",
   "layers": "old / new: effects added to the shot, in stack order, each {name (the effect becomes 'SceneCut <kind> <name>'), effect id, set {param: value}, keys {param: track}, expr {param: expression}, pivot? [x, y] (px of the 1920x1080 shot: a Transform effect's anchor = position = this point; default the centre)}; the shot's own transform is never touched",
   "track": "{t: [s], v: [values], ease: [one per segment: a Graph name (core/graphs.jsx) | 'linear' (hold the value / untouched) | 'hold' (a hold keyframe: the value jumps at the next key)], offset? (position values are offsets from the layer / Transform-effect centre or pivot, px of 1920x1080), spatial? ('linear': linear spatial interpolation on every key, a straight path with no overshoot between keys)}",
@@ -14,7 +14,8 @@
   "underlays": "a solid named BG / Dip with where: below is the dark backing the approved comps had under the shots (#08080b, tint): it shows where the approved render shows it on purpose (squeeze's gap, the card flip's surround, the blur crossfade's dip, the color dip) and nothing else ever shows the comp background",
   "colours": "#rrggbb",
   "energy": "calm | medium | high",
-  "demo": "the approved demo: old = presenter-micah, new = presenter-dharya (from = source s at comp 0), or new.titleCard = s relative to `at` when the transitions-a title card's text starts its entrance (navy 4-colour gradient, 'Part two' / 'The next point', slide up 100 px on Expo Out 1 + Entrance fade, the sub 3 frames later)"
+  "demo": "the approved demo: old = presenter-micah, new = presenter-dharya (from = source s at comp 0), or new.titleCard = s relative to `at` when the transitions-a title card's text starts its entrance (navy 4-colour gradient, 'Part two' / 'The next point', slide up 100 px on Expo Out 1 + Entrance fade, the sub 3 frames later); old.file / new.file: another clip from shelf/assets/media (default presenter-micah / presenter-dharya)",
+  "centre": "{overlay, margin}: the kind takes a `centre` [x, y] (px of 1920x1080): the named overlay's mask circle goes there and its last radius grows, when needed, to the farthest frame corner + margin px (so the circle still covers the frame); a centre on a kind without it is an error"
  },
  "default": "push-slide",
  "order": [
@@ -32,7 +33,10 @@
   "color-dip",
   "staggered-blocks",
   "horizontal-blinds",
-  "vertical-blinds"
+  "vertical-blinds",
+  "linear-wipe",
+  "point-iris",
+  "split-handoff"
  ],
  "kinds": {
   "push-slide": {
@@ -2556,6 +2560,649 @@
     },
     "new": {
      "titleCard": 0.166833
+    }
+   }
+  },
+  "linear-wipe": {
+   "title": "Linear wipe",
+   "from": "HyperFrames keyframes skill, creator-editing row 7 (Wipe + iris cut: the directional wipe)",
+   "reference": {
+    "t": "07",
+    "batch": "hf-keyframes-demo",
+    "comp": "07 Wipe and iris cut",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/07-wipe-and-iris-cut.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 51,
+   "frames": 81,
+   "energy": "medium",
+   "window": [
+    -0.7007,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "A hard vertical edge sweeps from the right edge to the left one in 0.7 s (Expo Out 1: fast first, long settle), the new shot uncovered behind it. No feather, no line, nothing moves inside the shots.",
+   "use": "A clean graphic change to the next shot or section; the next item of a list (dir: left · right · up · down).",
+   "dir": {
+    "default": "left",
+    "maps": {
+     "left": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "right": [
+      [
+       -1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "up": [
+      [
+       0,
+       1
+      ],
+      [
+       1,
+       0
+      ]
+     ],
+     "down": [
+      [
+       0,
+       1
+      ],
+      [
+       -1,
+       0
+      ]
+     ]
+    }
+   },
+   "stack": "old-over-new",
+   "shots": {
+    "new": {
+     "in": -0.7007
+    }
+   },
+   "overlays": [
+    {
+     "name": "Wipe",
+     "kind": "copy",
+     "shots": [
+      "new"
+     ],
+     "trim": {
+      "new": {
+       "in": -0.7007
+      }
+     },
+     "in": -0.7007,
+     "out": 0.0,
+     "mask": {
+      "keys": {
+       "path": {
+        "t": [
+         -0.7007,
+         0.0
+        ],
+        "v": [
+         [
+          [
+           1920,
+           0
+          ],
+          [
+           1920,
+           0
+          ],
+          [
+           1920,
+           1080
+          ],
+          [
+           1920,
+           1080
+          ]
+         ],
+         [
+          [
+           0,
+           0
+          ],
+          [
+           1920,
+           0
+          ],
+          [
+           1920,
+           1080
+          ],
+          [
+           0,
+           1080
+          ]
+         ]
+        ],
+        "ease": [
+         "Expo Out 1 (Elias)"
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "point-iris": {
+   "title": "Point iris",
+   "from": "HyperFrames keyframes skill, creator-editing row 7 (Wipe + iris cut: the iris)",
+   "reference": {
+    "t": "07",
+    "batch": "hf-keyframes-demo",
+    "comp": "07 Wipe and iris cut",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/07-wipe-and-iris-cut.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 51,
+   "frames": 81,
+   "energy": "medium",
+   "window": [
+    -0.7007,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "A hard-edged circle of the new shot opens from a point (by default the demo footage's face, 100 px above the frame centre) and grows past the corners in 0.7 s (Expo Out 1).",
+   "use": "A reveal from a subject: the speaker's face, a product, the thing being pointed at; 'here's who / what' (centre: the point).",
+   "centre": {
+    "overlay": "Iris",
+    "margin": 96
+   },
+   "stack": "old-over-new",
+   "shots": {
+    "new": {
+     "in": -0.7007
+    }
+   },
+   "overlays": [
+    {
+     "name": "Iris",
+     "kind": "copy",
+     "shots": [
+      "new"
+     ],
+     "trim": {
+      "new": {
+       "in": -0.7007
+      }
+     },
+     "in": -0.7007,
+     "out": 0.0,
+     "mask": {
+      "circle": [
+       960,
+       440
+      ],
+      "keys": {
+       "radius": {
+        "t": [
+         -0.7007,
+         0.0
+        ],
+        "v": [
+         2,
+         1250
+        ],
+        "ease": [
+         "Expo Out 1 (Elias)"
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "split-handoff": {
+   "title": "Split-screen handoff",
+   "from": "HyperFrames keyframes skill, creator-editing row 8 (Split-screen handoff)",
+   "reference": {
+    "t": "08",
+    "batch": "hf-keyframes-demo",
+    "comp": "08 Split-screen handoff",
+    "render": "The Vault/Rebuilds/hf-keyframes-demo/renders/08-split-screen-handoff.mp4",
+    "build": "The Vault/Rebuilds/hf-keyframes-demo/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 57,
+   "frames": 120,
+   "energy": "calm",
+   "window": [
+    -1.9019,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "The frame splits 50/50 at once, old shot left, new shot right, with a 4 px white divider (90 %); after 13 frames the divider slides to 2/3 (17 f, Expo In-Out), holds 9 frames, then the new shot takes the whole frame as the divider runs off the left edge (18 f, Expo In-Out). Each shot slides with its half, so the faces stay framed.",
+   "use": "Two sides side by side, then the answer wins: before / after, us vs them, a guest taking over; a handoff between two speakers.",
+   "overlays": [
+    {
+     "name": "Right",
+     "kind": "copy",
+     "shots": [
+      "new"
+     ],
+     "trim": {
+      "new": {
+       "in": -1.9019
+      }
+     },
+     "in": -1.9019,
+     "out": 0.0,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -1.9019,
+        -1.468133,
+        -0.9009,
+        -0.6006,
+        0.0
+       ],
+       "v": [
+        [
+         480,
+         0
+        ],
+        [
+         480,
+         0
+        ],
+        [
+         640,
+         0
+        ],
+        [
+         640,
+         0
+        ],
+        [
+         0,
+         0
+        ]
+       ],
+       "ease": [
+        "linear",
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "offset": true,
+       "spatial": "linear"
+      }
+     },
+     "mask": {
+      "keys": {
+       "path": {
+        "t": [
+         -1.9019,
+         -1.468133,
+         -0.9009,
+         -0.6006,
+         0.0
+        ],
+        "v": [
+         [
+          [
+           480,
+           0
+          ],
+          [
+           1440,
+           0
+          ],
+          [
+           1440,
+           1080
+          ],
+          [
+           480,
+           1080
+          ]
+         ],
+         [
+          [
+           480,
+           0
+          ],
+          [
+           1440,
+           0
+          ],
+          [
+           1440,
+           1080
+          ],
+          [
+           480,
+           1080
+          ]
+         ],
+         [
+          [
+           640,
+           0
+          ],
+          [
+           1280,
+           0
+          ],
+          [
+           1280,
+           1080
+          ],
+          [
+           640,
+           1080
+          ]
+         ],
+         [
+          [
+           640,
+           0
+          ],
+          [
+           1280,
+           0
+          ],
+          [
+           1280,
+           1080
+          ],
+          [
+           640,
+           1080
+          ]
+         ],
+         [
+          [
+           -6,
+           0
+          ],
+          [
+           1920,
+           0
+          ],
+          [
+           1920,
+           1080
+          ],
+          [
+           -6,
+           1080
+          ]
+         ]
+        ],
+        "ease": [
+         "linear",
+         "Expo In-Out (Elias)",
+         "linear",
+         "Expo In-Out (Elias)"
+        ]
+       }
+      }
+     }
+    },
+    {
+     "name": "Left",
+     "kind": "copy",
+     "shots": [
+      "old"
+     ],
+     "in": -1.9019,
+     "out": 0.0,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -1.9019,
+        -1.468133,
+        -0.9009,
+        -0.6006,
+        0.0
+       ],
+       "v": [
+        [
+         -540,
+         0
+        ],
+        [
+         -540,
+         0
+        ],
+        [
+         -380,
+         0
+        ],
+        [
+         -380,
+         0
+        ],
+        [
+         -700,
+         0
+        ]
+       ],
+       "ease": [
+        "linear",
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "offset": true,
+       "spatial": "linear"
+      }
+     },
+     "mask": {
+      "keys": {
+       "path": {
+        "t": [
+         -1.9019,
+         -1.468133,
+         -0.9009,
+         -0.6006,
+         0.0
+        ],
+        "v": [
+         [
+          [
+           540,
+           0
+          ],
+          [
+           1500,
+           0
+          ],
+          [
+           1500,
+           1080
+          ],
+          [
+           540,
+           1080
+          ]
+         ],
+         [
+          [
+           540,
+           0
+          ],
+          [
+           1500,
+           0
+          ],
+          [
+           1500,
+           1080
+          ],
+          [
+           540,
+           1080
+          ]
+         ],
+         [
+          [
+           380,
+           0
+          ],
+          [
+           1660,
+           0
+          ],
+          [
+           1660,
+           1080
+          ],
+          [
+           380,
+           1080
+          ]
+         ],
+         [
+          [
+           380,
+           0
+          ],
+          [
+           1660,
+           0
+          ],
+          [
+           1660,
+           1080
+          ],
+          [
+           380,
+           1080
+          ]
+         ],
+         [
+          [
+           700,
+           0
+          ],
+          [
+           694,
+           0
+          ],
+          [
+           694,
+           1080
+          ],
+          [
+           700,
+           1080
+          ]
+         ]
+        ],
+        "ease": [
+         "linear",
+         "Expo In-Out (Elias)",
+         "linear",
+         "Expo In-Out (Elias)"
+        ]
+       }
+      }
+     }
+    },
+    {
+     "name": "Divider",
+     "kind": "rect",
+     "size": [
+      4,
+      1080
+     ],
+     "position": [
+      960,
+      540
+     ],
+     "colour": "#ffffff",
+     "in": -1.9019,
+     "out": 0.0,
+     "set": {
+      "transform/opacity": 90
+     },
+     "keys": {
+      "transform/position": {
+       "t": [
+        -1.9019,
+        -1.468133,
+        -0.9009,
+        -0.6006,
+        0.0
+       ],
+       "v": [
+        [
+         960,
+         540
+        ],
+        [
+         960,
+         540
+        ],
+        [
+         1280,
+         540
+        ],
+        [
+         1280,
+         540
+        ],
+        [
+         -6,
+         540
+        ]
+       ],
+       "ease": [
+        "linear",
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0,
+     "file": "presenter-dharya-long.mp4"
     }
    }
   }
