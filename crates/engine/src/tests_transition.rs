@@ -1150,3 +1150,255 @@ fn scene_cut_menu_lists_the_15_kinds() {
     // The shipped table is the shelf's copy with labels instead of local paths.
     assert!(!include_str!("../presets/scene-cut.kinds.json").contains(concat!("/", "Users", "/")));
 }
+
+// ---------------------------------------------------------------- safety rules (ZC4)
+
+/// [`cut_at`] with two footage shots that have sound (stills with an audio stream: nothing is read).
+fn cut_at_audio(fps: f64, secs: f64, at: f64) -> (Session, u64, u64, u64, f64) {
+    use effectcraft_project::{Footage, FootageKind, ItemKind};
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Cut", "width": 384, "height": 216, "frameRate": fps, "duration": secs})).unwrap();
+    let cid = s.active_comp_id().unwrap().0;
+    let add = |s: &mut Session, name: &str| {
+        let f = Footage {
+            path: format!("/nowhere/{name}.mov"),
+            kind: FootageKind::Still,
+            width: 384,
+            height: 216,
+            has_video: true,
+            has_audio: true,
+            ..Default::default()
+        };
+        let item = std::sync::Arc::make_mut(&mut s.project).add_item(name, Default::default(), None, ItemKind::Footage(f)).0;
+        let l = s.execute("layer.addItem", json!({"comp": cid, "item": item})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.rename", json!({"layers": [l], "name": name})).unwrap();
+        l
+    };
+    let old = add(&mut s, "A Footage");
+    let new = add(&mut s, "B Footage");
+    s.execute("layer.timing", json!({"layers": [old], "out": at})).unwrap();
+    s.execute("layer.timing", json!({"layers": [new], "in": at})).unwrap();
+    let cut = s.active_comp().unwrap().layer(LayerId(new)).unwrap().in_point.seconds();
+    (s, cid, old, new, cut)
+}
+
+/// The audio keep copies in the comp: (id, name, in, out, video, audio, index).
+fn keeps(s: &Session, cid: u64) -> Vec<(u64, String, f64, f64, bool, bool, usize)> {
+    let comp = s.project.comp(ItemId(cid)).unwrap();
+    comp.layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.name.contains(" keep)"))
+        .map(|(i, l)| (l.id.0, l.name.clone(), l.in_point.seconds(), l.out_point.seconds(), l.switches.video, l.switches.audio, i))
+        .collect()
+}
+
+fn index(s: &Session, cid: u64, l: u64) -> usize {
+    s.project.comp(ItemId(cid)).unwrap().index_of(LayerId(l)).unwrap()
+}
+
+#[test]
+fn trimmed_shots_keep_their_sound() {
+    // diagonal-split ends the old shot 0.5 s early: its sound plays on to the cut from a copy.
+    let (mut s, cid, old, new, cut) = cut_at_audio(29.97, 10.0, 4.0);
+    let r = apply(&mut s, cid, old, new, "diagonal-split").unwrap();
+    let (_, oout) = timing(&s, cid, old);
+    assert!(oout.seconds() < cut - 0.4, "the picture is trimmed");
+    let k = keeps(&s, cid);
+    assert_eq!(k.len(), 1, "{k:?}");
+    let (kid, name, a, b, video, audio, i) = k[0].clone();
+    assert_eq!(name, "A Footage audio (SceneCut keep)");
+    assert!((a - oout.seconds()).abs() < 1e-9 && (b - cut).abs() < 1e-9, "the copy covers exactly the trimmed span: {a}–{b}");
+    assert!(!video && audio, "audio only");
+    assert_eq!(i, index(&s, cid, old) + 1, "right below its shot");
+    let comp = s.project.comp(ItemId(cid)).unwrap();
+    let (ol, kl) = (comp.layer(LayerId(old)).unwrap(), comp.layer(LayerId(kid)).unwrap());
+    assert_eq!((ol.source.item(), ol.comp_time(Tick::ZERO)), (kl.source.item(), kl.comp_time(Tick::ZERO)), "the same source time");
+    assert!(ol.switches.audio && comp.layer(LayerId(new)).unwrap().switches.audio, "no shot's audio is turned off");
+    assert!(kl.comment.starts_with(&format!("SceneCut {old}->{new}")), "tagged for the pair: {}", kl.comment);
+    // The reply lists it, with frames.
+    let m = moved(&r, kid, "audio-keep");
+    assert_eq!(m.len(), 1, "{}", r["moved"]);
+    assert_eq!(m[0]["of"], json!(old));
+    let fr = comp.frame_rate;
+    assert_eq!(m[0]["toFrame"].as_i64(), Some(r["cutFrame"].as_i64().unwrap()));
+    assert_eq!(m[0]["fromFrame"].as_i64(), Some(fr.frame_at(oout)));
+    assert!(moved(&r, old, "out")[0]["fromFrame"].is_i64(), "in / out moves carry frames too");
+    // The copy of the old shot inside the Split precomp is muted: the sound never doubles.
+    let split = layer_named(&s, cid, "SceneCut diagonal-split Split");
+    let LayerSource::Comp { item } = split.source else { panic!("a precomp") };
+    assert!(s.project.comp(item).unwrap().layers.iter().all(|l| !l.switches.audio), "copies of a shot are muted");
+    // color-dip starts the new shot 2 frames late: those 2 frames of its sound are kept.
+    let (mut s, cid, old, new, cut) = cut_at_audio(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "color-dip").unwrap();
+    let k = keeps(&s, cid);
+    assert_eq!(k.len(), 1, "{k:?}");
+    assert_eq!(k[0].1, "B Footage audio (SceneCut keep)");
+    assert!((k[0].2 - cut).abs() < 1e-9 && (k[0].3 - timing(&s, cid, new).0.seconds()).abs() < 1e-9, "{k:?}");
+    assert_eq!(k[0].6, index(&s, cid, new) + 1);
+    // card-flip-3d trims both shots: one copy each.
+    let (mut s, cid, old, new, _) = cut_at_audio(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "card-flip-3d").unwrap();
+    let names: Vec<String> = keeps(&s, cid).into_iter().map(|k| k.1).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    // An old shot that played on past the cut (under the new one) keeps that sound when a kind trims
+    // it to the cut; an FX cut and a scene cut alike.
+    for kind in ["crossfade", "light-leak"] {
+        let (mut s, cid, old, new, cut) = cut_at_audio(29.97, 10.0, 4.0);
+        s.execute("layer.timing", json!({"layers": [old], "out": 6.0})).unwrap();
+        let orig = timing(&s, cid, old).1.seconds();
+        let r = apply(&mut s, cid, old, new, kind).unwrap();
+        assert!((timing(&s, cid, old).1.seconds() - cut).abs() < 1e-9, "{kind}: the picture ends on the cut");
+        let k = keeps(&s, cid);
+        assert_eq!(k.len(), 1, "{kind}: {k:?}");
+        assert!((k[0].2 - cut).abs() < 1e-9 && (k[0].3 - orig).abs() < 1e-9, "{kind}: {k:?}");
+        assert_eq!(moved(&r, k[0].0, "audio-keep").len(), 1, "{kind}: {}", r["moved"]);
+    }
+    // Shots without sound get no copy.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "card-flip-3d").unwrap();
+    assert!(keeps(&s, cid).is_empty());
+}
+
+#[test]
+fn audio_keep_copies_go_with_reapply_switching_and_undo() {
+    let (mut s, cid, old, new, cut) = cut_at_audio(29.97, 10.0, 4.0);
+    s.execute("layer.timing", json!({"layers": [old], "out": 6.0})).unwrap();
+    let (o0, n0) = (timing(&s, cid, old), timing(&s, cid, new));
+    let items0 = s.project.items.len();
+    // card-flip-3d: the old shot's sound from its early end to 6 s, the new one's to its late start.
+    apply(&mut s, cid, old, new, "card-flip-3d").unwrap();
+    assert_eq!(keeps(&s, cid).len(), 2);
+    // Re-applying: the copies go with the transition and come back once, over the same spans.
+    let before: Vec<(f64, f64)> = keeps(&s, cid).into_iter().map(|k| (k.2, k.3)).collect();
+    let r = apply(&mut s, cid, old, new, "card-flip-3d").unwrap();
+    let after: Vec<(f64, f64)> = keeps(&s, cid).into_iter().map(|k| (k.2, k.3)).collect();
+    assert_eq!(before, after, "no stacking");
+    assert!(moved(&r, old, "out").is_empty() && moved(&r, new, "in").is_empty(), "the same trims again: {}", r["moved"]);
+    // Another family: the old shot gets its whole span back first (6 s), then that kind's trim.
+    let r = apply(&mut s, cid, old, new, "kick").unwrap();
+    assert!(keeps(&s, cid).is_empty(), "a zoom cut trims nothing");
+    assert_eq!((timing(&s, cid, old), timing(&s, cid, new)), (o0, n0), "both shots have their spans back");
+    assert!(r["moved"].as_array().unwrap().iter().all(|m| m["what"] != json!("audio-keep")), "{}", r["moved"]);
+    // Undo brings the card flip back, copies and all; again: the comp as it was.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(keeps(&s, cid).len(), 2);
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(keeps(&s, cid).is_empty());
+    assert_eq!((timing(&s, cid, old), timing(&s, cid, new)), (o0, n0));
+    assert_eq!(s.project.items.len(), items0);
+    assert!((timing(&s, cid, old).1.seconds() - 6.0).abs() < 0.05 && (timing(&s, cid, new).0.seconds() - cut).abs() < 1e-9);
+    // FX page-burn keeps the old shot's last 1.2 s of sound the same way.
+    let (mut s, cid, old, new, cut) = cut_at_audio(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "page-burn").unwrap();
+    let k = keeps(&s, cid);
+    assert_eq!(k.len(), 1, "{k:?}");
+    assert_eq!(k[0].1, "A Footage audio (FxCut keep)");
+    assert!((k[0].3 - cut).abs() < 1e-9 && k[0].2 < cut - 1.1, "{k:?}");
+}
+
+#[test]
+fn into_window_keeps_the_shots_sound_in_its_precomp() {
+    let (mut s, cid, old, new, _) = cut_at_audio(29.97, 10.0, 4.0);
+    let r = apply(&mut s, cid, old, new, "into-window").unwrap();
+    let win = r["new"].as_u64().unwrap();
+    let comp = s.project.comp(ItemId(cid)).unwrap();
+    let wl = comp.layer(LayerId(win)).unwrap();
+    let LayerSource::Comp { item } = wl.source else { panic!("the window is a precomp") };
+    assert!(effectcraft_render::audio::comp_has_audio(&s.project, item), "the shot still sounds inside the window");
+    assert!(effectcraft_render::audio::audible(&s.project, wl), "the window layer plays it");
+    let inner = s.project.comp(item).unwrap();
+    assert!(
+        inner.layers.iter().any(|l| matches!(l.source, LayerSource::Footage { .. }) && effectcraft_render::audio::audible(&s.project, l)),
+        "the shot inside keeps its audio switch"
+    );
+    assert_eq!(moved(&r, new, "precomposed").len(), 1, "{}", r["moved"]);
+}
+
+/// A solid named `name` placed right below `under`.
+fn third(s: &mut Session, cid: u64, under: u64, name: &str) -> u64 {
+    let t = s.execute("layer.newSolid", json!({"comp": cid, "name": name, "color": "#20d020"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.arrange", json!({"comp": cid, "layers": [t], "to": "front", "above": under})).unwrap();
+    s.execute("layer.arrange", json!({"comp": cid, "layers": [under], "to": "front", "above": t})).unwrap();
+    t
+}
+
+#[test]
+fn a_third_layer_between_the_shots_is_never_moved_past() {
+    // clock-wipe would put the old shot above the new one, past “Logo”.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    third(&mut s, cid, new, "Logo");
+    let before = s.project.clone();
+    let undo = s.history.undo.len();
+    let e = apply(&mut s, cid, old, new, "clock-wipe").unwrap_err().to_string();
+    assert!(e.contains("“Logo”") && e.contains("next to each other"), "{e}");
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project), "nothing changed");
+    assert_eq!(s.history.undo.len(), undo);
+    // crossfade would bring the new shot up over the old one, past “Logo”.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    s.execute("layer.arrange", json!({"layers": [old], "to": "front"})).unwrap();
+    third(&mut s, cid, old, "Logo");
+    let before = s.project.clone();
+    let e = apply(&mut s, cid, old, new, "crossfade").unwrap_err().to_string();
+    assert!(e.contains("“Logo”"), "{e}");
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project), "nothing changed");
+    // squeeze shows both shots over its backing: “Logo” between them while it runs is an error…
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    let logo = third(&mut s, cid, new, "Logo");
+    let e = apply(&mut s, cid, old, new, "squeeze").unwrap_err().to_string();
+    assert!(e.contains("“Logo”") && e.contains("together"), "{e}");
+    assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 3);
+    // …one that isn't on then is fine, and stays where it is, untouched.
+    s.execute("layer.timing", json!({"layers": [logo], "in": 8.0, "out": 9.0})).unwrap();
+    let t0 = timing(&s, cid, logo);
+    let r = apply(&mut s, cid, old, new, "squeeze").unwrap();
+    assert_eq!(timing(&s, cid, logo), t0);
+    assert!(r["moved"].as_array().unwrap().iter().all(|m| m["layer"] != json!(logo)), "{}", r["moved"]);
+    // A zoom cut is a hard cut: a layer between the shots doesn't matter.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    third(&mut s, cid, new, "Logo");
+    apply(&mut s, cid, old, new, "kick").unwrap();
+}
+
+#[test]
+fn transitions_on_a_shared_shot_never_collide_or_touch_each_other() {
+    // A 0–4 s, B 4–4.6 s, C from 4.6 s; C on top.
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Cut", "width": 384, "height": 216, "frameRate": 29.97, "duration": 10.0})).unwrap();
+    let solid =
+        |s: &mut Session, name: &str, colour: &str| s.execute("layer.newSolid", json!({"name": name, "color": colour})).unwrap()["layer"].as_u64().unwrap();
+    let (a, b, c) = (solid(&mut s, "A", "#d02020"), solid(&mut s, "B", "#20d020"), solid(&mut s, "C", "#2040d0"));
+    let cid = s.active_comp_id().unwrap().0;
+    s.execute("layer.timing", json!({"layers": [a], "out": 4.0})).unwrap();
+    s.execute("layer.timing", json!({"layers": [b], "in": 4.0, "out": 4.6})).unwrap();
+    s.execute("layer.timing", json!({"layers": [c], "in": 4.6})).unwrap();
+    let pair = |s: &mut Session, o: u64, n: u64, kind: &str| s.execute("transition.apply", json!({"comp": cid, "old": o, "new": n, "kind": kind}));
+    // B → C pushes in from 4.1 s: B's out-side move.
+    pair(&mut s, b, c, "push-slide").unwrap();
+    // A kick on A → B keys B from 4.0 to 5.27 s: it would overlap the push on B.
+    let before = s.project.clone();
+    let e = pair(&mut s, a, b, "kick").unwrap_err().to_string();
+    assert!(e.contains("overlap") && e.contains("“B”"), "{e}");
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project), "nothing changed");
+    // A crossfade on A → B (3.5–4.0 s) doesn't: both live on B.
+    pair(&mut s, a, b, "crossfade").unwrap();
+    let names = |s: &Session, l: u64| transition_effects(s, cid, l);
+    assert!(
+        names(&s, b).contains(&"SceneCut push-slide Push".to_string()) && names(&s, b).contains(&"SceneCut crossfade Fade".to_string()),
+        "{:?}",
+        names(&s, b)
+    );
+    // Re-applying one pair removes only its own effects from the shared shot.
+    pair(&mut s, a, b, "crossfade").unwrap();
+    assert_eq!(names(&s, b).iter().filter(|n| n.starts_with("SceneCut push-slide ")).count(), 1, "{:?}", names(&s, b));
+    assert_eq!(names(&s, b).iter().filter(|n| n.starts_with("SceneCut crossfade ")).count(), 1, "{:?}", names(&s, b));
+    pair(&mut s, b, c, "push-slide").unwrap();
+    assert_eq!(names(&s, b).iter().filter(|n| n.starts_with("SceneCut crossfade ")).count(), 1, "{:?}", names(&s, b));
+    assert_eq!(names(&s, b).iter().filter(|n| n.starts_with("SceneCut push-slide ")).count(), 1, "{:?}", names(&s, b));
+    assert_eq!(names(&s, c), ["SceneCut push-slide Seam", "SceneCut push-slide Push"]);
+    // Switching B → C to an FX cut leaves A → B's crossfade alone.
+    pair(&mut s, b, c, "light-leak").unwrap();
+    assert!(names(&s, b).iter().all(|n| !n.starts_with("SceneCut push-slide ")), "{:?}", names(&s, b));
+    assert_eq!(names(&s, b).iter().filter(|n| n.starts_with("SceneCut crossfade ")).count(), 1, "{:?}", names(&s, b));
+}

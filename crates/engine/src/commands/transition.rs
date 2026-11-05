@@ -19,8 +19,9 @@
 //! `ZoomCut …` / `FxCut …` / `SceneCut …` effects, the overlays and precomps it tagged, the solids
 //! only those overlays used, and an FX or scene cut's trims of the shots (no stacking). Everything is
 //! one undo step; any error rolls everything back. Whatever the command changed on the user's own
-//! layers beyond adding effects (in / out points, layer order, a shot moved into a precomp) is
-//! listed in the reply's `moved`.
+//! layers beyond adding effects (in / out points, layer order, a shot moved into a precomp, the audio
+//! keep copies) is listed in the reply's `moved`. Elias's safety rules (never cut the sound, never
+//! touch a third layer) are in [`super::transition_safety`].
 
 use std::sync::OnceLock;
 
@@ -33,6 +34,7 @@ use serde_json::{Map, Value, json};
 use super::peak::{Graph, apply_graph};
 use super::text_anim::json_value;
 use super::transition_fx::{self, Family};
+use super::transition_safety::{self as safety, Side};
 use super::transition_scene;
 use super::{CommandSpec, bad, comp_id, f_p, has_comp, layer_mut, resolve_layer, str_p, unlocked};
 use crate::taste::Profile;
@@ -44,7 +46,7 @@ pub(super) const C: &str = "transition.apply";
 pub const ZOOM_CUT_JSON: &str = include_str!("../../presets/zoom-cut.kinds.json");
 
 /// Everything the command adds is named with this prefix (effects and layers).
-const PREFIX: &str = "ZoomCut ";
+pub(super) const PREFIX: &str = "ZoomCut ";
 /// A layer comment or effect name the FX cuts add starts with this.
 const FX_PREFIX: &str = transition_fx::PREFIX;
 /// A layer comment or effect name the scene cuts add starts with this.
@@ -56,7 +58,7 @@ const MAX_OFFSET: f64 = 600.0;
 /// Overlays and effects per kind.
 const MAX_ITEMS: usize = 32;
 
-fn table() -> Result<&'static Value> {
+pub(super) fn table() -> Result<&'static Value> {
     static T: OnceLock<std::result::Result<Value, String>> = OnceLock::new();
     T.get_or_init(|| serde_json::from_str(ZOOM_CUT_JSON).map_err(|e| e.to_string()))
         .as_ref()
@@ -854,9 +856,10 @@ pub(super) fn tagged(comment: &str, tag: &str) -> bool {
     comment == tag || comment.strip_prefix(tag).is_some_and(|rest| rest.starts_with(' '))
 }
 
-/// Whether a layer / item comment carries one of the pair's tags (any family).
+/// Whether a layer / item comment carries one of the pair's tags (any family; an audio keep copy
+/// adds words after it).
 fn pair_tagged(comment: &str, ztag: &str, ftag: &str, stag: &str) -> bool {
-    comment == ztag || tagged(comment, ftag) || tagged(comment, stag)
+    tagged(comment, ztag) || tagged(comment, ftag) || tagged(comment, stag)
 }
 
 /// Re-applying on a pair: the previous transition goes first, whatever its family. The shots'
@@ -868,7 +871,17 @@ fn remove_previous(s: &mut Session, cid: ItemId, old: LayerId, new: LayerId) -> 
     let ztag = format!("{PREFIX}{}->{}", old.0, new.0);
     let ftag = Family::Fx.tag(old, new);
     let stag = Family::Scene.tag(old, new);
-    let restore = transition_fx::previous_trims(Family::Fx, s, cid, old, new).or_else(|| transition_fx::previous_trims(Family::Scene, s, cid, old, new));
+    // Only this pair's effects: a shot shared with another transition keeps that one's (the old
+    // shot's at its out point, the new shot's at its in point are this pair's).
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let mut mine: Vec<effectcraft_project::Uid> = vec![];
+    for (id, side) in [(old, Side::Out), (new, Side::In)] {
+        if let Some(l) = comp.layer(id) {
+            mine.extend(safety::owned(l, side));
+        }
+    }
+    let restore =
+        transition_fx::previous_trims(Family::Fx, s, cid, old, new, &mine).or_else(|| transition_fx::previous_trims(Family::Scene, s, cid, old, new, &mine));
     let out = s.edit("Remove Transition", None, |proj, st| {
         let mut out = Removed::default();
         // Precomps tagged for the pair, kept while anything outside them uses them.
@@ -892,12 +905,12 @@ fn remove_previous(s: &mut Session, cid: ItemId, old: LayerId, new: LayerId) -> 
                 l.in_point = t.min(l.out_point);
             }
         }
+        // The sound the transition kept: the shots get that span back.
+        safety::restore_kept(c, &|cm| pair_tagged(cm, &ztag, &ftag, &stag));
         for l in c.layers.iter_mut_where(|l| l.id == old || l.id == new) {
             if let Some(fx) = l.props.sub_mut("effects") {
                 let before = fx.children.len();
-                fx.children.retain(
-                    |n| !matches!(n, Node::Group(g) if g.name.starts_with(PREFIX) || g.name.starts_with(FX_PREFIX) || g.name.starts_with(SCENE_PREFIX)),
-                );
+                fx.children.retain(|n| !matches!(n, Node::Group(g) if is_ours(&g.name) && mine.contains(&g.uid)));
                 out.effects += before.saturating_sub(fx.children.len());
             }
         }
@@ -951,13 +964,24 @@ fn remove_previous(s: &mut Session, cid: ItemId, old: LayerId, new: LayerId) -> 
     Ok(out)
 }
 
-/// What a family's apply hands back: the reply, the undo step's name, the layers to select and the
-/// user's layers it moved in the layer order on purpose (an FX cut's restack, a scene cut's stack).
+/// A transition effect's name (any family).
+fn is_ours(name: &str) -> bool {
+    name.starts_with(PREFIX) || name.starts_with(FX_PREFIX) || name.starts_with(SCENE_PREFIX)
+}
+
+/// What a family's apply hands back: the reply, the undo step's name, the layers to select, the
+/// user's layers it moved in the layer order on purpose (an FX cut's restack, a scene cut's stack),
+/// the comp frames it acts in, the shots (id before → the layer showing it now: into-window's
+/// window), and the pair tag and family prefix its additions carry.
 pub(super) struct Applied {
     pub reply: Value,
     pub label: String,
     pub select: Vec<LayerId>,
     pub arranged: Vec<LayerId>,
+    pub span: (i64, i64),
+    pub shots: Vec<(LayerId, LayerId)>,
+    pub tag: String,
+    pub prefix: &'static str,
 }
 
 /// Every kind of the three families: zoom cuts, FX cuts, scene cuts.
@@ -983,10 +1007,13 @@ fn before_layers(s: &Session, cid: ItemId, old: LayerId, new: LayerId) -> Before
 }
 
 /// What the transition changed on the user's own layers: `{layer, name, what, from, to}` for an in
-/// / out point (comp s), the layer order (`order`: 1 = the top of the user's layers), or `precomposed`
-/// (moved into a precomp: into-window's window).
+/// / out point (comp s, with `fromFrame` / `toFrame`), the layer order (`order`: 1 = the top of the
+/// user's layers), or `precomposed` (moved into a precomp: into-window's window). The audio keep
+/// copies are added by the caller (`audio-keep`).
 fn moved(s: &Session, cid: ItemId, before: &Before, arranged: &[LayerId]) -> Vec<Value> {
     let Some(c) = s.project.comp(cid) else { return vec![] };
+    let fr = c.frame_rate;
+    let f = |t: Tick| fr.frame_at(fr.snap_nearest(t));
     let mut out = vec![];
     for (id, name, tin, tout) in before {
         match c.layer(*id) {
@@ -994,7 +1021,9 @@ fn moved(s: &Session, cid: ItemId, before: &Before, arranged: &[LayerId]) -> Vec
             Some(l) => {
                 for (what, a, b) in [("in", *tin, l.in_point), ("out", *tout, l.out_point)] {
                     if a != b {
-                        out.push(json!({"layer": id.0, "name": name, "what": what, "from": a.seconds(), "to": b.seconds()}));
+                        out.push(
+                            json!({"layer": id.0, "name": name, "what": what, "from": a.seconds(), "to": b.seconds(), "fromFrame": f(a), "toFrame": f(b)}),
+                        );
                     }
                 }
             }
@@ -1083,18 +1112,30 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     let snap = s.project.clone();
     let (history, state) = (s.history.clone(), s.state.clone());
     let before = before_layers(s, cid, old, new);
-    let result = (|| -> Result<Applied> {
+    let result = (|| -> Result<(Applied, Vec<Value>)> {
         // Re-applying on the same pair: the previous transition goes first (no stacking).
         let removed = remove_previous(s, cid, old, new)?;
-        match fam {
+        // The shots' spans with the previous transition gone, and the other transitions on them.
+        let spans: Vec<(LayerId, Tick, Tick)> = s
+            .project
+            .comp(cid)
+            .map(|c| c.layers.iter().filter(|l| l.id == old || l.id == new).map(|l| (l.id, l.in_point, l.out_point)).collect())
+            .unwrap_or_default();
+        let others = safety::others(s, cid, old, new);
+        let a = match fam {
             Fam::Zoom => apply_zoom(s, p, &kind, cid, old, new, removed),
             Fam::Fx => transition_fx::apply(s, p, &kind, cid, old, new, removed),
             Fam::Scene => transition_scene::apply(s, p, &kind, cid, old, new, removed),
-        }
+        }?;
+        safety::check_windows(s, cid, &kind, a.span, &others)?;
+        // Never cut the sound: what a trim took plays on from an audio-only copy.
+        let kept = safety::keep_audio(s, cid, &a.shots, &spans, &a.tag, a.prefix)?;
+        Ok((a, kept))
     })();
     match result {
-        Ok(mut a) => {
-            let mv = moved(s, cid, &before, &a.arranged);
+        Ok((mut a, kept)) => {
+            let mut mv = moved(s, cid, &before, &a.arranged);
+            mv.extend(kept);
             if let Some(o) = a.reply.as_object_mut() {
                 o.insert("moved".into(), Value::Array(mv));
             }
@@ -1233,6 +1274,10 @@ fn apply_zoom(s: &mut Session, p: &Value, kind: &str, cid: ItemId, old: LayerId,
         label: format!("Apply Transition Zoom Cut {title}"),
         select: vec![old, new_layer],
         arranged: vec![],
+        span: (lo, hi),
+        shots: vec![(old, old), (new, new_layer)],
+        tag: format!("{PREFIX}{}->{}", old.0, new_layer.0),
+        prefix: PREFIX,
     })
 }
 
@@ -1260,7 +1305,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Transition",
             ["Animation", "Transitions", "Zoom Cut"],
             None,
-            "{kind?: zoom cuts kick (default) | blur-settle | push-in | into-window | twos-card | twos-push | zoom-through | whip | zoom-out-through | punch | flash | white-flash, FX cuts light-leak | overexposure-burn | film-burn | glitch | chromatic-aberration | ripple | vhs-tape | shutter | clock-wipe | grid-dissolve | gravity-drop | morph-circle | blur-through | directional-blur | page-burn, scene cuts push-slide | vertical-push | elastic-push | squeeze | circle-iris | diamond-iris | diagonal-split | card-flip-3d | crossfade | blur-crossfade | focus-pull | color-dip | staggered-blocks | horizontal-blinds | vertical-blinds (transition.kinds), comp?, old?: layer (outgoing shot), new?: layer (incoming shot), layers?: [old, new], at? (comp s, the cut; default the new layer's in point), restScale? (zoom cuts: scale % the kind's rest layer settles at; lower = mirrored edges), centre?: [x, y] | {old, new} (zoom cuts: zoom centre, px of a 1920×1080 layer), dur? (FX and scene cuts: the transition's length in s; every time scales by dur / the kind's window), colour?: #rrggbb | [#rrggbb…] (FX and scene cuts: the cover / backing / dip / blocks / strips colour; a list = grid-dissolve's or staggered-blocks' palette), dir? (scene cuts that have one, transition.kinds `dirs`: push-slide, elastic-push, squeeze left | right | up | down; vertical-push up | down | left | right; staggered-blocks right | left | up | down; horizontal-blinds right | left; vertical-blinds down | up; diagonal-split up-right | up-left | down-right | down-left)} → {kind, family (zoom-cut | fx-cut | scene-cut), title, comp, old, new (the window layer for into-window), shot, at, cutFrame, land (comp s the move has settled), landFrame, restScale (zoom), start / startFrame / dur / comps (FX, scene), restacked (FX), stacked / dir (scene), effects: [{layer, effect, name, path}], layers (added overlay / background layers), removed {effects, layers, items}, moved: [{layer, name, what (in | out | order | precomposed), from, to}] (what changed on the user's own layers: in / out points in comp s, order 1 = the top of them)}. Without old/new: the two selected layers (the later in point is the new shot), or with nothing selected the layer starting at the playhead and the one under it ending there; pass `comp` with old/new when nothing is selected. Shots' transforms are never touched: every move is a `ZoomCut <kind> …` / `FxCut <kind> …` / `SceneCut <kind> …` effect, overlay or precomp; FX and scene cuts trim the shots to the kind (many start the new shot under or over the old one up to 1.2 s early: it needs that much footage; color-dip starts it 2 frames after the cut), and the scene cuts that slide or fade the new shot in over the old one (elastic-push, crossfade, blur-crossfade, focus-pull) move it right above the old one. Re-applying on the pair (any kind, any family) replaces the previous one. One undo step",
+            "{kind?: zoom cuts kick (default) | blur-settle | push-in | into-window | twos-card | twos-push | zoom-through | whip | zoom-out-through | punch | flash | white-flash, FX cuts light-leak | overexposure-burn | film-burn | glitch | chromatic-aberration | ripple | vhs-tape | shutter | clock-wipe | grid-dissolve | gravity-drop | morph-circle | blur-through | directional-blur | page-burn, scene cuts push-slide | vertical-push | elastic-push | squeeze | circle-iris | diamond-iris | diagonal-split | card-flip-3d | crossfade | blur-crossfade | focus-pull | color-dip | staggered-blocks | horizontal-blinds | vertical-blinds (transition.kinds), comp?, old?: layer (outgoing shot), new?: layer (incoming shot), layers?: [old, new], at? (comp s, the cut; default the new layer's in point), restScale? (zoom cuts: scale % the kind's rest layer settles at; lower = mirrored edges), centre?: [x, y] | {old, new} (zoom cuts: zoom centre, px of a 1920×1080 layer), dur? (FX and scene cuts: the transition's length in s; every time scales by dur / the kind's window), colour?: #rrggbb | [#rrggbb…] (FX and scene cuts: the cover / backing / dip / blocks / strips colour; a list = grid-dissolve's or staggered-blocks' palette), dir? (scene cuts that have one, transition.kinds `dirs`: push-slide, elastic-push, squeeze left | right | up | down; vertical-push up | down | left | right; staggered-blocks right | left | up | down; horizontal-blinds right | left; vertical-blinds down | up; diagonal-split up-right | up-left | down-right | down-left)} → {kind, family (zoom-cut | fx-cut | scene-cut), title, comp, old, new (the window layer for into-window), shot, at, cutFrame, land (comp s the move has settled), landFrame, restScale (zoom), start / startFrame / dur / comps (FX, scene), restacked (FX), stacked / dir (scene), effects: [{layer, effect, name, path}], layers (added overlay / background layers), removed {effects, layers, items}, moved: [{layer, name, what (in | out | order | precomposed | audio-keep), from, to, fromFrame / toFrame, of (audio-keep: the shot)}] (what changed on the user's own layers: in / out points in comp s and frames, order 1 = the top of them, the audio keep copies added)}. Safety: a trim cuts only the picture: a shot with sound gets an audio-only copy (video off, same source time, `<shot> audio (<Family> keep)`, right below it) over exactly the span the trim took, removed again with the transition (the shot gets that span back); copies of a shot inside a transition's precomps are muted. Errors that change nothing: a restack (FX old-over-new, scene new-over-old) past another layer, a kind that shows both shots together with another layer between them while it runs, a window that overlaps another transition's window on the same shot. Re-applying removes only the pair's own effects from a shot it shares with another transition. Without old/new: the two selected layers (the later in point is the new shot), or with nothing selected the layer starting at the playhead and the one under it ending there; pass `comp` with old/new when nothing is selected. Shots' transforms are never touched: every move is a `ZoomCut <kind> …` / `FxCut <kind> …` / `SceneCut <kind> …` effect, overlay or precomp; FX and scene cuts trim the shots to the kind (many start the new shot under or over the old one up to 1.2 s early: it needs that much footage; color-dip starts it 2 frames after the cut), and the scene cuts that slide or fade the new shot in over the old one (elastic-push, crossfade, blur-crossfade, focus-pull) move it right above the old one. Re-applying on the pair (any kind, any family) replaces the previous one. One undo step",
             can_apply,
             apply
         ),

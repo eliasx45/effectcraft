@@ -35,6 +35,7 @@ use super::transition::{
     Applied, C, Cx, Removed, arr, check_meets, cut_frame, finish_track, fmt_s, fps_of, layer_of, layer_times, new_effect, pt, put_below, run, set_props,
     set_values, tagged, value_like,
 };
+use super::transition_safety as safety;
 use super::{bad, layer_mut};
 use crate::taste::Profile;
 use crate::{EngineError, Result, Session};
@@ -163,7 +164,16 @@ fn kind_of<'a>(prefix: &str, name: &'a str) -> Option<&'a str> {
 /// shot's out point, the new shot's in point), both on its cut. The cut is the old shot's out point,
 /// or, when the kind ended the old shot early (page-burn, diagonal-split, card-flip-3d), the out
 /// point of its overlay that ends on the cut.
-pub(super) fn previous_trims(fam: Family, s: &Session, cid: ItemId, old: LayerId, new: LayerId) -> Option<(Option<Tick>, Option<Tick>)> {
+/// `mine`: the shots' effects that belong to this pair (a shot shared with another transition
+/// carries that one's too).
+pub(super) fn previous_trims(
+    fam: Family,
+    s: &Session,
+    cid: ItemId,
+    old: LayerId,
+    new: LayerId,
+    mine: &[effectcraft_project::Uid],
+) -> Option<(Option<Tick>, Option<Tick>)> {
     let t = fam.table().ok()?;
     let (prefix, tag) = (fam.prefix(), fam.tag(old, new));
     let tag = tag.as_str();
@@ -171,7 +181,7 @@ pub(super) fn previous_trims(fam: Family, s: &Session, cid: ItemId, old: LayerId
     let mut kind: Option<String> = None;
     for l in comp.layers.iter() {
         if l.id == old || l.id == new {
-            if let Some(k) = l.effects().and_then(|fx| fx.groups().find_map(|g| kind_of(prefix, &g.name))) {
+            if let Some(k) = l.effects().and_then(|fx| fx.groups().filter(|g| mine.contains(&g.uid)).find_map(|g| kind_of(prefix, &g.name))) {
                 kind = Some(k.to_string());
             }
         } else if tagged(&l.comment, tag)
@@ -734,6 +744,8 @@ fn scenes(s: &mut Session, fx: &Fx, spec: &Value, b: &mut Built) -> Result<ItemI
             let mut l = comp.layer(*id).ok_or_else(|| bad(C, "a shot is gone"))?.clone();
             super::edit::reid(&mut l, &mut next);
             l.name = format!("{prefix} {role}");
+            // The shot itself (and an audio keep copy) carries the sound: a copy never doubles it.
+            l.switches.audio = false;
             if *role == "old" {
                 l.out_point = old_out.max(l.in_point + fd);
             } else {
@@ -1136,6 +1148,18 @@ pub(super) fn apply_family(
         colour,
         expr_check: s.expr_check,
     };
+    // Never touch a third layer: no shot moves past another layer, and a kind that shows both shots
+    // together (or puts a layer under / between them) needs nothing between them while it runs.
+    if restack {
+        safety::check_restack(s, cid, kind, old, new)?;
+    } else if stack {
+        safety::check_restack(s, cid, kind, new, old)?;
+    } else {
+        let between_kind = arr(k, "overlays").iter().any(|o| matches!(o.get("where").and_then(Value::as_str), Some("below" | "above-new")));
+        if new_in_f < old_out_f || between_kind {
+            safety::check_adjacent(s, cid, kind, old, new, (fr.tick_of(lo), fr.tick_of(hi)))?;
+        }
+    }
     let mut b = Built::default();
     let mut arranged = vec![];
     if restack {
@@ -1215,5 +1239,14 @@ pub(super) fn apply_family(
             Family::Scene => o.insert("stacked".into(), json!(stack)),
         };
     }
-    Ok(Applied { reply, label: format!("Apply Transition {} {title}", fam.menu()), select: vec![old, new], arranged })
+    Ok(Applied {
+        reply,
+        label: format!("Apply Transition {} {title}", fam.menu()),
+        select: vec![old, new],
+        arranged,
+        span: (lo, hi),
+        shots: vec![(old, old), (new, new)],
+        tag: fam.tag(old, new),
+        prefix: fam.prefix(),
+    })
 }
