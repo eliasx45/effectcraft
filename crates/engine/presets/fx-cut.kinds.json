@@ -1,0 +1,2629 @@
+{
+ "about": "fx-cut kinds: the numbers behind every version of the fx-cut transition (motion-kit shelf/transitions/fx-cut.jsx; EffectCraft transition.apply is to read the same file next). 15 HyperFrames scene transitions (HyperFrames skill hyperframes-animation/transitions/css-*.md) rebuilt natively in Rebuilds/hf-demos/transitions-b (T18–T32), approved by Elias 4 Nov 2026 (\"The B are also good to save\"). Plain data, no code (expressions are data too: strings with ${…} placeholders).",
+ "schema": {
+  "time": "every t / in / out / land / window is SECONDS relative to `at`, the cut = the old shot's out-point = the first frame the new picture owns; a caller snaps at + t to its comp's frames (round), so any fps works",
+  "fps / cutFrame / frames": "the approved demo comp (transitions-b, 29.97 fps): its cut frame and length",
+  "window": "[start, end] of the whole transition (the <id>-start hit; `dur` scales every time by dur / (end − start))",
+  "land": "when everything has settled (the <id>-land hit)",
+  "shots": "{old: {out}, new: {in}}: where the shots are trimmed (default 0 = at); a negative new.in puts the new shot under the old one early (clock-wipe, gravity-drop, blur-through, directional-blur, page-burn): the shot needs that much footage before its in-point",
+  "layers": "old / new: effects added to the shot, in stack order, each {name (the effect becomes 'FxCut <kind> <name>'), effect id, set {param: value}, keys {param: track}, expr {param: expression}}; the shot's own transform is never touched (Transform effect: anchor = position = the layer centre)",
+  "track": "{t: [s], v: [values], ease: [one per segment: a Graph name (core/graphs.jsx) | 'linear' (hold / untouched)], offset? (position values are offsets from the layer / Transform-effect centre, px of 1920x1080)}",
+  "overlays": "layers fxCut adds, in order bottom → top, each named 'FxCut <kind> <name>' and tagged (layer comment 'FxCut <old>-><new>') so a re-call removes them: kind solid (colour; pad = px added on every side: an oversize solid) | glow (a radial gradient ellipse: size = diameter, colour at the centre, opacity stops 1 / 0.6 at 45 % / 0 at the rim) | rect / ellipse (shape layers: size, position, colour) | copy (a copy of the cut: duplicates of both shots (shots: ['old'] = only the old one) in a precomp 'FxCut <kind> Scenes', plain cut at `at`; pad = an oversize precomp with the copies centred, inner = effects on the copies inside; of = a comp overlay's name instead) | comp (a precomp the size of the comp built from its own `layers`, same specs). where: top (default: above both shots) | below (under both shots) | above-new (right above the new shot). in / out: when the layer is on. set {layer path: value}, keys {layer path: track} (positions absolute px of 1920x1080 unless offset; scale %: [v, v]), expr {layer path: expression}, effects (as on the shots), blend, mask ({rect: [x, y, w, h]} | {circle: [cx, cy], keys {radius: track}, feather}; layer px), matte (a solid spec made right above this layer and used as its track matte, mode alpha | alphaInverted), repeat {count, maskStep [dx, dy]} (count copies, mask moved by i × maskStep), tint (the `colour` option replaces colour; palette = index into an array `colour`)",
+  "amount": "one shared envelope track: every layer whose expressions use ${amount} gets a Slider Control 'FxCut <kind> Amount' keyed with it, and ${amount} → effect(\"FxCut <kind> Amount\")(\"Slider\")",
+  "expressions": "placeholders: ${refFps} = 29.97002997 (the approved comps' rate: per-frame randomness and the ripple's phase stay on the reference frame grid at any comp fps), ${amount} (above), ${i} = the copy's 1-based index (repeat)",
+  "colours": "#rrggbb",
+  "energy": "calm | medium | high",
+  "demo": "the approved demo: old = presenter-micah, new = presenter-dharya (from = source s at comp 0), or new.titleCard = the transitions-b navy title card ('Part two', 'How the edit is built'; enter = its slide-up entrance at the cut, fade = its texts fade up from black as in page burn)"
+ },
+ "default": "light-leak",
+ "order": [
+  "light-leak",
+  "overexposure-burn",
+  "film-burn",
+  "glitch",
+  "chromatic-aberration",
+  "ripple",
+  "vhs-tape",
+  "shutter",
+  "clock-wipe",
+  "grid-dissolve",
+  "gravity-drop",
+  "morph-circle",
+  "blur-through",
+  "directional-blur",
+  "page-burn"
+ ],
+ "kinds": {
+  "light-leak": {
+   "title": "Light leak",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-light.md (Light Leak)",
+   "reference": {
+    "t": "T18",
+    "batch": "transitions-b",
+    "comp": "18 Light leak",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/18-light-leak.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 43,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.433767,
+    0.467133
+   ],
+   "land": 0.467133,
+   "looks": "A warm orange Screen wash builds over ~0.4 s while two soft radial leaks (gold from the left, orange from the bottom) drift across; the hard cut hides under the peak and the light falls away over ~0.4 s.",
+   "use": "A warm, soft scene change: a new topic in a story, a memory, a lifestyle or travel beat.",
+   "overlays": [
+    {
+     "name": "Leak warm",
+     "kind": "solid",
+     "colour": "#ff8a3a",
+     "blend": "Screen",
+     "in": -0.433767,
+     "out": 0.467133,
+     "keys": {
+      "transform/opacity": {
+       "t": [
+        -0.433767,
+        0.0,
+        0.066733,
+        0.467133
+       ],
+       "v": [
+        0,
+        60,
+        60,
+        0
+       ],
+       "ease": [
+        "Slow launch · quick finish",
+        "linear",
+        "Quick launch · soft landing"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Leak 1",
+     "kind": "glow",
+     "size": 2600,
+     "colour": "#ffd27a",
+     "position": [
+      -300,
+      300
+     ],
+     "blend": "Screen",
+     "in": -0.4004,
+     "out": 0.4004,
+     "keys": {
+      "transform/opacity": {
+       "t": [
+        -0.4004,
+        0.066733,
+        0.4004
+       ],
+       "v": [
+        0,
+        90,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis",
+        "Quick launch · soft landing"
+       ]
+      },
+      "transform/position": {
+       "t": [
+        -0.4004,
+        0.066733,
+        0.4004
+       ],
+       "v": [
+        [
+         -300,
+         300
+        ],
+        [
+         0,
+         300
+        ],
+        [
+         600,
+         300
+        ]
+       ],
+       "ease": [
+        "Smooth emphasis",
+        "Quick launch · soft landing"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Leak 2",
+     "kind": "glow",
+     "size": 2200,
+     "colour": "#ff6a2a",
+     "position": [
+      300,
+      900
+     ],
+     "blend": "Screen",
+     "in": -0.333667,
+     "out": 0.467133,
+     "keys": {
+      "transform/opacity": {
+       "t": [
+        -0.333667,
+        0.033367,
+        0.066733,
+        0.467133
+       ],
+       "v": [
+        0,
+        80,
+        80,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis",
+        "linear",
+        "Quick launch · soft landing"
+       ]
+      },
+      "transform/position": {
+       "t": [
+        -0.333667,
+        0.166833
+       ],
+       "v": [
+        [
+         300,
+         900
+        ],
+        [
+         500,
+         900
+        ]
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "overexposure-burn": {
+   "title": "Overexposure burn",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-light.md (Overexposure Burn)",
+   "reference": {
+    "t": "T19",
+    "batch": "transitions-b",
+    "comp": "19 Overexposure burn",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/19-overexposure-burn.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 46,
+   "frames": 75,
+   "energy": "high",
+   "window": [
+    -0.533867,
+    0.367033
+   ],
+   "land": 0.367033,
+   "looks": "The old shot blows out (Exposure to +1.6) and pushes in 6 % while a white flash rises over ~0.4 s; the cut sits on full white and the new shot comes out of it over ~0.37 s.",
+   "use": "A hard reset or reveal: 'and then everything changed', a before → after, a big announcement.",
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Exposure",
+       "effect": "ec.color.exposure",
+       "keys": {
+        "master/exposure": {
+         "t": [
+          -0.533867,
+          -0.133467
+         ],
+         "v": [
+          0,
+          1.6
+         ],
+         "ease": [
+          "Slow launch · quick finish"
+         ]
+        }
+       }
+      },
+      {
+       "name": "Push",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.533867,
+          -0.133467
+         ],
+         "v": [
+          100,
+          106
+         ],
+         "ease": [
+          "Slow launch · quick finish"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "White",
+     "kind": "solid",
+     "colour": "#ffffff",
+     "tint": true,
+     "in": -0.4004,
+     "out": 0.367033,
+     "keys": {
+      "transform/opacity": {
+       "t": [
+        -0.4004,
+        0.0,
+        0.367033
+       ],
+       "v": [
+        0,
+        100,
+        0
+       ],
+       "ease": [
+        "Slow launch · quick finish",
+        "Quick launch · soft landing"
+       ]
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "film-burn": {
+   "title": "Film burn",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-light.md (Film Burn)",
+   "reference": {
+    "t": "T20",
+    "batch": "transitions-b",
+    "comp": "20 Film burn",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/20-film-burn.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 41,
+   "frames": 75,
+   "energy": "high",
+   "window": [
+    -0.367033,
+    0.5005
+   ],
+   "land": 0.5005,
+   "looks": "Amber, orange and red light bleeds in from the right edge, staggered by a frame or two (Add / Screen), covering the frame in ~0.5 s; the cut hides under it and the burn fades over ~0.3 s.",
+   "use": "Retro or film-look edits, a flashback, an energetic chapter change.",
+   "overlays": [
+    {
+     "name": "Burn a amber",
+     "kind": "glow",
+     "size": 3600,
+     "colour": "#ffb03a",
+     "position": [
+      2700,
+      420
+     ],
+     "blend": "Add",
+     "in": -0.367033,
+     "out": 0.367033,
+     "keys": {
+      "transform/opacity": {
+       "t": [
+        -0.367033,
+        0.033367,
+        0.066733,
+        0.367033
+       ],
+       "v": [
+        0,
+        100,
+        100,
+        0
+       ],
+       "ease": [
+        "Slow launch · quick finish",
+        "linear",
+        "Quick launch · soft landing"
+       ]
+      },
+      "transform/position": {
+       "t": [
+        -0.367033,
+        0.033367
+       ],
+       "v": [
+        [
+         2700,
+         420
+        ],
+        [
+         1600,
+         420
+        ]
+       ],
+       "ease": [
+        "Slow launch · quick finish"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Burn b orange",
+     "kind": "glow",
+     "size": 3600,
+     "colour": "#ff5a00",
+     "position": [
+      3000,
+      760
+     ],
+     "blend": "Add",
+     "in": -0.333667,
+     "out": 0.433767,
+     "keys": {
+      "transform/opacity": {
+       "t": [
+        -0.333667,
+        0.1001,
+        0.133467,
+        0.433767
+       ],
+       "v": [
+        0,
+        100,
+        100,
+        0
+       ],
+       "ease": [
+        "Slow launch · quick finish",
+        "linear",
+        "Quick launch · soft landing"
+       ]
+      },
+      "transform/position": {
+       "t": [
+        -0.333667,
+        0.1001
+       ],
+       "v": [
+        [
+         3000,
+         760
+        ],
+        [
+         1700,
+         760
+        ]
+       ],
+       "ease": [
+        "Slow launch · quick finish"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Burn c red",
+     "kind": "glow",
+     "size": 3600,
+     "colour": "#d0281a",
+     "position": [
+      2500,
+      240
+     ],
+     "blend": "Screen",
+     "in": -0.266933,
+     "out": 0.5005,
+     "keys": {
+      "transform/opacity": {
+       "t": [
+        -0.266933,
+        0.166833,
+        0.2002,
+        0.5005
+       ],
+       "v": [
+        0,
+        100,
+        100,
+        0
+       ],
+       "ease": [
+        "Slow launch · quick finish",
+        "linear",
+        "Quick launch · soft landing"
+       ]
+      },
+      "transform/position": {
+       "t": [
+        -0.266933,
+        0.166833
+       ],
+       "v": [
+        [
+         2500,
+         240
+        ],
+        [
+         1800,
+         240
+        ]
+       ],
+       "ease": [
+        "Slow launch · quick finish"
+       ]
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "glitch": {
+   "title": "Glitch",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-distortion.md (Glitch)",
+   "reference": {
+    "t": "T21",
+    "batch": "transitions-b",
+    "comp": "21 Glitch",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/21-glitch.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 39,
+   "frames": 75,
+   "energy": "high",
+   "window": [
+    -0.2002,
+    0.066733
+   ],
+   "land": 0.066733,
+   "looks": "8 frames of digital glitch around the cut: the picture jitters ±15 px every frame while red, green and blue copies (added at 35 %) jump ±60 px; the cut sits 2 frames before it ends.",
+   "use": "Tech, AI, hacking, 'something broke', a punchy jump between two takes.",
+   "overlays": [
+    {
+     "name": "Picture",
+     "kind": "copy",
+     "in": -0.2002,
+     "out": 0.066733,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 104,
+        "outputHeight": 104,
+        "mirrorEdges": true
+       }
+      }
+     ],
+     "expr": {
+      "transform/position": "var f = Math.round(time * ${refFps}); seedRandom(f * 13 + 1, true); value + [random(-15, 15), random(-4, 4), 0]"
+     }
+    },
+    {
+     "name": "Glitch R",
+     "kind": "copy",
+     "in": -0.2002,
+     "out": 0.066733,
+     "effects": [
+      {
+       "name": "Only R",
+       "effect": "ec.channel.shiftchannels",
+       "set": {
+        "takeGreenFrom": 10,
+        "takeBlueFrom": 10
+       }
+      }
+     ],
+     "blend": "Add",
+     "set": {
+      "transform/opacity": 35
+     },
+     "expr": {
+      "transform/position": "var f = Math.round(time * ${refFps}); seedRandom(f * 13 + 7, true); value + [random(-60, 60), random(-20, 20), 0]"
+     }
+    },
+    {
+     "name": "Glitch G",
+     "kind": "copy",
+     "in": -0.2002,
+     "out": 0.066733,
+     "effects": [
+      {
+       "name": "Only G",
+       "effect": "ec.channel.shiftchannels",
+       "set": {
+        "takeRedFrom": 10,
+        "takeBlueFrom": 10
+       }
+      }
+     ],
+     "blend": "Add",
+     "set": {
+      "transform/opacity": 35
+     },
+     "expr": {
+      "transform/position": "var f = Math.round(time * ${refFps}); seedRandom(f * 13 + 38, true); value + [random(-60, 60), random(-20, 20), 0]"
+     }
+    },
+    {
+     "name": "Glitch B",
+     "kind": "copy",
+     "in": -0.2002,
+     "out": 0.066733,
+     "effects": [
+      {
+       "name": "Only B",
+       "effect": "ec.channel.shiftchannels",
+       "set": {
+        "takeRedFrom": 10,
+        "takeGreenFrom": 10
+       }
+      }
+     ],
+     "blend": "Add",
+     "set": {
+      "transform/opacity": 35
+     },
+     "expr": {
+      "transform/position": "var f = Math.round(time * ${refFps}); seedRandom(f * 13 + 69, true); value + [random(-60, 60), random(-20, 20), 0]"
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "chromatic-aberration": {
+   "title": "Chromatic aberration",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-distortion.md (Chromatic Aberration)",
+   "reference": {
+    "t": "T22",
+    "batch": "transitions-b",
+    "comp": "22 Chromatic aberration",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/22-chromatic-aberration.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 39,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.3003,
+    0.333667
+   ],
+   "land": 0.333667,
+   "looks": "The picture splits into its red, green and blue channels (added back together), spreading ±80 px over ~0.3 s; the cut sits on the widest split and the channels converge on the new shot over ~0.33 s.",
+   "use": "A techy or 'mind-bending' change, a lens / camera topic, a glitch that's calmer than glitch.",
+   "overlays": [
+    {
+     "name": "Channel R",
+     "kind": "copy",
+     "in": -0.3003,
+     "out": 0.333667,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 115,
+        "outputHeight": 115,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Only R",
+       "effect": "ec.channel.shiftchannels",
+       "set": {
+        "takeGreenFrom": 10,
+        "takeBlueFrom": 10
+       }
+      }
+     ],
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.3003,
+        0.0,
+        0.333667
+       ],
+       "v": [
+        [
+         0,
+         0
+        ],
+        [
+         -80,
+         0
+        ],
+        [
+         0,
+         0
+        ]
+       ],
+       "ease": [
+        "Slow launch · quick finish",
+        "Quick launch · soft landing"
+       ],
+       "offset": true
+      }
+     }
+    },
+    {
+     "name": "Channel G",
+     "kind": "copy",
+     "in": -0.3003,
+     "out": 0.333667,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 115,
+        "outputHeight": 115,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Only G",
+       "effect": "ec.channel.shiftchannels",
+       "set": {
+        "takeRedFrom": 10,
+        "takeBlueFrom": 10
+       }
+      }
+     ],
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.3003,
+        0.0,
+        0.333667
+       ],
+       "v": [
+        [
+         0,
+         0
+        ],
+        [
+         0,
+         30
+        ],
+        [
+         0,
+         0
+        ]
+       ],
+       "ease": [
+        "Slow launch · quick finish",
+        "Quick launch · soft landing"
+       ],
+       "offset": true
+      }
+     },
+     "blend": "Add"
+    },
+    {
+     "name": "Channel B",
+     "kind": "copy",
+     "in": -0.3003,
+     "out": 0.333667,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 115,
+        "outputHeight": 115,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Only B",
+       "effect": "ec.channel.shiftchannels",
+       "set": {
+        "takeRedFrom": 10,
+        "takeGreenFrom": 10
+       }
+      }
+     ],
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.3003,
+        0.0,
+        0.333667
+       ],
+       "v": [
+        [
+         0,
+         0
+        ],
+        [
+         80,
+         0
+        ],
+        [
+         0,
+         0
+        ]
+       ],
+       "ease": [
+        "Slow launch · quick finish",
+        "Quick launch · soft landing"
+       ],
+       "offset": true
+      }
+     },
+     "blend": "Add"
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "ripple": {
+   "title": "Ripple",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-distortion.md (Ripple)",
+   "reference": {
+    "t": "T23",
+    "batch": "transitions-b",
+    "comp": "23 Ripple",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/23-ripple.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 38,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.266933,
+    0.533867
+   ],
+   "land": 0.533867,
+   "looks": "The picture wobbles side to side (±30 px at 12.5 Hz) and breathes ±3 % while it blurs (up to 32), building over ~0.27 s; the cut sits on the peak and the new shot settles over ~0.53 s.",
+   "use": "A dream, a 'wait, what?', a thought or imagination beat, water / heat / dizzy topics.",
+   "amount": {
+    "t": [
+     -0.266933,
+     0.0,
+     0.533867
+    ],
+    "v": [
+     0,
+     1,
+     0
+    ],
+    "ease": [
+     "Slow launch · quick finish",
+     "Quick launch · soft landing"
+    ]
+   },
+   "overlays": [
+    {
+     "name": "Picture",
+     "kind": "copy",
+     "in": -0.266933,
+     "out": 0.533867,
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 112,
+        "outputHeight": 112,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "expr": {
+        "blurriness": "${amount} * 32"
+       }
+      }
+     ],
+     "expr": {
+      "transform/position": "var w = ${amount}, tq = Math.round(time * ${refFps}) / ${refFps}; value + [30 * w * Math.sin(2 * Math.PI * 12.5 * tq), 0, 0]",
+      "transform/scale": "var w = ${amount}, tq = Math.round(time * ${refFps}) / ${refFps}; value * (1 + 0.03 * w * Math.sin(2 * Math.PI * 12.5 * tq + 1.3))"
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "vhs-tape": {
+   "title": "VHS tape",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-distortion.md (VHS Tape)",
+   "reference": {
+    "t": "T24",
+    "batch": "transitions-b",
+    "comp": "24 VHS tape",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/24-vhs-tape.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 38,
+   "frames": 75,
+   "energy": "high",
+   "window": [
+    -0.266933,
+    0.3003
+   ],
+   "land": 0.3003,
+   "looks": "20 horizontal strips of the picture slip sideways (up to 70 px) on their own random beats, with red and blue ghost fringes (Lighten); builds over ~0.27 s, the cut on the peak, calms over ~0.3 s.",
+   "use": "Retro / nostalgia, 'rewind', a throwback or an old-footage beat, a playful glitch.",
+   "amount": {
+    "t": [
+     -0.266933,
+     0.0,
+     0.3003
+    ],
+    "v": [
+     0,
+     70,
+     0
+    ],
+    "ease": [
+     "Slow launch · quick finish",
+     "Quick launch · soft landing"
+    ]
+   },
+   "overlays": [
+    {
+     "name": "Strips",
+     "kind": "comp",
+     "in": -0.266933,
+     "out": 0.3003,
+     "layers": [
+      {
+       "name": "Strip",
+       "kind": "copy",
+       "repeat": {
+        "count": 20,
+        "maskStep": [
+         0,
+         54
+        ]
+       },
+       "effects": [
+        {
+         "name": "Mirror edges",
+         "effect": "ec.stylize.motiontile",
+         "set": {
+          "outputWidth": 120,
+          "outputHeight": 100,
+          "mirrorEdges": true
+         }
+        }
+       ],
+       "mask": {
+        "rect": [
+         -200,
+         0,
+         2320,
+         54
+        ]
+       },
+       "expr": {
+        "transform/position": "var a = ${amount}; seedRandom(${i}, true); var step = random(0.033, 0.13); var kq = Math.floor(time / step); seedRandom(${i} * 97 + kq, true); value + [random(-1, 1) * a, 0, 0]"
+       }
+      }
+     ]
+    },
+    {
+     "name": "Ghost R",
+     "kind": "copy",
+     "of": "Strips",
+     "in": -0.266933,
+     "out": 0.3003,
+     "effects": [
+      {
+       "name": "Only R",
+       "effect": "ec.channel.shiftchannels",
+       "set": {
+        "takeGreenFrom": 10,
+        "takeBlueFrom": 10
+       }
+      }
+     ],
+     "blend": "Lighten",
+     "expr": {
+      "transform/position": "value + [${amount} * 0.3, 0, 0]",
+      "transform/opacity": "Math.min(100, ${amount} * 3)"
+     }
+    },
+    {
+     "name": "Ghost B",
+     "kind": "copy",
+     "of": "Strips",
+     "in": -0.266933,
+     "out": 0.3003,
+     "effects": [
+      {
+       "name": "Only B",
+       "effect": "ec.channel.shiftchannels",
+       "set": {
+        "takeRedFrom": 10,
+        "takeGreenFrom": 10
+       }
+      }
+     ],
+     "blend": "Lighten",
+     "expr": {
+      "transform/position": "value + [${amount} * -0.3, 0, 0]",
+      "transform/opacity": "Math.min(100, ${amount} * 3)"
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "shutter": {
+   "title": "Shutter",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-mechanical.md (Shutter)",
+   "reference": {
+    "t": "T25",
+    "batch": "transitions-b",
+    "comp": "25 Shutter",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/25-shutter.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 38,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.266933,
+    0.333667
+   ],
+   "land": 0.333667,
+   "looks": "Two near-black halves slam shut from top and bottom in ~0.27 s (Fast out), the cut happens while closed (2 frames), and they open again over ~0.27 s.",
+   "use": "A mechanical, decisive change: next chapter, 'cut to', a camera / photography beat.",
+   "overlays": [
+    {
+     "name": "Shutter top",
+     "kind": "rect",
+     "size": [
+      1920,
+      542
+     ],
+     "position": [
+      960,
+      -271
+     ],
+     "colour": "#111216",
+     "tint": true,
+     "in": -0.266933,
+     "out": 0.333667,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.266933,
+        0.0,
+        0.066733,
+        0.333667
+       ],
+       "v": [
+        [
+         960,
+         -271
+        ],
+        [
+         960,
+         270
+        ],
+        [
+         960,
+         270
+        ],
+        [
+         960,
+         -271
+        ]
+       ],
+       "ease": [
+        "Fast out",
+        "linear",
+        "Quick launch · soft landing"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Shutter bottom",
+     "kind": "rect",
+     "size": [
+      1920,
+      542
+     ],
+     "position": [
+      960,
+      1351
+     ],
+     "colour": "#111216",
+     "tint": true,
+     "in": -0.266933,
+     "out": 0.333667,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.266933,
+        0.0,
+        0.066733,
+        0.333667
+       ],
+       "v": [
+        [
+         960,
+         1351
+        ],
+        [
+         960,
+         810
+        ],
+        [
+         960,
+         810
+        ],
+        [
+         960,
+         1351
+        ]
+       ],
+       "ease": [
+        "Fast out",
+        "linear",
+        "Quick launch · soft landing"
+       ]
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "clock-wipe": {
+   "title": "Clock wipe",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-mechanical.md (Clock Wipe)",
+   "reference": {
+    "t": "T26",
+    "batch": "transitions-b",
+    "comp": "26 Clock wipe",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/26-clock-wipe.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 44,
+   "frames": 75,
+   "energy": "calm",
+   "window": [
+    -0.467133,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "The old shot is swept away clockwise from 12 o'clock over ~0.47 s (Smooth emphasis), revealing the new shot underneath.",
+   "use": "Time passing, 'later that day', a schedule / deadline / countdown topic.",
+   "shots": {
+    "new": {
+     "in": -0.467133
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Clock",
+       "effect": "ec.transition.radialwipe",
+       "keys": {
+        "completion": {
+         "t": [
+          -0.467133,
+          0.0
+         ],
+         "v": [
+          0,
+          100
+         ],
+         "ease": [
+          "Smooth emphasis"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "grid-dissolve": {
+   "title": "Grid dissolve",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-grid.md (Grid Dissolve)",
+   "reference": {
+    "t": "T27",
+    "batch": "transitions-b",
+    "comp": "27 Grid dissolve",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/27-grid-dissolve.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 44,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.467133,
+    0.5005
+   ],
+   "land": 0.5005,
+   "looks": "12 cells (4 × 3) in the 10-10 blues pop in from the centre outwards (Expo Out 1, 2 frames apart) until they cover the frame (~0.47 s); the cut happens under full cover and the cells fade out from the centre over ~0.5 s.",
+   "use": "Into a title card, a list or a structured section: 'part two', 'three reasons', a dashboard / data beat.",
+   "overlays": [
+    {
+     "name": "Cell 1",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      240,
+      180
+     ],
+     "colour": "#0c1423",
+     "palette": 0,
+     "tint": true,
+     "in": -0.266933,
+     "out": 0.5005,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.266933,
+        -0.066733
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.233567,
+        0.5005
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 2",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      720,
+      180
+     ],
+     "colour": "#123266",
+     "palette": 1,
+     "tint": true,
+     "in": -0.4004,
+     "out": 0.367033,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.4004,
+        -0.2002
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.1001,
+        0.367033
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 3",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      1200,
+      180
+     ],
+     "colour": "#236197",
+     "palette": 2,
+     "tint": true,
+     "in": -0.4004,
+     "out": 0.367033,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.4004,
+        -0.2002
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.1001,
+        0.367033
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 4",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      1680,
+      180
+     ],
+     "colour": "#4697f3",
+     "palette": 3,
+     "tint": true,
+     "in": -0.266933,
+     "out": 0.5005,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.266933,
+        -0.066733
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.233567,
+        0.5005
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 5",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      240,
+      540
+     ],
+     "colour": "#c5e4ff",
+     "palette": 4,
+     "tint": true,
+     "in": -0.333667,
+     "out": 0.433767,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.333667,
+        -0.133467
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.166833,
+        0.433767
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 6",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      720,
+      540
+     ],
+     "colour": "#0c1423",
+     "palette": 0,
+     "tint": true,
+     "in": -0.467133,
+     "out": 0.3003,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.467133,
+        -0.266933
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.033367,
+        0.3003
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 7",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      1200,
+      540
+     ],
+     "colour": "#123266",
+     "palette": 1,
+     "tint": true,
+     "in": -0.467133,
+     "out": 0.3003,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.467133,
+        -0.266933
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.033367,
+        0.3003
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 8",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      1680,
+      540
+     ],
+     "colour": "#236197",
+     "palette": 2,
+     "tint": true,
+     "in": -0.333667,
+     "out": 0.433767,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.333667,
+        -0.133467
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.166833,
+        0.433767
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 9",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      240,
+      900
+     ],
+     "colour": "#4697f3",
+     "palette": 3,
+     "tint": true,
+     "in": -0.266933,
+     "out": 0.5005,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.266933,
+        -0.066733
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.233567,
+        0.5005
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 10",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      720,
+      900
+     ],
+     "colour": "#c5e4ff",
+     "palette": 4,
+     "tint": true,
+     "in": -0.4004,
+     "out": 0.367033,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.4004,
+        -0.2002
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.1001,
+        0.367033
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 11",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      1200,
+      900
+     ],
+     "colour": "#0c1423",
+     "palette": 0,
+     "tint": true,
+     "in": -0.4004,
+     "out": 0.367033,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.4004,
+        -0.2002
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.1001,
+        0.367033
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Cell 12",
+     "kind": "rect",
+     "size": [
+      482,
+      362
+     ],
+     "position": [
+      1680,
+      900
+     ],
+     "colour": "#123266",
+     "palette": 1,
+     "tint": true,
+     "in": -0.266933,
+     "out": 0.5005,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.266933,
+        -0.066733
+       ],
+       "v": [
+        0,
+        100
+       ],
+       "ease": [
+        "Expo Out 1 (Elias)"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.233567,
+        0.5005
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "titleCard": "enter"
+    }
+   }
+  },
+  "gravity-drop": {
+   "title": "Gravity drop",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-other.md (Gravity Drop)",
+   "reference": {
+    "t": "T28",
+    "batch": "transitions-b",
+    "comp": "28 Gravity drop",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/28-gravity-drop.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.5005,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "The old shot falls off the bottom of the frame (1 200 px, Fast out) tilting 4° over ~0.5 s, the new shot already behind it.",
+   "use": "'It all fell apart', a failure, letting go of an idea, a playful drop into the next point.",
+   "shots": {
+    "new": {
+     "in": -0.5005
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Drop",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          [
+           0,
+           0
+          ],
+          [
+           0,
+           1200
+          ]
+         ],
+         "ease": [
+          "Fast out"
+         ],
+         "offset": true
+        },
+        "rotation": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          0,
+          4
+         ],
+         "ease": [
+          "Fast out"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "morph-circle": {
+   "title": "Morph circle",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-other.md (Morph Circle)",
+   "reference": {
+    "t": "T29",
+    "batch": "transitions-b",
+    "comp": "29 Morph circle",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/29-morph-circle.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 42,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.4004,
+    0.266933
+   ],
+   "land": 0.266933,
+   "looks": "A navy circle grows from the centre over ~0.5 s (Slow launch · quick finish) until it fills the frame; the cut happens under it and the circle fades over 5 frames into the new scene.",
+   "use": "Into a title card or a branded scene whose background is the circle's colour (colour option), a focus / zoom-in idea.",
+   "overlays": [
+    {
+     "name": "Circle",
+     "kind": "ellipse",
+     "size": [
+      100,
+      100
+     ],
+     "position": [
+      960,
+      540
+     ],
+     "colour": "#0c1423",
+     "tint": true,
+     "in": -0.4004,
+     "out": 0.266933,
+     "keys": {
+      "transform/scale": {
+       "t": [
+        -0.4004,
+        0.1001
+       ],
+       "v": [
+        0,
+        2300
+       ],
+       "ease": [
+        "Slow launch · quick finish"
+       ]
+      },
+      "transform/opacity": {
+       "t": [
+        0.1001,
+        0.266933
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Smooth emphasis"
+       ]
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "titleCard": "enter"
+    }
+   }
+  },
+  "blur-through": {
+   "title": "Blur through",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-blur.md (Blur Through)",
+   "reference": {
+    "t": "T30",
+    "batch": "transitions-b",
+    "comp": "30 Blur through",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/30-blur-through.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 90,
+   "energy": "calm",
+   "window": [
+    -0.7007,
+    0.7007
+   ],
+   "land": 0.7007,
+   "looks": "The old shot blurs to abstract (Gaussian 103) and pushes in 8 %, fading out while the new shot fades in still fully blurred (a soft dissolve); from the cut it sharpens and pushes in 92 → 100 % over ~0.7 s.",
+   "use": "A soft, dreamy change: a reflection, a quote, a time skip, a calm B-roll transition.",
+   "shots": {
+    "new": {
+     "in": -0.3003
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          -0.7007,
+          -0.2002
+         ],
+         "v": [
+          0,
+          103
+         ],
+         "ease": [
+          "Slow launch · quick finish"
+         ]
+        }
+       }
+      },
+      {
+       "name": "Push",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.7007,
+          -0.2002
+         ],
+         "v": [
+          100,
+          108
+         ],
+         "ease": [
+          "Slow launch · quick finish"
+         ]
+        },
+        "opacity": {
+         "t": [
+          -0.4004,
+          0.0
+         ],
+         "v": [
+          100,
+          0
+         ],
+         "ease": [
+          "Slow launch · quick finish"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 120,
+        "outputHeight": 120,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          0.0,
+          0.7007
+         ],
+         "v": [
+          103,
+          0
+         ],
+         "ease": [
+          "Quick launch · soft landing"
+         ]
+        }
+       }
+      },
+      {
+       "name": "Push",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          0.0,
+          0.7007
+         ],
+         "v": [
+          92,
+          100
+         ],
+         "ease": [
+          "Quick launch · soft landing"
+         ]
+        },
+        "opacity": {
+         "t": [
+          -0.3003,
+          0.0
+         ],
+         "v": [
+          0,
+          100
+         ],
+         "ease": [
+          "Smooth emphasis"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "Black",
+     "kind": "solid",
+     "colour": "#000000",
+     "where": "below",
+     "in": -0.4004,
+     "out": 0.0
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "directional-blur": {
+   "title": "Directional blur",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-blur.md (Directional Blur)",
+   "reference": {
+    "t": "T31",
+    "batch": "transitions-b",
+    "comp": "31 Directional blur",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/31-directional-blur.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 42,
+   "frames": 75,
+   "energy": "high",
+   "window": [
+    -0.4004,
+    0.133467
+   ],
+   "land": 0.133467,
+   "looks": "The old shot smears left (horizontal blur 90, 8° skew, 200 px, Fast out) and fades in ~0.4 s; the new shot slides in from the right 4 frames later, smeared, and lands sharp (Expo Out 1).",
+   "use": "Fast sideways energy: 'next', a swipe between options, a list moving on, a sports / speed topic.",
+   "shots": {
+    "new": {
+     "in": -0.266933
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 140,
+        "outputHeight": 130,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Smear",
+       "effect": "ec.blur.directional",
+       "set": {
+        "direction": 90
+       },
+       "keys": {
+        "length": {
+         "t": [
+          -0.4004,
+          0.0
+         ],
+         "v": [
+          0,
+          90
+         ],
+         "ease": [
+          "Fast out"
+         ]
+        }
+       }
+      },
+      {
+       "name": "Slide",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0,
+        "skewAxis": 90
+       },
+       "keys": {
+        "skew": {
+         "t": [
+          -0.4004,
+          0.0
+         ],
+         "v": [
+          0,
+          -8
+         ],
+         "ease": [
+          "Fast out"
+         ]
+        },
+        "position": {
+         "t": [
+          -0.4004,
+          0.0
+         ],
+         "v": [
+          [
+           0,
+           0
+          ],
+          [
+           -200,
+           0
+          ]
+         ],
+         "ease": [
+          "Fast out"
+         ],
+         "offset": true
+        },
+        "opacity": {
+         "t": [
+          -0.4004,
+          0.0
+         ],
+         "v": [
+          100,
+          0
+         ],
+         "ease": [
+          "Fast out"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 140,
+        "outputHeight": 130,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Smear",
+       "effect": "ec.blur.directional",
+       "set": {
+        "direction": 90
+       },
+       "keys": {
+        "length": {
+         "t": [
+          -0.266933,
+          0.133467
+         ],
+         "v": [
+          90,
+          0
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ]
+        }
+       }
+      },
+      {
+       "name": "Slide",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0,
+        "skewAxis": 90
+       },
+       "keys": {
+        "skew": {
+         "t": [
+          -0.266933,
+          0.133467
+         ],
+         "v": [
+          8,
+          0
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ]
+        },
+        "position": {
+         "t": [
+          -0.266933,
+          0.133467
+         ],
+         "v": [
+          [
+           200,
+           0
+          ],
+          [
+           0,
+           0
+          ]
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)"
+         ],
+         "offset": true
+        },
+        "opacity": {
+         "t": [
+          -0.266933,
+          0.0
+         ],
+         "v": [
+          0,
+          100
+         ],
+         "ease": [
+          "Entrance fade (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "Black",
+     "kind": "solid",
+     "colour": "#000000",
+     "where": "below",
+     "in": -0.4004,
+     "out": 0.0
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "page-burn": {
+   "title": "Page burn",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-destruction.md (Page Burn)",
+   "reference": {
+    "t": "T32",
+    "batch": "transitions-b",
+    "comp": "32 Page burn",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-b/renders/32-page-burn.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-b/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 56,
+   "frames": 108,
+   "energy": "high",
+   "window": [
+    -1.2012,
+    1.067733
+   ],
+   "land": 1.067733,
+   "looks": "A ragged fire front (torn by Turbulent Displace, a thin glowing ember rim and a scorched band) eats the old shot from the bottom-right corner over 1.2 s, black behind it; the new shot rises from black over ~1.2 s, starting just before the page is gone.",
+   "use": "A dramatic ending of one idea, 'burn the old way', a destruction / failure beat, into a title from black.",
+   "shots": {
+    "old": {
+     "out": -1.2012
+    },
+    "new": {
+     "in": -1.2012
+    }
+   },
+   "overlays": [
+    {
+     "name": "From black",
+     "kind": "solid",
+     "colour": "#000000",
+     "where": "above-new",
+     "in": -1.2012,
+     "out": 1.067733,
+     "keys": {
+      "transform/opacity": {
+       "t": [
+        -0.133467,
+        1.067733
+       ],
+       "v": [
+        100,
+        0
+       ],
+       "ease": [
+        "Quick launch · soft landing"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Ember",
+     "kind": "solid",
+     "colour": "#ff6a14",
+     "pad": 160,
+     "in": -1.2012,
+     "out": 0.0,
+     "matte": {
+      "name": "Ember matte",
+      "kind": "solid",
+      "colour": "#ffffff",
+      "pad": 160,
+      "mask": {
+       "circle": [
+        2080,
+        1240
+       ],
+       "keys": {
+        "radius": {
+         "t": [
+          -1.2012,
+          0.0
+         ],
+         "v": [
+          1,
+          2300
+         ],
+         "ease": [
+          "Slow launch · quick finish"
+         ]
+        }
+       }
+      },
+      "effects": [
+       {
+        "name": "Torn edge",
+        "effect": "ec.distort.turbulentdisplace",
+        "set": {
+         "amount": 70,
+         "size": 140,
+         "complexity": 3
+        },
+        "expr": {
+         "evolution": "time * 90"
+        }
+       }
+      ],
+      "mode": "alphaInverted"
+     }
+    },
+    {
+     "name": "Page",
+     "kind": "copy",
+     "shots": [
+      "old"
+     ],
+     "pad": 160,
+     "inner": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 120,
+        "outputHeight": 135,
+        "mirrorEdges": true
+       }
+      }
+     ],
+     "in": -1.2012,
+     "out": 0.0,
+     "matte": {
+      "name": "Page matte",
+      "kind": "solid",
+      "colour": "#ffffff",
+      "pad": 160,
+      "mask": {
+       "circle": [
+        2080,
+        1240
+       ],
+       "keys": {
+        "radius": {
+         "t": [
+          -1.2012,
+          0.0
+         ],
+         "v": [
+          17,
+          2316
+         ],
+         "ease": [
+          "Slow launch · quick finish"
+         ]
+        }
+       }
+      },
+      "effects": [
+       {
+        "name": "Torn edge",
+        "effect": "ec.distort.turbulentdisplace",
+        "set": {
+         "amount": 70,
+         "size": 140,
+         "complexity": 3
+        },
+        "expr": {
+         "evolution": "time * 90"
+        }
+       }
+      ],
+      "mode": "alphaInverted"
+     }
+    },
+    {
+     "name": "Char",
+     "kind": "solid",
+     "colour": "#1c0b03",
+     "pad": 160,
+     "in": -1.2012,
+     "out": 0.0,
+     "set": {
+      "transform/opacity": 85
+     },
+     "mask": {
+      "circle": [
+       2080,
+       1240
+      ],
+      "keys": {
+       "radius": {
+        "t": [
+         -1.2012,
+         0.0
+        ],
+        "v": [
+         60,
+         2360
+        ],
+        "ease": [
+         "Slow launch · quick finish"
+        ]
+       }
+      },
+      "feather": [
+       50,
+       50
+      ]
+     },
+     "effects": [
+      {
+       "name": "Torn edge",
+       "effect": "ec.distort.turbulentdisplace",
+       "set": {
+        "amount": 70,
+        "size": 140,
+        "complexity": 3
+       },
+       "expr": {
+        "evolution": "time * 90"
+       }
+      }
+     ],
+     "matte": {
+      "name": "Char matte",
+      "kind": "solid",
+      "colour": "#ffffff",
+      "pad": 160,
+      "mask": {
+       "circle": [
+        2080,
+        1240
+       ],
+       "keys": {
+        "radius": {
+         "t": [
+          -1.2012,
+          0.0
+         ],
+         "v": [
+          17,
+          2316
+         ],
+         "ease": [
+          "Slow launch · quick finish"
+         ]
+        }
+       }
+      },
+      "effects": [
+       {
+        "name": "Torn edge",
+        "effect": "ec.distort.turbulentdisplace",
+        "set": {
+         "amount": 70,
+         "size": 140,
+         "complexity": 3
+        },
+        "expr": {
+         "evolution": "time * 90"
+        }
+       }
+      ],
+      "mode": "alphaInverted"
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "titleCard": "fade"
+    }
+   }
+  }
+ }
+}

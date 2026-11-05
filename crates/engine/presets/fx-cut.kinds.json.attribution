@@ -1,0 +1,8 @@
+asset:        fx-cut.kinds.json
+title:        FX-cut transition kinds (light-leak, overexposure-burn, film-burn, glitch, chromatic-aberration, ripple, vhs-tape, shutter, clock-wipe, grid-dissolve, gravity-drop, morph-circle, blur-through, directional-blur, page-burn): the numbers behind Animation ▸ Transitions ▸ FX Cut (transition.apply)
+author:       Elias (eliasx45)
+source:       original work (copied from Elias's motion-kit repo, shelf/transitions/fx-cut.kinds.json, commit 846e197, sha256 f437f8c8cfabecc7…)
+license:      MIT OR Apache-2.0
+added:        2026-11-05 by eliasx45 (Claude Code agent, ZC2)
+notes:        Plain data: key times, values, ease names, effect settings, overlay specs and expression strings (with ${refFps} / ${amount} / ${i} placeholders) of Elias's native EffectCraft rebuilds of the HyperFrames scene transitions (transitions-b T18–T32, no footage or artwork), approved on 4 Nov 2026. The source of truth is motion-kit's shelf table; this is a copy, read by crates/engine/src/commands/transition_fx.rs with include_str!. Re-copy it (cp ~/Developer/motion-kit/shelf/transitions/fx-cut.kinds.json here) whenever the shelf table changes; never edit it here.
+When re-copying, replace the local path prefix ".../The Vault/" with "The Vault/" and "~/.claude/skills/hyperframes-animation/" with "HyperFrames skill hyperframes-animation/" (this repo is public; the paths are only labels, never read). Check: grep -c '/Users/' fx-cut.kinds.json is 0.

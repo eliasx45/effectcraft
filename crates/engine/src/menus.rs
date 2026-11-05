@@ -1012,6 +1012,22 @@ Animation
       Punch Through | transition.apply {"kind":"punch"}
       Flash Zoom | transition.apply {"kind":"flash"}
       White Flash Zoom | transition.apply {"kind":"white-flash"}
+    FX Cut
+      Light Leak | transition.apply {"kind":"light-leak"}
+      Overexposure Burn | transition.apply {"kind":"overexposure-burn"}
+      Film Burn | transition.apply {"kind":"film-burn"}
+      Glitch | transition.apply {"kind":"glitch"}
+      Chromatic Aberration | transition.apply {"kind":"chromatic-aberration"}
+      Ripple | transition.apply {"kind":"ripple"}
+      VHS Tape | transition.apply {"kind":"vhs-tape"}
+      Shutter | transition.apply {"kind":"shutter"}
+      Clock Wipe | transition.apply {"kind":"clock-wipe"}
+      Grid Dissolve | transition.apply {"kind":"grid-dissolve"}
+      Gravity Drop | transition.apply {"kind":"gravity-drop"}
+      Morph Circle | transition.apply {"kind":"morph-circle"}
+      Blur Through | transition.apply {"kind":"blur-through"}
+      Directional Blur | transition.apply {"kind":"directional-blur"}
+      Page Burn | transition.apply {"kind":"page-burn"}
   ---
   Add Keyframe | anim.addKeyframe
   Toggle Hold Keyframe | keys.toggleHold

@@ -88,6 +88,9 @@ Screenshots of EffectCraft itself, rendered headlessly, showing only procedurall
   `crates/engine/presets/behaviors.json` (sidecar `.attribution`).
 - Zoom-cut transition kinds (12 zoom cuts for Animation ▸ Transitions ▸ Zoom Cut, `transition.apply`; Elias's measured
   data, copied from his motion-kit shelf): `crates/engine/presets/zoom-cut.kinds.json` (sidecar `.attribution`).
+- FX-cut transition kinds (15 FX cuts for Animation ▸ Transitions ▸ FX Cut, `transition.apply`; Elias's native
+  rebuilds of the HyperFrames scene transitions, copied from his motion-kit shelf): `crates/engine/presets/fx-cut.kinds.json`
+  (sidecar `.attribution`).
 - Sample scripts (File ▸ Scripts) and ScriptUI panel: `crates/engine/scripts/Rename Layers.jsx`,
   `crates/engine/scripts/Sort Layers by In Point.jsx`, `crates/engine/scripts/Create Null at Selected Layers.jsx`,
   `crates/engine/scripts/Render Queue Batch.jsx`, `crates/engine/scripts/ScriptUI Panels/Layer Tools.jsx`

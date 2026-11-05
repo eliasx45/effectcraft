@@ -1,5 +1,6 @@
-//! `transition.apply` (Animation ▸ Transitions ▸ Zoom Cut): one of Elias's 12 approved zoom cuts
-//! at the cut between two layers. A port of motion-kit's shelf part `zoom-cut`
+//! `transition.apply` (Animation ▸ Transitions ▸ Zoom Cut / FX Cut): one of Elias's 12 approved
+//! zoom cuts, or one of his 15 approved FX cuts ([`super::transition_fx`]), at the cut between two
+//! layers. The zoom cuts are a port of motion-kit's shelf part `zoom-cut`
 //! (`shelf/transitions/zoom-cut.jsx`, verified frame-exact against the approved renders at
 //! 23.976/24/25/29.97/59.94); every number comes from the same data table, shipped here as
 //! `presets/zoom-cut.kinds.json` (re-copied when the shelf table changes, see its sidecar).
@@ -14,8 +15,10 @@
 //! Graphs by name, resolved through his ease profile ([`crate::taste`]: the Graphs cards and his
 //! saved Motion Library curves), custom `{out, in}` influences, or measured velocities.
 //!
-//! Re-applying on the same pair first removes the previous `ZoomCut …` effects and the overlays
-//! it tagged (no stacking). Everything is one undo step.
+//! Re-applying on the same pair (any kind, zoom or FX) first removes the previous transition: its
+//! `ZoomCut …` / `FxCut …` effects, the overlays and precomps it tagged, the solids only those
+//! overlays used, and an FX cut's trims of the shots (no stacking). Everything is one undo step;
+//! any error rolls everything back.
 
 use std::sync::OnceLock;
 
@@ -27,19 +30,22 @@ use serde_json::{Map, Value, json};
 
 use super::peak::{Graph, apply_graph};
 use super::text_anim::json_value;
+use super::transition_fx;
 use super::{CommandSpec, bad, comp_id, f_p, has_comp, layer_mut, resolve_layer, str_p, unlocked};
 use crate::taste::Profile;
 use crate::{EngineError, Result, Session, cmd, query};
 
-const C: &str = "transition.apply";
+pub(super) const C: &str = "transition.apply";
 
 /// The zoom-cut kinds: a copy of motion-kit's `shelf/transitions/zoom-cut.kinds.json`.
 pub const ZOOM_CUT_JSON: &str = include_str!("../../presets/zoom-cut.kinds.json");
 
 /// Everything the command adds is named with this prefix (effects and layers).
 const PREFIX: &str = "ZoomCut ";
+/// A layer comment or effect name the FX cuts add starts with this.
+const FX_PREFIX: &str = transition_fx::PREFIX;
 /// Most keys one track may hold, so a bad table can't allocate without bound.
-const MAX_KEYS: usize = 64;
+pub(super) const MAX_KEYS: usize = 64;
 /// Farthest a track time may sit from the cut, in seconds.
 const MAX_OFFSET: f64 = 600.0;
 /// Overlays and effects per kind.
@@ -67,7 +73,7 @@ fn kind_spec<'a>(t: &'a Value, kind: &str) -> Result<&'a Value> {
 }
 
 /// "30", "24000/1001" → frames per second.
-fn fps_of(s: &str) -> Option<f64> {
+pub(super) fn fps_of(s: &str) -> Option<f64> {
     let f = match s.split_once('/') {
         Some((a, b)) => a.trim().parse::<f64>().ok()? / b.trim().parse::<f64>().ok()?,
         None => s.trim().parse::<f64>().ok()?,
@@ -75,18 +81,18 @@ fn fps_of(s: &str) -> Option<f64> {
     (f.is_finite() && f > 0.0).then_some(f)
 }
 
-fn arr<'a>(v: &'a Value, k: &str) -> &'a [Value] {
+pub(super) fn arr<'a>(v: &'a Value, k: &str) -> &'a [Value] {
     v.get(k).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
 }
 
-fn pt(v: Option<&Value>) -> Option<[f64; 2]> {
+pub(super) fn pt(v: Option<&Value>) -> Option<[f64; 2]> {
     let a = v?.as_array()?;
     let (x, y) = (a.first()?.as_f64()?, a.get(1)?.as_f64()?);
     (x.is_finite() && y.is_finite()).then_some([x, y])
 }
 
 /// A `#rrggbb` string as a colour value (straight, alpha 1), else the JSON shaped like `like`.
-fn value_like(v: &Value, like: &KV) -> Option<KV> {
+pub(super) fn value_like(v: &Value, like: &KV) -> Option<KV> {
     if let Value::String(s) = v {
         let c = effectcraft_color::Rgba::from_hex(s)?;
         return Some(KV::Color([f64::from(c.r), f64::from(c.g), f64::from(c.b), 1.0]));
@@ -95,30 +101,36 @@ fn value_like(v: &Value, like: &KV) -> Option<KV> {
 }
 
 /// The comp's frames around the cut.
-struct Cx<'a> {
-    kind: &'a str,
-    fr: FrameRate,
-    fps: f64,
+pub(super) struct Cx<'a> {
+    pub kind: &'a str,
+    pub fr: FrameRate,
+    pub fps: f64,
     /// The reference's frame rate (the kind's `fps`).
-    ref_fps: f64,
+    pub ref_fps: f64,
     /// The cut's comp frame.
-    cut_f: i64,
-    profile: &'a Profile,
+    pub cut_f: i64,
+    pub profile: &'a Profile,
+    /// Every table time is multiplied by this (an FX cut's `dur`; 1 for the zoom cuts).
+    pub scale: f64,
 }
 
 impl Cx<'_> {
     /// Comp frame of `t` seconds after the cut.
-    fn frame(&self, t: f64) -> Result<i64> {
+    pub(super) fn frame(&self, t: f64) -> Result<i64> {
         if !t.is_finite() || t.abs() > MAX_OFFSET {
             return Err(bad(C, format!("{}: a track time {t} s is out of range", self.kind)));
         }
-        Ok(self.cut_f.saturating_add((t * self.fps).round() as i64))
+        let f = t * self.scale * self.fps;
+        if !f.is_finite() || f.abs() > MAX_OFFSET * 1000.0 {
+            return Err(bad(C, format!("{}: a track time {t} s is out of range", self.kind)));
+        }
+        Ok(self.cut_f.saturating_add(f.round() as i64))
     }
 
     /// A track's keys as comp frames: an old-shot key in the last reference frame before the cut
     /// goes on the last comp frame before it (a Launch out's peak; in seconds it would land two
     /// frames early at 60 fps and freeze that frame), and no two keys share a frame.
-    fn frames(&self, tr: &Value, role: &str) -> Result<Vec<i64>> {
+    pub(super) fn frames(&self, tr: &Value, role: &str) -> Result<Vec<i64>> {
         let ts = arr(tr, "t");
         if ts.len() < 2 || ts.len() > MAX_KEYS {
             return Err(bad(C, format!("{}: a track needs 2 to {MAX_KEYS} times, has {}", self.kind, ts.len())));
@@ -237,6 +249,13 @@ fn write_track(cx: &Cx, pr: &mut Property, tr: &Value, frames: &[i64], times: &[
         let kv = value_like(&j, &pr.value).ok_or_else(|| bad(C, format!("{kind}: {} doesn't take {j}", pr.name)))?;
         keys.push(Keyframe::new(*t, kv));
     }
+    finish_track(cx, pr, keys, tr, if zoom { sh.mul } else { 1.0 })
+}
+
+/// A track's keys on `pr` with the table's eases per segment (`m` scales measured velocities:
+/// the zoom factor on zoom tracks), and on twos when the track says so.
+pub(super) fn finish_track(cx: &Cx, pr: &mut Property, mut keys: Vec<Keyframe>, tr: &Value, m: f64) -> Result<()> {
+    let kind = cx.kind;
     let eases = arr(tr, "ease");
     for i in 0..keys.len().saturating_sub(1) {
         let Some(e) = eases.get(i) else { continue };
@@ -247,7 +266,6 @@ fn write_track(cx: &Cx, pr: &mut Property, tr: &Value, frames: &[i64], times: &[
             SegEase::Graph(g) => apply_graph(&mut keys, i, pr.spatial, &g)?,
             SegEase::Velocity { out_speed, out_inf, in_speed, in_inf } => {
                 // Measured speeds are units/s of the table's values: zoom tracks scale with them.
-                let m = if zoom { sh.mul } else { 1.0 };
                 let n = ease_dims(&a.value, pr.spatial);
                 if let Some(a) = keys.get_mut(i) {
                     (a.out_interp, a.auto_bezier, a.continuous) = (Interp::Bezier, false, false);
@@ -277,7 +295,7 @@ fn write_track(cx: &Cx, pr: &mut Property, tr: &Value, frames: &[i64], times: &[
 }
 
 /// Set an effect's static values (`set`); a parameter the effect doesn't have is an error.
-fn set_values(g: &mut PropGroup, set: Option<&Value>, kind: &str) -> Result<()> {
+pub(super) fn set_values(g: &mut PropGroup, set: Option<&Value>, kind: &str) -> Result<()> {
     let Some(Value::Object(m)) = set else { return Ok(()) };
     let gname = g.name.clone();
     for (path, v) in m {
@@ -287,7 +305,7 @@ fn set_values(g: &mut PropGroup, set: Option<&Value>, kind: &str) -> Result<()> 
     Ok(())
 }
 
-fn new_effect(next: &mut u64, effect: &str, name: &str, size: [f64; 2], kind: &str) -> Result<PropGroup> {
+pub(super) fn new_effect(next: &mut u64, effect: &str, name: &str, size: [f64; 2], kind: &str) -> Result<PropGroup> {
     let spec = effectcraft_effects::lookup(effect).ok_or_else(|| bad(C, format!("{kind}: unknown effect `{effect}`")))?;
     Ok(effectcraft_effects::instantiate(spec, &mut Ids(next), name, size))
 }
@@ -310,7 +328,7 @@ fn min_zoom(effs: &[Value], mul: f64) -> f64 {
 }
 
 /// Layer times of comp frames on `l`.
-fn layer_times(fr: FrameRate, l: &Layer, frames: &[i64]) -> Vec<Tick> {
+pub(super) fn layer_times(fr: FrameRate, l: &Layer, frames: &[i64]) -> Vec<Tick> {
     frames.iter().map(|f| l.layer_time(fr.tick_of(*f))).collect()
 }
 
@@ -425,19 +443,19 @@ fn shot(
 }
 
 /// Run a sub-command in `cid`.
-fn run(s: &mut Session, cid: ItemId, id: &str, mut p: Value) -> Result<Value> {
+pub(super) fn run(s: &mut Session, cid: ItemId, id: &str, mut p: Value) -> Result<Value> {
     if let Some(o) = p.as_object_mut() {
         o.insert("comp".into(), json!(cid.0));
     }
     s.execute(id, p)
 }
 
-fn layer_of(v: &Value) -> Result<LayerId> {
+pub(super) fn layer_of(v: &Value) -> Result<LayerId> {
     v.get("layer").and_then(Value::as_u64).map(LayerId).ok_or_else(|| bad(C, "a sub-command returned no layer"))
 }
 
 /// Static values on a layer's properties (`path` → JSON).
-fn set_props(s: &mut Session, cid: ItemId, lid: LayerId, vals: &[(&str, Value)]) -> Result<()> {
+pub(super) fn set_props(s: &mut Session, cid: ItemId, lid: LayerId, vals: &[(&str, Value)]) -> Result<()> {
     s.edit("Set Property", None, |proj, _| {
         let l = layer_mut(proj, cid, lid)?;
         for (path, v) in vals {
@@ -494,7 +512,7 @@ fn tag_layer(s: &mut Session, cid: ItemId, lid: LayerId, tag: &str) -> Result<()
 }
 
 /// `layer` directly under `over`.
-fn put_below(s: &mut Session, cid: ItemId, layer: LayerId, over: LayerId) -> Result<()> {
+pub(super) fn put_below(s: &mut Session, cid: ItemId, layer: LayerId, over: LayerId) -> Result<()> {
     run(s, cid, "layer.arrange", json!({"layers": [layer.0], "to": "front", "above": over.0}))?;
     run(s, cid, "layer.arrange", json!({"layers": [over.0], "to": "front", "above": layer.0}))?;
     Ok(())
@@ -539,7 +557,7 @@ fn window(s: &mut Session, cx: &Cx, cid: ItemId, nl: LayerId, spec: &Value, w: &
         Ok(())
     })?;
     // Inside: the footage scaled into the window, clipped to the footage area under the bar.
-    let foot = s.project.comp(wcomp).and_then(|c| c.layers.iter().last().map(|l| l.id)).ok_or_else(|| bad(C, "the window comp is empty"))?;
+    let foot = s.project.comp(wcomp).and_then(|c| c.layers.iter().next_back().map(|l| l.id)).ok_or_else(|| bad(C, "the window comp is empty"))?;
     let f = size[0] / 1920.0;
     let (x0, y0, ww, wh, bar) = (top_left[0] * k, top_left[1] * ky, size[0] * k, size[1] * ky, bar_ref * ky);
     let cxw = x0 + ww / 2.0;
@@ -772,7 +790,7 @@ fn span(cx: &Cx, k: &Value) -> Result<(i64, i64)> {
     Ok((frames.iter().copied().min().unwrap_or(cx.cut_f), frames.iter().copied().max().unwrap_or(cx.cut_f)))
 }
 
-fn fmt_s(t: Tick) -> String {
+pub(super) fn fmt_s(t: Tick) -> String {
     format!("{:.3}", t.seconds())
 }
 
@@ -784,11 +802,171 @@ fn is_window(s: &Session, l: &Layer) -> bool {
     }
 }
 
+/// The cut's comp frame: `at` (comp s), else the new layer's in point.
+pub(super) fn cut_frame(p: &Value, fr: FrameRate, nl: &Layer) -> Result<i64> {
+    let frame = |t: Tick| fr.frame_at(fr.snap_nearest(t));
+    match f_p(p, "at") {
+        Some(a) if a.is_finite() && a.abs() <= 1e7 => Ok(frame(Tick::from_seconds_f64(a))),
+        Some(_) => Err(bad(C, "`at` is the cut in comp seconds")),
+        None if p.get("at").is_some_and(|v| !v.is_null()) => Err(bad(C, "`at` is the cut in comp seconds")),
+        None => Ok(frame(nl.in_point)),
+    }
+}
+
+/// The shots meet at the cut: the old one plays up to it, the new one from it.
+pub(super) fn check_meets(fr: FrameRate, cut_f: i64, ol: &Layer, nl: &Layer) -> Result<()> {
+    let frame = |t: Tick| fr.frame_at(fr.snap_nearest(t));
+    let meets = frame(ol.in_point) < cut_f && frame(ol.out_point) >= cut_f && frame(nl.in_point) <= cut_f && frame(nl.out_point) > cut_f;
+    if meets {
+        return Ok(());
+    }
+    Err(bad(
+        C,
+        format!(
+            "the layers don't meet at the cut ({} s): “{}” plays {}–{} s and “{}” {}–{} s; the old layer must play up to the cut and the new one from it",
+            fmt_s(fr.tick_of(cut_f)),
+            ol.name,
+            fmt_s(ol.in_point),
+            fmt_s(ol.out_point),
+            nl.name,
+            fmt_s(nl.in_point),
+            fmt_s(nl.out_point)
+        ),
+    ))
+}
+
+/// What the previous transition on a pair left that re-applying removed.
+#[derive(Default, Clone, Copy)]
+pub(super) struct Removed {
+    pub effects: usize,
+    pub layers: usize,
+    pub items: usize,
+}
+
+/// A comment carries the pair's tag: exactly, or followed by more words (an FX cut's overlays
+/// add " · reference ease: …"). "FxCut 3->4" never matches "FxCut 3->45 …".
+pub(super) fn tagged(comment: &str, tag: &str) -> bool {
+    comment == tag || comment.strip_prefix(tag).is_some_and(|rest| rest.starts_with(' '))
+}
+
+/// Re-applying on a pair: the previous transition goes first, whatever its family. The shots'
+/// `ZoomCut …` / `FxCut …` effects, the layers tagged for the pair (`ZoomCut <old>-><new>`, `FxCut
+/// <old>-><new>`), the precomps an FX cut tagged (unless something else uses them), the solids
+/// only those layers used (no orphans left in the Solids folder), and an FX cut's trims of the
+/// shots go back to its cut.
+fn remove_previous(s: &mut Session, cid: ItemId, old: LayerId, new: LayerId) -> Result<Removed> {
+    let ztag = format!("{PREFIX}{}->{}", old.0, new.0);
+    let ftag = transition_fx::tag(old, new);
+    let restore = transition_fx::previous_trims(s, cid, old, new, &ftag);
+    let out = s.edit("Remove Transition", None, |proj, st| {
+        let mut out = Removed::default();
+        // Precomps tagged for the pair, kept while anything outside them uses them.
+        let mut items: Vec<ItemId> = proj.items.values().filter(|i| i.as_comp().is_some() && tagged(&i.comment, &ftag)).map(|i| i.id).collect();
+        for _ in 0..items.len() {
+            let keep: Vec<ItemId> =
+                items.iter().copied().filter(|id| proj.item_users(*id).iter().any(|(user, _)| *user != cid && !items.contains(user))).collect();
+            if keep.is_empty() {
+                break;
+            }
+            items.retain(|id| !keep.contains(id));
+        }
+        let mut solids: Vec<ItemId> = vec![];
+        let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
+        if let Some((old_out, new_in)) = restore {
+            if let (Some(t), Some(l)) = (old_out, c.layer_mut(old)) {
+                l.out_point = t.max(l.in_point);
+            }
+            if let (Some(t), Some(l)) = (new_in, c.layer_mut(new)) {
+                l.in_point = t.min(l.out_point);
+            }
+        }
+        for l in c.layers.iter_mut_where(|l| l.id == old || l.id == new) {
+            if let Some(fx) = l.props.sub_mut("effects") {
+                let before = fx.children.len();
+                fx.children.retain(|n| !matches!(n, Node::Group(g) if g.name.starts_with(PREFIX) || g.name.starts_with(FX_PREFIX)));
+                out.effects += before.saturating_sub(fx.children.len());
+            }
+        }
+        let gone = |l: &Layer| l.id != old && l.id != new && (l.comment == ztag || tagged(&l.comment, &ftag));
+        let doomed: Vec<LayerId> = c.layers.iter().filter(|l| gone(l)).map(|l| l.id).collect();
+        for l in c.layers.iter().filter(|l| gone(l)) {
+            if let LayerSource::Solid { item } = l.source {
+                solids.push(item);
+            }
+        }
+        let before = c.layers.len();
+        c.layers.retain(|l| !gone(l));
+        out.layers = before.saturating_sub(c.layers.len());
+        // Nothing left points at a removed layer (a matte, a parent).
+        for l in c.layers.iter_mut_where(|l| l.parent.is_some_and(|p| doomed.contains(&p)) || l.track_matte.is_some_and(|m| doomed.contains(&m.layer))) {
+            if l.parent.is_some_and(|p| doomed.contains(&p)) {
+                l.parent = None;
+            }
+            if l.track_matte.is_some_and(|m| doomed.contains(&m.layer)) {
+                l.track_matte = None;
+            }
+        }
+        for id in &items {
+            if let Some(ic) = proj.comp(*id) {
+                for l in ic.layers.iter() {
+                    if let LayerSource::Solid { item } = l.source {
+                        solids.push(item);
+                    }
+                }
+            }
+        }
+        for id in &items {
+            proj.items.remove(id);
+        }
+        out.items = items.len();
+        st.project_selection.retain(|i| !items.contains(i));
+        // A solid only the removed layers used goes with them.
+        solids.sort_unstable_by_key(|i| i.0);
+        solids.dedup();
+        for sid in solids {
+            if proj.item(sid).is_some_and(|i| matches!(i.kind, effectcraft_project::ItemKind::Solid(_))) && proj.item_users(sid).is_empty() {
+                proj.items.remove(&sid);
+                st.project_selection.retain(|i| *i != sid);
+            }
+        }
+        Ok(out)
+    })?;
+    if out.items > 0 {
+        s.sanitize_state();
+    }
+    Ok(out)
+}
+
+/// What a family's apply hands back: the reply, the undo step's name and the layers to select.
+pub(super) struct Applied {
+    pub reply: Value,
+    pub label: String,
+    pub select: Vec<LayerId>,
+}
+
+/// Every kind of both families, zoom cuts first.
+fn all_kinds() -> Vec<String> {
+    let mut k = kinds();
+    k.extend(transition_fx::kinds());
+    k
+}
+
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     let t = table()?;
     let default = t.get("default").and_then(Value::as_str).unwrap_or("kick");
     let kind = str_p(p, "kind").map(str::trim).filter(|k| !k.is_empty()).unwrap_or(default).to_string();
-    let k = kind_spec(t, &kind)?;
+    let fx = if t.get("kinds").and_then(|k| k.get(&kind)).is_some() {
+        false
+    } else if transition_fx::is_kind(&kind) {
+        true
+    } else {
+        return Err(bad(C, format!("unknown kind `{kind}`; kinds: {}", all_kinds().join(", "))));
+    };
+    let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
+    let (theirs, family, other) = if fx { (["restScale", "centre"], "an FX cut", "zoom cuts") } else { (["dur", "colour"], "a zoom cut", "FX cuts") };
+    if let Some(k) = theirs.iter().find(|k| given(k)) {
+        return Err(bad(C, format!("`{k}` is for {other}; {kind} is {family}")));
+    }
     let Pair { cid, old, new } = pair(s, p)?;
     if old == new {
         return Err(bad(C, "`old` and `new` are the same layer"));
@@ -796,6 +974,42 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     if unlocked(s, cid, vec![old, new], C)?.len() != 2 {
         return Err(bad(C, "one of the two layers is locked"));
     }
+    {
+        let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+        let nl = comp.layer(new).ok_or_else(|| bad(C, "no new layer"))?;
+        if is_window(s, nl) {
+            return Err(bad(C, format!("“{}” is a zoom-cut window already: undo that transition first, or apply to the shot inside it", nl.name)));
+        }
+    }
+    let snap = s.project.clone();
+    let (history, state) = (s.history.clone(), s.state.clone());
+    let result = (|| -> Result<Applied> {
+        // Re-applying on the same pair: the previous transition goes first (no stacking).
+        let removed = remove_previous(s, cid, old, new)?;
+        if fx { transition_fx::apply(s, p, &kind, cid, old, new, removed) } else { apply_zoom(s, p, &kind, cid, old, new, removed) }
+    })();
+    match result {
+        Ok(a) => {
+            super::batch::fold(s, &snap, &a.label);
+            if s.active_comp_id() == Some(cid) {
+                s.state.selected_layers = a.select;
+            }
+            Ok(a.reply)
+        }
+        Err(e) => {
+            s.project = snap;
+            s.history = history;
+            s.state = state;
+            s.bump();
+            Err(e)
+        }
+    }
+}
+
+/// A zoom cut on the pair (the previous transition is gone already).
+fn apply_zoom(s: &mut Session, p: &Value, kind: &str, cid: ItemId, old: LayerId, new: LayerId, removed: Removed) -> Result<Applied> {
+    let t = table()?;
+    let k = kind_spec(t, kind)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let fr = comp.frame_rate;
     let fps = fr.as_f64();
@@ -803,34 +1017,10 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, "the comp has no frame rate"));
     }
     let (ol, nl) = (comp.layer(old).ok_or_else(|| bad(C, "no old layer"))?, comp.layer(new).ok_or_else(|| bad(C, "no new layer"))?);
-    if is_window(s, nl) {
-        return Err(bad(C, format!("“{}” is a zoom-cut window already: undo that transition first, or apply to the shot inside it", nl.name)));
-    }
     let frame = |t: Tick| fr.frame_at(fr.snap_nearest(t));
-    let cut_f = match f_p(p, "at") {
-        Some(a) if a.is_finite() && a.abs() <= 1e7 => frame(Tick::from_seconds_f64(a)),
-        Some(_) => return Err(bad(C, "`at` is the cut in comp seconds")),
-        None if p.get("at").is_some_and(|v| !v.is_null()) => return Err(bad(C, "`at` is the cut in comp seconds")),
-        None => frame(nl.in_point),
-    };
+    let cut_f = cut_frame(p, fr, nl)?;
     let cut = fr.tick_of(cut_f);
-    // The shots meet at the cut: the old one plays up to it, the new one from it.
-    let meets = frame(ol.in_point) < cut_f && frame(ol.out_point) >= cut_f && frame(nl.in_point) <= cut_f && frame(nl.out_point) > cut_f;
-    if !meets {
-        return Err(bad(
-            C,
-            format!(
-                "the layers don't meet at the cut ({} s): “{}” plays {}–{} s and “{}” {}–{} s; the old layer must play up to the cut and the new one from it",
-                fmt_s(cut),
-                ol.name,
-                fmt_s(ol.in_point),
-                fmt_s(ol.out_point),
-                nl.name,
-                fmt_s(nl.in_point),
-                fmt_s(nl.out_point)
-            ),
-        ));
-    }
+    check_meets(fr, cut_f, ol, nl)?;
     if comp.index_of(old) < comp.index_of(new) && frame(ol.out_point) > cut_f {
         return Err(bad(
             C,
@@ -839,7 +1029,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let ref_fps = k.get("fps").and_then(Value::as_str).and_then(fps_of).unwrap_or(30.0);
     let (profile, _) = Profile::load(s.config.as_deref());
-    let cx = Cx { kind: &kind, fr, fps, ref_fps, cut_f, profile: &profile };
+    let cx = Cx { kind, fr, fps, ref_fps, cut_f, profile: &profile, scale: 1.0 };
     let (lo, hi) = span(&cx, k)?;
     if fr.tick_of(lo) < Tick::ZERO {
         return Err(bad(
@@ -872,114 +1062,85 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let (c_old, c_new) = centre_p(p)?;
     let land_f = cx.frame(k.get("land").and_then(Value::as_f64).unwrap_or(0.0))?;
-    let title = k.get("title").and_then(Value::as_str).unwrap_or(&kind).to_string();
+    let title = k.get("title").and_then(Value::as_str).unwrap_or(kind).to_string();
 
-    let snap = s.project.clone();
-    let (history, state) = (s.history.clone(), s.state.clone());
     let mut added = Added::default();
-    let result = (|| -> Result<(LayerId, usize, usize)> {
-        // Re-applying on the same pair: the previous zoom cut goes first (no stacking).
-        let tag = format!("{PREFIX}{}->{}", old.0, new.0);
-        let removed = s.edit("Remove Zoom Cut", None, |proj, _| {
+    // Transform shutter samples: a smooth smear, no ghost copies (raised, never lowered).
+    if let Some(cs) = k.get("comp") {
+        let samples = cs.get("motionBlurSamples").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
+        let limit = cs.get("adaptiveSampleLimit").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
+        s.edit("Composition Settings", None, |proj, _| {
             let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-            let mut fx_n = 0usize;
-            for l in c.layers.iter_mut_where(|l| l.id == old || l.id == new) {
-                if let Some(fx) = l.props.sub_mut("effects") {
-                    let before = fx.children.len();
-                    fx.children.retain(|n| !matches!(n, Node::Group(g) if g.name.starts_with(PREFIX)));
-                    fx_n += before.saturating_sub(fx.children.len());
-                }
+            if let Some(n) = samples {
+                c.motion_blur_samples = c.motion_blur_samples.max(n.min(256));
             }
-            let before = c.layers.len();
-            c.layers.retain(|l| l.id == old || l.id == new || l.comment != tag);
-            Ok((fx_n, before.saturating_sub(c.layers.len())))
+            if let Some(n) = limit {
+                c.motion_blur_adaptive_limit = c.motion_blur_adaptive_limit.max(n.min(256));
+            }
+            Ok(())
         })?;
-        // Transform shutter samples: a smooth smear, no ghost copies (raised, never lowered).
-        if let Some(cs) = k.get("comp") {
-            let samples = cs.get("motionBlurSamples").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
-            let limit = cs.get("adaptiveSampleLimit").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
-            s.edit("Composition Settings", None, |proj, _| {
-                let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-                if let Some(n) = samples {
-                    c.motion_blur_samples = c.motion_blur_samples.max(n.min(256));
-                }
-                if let Some(n) = limit {
-                    c.motion_blur_adaptive_limit = c.motion_blur_adaptive_limit.max(n.min(256));
-                }
-                Ok(())
-            })?;
-        }
-        let mut new_layer = new;
-        for role in ["old", "new", "window"] {
-            let Some(spec) = layers.get(role) else { continue };
-            let (m, grow) = if role == rest_role { (mul, (mul - 1.0).abs() > 1e-12) } else { (1.0, false) };
-            match role {
-                "old" => shot(s, &cx, cid, old, "old", spec, m, c_old, grow, &mut added)?,
-                "new" => shot(s, &cx, cid, new, "new", spec, m, c_new, grow, &mut added)?,
-                _ => {
-                    let w = k.get("window").ok_or_else(|| bad(C, format!("{kind}: no window in the table")))?;
-                    new_layer = window(s, &cx, cid, new, spec, w, m, &mut added)?;
-                    // The background goes with the final pair (old → window).
-                    let ftag = format!("{PREFIX}{}->{}", old.0, new_layer.0);
-                    for bg in added.layers.clone() {
-                        tag_layer(s, cid, LayerId(bg), &ftag)?;
-                    }
+    }
+    let mut new_layer = new;
+    for role in ["old", "new", "window"] {
+        let Some(spec) = layers.get(role) else { continue };
+        let (m, grow) = if role == rest_role { (mul, (mul - 1.0).abs() > 1e-12) } else { (1.0, false) };
+        match role {
+            "old" => shot(s, &cx, cid, old, "old", spec, m, c_old, grow, &mut added)?,
+            "new" => shot(s, &cx, cid, new, "new", spec, m, c_new, grow, &mut added)?,
+            _ => {
+                let w = k.get("window").ok_or_else(|| bad(C, format!("{kind}: no window in the table")))?;
+                new_layer = window(s, &cx, cid, new, spec, w, m, &mut added)?;
+                // The background goes with the final pair (old → window).
+                let ftag = format!("{PREFIX}{}->{}", old.0, new_layer.0);
+                for bg in added.layers.clone() {
+                    tag_layer(s, cid, LayerId(bg), &ftag)?;
                 }
             }
-        }
-        let ovs = arr(k, "overlays");
-        if !ovs.is_empty() {
-            let ftag = format!("{PREFIX}{}->{}", old.0, new_layer.0);
-            overlays(s, &cx, cid, ovs, old, new_layer, &ftag, &mut added)?;
-        }
-        Ok((new_layer, removed.0, removed.1))
-    })();
-    match result {
-        Ok((new_layer, fx_removed, layers_removed)) => {
-            super::batch::fold(s, &snap, &format!("Apply Transition Zoom Cut {title}"));
-            if s.active_comp_id() == Some(cid) {
-                s.state.selected_layers = vec![old, new_layer];
-            }
-            let land = fr.tick_of(land_f);
-            Ok(json!({
-                "kind": kind,
-                "title": title,
-                "comp": cid.0,
-                "old": old.0,
-                "new": new_layer.0,
-                "shot": new.0,
-                "at": cut.seconds(),
-                "cutFrame": cut_f,
-                "land": land.seconds(),
-                "landFrame": land_f,
-                "restScale": rest * mul,
-                "effects": added.effects,
-                "layers": added.layers,
-                "removed": {"effects": fx_removed, "layers": layers_removed},
-            }))
-        }
-        Err(e) => {
-            s.project = snap;
-            s.history = history;
-            s.state = state;
-            s.bump();
-            Err(e)
         }
     }
+    let ovs = arr(k, "overlays");
+    if !ovs.is_empty() {
+        let ftag = format!("{PREFIX}{}->{}", old.0, new_layer.0);
+        overlays(s, &cx, cid, ovs, old, new_layer, &ftag, &mut added)?;
+    }
+    let land = fr.tick_of(land_f);
+    Ok(Applied {
+        reply: json!({
+            "kind": kind,
+            "family": "zoom-cut",
+            "title": title,
+            "comp": cid.0,
+            "old": old.0,
+            "new": new_layer.0,
+            "shot": new.0,
+            "at": cut.seconds(),
+            "cutFrame": cut_f,
+            "land": land.seconds(),
+            "landFrame": land_f,
+            "restScale": rest * mul,
+            "effects": added.effects,
+            "layers": added.layers,
+            "removed": {"effects": removed.effects, "layers": removed.layers, "items": removed.items},
+        }),
+        label: format!("Apply Transition Zoom Cut {title}"),
+        select: vec![old, new_layer],
+    })
 }
 
-/// `transition.kinds`: the zoom-cut kinds in menu order, with what they look like and are for.
+/// `transition.kinds`: both families' kinds in menu order (zoom cuts, then FX cuts), with what
+/// they look like and are for.
 fn list(_: &mut Session, _: &Value) -> Result<Value> {
     let t = table()?;
-    Ok(Value::Array(
-        kinds()
-            .iter()
-            .filter_map(|id| {
-                let k = t.get("kinds")?.get(id)?;
-                Some(json!({"kind": id, "title": k.get("title"), "energy": k.get("energy"), "land": k.get("land"), "looks": k.get("looks"), "use": k.get("use")}))
-            })
-            .collect(),
-    ))
+    let default = t.get("default").and_then(Value::as_str).unwrap_or("kick");
+    let mut out: Vec<Value> = kinds()
+        .iter()
+        .filter_map(|id| {
+            let k = t.get("kinds")?.get(id)?;
+            Some(json!({"kind": id, "family": "zoom-cut", "default": id == default, "title": k.get("title"), "energy": k.get("energy"), "land": k.get("land"), "looks": k.get("looks"), "use": k.get("use")}))
+        })
+        .collect();
+    out.extend(transition_fx::list());
+    Ok(Value::Array(out))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -989,7 +1150,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Transition",
             ["Animation", "Transitions", "Zoom Cut"],
             None,
-            "{kind?: kick (default) | blur-settle | push-in | into-window | twos-card | twos-push | zoom-through | whip | zoom-out-through | punch | flash | white-flash (transition.kinds), comp?, old?: layer (outgoing shot), new?: layer (incoming shot), layers?: [old, new], at? (comp s, the cut; default the new layer's in point), restScale? (scale % the kind's rest layer settles at; lower = mirrored edges), centre?: [x, y] | {old, new} (zoom centre, px of a 1920×1080 layer)} → {kind, title, comp, old, new (the window layer for into-window), shot, at, cutFrame, land (comp s the move has settled), landFrame, restScale, effects: [{layer, effect, name, path}], layers (added overlay / background layers), removed {effects, layers}}. Without old/new: the two selected layers (the later in point is the new shot), or with nothing selected the layer starting at the playhead and the one under it ending there; pass `comp` with old/new when nothing is selected. Shots' transforms are never touched: every move is a `ZoomCut <kind> …` effect; re-applying on the pair replaces the previous one. One undo step",
+            "{kind?: zoom cuts kick (default) | blur-settle | push-in | into-window | twos-card | twos-push | zoom-through | whip | zoom-out-through | punch | flash | white-flash, FX cuts light-leak | overexposure-burn | film-burn | glitch | chromatic-aberration | ripple | vhs-tape | shutter | clock-wipe | grid-dissolve | gravity-drop | morph-circle | blur-through | directional-blur | page-burn (transition.kinds), comp?, old?: layer (outgoing shot), new?: layer (incoming shot), layers?: [old, new], at? (comp s, the cut; default the new layer's in point), restScale? (zoom cuts: scale % the kind's rest layer settles at; lower = mirrored edges), centre?: [x, y] | {old, new} (zoom cuts: zoom centre, px of a 1920×1080 layer), dur? (FX cuts: the transition's length in s; every time scales by dur / the kind's window), colour?: #rrggbb | [#rrggbb…] (FX cuts: the cover's colour for overexposure-burn, shutter, grid-dissolve, morph-circle; a list = grid-dissolve's cell palette)} → {kind, family (zoom-cut | fx-cut), title, comp, old, new (the window layer for into-window), shot, at, cutFrame, land (comp s the move has settled), landFrame, restScale (zoom), start / startFrame / dur / comps / restacked (FX), effects: [{layer, effect, name, path}], layers (added overlay / background layers), removed {effects, layers, items}}. Without old/new: the two selected layers (the later in point is the new shot), or with nothing selected the layer starting at the playhead and the one under it ending there; pass `comp` with old/new when nothing is selected. Shots' transforms are never touched: every move is a `ZoomCut <kind> …` / `FxCut <kind> …` effect, overlay or precomp; FX cuts trim the shots to the kind (some start the new shot under the old one up to 1.2 s early: it needs that much footage). Re-applying on the pair (any kind) replaces the previous one. One undo step",
             can_apply,
             apply
         ),

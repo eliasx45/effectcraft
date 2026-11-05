@@ -1,8 +1,8 @@
-//! `transition.apply` (Animation ▸ Transitions ▸ Zoom Cut): Elias's 12 zoom cuts from the
-//! motion-kit shelf table (ZC1).
+//! `transition.apply` (Animation ▸ Transitions ▸ Zoom Cut / FX Cut): Elias's 12 zoom cuts (ZC1)
+//! and 15 FX cuts (ZC2) from the motion-kit shelf tables.
 
 use effectcraft_keyframe::Interp;
-use effectcraft_project::{ItemId, LayerId, Project};
+use effectcraft_project::{ItemId, LayerId, LayerSource, Project};
 use effectcraft_time::{FrameRate, Tick};
 use serde_json::{Value, json};
 
@@ -11,6 +11,24 @@ use crate::render::RenderOpts;
 
 const KINDS: [&str; 12] =
     ["kick", "blur-settle", "push-in", "into-window", "twos-card", "twos-push", "zoom-through", "whip", "zoom-out-through", "punch", "flash", "white-flash"];
+
+const FX_KINDS: [&str; 15] = [
+    "light-leak",
+    "overexposure-burn",
+    "film-burn",
+    "glitch",
+    "chromatic-aberration",
+    "ripple",
+    "vhs-tape",
+    "shutter",
+    "clock-wipe",
+    "grid-dissolve",
+    "gravity-drop",
+    "morph-circle",
+    "blur-through",
+    "directional-blur",
+    "page-burn",
+];
 
 /// The kinds with a track key at the cut itself (t = 0 in the table).
 const CUT_KEY: [&str; 8] = ["kick", "into-window", "zoom-through", "whip", "zoom-out-through", "punch", "flash", "white-flash"];
@@ -218,7 +236,7 @@ fn bad_requests_are_errors_and_change_nothing() {
 
 #[test]
 fn the_selection_or_the_playhead_picks_the_pair() {
-    let (mut s, cid, old, new, cut) = cut_at(24.0, 10.0, 4.0);
+    let (mut s, _cid, old, new, cut) = cut_at(24.0, 10.0, 4.0);
     // Two selected layers, either order: the later in point is the new shot.
     for sel in [[old, new], [new, old]] {
         s.execute("layer.select", json!({"layers": sel})).unwrap();
@@ -242,8 +260,12 @@ fn the_selection_or_the_playhead_picks_the_pair() {
     let spec = crate::commands::find("transition.apply").unwrap();
     assert_eq!(spec.menu, ["Animation", "Transitions", "Zoom Cut"]);
     let kinds = s.execute("transition.kinds", json!({})).unwrap();
-    let ids: Vec<&str> = kinds.as_array().unwrap().iter().map(|k| k["kind"].as_str().unwrap()).collect();
-    assert_eq!(ids, KINDS);
+    let ids = |family: &str| -> Vec<String> {
+        kinds.as_array().unwrap().iter().filter(|k| k["family"] == json!(family)).map(|k| k["kind"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(ids("zoom-cut"), KINDS);
+    assert_eq!(ids("fx-cut"), FX_KINDS);
+    assert_eq!(kinds.as_array().unwrap().len(), 27);
 }
 
 #[test]
@@ -296,4 +318,348 @@ fn a_lower_rest_scale_brings_mirrored_edges() {
     // 480 × 384 / 1920 = 96, 270 × 216 / 1080 = 54.
     let anchor = g.prop("anchor").unwrap().value.components();
     assert!((anchor[0] - 96.0).abs() < 1e-9 && (anchor[1] - 54.0).abs() < 1e-9, "{anchor:?}");
+}
+
+// ---------------------------------------------------------------- FX cuts (ZC2)
+
+/// Every expression in the project: (comp, layer, uid path, text).
+fn all_exprs(p: &Project) -> Vec<(ItemId, LayerId, String, String)> {
+    let mut out = vec![];
+    for item in p.items.values() {
+        let Some(c) = item.as_comp() else { continue };
+        for l in c.layers.iter() {
+            l.props.walk("", &mut |path, pr| {
+                if let Some(e) = &pr.expr {
+                    out.push((item.id, l.id, path.to_string(), e.text.clone()));
+                }
+            });
+        }
+    }
+    out
+}
+
+/// Names of the items both families add (`ZoomCut …` / `FxCut …` comps).
+fn transition_items(s: &Session) -> Vec<String> {
+    s.project.items.values().filter(|i| i.name.starts_with("FxCut ") || i.name.starts_with("ZoomCut ")).map(|i| i.name.clone()).collect()
+}
+
+/// Solid items nothing uses.
+fn orphan_solids(s: &Session) -> Vec<String> {
+    s.project
+        .items
+        .values()
+        .filter(|i| matches!(i.kind, effectcraft_project::ItemKind::Solid(_)) && s.project.item_users(i.id).is_empty())
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+/// Effects of both families on a layer.
+fn transition_effects(s: &Session, cid: u64, l: u64) -> Vec<String> {
+    let comp = s.project.comp(ItemId(cid)).unwrap();
+    let Some(l) = comp.layer(LayerId(l)) else { return vec![] };
+    l.effects()
+        .map(|fx| fx.groups().filter(|g| g.name.starts_with("ZoomCut ") || g.name.starts_with("FxCut ")).map(|g| g.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn timing(s: &Session, cid: u64, l: u64) -> (Tick, Tick) {
+    let l = s.project.comp(ItemId(cid)).unwrap().layer(LayerId(l)).unwrap();
+    (l.in_point, l.out_point)
+}
+
+#[test]
+fn every_fx_kind_applies_at_29_97_and_24_fps() {
+    for fps in [29.97, 24.0] {
+        for kind in FX_KINDS {
+            let (mut s, cid, old, new, cut) = cut_at(fps, 10.0, 4.0);
+            let (t_old, t_new) = (transform(&s, cid, old), transform(&s, cid, new));
+            let (time_old, time_new) = (timing(&s, cid, old), timing(&s, cid, new));
+            let items_before = s.project.items.len();
+            let undo_before = s.history.undo.len();
+            let r = apply(&mut s, cid, old, new, kind).unwrap_or_else(|e| panic!("{kind} at {fps}: {e}"));
+            assert_eq!((r["kind"].as_str(), r["family"].as_str()), (Some(kind), Some("fx-cut")), "{r}");
+            // The cut is the new layer's in point, on a frame.
+            let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+            let at = Tick::from_seconds_f64(r["at"].as_f64().unwrap());
+            assert!((at.seconds() - cut).abs() < 1e-9, "{kind} at {fps}: cut {} vs {cut}", at.seconds());
+            assert_eq!(fr.snap_nearest(at), at, "{kind} at {fps}: the cut is on a frame");
+            // Every key, in every comp (copies of the cut, VHS strips), lands on a frame of its comp.
+            let keys = all_keys(&s.project);
+            assert!(!keys.is_empty() || kind == "glitch", "{kind} at {fps}: no keys");
+            for (kfr, t, what) in &keys {
+                assert_eq!(kfr.snap_nearest(*t), *t, "{kind} at {fps}: {what} key at {} s is between frames", t.seconds());
+            }
+            // The shots' own transforms are never touched.
+            assert_eq!(transform(&s, cid, old), t_old, "{kind} at {fps}: old transform changed");
+            assert_eq!(transform(&s, cid, new), t_new, "{kind} at {fps}: new transform changed");
+            // Everything added is named FxCut <kind> and tagged for the pair.
+            let pre = format!("FxCut {kind} ");
+            for e in r["effects"].as_array().unwrap() {
+                assert!(e["name"].as_str().unwrap().starts_with(&pre), "{kind}: {e}");
+            }
+            let comp = s.project.comp(ItemId(cid)).unwrap();
+            for l in r["layers"].as_array().unwrap() {
+                let l = comp.layer(LayerId(l.as_u64().unwrap())).unwrap();
+                assert!(l.name.starts_with(&pre), "{kind}: layer “{}”", l.name);
+                assert!(l.comment.starts_with(&format!("FxCut {old}->{new}")), "{kind}: “{}” comment “{}”", l.name, l.comment);
+            }
+            assert_eq!(comp.layers.len(), 2 + r["layers"].as_array().unwrap().len(), "{kind}: the reply lists every added layer");
+            for c in r["comps"].as_array().unwrap() {
+                let it = s.project.item(ItemId(c.as_u64().unwrap())).unwrap();
+                assert!(it.name.starts_with(&pre) && it.comment == format!("FxCut {old}->{new}"), "{kind}: item “{}” “{}”", it.name, it.comment);
+            }
+            assert!(r["effects"].as_array().unwrap().len() + r["layers"].as_array().unwrap().len() > 0, "{kind}: nothing added");
+            // Every expression placeholder is filled in.
+            for (_, _, path, text) in all_exprs(&s.project) {
+                assert!(!text.contains("${"), "{kind} at {fps}: {path}: {text}");
+            }
+            // One undo step takes it all back, the shots' trims too.
+            assert_eq!(s.history.undo.len(), undo_before + 1, "{kind} at {fps}: one undo step");
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 2, "{kind}: undo removes the added layers");
+            assert!(transition_effects(&s, cid, old).is_empty() && transition_effects(&s, cid, new).is_empty(), "{kind}: undo removes the effects");
+            assert_eq!(s.project.items.len(), items_before, "{kind}: undo removes the added items");
+            assert_eq!((timing(&s, cid, old), timing(&s, cid, new)), (time_old, time_new), "{kind}: undo restores the trims");
+        }
+    }
+}
+
+#[test]
+fn fx_cut_keys_follow_the_comp_frames_and_dur() {
+    for fps in [29.97, 24.0] {
+        // light-leak's warm solid: 0 → 60 % from 0.433767 s before the cut to the cut.
+        let (mut s, cid, old, new, _) = cut_at(fps, 10.0, 4.0);
+        let r = apply(&mut s, cid, old, new, "light-leak").unwrap();
+        let comp = s.project.comp(ItemId(cid)).unwrap();
+        let fr = comp.frame_rate;
+        let cut_f = r["cutFrame"].as_i64().unwrap();
+        let warm = comp.layers.iter().find(|l| l.name == "FxCut light-leak Leak warm").unwrap();
+        let op = warm.props.prop("transform/opacity").unwrap();
+        let frames: Vec<i64> = op.keys.iter().map(|k| fr.frame_at(warm.comp_time(k.time))).collect();
+        let f = |t: f64| cut_f + (t * fr.as_f64()).round() as i64;
+        assert_eq!(frames, [f(-0.433767), cut_f, f(0.066733), f(0.467133)], "{fps}");
+        let v: Vec<f64> = op.keys.iter().map(|k| k.value.components()[0]).collect();
+        assert_eq!(v, [0.0, 60.0, 60.0, 0.0]);
+        assert_eq!(fr.frame_at(warm.in_point), f(-0.433767));
+        assert_eq!(fr.frame_at(warm.out_point), f(0.467133));
+        assert_eq!(r["landFrame"].as_i64(), Some(f(0.467133)));
+        // Screen over the shots, from the window's start.
+        assert_eq!(warm.blend_mode, effectcraft_color::BlendMode::Screen);
+        assert_eq!(r["startFrame"].as_i64(), Some(f(-0.433767)));
+        // `dur` scales every time by dur / window (0.9009 s): twice as long.
+        let (mut s, cid, old, new, _) = cut_at(fps, 10.0, 4.0);
+        let r = s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "light-leak", "dur": 1.8018})).unwrap();
+        let comp = s.project.comp(ItemId(cid)).unwrap();
+        let warm = comp.layers.iter().find(|l| l.name == "FxCut light-leak Leak warm").unwrap();
+        let op = warm.props.prop("transform/opacity").unwrap();
+        let first = fr.frame_at(warm.comp_time(op.keys[0].time));
+        assert_eq!(first, r["cutFrame"].as_i64().unwrap() + (-0.433767f64 * 2.0 * fr.as_f64()).round() as i64, "{fps}: dur doubles the lead");
+        assert!((r["dur"].as_f64().unwrap() - 1.8018).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn light_leak_cut_frame_has_no_transparent_edge_pixel() {
+    for fps in [29.97, 24.0] {
+        let (mut s, cid, old, new, _) = cut_at(fps, 10.0, 4.0);
+        let r = apply(&mut s, cid, old, new, "light-leak").unwrap();
+        let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+        let f = r["cutFrame"].as_i64().unwrap();
+        let img = s.render(ItemId(cid), fr.tick_of(f), RenderOpts { scale: 1.0, motion_blur: false, ..Default::default() });
+        let (w, h) = (i64::from(img.width), i64::from(img.height));
+        let edge = (0..w).flat_map(|x| [(x, 0), (x, h - 1)]).chain((0..h).flat_map(|y| [(0, y), (w - 1, y)]));
+        let mut warm = 0;
+        for (x, y) in edge {
+            let px = img.get(x, y);
+            assert!(px[3] > 0.999, "{fps} fps cut frame {f}: transparent edge pixel at ({x}, {y}): {px:?}");
+            if px[0] > 0.3 {
+                warm += 1;
+            }
+        }
+        // The leak lights the blue shot: the edge isn't plain blue.
+        assert!(warm > 0, "{fps} fps: no light on the cut frame");
+    }
+}
+
+#[test]
+fn clock_wipe_starts_the_new_shot_under_the_old_one() {
+    let (mut s, cid, old, new, cut) = cut_at(29.97, 10.0, 4.0);
+    // cut_at stacks the new shot above the old one: the old one goes on top while both show.
+    let r = apply(&mut s, cid, old, new, "clock-wipe").unwrap();
+    assert_eq!(r["restacked"], json!(true));
+    let comp = s.project.comp(ItemId(cid)).unwrap();
+    assert!(comp.index_of(LayerId(old)) < comp.index_of(LayerId(new)), "the old shot is above the new one");
+    let fr = comp.frame_rate;
+    let cut_f = r["cutFrame"].as_i64().unwrap();
+    let early = cut_f + (-0.467133f64 * fr.as_f64()).round() as i64;
+    let (nin, _) = timing(&s, cid, new);
+    let (_, oout) = timing(&s, cid, old);
+    assert_eq!(fr.frame_at(nin), early, "the new shot starts 0.467 s early");
+    assert!((oout.seconds() - cut).abs() < 1e-9, "the old shot still ends on the cut");
+    assert_eq!(transition_effects(&s, cid, old), ["FxCut clock-wipe Clock"]);
+    let l = comp.layer(LayerId(old)).unwrap();
+    let g = l.effects().unwrap().groups().find(|g| g.name == "FxCut clock-wipe Clock").unwrap();
+    assert_eq!(g.match_id, "ec.transition.radialwipe");
+    let done = g.prop("completion").unwrap();
+    let frames: Vec<i64> = done.keys.iter().map(|k| fr.frame_at(l.comp_time(k.time))).collect();
+    assert_eq!(frames, [early, cut_f]);
+    // Re-applying (no `at`): the trims go back to the cut first, so it lands on the same cut.
+    let r2 = apply(&mut s, cid, old, new, "clock-wipe").unwrap();
+    assert_eq!(r2["cutFrame"], r["cutFrame"]);
+    assert_eq!(r2["removed"]["effects"], json!(1));
+    // A zoom cut after it: the new shot starts on the cut again.
+    let r3 = apply(&mut s, cid, old, new, "kick").unwrap();
+    assert_eq!(r3["cutFrame"], r["cutFrame"]);
+    assert!((timing(&s, cid, new).0.seconds() - cut).abs() < 1e-9);
+}
+
+#[test]
+fn page_burn_ends_the_old_shot_early_and_burns_a_copy() {
+    let (mut s, cid, old, new, cut) = cut_at(29.97, 10.0, 4.0);
+    let r = apply(&mut s, cid, old, new, "page-burn").unwrap();
+    let comp = s.project.comp(ItemId(cid)).unwrap();
+    let fr = comp.frame_rate;
+    let cut_f = r["cutFrame"].as_i64().unwrap();
+    let early = cut_f + (-1.2012f64 * fr.as_f64()).round() as i64;
+    assert_eq!(fr.frame_at(timing(&s, cid, old).1), early);
+    assert_eq!(fr.frame_at(timing(&s, cid, new).0), early);
+    // The burning page: a copy of the old shot (an oversize precomp), its matte inverted.
+    let page = comp.layers.iter().find(|l| l.name == "FxCut page-burn Page").unwrap();
+    let matte = page.track_matte.expect("the page has a track matte");
+    let ml = comp.layer(matte.layer).unwrap();
+    assert_eq!(ml.name, "FxCut page-burn Page matte");
+    assert_eq!(format!("{:?}", matte.kind), "AlphaInverted");
+    let LayerSource::Comp { item } = page.source else { panic!("the page is a precomp") };
+    let scenes = s.project.comp(item).unwrap();
+    assert!(scenes.width > comp.width && scenes.height > comp.height, "padded");
+    assert_eq!(scenes.layers.len(), 1, "a copy of the old shot only");
+    // The matte's circle grows: a keyed mask path.
+    let mask_keys = ml.masks().unwrap().groups().next().unwrap().prop("path").unwrap().keys.len();
+    assert_eq!(mask_keys, 2);
+    // Re-applying: the shots go back to the cut first, then the burn trims them again.
+    let r2 = apply(&mut s, cid, old, new, "page-burn").unwrap();
+    assert_eq!(r2["cutFrame"], r["cutFrame"]);
+    assert_eq!(fr.frame_at(timing(&s, cid, old).1), early);
+    // A plain FX cut after it: both shots meet on the cut again.
+    apply(&mut s, cid, old, new, "light-leak").unwrap();
+    assert!((timing(&s, cid, old).1.seconds() - cut).abs() < 1e-9 && (timing(&s, cid, new).0.seconds() - cut).abs() < 1e-9);
+}
+
+#[test]
+fn switching_kinds_on_the_same_pair_leaves_nothing_behind() {
+    let (mut s, cid, old, new, cut) = cut_at(29.97, 10.0, 4.0);
+    let items0 = s.project.items.len();
+    // Every FX cut, every zoom cut but into-window (it moves the new shot into a window), and the
+    // FX cuts again backwards: each replaces the one before.
+    let seq: Vec<&str> = FX_KINDS.iter().chain(KINDS.iter().filter(|k| **k != "into-window")).chain(FX_KINDS.iter().rev()).copied().collect();
+    for kind in seq {
+        let r = apply(&mut s, cid, old, new, kind).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        assert!((r["at"].as_f64().unwrap() - cut).abs() < 1e-9, "{kind}: the cut moved to {}", r["at"]);
+        let comp = s.project.comp(ItemId(cid)).unwrap();
+        assert_eq!(comp.layers.len(), 2 + r["layers"].as_array().unwrap().len(), "{kind}: leftover layers");
+        let pre = if r["family"] == json!("fx-cut") { format!("FxCut {kind} ") } else { format!("ZoomCut {kind} ") };
+        for l in [old, new] {
+            for e in transition_effects(&s, cid, l) {
+                assert!(e.starts_with(&pre), "{kind}: leftover effect “{e}”");
+            }
+        }
+        for l in comp.layers.iter().filter(|l| l.id != LayerId(old) && l.id != LayerId(new)) {
+            assert!(l.name.starts_with(&pre), "{kind}: leftover layer “{}”", l.name);
+        }
+        for i in transition_items(&s) {
+            assert!(i.starts_with(&pre), "{kind}: leftover item “{i}”");
+        }
+        assert!(orphan_solids(&s).is_empty(), "{kind}: orphan solids {:?}", orphan_solids(&s));
+    }
+    apply(&mut s, cid, old, new, "kick").unwrap();
+    assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 2);
+    assert!(transition_items(&s).is_empty());
+    assert_eq!(s.project.items.len(), items0, "no items left behind (solids, precomps)");
+    assert_eq!(transition_effects(&s, cid, new), ["ZoomCut kick Zoom"]);
+}
+
+#[test]
+fn zoom_cut_overlays_leave_no_orphan_solids() {
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    let items0 = s.project.items.len();
+    apply(&mut s, cid, old, new, "white-flash").unwrap();
+    assert!(s.project.items.len() > items0, "the lights are solids");
+    apply(&mut s, cid, old, new, "white-flash").unwrap();
+    assert!(orphan_solids(&s).is_empty(), "{:?}", orphan_solids(&s));
+    apply(&mut s, cid, old, new, "kick").unwrap();
+    assert_eq!(s.project.items.len(), items0);
+}
+
+#[test]
+fn fx_cut_expressions_evaluate() {
+    for kind in ["glitch", "chromatic-aberration", "ripple", "vhs-tape", "page-burn"] {
+        let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+        s.expr_check = Some(effectcraft_expr::check_syntax);
+        let r = apply(&mut s, cid, old, new, kind).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        let t = r["at"].as_f64().unwrap() - 0.05;
+        let exprs = all_exprs(&s.project);
+        assert!(!exprs.is_empty(), "{kind}: no expressions");
+        for (c, l, path, text) in exprs {
+            effectcraft_expr::eval_property(&s.project, c, l, &path, t).unwrap_or_else(|e| panic!("{kind}: {path} `{text}`: {e}"));
+        }
+    }
+    // ${amount} reads the layer's own Amount slider; ${i} is each strip's index.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "vhs-tape").unwrap();
+    let texts: Vec<String> = all_exprs(&s.project).into_iter().map(|e| e.3).collect();
+    assert!(texts.iter().any(|t| t.contains("effect(\"FxCut vhs-tape Amount\")(\"Slider\")")));
+    assert!(texts.iter().any(|t| t.contains("seedRandom(20, true)")), "the 20th strip");
+    let strips = s.project.items.values().find(|i| i.name == "FxCut vhs-tape Strips").and_then(|i| i.as_comp()).unwrap();
+    assert_eq!(strips.layers.len(), 20);
+}
+
+#[test]
+fn bad_fx_requests_are_errors_and_change_nothing() {
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    let before = s.project.clone();
+    let undo = s.history.undo.len();
+    let e = apply(&mut s, cid, old, new, "sparkle").unwrap_err().to_string();
+    assert!(e.contains("unknown kind") && e.contains("page-burn") && e.contains("kick"), "{e}");
+    // Each family's own options.
+    let e = s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "glitch", "restScale": 100})).unwrap_err().to_string();
+    assert!(e.contains("zoom cuts"), "{e}");
+    let e = s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "kick", "dur": 1})).unwrap_err().to_string();
+    assert!(e.contains("FX cuts"), "{e}");
+    assert!(s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "shutter", "dur": -1})).is_err());
+    assert!(s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "shutter", "colour": "red"})).is_err());
+    assert!(s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "grid-dissolve", "colour": []})).is_err());
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project), "nothing changed");
+    assert_eq!(s.history.undo.len(), undo);
+    // Both options are accepted parameters.
+    let r = s.execute_checked("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "shutter", "colour": "#ff0000", "dur": 0.5})).unwrap();
+    assert!((r["dur"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 2, "undo goes back");
+    // page-burn runs 1.2 s before the cut: too close to the comp's start.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 1.0);
+    let before = s.project.clone();
+    let e = apply(&mut s, cid, old, new, "page-burn").unwrap_err().to_string();
+    assert!(e.contains("too close to the comp's start"), "{e}");
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project), "nothing changed");
+    // The comp ends before it settles.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 4.5, 4.0);
+    let e = apply(&mut s, cid, old, new, "page-burn").unwrap_err().to_string();
+    assert!(e.contains("comp too short"), "{e}");
+    assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 2);
+}
+
+#[test]
+fn fx_colour_tints_the_covers() {
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "grid-dissolve", "colour": ["#ff0000", "#00ff00"]})).unwrap();
+    let comp = s.project.comp(ItemId(cid)).unwrap();
+    let cells = comp.layers.iter().filter(|l| l.name.starts_with("FxCut grid-dissolve Cell ")).count();
+    assert_eq!(cells, 12);
+    // The menu: Animation ▸ Transitions ▸ FX Cut ▸ the 15 kinds.
+    let bar = crate::menus::menu_bar();
+    let json = serde_json::to_string(bar).unwrap();
+    assert!(json.contains("\"label\":\"FX Cut\""), "no FX Cut submenu");
+    for kind in FX_KINDS {
+        assert!(json.contains(&format!("{{\"kind\":\"{kind}\"}}")), "{kind} isn't in the menus");
+    }
 }
