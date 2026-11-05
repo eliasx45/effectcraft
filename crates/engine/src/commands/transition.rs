@@ -1,6 +1,6 @@
-//! `transition.apply` (Animation ▸ Transitions ▸ Zoom Cut / FX Cut): one of Elias's 12 approved
-//! zoom cuts, or one of his 15 approved FX cuts ([`super::transition_fx`]), at the cut between two
-//! layers. The zoom cuts are a port of motion-kit's shelf part `zoom-cut`
+//! `transition.apply` (Animation ▸ Transitions ▸ Zoom Cut / FX Cut / Scene Cut): one of Elias's 12
+//! approved zoom cuts, one of his 15 approved FX cuts ([`super::transition_fx`]) or one of his 15
+//! approved scene cuts ([`super::transition_scene`]), at the cut between two layers. The zoom cuts are a port of motion-kit's shelf part `zoom-cut`
 //! (`shelf/transitions/zoom-cut.jsx`, verified frame-exact against the approved renders at
 //! 23.976/24/25/29.97/59.94); every number comes from the same data table, shipped here as
 //! `presets/zoom-cut.kinds.json` (re-copied when the shelf table changes, see its sidecar).
@@ -15,10 +15,12 @@
 //! Graphs by name, resolved through his ease profile ([`crate::taste`]: the Graphs cards and his
 //! saved Motion Library curves), custom `{out, in}` influences, or measured velocities.
 //!
-//! Re-applying on the same pair (any kind, zoom or FX) first removes the previous transition: its
-//! `ZoomCut …` / `FxCut …` effects, the overlays and precomps it tagged, the solids only those
-//! overlays used, and an FX cut's trims of the shots (no stacking). Everything is one undo step;
-//! any error rolls everything back.
+//! Re-applying on the same pair (any kind of any family) first removes the previous transition: its
+//! `ZoomCut …` / `FxCut …` / `SceneCut …` effects, the overlays and precomps it tagged, the solids
+//! only those overlays used, and an FX or scene cut's trims of the shots (no stacking). Everything is
+//! one undo step; any error rolls everything back. Whatever the command changed on the user's own
+//! layers beyond adding effects (in / out points, layer order, a shot moved into a precomp) is
+//! listed in the reply's `moved`.
 
 use std::sync::OnceLock;
 
@@ -30,7 +32,8 @@ use serde_json::{Map, Value, json};
 
 use super::peak::{Graph, apply_graph};
 use super::text_anim::json_value;
-use super::transition_fx;
+use super::transition_fx::{self, Family};
+use super::transition_scene;
 use super::{CommandSpec, bad, comp_id, f_p, has_comp, layer_mut, resolve_layer, str_p, unlocked};
 use crate::taste::Profile;
 use crate::{EngineError, Result, Session, cmd, query};
@@ -44,6 +47,8 @@ pub const ZOOM_CUT_JSON: &str = include_str!("../../presets/zoom-cut.kinds.json"
 const PREFIX: &str = "ZoomCut ";
 /// A layer comment or effect name the FX cuts add starts with this.
 const FX_PREFIX: &str = transition_fx::PREFIX;
+/// A layer comment or effect name the scene cuts add starts with this.
+const SCENE_PREFIX: &str = transition_scene::PREFIX;
 /// Most keys one track may hold, so a bad table can't allocate without bound.
 pub(super) const MAX_KEYS: usize = 64;
 /// Farthest a track time may sit from the cut, in seconds.
@@ -849,19 +854,26 @@ pub(super) fn tagged(comment: &str, tag: &str) -> bool {
     comment == tag || comment.strip_prefix(tag).is_some_and(|rest| rest.starts_with(' '))
 }
 
+/// Whether a layer / item comment carries one of the pair's tags (any family).
+fn pair_tagged(comment: &str, ztag: &str, ftag: &str, stag: &str) -> bool {
+    comment == ztag || tagged(comment, ftag) || tagged(comment, stag)
+}
+
 /// Re-applying on a pair: the previous transition goes first, whatever its family. The shots'
-/// `ZoomCut …` / `FxCut …` effects, the layers tagged for the pair (`ZoomCut <old>-><new>`, `FxCut
-/// <old>-><new>`), the precomps an FX cut tagged (unless something else uses them), the solids
-/// only those layers used (no orphans left in the Solids folder), and an FX cut's trims of the
-/// shots go back to its cut.
+/// `ZoomCut …` / `FxCut …` / `SceneCut …` effects, the layers tagged for the pair (`ZoomCut
+/// <old>-><new>`, `FxCut <old>-><new>`, `SceneCut <old>-><new>`), the precomps an FX or scene cut
+/// tagged (unless something else uses them), the solids only those layers used (no orphans left in
+/// the Solids folder), and an FX or scene cut's trims of the shots go back to its cut.
 fn remove_previous(s: &mut Session, cid: ItemId, old: LayerId, new: LayerId) -> Result<Removed> {
     let ztag = format!("{PREFIX}{}->{}", old.0, new.0);
-    let ftag = transition_fx::tag(old, new);
-    let restore = transition_fx::previous_trims(s, cid, old, new, &ftag);
+    let ftag = Family::Fx.tag(old, new);
+    let stag = Family::Scene.tag(old, new);
+    let restore = transition_fx::previous_trims(Family::Fx, s, cid, old, new).or_else(|| transition_fx::previous_trims(Family::Scene, s, cid, old, new));
     let out = s.edit("Remove Transition", None, |proj, st| {
         let mut out = Removed::default();
         // Precomps tagged for the pair, kept while anything outside them uses them.
-        let mut items: Vec<ItemId> = proj.items.values().filter(|i| i.as_comp().is_some() && tagged(&i.comment, &ftag)).map(|i| i.id).collect();
+        let mut items: Vec<ItemId> =
+            proj.items.values().filter(|i| i.as_comp().is_some() && (tagged(&i.comment, &ftag) || tagged(&i.comment, &stag))).map(|i| i.id).collect();
         for _ in 0..items.len() {
             let keep: Vec<ItemId> =
                 items.iter().copied().filter(|id| proj.item_users(*id).iter().any(|(user, _)| *user != cid && !items.contains(user))).collect();
@@ -883,11 +895,13 @@ fn remove_previous(s: &mut Session, cid: ItemId, old: LayerId, new: LayerId) -> 
         for l in c.layers.iter_mut_where(|l| l.id == old || l.id == new) {
             if let Some(fx) = l.props.sub_mut("effects") {
                 let before = fx.children.len();
-                fx.children.retain(|n| !matches!(n, Node::Group(g) if g.name.starts_with(PREFIX) || g.name.starts_with(FX_PREFIX)));
+                fx.children.retain(
+                    |n| !matches!(n, Node::Group(g) if g.name.starts_with(PREFIX) || g.name.starts_with(FX_PREFIX) || g.name.starts_with(SCENE_PREFIX)),
+                );
                 out.effects += before.saturating_sub(fx.children.len());
             }
         }
-        let gone = |l: &Layer| l.id != old && l.id != new && (l.comment == ztag || tagged(&l.comment, &ftag));
+        let gone = |l: &Layer| l.id != old && l.id != new && pair_tagged(&l.comment, &ztag, &ftag, &stag);
         let doomed: Vec<LayerId> = c.layers.iter().filter(|l| gone(l)).map(|l| l.id).collect();
         for l in c.layers.iter().filter(|l| gone(l)) {
             if let LayerSource::Solid { item } = l.source {
@@ -937,35 +951,120 @@ fn remove_previous(s: &mut Session, cid: ItemId, old: LayerId, new: LayerId) -> 
     Ok(out)
 }
 
-/// What a family's apply hands back: the reply, the undo step's name and the layers to select.
+/// What a family's apply hands back: the reply, the undo step's name, the layers to select and the
+/// user's layers it moved in the layer order on purpose (an FX cut's restack, a scene cut's stack).
 pub(super) struct Applied {
     pub reply: Value,
     pub label: String,
     pub select: Vec<LayerId>,
+    pub arranged: Vec<LayerId>,
 }
 
-/// Every kind of both families, zoom cuts first.
+/// Every kind of the three families: zoom cuts, FX cuts, scene cuts.
 fn all_kinds() -> Vec<String> {
     let mut k = kinds();
     k.extend(transition_fx::kinds());
+    k.extend(transition_scene::kinds());
     k
+}
+
+/// The comp's own layers before a transition (not the pair's tagged overlays): id, name, in, out,
+/// top to bottom.
+type Before = Vec<(LayerId, String, Tick, Tick)>;
+
+fn before_layers(s: &Session, cid: ItemId, old: LayerId, new: LayerId) -> Before {
+    let (ztag, ftag, stag) = (format!("{PREFIX}{}->{}", old.0, new.0), Family::Fx.tag(old, new), Family::Scene.tag(old, new));
+    let Some(c) = s.project.comp(cid) else { return vec![] };
+    c.layers
+        .iter()
+        .filter(|l| l.id == old || l.id == new || !pair_tagged(&l.comment, &ztag, &ftag, &stag))
+        .map(|l| (l.id, l.name.clone(), l.in_point, l.out_point))
+        .collect()
+}
+
+/// What the transition changed on the user's own layers: `{layer, name, what, from, to}` for an in
+/// / out point (comp s), the layer order (`order`: 1 = the top of the user's layers), or `precomposed`
+/// (moved into a precomp: into-window's window).
+fn moved(s: &Session, cid: ItemId, before: &Before, arranged: &[LayerId]) -> Vec<Value> {
+    let Some(c) = s.project.comp(cid) else { return vec![] };
+    let mut out = vec![];
+    for (id, name, tin, tout) in before {
+        match c.layer(*id) {
+            None => out.push(json!({"layer": id.0, "name": name, "what": "precomposed"})),
+            Some(l) => {
+                for (what, a, b) in [("in", *tin, l.in_point), ("out", *tout, l.out_point)] {
+                    if a != b {
+                        out.push(json!({"layer": id.0, "name": name, "what": what, "from": a.seconds(), "to": b.seconds()}));
+                    }
+                }
+            }
+        }
+    }
+    // The order among the user's layers that are still here (1 = the top).
+    let ids: Vec<LayerId> = before.iter().map(|b| b.0).filter(|id| c.layer(*id).is_some()).collect();
+    let after: Vec<LayerId> = c.layers.iter().map(|l| l.id).filter(|id| ids.contains(id)).collect();
+    let pos = |list: &[LayerId], id: LayerId| list.iter().position(|x| *x == id).map(|i| i.saturating_add(1));
+    let mut order = |id: LayerId| {
+        if let (Some(a), Some(b)) = (pos(&ids, id), pos(&after, id))
+            && a != b
+        {
+            let name = before.iter().find(|x| x.0 == id).map(|x| x.1.clone()).unwrap_or_default();
+            out.push(json!({"layer": id.0, "name": name, "what": "order", "from": a, "to": b}));
+        }
+    };
+    for id in arranged {
+        order(*id);
+    }
+    // Anything else out of order (never expected): every layer whose place changed.
+    let rest = |l: &[LayerId]| l.iter().copied().filter(|id| !arranged.contains(id)).collect::<Vec<_>>();
+    if rest(&ids) != rest(&after) {
+        for id in rest(&ids) {
+            order(id);
+        }
+    }
+    out
+}
+
+/// The three families of `transition.apply`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fam {
+    Zoom,
+    Fx,
+    Scene,
 }
 
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     let t = table()?;
     let default = t.get("default").and_then(Value::as_str).unwrap_or("kick");
     let kind = str_p(p, "kind").map(str::trim).filter(|k| !k.is_empty()).unwrap_or(default).to_string();
-    let fx = if t.get("kinds").and_then(|k| k.get(&kind)).is_some() {
-        false
+    let fam = if t.get("kinds").and_then(|k| k.get(&kind)).is_some() {
+        Fam::Zoom
     } else if transition_fx::is_kind(&kind) {
-        true
+        Fam::Fx
+    } else if transition_scene::is_kind(&kind) {
+        Fam::Scene
     } else {
         return Err(bad(C, format!("unknown kind `{kind}`; kinds: {}", all_kinds().join(", "))));
     };
+    // Each family's own options.
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
-    let (theirs, family, other) = if fx { (["restScale", "centre"], "an FX cut", "zoom cuts") } else { (["dur", "colour"], "a zoom cut", "FX cuts") };
-    if let Some(k) = theirs.iter().find(|k| given(k)) {
-        return Err(bad(C, format!("`{k}` is for {other}; {kind} is {family}")));
+    let family = match fam {
+        Fam::Zoom => "a zoom cut",
+        Fam::Fx => "an FX cut",
+        Fam::Scene => "a scene cut",
+    };
+    let options: [(&str, &str, bool); 5] = [
+        ("restScale", "zoom cuts", fam == Fam::Zoom),
+        ("centre", "zoom cuts", fam == Fam::Zoom),
+        ("dur", "FX cuts and scene cuts", fam != Fam::Zoom),
+        ("colour", "FX cuts and scene cuts", fam != Fam::Zoom),
+        ("dir", "scene cuts", fam == Fam::Scene),
+    ];
+    if let Some((k, whose, _)) = options.iter().find(|(k, _, ok)| !ok && given(k)) {
+        return Err(bad(C, format!("`{k}` is for {whose}; {kind} is {family}")));
+    }
+    if fam == Fam::Scene {
+        transition_scene::dir_matrix(&kind, p)?;
     }
     let Pair { cid, old, new } = pair(s, p)?;
     if old == new {
@@ -983,13 +1082,22 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let snap = s.project.clone();
     let (history, state) = (s.history.clone(), s.state.clone());
+    let before = before_layers(s, cid, old, new);
     let result = (|| -> Result<Applied> {
         // Re-applying on the same pair: the previous transition goes first (no stacking).
         let removed = remove_previous(s, cid, old, new)?;
-        if fx { transition_fx::apply(s, p, &kind, cid, old, new, removed) } else { apply_zoom(s, p, &kind, cid, old, new, removed) }
+        match fam {
+            Fam::Zoom => apply_zoom(s, p, &kind, cid, old, new, removed),
+            Fam::Fx => transition_fx::apply(s, p, &kind, cid, old, new, removed),
+            Fam::Scene => transition_scene::apply(s, p, &kind, cid, old, new, removed),
+        }
     })();
     match result {
-        Ok(a) => {
+        Ok(mut a) => {
+            let mv = moved(s, cid, &before, &a.arranged);
+            if let Some(o) = a.reply.as_object_mut() {
+                o.insert("moved".into(), Value::Array(mv));
+            }
             super::batch::fold(s, &snap, &a.label);
             if s.active_comp_id() == Some(cid) {
                 s.state.selected_layers = a.select;
@@ -1124,11 +1232,12 @@ fn apply_zoom(s: &mut Session, p: &Value, kind: &str, cid: ItemId, old: LayerId,
         }),
         label: format!("Apply Transition Zoom Cut {title}"),
         select: vec![old, new_layer],
+        arranged: vec![],
     })
 }
 
-/// `transition.kinds`: both families' kinds in menu order (zoom cuts, then FX cuts), with what
-/// they look like and are for.
+/// `transition.kinds`: the three families' kinds in menu order (zoom cuts, FX cuts, scene cuts),
+/// with what they look like and are for, and the `dir` values each takes (scene cuts).
 fn list(_: &mut Session, _: &Value) -> Result<Value> {
     let t = table()?;
     let default = t.get("default").and_then(Value::as_str).unwrap_or("kick");
@@ -1136,10 +1245,11 @@ fn list(_: &mut Session, _: &Value) -> Result<Value> {
         .iter()
         .filter_map(|id| {
             let k = t.get("kinds")?.get(id)?;
-            Some(json!({"kind": id, "family": "zoom-cut", "default": id == default, "title": k.get("title"), "energy": k.get("energy"), "land": k.get("land"), "looks": k.get("looks"), "use": k.get("use")}))
+            Some(json!({"kind": id, "family": "zoom-cut", "default": id == default, "title": k.get("title"), "energy": k.get("energy"), "land": k.get("land"), "looks": k.get("looks"), "use": k.get("use"), "dir": null, "dirs": []}))
         })
         .collect();
     out.extend(transition_fx::list());
+    out.extend(transition_scene::list());
     Ok(Value::Array(out))
 }
 
@@ -1150,7 +1260,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Transition",
             ["Animation", "Transitions", "Zoom Cut"],
             None,
-            "{kind?: zoom cuts kick (default) | blur-settle | push-in | into-window | twos-card | twos-push | zoom-through | whip | zoom-out-through | punch | flash | white-flash, FX cuts light-leak | overexposure-burn | film-burn | glitch | chromatic-aberration | ripple | vhs-tape | shutter | clock-wipe | grid-dissolve | gravity-drop | morph-circle | blur-through | directional-blur | page-burn (transition.kinds), comp?, old?: layer (outgoing shot), new?: layer (incoming shot), layers?: [old, new], at? (comp s, the cut; default the new layer's in point), restScale? (zoom cuts: scale % the kind's rest layer settles at; lower = mirrored edges), centre?: [x, y] | {old, new} (zoom cuts: zoom centre, px of a 1920×1080 layer), dur? (FX cuts: the transition's length in s; every time scales by dur / the kind's window), colour?: #rrggbb | [#rrggbb…] (FX cuts: the cover's colour for overexposure-burn, shutter, grid-dissolve, morph-circle; a list = grid-dissolve's cell palette)} → {kind, family (zoom-cut | fx-cut), title, comp, old, new (the window layer for into-window), shot, at, cutFrame, land (comp s the move has settled), landFrame, restScale (zoom), start / startFrame / dur / comps / restacked (FX), effects: [{layer, effect, name, path}], layers (added overlay / background layers), removed {effects, layers, items}}. Without old/new: the two selected layers (the later in point is the new shot), or with nothing selected the layer starting at the playhead and the one under it ending there; pass `comp` with old/new when nothing is selected. Shots' transforms are never touched: every move is a `ZoomCut <kind> …` / `FxCut <kind> …` effect, overlay or precomp; FX cuts trim the shots to the kind (some start the new shot under the old one up to 1.2 s early: it needs that much footage). Re-applying on the pair (any kind) replaces the previous one. One undo step",
+            "{kind?: zoom cuts kick (default) | blur-settle | push-in | into-window | twos-card | twos-push | zoom-through | whip | zoom-out-through | punch | flash | white-flash, FX cuts light-leak | overexposure-burn | film-burn | glitch | chromatic-aberration | ripple | vhs-tape | shutter | clock-wipe | grid-dissolve | gravity-drop | morph-circle | blur-through | directional-blur | page-burn, scene cuts push-slide | vertical-push | elastic-push | squeeze | circle-iris | diamond-iris | diagonal-split | card-flip-3d | crossfade | blur-crossfade | focus-pull | color-dip | staggered-blocks | horizontal-blinds | vertical-blinds (transition.kinds), comp?, old?: layer (outgoing shot), new?: layer (incoming shot), layers?: [old, new], at? (comp s, the cut; default the new layer's in point), restScale? (zoom cuts: scale % the kind's rest layer settles at; lower = mirrored edges), centre?: [x, y] | {old, new} (zoom cuts: zoom centre, px of a 1920×1080 layer), dur? (FX and scene cuts: the transition's length in s; every time scales by dur / the kind's window), colour?: #rrggbb | [#rrggbb…] (FX and scene cuts: the cover / backing / dip / blocks / strips colour; a list = grid-dissolve's or staggered-blocks' palette), dir? (scene cuts that have one, transition.kinds `dirs`: push-slide, elastic-push, squeeze left | right | up | down; vertical-push up | down | left | right; staggered-blocks right | left | up | down; horizontal-blinds right | left; vertical-blinds down | up; diagonal-split up-right | up-left | down-right | down-left)} → {kind, family (zoom-cut | fx-cut | scene-cut), title, comp, old, new (the window layer for into-window), shot, at, cutFrame, land (comp s the move has settled), landFrame, restScale (zoom), start / startFrame / dur / comps (FX, scene), restacked (FX), stacked / dir (scene), effects: [{layer, effect, name, path}], layers (added overlay / background layers), removed {effects, layers, items}, moved: [{layer, name, what (in | out | order | precomposed), from, to}] (what changed on the user's own layers: in / out points in comp s, order 1 = the top of them)}. Without old/new: the two selected layers (the later in point is the new shot), or with nothing selected the layer starting at the playhead and the one under it ending there; pass `comp` with old/new when nothing is selected. Shots' transforms are never touched: every move is a `ZoomCut <kind> …` / `FxCut <kind> …` / `SceneCut <kind> …` effect, overlay or precomp; FX and scene cuts trim the shots to the kind (many start the new shot under or over the old one up to 1.2 s early: it needs that much footage; color-dip starts it 2 frames after the cut), and the scene cuts that slide or fade the new shot in over the old one (elastic-push, crossfade, blur-crossfade, focus-pull) move it right above the old one. Re-applying on the pair (any kind, any family) replaces the previous one. One undo step",
             can_apply,
             apply
         ),

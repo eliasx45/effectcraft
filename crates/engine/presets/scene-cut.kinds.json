@@ -1,0 +1,2563 @@
+{
+ "about": "scene-cut kinds: the numbers behind every version of the scene-cut transition (motion-kit shelf/transitions/scene-cut.jsx; EffectCraft transition.apply is to read the same file next). 15 HyperFrames scene transitions (HyperFrames skill hyperframes-animation/transitions/css-*.md) rebuilt natively in Rebuilds/hf-demos/transitions-a (T01–T08, T11–T17; T09 zoom through and T10 zoom out were rejected, replaced by zoom-cut), approved by Elias 5 Nov 2026 (\"yea these are good\"). Plain data, no code.",
+ "schema": {
+  "time": "every t / in / out / land / window / trim is SECONDS relative to `at`, the cut = the old shot's out-point = the first frame the new picture owns fully; a caller snaps at + t to its comp's frames (round), so any fps works",
+  "fps / cutFrame / frames": "the approved demo comp (transitions-a, 29.97 fps): its cut frame and length (every transition there starts at frame 30)",
+  "window": "[start, end] of the whole transition (the <id>-start hit; `dur` scales every time by dur / (end − start))",
+  "land": "when everything has settled (the <id>-land hit)",
+  "shots": "{old: {out}, new: {in}}: where the shots are trimmed (default 0 = at); a negative new.in starts the new shot early (it needs that much footage before its in-point); a negative old.out ends the old shot early (a copy carries it); a positive new.in leaves a gap (color-dip: the dip colour)",
+  "stack": "new-over-old: the kind needs the new shot above the old one (it slides or fades in over it); the caller moves the new shot right above the old one when it is below. Absent = either order (the shots never overlap where it matters)",
+  "dir": "{default, maps: {dir: [[a, b], [c, d]]}}: the kind's data is written for `default`; another dir maps every geometric value with its 2×2 matrix in centred, normalised frame coords (u = x / 1920 − 0.5, v = y / 1080 − 0.5; [u', v'] = M · [u, v]): absolute points (positions, pivots, mask circle centres, mask polygon vertices) x' = (u' + 0.5) · 1920, y' = (v' + 0.5) · 1080; offsets [dx, dy] → M · [dx / 1920, dy / 1080] · [1920, 1080]; when M swaps the axes (M[0][0] = 0), every effect param named …Width ↔ …Height (scaleWidth ↔ scaleHeight, outputWidth ↔ outputHeight) and rect sizes [w, h] → [h · 1920 / 1080, w · 1080 / 1920]. A kind without `dir` takes none (an error)",
+  "layers": "old / new: effects added to the shot, in stack order, each {name (the effect becomes 'SceneCut <kind> <name>'), effect id, set {param: value}, keys {param: track}, expr {param: expression}, pivot? [x, y] (px of the 1920x1080 shot: a Transform effect's anchor = position = this point; default the centre)}; the shot's own transform is never touched",
+  "track": "{t: [s], v: [values], ease: [one per segment: a Graph name (core/graphs.jsx) | 'linear' (hold the value / untouched) | 'hold' (a hold keyframe: the value jumps at the next key)], offset? (position values are offsets from the layer / Transform-effect centre or pivot, px of 1920x1080), spatial? ('linear': linear spatial interpolation on every key, a straight path with no overshoot between keys)}",
+  "overlays": "layers sceneCut adds, in order bottom → top, each named 'SceneCut <kind> <name>' and tagged (layer comment 'SceneCut <old>-><new>') so a re-call removes them: kind solid (colour; pad = px added on every side; size = [w, h] px of 1920x1080 instead of the comp's size: a strip, its centre = its layer position) | glow | rect / ellipse (shape layers: size, position = the centre = the layer position, colour) | copy (a copy of the cut: duplicates of the shots named in `shots` (['old'] / ['new'] / both) in a precomp 'SceneCut <kind> Scenes', each trimmed as a plain cut at `at` (old out = 0, new in = 0) unless `trim` {old: {out}, new: {in}} moves it (circle / diamond iris: the new copy starts at the window start); threeD: true = a 3-D layer turned by transform/rotationX|Y|Z keys through the comp's camera (none: the default camera)) | comp (a precomp of its own `layers`). where: top (default: above both shots) | below (under both shots) | above-new. in / out: when the layer is on. keys {layer path: track} (positions absolute px of 1920x1080 unless offset), effects, blend, mask ({rect: [x, y, w, h]} | {circle: [cx, cy], keys {radius: track}, feather} | {keys {path: track of polygons [[x, y], …] (straight edges, any vertex count, the same count in every key)}}; layer px of 1920x1080), matte, repeat, tint (the `colour` option replaces colour; palette = index into an array `colour`)",
+  "underlays": "a solid named BG / Dip with where: below is the dark backing the approved comps had under the shots (#08080b, tint): it shows where the approved render shows it on purpose (squeeze's gap, the card flip's surround, the blur crossfade's dip, the color dip) and nothing else ever shows the comp background",
+  "colours": "#rrggbb",
+  "energy": "calm | medium | high",
+  "demo": "the approved demo: old = presenter-micah, new = presenter-dharya (from = source s at comp 0), or new.titleCard = s relative to `at` when the transitions-a title card's text starts its entrance (navy 4-colour gradient, 'Part two' / 'The next point', slide up 100 px on Expo Out 1 + Entrance fade, the sub 3 frames later)"
+ },
+ "default": "push-slide",
+ "order": [
+  "push-slide",
+  "vertical-push",
+  "elastic-push",
+  "squeeze",
+  "circle-iris",
+  "diamond-iris",
+  "diagonal-split",
+  "card-flip-3d",
+  "crossfade",
+  "blur-crossfade",
+  "focus-pull",
+  "color-dip",
+  "staggered-blocks",
+  "horizontal-blinds",
+  "vertical-blinds"
+ ],
+ "kinds": {
+  "push-slide": {
+   "title": "Push slide",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-push.md (Push Slide)",
+   "reference": {
+    "t": "T01",
+    "batch": "transitions-a",
+    "comp": "T01 Push slide",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T01-push-slide.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.5005,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "The new shot pushes the old one out to the left, edge to edge, both moving together over 0.5 s (Expo In-Out).",
+   "use": "Next point in a list, the next step of a process, moving on in a story (dir: left · right · up · down).",
+   "dir": {
+    "default": "left",
+    "maps": {
+     "left": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "right": [
+      [
+       -1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "up": [
+      [
+       0,
+       1
+      ],
+      [
+       1,
+       0
+      ]
+     ],
+     "down": [
+      [
+       0,
+       1
+      ],
+      [
+       -1,
+       0
+      ]
+     ]
+    }
+   },
+   "shots": {
+    "new": {
+     "in": -0.5005
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Push",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          [
+           0,
+           0
+          ],
+          [
+           -1920,
+           0
+          ]
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ],
+         "offset": true
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "effects": [
+      {
+       "name": "Seam",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 100.4,
+        "outputHeight": 100,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Push",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          [
+           1920,
+           0
+          ],
+          [
+           0,
+           0
+          ]
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ],
+         "offset": true
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "vertical-push": {
+   "title": "Vertical push",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-push.md (Vertical Push)",
+   "reference": {
+    "t": "T02",
+    "batch": "transitions-a",
+    "comp": "T02 Vertical push",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T02-vertical-push.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.5005,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "The new shot pushes the old one up and out of the frame, edge to edge, over 0.5 s (Expo In-Out).",
+   "use": "Scrolling to the next thing, a feed / list / timeline moving on, 'next up' (dir: up · down · left · right).",
+   "dir": {
+    "default": "up",
+    "maps": {
+     "up": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "down": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       -1
+      ]
+     ],
+     "left": [
+      [
+       0,
+       1
+      ],
+      [
+       1,
+       0
+      ]
+     ],
+     "right": [
+      [
+       0,
+       -1
+      ],
+      [
+       1,
+       0
+      ]
+     ]
+    }
+   },
+   "shots": {
+    "new": {
+     "in": -0.5005
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Push",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          [
+           0,
+           0
+          ],
+          [
+           0,
+           -1080
+          ]
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ],
+         "offset": true
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "effects": [
+      {
+       "name": "Seam",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 100,
+        "outputHeight": 100.4,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Push",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          [
+           0,
+           1080
+          ],
+          [
+           0,
+           0
+          ]
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ],
+         "offset": true
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "elastic-push": {
+   "title": "Elastic push",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-push.md (Elastic Push)",
+   "reference": {
+    "t": "T03",
+    "batch": "transitions-a",
+    "comp": "T03 Elastic push",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T03-elastic-push.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 75,
+   "energy": "high",
+   "window": [
+    -0.5005,
+    0.266933
+   ],
+   "land": 0.266933,
+   "looks": "The old shot accelerates out to the left (Fast out, 0.5 s) while the new one slides in over it from the right, overshoots 30 px, swings back 15 px and settles (Expo Out 1, then Expo In-Out) 0.27 s after the cut.",
+   "use": "A lively, bouncy next point: an upbeat list, a fun fact, a playful change of topic (dir: left · right · up · down).",
+   "dir": {
+    "default": "left",
+    "maps": {
+     "left": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "right": [
+      [
+       -1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "up": [
+      [
+       0,
+       1
+      ],
+      [
+       1,
+       0
+      ]
+     ],
+     "down": [
+      [
+       0,
+       1
+      ],
+      [
+       -1,
+       0
+      ]
+     ]
+    }
+   },
+   "stack": "new-over-old",
+   "shots": {
+    "new": {
+     "in": -0.4004
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 120,
+        "outputHeight": 100,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Push",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          [
+           0,
+           0
+          ],
+          [
+           -1920,
+           0
+          ]
+         ],
+         "ease": [
+          "Fast out"
+         ],
+         "offset": true
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputHeight": 100,
+        "mirrorEdges": true
+       },
+       "keys": {
+        "outputWidth": {
+         "t": [
+          -0.4004,
+          0.0
+         ],
+         "v": [
+          100,
+          104
+         ],
+         "ease": [
+          "hold"
+         ]
+        }
+       }
+      },
+      {
+       "name": "Push",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "position": {
+         "t": [
+          -0.4004,
+          0.0,
+          0.166833,
+          0.266933
+         ],
+         "v": [
+          [
+           1920,
+           0
+          ],
+          [
+           30,
+           0
+          ],
+          [
+           -15,
+           0
+          ],
+          [
+           0,
+           0
+          ]
+         ],
+         "ease": [
+          "Expo Out 1 (Elias)",
+          "Expo In-Out (Elias)",
+          "Expo In-Out (Elias)"
+         ],
+         "offset": true,
+         "spatial": "linear"
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "squeeze": {
+   "title": "Squeeze",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-push.md (Squeeze)",
+   "reference": {
+    "t": "T04",
+    "batch": "transitions-a",
+    "comp": "T04 Squeeze",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T04-squeeze.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 42,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.4004,
+    0.1001
+   ],
+   "land": 0.1001,
+   "looks": "The old shot squeezes flat into the left edge while the new one stretches out from the right edge, 0.1 s behind (both 0.4 s, Expo In-Out); the dark backing shows between them for a moment, as built.",
+   "use": "A 'squeeze it in' / compress / make room beat, a quick change between two sides (dir: left · right · up · down).",
+   "dir": {
+    "default": "left",
+    "maps": {
+     "left": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "right": [
+      [
+       -1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "up": [
+      [
+       0,
+       1
+      ],
+      [
+       1,
+       0
+      ]
+     ],
+     "down": [
+      [
+       0,
+       1
+      ],
+      [
+       -1,
+       0
+      ]
+     ]
+    }
+   },
+   "shots": {
+    "new": {
+     "in": -0.3003
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Squeeze",
+       "effect": "ec.distort.transform",
+       "pivot": [
+        0,
+        540
+       ],
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0,
+        "uniform": false
+       },
+       "keys": {
+        "scaleWidth": {
+         "t": [
+          -0.4004,
+          0.0
+         ],
+         "v": [
+          100,
+          0
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "effects": [
+      {
+       "name": "Squeeze",
+       "effect": "ec.distort.transform",
+       "pivot": [
+        1920,
+        540
+       ],
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0,
+        "uniform": false
+       },
+       "keys": {
+        "scaleWidth": {
+         "t": [
+          -0.3003,
+          0.1001
+         ],
+         "v": [
+          0,
+          100
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "BG",
+     "kind": "solid",
+     "colour": "#08080b",
+     "tint": true,
+     "where": "below",
+     "in": -0.4004,
+     "out": 0.1001
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "titleCard": -0.133467
+    }
+   }
+  },
+  "circle-iris": {
+   "title": "Circle iris",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-radial.md (Circle Iris)",
+   "reference": {
+    "t": "T05",
+    "batch": "transitions-a",
+    "comp": "T05 Circle iris",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T05-circle-iris.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.5005,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "A circle of the new shot opens from the centre and grows past the corners in 0.5 s (Expo Out 1: fast first, long settle).",
+   "use": "A reveal from a point: zooming in on one idea, 'here's the answer', a spotlight on the next thing.",
+   "overlays": [
+    {
+     "name": "Iris",
+     "kind": "copy",
+     "shots": [
+      "new"
+     ],
+     "trim": {
+      "new": {
+       "in": -0.5005
+      }
+     },
+     "in": -0.5005,
+     "out": 0.0,
+     "mask": {
+      "circle": [
+       960,
+       540
+      ],
+      "keys": {
+       "radius": {
+        "t": [
+         -0.5005,
+         0.0
+        ],
+        "v": [
+         2,
+         1168
+        ],
+        "ease": [
+         "Expo Out 1 (Elias)"
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "diamond-iris": {
+   "title": "Diamond iris",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-radial.md (Diamond Iris)",
+   "reference": {
+    "t": "T06",
+    "batch": "transitions-a",
+    "comp": "T06 Diamond iris",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T06-diamond-iris.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.5005,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "A diamond of the new shot opens from the centre and grows past the corners in 0.5 s (Expo Out 1).",
+   "use": "A sharper, graphic reveal: a new section, a 'level up' / gem / premium beat.",
+   "overlays": [
+    {
+     "name": "Iris",
+     "kind": "copy",
+     "shots": [
+      "new"
+     ],
+     "trim": {
+      "new": {
+       "in": -0.5005
+      }
+     },
+     "in": -0.5005,
+     "out": 0.0,
+     "mask": {
+      "keys": {
+       "path": {
+        "t": [
+         -0.5005,
+         0.0
+        ],
+        "v": [
+         [
+          [
+           960,
+           540
+          ],
+          [
+           960,
+           540
+          ],
+          [
+           960,
+           540
+          ],
+          [
+           960,
+           540
+          ]
+         ],
+         [
+          [
+           960,
+           -590
+          ],
+          [
+           2960,
+           540
+          ],
+          [
+           960,
+           1670
+          ],
+          [
+           -1040,
+           540
+          ]
+         ]
+        ],
+        "ease": [
+         "Expo Out 1 (Elias)"
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "diagonal-split": {
+   "title": "Diagonal split",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-radial.md (Diagonal Split)",
+   "reference": {
+    "t": "T07",
+    "batch": "transitions-a",
+    "comp": "T07 Diagonal split",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T07-diagonal-split.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.5005,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "A diagonal edge sweeps up across the old shot and closes it into the top-right corner in 0.5 s (Expo In-Out), revealing the new shot under it.",
+   "use": "A clean graphic change into a title card or a new section, a 'flip side' beat (dir: up-right · up-left · down-right · down-left).",
+   "dir": {
+    "default": "up-right",
+    "maps": {
+     "up-right": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "up-left": [
+      [
+       -1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "down-right": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       -1
+      ]
+     ],
+     "down-left": [
+      [
+       -1,
+       0
+      ],
+      [
+       0,
+       -1
+      ]
+     ]
+    }
+   },
+   "shots": {
+    "old": {
+     "out": -0.5005
+    },
+    "new": {
+     "in": -0.5005
+    }
+   },
+   "overlays": [
+    {
+     "name": "Split",
+     "kind": "copy",
+     "shots": [
+      "old"
+     ],
+     "in": -0.5005,
+     "out": 0.0,
+     "mask": {
+      "keys": {
+       "path": {
+        "t": [
+         -0.5005,
+         0.0
+        ],
+        "v": [
+         [
+          [
+           -1920,
+           0
+          ],
+          [
+           1920,
+           0
+          ],
+          [
+           1920,
+           2160
+          ]
+         ],
+         [
+          [
+           1920,
+           0
+          ],
+          [
+           1920,
+           0
+          ],
+          [
+           1920,
+           0
+          ]
+         ]
+        ],
+        "ease": [
+         "Expo In-Out (Elias)"
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "titleCard": -0.3003
+    }
+   }
+  },
+  "card-flip-3d": {
+   "title": "3D card flip",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-3d.md (3D Card Flip)",
+   "reference": {
+    "t": "T08",
+    "batch": "transitions-a",
+    "comp": "T08 3D card flip",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T08-3d-card-flip.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 39,
+   "frames": 75,
+   "energy": "high",
+   "window": [
+    -0.3003,
+    0.3003
+   ],
+   "land": 0.3003,
+   "looks": "The old shot turns away like a card (180° on Y, 0.6 s, Expo In-Out, the comp camera's perspective); edge-on at the cut it becomes the new shot, which turns to face front. The dark backing shows around the turning card, as built.",
+   "use": "A reversal: 'on the other hand', the flip side, before → after, myth → truth.",
+   "shots": {
+    "old": {
+     "out": -0.3003
+    },
+    "new": {
+     "in": 0.3003
+    }
+   },
+   "overlays": [
+    {
+     "name": "BG",
+     "kind": "solid",
+     "colour": "#08080b",
+     "tint": true,
+     "where": "below",
+     "in": -0.3003,
+     "out": 0.3003
+    },
+    {
+     "name": "Card old",
+     "kind": "copy",
+     "shots": [
+      "old"
+     ],
+     "threeD": true,
+     "in": -0.3003,
+     "out": 0.0,
+     "keys": {
+      "transform/rotationY": {
+       "t": [
+        -0.3003,
+        0.3003
+       ],
+       "v": [
+        0,
+        180
+       ],
+       "ease": [
+        "Expo In-Out (Elias)"
+       ]
+      }
+     }
+    },
+    {
+     "name": "Card new",
+     "kind": "copy",
+     "shots": [
+      "new"
+     ],
+     "threeD": true,
+     "in": 0.0,
+     "out": 0.3003,
+     "keys": {
+      "transform/rotationY": {
+       "t": [
+        -0.3003,
+        0.3003
+       ],
+       "v": [
+        -180,
+        0
+       ],
+       "ease": [
+        "Expo In-Out (Elias)"
+       ]
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "titleCard": 0.033367
+    }
+   }
+  },
+  "crossfade": {
+   "title": "Crossfade",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-dissolve.md (Crossfade)",
+   "reference": {
+    "t": "T11",
+    "batch": "transitions-a",
+    "comp": "T11 Crossfade",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T11-crossfade.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 75,
+   "energy": "calm",
+   "window": [
+    -0.5005,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "The new shot dissolves in over the old one in 0.5 s (Expo In-Out).",
+   "use": "A calm, soft change: time passing, a related thought, B-roll to B-roll.",
+   "stack": "new-over-old",
+   "shots": {
+    "new": {
+     "in": -0.5005
+    }
+   },
+   "layers": {
+    "new": {
+     "effects": [
+      {
+       "name": "Fade",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "opacity": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          0,
+          100
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "blur-crossfade": {
+   "title": "Blur crossfade",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-dissolve.md (Blur Crossfade)",
+   "reference": {
+    "t": "T12",
+    "batch": "transitions-a",
+    "comp": "T12 Blur crossfade",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T12-blur-crossfade.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 45,
+   "frames": 75,
+   "energy": "calm",
+   "window": [
+    -0.5005,
+    0.1001
+   ],
+   "land": 0.1001,
+   "looks": "The old shot blurs (10 px), grows 3 % and fades while the new one comes in from 97 %, blurred, and sharpens, 0.1 s behind (both 0.5 s, Expo In-Out); a slight dip through the dark backing, as built.",
+   "use": "A soft, dreamy change: a memory, a reflection, an idea forming, a calm topic change.",
+   "stack": "new-over-old",
+   "shots": {
+    "new": {
+     "in": -0.4004
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          0,
+          34.482759
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        }
+       }
+      },
+      {
+       "name": "Grow",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          100,
+          103
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        },
+        "opacity": {
+         "t": [
+          -0.5005,
+          0.0
+         ],
+         "v": [
+          100,
+          0
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "effects": [
+      {
+       "name": "Mirror edges",
+       "effect": "ec.stylize.motiontile",
+       "set": {
+        "outputWidth": 120,
+        "outputHeight": 120,
+        "mirrorEdges": true
+       }
+      },
+      {
+       "name": "Blur",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          -0.4004,
+          0.1001
+         ],
+         "v": [
+          34.482759,
+          0
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        }
+       }
+      },
+      {
+       "name": "Grow",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "scaleHeight": {
+         "t": [
+          -0.4004,
+          0.1001
+         ],
+         "v": [
+          97,
+          100
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        },
+        "opacity": {
+         "t": [
+          -0.4004,
+          0.1001
+         ],
+         "v": [
+          0,
+          100
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "BG",
+     "kind": "solid",
+     "colour": "#08080b",
+     "tint": true,
+     "where": "below",
+     "in": -0.5005,
+     "out": 0.1001
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "focus-pull": {
+   "title": "Focus pull",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-dissolve.md (Focus Pull)",
+   "reference": {
+    "t": "T13",
+    "batch": "transitions-a",
+    "comp": "T13 Focus pull",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T13-focus-pull.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 47,
+   "frames": 75,
+   "energy": "calm",
+   "window": [
+    -0.567233,
+    0.0
+   ],
+   "land": 0.0,
+   "looks": "The old shot racks out of focus (15 px blur, 0.5 s, Slow launch · quick finish) and the new one fades in sharp over it in 0.3 s (Entrance fade), finishing on the cut.",
+   "use": "A camera-like change of attention: 'but here's what matters', from the setting to the subject, a realisation.",
+   "stack": "new-over-old",
+   "shots": {
+    "new": {
+     "in": -0.3003
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Rack",
+       "effect": "ec.blur.gaussian",
+       "set": {
+        "repeatEdge": true
+       },
+       "keys": {
+        "blurriness": {
+         "t": [
+          -0.567233,
+          -0.066733
+         ],
+         "v": [
+          0,
+          51.724138
+         ],
+         "ease": [
+          "Slow launch · quick finish"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "effects": [
+      {
+       "name": "Fade",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "opacity": {
+         "t": [
+          -0.3003,
+          0.0
+         ],
+         "v": [
+          0,
+          100
+         ],
+         "ease": [
+          "Entrance fade (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "color-dip": {
+   "title": "Color dip",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-dissolve.md (Color Dip)",
+   "reference": {
+    "t": "T14",
+    "batch": "transitions-a",
+    "comp": "T14 Color dip",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T14-color-dip.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 36,
+   "frames": 75,
+   "energy": "calm",
+   "window": [
+    -0.2002,
+    0.266933
+   ],
+   "land": 0.266933,
+   "looks": "The old shot fades to near-black in 0.2 s (Expo In-Out), holds 2 frames, and the new one fades up in 0.2 s (Entrance fade); the dip colour is the colour option.",
+   "use": "A clear pause between two ideas: end of a section, 'later', a reset before a new chapter.",
+   "shots": {
+    "new": {
+     "in": 0.066733
+    }
+   },
+   "layers": {
+    "old": {
+     "effects": [
+      {
+       "name": "Dip",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "opacity": {
+         "t": [
+          -0.2002,
+          0.0
+         ],
+         "v": [
+          100,
+          0
+         ],
+         "ease": [
+          "Expo In-Out (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    "new": {
+     "effects": [
+      {
+       "name": "Dip",
+       "effect": "ec.distort.transform",
+       "set": {
+        "useCompositionShutterAngle": false,
+        "shutterAngle": 0
+       },
+       "keys": {
+        "opacity": {
+         "t": [
+          0.066733,
+          0.266933
+         ],
+         "v": [
+          0,
+          100
+         ],
+         "ease": [
+          "Entrance fade (Elias)"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "Dip",
+     "kind": "solid",
+     "colour": "#08080b",
+     "tint": true,
+     "where": "below",
+     "in": -0.2002,
+     "out": 0.266933
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "staggered-blocks": {
+   "title": "Staggered blocks",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-cover.md (Staggered Color Blocks)",
+   "reference": {
+    "t": "T15",
+    "batch": "transitions-a",
+    "comp": "T15 Staggered blocks",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T15-staggered-blocks.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 38,
+   "frames": 75,
+   "energy": "high",
+   "window": [
+    -0.266933,
+    0.367033
+   ],
+   "land": 0.367033,
+   "looks": "Two full-frame colour blocks (Tapa blue, then bright blue 2 frames later) wipe in from the left in 0.27 s and carry on out to the right (Expo In-Out); the cut happens under them.",
+   "use": "A bold, branded change: a new chapter, a title card, 'step 2' (colour: [a, b] or one colour; dir: right · left · up · down).",
+   "dir": {
+    "default": "right",
+    "maps": {
+     "right": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "left": [
+      [
+       -1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "up": [
+      [
+       0,
+       -1
+      ],
+      [
+       -1,
+       0
+      ]
+     ],
+     "down": [
+      [
+       0,
+       1
+      ],
+      [
+       1,
+       0
+      ]
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "Block A",
+     "kind": "solid",
+     "colour": "#236197",
+     "tint": true,
+     "palette": 0,
+     "in": -0.266933,
+     "out": 0.3003,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.266933,
+        0.0,
+        0.033367,
+        0.3003
+       ],
+       "v": [
+        [
+         -960,
+         540
+        ],
+        [
+         960,
+         540
+        ],
+        [
+         960,
+         540
+        ],
+        [
+         2880,
+         540
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Block B",
+     "kind": "solid",
+     "colour": "#4697f3",
+     "tint": true,
+     "palette": 1,
+     "in": -0.2002,
+     "out": 0.367033,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.2002,
+        0.066733,
+        0.1001,
+        0.367033
+       ],
+       "v": [
+        [
+         -960,
+         540
+        ],
+        [
+         960,
+         540
+        ],
+        [
+         960,
+         540
+        ],
+        [
+         2880,
+         540
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "titleCard": 0.066733
+    }
+   }
+  },
+  "horizontal-blinds": {
+   "title": "Horizontal blinds",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-cover.md (Horizontal Blinds)",
+   "reference": {
+    "t": "T16",
+    "batch": "transitions-a",
+    "comp": "T16 Horizontal blinds",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T16-horizontal-blinds.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 41,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.367033,
+    0.4004
+   ],
+   "land": 0.4004,
+   "looks": "Eight full-width blue strips slide in from the left one after another (0.025 s apart, 0.2 s each, Expo In-Out), cover the frame for the cut and slide on out to the right.",
+   "use": "A structured, list-like change: next section, a data / report beat, 'let's break it down' (dir: right · left).",
+   "dir": {
+    "default": "right",
+    "maps": {
+     "right": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "left": [
+      [
+       -1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "Blind 1",
+     "kind": "solid",
+     "size": [
+      1920,
+      135.0
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.367033,
+     "out": 0.233567,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.367033,
+        -0.166833,
+        0.033367,
+        0.233567
+       ],
+       "v": [
+        [
+         -960,
+         67.5
+        ],
+        [
+         960,
+         67.5
+        ],
+        [
+         960,
+         67.5
+        ],
+        [
+         2880,
+         67.5
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 2",
+     "kind": "solid",
+     "size": [
+      1920,
+      135.0
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.333667,
+     "out": 0.266933,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.333667,
+        -0.133467,
+        0.066733,
+        0.266933
+       ],
+       "v": [
+        [
+         -960,
+         202.5
+        ],
+        [
+         960,
+         202.5
+        ],
+        [
+         960,
+         202.5
+        ],
+        [
+         2880,
+         202.5
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 3",
+     "kind": "solid",
+     "size": [
+      1920,
+      135.0
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.3003,
+     "out": 0.3003,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.3003,
+        -0.1001,
+        0.1001,
+        0.3003
+       ],
+       "v": [
+        [
+         -960,
+         337.5
+        ],
+        [
+         960,
+         337.5
+        ],
+        [
+         960,
+         337.5
+        ],
+        [
+         2880,
+         337.5
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 4",
+     "kind": "solid",
+     "size": [
+      1920,
+      135.0
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.3003,
+     "out": 0.3003,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.3003,
+        -0.1001,
+        0.1001,
+        0.3003
+       ],
+       "v": [
+        [
+         -960,
+         472.5
+        ],
+        [
+         960,
+         472.5
+        ],
+        [
+         960,
+         472.5
+        ],
+        [
+         2880,
+         472.5
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 5",
+     "kind": "solid",
+     "size": [
+      1920,
+      135.0
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.266933,
+     "out": 0.333667,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.266933,
+        -0.066733,
+        0.133467,
+        0.333667
+       ],
+       "v": [
+        [
+         -960,
+         607.5
+        ],
+        [
+         960,
+         607.5
+        ],
+        [
+         960,
+         607.5
+        ],
+        [
+         2880,
+         607.5
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 6",
+     "kind": "solid",
+     "size": [
+      1920,
+      135.0
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.233567,
+     "out": 0.367033,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.233567,
+        -0.033367,
+        0.166833,
+        0.367033
+       ],
+       "v": [
+        [
+         -960,
+         742.5
+        ],
+        [
+         960,
+         742.5
+        ],
+        [
+         960,
+         742.5
+        ],
+        [
+         2880,
+         742.5
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 7",
+     "kind": "solid",
+     "size": [
+      1920,
+      135.0
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.2002,
+     "out": 0.4004,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.2002,
+        0.0,
+        0.2002,
+        0.4004
+       ],
+       "v": [
+        [
+         -960,
+         877.5
+        ],
+        [
+         960,
+         877.5
+        ],
+        [
+         960,
+         877.5
+        ],
+        [
+         2880,
+         877.5
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 8",
+     "kind": "solid",
+     "size": [
+      1920,
+      135.0
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.2002,
+     "out": 0.4004,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.2002,
+        0.0,
+        0.2002,
+        0.4004
+       ],
+       "v": [
+        [
+         -960,
+         1012.5
+        ],
+        [
+         960,
+         1012.5
+        ],
+        [
+         960,
+         1012.5
+        ],
+        [
+         2880,
+         1012.5
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "from": 0
+    }
+   }
+  },
+  "vertical-blinds": {
+   "title": "Vertical blinds",
+   "from": "HyperFrames skill hyperframes-animation/transitions/css-cover.md (Vertical Blinds)",
+   "reference": {
+    "t": "T17",
+    "batch": "transitions-a",
+    "comp": "T17 Vertical blinds",
+    "render": "The Vault/Rebuilds/hf-demos/transitions-a/renders/T17-vertical-blinds.mp4",
+    "build": "The Vault/Rebuilds/hf-demos/transitions-a/scripts/build.jsx"
+   },
+   "fps": "30000/1001",
+   "cutFrame": 41,
+   "frames": 75,
+   "energy": "medium",
+   "window": [
+    -0.367033,
+    0.4004
+   ],
+   "land": 0.4004,
+   "looks": "Eight full-height blue strips drop in from the top one after another (0.025 s apart, 0.2 s each, Expo In-Out), cover the frame for the cut and drop on out of the bottom.",
+   "use": "Like horizontal blinds, with a falling feel: into a title card, a new chapter, a curtain-like change (dir: down · up).",
+   "dir": {
+    "default": "down",
+    "maps": {
+     "down": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "up": [
+      [
+       1,
+       0
+      ],
+      [
+       0,
+       -1
+      ]
+     ]
+    }
+   },
+   "overlays": [
+    {
+     "name": "Blind 1",
+     "kind": "solid",
+     "size": [
+      240.0,
+      1080
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.367033,
+     "out": 0.233567,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.367033,
+        -0.166833,
+        0.033367,
+        0.233567
+       ],
+       "v": [
+        [
+         120.0,
+         -540
+        ],
+        [
+         120.0,
+         540
+        ],
+        [
+         120.0,
+         540
+        ],
+        [
+         120.0,
+         1620
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 2",
+     "kind": "solid",
+     "size": [
+      240.0,
+      1080
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.333667,
+     "out": 0.266933,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.333667,
+        -0.133467,
+        0.066733,
+        0.266933
+       ],
+       "v": [
+        [
+         360.0,
+         -540
+        ],
+        [
+         360.0,
+         540
+        ],
+        [
+         360.0,
+         540
+        ],
+        [
+         360.0,
+         1620
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 3",
+     "kind": "solid",
+     "size": [
+      240.0,
+      1080
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.3003,
+     "out": 0.3003,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.3003,
+        -0.1001,
+        0.1001,
+        0.3003
+       ],
+       "v": [
+        [
+         600.0,
+         -540
+        ],
+        [
+         600.0,
+         540
+        ],
+        [
+         600.0,
+         540
+        ],
+        [
+         600.0,
+         1620
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 4",
+     "kind": "solid",
+     "size": [
+      240.0,
+      1080
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.3003,
+     "out": 0.3003,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.3003,
+        -0.1001,
+        0.1001,
+        0.3003
+       ],
+       "v": [
+        [
+         840.0,
+         -540
+        ],
+        [
+         840.0,
+         540
+        ],
+        [
+         840.0,
+         540
+        ],
+        [
+         840.0,
+         1620
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 5",
+     "kind": "solid",
+     "size": [
+      240.0,
+      1080
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.266933,
+     "out": 0.333667,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.266933,
+        -0.066733,
+        0.133467,
+        0.333667
+       ],
+       "v": [
+        [
+         1080.0,
+         -540
+        ],
+        [
+         1080.0,
+         540
+        ],
+        [
+         1080.0,
+         540
+        ],
+        [
+         1080.0,
+         1620
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 6",
+     "kind": "solid",
+     "size": [
+      240.0,
+      1080
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.233567,
+     "out": 0.367033,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.233567,
+        -0.033367,
+        0.166833,
+        0.367033
+       ],
+       "v": [
+        [
+         1320.0,
+         -540
+        ],
+        [
+         1320.0,
+         540
+        ],
+        [
+         1320.0,
+         540
+        ],
+        [
+         1320.0,
+         1620
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 7",
+     "kind": "solid",
+     "size": [
+      240.0,
+      1080
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.2002,
+     "out": 0.4004,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.2002,
+        0.0,
+        0.2002,
+        0.4004
+       ],
+       "v": [
+        [
+         1560.0,
+         -540
+        ],
+        [
+         1560.0,
+         540
+        ],
+        [
+         1560.0,
+         540
+        ],
+        [
+         1560.0,
+         1620
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    },
+    {
+     "name": "Blind 8",
+     "kind": "solid",
+     "size": [
+      240.0,
+      1080
+     ],
+     "colour": "#236197",
+     "tint": true,
+     "in": -0.2002,
+     "out": 0.4004,
+     "keys": {
+      "transform/position": {
+       "t": [
+        -0.2002,
+        0.0,
+        0.2002,
+        0.4004
+       ],
+       "v": [
+        [
+         1800.0,
+         -540
+        ],
+        [
+         1800.0,
+         540
+        ],
+        [
+         1800.0,
+         540
+        ],
+        [
+         1800.0,
+         1620
+        ]
+       ],
+       "ease": [
+        "Expo In-Out (Elias)",
+        "linear",
+        "Expo In-Out (Elias)"
+       ],
+       "spatial": "linear"
+      }
+     }
+    }
+   ],
+   "demo": {
+    "old": {
+     "from": 0
+    },
+    "new": {
+     "titleCard": 0.166833
+    }
+   }
+  }
+ }
+}

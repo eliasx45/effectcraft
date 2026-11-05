@@ -1028,6 +1028,22 @@ Animation
       Blur Through | transition.apply {"kind":"blur-through"}
       Directional Blur | transition.apply {"kind":"directional-blur"}
       Page Burn | transition.apply {"kind":"page-burn"}
+    Scene Cut
+      Push Slide | transition.apply {"kind":"push-slide"}
+      Vertical Push | transition.apply {"kind":"vertical-push"}
+      Elastic Push | transition.apply {"kind":"elastic-push"}
+      Squeeze | transition.apply {"kind":"squeeze"}
+      Circle Iris | transition.apply {"kind":"circle-iris"}
+      Diamond Iris | transition.apply {"kind":"diamond-iris"}
+      Diagonal Split | transition.apply {"kind":"diagonal-split"}
+      3D Card Flip | transition.apply {"kind":"card-flip-3d"}
+      Crossfade | transition.apply {"kind":"crossfade"}
+      Blur Crossfade | transition.apply {"kind":"blur-crossfade"}
+      Focus Pull | transition.apply {"kind":"focus-pull"}
+      Color Dip | transition.apply {"kind":"color-dip"}
+      Staggered Blocks | transition.apply {"kind":"staggered-blocks"}
+      Horizontal Blinds | transition.apply {"kind":"horizontal-blinds"}
+      Vertical Blinds | transition.apply {"kind":"vertical-blinds"}
   ---
   Add Keyframe | anim.addKeyframe
   Toggle Hold Keyframe | keys.toggleHold

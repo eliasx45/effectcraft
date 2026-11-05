@@ -1,0 +1,8 @@
+asset:        scene-cut.kinds.json
+title:        Scene-cut transition kinds (push-slide, vertical-push, elastic-push, squeeze, circle-iris, diamond-iris, diagonal-split, card-flip-3d, crossfade, blur-crossfade, focus-pull, color-dip, staggered-blocks, horizontal-blinds, vertical-blinds): the numbers behind Animation ▸ Transitions ▸ Scene Cut (transition.apply)
+author:       Elias (eliasx45)
+source:       original work (copied from Elias's motion-kit repo, shelf/transitions/scene-cut.kinds.json, commit 1cbe493, sha256 3e756753ed0eb7f4…)
+license:      MIT OR Apache-2.0
+added:        2026-11-05 by eliasx45 (Claude Code agent, ZC3)
+notes:        Plain data: key times, values, ease names, effect settings, direction matrices and overlay specs of Elias's native EffectCraft rebuilds of the HyperFrames scene transitions (transitions-a T01–T08, T11–T17, no footage or artwork), approved on 5 Nov 2026. The source of truth is motion-kit's shelf table; this is a copy, read by crates/engine/src/commands/transition_scene.rs with include_str!. Re-copy it (cp ~/Developer/motion-kit/shelf/transitions/scene-cut.kinds.json here) whenever the shelf table changes; never edit it here.
+When re-copying, replace the local path prefix ".../The Vault/" with "The Vault/" and "~/.claude/skills/hyperframes-animation/" with "HyperFrames skill hyperframes-animation/" (this repo is public; the paths are only labels, never read). Check: no local home-folder path is left in the copy (the test scene_cut_menu_lists_the_15_kinds checks it).

@@ -1,5 +1,5 @@
-//! `transition.apply` (Animation ▸ Transitions ▸ Zoom Cut / FX Cut): Elias's 12 zoom cuts (ZC1)
-//! and 15 FX cuts (ZC2) from the motion-kit shelf tables.
+//! `transition.apply` (Animation ▸ Transitions ▸ Zoom Cut / FX Cut / Scene Cut): Elias's 12 zoom
+//! cuts (ZC1), 15 FX cuts (ZC2) and 15 scene cuts (ZC3) from the motion-kit shelf tables.
 
 use effectcraft_keyframe::Interp;
 use effectcraft_project::{ItemId, LayerId, LayerSource, Project};
@@ -30,6 +30,27 @@ const FX_KINDS: [&str; 15] = [
     "page-burn",
 ];
 
+const SCENE_KINDS: [&str; 15] = [
+    "push-slide",
+    "vertical-push",
+    "elastic-push",
+    "squeeze",
+    "circle-iris",
+    "diamond-iris",
+    "diagonal-split",
+    "card-flip-3d",
+    "crossfade",
+    "blur-crossfade",
+    "focus-pull",
+    "color-dip",
+    "staggered-blocks",
+    "horizontal-blinds",
+    "vertical-blinds",
+];
+
+/// The scene cuts that move the new shot right above the old one.
+const STACK_KINDS: [&str; 4] = ["elastic-push", "crossfade", "blur-crossfade", "focus-pull"];
+
 /// The kinds with a track key at the cut itself (t = 0 in the table).
 const CUT_KEY: [&str; 8] = ["kick", "into-window", "zoom-through", "whip", "zoom-out-through", "punch", "flash", "white-flash"];
 
@@ -37,8 +58,13 @@ const CUT_KEY: [&str; 8] = ["kick", "into-window", "zoom-through", "whip", "zoom
 /// old one (red, below) plays up to it, the new one (blue, above) from it.
 /// Returns (session, comp, old, new, the cut in seconds as the layers have it).
 fn cut_at(fps: f64, secs: f64, at: f64) -> (Session, u64, u64, u64, f64) {
+    cut_at_size(fps, secs, at, 384, 216)
+}
+
+/// [`cut_at`] in a `w`×`h` comp.
+fn cut_at_size(fps: f64, secs: f64, at: f64, w: u32, h: u32) -> (Session, u64, u64, u64, f64) {
     let mut s = Session::default();
-    s.execute("comp.new", json!({"name": "Cut", "width": 384, "height": 216, "frameRate": fps, "duration": secs})).unwrap();
+    s.execute("comp.new", json!({"name": "Cut", "width": w, "height": h, "frameRate": fps, "duration": secs})).unwrap();
     let cid = s.active_comp_id().unwrap().0;
     let old = s.execute("layer.newSolid", json!({"name": "A Footage", "color": "#d02020"})).unwrap()["layer"].as_u64().unwrap();
     let new = s.execute("layer.newSolid", json!({"name": "B Footage", "color": "#2040d0"})).unwrap()["layer"].as_u64().unwrap();
@@ -265,7 +291,8 @@ fn the_selection_or_the_playhead_picks_the_pair() {
     };
     assert_eq!(ids("zoom-cut"), KINDS);
     assert_eq!(ids("fx-cut"), FX_KINDS);
-    assert_eq!(kinds.as_array().unwrap().len(), 27);
+    assert_eq!(ids("scene-cut"), SCENE_KINDS);
+    assert_eq!(kinds.as_array().unwrap().len(), 42);
 }
 
 #[test]
@@ -338,9 +365,14 @@ fn all_exprs(p: &Project) -> Vec<(ItemId, LayerId, String, String)> {
     out
 }
 
-/// Names of the items both families add (`ZoomCut …` / `FxCut …` comps).
+/// Names every family's additions start with.
+fn ours(name: &str) -> bool {
+    name.starts_with("FxCut ") || name.starts_with("ZoomCut ") || name.starts_with("SceneCut ")
+}
+
+/// Names of the items the families add (`ZoomCut …` / `FxCut …` / `SceneCut …` comps).
 fn transition_items(s: &Session) -> Vec<String> {
-    s.project.items.values().filter(|i| i.name.starts_with("FxCut ") || i.name.starts_with("ZoomCut ")).map(|i| i.name.clone()).collect()
+    s.project.items.values().filter(|i| ours(&i.name)).map(|i| i.name.clone()).collect()
 }
 
 /// Solid items nothing uses.
@@ -353,13 +385,11 @@ fn orphan_solids(s: &Session) -> Vec<String> {
         .collect()
 }
 
-/// Effects of both families on a layer.
+/// Effects of every family on a layer.
 fn transition_effects(s: &Session, cid: u64, l: u64) -> Vec<String> {
     let comp = s.project.comp(ItemId(cid)).unwrap();
     let Some(l) = comp.layer(LayerId(l)) else { return vec![] };
-    l.effects()
-        .map(|fx| fx.groups().filter(|g| g.name.starts_with("ZoomCut ") || g.name.starts_with("FxCut ")).map(|g| g.name.clone()).collect())
-        .unwrap_or_default()
+    l.effects().map(|fx| fx.groups().filter(|g| ours(&g.name)).map(|g| g.name.clone()).collect()).unwrap_or_default()
 }
 
 fn timing(s: &Session, cid: u64, l: u64) -> (Tick, Tick) {
@@ -662,4 +692,461 @@ fn fx_colour_tints_the_covers() {
     for kind in FX_KINDS {
         assert!(json.contains(&format!("{{\"kind\":\"{kind}\"}}")), "{kind} isn't in the menus");
     }
+}
+
+// ---------------------------------------------------------------- scene cuts (ZC3)
+
+fn apply_dir(s: &mut Session, cid: u64, old: u64, new: u64, kind: &str, dir: &str) -> crate::Result<Value> {
+    s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": kind, "dir": dir}))
+}
+
+fn effect<'a>(s: &'a Session, cid: u64, l: u64, name: &str) -> &'a effectcraft_project::PropGroup {
+    let l = s.project.comp(ItemId(cid)).unwrap().layer(LayerId(l)).unwrap();
+    l.effects().unwrap().groups().find(|g| g.name == name).unwrap_or_else(|| panic!("no effect “{name}” on “{}”", l.name))
+}
+
+fn layer_named<'a>(s: &'a Session, cid: u64, name: &str) -> &'a effectcraft_project::Layer {
+    s.project.comp(ItemId(cid)).unwrap().layers.iter().find(|l| l.name == name).unwrap_or_else(|| panic!("no layer “{name}”"))
+}
+
+/// The `moved` entries of a reply for one layer and what.
+fn moved<'a>(r: &'a Value, layer: u64, what: &str) -> Vec<&'a Value> {
+    r["moved"].as_array().unwrap().iter().filter(|m| m["layer"] == json!(layer) && m["what"] == json!(what)).collect()
+}
+
+#[test]
+fn every_scene_kind_applies_at_29_97_and_24_fps() {
+    for fps in [29.97, 24.0] {
+        for kind in SCENE_KINDS {
+            let (mut s, cid, old, new, cut) = cut_at(fps, 10.0, 4.0);
+            let (t_old, t_new) = (transform(&s, cid, old), transform(&s, cid, new));
+            let (time_old, time_new) = (timing(&s, cid, old), timing(&s, cid, new));
+            let items_before = s.project.items.len();
+            let undo_before = s.history.undo.len();
+            let r = apply(&mut s, cid, old, new, kind).unwrap_or_else(|e| panic!("{kind} at {fps}: {e}"));
+            assert_eq!((r["kind"].as_str(), r["family"].as_str()), (Some(kind), Some("scene-cut")), "{r}");
+            // The cut is the new layer's in point, on a frame.
+            let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+            let at = Tick::from_seconds_f64(r["at"].as_f64().unwrap());
+            assert!((at.seconds() - cut).abs() < 1e-9, "{kind} at {fps}: cut {} vs {cut}", at.seconds());
+            assert_eq!(fr.snap_nearest(at), at, "{kind} at {fps}: the cut is on a frame");
+            // Every key, in every comp (copies of the shots), lands on a frame of its comp.
+            let keys = all_keys(&s.project);
+            assert!(!keys.is_empty(), "{kind} at {fps}: no keys");
+            for (kfr, t, what) in &keys {
+                assert_eq!(kfr.snap_nearest(*t), *t, "{kind} at {fps}: {what} key at {} s is between frames", t.seconds());
+            }
+            // The shots' own transforms are never touched.
+            assert_eq!(transform(&s, cid, old), t_old, "{kind} at {fps}: old transform changed");
+            assert_eq!(transform(&s, cid, new), t_new, "{kind} at {fps}: new transform changed");
+            // Everything added is named SceneCut <kind> and tagged for the pair.
+            let pre = format!("SceneCut {kind} ");
+            for e in r["effects"].as_array().unwrap() {
+                assert!(e["name"].as_str().unwrap().starts_with(&pre), "{kind}: {e}");
+            }
+            let comp = s.project.comp(ItemId(cid)).unwrap();
+            for l in r["layers"].as_array().unwrap() {
+                let l = comp.layer(LayerId(l.as_u64().unwrap())).unwrap();
+                assert!(l.name.starts_with(&pre), "{kind}: layer “{}”", l.name);
+                assert!(l.comment.starts_with(&format!("SceneCut {old}->{new}")), "{kind}: “{}” comment “{}”", l.name, l.comment);
+            }
+            assert_eq!(comp.layers.len(), 2 + r["layers"].as_array().unwrap().len(), "{kind}: the reply lists every added layer");
+            for c in r["comps"].as_array().unwrap() {
+                let it = s.project.item(ItemId(c.as_u64().unwrap())).unwrap();
+                assert!(it.name.starts_with(&pre) && it.comment == format!("SceneCut {old}->{new}"), "{kind}: item “{}” “{}”", it.name, it.comment);
+            }
+            assert!(r["effects"].as_array().unwrap().len() + r["layers"].as_array().unwrap().len() > 0, "{kind}: nothing added");
+            // cut_at puts the new shot above the old one already: no layer moves in the order, and
+            // every in / out point the kind changed is in `moved`.
+            assert_eq!(r["stacked"], json!(false), "{kind}");
+            assert!(r["moved"].as_array().unwrap().iter().all(|m| m["what"] != json!("order")), "{kind}: {}", r["moved"]);
+            let (now_old, now_new) = (timing(&s, cid, old), timing(&s, cid, new));
+            assert_eq!(moved(&r, new, "in").len(), usize::from(now_new.0 != time_new.0), "{kind}: {}", r["moved"]);
+            assert_eq!(moved(&r, old, "out").len(), usize::from(now_old.1 != time_old.1), "{kind}: {}", r["moved"]);
+            // One undo step takes it all back, the shots' trims too.
+            assert_eq!(s.history.undo.len(), undo_before + 1, "{kind} at {fps}: one undo step");
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 2, "{kind}: undo removes the added layers");
+            assert!(transition_effects(&s, cid, old).is_empty() && transition_effects(&s, cid, new).is_empty(), "{kind}: undo removes the effects");
+            assert_eq!(s.project.items.len(), items_before, "{kind}: undo removes the added items");
+            assert_eq!((timing(&s, cid, old), timing(&s, cid, new)), (time_old, time_new), "{kind}: undo restores the trims");
+        }
+    }
+}
+
+#[test]
+fn push_slide_keys_follow_the_comp_frames_and_every_dir() {
+    for fps in [29.97, 24.0] {
+        let (mut s, cid, old, new, _) = cut_at(fps, 10.0, 4.0);
+        let r = apply(&mut s, cid, old, new, "push-slide").unwrap();
+        assert_eq!(r["dir"], json!("left"), "the default dir");
+        let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+        let cut_f = r["cutFrame"].as_i64().unwrap();
+        let start = cut_f + (-0.5005 * fr.as_f64()).round() as i64;
+        assert_eq!(r["startFrame"].as_i64(), Some(start));
+        // The new shot starts at the window's start (it pushes in), the old one ends on the cut.
+        assert_eq!(fr.frame_at(timing(&s, cid, new).0), start, "{fps}");
+        assert_eq!(fr.frame_at(timing(&s, cid, old).1), cut_f, "{fps}");
+        assert_eq!(moved(&r, new, "in").len(), 1, "{}", r["moved"]);
+        let l = s.project.comp(ItemId(cid)).unwrap().layer(LayerId(old)).unwrap().clone();
+        let g = effect(&s, cid, old, "SceneCut push-slide Push");
+        let pos = g.prop("position").unwrap();
+        let frames: Vec<i64> = pos.keys.iter().map(|k| fr.frame_at(l.comp_time(k.time))).collect();
+        assert_eq!(frames, [start, cut_f], "{fps}");
+        // [0, 0] → [-1920, 0] offsets from the centre of a 384×216 layer: 192 → 192 − 384.
+        let xs: Vec<f64> = pos.keys.iter().map(|k| k.value.components()[0]).collect();
+        assert!((xs[0] - 192.0).abs() < 1e-9 && (xs[1] + 192.0).abs() < 1e-9, "{xs:?}");
+        // Expo In-Out (Elias) on the push.
+        assert_eq!((pos.keys[0].out_interp, pos.keys[1].in_interp), (Interp::Bezier, Interp::Bezier));
+    }
+    // Every dir: right mirrors x, up / down swap the axes (the seam's Motion Tile grows in height).
+    let want = [("left", [-192.0, 108.0]), ("right", [576.0, 108.0]), ("up", [192.0, -108.0]), ("down", [192.0, 324.0])];
+    for (dir, end) in want {
+        let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+        let r = apply_dir(&mut s, cid, old, new, "push-slide", dir).unwrap_or_else(|e| panic!("{dir}: {e}"));
+        assert_eq!(r["dir"], json!(dir));
+        let pos = effect(&s, cid, old, "SceneCut push-slide Push").prop("position").unwrap().clone();
+        let last = pos.keys.last().unwrap().value.components();
+        assert!((last[0] - end[0]).abs() < 1e-6 && (last[1] - end[1]).abs() < 1e-6, "{dir}: old shot ends at {last:?}, want {end:?}");
+        let seam = effect(&s, cid, new, "SceneCut push-slide Seam");
+        let (ow, oh) = (seam.prop("outputWidth").unwrap().value.components()[0], seam.prop("outputHeight").unwrap().value.components()[0]);
+        let swap = dir == "up" || dir == "down";
+        assert_eq!((ow, oh), if swap { (100.0, 100.4) } else { (100.4, 100.0) }, "{dir}");
+    }
+}
+
+#[test]
+fn every_dir_of_the_kinds_that_have_one_applies() {
+    let (mut s0, ..) = cut_at(29.97, 10.0, 4.0);
+    let kinds = s0.execute("transition.kinds", json!({})).unwrap();
+    let mut n = 0;
+    for row in kinds.as_array().unwrap() {
+        let kind = row["kind"].as_str().unwrap();
+        let dirs = row["dirs"].as_array().unwrap();
+        if row["family"] != json!("scene-cut") {
+            assert!(dirs.is_empty(), "{kind}: only scene cuts take a dir");
+            continue;
+        }
+        assert_eq!(dirs.first(), row.get("dir").filter(|d| !d.is_null()), "{kind}: the default dir comes first");
+        for d in dirs {
+            let dir = d.as_str().unwrap();
+            for fps in [29.97, 24.0] {
+                let (mut s, cid, old, new, _) = cut_at(fps, 10.0, 4.0);
+                let r = apply_dir(&mut s, cid, old, new, kind, dir).unwrap_or_else(|e| panic!("{kind} {dir} at {fps}: {e}"));
+                assert_eq!(r["dir"], json!(dir));
+                for (kfr, t, what) in &all_keys(&s.project) {
+                    assert_eq!(kfr.snap_nearest(*t), *t, "{kind} {dir} at {fps}: {what} key between frames");
+                }
+                n += 1;
+            }
+        }
+    }
+    // push-slide, vertical-push, elastic-push, squeeze, staggered-blocks: 4 each; diagonal-split 4;
+    // the blinds 2 each; at two frame rates.
+    assert_eq!(n, 2 * (6 * 4 + 2 + 2));
+}
+
+#[test]
+fn blinds_follow_their_dir() {
+    // horizontal-blinds left: the strips come in from the right (x 2880 → 960 → −960 of 1920).
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply_dir(&mut s, cid, old, new, "horizontal-blinds", "left").unwrap();
+    let b1 = layer_named(&s, cid, "SceneCut horizontal-blinds Blind 1");
+    let xs: Vec<f64> = b1.props.prop("transform/position").unwrap().keys.iter().map(|k| k.value.components()[0]).collect();
+    assert_eq!(xs.len(), 4);
+    assert!((xs[0] - 576.0).abs() < 1e-6 && (xs[1] - 192.0).abs() < 1e-6 && (xs[3] + 192.0).abs() < 1e-6, "{xs:?}");
+    // A straight path: no overshoot between keys.
+    assert!(b1.props.prop("transform/position").unwrap().keys.iter().all(|k| !k.spatial_auto && k.spatial_in == [0.0; 3] && k.spatial_out == [0.0; 3]));
+    // 8 strips of 1920×135 (of 1080) → 384×27 solids.
+    let strips: Vec<&effectcraft_project::Layer> =
+        s.project.comp(ItemId(cid)).unwrap().layers.iter().filter(|l| l.name.starts_with("SceneCut horizontal-blinds Blind ")).collect();
+    assert_eq!(strips.len(), 8);
+    let (w, h) = effectcraft_render::source_size(&s.project, strips[0]);
+    assert_eq!((w, h), (384, 27));
+    // vertical-blinds up: from below (y 1620 of 1080), 240×1080 strips → 48×216.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply_dir(&mut s, cid, old, new, "vertical-blinds", "up").unwrap();
+    let b1 = layer_named(&s, cid, "SceneCut vertical-blinds Blind 1");
+    let p0 = b1.props.prop("transform/position").unwrap().keys[0].value.components();
+    assert!((p0[0] - 24.0).abs() < 1e-6 && (p0[1] - 324.0).abs() < 1e-6, "{p0:?}");
+    assert_eq!(effectcraft_render::source_size(&s.project, b1), (48, 216));
+}
+
+#[test]
+fn bad_scene_requests_are_errors_and_change_nothing() {
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    let before = s.project.clone();
+    let undo = s.history.undo.len();
+    // A dir the kind doesn't have, a kind without one, a dir on the other families, not a string.
+    let e = apply_dir(&mut s, cid, old, new, "push-slide", "sideways").unwrap_err().to_string();
+    assert!(e.contains("no dir") && e.contains("right"), "{e}");
+    let e = apply_dir(&mut s, cid, old, new, "horizontal-blinds", "up").unwrap_err().to_string();
+    assert!(e.contains("no dir"), "{e}");
+    let e = apply_dir(&mut s, cid, old, new, "crossfade", "left").unwrap_err().to_string();
+    assert!(e.contains("takes no `dir`"), "{e}");
+    let e = apply_dir(&mut s, cid, old, new, "kick", "left").unwrap_err().to_string();
+    assert!(e.contains("scene cuts"), "{e}");
+    let e = apply_dir(&mut s, cid, old, new, "light-leak", "left").unwrap_err().to_string();
+    assert!(e.contains("scene cuts"), "{e}");
+    assert!(s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "push-slide", "dir": 3})).is_err());
+    // The zoom cuts' options.
+    let e = s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "squeeze", "restScale": 100})).unwrap_err().to_string();
+    assert!(e.contains("zoom cuts") && e.contains("a scene cut"), "{e}");
+    assert!(s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "staggered-blocks", "colour": "blue"})).is_err());
+    assert!(s.execute("transition.apply", json!({"comp": cid, "old": old, "new": new, "kind": "crossfade", "dur": 0})).is_err());
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project), "nothing changed");
+    assert_eq!(s.history.undo.len(), undo);
+    // dir, dur and colour are accepted parameters.
+    let r = s
+        .execute_checked(
+            "transition.apply",
+            json!({"comp": cid, "old": old, "new": new, "kind": "staggered-blocks", "dir": "up", "dur": 1.0, "colour": ["#ff0000", "#00ff00"]}),
+        )
+        .unwrap();
+    assert!((r["dur"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    // The palette tints the two blocks.
+    let a = layer_named(&s, cid, "SceneCut staggered-blocks Block A");
+    let LayerSource::Solid { item } = a.source else { panic!("a block is a solid") };
+    let effectcraft_project::ItemKind::Solid(sol) = &s.project.item(item).unwrap().kind else { panic!("a solid item") };
+    assert!(sol.color[0] > 0.99 && sol.color[1] < 0.01, "{:?}", sol.color);
+    s.execute("edit.undo", json!({})).unwrap();
+    // The new shot must play past color-dip's late start; footage must reach card-flip-3d's end.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    s.execute("layer.timing", json!({"layers": [new], "out": 4.0 + 1.0 / 29.97})).unwrap();
+    let e = apply(&mut s, cid, old, new, "color-dip").unwrap_err().to_string();
+    assert!(e.contains("play longer"), "{e}");
+    assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 2);
+    // Too close to the comp's start; the comp ends before it settles.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 0.2);
+    let e = apply(&mut s, cid, old, new, "push-slide").unwrap_err().to_string();
+    assert!(e.contains("too close to the comp's start"), "{e}");
+    let (mut s, cid, old, new, _) = cut_at(29.97, 4.2, 4.0);
+    let e = apply(&mut s, cid, old, new, "horizontal-blinds").unwrap_err().to_string();
+    assert!(e.contains("comp too short"), "{e}");
+}
+
+#[test]
+fn stack_kinds_move_the_new_shot_above_the_old_one_and_say_so() {
+    for kind in STACK_KINDS {
+        let (mut s, cid, old, new, cut) = cut_at(29.97, 10.0, 4.0);
+        // The old shot on top: the new one has to come up to fade / slide in over it.
+        s.execute("layer.arrange", json!({"layers": [old], "to": "front"})).unwrap();
+        let r = apply(&mut s, cid, old, new, kind).unwrap();
+        assert_eq!(r["stacked"], json!(true), "{kind}");
+        let comp = s.project.comp(ItemId(cid)).unwrap();
+        assert_eq!(comp.index_of(LayerId(new)).map(|i| i + 1), comp.index_of(LayerId(old)), "{kind}: the new shot is right above the old one");
+        let order = moved(&r, new, "order");
+        assert_eq!(order.len(), 1, "{kind}: {}", r["moved"]);
+        assert_eq!((order[0]["from"].as_u64(), order[0]["to"].as_u64()), (Some(2), Some(1)), "{kind}: {}", r["moved"]);
+        assert!(moved(&r, old, "order").is_empty(), "{kind}: only the new shot moved: {}", r["moved"]);
+        // Its in point moved too, to the kind's early start.
+        let inn = moved(&r, new, "in");
+        assert_eq!(inn.len(), 1, "{kind}: {}", r["moved"]);
+        assert!((inn[0]["from"].as_f64().unwrap() - cut).abs() < 1e-9);
+        assert!(inn[0]["to"].as_f64().unwrap() < cut, "{kind}: starts early");
+        // Undo puts the order back.
+        s.execute("edit.undo", json!({})).unwrap();
+        let comp = s.project.comp(ItemId(cid)).unwrap();
+        assert!(comp.index_of(LayerId(old)) < comp.index_of(LayerId(new)), "{kind}: undo restores the order");
+    }
+    // A kind without `stack` leaves the order alone.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    s.execute("layer.arrange", json!({"layers": [old], "to": "front"})).unwrap();
+    let r = apply(&mut s, cid, old, new, "push-slide").unwrap();
+    assert_eq!(r["stacked"], json!(false));
+    assert!(moved(&r, new, "order").is_empty() && moved(&r, old, "order").is_empty(), "{}", r["moved"]);
+    // An FX cut's restack is reported the same way (clock-wipe puts the old shot on top).
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    let r = apply(&mut s, cid, old, new, "clock-wipe").unwrap();
+    assert_eq!(r["restacked"], json!(true));
+    assert_eq!(moved(&r, old, "order").len(), 1, "{}", r["moved"]);
+}
+
+#[test]
+fn shape_kinds_mask_copies_of_the_shots() {
+    // circle-iris: a copy of the new shot, from the window's start, opens in a keyed circle.
+    let (mut s, cid, old, new, cut) = cut_at(29.97, 10.0, 4.0);
+    let r = apply(&mut s, cid, old, new, "circle-iris").unwrap();
+    let iris = layer_named(&s, cid, "SceneCut circle-iris Iris");
+    let LayerSource::Comp { item } = iris.source else { panic!("the iris is a precomp") };
+    let scenes = s.project.comp(item).unwrap();
+    assert_eq!(scenes.layers.len(), 1, "a copy of the new shot only");
+    let fr = scenes.frame_rate;
+    let start = r["cutFrame"].as_i64().unwrap() + (-0.5005 * fr.as_f64()).round() as i64;
+    assert_eq!(fr.frame_at(scenes.layers.iter().next().unwrap().in_point), start, "the copy starts at the window's start");
+    assert!((timing(&s, cid, new).0.seconds() - cut).abs() < 1e-9, "the shot itself still starts on the cut");
+    let mp = iris.masks().unwrap().groups().next().unwrap().prop("path").unwrap();
+    assert_eq!(mp.keys.len(), 2);
+    // diamond-iris: a 4-vertex polygon with straight edges, from a point to past the corners.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "diamond-iris").unwrap();
+    let iris = layer_named(&s, cid, "SceneCut diamond-iris Iris");
+    let mp = iris.masks().unwrap().groups().next().unwrap().prop("path").unwrap();
+    assert_eq!(mp.keys.len(), 2);
+    for k in &mp.keys {
+        let effectcraft_project::Value::Path(p) = &k.value else { panic!("a path key") };
+        assert_eq!(p.vertices.len(), 4);
+        assert!(p.closed && p.in_tangents.iter().chain(&p.out_tangents).all(|t| *t == [0.0, 0.0]), "straight edges");
+    }
+    // diagonal-split: the old shot ends at the window's start, a masked copy carries it; re-applying
+    // with no `at` finds the same cut.
+    let (mut s, cid, old, new, cut) = cut_at(29.97, 10.0, 4.0);
+    let r = apply(&mut s, cid, old, new, "diagonal-split").unwrap();
+    assert!(timing(&s, cid, old).1.seconds() < cut - 0.4, "the old shot ends early");
+    assert_eq!(moved(&r, old, "out").len(), 1, "{}", r["moved"]);
+    let r2 = apply(&mut s, cid, old, new, "diagonal-split").unwrap();
+    assert_eq!(r2["cutFrame"], r["cutFrame"]);
+    assert!(moved(&r2, old, "out").is_empty(), "the same trims again: nothing moved: {}", r2["moved"]);
+    let r3 = apply_dir(&mut s, cid, old, new, "diagonal-split", "down-left").unwrap();
+    assert_eq!(r3["cutFrame"], r["cutFrame"]);
+    // A zoom cut after it: both shots meet on the cut again.
+    apply(&mut s, cid, old, new, "kick").unwrap();
+    assert!((timing(&s, cid, old).1.seconds() - cut).abs() < 1e-9 && (timing(&s, cid, new).0.seconds() - cut).abs() < 1e-9);
+}
+
+#[test]
+fn card_flip_turns_3d_copies_over_the_dark_backing() {
+    let (mut s, cid, old, new, cut) = cut_at(29.97, 10.0, 4.0);
+    let r = apply(&mut s, cid, old, new, "card-flip-3d").unwrap();
+    let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+    let cut_f = r["cutFrame"].as_i64().unwrap();
+    let d = (0.3003 * fr.as_f64()).round() as i64;
+    assert_eq!(fr.frame_at(timing(&s, cid, old).1), cut_f - d, "the old shot ends when the turn starts");
+    assert_eq!(fr.frame_at(timing(&s, cid, new).0), cut_f + d, "the new shot starts when the turn ends");
+    for (name, from, to) in [("SceneCut card-flip-3d Card old", 0.0, 180.0), ("SceneCut card-flip-3d Card new", -180.0, 0.0)] {
+        let l = layer_named(&s, cid, name);
+        assert!(l.is_3d(), "{name} is a 3-D layer");
+        let ry = l.props.prop("transform/rotationY").unwrap();
+        let v: Vec<f64> = ry.keys.iter().map(|k| k.value.components()[0]).collect();
+        assert_eq!(v, [from, to], "{name}");
+    }
+    let bg = layer_named(&s, cid, "SceneCut card-flip-3d BG");
+    let comp = s.project.comp(ItemId(cid)).unwrap();
+    assert!(comp.index_of(bg.id) > comp.index_of(LayerId(old)) && comp.index_of(bg.id) > comp.index_of(LayerId(new)), "the backing is under both shots");
+    // Re-applying finds the same cut (the trims go back first).
+    let r2 = apply(&mut s, cid, old, new, "card-flip-3d").unwrap();
+    assert_eq!(r2["cutFrame"], r["cutFrame"]);
+    apply(&mut s, cid, old, new, "crossfade").unwrap();
+    assert!((timing(&s, cid, old).1.seconds() - cut).abs() < 1e-9, "the old shot ends on the cut again");
+    // color-dip starts the new shot 2 frames after the cut.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    let r = apply(&mut s, cid, old, new, "color-dip").unwrap();
+    assert_eq!(fr.frame_at(timing(&s, cid, new).0), r["cutFrame"].as_i64().unwrap() + 2);
+    let r2 = apply(&mut s, cid, old, new, "color-dip").unwrap();
+    assert_eq!(r2["cutFrame"], r["cutFrame"], "re-applying finds the same cut");
+}
+
+#[test]
+fn hold_keys_straight_paths_and_pivots() {
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "elastic-push").unwrap();
+    // The mirrored edges widen on the cut, not before: a hold key.
+    let tile = effect(&s, cid, new, "SceneCut elastic-push Mirror edges").prop("outputWidth").unwrap().clone();
+    assert_eq!(tile.keys.len(), 2);
+    assert_eq!(tile.keys[0].out_interp, Interp::Hold);
+    // The push overshoots on a straight path; Expo Out 1 then Expo In-Out on its segments.
+    let pos = effect(&s, cid, new, "SceneCut elastic-push Push").prop("position").unwrap().clone();
+    assert_eq!(pos.keys.len(), 4);
+    assert!(pos.keys.iter().all(|k| !k.spatial_auto && k.spatial_in == [0.0; 3] && k.spatial_out == [0.0; 3]), "spatially linear");
+    assert!(pos.keys.iter().take(3).all(|k| k.out_interp == Interp::Bezier));
+    // squeeze: each shot's Transform pivots on its own edge (0, 540 and 1920, 540 of 1920×1080).
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply(&mut s, cid, old, new, "squeeze").unwrap();
+    for (l, x) in [(old, 0.0), (new, 384.0)] {
+        let g = effect(&s, cid, l, "SceneCut squeeze Squeeze");
+        let a = g.prop("anchor").unwrap().value.components();
+        let p = g.prop("position").unwrap().value.components();
+        assert!((a[0] - x).abs() < 1e-9 && (a[1] - 108.0).abs() < 1e-9 && a == p, "{a:?} {p:?}");
+        assert_eq!(g.prop("scaleWidth").unwrap().keys.len(), 2);
+    }
+    // squeeze up: the pivot moves to the top edge and the squeeze is in height.
+    let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+    apply_dir(&mut s, cid, old, new, "squeeze", "up").unwrap();
+    let g = effect(&s, cid, old, "SceneCut squeeze Squeeze");
+    let a = g.prop("anchor").unwrap().value.components();
+    assert!((a[0] - 192.0).abs() < 1e-9 && a[1].abs() < 1e-9, "{a:?}");
+    assert_eq!(g.prop("scaleHeight").unwrap().keys.len(), 2);
+    assert!(g.prop("scaleWidth").unwrap().keys.is_empty());
+}
+
+#[test]
+fn switching_families_on_the_same_pair_leaves_nothing_behind() {
+    let (mut s, cid, old, new, cut) = cut_at(29.97, 10.0, 4.0);
+    let items0 = s.project.items.len();
+    // Every scene cut, with a zoom cut and FX cuts (one that trims, one with copies) between them,
+    // then backwards: each replaces the one before, whatever its family.
+    let mut seq: Vec<&str> = vec![];
+    for (i, k) in SCENE_KINDS.iter().enumerate() {
+        seq.push(k);
+        seq.push(["kick", "page-burn", "clock-wipe", "light-leak", "white-flash"][i % 5]);
+    }
+    seq.extend(SCENE_KINDS.iter().rev());
+    for kind in seq {
+        let r = apply(&mut s, cid, old, new, kind).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        assert!((r["at"].as_f64().unwrap() - cut).abs() < 1e-9, "{kind}: the cut moved to {}", r["at"]);
+        let comp = s.project.comp(ItemId(cid)).unwrap();
+        assert_eq!(comp.layers.len(), 2 + r["layers"].as_array().unwrap().len(), "{kind}: leftover layers");
+        let pre = match r["family"].as_str() {
+            Some("fx-cut") => format!("FxCut {kind} "),
+            Some("scene-cut") => format!("SceneCut {kind} "),
+            _ => format!("ZoomCut {kind} "),
+        };
+        for l in [old, new] {
+            for e in transition_effects(&s, cid, l) {
+                assert!(e.starts_with(&pre), "{kind}: leftover effect “{e}”");
+            }
+        }
+        for l in comp.layers.iter().filter(|l| l.id != LayerId(old) && l.id != LayerId(new)) {
+            assert!(l.name.starts_with(&pre), "{kind}: leftover layer “{}”", l.name);
+        }
+        for i in transition_items(&s) {
+            assert!(i.starts_with(&pre), "{kind}: leftover item “{i}”");
+        }
+        assert!(orphan_solids(&s).is_empty(), "{kind}: orphan solids {:?}", orphan_solids(&s));
+    }
+    apply(&mut s, cid, old, new, "kick").unwrap();
+    assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 2);
+    assert!(transition_items(&s).is_empty());
+    assert_eq!(s.project.items.len(), items0, "no items left behind (solids, precomps)");
+    assert_eq!(transition_effects(&s, cid, new), ["ZoomCut kick Zoom"]);
+    assert!((timing(&s, cid, old).1.seconds() - cut).abs() < 1e-9 && (timing(&s, cid, new).0.seconds() - cut).abs() < 1e-9, "the shots meet on the cut");
+}
+
+#[test]
+fn push_slide_mid_frame_has_no_transparent_pixel() {
+    // At 1920×1080, the size the seam's 100.4 % mirrored edge was tuned for (3.8 px a side).
+    for fps in [29.97, 24.0] {
+        let (mut s, cid, old, new, _) = cut_at_size(fps, 10.0, 4.0, 1920, 1080);
+        let r = apply(&mut s, cid, old, new, "push-slide").unwrap();
+        let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+        let f = (r["startFrame"].as_i64().unwrap() + r["cutFrame"].as_i64().unwrap()) / 2;
+        let img = s.render(ItemId(cid), fr.tick_of(f), RenderOpts { scale: 1.0, motion_blur: false, ..Default::default() });
+        let (w, h) = (i64::from(img.width), i64::from(img.height));
+        let (mut red, mut blue) = (0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let px = img.get(x, y);
+                assert!(px[3] > 0.999, "{fps} fps frame {f}: transparent pixel at ({x}, {y}): {px:?}");
+                if px[0] > px[2] {
+                    red += 1;
+                } else {
+                    blue += 1;
+                }
+            }
+        }
+        // Both shots show, side by side, mid-push.
+        assert!(red > 0 && blue > 0, "{fps} fps: red {red} blue {blue}");
+    }
+}
+
+#[test]
+fn scene_cut_menu_lists_the_15_kinds() {
+    let bar = crate::menus::menu_bar();
+    let json = serde_json::to_string(bar).unwrap();
+    assert!(json.contains("\"label\":\"Scene Cut\""), "no Scene Cut submenu");
+    for kind in SCENE_KINDS {
+        assert!(json.contains(&format!("{{\"kind\":\"{kind}\"}}")), "{kind} isn't in the menus");
+    }
+    // The shipped table is the shelf's copy with labels instead of local paths.
+    assert!(!include_str!("../presets/scene-cut.kinds.json").contains(concat!("/", "Users", "/")));
 }

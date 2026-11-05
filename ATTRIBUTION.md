@@ -91,6 +91,9 @@ Screenshots of EffectCraft itself, rendered headlessly, showing only procedurall
 - FX-cut transition kinds (15 FX cuts for Animation ▸ Transitions ▸ FX Cut, `transition.apply`; Elias's native
   rebuilds of the HyperFrames scene transitions, copied from his motion-kit shelf): `crates/engine/presets/fx-cut.kinds.json`
   (sidecar `.attribution`).
+- Scene-cut transition kinds (15 scene cuts for Animation ▸ Transitions ▸ Scene Cut, `transition.apply`; Elias's native
+  rebuilds of the HyperFrames scene transitions, transitions-a, copied from his motion-kit shelf):
+  `crates/engine/presets/scene-cut.kinds.json` (sidecar `.attribution`).
 - Sample scripts (File ▸ Scripts) and ScriptUI panel: `crates/engine/scripts/Rename Layers.jsx`,
   `crates/engine/scripts/Sort Layers by In Point.jsx`, `crates/engine/scripts/Create Null at Selected Layers.jsx`,
   `crates/engine/scripts/Render Queue Batch.jsx`, `crates/engine/scripts/ScriptUI Panels/Layer Tools.jsx`
