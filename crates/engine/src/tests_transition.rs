@@ -1199,12 +1199,13 @@ fn index(s: &Session, cid: u64, l: u64) -> usize {
 
 #[test]
 fn trimmed_shots_keep_their_sound() {
-    // diagonal-split ends the old shot 0.5 s early: its sound plays on to the cut from a copy.
+    // diagonal-split ends the old shot 0.5 s early: its sound plays on to the cut from a copy. (It
+    // starts the new shot 0.5 s early too: see the_picture_starting_early_never_starts_the_sound_early.)
     let (mut s, cid, old, new, cut) = cut_at_audio(29.97, 10.0, 4.0);
     let r = apply(&mut s, cid, old, new, "diagonal-split").unwrap();
     let (_, oout) = timing(&s, cid, old);
     assert!(oout.seconds() < cut - 0.4, "the picture is trimmed");
-    let k = keeps(&s, cid);
+    let k: Vec<_> = keeps(&s, cid).into_iter().filter(|k| k.1.starts_with("A Footage")).collect();
     assert_eq!(k.len(), 1, "{k:?}");
     let (kid, name, a, b, video, audio, i) = k[0].clone();
     assert_eq!(name, "A Footage audio (SceneCut keep)");
@@ -1214,7 +1215,8 @@ fn trimmed_shots_keep_their_sound() {
     let comp = s.project.comp(ItemId(cid)).unwrap();
     let (ol, kl) = (comp.layer(LayerId(old)).unwrap(), comp.layer(LayerId(kid)).unwrap());
     assert_eq!((ol.source.item(), ol.comp_time(Tick::ZERO)), (kl.source.item(), kl.comp_time(Tick::ZERO)), "the same source time");
-    assert!(ol.switches.audio && comp.layer(LayerId(new)).unwrap().switches.audio, "no shot's audio is turned off");
+    assert!(ol.switches.audio, "the old shot's audio stays on");
+    assert!(!kl.comment.ends_with(" · muted"), "{}", kl.comment);
     assert!(kl.comment.starts_with(&format!("SceneCut {old}->{new}")), "tagged for the pair: {}", kl.comment);
     // The reply lists it, with frames.
     let m = moved(&r, kid, "audio-keep");
@@ -1249,7 +1251,7 @@ fn trimmed_shots_keep_their_sound() {
         let orig = timing(&s, cid, old).1.seconds();
         let r = apply(&mut s, cid, old, new, kind).unwrap();
         assert!((timing(&s, cid, old).1.seconds() - cut).abs() < 1e-9, "{kind}: the picture ends on the cut");
-        let k = keeps(&s, cid);
+        let k: Vec<_> = keeps(&s, cid).into_iter().filter(|k| k.1.starts_with("A Footage")).collect();
         assert_eq!(k.len(), 1, "{kind}: {k:?}");
         assert!((k[0].2 - cut).abs() < 1e-9 && (k[0].3 - orig).abs() < 1e-9, "{kind}: {k:?}");
         assert_eq!(moved(&r, k[0].0, "audio-keep").len(), 1, "{kind}: {}", r["moved"]);
@@ -1258,6 +1260,41 @@ fn trimmed_shots_keep_their_sound() {
     let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
     apply(&mut s, cid, old, new, "card-flip-3d").unwrap();
     assert!(keeps(&s, cid).is_empty());
+}
+
+#[test]
+fn the_picture_starting_early_never_starts_the_sound_early() {
+    // Kinds that start the new shot's picture before the cut (FX and scene cuts alike): one copy
+    // carries its sound over its whole span as it was, and the shot's own audio goes off.
+    for kind in ["clock-wipe", "push-slide", "crossfade", "diagonal-split", "page-burn"] {
+        let (mut s, cid, old, new, cut) = cut_at_audio(29.97, 10.0, 4.0);
+        let n0 = timing(&s, cid, new);
+        let r = apply(&mut s, cid, old, new, kind).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        assert!(timing(&s, cid, new).0.seconds() < cut - 0.2, "{kind}: the picture starts early");
+        let k: Vec<_> = keeps(&s, cid).into_iter().filter(|k| k.1.starts_with("B Footage")).collect();
+        assert_eq!(k.len(), 1, "{kind}: {k:?}");
+        let (kid, name, a, b, video, audio, i) = k[0].clone();
+        assert_eq!(name, format!("B Footage audio ({} keep)", if kind == "clock-wipe" || kind == "page-burn" { "FxCut" } else { "SceneCut" }));
+        assert!((a - n0.0.seconds()).abs() < 1e-9 && (b - n0.1.seconds()).abs() < 1e-9, "{kind}: the shot's whole span as it was: {a}–{b}");
+        assert!(!video && audio, "{kind}: audio only");
+        assert_eq!(i, index(&s, cid, new) + 1, "{kind}: right below its shot");
+        let comp = s.project.comp(ItemId(cid)).unwrap();
+        assert!(!comp.layer(LayerId(new)).unwrap().switches.audio, "{kind}: the shot's own audio is off");
+        assert!(comp.layer(LayerId(kid)).unwrap().comment.ends_with(" · muted"), "{kind}");
+        let m = moved(&r, kid, "audio-keep");
+        assert_eq!(m.len(), 1, "{kind}: {}", r["moved"]);
+        assert_eq!((m[0]["of"].as_u64(), m[0]["shotAudio"].as_str()), (Some(new), Some("off")), "{kind}");
+        // Switching to a zoom cut gives the shot its span and its audio back, no copy left.
+        apply(&mut s, cid, old, new, "kick").unwrap();
+        let comp = s.project.comp(ItemId(cid)).unwrap();
+        assert!(comp.layer(LayerId(new)).unwrap().switches.audio, "{kind}: the shot's audio is back on");
+        assert!(keeps(&s, cid).is_empty(), "{kind}");
+        assert_eq!(timing(&s, cid, new), n0, "{kind}");
+        // Undo twice: as it was.
+        s.execute("edit.undo", json!({})).unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(s.project.comp(ItemId(cid)).unwrap().layer(LayerId(new)).unwrap().switches.audio, "{kind}: undo");
+    }
 }
 
 #[test]
@@ -1292,7 +1329,7 @@ fn audio_keep_copies_go_with_reapply_switching_and_undo() {
     // FX page-burn keeps the old shot's last 1.2 s of sound the same way.
     let (mut s, cid, old, new, cut) = cut_at_audio(29.97, 10.0, 4.0);
     apply(&mut s, cid, old, new, "page-burn").unwrap();
-    let k = keeps(&s, cid);
+    let k: Vec<_> = keeps(&s, cid).into_iter().filter(|k| k.1.starts_with("A Footage")).collect();
     assert_eq!(k.len(), 1, "{k:?}");
     assert_eq!(k[0].1, "A Footage audio (FxCut keep)");
     assert!((k[0].3 - cut).abs() < 1e-9 && k[0].2 < cut - 1.1, "{k:?}");

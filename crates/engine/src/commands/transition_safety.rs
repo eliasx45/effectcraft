@@ -5,7 +5,10 @@
 //!    the new one, the old shot playing past the cut) trims only its picture: when the shot has
 //!    audio, an audio-only copy of it (video off, the same source time) plays over exactly the span
 //!    the trim took, right below its shot, named `<shot> audio (<Family> keep)` and tagged for the
-//!    pair. Re-applying or switching kinds deletes it and gives the shot its span back. The copies of
+//!    pair. A kind that starts the new shot's picture early (under or over the old one) never starts
+//!    its sound early: one copy carries the shot's whole span as it was and the shot's own audio goes
+//!    off. Re-applying or switching kinds deletes the copies and gives the shot its span (and its
+//!    audio) back. The copies of
 //!    a shot a kind shows in its `… Scenes` precomps are muted, so the sound never doubles.
 //! 2. Never touch a third layer. A restack (an FX cut's old-over-new, a scene cut's new-over-old)
 //!    that would move a shot past another layer, a kind that composites the two shots together while
@@ -296,8 +299,12 @@ pub(super) fn check_adjacent(s: &Session, cid: ItemId, kind: &str, old: LayerId,
     ))
 }
 
+/// The comment ending of an audio keep copy that turned its shot's own audio off: the transition
+/// shows the shot's picture earlier (or later) than its sound played, so the copy carries all of it.
+pub(super) const MUTED: &str = " · muted";
+
 /// Does the layer make sound (Audio switch on, footage with audio, a precomp with sound, a tone)?
-fn has_audio(s: &Session, l: &Layer) -> bool {
+pub(super) fn has_audio(s: &Session, l: &Layer) -> bool {
     effectcraft_render::audio::audible(&s.project, l)
         && match l.source {
             LayerSource::Comp { item } => effectcraft_render::audio::comp_has_audio(&s.project, item),
@@ -307,8 +314,11 @@ fn has_audio(s: &Session, l: &Layer) -> bool {
 
 /// Rule 1: for each shot (`(before, now)`: its id before the transition and the layer now showing
 /// it, the window for into-window) whose span the transition shortened, an audio-only copy over
-/// each span it lost, right below it. `spans`: the shots' (in, out) before the transition (after the
-/// previous one's trims went back). Returns the reply's `audio-keep` entries.
+/// each span it lost, right below it. A shot whose picture now starts earlier (or ends later) than
+/// before (the new shot under or over the old one from the window's start) would play its sound
+/// early: one copy carries its whole span as it was and the shot's own audio goes off (the shelf's
+/// cut-safety `mute`), so the mix is what it was. `spans`: the shots' (in, out) before the
+/// transition (after the previous one's trims went back). Returns the reply's `audio-keep` entries.
 pub(super) fn keep_audio(
     s: &mut Session,
     cid: ItemId,
@@ -318,18 +328,23 @@ pub(super) fn keep_audio(
     prefix: &str,
 ) -> Result<Vec<Value>> {
     let fr: FrameRate = s.project.comp(cid).ok_or(EngineError::NoComp)?.frame_rate;
-    let mut plan: Vec<(LayerId, Tick, Tick)> = vec![];
+    // (shot, from, to, mute the shot)
+    let mut plan: Vec<(LayerId, Tick, Tick, bool)> = vec![];
     for (was, now) in shots {
         let Some((_, in0, out0)) = spans.iter().find(|x| x.0 == *was).copied() else { continue };
         let Some(l) = s.project.comp(cid).and_then(|c| c.layer(*now)) else { continue };
         if !has_audio(s, l) {
             continue;
         }
+        if l.in_point < in0 || l.out_point > out0 {
+            plan.push((*now, in0, out0, true));
+            continue;
+        }
         if l.in_point > in0 {
-            plan.push((*now, in0, l.in_point));
+            plan.push((*now, in0, l.in_point, false));
         }
         if l.out_point < out0 {
-            plan.push((*now, l.out_point, out0));
+            plan.push((*now, l.out_point, out0, false));
         }
     }
     if plan.is_empty() {
@@ -341,20 +356,24 @@ pub(super) fn keep_audio(
         let mut next = proj.next_id;
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let mut made = vec![];
-        for (shot, a, b) in &plan2 {
+        for (shot, a, b, mute) in &plan2 {
             let i = comp.layers.iter().position(|l| l.id == *shot).ok_or_else(|| bad(C, "a shot is gone"))?;
             let mut l = comp.layer(*shot).ok_or_else(|| bad(C, "a shot is gone"))?.clone();
             super::edit::reid(&mut l, &mut next);
             l.name = format!("{} audio ({fam} keep)", l.name);
-            l.comment = format!("{tag}{AUDIO_KEEP}{}", shot.0);
+            l.comment = format!("{tag}{AUDIO_KEEP}{}{}", shot.0, if *mute { MUTED } else { "" });
             (l.in_point, l.out_point) = (*a, *b);
             l.switches.video = false;
+            l.switches.audio = true;
             l.track_matte = None;
             if let Some(fx) = l.props.sub_mut("effects") {
                 fx.children.retain(|n| !matches!(n, Node::Group(g) if prefix_of(&g.name).is_some()));
             }
-            made.push((l.id, l.name.clone(), *shot, *a, *b));
+            made.push((l.id, l.name.clone(), *shot, *a, *b, *mute));
             comp.layers.insert(i.saturating_add(1), l);
+            if *mute && let Some(sl) = comp.layer_mut(*shot) {
+                sl.switches.audio = false;
+            }
         }
         proj.next_id = next;
         Ok(made)
@@ -362,21 +381,29 @@ pub(super) fn keep_audio(
     let f = |t: Tick| fr.frame_at(fr.snap_nearest(t));
     Ok(made
         .into_iter()
-        .map(|(id, name, shot, a, b)| {
-            json!({"layer": id.0, "name": name, "what": "audio-keep", "of": shot.0, "from": a.seconds(), "to": b.seconds(), "fromFrame": f(a), "toFrame": f(b)})
+        .map(|(id, name, shot, a, b, mute)| {
+            json!({"layer": id.0, "name": name, "what": "audio-keep", "of": shot.0, "from": a.seconds(), "to": b.seconds(), "fromFrame": f(a), "toFrame": f(b), "shotAudio": if mute { "off" } else { "on" }})
         })
         .collect())
 }
 
 /// Removal: the pair's audio keep copies (`is_pair` on their comment) give their shots back the
-/// span they kept (in = the earliest, out = the latest); each copy names its own shot.
+/// span they kept (in = the earliest, out = the latest) and, when a copy turned it off, the shot's
+/// own audio; each copy names its own shot.
 pub(super) fn restore_kept(c: &mut Comp, is_pair: &dyn Fn(&str) -> bool) {
-    let kept: Vec<(LayerId, Tick, Tick)> =
-        c.layers.iter().filter(|l| is_pair(&l.comment)).filter_map(|l| keep_of(&l.comment).map(|shot| (shot, l.in_point, l.out_point))).collect();
-    for (shot, a, b) in kept {
+    let kept: Vec<(LayerId, Tick, Tick, bool)> = c
+        .layers
+        .iter()
+        .filter(|l| is_pair(&l.comment))
+        .filter_map(|l| keep_of(&l.comment).map(|shot| (shot, l.in_point, l.out_point, l.comment.ends_with(MUTED))))
+        .collect();
+    for (shot, a, b, muted) in kept {
         if let Some(l) = c.layer_mut(shot) {
             l.in_point = l.in_point.min(a);
             l.out_point = l.out_point.max(b);
+            if muted {
+                l.switches.audio = true;
+            }
         }
     }
 }
