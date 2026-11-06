@@ -4,6 +4,9 @@
 //! H.264 and HEVC on macOS) give pictures that look the same as the pure-Rust decoders' but are
 //! not guaranteed bit-identical, so only previews may use them: exports, the Render Queue and
 //! other final renders decode exactly.
+//! (Exception, opt-in: a draft / fast export that asked for hardware decoding reads the pool's
+//! preview view: `effectcraft_export::speed::hardware_decode`, `effectcraft-cli render
+//! --hw-decode` / `--fast`.)
 //!
 //! FilmCraft creates decoders through one process-wide registry, so the choice is made per
 //! decoding thread: [`MediaPool`](crate::MediaPool) runs every movie decode inside a [`scope`]

@@ -2,7 +2,7 @@
 //!
 //! | Format | Container / files | Video | Alpha | Audio |
 //! |---|---|---|---|---|
-//! | H.264 | MP4 | FilmCraft H.264 High, 8-bit 4:2:0 BT.709 limited, VBR | no | AAC-LC (FilmCraft), mono/stereo |
+//! | H.264 | MP4 | FilmCraft H.264 High, 8-bit 4:2:0 BT.709 limited, VBR, 2 s keyframe groups encoded in parallel ([`speed`]); or the platform's hardware encoder when asked | no | AAC-LC (FilmCraft), mono/stereo |
 //! | ProRes | QuickTime MOV | FilmCraft ProRes 422 Proxy/LT/422/HQ, 10-bit; 4444/4444 XQ 4:4:4 | 4444 (16-bit alpha coding) | PCM 16/24-bit or 32-bit float, mono/stereo |
 //! | Uncompressed | QuickTime MOV (`raw `) | 8-bit RGB (depth 24, rows padded to even bytes) or ARGB (depth 32) | RGB + Alpha (straight or premultiplied) | PCM 16/24-bit or 32-bit float, mono/stereo |
 //! | PNG / JPEG / TIFF sequence | one file per frame | 8-bit | PNG, TIFF | — |
@@ -33,9 +33,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod encode;
+mod h264_groups;
 mod hevc_av1;
 mod out;
 mod pipeline;
+pub mod speed;
 mod uncompressed;
 mod webm;
 mod webm_av1;
@@ -113,8 +115,13 @@ pub struct JobOptions<'a> {
 
 impl<'a> Job<'a> {
     /// The footage the job renders from: the source's exact view ([`FootageSource::exact`]),
-    /// never frames a preview decoded on a hardware decoder.
+    /// never frames a preview decoded on a hardware decoder. Draft / fast exports that asked
+    /// for hardware decoding ([`speed::hardware_decode`]) read the source itself, which decodes
+    /// on a hardware decoder where its owner turned that on.
     pub fn source(&self) -> &'a dyn FootageSource {
+        if speed::hardware_decode() {
+            return self.footage;
+        }
         self.footage.exact().unwrap_or(self.footage)
     }
 }

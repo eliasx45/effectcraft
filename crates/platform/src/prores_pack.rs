@@ -110,9 +110,49 @@ pub(crate) fn pack_sv22(f: &Frame, planes: &mut [RowsMut<'_>]) -> Result<(), Str
     Ok(())
 }
 
+/// Fill a `420v` buffer's two planes (Y', interleaved Cb Cr) from planar 8-bit 4:2:0 (`y`
+/// `w`×`h`, `u` / `v` `⌈w/2⌉`×`⌈h/2⌉`, no padding): the hardware H.264 encoder's source
+/// (`videotoolbox_h264`).
+pub(crate) fn pack_nv12(y: &[u8], u: &[u8], v: &[u8], w: usize, h: usize, planes: &mut [RowsMut<'_>]) -> Result<(), String> {
+    let [luma, chroma] = planes else {
+        return Err(format!("420v buffer with {} planes", planes.len()));
+    };
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    for row in 0..h {
+        let src = y.get(row * w..(row + 1) * w).ok_or("picture row out of range")?;
+        luma.row(row, w)?.copy_from_slice(src);
+    }
+    for row in 0..ch {
+        let (us, vs) = (u.get(row * cw..(row + 1) * cw), v.get(row * cw..(row + 1) * cw));
+        let (Some(us), Some(vs)) = (us, vs) else { return Err("picture row out of range".into()) };
+        for (o, (&a, &b)) in chroma.row(row, cw * 2)?.as_chunks_mut::<2>().0.iter_mut().zip(us.iter().zip(vs)) {
+            *o = [a, b];
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nv12_interleaves_chroma_after_the_luma_rows() {
+        let (w, h) = (4usize, 2usize);
+        let y: Vec<u8> = (0..8).collect();
+        let (u, v) = (vec![100, 101], vec![200, 201]);
+        // strides wider than the rows, as CoreVideo pads them
+        let (mut lb, mut cb) = (vec![0u8; 6 * 2], vec![0u8; 6]);
+        let mut planes = [RowsMut { data: &mut lb, stride: 6 }, RowsMut { data: &mut cb, stride: 6 }];
+        pack_nv12(&y, &u, &v, w, h, &mut planes).unwrap();
+        assert_eq!(lb, [0, 1, 2, 3, 0, 0, 4, 5, 6, 7, 0, 0]);
+        assert_eq!(cb, [100, 200, 101, 201, 0, 0]);
+        // short planes or a wrong plane count are errors
+        let mut one = [RowsMut { data: &mut lb, stride: 6 }];
+        assert!(pack_nv12(&y, &u, &v, w, h, &mut one).is_err());
+        let mut planes = [RowsMut { data: &mut lb, stride: 6 }, RowsMut { data: &mut cb, stride: 6 }];
+        assert!(pack_nv12(&y[..5], &u, &v, w, h, &mut planes).is_err());
+    }
 
     fn words(b: &[u8]) -> Vec<u16> {
         b.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes(*p)).collect()

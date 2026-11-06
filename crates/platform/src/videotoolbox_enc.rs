@@ -47,7 +47,7 @@ pub(crate) const SV22: u32 = kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange;
 
 /// The CoreVideo names of ISO/IEC 23091-2 colour codes (primaries, transfer, matrix), or `None`
 /// for a code a session can't be told (unspecified, or one CoreVideo has no name for).
-fn color_names(primaries: u8, transfer: u8, matrix: u8) -> Option<[&'static CFString; 3]> {
+pub(crate) fn color_names(primaries: u8, transfer: u8, matrix: u8) -> Option<[&'static CFString; 3]> {
     // SAFETY: reading immutable framework constants.
     let p = unsafe {
         match primaries {
@@ -175,10 +175,10 @@ fn copy_sample(sample: &CMSampleBuffer) -> Result<Vec<u8>, String> {
 }
 
 /// Unlocks a pixel buffer's base address when dropped (made after a successful read-write lock).
-struct Locked<'a>(&'a CVImageBuffer);
+pub(crate) struct Locked<'a>(&'a CVImageBuffer);
 
 impl<'a> Locked<'a> {
-    fn new(pb: &'a CVImageBuffer) -> Result<Self, String> {
+    pub(crate) fn new(pb: &'a CVImageBuffer) -> Result<Self, String> {
         // SAFETY: `pb` is a valid pixel buffer borrowed for 'a; the guard unlocks it with the
         // same flags exactly once.
         if unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags(0)) } != 0 {
@@ -197,7 +197,7 @@ impl Drop for Locked<'_> {
 
 /// The writable rows of every plane of a locked buffer. They borrow the lock guard mutably, so
 /// they cannot outlive the locked base address, and each plane is a separate region.
-fn planes_mut<'l>(pb: &CVImageBuffer, _lock: &'l mut Locked<'_>) -> Result<Vec<RowsMut<'l>>, String> {
+pub(crate) fn planes_mut<'l>(pb: &CVImageBuffer, _lock: &'l mut Locked<'_>) -> Result<Vec<RowsMut<'l>>, String> {
     let n = CVPixelBufferGetPlaneCount(pb);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {

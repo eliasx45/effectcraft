@@ -44,11 +44,73 @@ pub(crate) trait VideoEncoder {
     fn media_start(&self) -> Option<i64> {
         None
     }
+    /// A hardware encoder (the movie is encoded in software instead when its first frames fail).
+    fn hardware(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------- H.264
 
-struct H264 {
+/// The H.264 key-frame interval: 2 s of frames.
+pub(crate) fn h264_keyint(rate: FrameRate) -> u32 {
+    (rate.as_f64() * 2.0).round().max(1.0) as u32
+}
+
+/// FilmCraft H.264 High for MP4 samples: VBR at `kbps` (peak 1.5×), a key frame every 2 s.
+pub(crate) fn h264_config(w: u32, h: u32, rate: FrameRate, kbps: u32) -> filmcraft_h264enc::EncoderConfig {
+    let mut cfg = filmcraft_h264enc::EncoderConfig::new(w, h, rate.num as u32, rate.den as u32);
+    cfg.format = filmcraft_h264enc::PacketFormat::LengthPrefixed;
+    cfg.aud = false;
+    cfg.keyint = h264_keyint(rate);
+    let kbps = kbps.max(100);
+    cfg.rate = filmcraft_h264enc::RateControl::Vbr { target_kbps: kbps, max_kbps: kbps * 3 / 2 };
+    cfg
+}
+
+/// The `avc1` sample entry of an `avcC` record, or of the parameter sets when it doesn't parse.
+pub(crate) fn avc_entry(avcc: &[u8], ps: Option<(Vec<u8>, Vec<u8>)>, w: u32, h: u32) -> SampleEntry {
+    let cfg = filmcraft_isobmff::AvcConfig::parse(avcc).unwrap_or_else(|_| {
+        let (sps, pps) = ps.unwrap_or_default();
+        filmcraft_isobmff::AvcConfig::new(vec![sps], vec![pps], 4)
+    });
+    SampleEntry::avc(cfg, w as u16, h as u16)
+}
+
+/// The H.264 encoder of a movie of `total` frames: the hardware encoder when asked for
+/// ([`crate::speed::hardware_h264`]) and one opens, else [`software_h264`].
+fn h264_encoder(w: u32, h: u32, rate: FrameRate, kbps: u32, total: u64) -> Result<Box<dyn VideoEncoder>> {
+    if crate::speed::hardware_h264() {
+        match HwH264::open(w, h, rate, kbps) {
+            Ok(e) => {
+                log::info!(target: "effectcraft_export", "H.264: hardware encoder");
+                return Ok(Box::new(e));
+            }
+            Err(e) => log::warn!(target: "effectcraft_export", "H.264: no hardware encoder ({e}), encoding in software"),
+        }
+    }
+    software_h264(w, h, rate, kbps, total)
+}
+
+/// FilmCraft's encoder: parallel keyframe groups ([`crate::h264_groups`]) when the movie has more
+/// than one group to run at once and [`crate::speed::parallel_h264`], else one encoder.
+fn software_h264(w: u32, h: u32, rate: FrameRate, kbps: u32, total: u64) -> Result<Box<dyn VideoEncoder>> {
+    let cfg = h264_config(w, h, rate, kbps);
+    if cfg!(not(target_arch = "wasm32")) && crate::speed::parallel_h264() {
+        use crate::h264_groups::{GROUPS_ENV, GroupedH264, QUEUE_BUDGET, THREADS_ENV, plan, plan_with_env};
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let p = plan(w, h, u64::from(cfg.keyint), total, cores, QUEUE_BUDGET);
+        let p = plan_with_env(p, std::env::var(GROUPS_ENV).ok().as_deref(), std::env::var(THREADS_ENV).ok().as_deref());
+        if p.lanes > 1 {
+            let threads = if p.threads == 0 { "all cores".to_string() } else { format!("{} threads", p.threads) };
+            log::info!(target: "effectcraft_export", "H.264: {} keyframe groups at once, {threads} each", p.lanes);
+            return Ok(Box::new(GroupedH264::new(cfg, rate.den, p)?));
+        }
+    }
+    Ok(Box::new(H264::with_config(cfg, rate)?))
+}
+
+pub(crate) struct H264 {
     enc: filmcraft_h264enc::Encoder,
     w: u32,
     h: u32,
@@ -59,13 +121,8 @@ struct H264 {
 }
 
 impl H264 {
-    fn new(w: u32, h: u32, rate: FrameRate, kbps: u32) -> Result<H264> {
-        let mut cfg = filmcraft_h264enc::EncoderConfig::new(w, h, rate.num as u32, rate.den as u32);
-        cfg.format = filmcraft_h264enc::PacketFormat::LengthPrefixed;
-        cfg.aud = false;
-        cfg.keyint = (rate.as_f64() * 2.0).round().max(1.0) as u32;
-        let kbps = kbps.max(100);
-        cfg.rate = filmcraft_h264enc::RateControl::Vbr { target_kbps: kbps, max_kbps: kbps * 3 / 2 };
+    pub(crate) fn with_config(cfg: filmcraft_h264enc::EncoderConfig, rate: FrameRate) -> Result<H264> {
+        let (w, h) = (cfg.width, cfg.height);
         let enc = filmcraft_h264enc::Encoder::new(cfg).map_err(enc)?;
         Ok(H264 { enc, w, h, rate, y: vec![], u: vec![], v: vec![] })
     }
@@ -76,11 +133,7 @@ impl H264 {
 
 impl VideoEncoder for H264 {
     fn sample_entry(&self) -> SampleEntry {
-        let cfg = filmcraft_isobmff::AvcConfig::parse(&self.enc.avcc()).unwrap_or_else(|_| {
-            let (sps, pps) = self.enc.sps_pps();
-            filmcraft_isobmff::AvcConfig::new(vec![sps], vec![pps], 4)
-        });
-        SampleEntry::avc(cfg, self.w as u16, self.h as u16)
+        avc_entry(&self.enc.avcc(), Some(self.enc.sps_pps()), self.w, self.h)
     }
     fn encode(&mut self, rgba: &[u8], index: u64) -> Result<Vec<Packet>> {
         rgba_to_yuv420(rgba, self.w as usize, self.h as usize, &mut self.y, &mut self.u, &mut self.v);
@@ -95,6 +148,108 @@ impl VideoEncoder for H264 {
     }
     fn media_start(&self) -> Option<i64> {
         (self.enc.delay() > 0).then_some(self.rate.den)
+    }
+}
+
+/// H.264 on the platform's hardware encoder (`effectcraft_media::h264_hw`): no B-frames, so
+/// samples come out in presentation order with no composition offsets and no edit.
+struct HwH264 {
+    session: Box<dyn effectcraft_media::h264_hw::H264Session>,
+    cfg: effectcraft_media::h264_hw::H264Config,
+    /// The stream's SPS / PPS (from its first sample).
+    ps: Option<(Vec<u8>, Vec<u8>)>,
+    /// Pictures handed in and samples handed out.
+    sent: u64,
+    got: u64,
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+}
+
+impl HwH264 {
+    fn open(w: u32, h: u32, rate: FrameRate, kbps: u32) -> std::result::Result<HwH264, String> {
+        let cfg = effectcraft_media::h264_hw::H264Config {
+            width: w,
+            height: h,
+            fps_num: u32::try_from(rate.num).map_err(|_| "frame rate")?,
+            fps_den: u32::try_from(rate.den).map_err(|_| "frame rate")?,
+            kbps: kbps.max(100),
+            keyint: h264_keyint(rate),
+        };
+        let session = effectcraft_media::h264_hw::open(&cfg)?;
+        Ok(HwH264 { session, cfg, ps: None, sent: 0, got: 0, y: vec![], u: vec![], v: vec![] })
+    }
+
+    fn take(&mut self, samples: Vec<effectcraft_media::h264_hw::H264Sample>) -> Result<Vec<Packet>> {
+        if self.ps.is_none() {
+            self.ps = self.session.parameter_sets();
+        }
+        let mut out = Vec::with_capacity(samples.len());
+        for s in samples {
+            if s.index != self.got {
+                return Err(ExportError::Encode(format!("the hardware H.264 encoder returned picture {} where {} was due", s.index, self.got)));
+            }
+            self.got += 1;
+            out.push(Packet { data: s.data, key: s.key, cto: 0 });
+        }
+        Ok(out)
+    }
+
+    /// After the session failed on picture `index`: a new session (it starts with an IDR) codes
+    /// it again, and the stream goes on if its parameter sets are the same.
+    fn reopen(&mut self, index: u64, why: String) -> Result<Vec<Packet>> {
+        log::warn!(target: "effectcraft_export", "hardware H.264 encoder failed at frame {index} ({why}): a new session");
+        let mut s = effectcraft_media::h264_hw::open(&self.cfg)
+            .map_err(|e| ExportError::Encode(format!("hardware H.264 encoder failed ({why}) and could not restart: {e}")))?;
+        let mut samples = s.encode(&self.y, &self.u, &self.v, index).map_err(enc)?;
+        samples.extend(s.complete().map_err(enc)?);
+        if s.parameter_sets() != self.ps {
+            return Err(ExportError::Encode(format!("hardware H.264 encoder failed at frame {index} ({why}); export again without hardware encoding")));
+        }
+        self.session = s;
+        self.take(samples)
+    }
+}
+
+impl VideoEncoder for HwH264 {
+    fn sample_entry(&self) -> SampleEntry {
+        let (sps, pps) = self.ps.clone().unwrap_or_default();
+        SampleEntry::avc(filmcraft_isobmff::AvcConfig::new(vec![sps], vec![pps], 4), self.cfg.width as u16, self.cfg.height as u16)
+    }
+    fn encode(&mut self, rgba: &[u8], index: u64) -> Result<Vec<Packet>> {
+        rgba_to_yuv420(rgba, self.cfg.width as usize, self.cfg.height as usize, &mut self.y, &mut self.u, &mut self.v);
+        self.sent += 1;
+        match self.session.encode(&self.y, &self.u, &self.v, index) {
+            Ok(samples) => self.take(samples),
+            Err(e) if self.ps.is_some() => self.reopen(index, e),
+            Err(e) => Err(ExportError::Encode(e)),
+        }
+    }
+    fn encode_batch(&mut self, frames: &[Vec<u8>], first: u64) -> Result<Vec<Packet>> {
+        let mut out = Vec::new();
+        for (k, px) in frames.iter().enumerate() {
+            out.extend(self.encode(px, first + k as u64)?);
+        }
+        if self.ps.is_none() && !frames.is_empty() {
+            // the sample entry is made after the first batch: its parameter sets are needed now
+            let done = self.session.complete().map_err(enc)?;
+            out.extend(self.take(done)?);
+            if self.ps.is_none() {
+                return Err(ExportError::Encode("the hardware H.264 encoder gave no parameter sets".into()));
+            }
+        }
+        Ok(out)
+    }
+    fn flush(&mut self) -> Result<Vec<Packet>> {
+        let done = self.session.complete().map_err(enc)?;
+        let out = self.take(done)?;
+        if self.got != self.sent {
+            return Err(ExportError::Encode(format!("the hardware H.264 encoder returned {} of {} frames", self.got, self.sent)));
+        }
+        Ok(out)
+    }
+    fn hardware(&self) -> bool {
+        true
     }
 }
 
@@ -295,7 +450,7 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         c => c,
     };
     let mut venc: Box<dyn VideoEncoder> = match fmt {
-        OutputFormat::H264 => Box::new(H264::new(w, h, rate, job.output.bitrate_kbps)?),
+        OutputFormat::H264 => h264_encoder(w, h, rate, job.output.bitrate_kbps, st.total)?,
         OutputFormat::Hevc => Box::new(crate::hevc_av1::Hevc::new(w, h, rate, job.output)?),
         OutputFormat::Av1 => Box::new(crate::hevc_av1::Av1::new(w, h, rate, job.output)?),
         OutputFormat::Uncompressed => Box::new(crate::uncompressed::Raw::new(w, h, channels == Channels::Rgba)?),
@@ -311,7 +466,16 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         // Encode the first batch before creating tracks: encoders finalise their config on frame 1.
         let first_end = batch.min(total);
         let first: Vec<Vec<u8>> = batches.next().await?.map(|(_, _, f)| f).unwrap_or_default();
-        let pending = venc.encode_batch(&first, 0)?;
+        let pending = match venc.encode_batch(&first, 0) {
+            Ok(p) => p,
+            // nothing is written yet: the whole movie encodes in software instead
+            Err(e) if venc.hardware() => {
+                log::warn!(target: "effectcraft_export", "hardware encoder failed on the first frames ({e}): encoding in software");
+                venc = software_h264(w, h, rate, job.output.bitrate_kbps, total)?;
+                venc.encode_batch(&first, 0)?
+            }
+            Err(e) => return Err(e),
+        };
         drop(first);
         st.advance(first_end)?;
 
@@ -357,11 +521,15 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         let (span_start, span_end) = job.settings.span(comp);
         let mut cursor = span_start.to_units_floor(sr as i64);
 
-        let write_video = |mux: &mut Writer, ps: Vec<Packet>| -> Result<()> {
+        // Video samples written so far: audio is interleaved up to the end of their frames (an
+        // encoder may hand frames out well after they went in: B-frames, keyframe groups).
+        let mut muxed = 0u64;
+        let mut write_video = |mux: &mut Writer, ps: Vec<Packet>| -> Result<u64> {
             for p in ps {
                 mux.write_sample(vt, WriteSample { data: &p.data, duration: rate.den as u32, composition_offset: p.cto, is_sync: p.key }).map_err(mux_err)?;
+                muxed += 1;
             }
-            Ok(())
+            Ok(muxed)
         };
         let mut write_audio_until = |mux: &mut Writer, until: Tick, cursor: &mut i64| -> Result<()> {
             let Some((a, at)) = audio.as_mut() else { return Ok(()) };
@@ -390,12 +558,12 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
             Ok(())
         };
         let frame_end_time = |k: u64| -> Tick { if k >= total { span_end } else { job.settings.frame_time(comp, k) } };
-        write_video(&mut mux, pending)?;
-        write_audio_until(&mut mux, frame_end_time(first_end), &mut cursor)?;
+        let n = write_video(&mut mux, pending)?;
+        write_audio_until(&mut mux, frame_end_time(n.min(first_end)), &mut cursor)?;
         while let Some((i, end, frames)) = batches.next().await? {
             let ps = venc.encode_batch(&frames, i)?;
-            write_video(&mut mux, ps)?;
-            write_audio_until(&mut mux, frame_end_time(end), &mut cursor)?;
+            let n = write_video(&mut mux, ps)?;
+            write_audio_until(&mut mux, frame_end_time(n.min(end)), &mut cursor)?;
             st.advance(end - i)?;
         }
         write_video(&mut mux, venc.flush()?)?;

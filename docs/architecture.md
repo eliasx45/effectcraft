@@ -363,7 +363,7 @@ zero texture per size, readback staging buffers are reused, and the 8/16 bpc qua
 each layer is fused into the layer's composite kernel; under test, pooled scratch images start
 as NaNs (a kernel that skips pixels fails the oracle) and validation errors panic. The desktop viewer builds the
 `Gpu` on egui-wgpu's device and shows frames from GPU textures without reading them back
-(`ui-egui::frames`); headless renders, the CLI (unless `--gpu`) and CI use the CPU. Outside
+(`ui-egui::frames`); headless renders, the CLI (unless `--gpu`; `render` exports use the GPU unless `--cpu`, falling back to the CPU without a usable adapter) and CI use the CPU. Outside
 tests, device errors are logged rather than fatal. A viewer frame that runs out of video memory
 (`Gpu::within_memory`) renders on the CPU, the uploaded layers and pooled textures are freed, and
 the RAM preview keeps half as many GPU frames from then on. A frame whose render panics is

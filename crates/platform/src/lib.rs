@@ -32,7 +32,9 @@
 //!
 //! [`register`] also installs the VideoToolbox ProRes encoder ([`prores_enc`], Fix 4) behind
 //! `effectcraft_media::prores_enc`: ProRes exports and proxies encode on the media engines, and
-//! any frame the hardware declines or fails is encoded by FilmCraft's encoder.
+//! any frame the hardware declines or fails is encoded by FilmCraft's encoder. It also installs
+//! the VideoToolbox H.264 encoder ([`h264_enc`], E2b) behind `effectcraft_media::h264_hw`, which
+//! exports use only when asked for (fast exports).
 //!
 //! [`background_thread`] lowers a thread to background quality of service (macOS), for the
 //! threads Cache Frames When Idle renders on.
@@ -46,6 +48,8 @@
 mod convert;
 /// The cursor's screen position while the Finder drags files over the window (no `unsafe`).
 pub mod cursor;
+#[cfg(target_os = "macos")]
+pub mod h264_enc;
 #[cfg(target_os = "macos")]
 pub mod h26x;
 pub mod hybrid;
@@ -72,6 +76,9 @@ mod videotoolbox;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod videotoolbox_enc;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod videotoolbox_h264;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod videotoolbox_nal;
@@ -131,6 +138,9 @@ pub fn register() -> Availability {
         if std::env::var_os("EFFECTCRAFT_SOFTWARE_PRORES_ENCODE").is_none_or(|v| v.is_empty() || v == "0") {
             effectcraft_media::prores_enc::register(prores_enc::encode);
         }
+        // E2b: H.264 movies may encode on the media engines, only when an export asks for it
+        // (`effectcraft_export::speed::hardware_h264`, `render --hw-h264` / `--fast`).
+        effectcraft_media::h264_hw::register(h264_enc::open);
         match (prores, nal) {
             (true, true) => Availability::Available("VideoToolbox ProRes, H.264, HEVC"),
             (true, false) => Availability::Available("VideoToolbox ProRes"),
