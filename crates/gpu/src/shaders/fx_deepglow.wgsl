@@ -184,3 +184,226 @@ fn fdg_finish(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     textureStore(out, p, o);
 }
+
+// ---------------------------------------------------------------- Deep Glow 2 (effects::deepglow2)
+// The Deep Glow 2 glow model: key → 13-tap downsample chain → one separable Gaussian per level
+// → coarse-to-fine tent upsample → finish. Images are RGB (alpha unused, written 0) and are
+// sampled GL_LINEAR clamp-to-edge in index space (deepglow2::lin / sample_row), as the CPU does.
+
+fn fdg_bilinear(t: texture_2d<f32>, px: f32, py: f32) -> vec3<f32> {
+    let x0 = floor(px);
+    let y0 = floor(py);
+    let fx = px - x0;
+    let fy = py - y0;
+    let xi = i32(x0);
+    let yi = i32(y0);
+    let a = tex_get_clamped(t, xi, yi).xyz;
+    let b = tex_get_clamped(t, xi + 1, yi).xyz;
+    let c = tex_get_clamped(t, xi, yi + 1).xyz;
+    let d = tex_get_clamped(t, xi + 1, yi + 1).xyz;
+    return (a * (1.0 - fx) + b * fx) * (1.0 - fy) + (c * (1.0 - fx) + d * fx) * fy;
+}
+
+fn fdg_smooth(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// The glow input (deepglow2::dg2_key, then Screen's clamp and the gamma). src = the unpadded
+// layer at (offset, offset) in the frame; aux = the fitted Mask Layer.
+// u[0] = (mask, luma mask, invert mask, view input); u[1] = (src offset, screen); f[0] = (threshold,
+// smooth, gamma). View input: the keyed, masked layer in display values with its alpha.
+@compute @workgroup_size(16, 16)
+fn fdg_dg2_key(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!fdg_inside(p)) {
+        return;
+    }
+    let so = i32(P.u[1].x);
+    let px = tex_get(src, p.x - so, p.y - so);
+    var x = max(px.xyz, vec3<f32>(0.0));
+    let t = P.f[0].x;
+    let s = P.f[0].y;
+    if (t > 0.0) {
+        x = vec3<f32>(x.x * fdg_smooth(t - s, t + s, x.x), x.y * fdg_smooth(t - s, t + s, x.y), x.z * fdg_smooth(t - s, t + s, x.z));
+    }
+    var amount = 1.0;
+    if (P.u[0].x != 0u) {
+        let m = tex_get(aux, p.x, p.y);
+        amount = m.w;
+        if (P.u[0].y != 0u && m.w > 0.0) {
+            amount = luminance(vec3<f32>(m.x / m.w, m.y / m.w, m.z / m.w)) * m.w;
+        }
+        if (P.u[0].z != 0u) {
+            amount = 1.0 - amount;
+        }
+        amount = clamp(amount, 0.0, 1.0);
+    }
+    x = x * amount;
+    if (P.u[0].w != 0u) {
+        textureStore(out, p, vec4<f32>(x, clamp(px.w * amount, 0.0, 1.0)));
+        return;
+    }
+    if (P.u[1].y != 0u) {
+        x = min(x, vec3<f32>(1.0));
+    }
+    let g = P.f[0].z;
+    if (g > 1.0) {
+        x = vec3<f32>(select(0.0, pow(x.x, g), x.x > 0.0), select(0.0, pow(x.y, g), x.y > 0.0), select(0.0, pow(x.z, g), x.z > 0.0));
+    }
+    textureStore(out, p, vec4<f32>(x, 0.0));
+}
+
+// The 13-tap downsample of src to out's size (offsets in destination texels).
+// f[0] = (src w / out w, src h / out h).
+@compute @workgroup_size(16, 16)
+fn fdg_down(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!fdg_inside(p)) {
+        return;
+    }
+    let r = P.f[0].xy;
+    let cx = (f32(p.x) + 0.5) * r.x - 0.5;
+    let cy = (f32(p.y) + 0.5) * r.y - 0.5;
+    var acc = 0.125 * fdg_bilinear(src, cx, cy);
+    for (var j = -1; j <= 1; j += 2) {
+        for (var i = -1; i <= 1; i += 2) {
+            acc += 0.03125 * fdg_bilinear(src, cx + 2.0 * f32(i) * r.x, cy + 2.0 * f32(j) * r.y);
+            acc += 0.125 * fdg_bilinear(src, cx + f32(i) * r.x, cy + f32(j) * r.y);
+        }
+    }
+    acc += 0.0625 * fdg_bilinear(src, cx, cy + 2.0 * r.y);
+    acc += 0.0625 * fdg_bilinear(src, cx, cy - 2.0 * r.y);
+    acc += 0.0625 * fdg_bilinear(src, cx + 2.0 * r.x, cy);
+    acc += 0.0625 * fdg_bilinear(src, cx - 2.0 * r.x, cy);
+    textureStore(out, p, vec4<f32>(acc, 0.0));
+}
+
+// One axis of a level's Gaussian: 2·steps + 1 linear taps `stride` texels apart, weights
+// deepglow2::dg2_weight × 1/sum, times the fade (f[1]; 1 on the vertical pass).
+// u[0] = (vertical, steps); f[0] = (stride, 1 / weight sum).
+@compute @workgroup_size(16, 16)
+fn fdg_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!fdg_inside(p)) {
+        return;
+    }
+    let vertical = P.u[0].x != 0u;
+    let steps = i32(max(P.u[0].y, 1u));
+    let stride = P.f[0].x;
+    let inv = P.f[0].y;
+    let d = vec2<i32>(textureDimensions(src));
+    var acc = vec3<f32>(0.0);
+    for (var k = -steps; k <= steps; k++) {
+        let t = f32(k) / f32(steps);
+        let w = exp(-0.5 * t * t / 0.06) * inv;
+        let off = f32(k) * stride;
+        var v: vec3<f32>;
+        if (vertical) {
+            let q = f32(p.y) + off;
+            let i0 = floor(q);
+            let f = q - i0;
+            let a = clamp(i32(i0), 0, d.y - 1);
+            let b = clamp(i32(i0) + 1, 0, d.y - 1);
+            v = textureLoad(src, vec2<i32>(p.x, a), 0).xyz * (1.0 - f) + textureLoad(src, vec2<i32>(p.x, b), 0).xyz * f;
+        } else {
+            let q = f32(p.x) + off;
+            let i0 = floor(q);
+            let f = q - i0;
+            let a = clamp(i32(i0), 0, d.x - 1);
+            let b = clamp(i32(i0) + 1, 0, d.x - 1);
+            v = textureLoad(src, vec2<i32>(a, p.y), 0).xyz * (1.0 - f) + textureLoad(src, vec2<i32>(b, p.y), 0).xyz * f;
+        }
+        acc += w * v;
+    }
+    textureStore(out, p, vec4<f32>(acc * P.f[1].xyz, 0.0));
+}
+
+// The finer level aux plus the 3 × 3 tent upsample of the coarser src (added, or screened).
+// u[0] = (screen); f[0] = (src w / out w, src h / out h).
+@compute @workgroup_size(16, 16)
+fn fdg_up(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!fdg_inside(p)) {
+        return;
+    }
+    let r = P.f[0].xy;
+    let cx = (f32(p.x) + 0.5) * r.x - 0.5;
+    let cy = (f32(p.y) + 0.5) * r.y - 0.5;
+    var u = vec3<f32>(0.0);
+    for (var j = -1; j <= 1; j++) {
+        for (var i = -1; i <= 1; i++) {
+            let w = select(0.5, 0.25, i != 0) * select(0.5, 0.25, j != 0);
+            u += w * fdg_bilinear(src, cx + f32(i) * r.x, cy + f32(j) * r.y);
+        }
+    }
+    let d = textureLoad(aux, p, 0).xyz;
+    var o = u + d;
+    if (P.u[0].x != 0u) {
+        o = u + d * (vec3<f32>(1.0) - u);
+    }
+    textureStore(out, p, vec4<f32>(o, 0.0));
+}
+
+// The finish (deepglow2::dg2_finish): the level-0 sum (aux) sampled to the frame, × exposure,
+// tint, 1/gamma, Screen's clamp; the layer (src at (offset, offset)) on top; Unmult.
+// u[0] = (unmult, screen, tint, tint mode); u[1] = (src offset); f[0] = (exposure, gamma,
+// source opacity, tint mix); f[1] = tint colour; f[2] = (aux w / out w, aux h / out h).
+@compute @workgroup_size(16, 16)
+fn fdg_post(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!fdg_inside(p)) {
+        return;
+    }
+    let so = i32(P.u[1].x);
+    let px = tex_get(src, p.x - so, p.y - so);
+    let r = P.f[2].xy;
+    let g = fdg_bilinear(aux, (f32(p.x) + 0.5) * r.x - 0.5, (f32(p.y) + 0.5) * r.y - 0.5);
+    let gamma = P.f[0].y;
+    let inv = 1.0 / gamma;
+    let screen = P.u[0].y != 0u;
+    var o = vec4<f32>(0.0);
+    for (var c = 0; c < 3; c++) {
+        var v = g[c] * P.f[0].x;
+        if (P.u[0].z != 0u) {
+            let t = P.f[1][c];
+            var tinted = v * t;
+            if (P.u[0].w == 1u) {
+                if (v <= 0.5) {
+                    tinted = 2.0 * v * t;
+                } else {
+                    tinted = 1.0 - 2.0 * (1.0 - v) * (1.0 - t);
+                }
+            } else if (P.u[0].w == 2u) {
+                if (t <= 0.5) {
+                    tinted = v - (1.0 - 2.0 * t) * v * (1.0 - v);
+                } else {
+                    var dd = sqrt(v);
+                    if (v <= 0.25) {
+                        dd = ((16.0 * v - 12.0) * v + 4.0) * v;
+                    }
+                    tinted = v + (2.0 * t - 1.0) * (dd - v);
+                }
+            }
+            v = v + (tinted - v) * P.f[0].w;
+        }
+        if (gamma > 1.0) {
+            v = select(0.0, pow(v, inv), v > 0.0);
+        }
+        if (screen) {
+            v = min(v, 1.0);
+        }
+        let s = px[c] * P.f[0].z;
+        if (screen) {
+            o[c] = 1.0 - (1.0 - v) * (1.0 - s);
+        } else {
+            o[c] = v + s;
+        }
+    }
+    if (P.u[0].x != 0u) {
+        o.w = clamp(max(o.x, max(o.y, o.z)), 0.0, 1.0);
+    } else {
+        o.w = 1.0;
+    }
+    textureStore(out, p, o);
+}

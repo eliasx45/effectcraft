@@ -8,7 +8,10 @@ use crate::{CATEGORIES, registry};
 /// `(effect id, what is missing)`. Everything else in the registry is implemented in full as far
 /// as the public behaviour documentation describes it.
 pub const PARTIAL: &[(&str, &str)] = &[
-    ("ec.stylize.deepglow", "Approximate falloff, tint, chromatic aberration and downsampling; edge modes and masking are not fully matched"),
+    (
+        "ec.stylize.deepglow",
+        "Glow Model Deep Glow 2 (default) matches Deep Glow 2's Exponential glow (round level pyramid, Quality Presets, gamma, linear Exposure, per-channel Threshold, Unmult); Spread, Downsample and Dither apply to the Legacy model only; Lens Iris, Tone Mapping, Duocolor tint, glow aberration and Lens Dirt are not implemented",
+    ),
     ("ec.perspective.shadowstudio2", "Approximate sampled directional shadow; easing, texture, inner and point modes are not implemented"),
     ("ec.perspective.shadowstudio3", "Approximate sampled directional shadow; raytracing, gradients, texture, inner and point modes are not implemented"),
     ("ec.perspective.cccylinder", "Orthographic 3D projection; AE camera and rotation-order settings are not yet matched"),

@@ -18,7 +18,10 @@ use crate::effects::{GBuf, Precision, gaussian_blur_owned};
 use crate::ops;
 
 /// Compute entry points in `fx_deepglow.wgsl`.
-pub(crate) const KERNELS: &[&str] = &["fdg_key", "fdg_sum", "fdg_finish"];
+pub(crate) const KERNELS: &[&str] = &["fdg_key", "fdg_sum", "fdg_finish", "fdg_dg2_key", "fdg_down", "fdg_blur", "fdg_up", "fdg_post"];
+
+/// The Deep Glow 2 kernels that may write half working images.
+const DG2_HALF: &[&str] = &["fdg_dg2_key", "fdg_down", "fdg_blur", "fdg_up"];
 
 /// Effect ids implemented here.
 pub(crate) const IDS: &[&str] = &["ec.stylize.deepglow"];
@@ -92,8 +95,93 @@ fn weighted_sum(e: &mut Enc, a: &GpuImage, wa: f32, fa: [f32; 4], b: &GpuImage, 
     out
 }
 
+/// Deep Glow 2 (`effects::deepglow2`, the default Glow Model): the key into the padded frame,
+/// the 13-tap downsample chain, each level's two Gaussian passes at its own size, the
+/// coarse-to-fine tent upsample sums and the finish, as the CPU's steps (which skip the
+/// rectangles where an image is exactly zero; here the levels are whole and those parts
+/// compute to zero).
+fn deep_glow2(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+    let Some(st) = effectcraft_effects::Dg2Settings::new(ctx, b.scale) else { return Some(b) };
+    let pr = ctx.params;
+    let (w0, h0) = (b.img.width, b.img.height);
+    let pad = st.pad(ctx, w0, h0);
+    let (fw, fh) = (w0.checked_add(pad.checked_mul(2)?)?, h0.checked_add(pad.checked_mul(2)?)?);
+    if !e.g.fits(fw, fh) || fw == 0 || fh == 0 {
+        return None;
+    }
+    b.offset[0] += f64::from(pad);
+    b.offset[1] += f64::from(pad);
+    let input = b.img.clone();
+    let mask = match ctx.layer_param("PEDG-0056", true) {
+        Some(o) => {
+            let cpu = Buf { img: Image::new(fw, fh), offset: b.offset, scale: b.scale };
+            Some(e.g.upload_image(&effectcraft_effects::util::fit_layer(ctx, &cpu, &o, false))?)
+        }
+        None => None,
+    };
+    let half = !st.view_input && Precision::pick(e, DG2_HALF, true) == Precision::Half;
+    let mut p = Params::default();
+    p.u[0] = [mask.is_some() as u32, (pr.e("PEDG-0057") == 1) as u32, pr.b("PEDG-0059") as u32, st.view_input as u32];
+    p.u[1] = [pad, st.screen as u32, 0, 0];
+    p.f[0] = [st.threshold, st.smooth, st.gamma, 0.0];
+    let key = if st.view_input { e.scratch(fw, fh) } else { e.scratch_as(fw, fh, half) };
+    e.pixels("fdg_dg2_key", &p, &input, mask.as_ref(), &key, None);
+    drop(mask);
+    if st.view_input {
+        b.img = key;
+        return Some(b);
+    }
+    let levels = st.levels(fw, fh);
+    let mut sums: Vec<GpuImage> = Vec::with_capacity(levels.len());
+    let mut prev = key;
+    for lv in &levels {
+        let mut p = Params::default();
+        p.f[0] = [prev.width as f32 / lv.w as f32, prev.height as f32 / lv.h as f32, 0.0, 0.0];
+        let down = e.scratch_as(lv.w, lv.h, half);
+        e.pixels("fdg_down", &p, &prev, None, &down, None);
+        prev = down;
+        let mut part = prev.clone();
+        for (axis, fade) in [(0usize, [lv.fade[0], lv.fade[1], lv.fade[2], 0.0]), (1, [1.0; 4])] {
+            let steps = lv.steps[axis];
+            let mut p = Params::default();
+            p.u[0] = [axis as u32, steps, 0, 0];
+            p.f[0] = [lv.stride[axis], effectcraft_effects::dg2_inv_sum(steps), 0.0, 0.0];
+            p.f[1] = fade;
+            let out = e.scratch_as(lv.w, lv.h, half);
+            e.pixels("fdg_blur", &p, &part, None, &out, None);
+            part = out;
+        }
+        sums.push(part);
+    }
+    drop(prev);
+    let mut acc = sums.pop()?;
+    while let Some(fine) = sums.pop() {
+        let mut p = Params::default();
+        p.u[0] = [st.screen as u32, 0, 0, 0];
+        p.f[0] = [acc.width as f32 / fine.width as f32, acc.height as f32 / fine.height as f32, 0.0, 0.0];
+        let out = e.scratch_as(fine.width, fine.height, half);
+        e.pixels("fdg_up", &p, &acc, Some(&fine), &out, None);
+        acc = out;
+    }
+    let tint = st.tint;
+    let mut p = Params::default();
+    p.u[0] = [st.unmult as u32, st.screen as u32, tint.is_some() as u32, tint.map_or(0, |t| t.mode)];
+    p.u[1] = [pad, 0, 0, 0];
+    p.f[0] = [st.exposure, st.gamma, st.source_opacity, tint.map_or(0.0, |t| t.mix)];
+    let tc = tint.map_or([0.0; 3], |t| t.color);
+    p.f[1] = [tc[0], tc[1], tc[2], 0.0];
+    p.f[2] = [acc.width as f32 / fw as f32, acc.height as f32 / fh as f32, 0.0, 0.0];
+    let out = e.scratch(fw, fh);
+    e.pixels("fdg_post", &p, &input, Some(&acc), &out, None);
+    b.img = out;
+    Some(b)
+}
+
 fn deep_glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let pr = ctx.params;
+    if effectcraft_effects::deep_glow_is_dg2(pr) {
+        return deep_glow2(e, ctx, b);
+    }
     let radius = (pr.f("PEDG-0001") * b.scale).clamp(0.0, 2000.0);
     if !radius.is_finite() || radius < 0.5 {
         return Some(b);

@@ -310,7 +310,7 @@ fn deep_glow_key(px: Px, threshold: f32, smooth: f32) -> Px {
 
 /// How much of the glow input Deep Glow's Mask Layer keeps at mask pixel `m`.
 #[inline]
-fn deep_glow_mask(m: Px, luma: bool, invert: bool) -> f32 {
+pub(crate) fn deep_glow_mask(m: Px, luma: bool, invert: bool) -> f32 {
     let mut amount = if luma && m[3] > 0.0 { luminance(m[0] / m[3], m[1] / m[3], m[2] / m[3]) * m[3] } else { m[3] };
     if invert {
         amount = 1.0 - amount;
@@ -484,6 +484,10 @@ fn dg_encode(v: f32) -> f32 {
 /// resamples run on that rectangle ([`Sparse`]) instead of the whole padded frame, and the
 /// conversions, composite, Unmult and Dither run in one pass over the frame.
 fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    // Glow Model: Deep Glow 2 (the default; `crate::deepglow2`) or this Legacy model.
+    if crate::deepglow2::deep_glow_is_dg2(ctx.params) {
+        return crate::deepglow2::deep_glow2(ctx, b);
+    }
     let radius = (ctx.params.f("PEDG-0001") * b.scale).clamp(0.0, 2000.0);
     if !radius.is_finite() || radius < 0.5 {
         return b;
@@ -1448,6 +1452,11 @@ pub fn specs() -> Vec<EffectSpec> {
             "Deep Glow (Native)",
             "Stylize",
             vec![
+                // Deep Glow 2 (round Gaussian pyramid, the default) or Legacy (the earlier
+                // three-scale / box-blur model). Spread, Downsample, Dither, Buffer Expansion and
+                // the Gamma Correction checkbox apply to Legacy only; Gamma Correction Amount,
+                // Quality Preset, Resolution and Steps Multiplier to Deep Glow 2 only.
+                p("glowModel", "Glow Model", Value::Enum(0), popup(&crate::deepglow2::DEEP_GLOW_MODELS)),
                 p("PEDG-0001", "Radius", num(116.0), slider(0.0, 2000.0, 0.0, 500.0, 0)),
                 p("glowExposure", "Exposure", num(0.04), slider(0.0, 128.0, 0.0, 4.0, 3)),
                 p("PEDG-0004", "Threshold", num(0.0), slider(0.0, 1600.0, 0.0, 100.0, 0)),
@@ -1475,6 +1484,11 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("PEDG-0059", "Invert Mask", Value::Bool(false), ParamUi::Checkbox),
                 p("PEDG-0023", "View", Value::Enum(1), popup(&["Glow Input", "Final"])),
                 p("PEDG-0024", "Source Opacity", num(100.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
+                // Deep Glow 2's own (Auto Detect Gamma off: gamma 1 + 1.2 × Amount / 100).
+                p("PEDG2-0154", "Gamma Correction Amount", num(100.0), slider(0.0, 300.0, 0.0, 300.0, 0)),
+                p("PEDG2-0048", "Quality Preset", Value::Enum(2), popup(&["Draft", "Low", "Medium", "Standard", "High", "Extreme", "Custom"])),
+                p("PEDG2-0049", "Resolution", num(75.0), slider(25.0, 100.0, 25.0, 100.0, 0)),
+                p("PEDG2-0050", "Steps Multiplier", num(0.5), slider(0.01, 3.0, 0.01, 3.0, 2)),
             ],
             deep_glow,
         ),
@@ -1860,7 +1874,12 @@ mod tests {
         assert_eq!(crate::lookup("PEDG").map(|s| s.id), Some("ec.stylize.deepglow"));
         let mut img = Image::new(17, 17);
         img.set(8, 8, [1.0, 0.25, 0.1, 1.0]);
-        let run = |vals: &[(&str, Value)]| run_fx("ec.stylize.deepglow", vals, img.clone(), 0.0, EffectEnv::default());
+        // The Legacy model's controls (Deep Glow 2's are in `deepglow2::tests`).
+        let legacy = ("glowModel", Value::Enum(1));
+        let run = |vals: &[(&str, Value)]| {
+            let vals: Vec<(&str, Value)> = std::iter::once(legacy.clone()).chain(vals.iter().cloned()).collect();
+            run_fx("ec.stylize.deepglow", &vals, img.clone(), 0.0, EffectEnv::default())
+        };
         let base = run(&[("PEDG-0001", num(8.0))]);
         let pixel = |b: &Buf, x: i64, y: i64| b.img.get(x + b.offset[0] as i64, y + b.offset[1] as i64);
         assert!(pixel(&base, 11, 8)[0] > 0.0, "radius must create a halo");
@@ -1886,7 +1905,7 @@ mod tests {
         assert!(pixel(&corpus, 11, 8)[0] > 0.0, "AE View 2 must render final glow");
         let mut dim = Image::new(17, 17);
         dim.set(8, 8, [0.2, 0.05, 0.02, 1.0]);
-        let dim_run = |mode| run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0008", native(mode))], dim.clone(), 0.0, EffectEnv::default());
+        let dim_run = |mode| run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(8.0)), ("PEDG-0008", native(mode))], dim.clone(), 0.0, EffectEnv::default());
         let (dim_add, dim_screen) = (dim_run(2), dim_run(1));
         assert!(pixel(&dim_add, 8, 8)[0] > pixel(&dim_screen, 8, 8)[0], "AE Blend Mode 2 (Add) lifts the source more than Screen");
         let low_auto = run(&[("PEDG-0001", num(8.0)), ("glowExposure", num(0.74))]);
@@ -1902,7 +1921,7 @@ mod tests {
         let masked = |invert| {
             run_fx(
                 "ec.stylize.deepglow",
-                &[("PEDG-0001", num(8.0)), ("PEDG-0056", Value::Layer(Some(7))), ("PEDG-0059", Value::Bool(invert))],
+                &[legacy.clone(), ("PEDG-0001", num(8.0)), ("PEDG-0056", Value::Layer(Some(7))), ("PEDG-0059", Value::Bool(invert))],
                 img.clone(),
                 0.0,
                 EffectEnv { host: Some(&host), ..Default::default() },
@@ -1913,14 +1932,14 @@ mod tests {
 
         let mut impulse = Image::new(9, 9);
         impulse.set(4, 4, [1.0; 4]);
-        let wide = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(320.0))], impulse.clone(), 0.0, EffectEnv::default());
+        let wide = run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(320.0))], impulse.clone(), 0.0, EffectEnv::default());
         // The halo spans a fraction of the radius (AE: a 439 px glow fades out ~200 px past an edge).
         assert!(pixel(&wide, 64, 4)[0] > 0.0, "a 320 px radius reaches 60 px");
-        let opaque = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0025", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
+        let opaque = run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(8.0)), ("PEDG-0025", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
         assert_eq!(pixel(&opaque, 7, 7)[3], 1.0, "Unmult off keeps a black opaque backdrop");
         let gray = Image::filled(9, 9, [0.3, 0.3, 0.3, 1.0]);
-        let dithered = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0))], gray.clone(), 0.0, EffectEnv::default());
-        let clean = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0031", Value::Bool(false))], gray, 0.0, EffectEnv::default());
+        let dithered = run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(8.0))], gray.clone(), 0.0, EffectEnv::default());
+        let clean = run_fx("ec.stylize.deepglow", &[legacy, ("PEDG-0001", num(8.0)), ("PEDG-0031", Value::Bool(false))], gray, 0.0, EffectEnv::default());
         assert!(dithered.img.data.iter().zip(&clean.img.data).any(|(a, b)| a != b), "Dither must affect opaque pixels");
     }
 
@@ -1934,7 +1953,9 @@ mod tests {
                 img.set(x, y, [0.35, 0.15, 0.6, 1.0]);
             }
         }
+        // Legacy (Deep Glow 2's Unmult is alpha = max(r, g, b): `deepglow2::tests`).
         let set = [
+            ("glowModel", Value::Enum(1)),
             ("PEDG-0001", num(100.0)),
             ("glowExposure", num(0.8)),
             ("PEDG-0008", Value::Enum(0)),
@@ -1979,7 +2000,8 @@ mod tests {
         let spec = crate::find("ec.stylize.deepglow");
         let mut params =
             crate::Params { values: spec.map(|s| s.params.iter().map(|p| (p.id.to_string(), crate::default_value(p, size))).collect()).unwrap_or_default() };
-        for (k, v) in [("PEDG-0001", num(150.0)), ("glowExposure", num(0.02))].iter().chain(vals) {
+        // The Legacy model (what `deep_glow_reference` renders).
+        for (k, v) in [("glowModel", Value::Enum(1)), ("PEDG-0001", num(150.0)), ("glowExposure", num(0.02))].iter().chain(vals) {
             assert!(params.values.contains_key(*k), "unknown param {k}");
             params.values.insert(k.to_string(), v.clone());
         }
@@ -2087,7 +2109,7 @@ mod tests {
         impulse.set(4, 4, [1.0; 4]);
         let wide = run_fx(
             "ec.stylize.deepglow",
-            &[("PEDG-0001", num(1603.0)), ("glowExposure", num(2.0)), ("PEDG-0031", Value::Bool(false))],
+            &[("glowModel", Value::Enum(1)), ("PEDG-0001", num(1603.0)), ("glowExposure", num(2.0)), ("PEDG-0031", Value::Bool(false))],
             impulse,
             0.0,
             EffectEnv::default(),

@@ -3,7 +3,7 @@
 <!-- Generated from the effect registry (crates/effects/src/catalog.rs); do not edit by hand.
      Regenerate: UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current -->
 
-EffectCraft ships 317 effects with 3212 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
+EffectCraft ships 317 effects with 3217 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
 
 - **GPU**: 283 effects also run on the GPU compositor with identical results.
 - **32**: 317 effects process 32-bit float (HDR, overbright) pixels without clamping.
@@ -361,7 +361,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | CC Vignette | `ec.stylize.ccvignette` | 4 | GPU | 32 | Implemented |
 | Cartoon | `ec.stylize.cartoon` | 12 | GPU | 32 | Implemented |
 | Color Emboss | `ec.stylize.coloremboss` | 4 | GPU | 32 | Implemented |
-| Deep Glow (Native) | `ec.stylize.deepglow` | 27 | GPU | 32 | Partial: Approximate falloff, tint, chromatic aberration and downsampling; edge modes and masking are not fully matched |
+| Deep Glow (Native) | `ec.stylize.deepglow` | 32 | GPU | 32 | Partial: Glow Model Deep Glow 2 (default) matches Deep Glow 2's Exponential glow (round level pyramid, Quality Presets, gamma, linear Exposure, per-channel Threshold, Unmult); Spread, Downsample and Dither apply to the Legacy model only; Lens Iris, Tone Mapping, Duocolor tint, glow aberration and Lens Dirt are not implemented |
 | Emboss | `ec.stylize.emboss` | 4 | GPU | 32 | Implemented |
 | Find Edges | `ec.stylize.findedges` | 2 | GPU | 32 | Implemented |
 | Glow | `ec.stylize.glow` | 14 | GPU | 32 | Implemented |

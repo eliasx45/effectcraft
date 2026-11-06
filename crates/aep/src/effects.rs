@@ -1058,6 +1058,12 @@ pub(crate) fn param_id(effect_id: &str, ae_param_match: &str) -> Option<&'static
         ("ec.stylize.deepglow", "PEDG2-0024") => "PEDG-0008",
         ("ec.stylize.deepglow", "PEDG2-0054") => "PEDG-0024",
         ("ec.stylize.deepglow", "PEDG2-0055") => "PEDG-0025",
+        ("ec.stylize.deepglow", "PEDG2-0026") => "PEDG-0043",
+        ("ec.stylize.deepglow", "PEDG2-0031") => "PEDG-0010",
+        ("ec.stylize.deepglow", "PEDG2-0048") => "PEDG2-0048",
+        ("ec.stylize.deepglow", "PEDG2-0049") => "PEDG2-0049",
+        ("ec.stylize.deepglow", "PEDG2-0050") => "PEDG2-0050",
+        ("ec.stylize.deepglow", "PEDG2-0154") => "PEDG2-0154",
         ("ec.stylize.deepglow", "PEDG-0004") => "PEDG-0004",
         ("ec.stylize.deepglow", "PEDG-0005") => "PEDG-0005",
         ("ec.stylize.deepglow", "PEDG-0008") => "PEDG-0008",
@@ -1375,6 +1381,18 @@ mod tests {
         assert_eq!(param_id("ec.stylize.deepglow", "PEDG-0057"), Some("PEDG-0057"));
         assert_eq!(param_id("ec.stylize.deepglow", "PEDG-0059"), Some("PEDG-0059"));
         assert_eq!(param_id("ec.stylize.deepglow", "PEDG-0056"), Some("PEDG-0056"));
+        // Deep Glow 2's own controls (rendered by the Deep Glow 2 model, the default).
+        for (raw, native) in [
+            ("PEDG2-0017", "PEDG-0001"),
+            ("PEDG2-0026", "PEDG-0043"),
+            ("PEDG2-0031", "PEDG-0010"),
+            ("PEDG2-0048", "PEDG2-0048"),
+            ("PEDG2-0049", "PEDG2-0049"),
+            ("PEDG2-0050", "PEDG2-0050"),
+            ("PEDG2-0154", "PEDG2-0154"),
+        ] {
+            assert_eq!(param_id("ec.stylize.deepglow", raw), Some(native), "{raw}");
+        }
         for raw in ["PEDG-0009", "PEDG-0025", "PEDG-0031", "PEDG-0032", "PEDG-0033", "PEDG-0043"] {
             assert_eq!(param_id("ec.stylize.deepglow", raw), Some(raw));
         }

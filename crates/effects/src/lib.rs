@@ -43,6 +43,7 @@ pub use color_fx::{
 };
 pub use color2::{Curve, auto_correct_settings, color_link_mode, color_link_sample, equalize_tables, luma_clip_points, shadow_highlight_amounts};
 pub use color3::OffsetCurve;
+pub use deepglow2::{DEEP_GLOW_MODELS, DG2_PRESETS, Dg2Level, Dg2Settings, Dg2Tint, deep_glow_is_dg2, dg2_inv_sum, dg2_weight};
 pub use distort::{
     BULGE_STRENGTH, transform_effect_matrix, transform_extent, transform_follow, transform_follow_blur, transform_shutter, twirl_radius, wave_warp_cycles,
 };
@@ -569,7 +570,7 @@ pub fn categories() -> Vec<&'static str> {
 /// After Effects' third-party display names of effects we register under a generic name.
 const ALIASES: &[(&str, &[&str])] = &[
     ("ec.keying.keylight", keylight::KEYLIGHT_ALIASES),
-    ("ec.stylize.deepglow", &["PEDG", "Deep Glow"]),
+    ("ec.stylize.deepglow", &["PEDG", "Deep Glow", "PEDG2", "Deep Glow 2"]),
     ("ec.perspective.shadowstudio2", &["PESS2", "Shadow Studio 2"]),
     ("ec.perspective.shadowstudio3", &["PESS3", "Shadow Studio 3"]),
 ];

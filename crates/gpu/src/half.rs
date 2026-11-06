@@ -42,6 +42,11 @@ pub(crate) const KERNELS: &[&str] = &[
     "glow_ab",
     // Deep Glow (`fx_deepglow`): the weighted pass sums.
     "fdg_sum",
+    // Deep Glow 2: the key, the downsample chain, the level blurs and the upsample sums.
+    "fdg_dg2_key",
+    "fdg_down",
+    "fdg_blur",
+    "fdg_up",
     // Layer styles (`fx_styles`): alpha planes, packed planes, the bevel's height profile and
     // its packed (height, region). The distance field (squared distances up to 65 536) stays f32.
     "sty_alpha",

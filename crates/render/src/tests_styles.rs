@@ -886,11 +886,13 @@ fn shadows_deep_glow_and_bevel_run_on_the_reachable_part_of_the_canvas() {
                 // The whole caption stack reaches most of this small comp.
                 let shrunk = if stack.len() > 2 { small < big } else { small * 3 < big * 2 };
                 assert!(shrunk, "{at}: {small} vs {big} px");
-                // One 8-bit step at most (the float sums round either way). Deep Glow's
-                // Downsample pass resamples the whole canvas and its Dither follows buffer
-                // pixels, so its halo may move by two steps on a few pixels.
+                // One 8-bit step at most (the float sums round either way). Deep Glow sizes its
+                // levels from the buffer (Deep Glow 2's pyramid, as in After Effects; Legacy's
+                // Downsample pass resamples the whole canvas), so a smaller canvas moves their
+                // pixel grid and the halo may move by two steps on a few pixels (≤ 1.4 % of
+                // channels on these 400 × 200 comps).
                 let deep = stack.iter().any(|(id, _)| *id == "ec.stylize.deepglow");
-                let (steps, share) = if deep { (2.0, 100) } else { (1.0, 1000) };
+                let (steps, share) = if deep { (2.0, 40) } else { (1.0, 1000) };
                 let diffs: Vec<f32> = whole.data.iter().zip(&part.data).flat_map(|(a, b)| (0..4).map(move |i| (a[i] - b[i]).abs())).collect();
                 let worst = diffs.iter().copied().fold(0.0f32, f32::max);
                 let off = diffs.iter().filter(|d| **d > 1e-6).count();
