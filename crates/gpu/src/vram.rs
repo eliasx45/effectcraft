@@ -64,10 +64,87 @@ pub fn budget_checked(backend: wgpu::Backend) -> bool {
     matches!(backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12)
 }
 
-/// Thresholds at `percent` of the budget, or none on a small-BAR NVIDIA card without a cap.
+/// `0` turns wgpu's budget check off (no thresholds on any device), `1` on. Unset: off on Windows
+/// (unless [`VRAM_CAP_ENV`] caps the process), on elsewhere ([`budget_check_on`]).
+pub const BUDGET_CHECK_ENV: &str = "EFFECTCRAFT_GPU_BUDGET_CHECK";
+
+/// LVR1: whether wgpu checks the budget, from [`BUDGET_CHECK_ENV`] (`env`), a [`VRAM_CAP_ENV`]
+/// cap (`capped`, which works through the check) and the OS. Off on Windows by default: Windows
+/// pages video memory out to RAM past the budget, while wgpu's check loses the device when one of
+/// its own allocations (a staging buffer, a readback) passes the threshold. The C0666 replay on an
+/// RTX 4060 Laptop (8 GB, Vulkan, 6 Nov 2026) lost the compositor's device 12 times with the check
+/// (952 refused allocations, frames on the CPU at seconds each) and never without it (frames
+/// every 40 ms, 7.5 of 8 GB used). Linux has no such paging: the check stays.
+fn budget_check_on(env: Option<&str>, capped: bool, windows: bool) -> bool {
+    match env.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => capped || !windows,
+    }
+}
+
+fn budget_check_off(capped: bool) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        let env = std::env::var(BUDGET_CHECK_ENV).ok();
+        let off = !budget_check_on(env.as_deref(), capped, cfg!(target_os = "windows"));
+        if off {
+            log::info!("gpu: video memory budget check off (the driver pages past its budget; {BUDGET_CHECK_ENV}=1 turns it on)");
+        }
+        off
+    })
+}
+
+/// This process's use of the video memory heap and the budget the driver gives it, in bytes: the
+/// numbers wgpu's thresholds are a share of (Vulkan `VK_EXT_memory_budget`, the largest
+/// device-local heap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapBudget {
+    pub usage: u64,
+    pub budget: u64,
+}
+
+impl HeapBudget {
+    /// LVR1: where the compositor stops starting frames: [`COMPOSITOR_PERCENT`] of the budget less
+    /// an eighth of it (at least 512 MiB). wgpu fails a resource past the threshold gracefully,
+    /// but its own allocations past it (a 256-byte staging buffer for a uniform write, a readback)
+    /// lose the device, and the allocator takes memory in blocks larger than the texture it
+    /// checked, so the use reached the threshold through textures that each passed: the
+    /// compositor's device was lost every 40 s (6.9 GB budget, 5.8 GB used, RTX 4060 Laptop,
+    /// 6 Nov 2026). Frames stop well before it. Where the check is off (Windows,
+    /// [`budget_check_on`]) it keeps the frames within the budget, so little is paged out.
+    pub fn soft_ceiling(self) -> u64 {
+        (self.budget / 100 * u64::from(COMPOSITOR_PERCENT)).saturating_sub((self.budget / 8).max(512 << 20))
+    }
+
+    /// Bytes frames may still take below [`HeapBudget::soft_ceiling`].
+    pub fn room(self) -> u64 {
+        self.soft_ceiling().saturating_sub(self.usage)
+    }
+}
+
+/// Asks the driver for a device's [`HeapBudget`] (the platform crate's Vulkan query: it needs
+/// `unsafe`, which this crate forbids).
+pub type HeapBudgetProbe = fn(device: &wgpu::Device) -> Option<HeapBudget>;
+
+static HEAP_BUDGET_PROBE: std::sync::OnceLock<HeapBudgetProbe> = std::sync::OnceLock::new();
+
+/// Install the platform's [`HeapBudgetProbe`] (once; later calls are ignored).
+pub fn set_heap_budget_probe(probe: HeapBudgetProbe) {
+    let _ = HEAP_BUDGET_PROBE.set(probe);
+}
+
+/// [`HeapBudget`] of `device` now (a cheap driver query), where a probe is installed and the
+/// driver reports one (Vulkan with `VK_EXT_memory_budget`).
+pub fn heap_budget(device: &wgpu::Device) -> Option<HeapBudget> {
+    HEAP_BUDGET_PROBE.get().and_then(|probe| probe(device))
+}
+
+/// Thresholds at `percent` of the budget, or none where the check is off ([`budget_check_on`]) or
+/// on a small-BAR NVIDIA card without a cap.
 fn thresholds_at(percent: u8) -> wgpu::MemoryBudgetThresholds {
     let capped = std::env::var(VRAM_CAP_ENV).is_ok_and(|v| v.trim().parse::<u64>().is_ok_and(|mb| mb > 0));
-    if !capped && small_bar() {
+    if budget_check_off(capped) || (!capped && small_bar()) {
         return wgpu::MemoryBudgetThresholds { for_resource_creation: None, for_device_loss: None };
     }
     wgpu::MemoryBudgetThresholds { for_resource_creation: Some(percent), for_device_loss: None }
@@ -312,6 +389,33 @@ mod tests {
         }
         assert!(budget_checked(wgpu::Backend::Vulkan) && budget_checked(wgpu::Backend::Dx12));
         assert!(!budget_checked(wgpu::Backend::Metal) && !budget_checked(wgpu::Backend::Gl), "Metal ignores thresholds");
+    }
+
+    #[test]
+    fn frames_stop_well_below_the_compositors_threshold() {
+        const MIB: u64 = 1 << 20;
+        // The laptop's numbers when its compositor was lost (6 Nov 2026): 6.88 GB budget.
+        let b = HeapBudget { usage: 5_830_266_880, budget: 6_879_227_904 };
+        let threshold = b.budget / 100 * u64::from(COMPOSITOR_PERCENT);
+        assert!(b.soft_ceiling() + 512 * MIB <= threshold, "at least 512 MiB under wgpu's threshold");
+        assert!(b.soft_ceiling() > 4500 * MIB, "most of the budget still usable: {}", b.soft_ceiling() / MIB);
+        assert_eq!(b.room(), 0, "5.8 GB used: no room for another frame");
+        assert_eq!(HeapBudget { usage: 1 << 30, budget: b.budget }.room(), b.soft_ceiling() - (1 << 30));
+        // A small budget keeps 512 MiB, and a tiny one never underflows.
+        let small = HeapBudget { usage: 0, budget: 2 << 30 };
+        assert_eq!(small.soft_ceiling(), (2u64 << 30) / 100 * 85 - 512 * MIB);
+        assert_eq!(HeapBudget { usage: 0, budget: 256 * MIB }.soft_ceiling(), 0);
+        // No probe installed (tests, Metal): no budget.
+        assert!(HEAP_BUDGET_PROBE.get().is_none());
+    }
+
+    #[test]
+    fn windows_pages_past_the_budget_so_the_check_is_off_there() {
+        assert!(!budget_check_on(None, false, true), "Windows: off by default");
+        assert!(budget_check_on(None, false, false), "Linux: on by default");
+        assert!(budget_check_on(None, true, true), "a cap works through the check: on");
+        assert!(budget_check_on(Some(" 1 "), false, true) && !budget_check_on(Some("0"), true, false), "the env decides");
+        assert!(!budget_check_on(Some("yes"), false, true), "anything else: the default");
     }
 
     #[test]

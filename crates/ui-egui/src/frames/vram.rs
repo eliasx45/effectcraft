@@ -46,6 +46,8 @@ pub(crate) struct Gate {
     /// The device reports its allocations: 0 not known yet, 1 yes, 2 no.
     measurable: std::sync::atomic::AtomicU8,
     last_sample: Mutex<Option<web_time::Instant>>,
+    /// The driver's budget was logged (once per compositor).
+    budget_logged: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Gate {
@@ -60,6 +62,7 @@ impl Default for Gate {
             last_bytes: AtomicU64::new(0),
             measurable: std::sync::atomic::AtomicU8::new(0),
             last_sample: Mutex::new(None),
+            budget_logged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -126,6 +129,34 @@ impl Gate {
         let assumed = if learned == 0 { vram.map_or(0, |m| assumed_frame_bytes(m.total)) } else { learned };
         let per = (assumed as f64).max(frame).max(1.0);
         let rendering = self.rendering.load(Ordering::Acquire);
+        // The frames rendering may still grow to a whole frame each: that room is kept for them.
+        let reserve = || {
+            let grown = match self.baseline.load(Ordering::Acquire) {
+                u64::MAX => 0,
+                b => self.last_bytes.load(Ordering::Acquire).saturating_sub(b),
+            };
+            ((rendering as f64 * per) as u64).saturating_sub(grown)
+        };
+        // LVR1: where the driver reports this process's use and budget (Vulkan), frames start
+        // only below the soft ceiling under wgpu's threshold (`HeapBudget::soft_ceiling`): the
+        // exact numbers wgpu checks, now, instead of the card's free memory a second ago.
+        if let Some(b) = ctx.heap_budget() {
+            if !self.budget_logged.swap(true, Ordering::AcqRel) {
+                log::info!(
+                    "GPU frames: video memory budget {} MiB, {} MiB used, new frames only below {} MiB",
+                    b.budget >> 20,
+                    b.usage >> 20,
+                    b.soft_ceiling() >> 20
+                );
+            }
+            let room = b.room().saturating_sub(reserve());
+            let cap = frames_cap(vram.map_or(b.budget, |m| m.total));
+            let mut n = rendering.saturating_add((room as f64 / per) as usize).min(cap).clamp(1, threads.max(1));
+            if self.measurable.load(Ordering::Acquire) != 2 {
+                n = n.min(self.finished.load(Ordering::Acquire).saturating_add(2));
+            }
+            return Some(n.min(self.ceiling()));
+        }
         let mut n = match ctx.live_video_memory() {
             // The frames rendering now, and as many more as the room left on the card holds,
             // keeping a tenth of it free (other programs, the driver): another program that
@@ -133,12 +164,7 @@ impl Gate {
             // frames rendering may still grow to a whole frame each: that room is kept for them
             // (a heavy stretch of the comp took 9 GB in a second, 8 frames at once).
             Some(m) => {
-                let grown = match self.baseline.load(Ordering::Acquire) {
-                    u64::MAX => 0,
-                    b => self.last_bytes.load(Ordering::Acquire).saturating_sub(b),
-                };
-                let reserve = ((rendering as f64 * per) as u64).saturating_sub(grown);
-                let room = m.free.saturating_sub(kept_free(m.total)).saturating_sub(reserve);
+                let room = m.free.saturating_sub(kept_free(m.total)).saturating_sub(reserve());
                 rendering.saturating_add((room as f64 / per) as usize).min(frames_cap(m.total))
             }
             None => ((UNKNOWN_VRAM_BUDGET as f64 / per) as usize).min(vram.map_or(usize::MAX, |m| frames_cap(m.total))),
@@ -223,6 +249,7 @@ impl Gate {
         self.baseline.store(u64::MAX, Ordering::Release);
         self.peak.store(self.rendering.load(Ordering::Acquire), Ordering::Release);
         self.measurable.store(0, Ordering::Release);
+        self.budget_logged.store(false, Ordering::Release);
     }
 
     /// Device bytes now, at most every [`SAMPLE_EVERY`] unless `always` (`None` between, or

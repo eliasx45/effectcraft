@@ -1651,6 +1651,12 @@ impl GpuContext {
         self.device.generate_allocator_report().map(|r| r.total_reserved_bytes)
     }
 
+    /// This process's use of the video memory heap and the budget the driver gives it, now: what
+    /// wgpu's thresholds are a share of (LVR1, [`crate::vram::heap_budget`]; Vulkan only).
+    pub fn heap_budget(&self) -> Option<crate::vram::HeapBudget> {
+        crate::vram::heap_budget(&self.device)
+    }
+
     /// At most how many renders should be in flight at once on this device, after one ran out
     /// of memory: half as many as were in flight then, each time (at least one). `None` until
     /// then (CR1; an export's GPU frames in flight follow it).

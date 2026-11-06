@@ -49,6 +49,13 @@ objc2-io-surface = "0.3.2"
 objc2-metal = { version = "0.3.2", features = ["objc2-io-surface"] }
 wgpu = { workspace = true }
 
+# LVR1: this process's video memory budget on Vulkan (vulkan_budget.rs, through wgpu-hal; the
+# ash version wgpu-hal uses, already in the lockfile).
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+effectcraft-gpu = { workspace = true }
+wgpu = { workspace = true }
+ash = "0.38"
+
 [dev-dependencies]
 pollster = { workspace = true }
 # prores_surface_bench: the old 8-bit rounding, for comparison

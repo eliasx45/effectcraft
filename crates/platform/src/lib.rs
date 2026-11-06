@@ -75,6 +75,9 @@ mod videotoolbox_enc;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod videotoolbox_nal;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[allow(unsafe_code)]
+mod vulkan_budget;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -91,6 +94,9 @@ pub enum Availability {
 /// hardware decoder for it (call once at startup; repeated calls are harmless). Only preview reads
 /// use them ([`effectcraft_media::hw`]).
 pub fn register() -> Availability {
+    // LVR1: the compositor's frame gate reads this process's video memory budget (Vulkan).
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    effectcraft_gpu::vram::set_heap_budget_probe(vulkan_budget::heap_budget);
     #[cfg(target_os = "macos")]
     {
         let prores = prores::hardware_available();
