@@ -100,15 +100,7 @@ pub(crate) struct Resident {
 impl Resident {
     /// The picture `surface` holds: `pixel_format` ([`videotoolbox::S4AS`] / [`videotoolbox::X422`]),
     /// `width`×`height`, `bits` deep, alpha when `alpha`, made by `decoder` ([`decoder_id`]).
-    pub(crate) fn new(
-        surface: Surface,
-        pixel_format: u32,
-        (width, height): (u32, u32),
-        bits: u32,
-        subsampling: [u32; 2],
-        alpha: bool,
-        decoder: u64,
-    ) -> Self {
+    pub(crate) fn new(surface: Surface, pixel_format: u32, (width, height): (u32, u32), bits: u32, subsampling: [u32; 2], alpha: bool, decoder: u64) -> Self {
         let bytes = surface.bytes();
         Self { surface, pixel_format, width, height, bits, subsampling, alpha, bytes, decoder }
     }
@@ -403,12 +395,7 @@ pub fn shed_spare() -> usize {
             let n = newest.entry(e.picture.decoder).or_default();
             *n = (*n).max(e.seq);
         }
-        let oldest = r
-            .entries
-            .iter()
-            .filter(|(_, e)| e.spare() && newest.get(&e.picture.decoder) != Some(&e.seq))
-            .min_by_key(|(_, e)| e.seq)
-            .map(|(k, _)| *k);
+        let oldest = r.entries.iter().filter(|(_, e)| e.spare() && newest.get(&e.picture.decoder) != Some(&e.seq)).min_by_key(|(_, e)| e.seq).map(|(k, _)| *k);
         let freed = oldest.map_or(0, |k| r.take(k, &mut gone));
         r.count_spare();
         freed

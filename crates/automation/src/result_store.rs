@@ -403,6 +403,7 @@ impl ResultStore {
     fn spill(&mut self, id: &str, value: &Value) -> Result<PathBuf> {
         if self.directory.is_none() {
             let path = std::env::temp_dir().join(format!("effectcraft-results-{}", token()?));
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             {

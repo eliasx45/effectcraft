@@ -130,7 +130,7 @@ impl Notices {
     fn notice(&mut self, project: &Project, comp: ItemId, ft: &FrameTimes) -> Option<CpuNotice> {
         let c = project.comp(comp)?;
         let fps = c.frame_rate.as_f64();
-        if !(fps.is_finite() && fps > 0.0) || !ft.frame_ms.is_finite() || ft.frame_ms <= 1000.0 / fps {
+        if !(fps.is_finite() && fps > 0.0 && ft.frame_ms.is_finite()) || ft.frame_ms <= 1000.0 / fps {
             return None;
         }
         let (layer, why) = match ft.frame_cpu {

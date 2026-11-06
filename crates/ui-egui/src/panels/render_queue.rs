@@ -444,8 +444,7 @@ pub fn column_xs(x0: f32, right: f32, widths: &std::collections::BTreeMap<String
     let mut x = if x0.is_finite() { x0 } else { 0.0 };
     for (i, slot) in xs.iter_mut().enumerate() {
         *slot = x;
-        let wi =
-            if i == 3 && !widths.get("name").is_some_and(|v| clamp_column("name", *v).is_some()) { (right - x - fixed_right).max(MIN_NAME_W) } else { w(i) };
+        let wi = if i == 3 && widths.get("name").is_none_or(|v| clamp_column("name", *v).is_none()) { (right - x - fixed_right).max(MIN_NAME_W) } else { w(i) };
         x += if wi.is_finite() { wi } else { 0.0 };
     }
     xs

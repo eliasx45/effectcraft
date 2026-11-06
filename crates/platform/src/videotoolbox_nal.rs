@@ -201,7 +201,7 @@ fn copy_out(pb: &CVImageBuffer, s: &Shared) -> Result<VideoFrame, String> {
         }
         let (mut u, mut v) = (Vec::with_capacity(cw * ch), Vec::with_capacity(cw * ch));
         for y in 0..ch {
-            for pair in cs.row(coy + y, cox * 2, cw * 2)?.chunks_exact(2) {
+            for pair in cs.row(coy + y, cox * 2, cw * 2)?.as_chunks::<2>().0 {
                 u.push(pair[0]);
                 v.push(pair[1]);
             }
@@ -213,11 +213,11 @@ fn copy_out(pb: &CVImageBuffer, s: &Shared) -> Result<VideoFrame, String> {
         let shift = 16u32.saturating_sub(l.bits);
         let mut yp = Vec::with_capacity(w * h);
         for y in 0..h {
-            yp.extend(ys.row(oy + y, ox * 2, w * 2)?.chunks_exact(2).map(|b| u16::from_ne_bytes([b[0], b[1]]) >> shift));
+            yp.extend(ys.row(oy + y, ox * 2, w * 2)?.as_chunks::<2>().0.iter().map(|b| u16::from_ne_bytes(*b) >> shift));
         }
         let (mut u, mut v) = (Vec::with_capacity(cw * ch), Vec::with_capacity(cw * ch));
         for y in 0..ch {
-            for q in cs.row(coy + y, cox * 4, cw * 4)?.chunks_exact(4) {
+            for q in cs.row(coy + y, cox * 4, cw * 4)?.as_chunks::<4>().0 {
                 u.push(u16::from_ne_bytes([q[0], q[1]]) >> shift);
                 v.push(u16::from_ne_bytes([q[2], q[3]]) >> shift);
             }

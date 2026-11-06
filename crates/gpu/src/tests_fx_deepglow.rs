@@ -240,6 +240,7 @@ fn deep_glow_blob_perf() {
 /// A text-like layer: rows of glyph-sized white blocks in a `w × h` layer, filling the box
 /// `[x0, x1) × [y0, y1)` (the sambranding-roi "$10,000 / $500/day" text: [620, 1296) × [446, 711)
 /// of a comp-sized precomp).
+#[cfg(feature = "profile")]
 fn text_layer(w: u32, h: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> effectcraft_raster::Image {
     let mut img = effectcraft_raster::Image::new(w, h);
     for y in y0..y1.min(h) {
@@ -258,6 +259,7 @@ fn text_layer(w: u32, h: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> effectcraft
 /// the half path's and the CPU's largest difference from the GPU f32 result (/255):
 /// `cargo test -p effectcraft-gpu --features profile --lib deep_glow_model_perf -- --ignored --nocapture`.
 #[test]
+#[cfg(feature = "profile")]
 #[ignore = "perf: needs --features profile"]
 fn deep_glow_model_perf() {
     let Some(g) = crate::tests::gpu() else { return };

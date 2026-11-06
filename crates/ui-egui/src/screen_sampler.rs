@@ -104,6 +104,7 @@ fn run_sampler() -> Option<[f32; 3]> {
 }
 
 /// "r g b" (0–1 each) as the helper prints it; anything else (`cancel`) is no colour.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn parse_rgb(s: &str) -> Option<[f32; 3]> {
     let mut it = s.split_whitespace().map(|v| v.parse::<f32>().ok().filter(|f| f.is_finite()).map(|f| f.clamp(0.0, 1.0)));
     let rgb = [it.next()??, it.next()??, it.next()??];

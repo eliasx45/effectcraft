@@ -133,7 +133,8 @@ fn spare(footage: &Footage) {
     let n = 16;
     let p = pool(EightBit::Off, true);
     let reference = pool(EightBit::Off, false);
-    let kept = (0..n).filter(|i| p.frame_pixels(ItemId(1), footage, at(footage, *i)).is_some_and(|px| px.gpu_yuv().is_some_and(|v| v.surface.is_some()))).count();
+    let kept =
+        (0..n).filter(|i| p.frame_pixels(ItemId(1), footage, at(footage, *i)).is_some_and(|px| px.gpu_yuv().is_some_and(|v| v.surface.is_some()))).count();
     if kept < n as usize {
         eprintln!("{name}: {kept} of {n} frames kept on the GPU: spare pictures not checked");
         return;

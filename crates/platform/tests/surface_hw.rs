@@ -92,7 +92,7 @@ fn key(luma: usize, width: u32, height: u32, bits: u32) -> SurfaceKey {
 }
 
 fn bytemuck_u32(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.as_chunks::<4>().0.iter().map(|c| u32::from_ne_bytes(*c)).collect()
 }
 
 /// The frame's luma address (the registry key) and its planes as integers.

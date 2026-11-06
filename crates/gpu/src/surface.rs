@@ -201,7 +201,8 @@ fn direct_pipeline(device: &wgpu::Device) -> Option<Arc<Split>> {
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
         let input =
             wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false };
-        let uniform = |n| wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(n) };
+        let uniform =
+            |n| wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(n) };
         let output = wgpu::BindingType::StorageTexture {
             access: wgpu::StorageTextureAccess::WriteOnly,
             format: wgpu::TextureFormat::Rgba32Float,
