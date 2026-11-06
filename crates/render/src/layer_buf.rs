@@ -207,6 +207,13 @@ impl<'a> Renderer<'a> {
         Some((key?, clip))
     }
 
+    /// The window of the layer's buffer its content is made in ([`Self::resident_content`]'s,
+    /// also without a layer cache): what an accelerator making the content without keeping it
+    /// passes to a raster plan ([`Self::shape_raster_plan`]).
+    pub fn content_clip(&self, ctx: &EvalCtx, layer: &Layer) -> ContentClip {
+        self.content_cache_key_noted(ctx, layer).2
+    }
+
     /// Source and masks rebased into effect space, exactly as the CPU content producer, in the
     /// window `clip` that came with the layer's key ([`Self::resident_content`]).
     pub fn resident_source(&self, ctx: &EvalCtx, layer: &Layer, clip: ContentClip) -> Option<Buf> {

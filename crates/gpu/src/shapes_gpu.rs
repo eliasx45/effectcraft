@@ -41,8 +41,6 @@
 //! (TEXT-GPU2) is one group of draws per shutter sub-sample, as `blurred_source` averages them.
 //! `EFFECTCRAFT_GPU_TEXT=0` turns that off.
 
-use std::sync::{Arc, Mutex};
-
 use effectcraft_project::{Layer, LayerSource};
 use effectcraft_render::shapes::gpu_plan::{PlanDraw, PlanPaint, RasterPlan};
 use effectcraft_render::{ContentClip, EvalCtx, Renderer};
@@ -124,26 +122,25 @@ pub(crate) struct Pipes {
     compose: wgpu::ComputePipeline,
 }
 
-/// The kernels per device (few devices live at once: the app's, a test's).
-static PIPES: Mutex<Vec<(wgpu::Device, Arc<Result<Pipes, String>>)>> = Mutex::new(Vec::new());
-const DEVICES_KEPT: usize = 4;
-
-fn pipes(g: &GpuContext) -> Option<Arc<Result<Pipes, String>>> {
-    let mut all = PIPES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, p)) = all.iter().find(|(d, _)| *d == g.device) {
-        return Some(p.clone());
-    }
-    let built = Arc::new(build(g));
-    if let Err(e) = built.as_ref() {
-        log::warn!("gpu: shape kernels: {e}");
-    } else {
-        g.static_pipeline_count.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
-    }
-    if all.len() >= DEVICES_KEPT {
-        all.remove(0);
-    }
-    all.push((g.device.clone(), built.clone()));
-    Some(built)
+/// The kernels of `g`'s device, built on first use. Kept with the context, not in a list by
+/// device: `wgpu::Device` compares by id only, and contexts on their own `wgpu::Instance`
+/// (`GpuContext::request`, the compositor's own instance on Vulkan / DX12) can have equal ids,
+/// so a list found another device's pipelines for it (wgpu panicked: "Cannot get non-existent
+/// resource BindGroupLayoutId").
+fn pipes(g: &GpuContext) -> Option<&Pipes> {
+    g.shapes
+        .get_or_init(|| {
+            let built = build(g);
+            match &built {
+                Err(e) => log::warn!("gpu: shape kernels: {e}"),
+                Ok(_) => {
+                    g.static_pipeline_count.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            built
+        })
+        .as_ref()
+        .ok()
 }
 
 fn build(g: &GpuContext) -> Result<Pipes, String> {
@@ -292,8 +289,7 @@ pub(crate) fn raster(e: &mut Enc, plan: &RasterPlan) -> Option<GpuImage> {
     if drawn.is_empty() {
         return Some(e.image(w, h));
     }
-    let pipes = pipes(e.g)?;
-    let Ok(p) = pipes.as_ref() else { return None };
+    let p = pipes(e.g)?;
     let limits = e.g.device.limits();
     let max_bind = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
     let max_groups = u64::from(limits.max_compute_workgroups_per_dimension);

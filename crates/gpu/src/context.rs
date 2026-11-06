@@ -1034,6 +1034,8 @@ pub struct GpuContext {
     pub(crate) adv3d: std::sync::OnceLock<Result<crate::adv3d::Pipes, String>>,
     /// Mask feather pipelines (built on first use, see [`crate::masks_gpu`]).
     pub(crate) masks: std::sync::OnceLock<Result<crate::masks_gpu::Pipes, String>>,
+    /// Shape raster pipelines (built on first use, see [`crate::shapes_gpu`]).
+    pub(crate) shapes: std::sync::OnceLock<Result<crate::shapes_gpu::Pipes, String>>,
     /// Half-float effect kernels (built on first use, see [`crate::half`]).
     half: std::sync::OnceLock<Result<crate::half::Bank, String>>,
     /// Viewer display renders keep effect intermediates as RGBA16F ([`GpuContext::set_half_intermediates`]).
@@ -1595,6 +1597,7 @@ impl GpuContext {
             unpack8: Default::default(),
             adv3d: std::sync::OnceLock::new(),
             masks: std::sync::OnceLock::new(),
+            shapes: std::sync::OnceLock::new(),
             half: std::sync::OnceLock::new(),
             half_on: std::sync::atomic::AtomicBool::new(half_env().unwrap_or(false)),
             metal,

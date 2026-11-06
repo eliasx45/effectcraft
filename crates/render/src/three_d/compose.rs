@@ -70,6 +70,9 @@ pub(crate) struct Item<'a> {
     bbox: [i64; 4],
     /// Depth of field left to an accelerator (`buf` is then unblurred and unpadded).
     dof: Option<PlaneDof>,
+    /// See [`Plane3d::made`] and [`Plane3d::minify`].
+    made: usize,
+    minify: u32,
 }
 
 /// Depth of field of a plane for an accelerator to apply ([`Plane3d::dof`]): pad the buffer by
@@ -198,7 +201,8 @@ pub(crate) fn plane_view(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, 
             return None;
         }
         let cv = c.view * world;
-        let g = Geo { hinv: h.inverse()?, depth: [cv.0[2][0], cv.0[2][1], cv.0[2][3]], world, normal: plane_normal(world)?, bbox: [0; 4], cam: c, ray_depth: None };
+        let g =
+            Geo { hinv: h.inverse()?, depth: [cv.0[2][0], cv.0[2][1], cv.0[2][3]], world, normal: plane_normal(world)?, bbox: [0; 4], cam: c, ray_depth: None };
         for (x, y) in [(0.0, 0.0), (ow, 0.0), (ow, oh), (0.0, oh)] {
             let (u, v, _) = unproject(&g, x, y)?;
             r_out = [r_out[0].min(u), r_out[1].min(v), r_out[2].max(u), r_out[3].max(v)];
@@ -419,18 +423,33 @@ fn prepare_with<'a>(
     // Minification: a plane shrunk on screen samples a box-filtered copy of its buffer, as a 2D
     // layer's warp does, so thin detail (a logo's stripes in a small contact-sheet cell or a
     // quarter-resolution preview) is averaged, not skipped between samples. Not for shadow
-    // casters (a shadow can be larger on screen than its caster), deferred depth of field (its
-    // radius map is the buffer's size) or pixel-less accelerator planes.
-    let lod = if plane_dof.is_none() && mat.casts_shadows == 0 && buf.img.data.len() == buf.img.width as usize * buf.img.height as usize {
+    // casters (a shadow can be larger on screen than its caster) or deferred depth of field (its
+    // radius map is the buffer's size). A pixel-less plane an accelerator made itself
+    // ([`PlaneBufs`]) is minified there: `minify` halvings of its image, `buf` the halved size.
+    let pixels = buf.img.data.len() == buf.img.width as usize * buf.img.height as usize;
+    let pixel_less = buf.img.data.is_empty();
+    let made = if pixel_less { Arc::as_ptr(&buf) as usize } else { 0 };
+    let lod = if plane_dof.is_none() && mat.casts_shadows == 0 && (pixels || pixel_less) {
         minify_levels(&geos, buf.scale, (buf.img.width, buf.img.height))
     } else {
         0
     };
+    let mut minify = 0;
     if lod > 0 {
-        let mut img = effectcraft_raster::half(&buf.img);
-        for _ in 1..lod {
-            img = effectcraft_raster::half(&img);
-        }
+        let img = if pixel_less {
+            minify = lod;
+            let (mut w, mut h) = (buf.img.width, buf.img.height);
+            for _ in 0..lod {
+                (w, h) = (w.div_ceil(2).max(1), h.div_ceil(2).max(1));
+            }
+            effectcraft_raster::Image { width: w, height: h, data: Vec::new() }
+        } else {
+            let mut img = effectcraft_raster::half(&buf.img);
+            for _ in 1..lod {
+                img = effectcraft_raster::half(&img);
+            }
+            img
+        };
         let k = 0.5f64.powi(lod as i32);
         buf = Arc::new(Buf { img, offset: [buf.offset[0] * k, buf.offset[1] * k], scale: buf.scale * k });
         bounds = buf_bounds(&buf);
@@ -450,6 +469,8 @@ fn prepare_with<'a>(
         bounds,
         bbox,
         dof: plane_dof,
+        made,
+        minify,
     })
 }
 
@@ -949,6 +970,13 @@ pub struct Plane3d {
     pub order: usize,
     pub layer_id: u32,
     pub mode: BlendMode,
+    /// The key of the accelerator's own image for a plane it made ([`PlaneBufs`]: the address of
+    /// the pixel-less buffer it handed in; `buf` is that buffer, or it minified).
+    pub made: usize,
+    /// Box-filter halvings ([`effectcraft_raster::half`]) the accelerator applies to the image
+    /// it made before drawing it (`buf` has the halved size, offset and scale), as the CPU
+    /// minifies a plane shrunk on screen. 0 for planes with pixels (already minified).
+    pub minify: u32,
 }
 
 /// Prepare a run of 3D layers for an accelerator. `None` when the run must be drawn on the CPU
@@ -983,6 +1011,8 @@ pub(crate) fn gpu_run(r: &Renderer, ctx: &EvalCtx, run: &[&Layer], out: (u32, u3
             bounds: it.bounds,
             bbox: it.bbox,
             order: it.order,
+            made: it.made,
+            minify: it.minify,
         })
         .collect();
     let casters = planes.iter().enumerate().filter(|(_, p)| r.opts.shadows() && p.mat.casts_shadows != 0 && !p.geos.is_empty()).map(|(i, _)| i).collect();

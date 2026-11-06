@@ -8,8 +8,9 @@ use std::collections::HashMap;
 
 use effectcraft_geom::Mat4;
 use effectcraft_project::LightKind;
-use effectcraft_render::three_d::{LightState, PlaneGeo, Run3d};
+use effectcraft_render::three_d::{LightState, Plane3d, PlaneGeo, Run3d};
 
+use crate::codes::Pixels;
 use crate::context::{Enc, GpuImage, Params};
 use crate::ops::mode_id;
 
@@ -145,8 +146,8 @@ pub(crate) fn draw_run(e: &mut Enc, run: &Run3d, canvas: &GpuImage) -> Option<Gp
 }
 
 /// [`draw_run`] with planes the GPU made itself (`crate::plane3d`): their images by the
-/// address of their (pixel-less) plane buffers.
-pub(crate) fn draw_run_made(e: &mut Enc, run: &Run3d, canvas: &GpuImage, made: &HashMap<usize, GpuImage>) -> Option<GpuImage> {
+/// address of their (pixel-less) plane buffers ([`Plane3d::made`]).
+pub(crate) fn draw_run_made(e: &mut Enc, run: &Run3d, canvas: &GpuImage, made: &HashMap<usize, Pixels>) -> Option<GpuImage> {
     let (w, h) = (canvas.width, canvas.height);
     let boxes: Vec<[i64; 4]> = run.planes.iter().filter(|p| p.draw).map(|p| p.bbox).collect();
     if boxes.is_empty() {
@@ -177,8 +178,8 @@ pub(crate) fn draw_run_made(e: &mut Enc, run: &Run3d, canvas: &GpuImage, made: &
             // blurred here when the plane has it.
             let mut texs: Vec<(GpuImage, [f64; 2])> = Vec::with_capacity(run.planes.len());
             for p in &run.planes {
-                let up = match made.get(&(std::sync::Arc::as_ptr(&p.buf) as usize)) {
-                    Some(img) => img.clone(),
+                let up = match made_image(e, p, made) {
+                    Some(px) => px.float(e)?,
                     None => e.upload_buf(&p.buf)?,
                 };
                 match &p.dof {
@@ -269,6 +270,28 @@ pub(crate) fn draw_run_made(e: &mut Enc, run: &Run3d, canvas: &GpuImage, made: &
     Some(out)
 }
 
+/// Made planes drawn minified ([`made_image`]).
+#[cfg(test)]
+pub(crate) static MINIFIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The image the GPU made for plane `p` (`None`: the plane has the CPU's pixels), minified as
+/// the CPU minifies a plane shrunk on screen: [`Plane3d::minify`] box halvings (the `half`
+/// kernel is `effectcraft_raster::half`), so its size, offset and scale are `p.buf`'s.
+fn made_image(e: &mut Enc, p: &Plane3d, made: &HashMap<usize, Pixels>) -> Option<Pixels> {
+    let px = made.get(&p.made)?;
+    if p.minify == 0 {
+        return Some(px.clone());
+    }
+    #[cfg(test)]
+    MINIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::debug!("3D plane of layer {} made on the GPU, drawn minified {} time(s)", p.layer_id, p.minify);
+    let mut img = crate::ops::half_px(e, px);
+    for _ in 1..p.minify {
+        img = crate::ops::half(e, &img);
+    }
+    Some(Pixels::Float(img))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Tests: this thread's runs use the f32 atlas (the codes atlas is compared against it).
@@ -284,7 +307,7 @@ enum Atlas {
 /// LVR1: every plane of `run` as codes, without changing a value ([`crate::codes::exact_codes`]),
 /// with its buffer offset; `None` (the f32 atlas) when one isn't on the 8 bpc grid, has depth of
 /// field (blurred in f32), or the codes Classic 3D kernel isn't there.
-fn codes_planes(e: &mut Enc, run: &Run3d, made: &HashMap<usize, GpuImage>) -> Option<Vec<(crate::codes::CodeImage, [f64; 2])>> {
+fn codes_planes(e: &mut Enc, run: &Run3d, made: &HashMap<usize, Pixels>) -> Option<Vec<(crate::codes::CodeImage, [f64; 2])>> {
     #[cfg(test)]
     if F32_ATLAS.with(std::cell::Cell::get) {
         return None;
@@ -294,8 +317,8 @@ fn codes_planes(e: &mut Enc, run: &Run3d, made: &HashMap<usize, GpuImage>) -> Op
     }
     let mut pixels = Vec::with_capacity(run.planes.len());
     for p in &run.planes {
-        let px = match made.get(&(std::sync::Arc::as_ptr(&p.buf) as usize)) {
-            Some(img) => crate::codes::Pixels::Float(img.clone()),
+        let px = match made_image(e, p, made) {
+            Some(px) => px,
             None => e.upload_pixels(&p.buf)?,
         };
         // Checked for every plane before any is converted: a run that can't go as codes costs

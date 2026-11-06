@@ -13,6 +13,7 @@ use effectcraft_raster::Image;
 use effectcraft_render::three_d::{PlaneBufs, plane_key};
 use effectcraft_render::{EvalCtx, Renderer, styles};
 
+use crate::codes::Pixels;
 use crate::context::{Enc, GpuImage, Params};
 
 /// Plane-sized images the GPU styles hold at once, at most (see [`plane`]).
@@ -28,7 +29,7 @@ pub(crate) static MADE_ON_GPU: std::sync::atomic::AtomicUsize = std::sync::atomi
 /// The planes of `run` the GPU makes for an `out` canvas (see [`plane`]): their pixel-less
 /// buffers for `Renderer::prepare_3d_run_with`, and their images by the address of those
 /// buffers for `classic3d::draw_run_made`.
-pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer], out: (u32, u32)) -> (PlaneBufs, HashMap<usize, GpuImage>) {
+pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer], out: (u32, u32)) -> (PlaneBufs, HashMap<usize, Pixels>) {
     let mut bufs = PlaneBufs::new();
     let mut made = HashMap::new();
     for &l in run {
@@ -44,16 +45,16 @@ pub(crate) fn make(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, run: &[&Layer], out
     (bufs, made)
 }
 
-/// A 3D shape layer's plane made on the GPU: its source (with masks, from the CPU), its effect
-/// stack, then its Layer Styles when every one renders on the GPU and none paints outside the
-/// layer (Drop Shadow, Outer Glow: the CPU flattens those passes). `None` leaves the layer to
-/// the CPU: no effects or styles to run, an unchanged layer the layer cache holds already (one
-/// it doesn't hold is made here: the CPU would style it once at its full raster size, seconds
-/// for a large Bevel and Emboss),
+/// A 3D shape layer's plane made on the GPU. Without Layer Styles: [`shape_plane`]. With them:
+/// its source (with masks, from the CPU), its effect stack, then its Layer Styles when every one
+/// renders on the GPU and none paints outside the layer (Drop Shadow, Outer Glow: the CPU
+/// flattens those passes). `None` leaves the layer to the CPU: an unchanged layer the layer
+/// cache holds already (one it doesn't hold is made here: the CPU would style it once at its
+/// full raster size, seconds for a large Bevel and Emboss),
 /// linear blending, or a step the GPU can't do. The styles only style the part of the plane the
 /// `out` canvas can show (and what reaches it): a layer scaled up far past the frame keeps
 /// its styles' images small.
-fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Result<(Buf, GpuImage), &'static str> {
+fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Result<(Buf, Pixels), &'static str> {
     if r.pipe().to_blend().is_some() {
         return Err("linear blending");
     }
@@ -65,8 +66,11 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32
     }
     let styled = styles::active(ctx, layer);
     let has_fx = layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty());
-    if !matches!(layer.source, LayerSource::Shape) || layer.switches.adjustment || !(styled || has_fx) {
-        return Err("not a shape with effects or styles, nor a precomp");
+    if !matches!(layer.source, LayerSource::Shape) || layer.switches.adjustment {
+        return Err("not a shape layer, nor a precomp");
+    }
+    if !styled {
+        return shape_plane(e, r, ctx, layer, has_fx);
     }
     // Only this plane's own steps count (see `alpha_bounds`).
     e.take_missing();
@@ -81,10 +85,6 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32
     let offset = [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale];
     if img.width == 0 || img.height == 0 {
         return Err("empty after effects");
-    }
-    if !styled {
-        let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
-        return finish(e, shape, img);
     }
     log::debug!(
         "3D plane {:?}: effect canvas {}x{}, seen {:?}",
@@ -135,7 +135,7 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32
     e.copy_region_to(&img, &padded, x0, y0, x1 - x0, y1 - y0, prep.pad, prep.pad);
     drop(img);
     let st = crate::fx_styles::render(e, &padded, &prep.plan).ok_or("style kernels failed")?;
-    finish(e, prep.shape, st.body)
+    finish(e, prep.shape, st.body.into())
 }
 
 /// A 3D precomp layer's plane made on the GPU: its nested comp walked on the device
@@ -144,7 +144,7 @@ fn plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32
 /// every GPU effect run inside it back and uploads the plane again (10-10 MAIN's Clock 1 and
 /// Clock 2: their glowing circles' effect canvases, about a second a frame). Masks, Layer
 /// Styles, a collapsed precomp and whatever `Renderer::precomp_source` declines stay on the CPU.
-fn precomp_plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Result<(Buf, GpuImage), &'static str> {
+fn precomp_plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Result<(Buf, Pixels), &'static str> {
     if layer.switches.collapse || layer.switches.adjustment {
         return Err("a collapsed or adjustment precomp");
     }
@@ -162,12 +162,72 @@ fn precomp_plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Res
     if w == 0 || h == 0 {
         return Err("empty precomp");
     }
-    let img = image.img.float(e).ok_or("precomp to float")?;
     let shape = Buf { img: Image { width: w, height: h, data: Vec::new() }, offset: image.offset, scale: image.scale };
-    finish(e, shape, img)
+    finish(e, shape, image.img)
 }
 
-fn finish(e: &mut Enc, shape: Buf, img: GpuImage) -> Result<(Buf, GpuImage), &'static str> {
+/// A 3D shape layer without Layer Styles (with or without effects): its plane is the layer's
+/// Processed pixels (source → masks → effects, layer space), made on the GPU as a 2D shape
+/// layer's are: `shapes_gpu` rasterises its paths and paints its fills, strokes and gradients
+/// with the CPU's own coverage and gradient model (no per-pixel gradient sampling on the CPU, no
+/// 8 bpc packing and upload: C0666's BG Glow planes, 14 radial-gradient ellipses of 1900 px,
+/// were most of a frame's CPU time), then its effects run on the device. Through
+/// `walk::processed_resident` (as a 2D layer: the retained image, or the layer cache's buffer
+/// uploaded, else made here and retained when its content repeats); when this encoder can't
+/// retain images, made here each frame. Masks the GPU can't draw, non-Normal draw blend modes,
+/// Taper / Wave strokes and effects without a GPU kernel leave the layer to the CPU.
+fn shape_plane(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, has_fx: bool) -> Result<(Buf, Pixels), &'static str> {
+    if !has_fx && !crate::shapes_gpu::eligible(r, ctx, layer) {
+        return Err("a shape the GPU can't rasterise");
+    }
+    // Only this plane's own steps count (see `alpha_bounds`).
+    e.take_missing();
+    if let Some((image, keep)) = crate::walk::processed_resident(e, r, ctx, layer, false) {
+        let (w, h) = (image.img.width(), image.img.height());
+        if w == 0 || h == 0 {
+            return Err("empty source");
+        }
+        let shape = Buf { img: Image { width: w, height: h, data: Vec::new() }, offset: image.offset, scale: image.scale };
+        let made = finish(e, shape, image.img.clone())?;
+        crate::walk::keep_processed(e, r, ctx, layer, keep, image);
+        return Ok(made);
+    }
+    let clip = r.content_clip(ctx, layer);
+    let (src, at, bs) = match crate::shapes_gpu::resident_source(e, r, ctx, layer, clip) {
+        Some(made) => made,
+        // The source from the CPU, the effects here (as before shape planes were made here).
+        None if has_fx => {
+            let input = r.layer_input(ctx, layer, 0).ok_or("no source")?;
+            if input.img.is_empty() {
+                return Err("empty source");
+            }
+            (e.upload_buf(&input).ok_or("source upload")?, input.offset, input.scale)
+        }
+        None => return Err("a shape the GPU can't rasterise"),
+    };
+    let mut fx = crate::effects::GpuFx::new(e, src, at, bs, r.pipe().levels);
+    let origin = r.run_layer_effects_in(ctx, layer, &mut fx, clip);
+    let (img, offset, scale) = fx.finish().ok_or("an effect the GPU can't run")?;
+    if img.width == 0 || img.height == 0 {
+        return Err("empty after effects");
+    }
+    let offset = [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale];
+    let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
+    finish(e, shape, img.into())
+}
+
+fn finish(e: &mut Enc, shape: Buf, img: Pixels) -> Result<(Buf, Pixels), &'static str> {
+    // A plane on the 8 bpc grid waits for its run as its codes (LVR1: a quarter of the bytes,
+    // the same values; the run's atlas is made of codes then), its float image back in the pool
+    // for the next plane: C0666 N2's 14 glow planes are ~800 MB a frame as floats.
+    let img = if matches!(&img, Pixels::Float(f) if f.levels == Some(crate::codes::LEVELS)) {
+        match crate::codes::exact_codes(e, &img) {
+            Some(c) => Pixels::Codes(c),
+            None => img,
+        }
+    } else {
+        img
+    };
     if e.take_missing() || e.g.check_health().is_err() {
         return Err("a kernel is missing or the device failed");
     }

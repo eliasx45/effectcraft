@@ -6,10 +6,10 @@
 use std::sync::atomic::Ordering;
 
 use effectcraft_color::Label;
-use effectcraft_keyframe::{Gradient, Keyframe, Value};
+use effectcraft_keyframe::{Gradient, Keyframe, ShapePath, Value};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::styles::{self as st, GROUP};
-use effectcraft_project::{BitDepth, Comp, ItemKind, LayerSource};
+use effectcraft_project::{BitDepth, Comp, ItemKind, LayerSource, MaskMode};
 use effectcraft_render::RenderOpts;
 use effectcraft_time::{FrameRate, Tick};
 
@@ -179,5 +179,173 @@ fn a_3d_precomp_plane_is_made_on_the_gpu() {
             }
             check(&format!("3D precomp, {depth:?} at {scale}"), d, 0.002);
         }
+    }
+}
+
+/// A gradient with `colors` colour stops and five opacity stops (C0666's BG Glow: a radial glow
+/// fading out), uneven midpoints on both.
+fn ramp(colors: usize) -> Gradient {
+    let n = colors.max(2);
+    let colors: Vec<(f64, [f32; 4])> = (0..n)
+        .map(|i| {
+            let t = i as f64 / (n - 1) as f64;
+            let f = t as f32;
+            (t, [0.09 + 0.8 * f, 0.9 - 0.7 * f * f, 0.37 + 0.5 * (f * 6.0).sin().abs(), 1.0])
+        })
+        .collect();
+    Gradient {
+        color_midpoints: (0..n - 1).map(|i| [0.5, 0.2, 0.8, 0.35][i % 4]).collect(),
+        colors,
+        opacities: vec![(0.0, 1.0), (0.25, 0.82), (0.5, 0.46), (0.75, 0.17), (1.0, 0.0)],
+        opacity_midpoints: vec![0.5, 0.3, 0.65, 0.5],
+    }
+}
+
+/// Plain Classic 3D shape layers painted with gradients over footage (no effects, no Layer
+/// Styles: the CPU painted these pixel by pixel before): a radial glow ellipse with opacity
+/// stops, turned in Y; a linear gradient with many stops on a rounded rectangle tilted in X; a
+/// star with a radial gradient stroke (highlight) over a solid fill; an elliptical gradient
+/// (width point) on an even-odd path, behind a feathered mask; a gradient with a Multiply fill
+/// (the GPU's plan declines it: the CPU paints that one). `tiny`: the glow at 3 % of a 2000 px
+/// ellipse, minified on screen.
+fn gradient_planes(depth: BitDepth, tiny: bool) -> Scene {
+    let mut s = Scene::new(depth);
+    let bg = s.footage(97, 61);
+    s.push(bg);
+    let mut next = s.p.next_id;
+    let mut ids = Ids(&mut next);
+    let glow_size = if tiny { 2000.0 } else { 70.0 };
+    // The glow's gradient end moves: content that changes every frame.
+    let mut glow_fill = build::shape_gradient_fill(&mut ids, true, [0.0, 0.0], [glow_size / 2.0, 0.0], ramp(2));
+    glow_fill.prop_mut("end").unwrap().keys =
+        vec![Keyframe::new(Tick::ZERO, Value::Vec2([glow_size / 2.0, 0.0])), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec2([glow_size / 2.6, 4.0]))];
+    let glow = vec![build::shape_ellipse(&mut ids, [glow_size, glow_size], [0.0, 0.0]), glow_fill];
+    let bar =
+        vec![build::shape_rect(&mut ids, [60.0, 22.0], [0.0, 0.0], 5.0), build::shape_gradient_fill(&mut ids, false, [-30.0, -4.0], [30.0, 6.0], ramp(9))];
+    let mut gstroke = build::shape_gradient_stroke(&mut ids, true, [0.0, 0.0], [20.0, 3.0], ramp(4), 4.0);
+    gstroke.prop_mut("highlightLength").unwrap().value = Value::Scalar(35.0);
+    gstroke.prop_mut("highlightAngle").unwrap().value = Value::Scalar(70.0);
+    let star = vec![build::shape_star(&mut ids, true, 5.0, [0.0, 0.0], 20.0, 8.0), gstroke, build::shape_fill(&mut ids, [0.2, 0.3, 0.8, 0.9])];
+    let mut wide = build::shape_gradient_fill(&mut ids, true, [0.0, 0.0], [24.0, 0.0], ramp(3));
+    wide.prop_mut("rule").unwrap().value = Value::Enum(1);
+    wide.prop_mut("widthPoint").unwrap().value = Value::Vec2([0.0, 10.0]);
+    let oval = vec![build::shape_star(&mut ids, true, 7.0, [0.0, 0.0], 24.0, 12.0), wide];
+    let mut multiply = build::shape_gradient_fill(&mut ids, false, [-15.0, 0.0], [15.0, 0.0], ramp(3));
+    // Multiply (as `tests_shapes_gpu`).
+    multiply.prop_mut("blend").unwrap().value = Value::Enum(3);
+    let mult = vec![build::shape_ellipse(&mut ids, [30.0, 30.0], [0.0, 0.0]), multiply];
+    let groups: Vec<_> = [glow, bar, star, oval, mult].into_iter().map(|items| build::shape_group(&mut ids, "Group", items)).collect();
+    s.p.next_id = next;
+    let places: [([f64; 3], f64, f64, f64, f64); 5] = [
+        ([48.0, 30.0, 40.0], if tiny { 3.0 } else { 100.0 }, 0.0, 20.0, 70.0),
+        ([40.0, 20.0, 0.0], 100.0, 30.0, 0.0, 100.0),
+        ([70.0, 40.0, -10.0], 120.0, 0.0, -25.0, 100.0),
+        ([25.0, 42.0, 5.0], 90.0, 15.0, 15.0, 85.0),
+        ([75.0, 15.0, 0.0], 100.0, 0.0, 10.0, 100.0),
+    ];
+    for (i, (g, (pos, scale, rx, ry, opacity))) in groups.into_iter().zip(places).enumerate() {
+        let mut l = build::layer(&mut s.p, &s.comp, &format!("Gradient {i}"), LayerSource::Shape, (97, 61), None);
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        l.switches.three_d = true;
+        set(&mut l, "transform/position", Value::Vec3(pos));
+        set(&mut l, "transform/scale", Value::Vec3([scale, scale, 100.0]));
+        set(&mut l, "transform/rotationX", Value::Scalar(rx));
+        set(&mut l, "transform/rotationY", Value::Scalar(ry));
+        set(&mut l, "transform/opacity", Value::Scalar(opacity));
+        if i == 3 {
+            let mut next = s.p.next_id;
+            let mut m = build::mask(&mut Ids(&mut next), "Mask 1", ShapePath::ellipse([0.0, 0.0], 40.0, 28.0), MaskMode::Add, [255, 255, 0]);
+            s.p.next_id = next;
+            m.get_mut("feather").unwrap().value = Value::Vec2([3.0, 3.0]);
+            l.props.sub_mut("masks").unwrap().children.push(m.into());
+        }
+        s.push(l);
+    }
+    s
+}
+
+/// Plain 3D gradient shapes are made on the GPU (`plane3d::shape_plane`) and the frame matches
+/// the CPU's at 8, 16 and 32 bpc, Full and Half, without a layer cache (made every frame).
+#[test]
+fn plain_3d_gradient_shapes_are_made_on_the_gpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+        for scale in [1.0, 0.5] {
+            for t in [0.0, 0.37] {
+                let s = gradient_planes(depth, false);
+                let before = crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed);
+                let d = compare_at(&s, RenderOpts { scale, ..opts() }, Tick::from_seconds_f64(t));
+                if d.is_some() {
+                    // Four of the five (the Multiply fill stays on the CPU).
+                    let made = crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed) - before;
+                    assert!(made >= 4, "{depth:?} at {scale}, t {t}: {made} planes made on the GPU");
+                }
+                check(&format!("3D gradient shapes, {depth:?} at {scale}, t {t}"), d, 0.0);
+            }
+        }
+    }
+}
+
+/// With a layer cache the planes come through the GPU's resident path (as 2D shape layers:
+/// rasterised here, retained when their content repeats) and every frame still matches the CPU.
+#[test]
+fn plain_3d_gradient_shapes_through_the_resident_path_match_the_cpu() {
+    use effectcraft_render::{Backend, LayerCache, Renderer};
+    let g = crate::tests::gpu();
+    assert!(g.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+    let Some(g) = g else { return };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+        let s = gradient_planes(depth, false);
+        let cache = LayerCache::default();
+        for t in [0.0, 0.5, 0.5, 1.2] {
+            let made = crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed);
+            let mut r = Renderer::new(&s.p, &crate::tests::Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+            r.accel = Some(g);
+            r.cache = Some(&cache);
+            let img = g.render(&r, s.cid, Tick::from_seconds_f64(t)).expect("the GPU renders the frame");
+            assert!(crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed) > made, "{depth:?} t {t}: no plane made on the GPU");
+            let cpu =
+                Renderer::new(&s.p, &crate::tests::Pattern, RenderOpts { backend: Backend::Cpu, ..opts() }).comp_frame_cpu(s.cid, Tick::from_seconds_f64(t));
+            let mut d = crate::tests::diff(&cpu, &img, crate::tests::tolerance(depth));
+            d.quantized = depth != BitDepth::Bpc32;
+            check(&format!("resident 3D gradient shapes, {depth:?} t {t}"), Some(d), 0.0);
+        }
+    }
+}
+
+/// A plane the GPU made and the camera shows shrunk (a 2000 px glow at 3 %, a precomp card at
+/// 30 %: C0666 N2's footage cards) is box-minified as the CPU minifies it, not sampled whole.
+#[test]
+fn made_planes_shrunk_on_screen_are_minified_as_on_the_cpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let s = gradient_planes(depth, true);
+        let before = crate::classic3d::MINIFIED.load(Ordering::Relaxed);
+        let d = compare_at(&s, opts(), Tick::from_seconds_f64(0.2));
+        if d.is_some() {
+            assert!(crate::classic3d::MINIFIED.load(Ordering::Relaxed) > before, "{depth:?}: the tiny glow wasn't minified");
+        }
+        check(&format!("tiny 3D gradient glow, {depth:?}"), d, 0.0);
+
+        // A precomp of detailed footage on a 3D card at 30 %.
+        let mut s = Scene::new(depth);
+        let inner = Comp::new(97, 61, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let inner_id = s.p.add_item("Card", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+        let mut fine = s.footage(97, 61);
+        s.effect(&mut fine, "ec.blur.gaussian", &[("blurriness", n(0.5))]);
+        s.p.comp_mut(inner_id).unwrap().layers = vec![fine].into();
+        let bg = s.footage(97, 61);
+        s.push(bg);
+        let mut card = build::layer(&mut s.p, &s.comp, "Card", LayerSource::Comp { item: inner_id }, (97, 61), None);
+        card.switches.three_d = true;
+        set(&mut card, "transform/scale", Value::Vec3([30.0, 30.0, 100.0]));
+        set(&mut card, "transform/rotationY", Value::Scalar(12.0));
+        s.effect(&mut card, "ec.blur.gaussian", &[("blurriness", n(0.3))]);
+        s.push(card);
+        let (made, minified) = (crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed), crate::classic3d::MINIFIED.load(Ordering::Relaxed));
+        let d = compare_at(&s, opts(), Tick::from_seconds_f64(0.2));
+        if d.is_some() {
+            assert!(crate::plane3d::MADE_ON_GPU.load(Ordering::Relaxed) > made, "{depth:?}: the card was made on the CPU");
+            assert!(crate::classic3d::MINIFIED.load(Ordering::Relaxed) > minified, "{depth:?}: the card wasn't minified");
+        }
+        check(&format!("3D precomp card at 30 %, {depth:?}"), d, 0.0);
     }
 }

@@ -678,7 +678,7 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
 
 /// The claim on a Processed key [`processed_resident`] made the image for: kept by
 /// [`keep_processed`] once the image is drawn.
-struct KeepProcessed {
+pub(crate) struct KeepProcessed {
     key: u64,
     flight: effectcraft_render::cache::FlightGuard,
     intent: Option<effectcraft_render::disk_cache::LayerWriteIntent>,
@@ -691,7 +691,7 @@ struct KeepProcessed {
 /// other sources from the CPU) with the claim to keep it once drawn. `render_anyway`: when this
 /// thread already holds the key's claim (`Claim::Render`), make it here without keeping it
 /// instead of leaving the layer to the CPU. `None`: not here (draw it the usual way).
-fn processed_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, render_anyway: bool) -> Option<(SourceImage, Option<KeepProcessed>)> {
+pub(crate) fn processed_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, render_anyway: bool) -> Option<(SourceImage, Option<KeepProcessed>)> {
     processed_resident_bounded(e, r, ctx, layer, render_anyway).map(|(image, keep, _)| (image, keep))
 }
 
@@ -823,7 +823,7 @@ fn remember_bounds(key: u64, bounds: Option<(u32, u32, u32, u32)>) {
 }
 
 /// Retain `image` (made by [`processed_resident`] under `keep`'s claim) once it was drawn.
-fn keep_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, keep: Option<KeepProcessed>, image: SourceImage) {
+pub(crate) fn keep_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, keep: Option<KeepProcessed>, image: SourceImage) {
     let (Some(KeepProcessed { key, flight, intent }), Some(cache)) = (keep, r.cache) else { return };
     // Unique animated versions are transient. Held values and repeated visits
     // can reuse their exact key after the bounded doorkeeper sees it twice.
