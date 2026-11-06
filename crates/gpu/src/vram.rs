@@ -26,11 +26,51 @@ pub const VRAM_CAP_ENV: &str = "EFFECTCRAFT_GPU_VRAM_CAP_MB";
 /// device could not be made again, with 29 GB of video memory free (18 Oct). A cap
 /// ([`VRAM_CAP_ENV`]) still applies there.
 pub fn memory_budget_thresholds() -> wgpu::MemoryBudgetThresholds {
+    thresholds_at(creation_percent())
+}
+
+/// The window device's share of the driver's budget ([`window_budget_thresholds`]).
+pub const WINDOW_PERCENT: u8 = 97;
+
+/// The desktop compositor's share when it has a device of its own
+/// ([`compositor_budget_thresholds`]).
+pub const COMPOSITOR_PERCENT: u8 = 85;
+
+// The window always keeps room above the compositor (see `window_budget_thresholds`).
+const _: () = assert!(COMPOSITOR_PERCENT < WINDOW_PERCENT && WINDOW_PERCENT < 100);
+
+/// LVR1: thresholds for the window's device (egui's renderer). wgpu applies a threshold to every
+/// allocation, its own staging buffers included, and treats an out-of-memory error outside resource
+/// creation (a submit, `write_texture`'s staging) as a lost device, which closes the window. With
+/// the window and the compositor at the same 90 %, a compositor that filled the budget made the
+/// window's next 256-byte staging buffer fail: the device was lost and the window closed (RTX 4060
+/// Laptop, 8 GB, Vulkan, 6 Nov 2026). The window stops at 97 %, above the compositor's
+/// [`COMPOSITOR_PERCENT`], so it always has room for its own few megabytes.
+pub fn window_budget_thresholds() -> wgpu::MemoryBudgetThresholds {
+    thresholds_at(WINDOW_PERCENT)
+}
+
+/// LVR1: thresholds for the desktop compositor on a device of its own, below the window's
+/// [`WINDOW_PERCENT`] (see [`window_budget_thresholds`]). A compositor that runs out fails its
+/// frames (they render on the CPU) or loses its own device (it is set up again); the window keeps
+/// drawing either way.
+pub fn compositor_budget_thresholds() -> wgpu::MemoryBudgetThresholds {
+    thresholds_at(COMPOSITOR_PERCENT.min(creation_percent()))
+}
+
+/// Whether wgpu checks memory budgets on `backend` at all (Vulkan, Direct3D 12): the thresholds
+/// above change nothing elsewhere (Metal, OpenGL).
+pub fn budget_checked(backend: wgpu::Backend) -> bool {
+    matches!(backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12)
+}
+
+/// Thresholds at `percent` of the budget, or none on a small-BAR NVIDIA card without a cap.
+fn thresholds_at(percent: u8) -> wgpu::MemoryBudgetThresholds {
     let capped = std::env::var(VRAM_CAP_ENV).is_ok_and(|v| v.trim().parse::<u64>().is_ok_and(|mb| mb > 0));
     if !capped && small_bar() {
         return wgpu::MemoryBudgetThresholds { for_resource_creation: None, for_device_loss: None };
     }
-    wgpu::MemoryBudgetThresholds { for_resource_creation: Some(creation_percent()), for_device_loss: None }
+    wgpu::MemoryBudgetThresholds { for_resource_creation: Some(percent), for_device_loss: None }
 }
 
 /// Below this BAR1 aperture the budget check is off (resizable BAR gives the whole card).
@@ -260,6 +300,19 @@ fn amd_sysfs(device: u32) -> Option<VideoMemory> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LVR1: the window keeps room above the compositor, so a compositor that fills its share
+    /// can't make the window's own small allocations fail (a lost window device closes the app).
+    #[test]
+    fn the_window_device_keeps_room_above_the_compositor() {
+        let at = |t: wgpu::MemoryBudgetThresholds| t.for_resource_creation;
+        if let (Some(w), Some(c)) = (at(window_budget_thresholds()), at(compositor_budget_thresholds())) {
+            assert!(c < w, "compositor {c} % below window {w} %");
+            assert!(c <= creation_percent(), "never above the headless share");
+        }
+        assert!(budget_checked(wgpu::Backend::Vulkan) && budget_checked(wgpu::Backend::Dx12));
+        assert!(!budget_checked(wgpu::Backend::Metal) && !budget_checked(wgpu::Backend::Gl), "Metal ignores thresholds");
+    }
 
     #[test]
     fn bar1_total_from_nvidia_smi_q() {

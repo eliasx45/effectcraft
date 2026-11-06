@@ -84,6 +84,31 @@ impl Drop for Entered<'_> {
     }
 }
 
+const GIB: u64 = 1 << 30;
+
+/// LVR1: the bytes a GPU frame is assumed to take before one is measured on a card of `total`
+/// bytes: a sixteenth of it, at least 1 GiB (a quarter of a card under 4 GiB). Heavy 3D comps took
+/// 500-800 MB a frame; with a sixteenth (512 MB) an 8 GB card started 13 frames at once and filled
+/// its memory in 4 s (RTX 4060 Laptop, 6 Nov 2026). From 16 GiB on, a sixteenth as before.
+fn assumed_frame_bytes(total: u64) -> u64 {
+    (total / 16).max(GIB.min(total / 4))
+}
+
+/// LVR1: video memory kept free on a card of `total` bytes: a tenth, at least 2 GiB (a quarter of
+/// a card under 8 GiB). The driver's budget is less than the card (7.2 of 8 GB on that laptop) and
+/// the window and the desktop need their part: a tenth of 8 GB left the compositor allowed past the
+/// point where its allocations fail. From 20 GiB on, a tenth as before.
+fn kept_free(total: u64) -> u64 {
+    (total / 10).max((2 * GIB).min(total / 4))
+}
+
+/// LVR1: GPU frames at once on a card of `total` bytes, at most: one per 2 GiB, at least two
+/// (4 on 8 GB, 12 on 24 GB). The live room is asked of the driver about once a second, slower than
+/// frames start: this bounds what the first second can take.
+fn frames_cap(total: u64) -> usize {
+    usize::try_from(total / (2 * GIB)).unwrap_or(usize::MAX).max(2)
+}
+
 impl Gate {
     /// GPU frames that may render at once on `g` when one takes at least `frame` bytes (the
     /// static estimate), with `threads` frame threads. `None` on an integrated GPU (or another
@@ -98,7 +123,7 @@ impl Gate {
         let learned = self.per_frame.load(Ordering::Acquire);
         // Until a frame has been measured, assume one takes a sixteenth of the card (heavy comps
         // took about 1 GB a frame on a 24 GB card): the first frames never fill it at once.
-        let assumed = if learned == 0 { vram.map_or(0, |m| m.total / 16) } else { learned };
+        let assumed = if learned == 0 { vram.map_or(0, |m| assumed_frame_bytes(m.total)) } else { learned };
         let per = (assumed as f64).max(frame).max(1.0);
         let rendering = self.rendering.load(Ordering::Acquire);
         let mut n = match ctx.live_video_memory() {
@@ -113,10 +138,10 @@ impl Gate {
                     b => self.last_bytes.load(Ordering::Acquire).saturating_sub(b),
                 };
                 let reserve = ((rendering as f64 * per) as u64).saturating_sub(grown);
-                let room = m.free.saturating_sub(m.total / 10).saturating_sub(reserve);
-                rendering.saturating_add((room as f64 / per) as usize)
+                let room = m.free.saturating_sub(kept_free(m.total)).saturating_sub(reserve);
+                rendering.saturating_add((room as f64 / per) as usize).min(frames_cap(m.total))
             }
-            None => (UNKNOWN_VRAM_BUDGET as f64 / per) as usize,
+            None => ((UNKNOWN_VRAM_BUDGET as f64 / per) as usize).min(vram.map_or(usize::MAX, |m| frames_cap(m.total))),
         }
         .clamp(1, threads.max(1));
         if self.measurable.load(Ordering::Acquire) != 2 {
@@ -240,6 +265,26 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LVR1: small cards assume heavier frames, keep more free and run fewer frames at once;
+    /// big cards keep their caps (Apple Silicon never gets here: `limit` is `None` there).
+    #[test]
+    fn small_cards_start_fewer_frames_and_keep_more_free() {
+        let gb = |n: u64| n * GIB;
+        assert_eq!(assumed_frame_bytes(gb(8)), GIB, "8 GB: 1 GiB a frame, not 512 MiB");
+        assert_eq!(assumed_frame_bytes(gb(24)), gb(24) / 16, "24 GB: unchanged");
+        assert_eq!(assumed_frame_bytes(gb(2)), gb(2) / 4);
+        assert_eq!(kept_free(gb(8)), 2 * GIB);
+        assert_eq!(kept_free(gb(24)), gb(24) / 10, "24 GB: unchanged");
+        assert_eq!(kept_free(gb(4)), GIB);
+        assert_eq!(frames_cap(gb(8)), 4);
+        assert_eq!(frames_cap(gb(24)), 12);
+        assert_eq!(frames_cap(gb(2)), 2);
+        assert_eq!(frames_cap(0), 2);
+        for total in [0, 1, gb(1), gb(6), gb(8), gb(12), gb(16), gb(24), gb(80), u64::MAX] {
+            assert!(kept_free(total) <= total && assumed_frame_bytes(total) <= total.max(1), "{total}");
+        }
+    }
 
     #[test]
     fn each_out_of_memory_halves_the_frames_rendering_down_to_one() {

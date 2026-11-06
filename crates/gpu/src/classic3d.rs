@@ -157,31 +157,50 @@ pub(crate) fn draw_run_made(e: &mut Enc, run: &Run3d, canvas: &GpuImage, made: &
     {
         return None;
     }
-    // Plane textures: the layer uploads (cached per buffer), with bokeh depth of field blurred
-    // here when the plane has it.
-    let mut texs: Vec<(GpuImage, [f64; 2])> = Vec::with_capacity(run.planes.len());
-    for p in &run.planes {
-        let up = match made.get(&(std::sync::Arc::as_ptr(&p.buf) as usize)) {
-            Some(img) => img.clone(),
-            None => e.upload_buf(&p.buf)?,
-        };
-        match &p.dof {
-            Some(d) => {
-                let pad = d.pad as f64;
-                texs.push((crate::bokeh::apply(e, &up, d)?, [p.buf.offset[0] + pad, p.buf.offset[1] + pad]));
+    // LVR1: an 8 bpc run keeps its planes as codes, in an atlas of codes: a quarter of the f32
+    // atlas, and no f32 copy of each plane first (N2's 14 glow planes: an 809 MB f32 atlas plus
+    // 809 MB of decoded planes per frame ran an 8 GB card out of memory). The kernel decodes each
+    // texel to the floats the f32 atlas would hold (`codes::classic3d_source`): the same pixels.
+    let (sizes, atlas) = match codes_planes(e, run, made) {
+        Some(parts) => {
+            let sizes: Vec<(u32, u32)> = parts.iter().map(|(c, _)| (c.width(), c.height())).collect();
+            let (aw, ah, pos) = pack(&sizes, e.g.max_dim)?;
+            if (aw as u64) * (ah as u64) * 4 > 2 << 30 {
+                return None;
             }
-            None => texs.push((up, p.buf.offset)),
+            let placed: Vec<_> = parts.iter().map(|(c, _)| c).zip(pos.iter().copied()).collect();
+            let atlas = crate::codes::atlas(e, &placed, aw, ah)?;
+            (parts.into_iter().map(|(c, off)| ((c.width(), c.height()), off)).zip(pos).collect::<Vec<_>>(), Atlas::Codes(atlas))
         }
-    }
-    let sizes: Vec<(u32, u32)> = texs.iter().map(|(t, _)| (t.width, t.height)).collect();
-    let (aw, ah, pos) = pack(&sizes, e.g.max_dim)?;
-    if (aw as u64) * (ah as u64) * 16 > 2 << 30 {
-        return None;
-    }
-    let atlas = e.image(aw, ah);
-    for ((t, _), &(x, y)) in texs.iter().zip(&pos) {
-        e.copy_into(t, &atlas, x, y);
-    }
+        None => {
+            // Plane textures: the layer uploads (cached per buffer), with bokeh depth of field
+            // blurred here when the plane has it.
+            let mut texs: Vec<(GpuImage, [f64; 2])> = Vec::with_capacity(run.planes.len());
+            for p in &run.planes {
+                let up = match made.get(&(std::sync::Arc::as_ptr(&p.buf) as usize)) {
+                    Some(img) => img.clone(),
+                    None => e.upload_buf(&p.buf)?,
+                };
+                match &p.dof {
+                    Some(d) => {
+                        let pad = d.pad as f64;
+                        texs.push((crate::bokeh::apply(e, &up, d)?, [p.buf.offset[0] + pad, p.buf.offset[1] + pad]));
+                    }
+                    None => texs.push((up, p.buf.offset)),
+                }
+            }
+            let sizes: Vec<(u32, u32)> = texs.iter().map(|(t, _)| (t.width, t.height)).collect();
+            let (aw, ah, pos) = pack(&sizes, e.g.max_dim)?;
+            if (aw as u64) * (ah as u64) * 16 > 2 << 30 {
+                return None;
+            }
+            let atlas = e.image(aw, ah);
+            for ((t, _), &(x, y)) in texs.iter().zip(&pos) {
+                e.copy_into(t, &atlas, x, y);
+            }
+            (texs.into_iter().map(|(t, off)| ((t.width, t.height), off)).zip(pos).collect::<Vec<_>>(), Atlas::F32(atlas))
+        }
+    };
     // Track mattes (shared by the planes of one layer).
     let mut mattes: Vec<f32> = vec![];
     let mut matte_ix: HashMap<usize, u32> = HashMap::new();
@@ -189,7 +208,7 @@ pub(crate) fn draw_run_made(e: &mut Enc, run: &Run3d, canvas: &GpuImage, made: &
     let mut planes = Words::default();
     let mut geos = Words::default();
     let mut n_geos = 0u32;
-    for ((p, (t, off)), &(ax, ay)) in run.planes.iter().zip(&texs).zip(&pos) {
+    for (p, &(((tw, th), off), (ax, ay))) in run.planes.iter().zip(&sizes) {
         let matte = match &p.matte {
             Some(m) if m.len() == n_px => {
                 let key = std::sync::Arc::as_ptr(m) as usize;
@@ -203,7 +222,7 @@ pub(crate) fn draw_run_made(e: &mut Enc, run: &Run3d, canvas: &GpuImage, made: &
             Some(_) => return None,
             None => 0,
         };
-        planes.f([ax as f32, ay as f32, t.width as f32, t.height as f32]);
+        planes.f([ax as f32, ay as f32, tw as f32, th as f32]);
         planes.d([off[0], off[1], p.buf.scale, if p.bicubic { 1.0 } else { 0.0 }]);
         planes.d(p.bbox.map(|v| v as f64));
         planes.d(p.bounds);
@@ -238,8 +257,59 @@ pub(crate) fn draw_run_made(e: &mut Enc, run: &Run3d, canvas: &GpuImage, made: &
     let mut p = Params::default();
     p.u[0] = [run.planes.len() as u32, run.lights.len() as u32, run.casters.len() as u32, 0];
     let out = e.scratch(w, h);
-    e.dispatch_ext("classic3d", &p, &atlas, Some(canvas), &out, Some(&mb), (w.div_ceil(16), h.div_ceil(16)), Some([&pb, &gb, &lb, &cb]));
+    let groups = (w.div_ceil(16), h.div_ceil(16));
+    match &atlas {
+        Atlas::F32(atlas) => e.dispatch_ext("classic3d", &p, atlas, Some(canvas), &out, Some(&mb), groups, Some([&pb, &gb, &lb, &cb])),
+        Atlas::Codes(atlas) => {
+            let g = e.g;
+            let (pipe, layout, lut) = g.codes.as_ref()?.classic3d_parts(&g.bgl_ext)?;
+            e.dispatch_views("classic3d", pipe, layout, &p, [atlas.view(), &canvas.view, &out.view], Some(&mb), groups, Some([&pb, &gb, &lb, &cb]), Some(lut));
+        }
+    }
     Some(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: this thread's runs use the f32 atlas (the codes atlas is compared against it).
+    pub(crate) static F32_ATLAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The plane atlas a run's kernel reads: f32, or 8 bpc codes (LVR1).
+enum Atlas {
+    F32(GpuImage),
+    Codes(crate::codes::CodeImage),
+}
+
+/// LVR1: every plane of `run` as codes, without changing a value ([`crate::codes::exact_codes`]),
+/// with its buffer offset; `None` (the f32 atlas) when one isn't on the 8 bpc grid, has depth of
+/// field (blurred in f32), or the codes Classic 3D kernel isn't there.
+fn codes_planes(e: &mut Enc, run: &Run3d, made: &HashMap<usize, GpuImage>) -> Option<Vec<(crate::codes::CodeImage, [f64; 2])>> {
+    #[cfg(test)]
+    if F32_ATLAS.with(std::cell::Cell::get) {
+        return None;
+    }
+    if run.planes.iter().any(|p| p.dof.is_some()) || !e.g.codes.as_ref()?.has_classic3d(&e.g.bgl_ext) {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(run.planes.len());
+    for p in &run.planes {
+        let px = match made.get(&(std::sync::Arc::as_ptr(&p.buf) as usize)) {
+            Some(img) => crate::codes::Pixels::Float(img.clone()),
+            None => e.upload_pixels(&p.buf)?,
+        };
+        // Checked for every plane before any is converted: a run that can't go as codes costs
+        // nothing here.
+        let exact = match &px {
+            crate::codes::Pixels::Codes(_) => true,
+            crate::codes::Pixels::Float(f) => f.levels == Some(crate::codes::LEVELS),
+        };
+        if !exact {
+            return None;
+        }
+        pixels.push((px, p.buf.offset));
+    }
+    pixels.into_iter().map(|(px, off)| crate::codes::exact_codes(e, &px).map(|c| (c, off))).collect()
 }
 
 #[cfg(test)]

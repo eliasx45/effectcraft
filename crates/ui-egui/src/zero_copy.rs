@@ -41,6 +41,18 @@ fn parse_choice(v: Option<&str>) -> Option<bool> {
     }
 }
 
+/// LVR1: whether the compositor may share the window's device on an adapter of `kind` reached
+/// through `backend`. Not on a discrete GPU on Vulkan or Direct3D 12 (unless [`ENV`] is `1`): its
+/// video memory is a fixed pool, and wgpu treats running out of it outside resource creation as a
+/// lost device. A compositor on the window's device that filled it lost the window's device, and
+/// the window closed (RTX 4060 Laptop, 8 GB, 6 Nov 2026); on a device of its own it is set up again
+/// and the window keeps drawing. Unified memory (Apple Silicon, integrated GPUs) and Metal share as
+/// before.
+pub(crate) fn shares_safely(backend: eframe::wgpu::Backend, kind: eframe::wgpu::DeviceType) -> bool {
+    use eframe::wgpu::{Backend, DeviceType};
+    env_choice() == Some(true) || kind != DeviceType::DiscreteGpu || !matches!(backend, Backend::Vulkan | Backend::Dx12)
+}
+
 /// The host's offer and what became of it.
 #[derive(Default)]
 pub struct ZeroCopy {
@@ -97,6 +109,22 @@ pub(crate) fn hold_for_new_viewport(app: &crate::EffectcraftApp, ctx: &egui::Con
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LVR1: a discrete Vulkan / Direct3D 12 card keeps the compositor off the window's device;
+    /// unified memory and Metal (the Mac) share as before.
+    #[test]
+    fn discrete_cards_keep_the_compositor_off_the_window_device() {
+        use eframe::wgpu::{Backend, DeviceType};
+        if env_choice() == Some(true) {
+            return;
+        }
+        assert!(!shares_safely(Backend::Vulkan, DeviceType::DiscreteGpu));
+        assert!(!shares_safely(Backend::Dx12, DeviceType::DiscreteGpu));
+        assert!(shares_safely(Backend::Metal, DeviceType::IntegratedGpu), "Apple Silicon unchanged");
+        assert!(shares_safely(Backend::Metal, DeviceType::DiscreteGpu), "Metal checks no budgets");
+        assert!(shares_safely(Backend::Vulkan, DeviceType::IntegratedGpu));
+        assert!(shares_safely(Backend::Dx12, DeviceType::IntegratedGpu));
+    }
 
     #[test]
     fn kill_switch_values() {

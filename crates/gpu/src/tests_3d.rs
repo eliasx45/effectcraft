@@ -219,6 +219,41 @@ fn the_gpu_draws_classic_3d_runs_itself() {
     assert!(d.over * 200 <= d.total, "{d:?}");
 }
 
+/// LVR1: an 8 bpc run's planes go to the kernel as codes (a quarter of the f32 atlas) and render
+/// the same pixels, bit for bit, as the f32 atlas.
+#[test]
+fn an_8_bpc_run_reads_a_codes_atlas_with_the_same_pixels() {
+    let Some(g) = gpu() else { return };
+    if g.context().codes.is_none() {
+        return;
+    }
+    for mode in [BlendMode::Normal, BlendMode::Add, BlendMode::Screen] {
+        let s = crossing(BitDepth::Bpc8, mode);
+        let r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        let ctx = r.eval_ctx(s.cid, Tick::ZERO).unwrap();
+        let run: Vec<_> = r.visible_layers(&ctx).into_iter().filter(|l| l.is_3d()).collect();
+        let prep = r.prepare_3d_run(&ctx, &run, (W, H)).expect("a classic run is prepared for the GPU");
+        let draw = |f32_atlas: bool| {
+            crate::classic3d::F32_ATLAS.with(|c| c.set(f32_atlas));
+            let before = g.codes_stats().map_or(0, |s| s.0);
+            let mut e = crate::context::Enc::new(g.context());
+            let canvas = e.image(W, H);
+            let out = crate::classic3d::draw_run(&mut e, &prep, &canvas).expect("the kernel draws the run");
+            let img = e.download(&out).unwrap();
+            crate::classic3d::F32_ATLAS.with(|c| c.set(false));
+            (img, g.codes_stats().map_or(0, |s| s.0) > before)
+        };
+        let (codes, used_codes) = draw(false);
+        let (f32s, _) = draw(true);
+        assert!(used_codes, "{mode:?}: the 8 bpc planes went as codes");
+        assert_eq!(codes.data.len(), f32s.data.len());
+        for (i, (a, b)) in codes.data.iter().zip(&f32s.data).enumerate() {
+            assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits), "{mode:?}: pixel {i}");
+        }
+        assert!(codes.data.iter().any(|p| p[3] > 0.5), "{mode:?}: the planes drew something");
+    }
+}
+
 /// Classic 3D bokeh depth of field runs on the GPU: iris shapes, highlights, fringe, Fast
 /// Rectangle and a tilted plane (progressive blur) match the CPU.
 #[test]

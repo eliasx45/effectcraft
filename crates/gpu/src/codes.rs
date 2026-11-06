@@ -181,6 +181,8 @@ pub(crate) struct Bank {
     display: OnceLock<Result<Variant, String>>,
     /// Effect kernels reading codes: [`FX_SRC`] by `src`, [`FX_AUX`] by `aux` (f32 out).
     fx: [OnceLock<Result<Variant, String>>; 2],
+    /// LVR1: Classic 3D reading its plane atlas as codes ([`classic3d_source`]).
+    classic3d: OnceLock<Result<Variant, String>>,
     /// Codes decoded for a float-only consumer (diagnostics, tests).
     pub(crate) promotions: AtomicU64,
     /// Passes that read or wrote codes (diagnostics, tests).
@@ -212,6 +214,7 @@ impl Bank {
             variants: Default::default(),
             display: OnceLock::new(),
             fx: Default::default(),
+            classic3d: OnceLock::new(),
             promotions: AtomicU64::new(0),
             dispatches: AtomicU64::new(0),
             sites: Default::default(),
@@ -266,6 +269,33 @@ impl Bank {
 
     fn display_variant(&self) -> Result<&Variant, &String> {
         self.display.get_or_init(|| build_display(&self.device)).as_ref()
+    }
+
+    /// LVR1: Classic 3D reading its plane atlas as codes: its pipeline, group 0 layout and the
+    /// decode table (`ext`: the device's group 1 layout, the f32 kernel's). `None` when it doesn't
+    /// build (the run uses the f32 atlas as before) or [`CLASSIC3D_ENV`] is `0`.
+    pub(crate) fn classic3d_parts(&self, ext: &wgpu::BindGroupLayout) -> Option<(&wgpu::ComputePipeline, &wgpu::BindGroupLayout, &wgpu::Buffer)> {
+        let v = self.classic3d_variant(ext)?;
+        let (_, pipe) = v.pipes.first()?;
+        self.dispatches.fetch_add(1, Relaxed);
+        Some((pipe, &v.layout, &self.lut))
+    }
+
+    /// Whether [`Bank::classic3d_parts`] has a pipeline (built now if not yet), without counting it.
+    pub(crate) fn has_classic3d(&self, ext: &wgpu::BindGroupLayout) -> bool {
+        self.classic3d_variant(ext).is_some()
+    }
+
+    /// Build [`Bank::classic3d_parts`]'s pipeline now (a startup worker), without counting it.
+    pub(crate) fn warm_classic3d(&self, ext: &wgpu::BindGroupLayout) {
+        let _ = self.classic3d_variant(ext);
+    }
+
+    fn classic3d_variant(&self, ext: &wgpu::BindGroupLayout) -> Option<&Variant> {
+        if !classic3d_enabled() {
+            return None;
+        }
+        self.classic3d.get_or_init(|| build_classic3d(&self.device, ext)).as_ref().ok()
     }
 
     /// Whether kernel `entry` exists for `io` (a producer asks before choosing codes output).
@@ -591,6 +621,73 @@ pub(crate) fn fx_source(aux: bool) -> Result<String, String> {
     Ok(text)
 }
 
+const CLASSIC3D: &str = include_str!("shaders/classic3d.wgsl");
+
+/// LVR1: `0` keeps Classic 3D's plane atlas f32 (A/B in one binary; the f32 atlas renders the
+/// same pixels with four times the memory).
+pub const CLASSIC3D_ENV: &str = "EFFECTCRAFT_CLASSIC3D_CODES";
+
+fn classic3d_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var(CLASSIC3D_ENV).map_or(true, |v| v.trim() != "0"))
+}
+
+/// LVR1: the WGSL of Classic 3D (`classic3d.wgsl`) reading its plane atlas `src` as codes, each
+/// texel decoded through the table before any interpolation (as [`source`] does for the
+/// compositor kernels): the same floats as the f32 atlas, which holds the planes' decoded codes,
+/// so the same pixels. A plane atlas of codes is a quarter of the f32 one (an 809 MB atlas of 14
+/// glow planes ran an 8 GB card out of memory, 6 Nov 2026).
+pub(crate) fn classic3d_source() -> Result<String, String> {
+    let mut common = COMMON.to_owned();
+    common = subst(&common, "var src: texture_2d<f32>;", "var src: texture_2d<u32>;", 1)?;
+    common = subst(&common, "(t: texture_2d<f32>,", "(t: texture_2d<u32>,", 6)?;
+    common = subst(&common, "return textureLoad(t, vec2<i32>(x, y), 0);", "return dec(textureLoad(t, vec2<i32>(x, y), 0));", 1)?;
+    common = subst(
+        &common,
+        "return textureLoad(t, vec2<i32>(clamp(x, 0, d.x - 1), clamp(y, 0, d.y - 1)), 0);",
+        "return dec(textureLoad(t, vec2<i32>(clamp(x, 0, d.x - 1), clamp(y, 0, d.y - 1)), 0));",
+        1,
+    )?;
+    let c3d = subst(
+        CLASSIC3D,
+        "return textureLoad(src, vec2<i32>(i32(r.x) + x, i32(r.y) + y), 0);",
+        "return dec(textureLoad(src, vec2<i32>(i32(r.x) + x, i32(r.y) + y), 0));",
+        1,
+    )?;
+    let out_dims = function(KERNELS, "out_dims")?;
+    Ok(format!("{common}\n{DECODE}\n@group(0) @binding(3) var out: texture_storage_2d<rgba32float, write>;\n{out_dims}\n{c3d}\n"))
+}
+
+/// LVR1: `p` as codes without changing a value: codes as they are, or floats already on the
+/// 8 bpc grid (`levels` 255: [`crate::ops::quantize`]'s output) quantised again into codes,
+/// which gives back each code (quantising is idempotent there). `None` for floats off the grid
+/// (16/32 bpc, depth of field, anything not yet quantised) or without the kernels.
+pub(crate) fn exact_codes(e: &mut Enc, p: &Pixels) -> Option<CodeImage> {
+    match p {
+        Pixels::Codes(c) => Some(c.clone()),
+        Pixels::Float(f) if f.levels == Some(LEVELS) && e.g.codes.as_ref()?.has("quantize", Io { src: false, aux: false, out: true }) => {
+            let out = Pixels::Codes(e.scratch_codes(f.width, f.height)?);
+            let mut q = Params::default();
+            q.f[0][0] = LEVELS;
+            q.f[0][1] = 1.0 / LEVELS;
+            pixels(e, "quantize", &q, p, None, &out, None);
+            let Pixels::Codes(c) = out else { return None };
+            Some(c)
+        }
+        Pixels::Float(_) => None,
+    }
+}
+
+/// LVR1: a codes atlas `w` × `h` holding `parts` at their positions (texels outside them are
+/// never read: Classic 3D reads a plane's own rectangle only). `None` when it can't be made.
+pub(crate) fn atlas(e: &mut Enc, parts: &[(&CodeImage, (u32, u32))], w: u32, h: u32) -> Option<CodeImage> {
+    let atlas = e.scratch_codes(w, h)?;
+    for (c, (x, y)) in parts {
+        e.copy_into(&c.0, &atlas.0, *x, *y);
+    }
+    Some(atlas)
+}
+
 /// The WGSL of the codes `display` pass.
 pub(crate) fn display_source() -> Result<String, String> {
     let mut d = subst(DISPLAY, "var dsrc: texture_2d<f32>;", "var dsrc: texture_2d<u32>;", 1)?;
@@ -681,6 +778,44 @@ fn build_fx(device: &wgpu::Device, aux: bool) -> Result<Variant, String> {
     compile(device, "8 bpc codes effect kernels", fx_source(aux)?, &layout, fx_entries(aux))
 }
 
+/// LVR1: [`classic3d_source`]'s pipeline: group 0 as the compositor's codes variants (atlas
+/// `src` as codes, canvas `aux` f32, out f32, track mattes, the table), group 1 the device's
+/// `ext` layout (planes, geometries, lights, casters).
+fn build_classic3d(device: &wgpu::Device, ext: &wgpu::BindGroupLayout) -> Result<Variant, String> {
+    let label = "8 bpc codes classic3d";
+    let text = classic3d_source()?;
+    let entries = [
+        buffer_entry(0, wgpu::BufferBindingType::Uniform),
+        texture_entry(1, true),
+        texture_entry(2, false),
+        storage_texture_entry(3, crate::context::FORMAT),
+        buffer_entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
+        buffer_entry(6, wgpu::BufferBindingType::Storage { read_only: true }),
+    ];
+    let module = init_resource(device, label, || {
+        device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(text.into()) })
+    })?;
+    let layout = init_resource(device, label, || device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries: &entries }))?;
+    let pl = init_resource(device, label, || {
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(label),
+            bind_group_layouts: &[Some(&layout), Some(ext)],
+            immediate_size: 0,
+        })
+    })?;
+    let pipe = init_resource(device, label, || {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("classic3d"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    })?;
+    Ok(Variant { layout, pipes: vec![("classic3d", pipe)] })
+}
+
 fn build_display(device: &wgpu::Device) -> Result<Variant, String> {
     let entries = [
         texture_entry(1, true),
@@ -722,6 +857,11 @@ mod tests {
             }
         }
         display_source().unwrap();
+        // LVR1: Classic 3D reads its atlas through the decoder only.
+        let c3d = classic3d_source().unwrap();
+        assert!(c3d.contains("fn classic3d(") && c3d.contains("fn out_dims("));
+        assert_eq!(c3d.matches("textureLoad(src, ").count(), 1, "classic3d reads src undecoded");
+        assert!(c3d.contains("return dec(textureLoad(src, vec2<i32>(i32(r.x) + x, i32(r.y) + y), 0));"));
         for aux in [false, true] {
             let s = fx_source(aux).unwrap_or_else(|e| panic!("fx {aux}: {e}"));
             for name in fx_entries(aux) {

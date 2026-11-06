@@ -463,10 +463,12 @@ fn wgpu_options(backends: Option<eframe::wgpu::Backends>, gate: Option<std::sync
         // Iris Pro: the device is lost and the window never opens.
         // `WGPU_VALIDATION_INDIRECT_CALL=1` turns the check back on.
         setup.instance_descriptor.flags = setup.instance_descriptor.flags.difference(eframe::wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL).with_env();
-        // CR1: on Vulkan and Direct3D 12 a texture past 90 % of the video memory budget fails
+        // CR1: on Vulkan and Direct3D 12 a texture past the video memory budget threshold fails
         // with an out-of-memory error the frame's error scope catches (the GPU preview backs off)
-        // instead of overcommitting until the device is lost (`effectcraft_gpu::vram`).
-        setup.instance_descriptor.memory_budget_thresholds = eframe::wgpu::MemoryBudgetThresholds { for_resource_creation: Some(90), for_device_loss: None };
+        // instead of overcommitting until the device is lost (`effectcraft_gpu::vram`). LVR1: the
+        // window's threshold (97 %) sits above the compositor's (85 %), so a compositor that fills
+        // its share can't make the window's own staging buffers fail and lose its device.
+        setup.instance_descriptor.memory_budget_thresholds = effectcraft_ui_egui::gpu_vram::window_budget_thresholds();
         setup.device_descriptor = std::sync::Arc::new(|adapter| device_descriptor(adapter.limits()));
     }
     config

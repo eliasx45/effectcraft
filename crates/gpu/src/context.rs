@@ -421,6 +421,9 @@ fn cache_budgets(layer_cache: usize, integrated: bool, memory: u64) -> (usize, u
 /// ~1.7 GiB; at 1.5 GiB they evicted each other every frame and re-rendered on the CPU).
 fn retained_cap_for(integrated: bool, memory: u64) -> usize {
     const GIB: u64 = 1 << 30;
+    if !integrated && memory > 0 && memory < SMALL_VRAM {
+        return small_vram_cap(memory / 8, 256 << 20, UPLOAD_BUDGET);
+    }
     let cap = match integrated {
         true if memory >= 32 * GIB => RETAINED_MAX as u64,
         false if memory >= 16 * GIB => (memory / 8).min(RETAINED_MAX as u64),
@@ -454,7 +457,22 @@ fn unified_pool_cap(system_memory: u64) -> usize {
 /// 12 GiB on, up to [`DISCRETE_POOL_MAX`] (CR1: 1.5 GiB on a 24 GB card, where many frames
 /// render at once and a 768 MiB pool misses).
 fn discrete_pool_cap(vram: u64) -> usize {
+    if vram > 0 && vram < SMALL_VRAM {
+        return small_vram_cap(vram / 16, 128 << 20, POOL_BUDGET);
+    }
     usize::try_from(vram / 16).unwrap_or(DISCRETE_POOL_MAX).clamp(POOL_BUDGET, DISCRETE_POOL_MAX)
+}
+
+/// LVR1: below this much video memory a discrete GPU's caches follow it ([`retained_cap_for`]:
+/// an eighth; [`discrete_pool_cap`]: a sixteenth) instead of the fixed 1.5 GiB + 768 MiB, which on
+/// an 8 GB card (7.2 GB of driver budget) left too little for the frames themselves (RTX 4060
+/// Laptop, 6 Nov 2026: the retained uploads filled their 1.5 GiB while frames ran out). From
+/// 12 GiB on, unchanged.
+const SMALL_VRAM: u64 = 12 << 30;
+
+/// `bytes` as a cache cap, within `floor..=ceiling`.
+fn small_vram_cap(bytes: u64, floor: usize, ceiling: usize) -> usize {
+    usize::try_from(bytes).unwrap_or(ceiling).clamp(floor, ceiling)
 }
 
 /// Largest working-texture pool on a discrete GPU (see [`discrete_pool_cap`]).
@@ -962,7 +980,7 @@ pub struct GpuContext {
     upload_full_warned: std::sync::atomic::AtomicBool,
     auxiliary_budget: std::sync::atomic::AtomicU64,
     pub(crate) bgl: wgpu::BindGroupLayout,
-    bgl_ext: wgpu::BindGroupLayout,
+    pub(crate) bgl_ext: wgpu::BindGroupLayout,
     pub(crate) fusion: crate::fusion::Pipelines,
     pub(crate) yuv: Option<crate::yuv::Pipelines>,
     /// The compositor's own kernels (built with the context).
@@ -1936,6 +1954,35 @@ impl GpuContext {
         )
     }
 
+    /// LVR1: a device of its own on the window's adapter `window`, made through an instance of
+    /// its own whose memory budget threshold is the compositor's
+    /// ([`crate::vram::compositor_budget_thresholds`]), below the window device's: the window
+    /// keeps room for its own allocations when the compositor fills its share. `None` where wgpu
+    /// doesn't check budgets (Metal, OpenGL: the window's instance is as good) or no adapter of
+    /// that instance is the window's.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn request_own_instance(window: &wgpu::AdapterInfo) -> Option<Result<GpuContext, String>> {
+        if !crate::vram::budget_checked(window.backend) {
+            return None;
+        }
+        let backends = wgpu::Backends::from(window.backend);
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = backends;
+        desc.memory_budget_thresholds = crate::vram::compositor_budget_thresholds();
+        let instance = wgpu::Instance::new(desc);
+        let adapters = instance.enumerate_adapters(backends).await;
+        let adapter = adapters.iter().find(|a| same_adapter(&a.get_info(), window))?;
+        Some(
+            Self::request_on_adapter(adapter)
+                .await
+                .map(|mut context| {
+                    context.own_instance = true;
+                    context
+                })
+                .map_err(|e| format!("{} ({:?}): {e}", window.name, window.backend)),
+        )
+    }
+
     /// Request a separate device on an existing adapter (the desktop window's adapter).
     pub async fn request_on_adapter(adapter: &wgpu::Adapter) -> Result<GpuContext, String> {
         let limits = adapter.limits();
@@ -2885,6 +2932,14 @@ impl Drop for GpuContext {
         clear_retained(&self.uploads);
         self.mips.clear();
     }
+}
+
+/// Whether `a` and `b` describe the same GPU through the same API (two instances enumerate the
+/// same adapter anew): backend, vendor, device and kind, and the PCI bus where both report one (two
+/// identical cards differ only there).
+fn same_adapter(a: &wgpu::AdapterInfo, b: &wgpu::AdapterInfo) -> bool {
+    let bus = a.device_pci_bus_id.is_empty() || b.device_pci_bus_id.is_empty() || a.device_pci_bus_id == b.device_pci_bus_id;
+    a.backend == b.backend && a.vendor == b.vendor && a.device == b.device && a.device_type == b.device_type && a.name == b.name && bus
 }
 
 fn profile_features(available: wgpu::Features) -> wgpu::Features {
@@ -4476,12 +4531,40 @@ mod upload_budget_tests {
         assert_eq!(cache_budgets(usize::MAX, false, 0), (UPLOAD_BUDGET, POOL_BUDGET, AUX_CACHE_BUDGET));
     }
 
+    /// LVR1: the compositor's own instance finds the window's adapter again by what identifies it.
+    #[test]
+    fn same_adapter_matches_the_window_adapter_only() {
+        let info = |name: &str, device: u32, bus: &str| wgpu::AdapterInfo {
+            name: name.into(),
+            vendor: 0x10de,
+            device,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            device_pci_bus_id: bus.into(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Vulkan,
+            subgroup_min_size: 32,
+            subgroup_max_size: 32,
+            transient_saves_memory: None,
+            limit_bucket: None,
+        };
+        let window = info("RTX 4060", 0x28e0, "0000:01:00.0");
+        assert!(same_adapter(&window, &info("RTX 4060", 0x28e0, "0000:01:00.0")));
+        assert!(same_adapter(&window, &info("RTX 4060", 0x28e0, "")), "a bus id one side lacks doesn't count");
+        assert!(!same_adapter(&window, &info("RTX 4060", 0x28e0, "0000:02:00.0")), "a second identical card");
+        assert!(!same_adapter(&window, &info("RTX 4070", 0x2860, "0000:01:00.0")));
+        assert!(!same_adapter(&window, &wgpu::AdapterInfo { backend: wgpu::Backend::Dx12, ..window.clone() }));
+    }
+
     /// Big video memory (or shared RAM) retains more; the layer budget still bounds it.
     #[test]
     fn retained_ceiling_grows_with_memory() {
         const GIB: u64 = 1 << 30;
         let retained = |layer: usize, integrated: bool, memory: u64| cache_budgets(layer, integrated, memory).0;
-        assert_eq!(retained(usize::MAX, false, 8 * GIB), UPLOAD_BUDGET);
+        assert_eq!(retained(usize::MAX, false, 8 * GIB), 1 << 30, "LVR1: an eighth below 12 GiB");
+        assert_eq!(retained(usize::MAX, false, 12 * GIB), UPLOAD_BUDGET);
+        assert_eq!(retained(usize::MAX, false, 0), UPLOAD_BUDGET, "unknown video memory: unchanged");
+        assert_eq!(retained(usize::MAX, false, GIB), 256 << 20, "never under 256 MiB");
         assert_eq!(retained(usize::MAX, false, 16 * GIB), 2 << 30);
         assert_eq!(retained(usize::MAX, false, 24 * GIB), RETAINED_MAX);
         assert_eq!(retained(usize::MAX, false, 80 * GIB), RETAINED_MAX);
@@ -4505,7 +4588,7 @@ mod upload_budget_tests {
         assert_eq!(pool(usize::MAX, true, 64 * GIB), POOL_BUDGET);
         assert_eq!(pool(usize::MAX, true, u64::MAX), POOL_BUDGET);
         assert_eq!(pool(1 << 30, true, 64 * GIB), 512 << 20);
-        assert_eq!(pool(usize::MAX, false, 8 * GIB), POOL_BUDGET);
+        assert_eq!(pool(usize::MAX, false, 16 * GIB), 1 << 30);
         // Scratch caches keep their unified-memory caps.
         assert_eq!(cache_budgets(usize::MAX, true, 64 * GIB).2, 32 << 20);
     }
@@ -4518,7 +4601,8 @@ mod upload_budget_tests {
         const GIB: u64 = 1 << 30;
         let pool = |layer: usize, vram: u64| cache_budgets(layer, false, vram).1;
         assert_eq!(pool(usize::MAX, 0), POOL_BUDGET);
-        assert_eq!(pool(usize::MAX, 8 * GIB), POOL_BUDGET);
+        assert_eq!(pool(usize::MAX, 8 * GIB), 512 << 20, "LVR1: a sixteenth below 12 GiB");
+        assert_eq!(pool(usize::MAX, GIB), 128 << 20, "never under 128 MiB");
         assert_eq!(pool(usize::MAX, 12 * GIB), POOL_BUDGET);
         assert_eq!(pool(usize::MAX, 24 * GIB), 1536 << 20);
         assert_eq!(pool(usize::MAX, 48 * GIB), DISCRETE_POOL_MAX);

@@ -162,6 +162,8 @@ impl Gpu {
         crate::particles::warm(&self.ctx)?;
         if let Some(bank) = &self.ctx.codes {
             bank.warm().unwrap_or_else(|e| log::warn!("gpu: 8 bpc codes kernels: {e}"));
+            // LVR1: Classic 3D's codes variant, so the first 3D frame doesn't wait for it.
+            bank.warm_classic3d(&self.ctx.bgl_ext);
         }
         self.ctx.check_health()
     }
@@ -223,6 +225,14 @@ impl Gpu {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn request_off_window(window: &wgpu::AdapterInfo) -> Option<Result<Gpu, String>> {
         GpuContext::request_off_window(window).await.map(|r| r.map(Gpu::from_context))
+    }
+
+    /// LVR1: a device of its own on the window's adapter, through an instance whose memory
+    /// budget threshold sits below the window device's (see [`GpuContext::request_own_instance`]):
+    /// `None` where budgets aren't checked (Metal, OpenGL) or the adapter isn't found again.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn request_own_instance(window: &wgpu::AdapterInfo) -> Option<Result<Gpu, String>> {
+        GpuContext::request_own_instance(window).await.map(|r| r.map(Gpu::from_context))
     }
 
     /// A weak handle on this compositor's device: dead once every clone is dropped, and its

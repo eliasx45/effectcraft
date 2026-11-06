@@ -31,6 +31,8 @@ use effectcraft_engine::Session;
 use effectcraft_engine::project::ItemId;
 use effectcraft_engine::render::RenderOpts;
 use effectcraft_engine::time::Tick;
+/// The video memory budget thresholds the host's window device takes (LVR1).
+pub use effectcraft_gpu::vram as gpu_vram;
 use frames::{FrameKey, Frames, RenderSource};
 use serde_json::json;
 use state::UiState;
@@ -75,6 +77,20 @@ fn compositor_gpu(
                 None => log::info!("GPU compositor: no adapter better than the window's {} ({:?}, {:?})", window.name, window.backend, window.device_type),
             }
         }
+        // LVR1: on a discrete card the window's device is not shared (see
+        // `zero_copy::shares_safely`): the compositor gets a device of its own below.
+        let share = share.filter(|_| {
+            let safe = zero_copy::shares_safely(window.backend, window.device_type);
+            if !safe {
+                log::info!(
+                    "GPU compositor on a device of its own next to the window's {} ({:?}, {:?}): running out of video memory can't close the window",
+                    window.name,
+                    window.backend,
+                    window.device_type
+                );
+            }
+            safe
+        });
         if let Some(light) = share {
             let gpu = effectcraft_gpu::Gpu::new(adapter, device, queue)?;
             if let Some(light) = light {
@@ -83,6 +99,16 @@ fn compositor_gpu(
             return Ok(gpu);
         }
         let _ = (device, queue);
+        // LVR1: through an instance of its own whose budget threshold leaves the window room
+        // (Vulkan, Direct3D 12; elsewhere the window's instance, as before).
+        match pollster::block_on(effectcraft_gpu::Gpu::request_own_instance(&window)) {
+            Some(Ok(gpu)) => return Ok(gpu),
+            Some(Err(e)) => log::info!("GPU compositor: no device on an instance of its own: {e}"),
+            None if effectcraft_gpu::vram::budget_checked(window.backend) => {
+                log::info!("GPU compositor: {} not found on an instance of its own", window.name)
+            }
+            None => {}
+        }
         pollster::block_on(effectcraft_gpu::Gpu::request_on_adapter(adapter))
     }
     #[cfg(target_arch = "wasm32")]
