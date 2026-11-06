@@ -297,3 +297,36 @@ whole (on 30 Oct an embedded EffectCraft had 28 GB of GPU memory swapped out and
   5.05), 4K 422 HQ 7.79 → 7.60 ms (7.84 → 7.46); no transient split planes (133 MB a 4K
   4444+alpha frame, 66 MB 4K 4:2:2). The preview read (decode + GPU) is dominated by the decode:
   4K 4444+alpha 9.8 ms wall either way.
+
+## Amendment (2026-11-06): hardware H.264 encoding for fast exports (E2b)
+
+**Status:** accepted (2026-11-06, approved by the project owner, Elias, as "E2" of the export
+speed plan: "ok"). His 12 Oct "no hardware H.264" decision was about footage *decoding*.
+
+H.264 exports encoded every frame with FilmCraft's pure-Rust encoder: about half the wall time of
+a GPU H.264 export of C0666 MAIN (10 s at 1080p). The sixth job of this crate is hardware **H.264
+encoding**, opt-in, under the same containment rules:
+
+- FFI module `videotoolbox_h264` (`#[allow(unsafe_code)]`, every block with `// SAFETY:`; the
+  output callback runs under `catch_unwind`): one `VTCompressionSession` per movie, hardware
+  encoder required, High profile (auto level), average bit rate = the output module's, a key frame
+  at most every 2 s, **no frame reordering** (no B-frames: samples come out in presentation order,
+  so the MP4 needs no composition offsets or edit), BT.709 tags. Pictures go in as `420v` from the
+  session's IOSurface pool, asynchronously; the frame refcon carries the picture index (not a
+  pointer); SPS / PPS are read from each key frame's format description (4-byte NAL lengths
+  checked).
+- Safe code around it: `prores_pack::pack_nv12` (planar 4:2:0 into the buffer) and `h264_enc`
+  (sizes 64..=4096, even; parameter sets must not change mid-stream).
+- The hook is `effectcraft_media::h264_hw` (`register` / `open`, a session trait). The movie
+  exporter uses it **only when asked** (`effectcraft_export::speed::set_hardware_h264`,
+  `effectcraft-cli render --hw-h264` or `--fast`): its bits differ from FilmCraft's encoder and it
+  exists only on Macs. No session, or a failure on the first frames: the whole movie encodes in
+  software. A failure later: one new session (it starts with an IDR) continues the stream if its
+  parameter sets match; otherwise the export fails with an error naming the flag.
+- Measured on C0666 MAIN 100–110 s (GPU render): PSNR against the GPU ProRes HQ export 48.1 dB
+  average (min 44.2), the software encoder's 48.1 dB (min 42.2); the file 1 % larger at the same
+  target bitrate.
+
+Also opt-in since 2026-11-06 (E3, `render --hw-decode` / `--fast`): a draft export may read
+footage through the media pool's preview view, so the hardware **decoders** above serve exports
+too. Default exports still decode exactly (`Job::source` → `FootageSource::exact`).

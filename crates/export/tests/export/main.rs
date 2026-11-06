@@ -19,6 +19,8 @@ fn every_test_file_is_a_module() {
 
 #[path = "../audio_sample_positions.rs"]
 mod audio_sample_positions;
+#[path = "../h264_groups.rs"]
+mod h264_groups;
 #[path = "../hevc_av1_roundtrip.rs"]
 mod hevc_av1_roundtrip;
 #[path = "../mov_audio_sample_positions.rs"]

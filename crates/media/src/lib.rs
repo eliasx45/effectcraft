@@ -21,6 +21,7 @@ pub mod downmix;
 mod dpx;
 pub mod exr_channels;
 mod gif_anim;
+pub mod h264_hw;
 pub mod hw;
 mod layered;
 mod open;

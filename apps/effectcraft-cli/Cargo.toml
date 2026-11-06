@@ -22,6 +22,8 @@ ui = ["effectcraft-ui-egui/offscreen"]
 [dependencies]
 effectcraft-engine = { workspace = true }
 effectcraft-host = { workspace = true }
+# `render --hw-h264 / --hw-decode / --fast`: the export speed switches (effectcraft_export::speed).
+effectcraft-export = { workspace = true }
 effectcraft-automation = { workspace = true }
 effectcraft-ui-egui = { workspace = true }
 # Fork-only: hardware ProRes decoding for previews (docs/adr/0001-platform-ffi.md).

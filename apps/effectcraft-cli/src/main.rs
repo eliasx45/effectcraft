@@ -15,6 +15,7 @@
 //!     [--jpeg-quality N] [--bitrate KBPS] [--prores proxy|lt|standard|hq|4444|4444xq] [--audio auto|on|off]
 //!     [--profile main|main10] [--level auto|4.1] [--rate-control bitrate|quality] [--video-quality 1-100]
 //!     [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice]
+//!     [--cpu] [--hw-h264] [--hw-decode] [--fast]
 //!     (a relative --out is relative to the working directory; --queue outputs follow the project's own settings)
 //! effectcraft-cli render --template T.ectemplate [--values V.json] --out FILE
 //! effectcraft-cli render-frame --template T.ectemplate [--values V.json] [--time S] [--out F.png]
@@ -35,8 +36,9 @@
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
 //! Saving:   --save (back to --project) | --save-as F.ecproj
-//! GPU:      --gpu renders on the GPU compositor (Mercury GPU Acceleration) when an adapter exists;
-//!           the default is the CPU (Mercury Software Only)
+//! GPU:      `render` renders on the GPU compositor (Mercury GPU Acceleration, as the app's Render
+//!           Queue) when the project asks for it and an adapter exists, else on the CPU; `--cpu`
+//!           forces the CPU. Other commands render on the CPU unless started with --gpu.
 //! Bridge:   --bridge PORT drives a running `effectcraft --control PORT` instead of a headless session
 //! UI:       mcp --ui [--ui-size WxH] [--ui-scale K] runs the full app offscreen (no window) for
 //!           screenshot and the ui_* tools (feature `ui`, on by default); with --autosave its
@@ -123,9 +125,17 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
          [--jpeg-quality N] [--bitrate KBPS] [--prores PROFILE] [--audio auto|on|off]
          [--profile main|main10] [--level auto|4.1] [--rate-control bitrate|quality] [--video-quality N]
          [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice] | --queue
+         [--cpu] [--hw-h264] [--hw-decode] [--fast]
                                            (formats h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff;
                                            --profile..--keyint: HEVC / AV1, --audio-bitrate/--opus-app: WebM Opus)
                                            a relative --out is relative to the working directory
+                                           renders on the GPU when the project uses Mercury GPU Acceleration
+                                           and a GPU is usable (else the CPU); --cpu: always the CPU
+                                           H.264 encodes 2 s keyframe groups on several encoders at once
+                                           (EFFECTCRAFT_H264_PARALLEL=0: one encoder)
+                                           draft / fast exports (not bit-exact): --hw-h264 encodes H.264 on
+                                           the hardware encoder (macOS), --hw-decode decodes footage on the
+                                           hardware decoders, --fast = both
   compare A.png B.png [--threshold L] [--min-psnr DB] [--max-side PX] [--amplify K] [--diff D.png]
                                            compare two PNG/JPEG images (max/mean abs diff, PSNR, SSIM, changed
                                            pixels; --diff writes a heatmap); exit 1 when they don't pass
@@ -285,6 +295,10 @@ const FLAGS: &[&str] = &[
     "--rt-warm",
     "--rt-checksum",
     "--hw-prores",
+    "--hw-h264",
+    "--hw-decode",
+    "--fast",
+    "--cpu",
     "--rt-drag",
     "--rt-warmup",
     "--json",
@@ -448,7 +462,8 @@ fn main() {
         _ => fail_usage("--frame-threads: expected a whole number of at least 1"),
     }
     // Hardware ProRes decoding for previews (the app's Settings ▸ Previews ▸ Hardware ProRes
-    // Decoding; a CLI session turns it on with `bench --hw-prores`). Exports always decode exactly.
+    // Decoding; a CLI session turns it on with `bench --hw-prores`). Exports decode exactly unless
+    // `render --hw-decode` / `--fast` asks for a draft export.
     let _ = effectcraft_platform::register();
     let cmd = args.pos.remove(0);
     match run(&cmd, &args, json_out) {
@@ -741,6 +756,11 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     }
     if args.flag("--all-tools") && cmd != "mcp" {
         return usage_err("--all-tools is only supported by mcp");
+    }
+    if cmd != "render"
+        && let Some(o) = ["--cpu", "--hw-h264", "--hw-decode", "--fast"].into_iter().find(|o| args.flag(o))
+    {
+        return usage_err(&format!("{o} is only supported by render"));
     }
     if cmd != "mcp" {
         if let Some(o) = ["--ui", "--ui-size", "--ui-scale"].into_iter().find(|o| args.opts.iter().any(|(k, _)| k == o)) {
@@ -1143,6 +1163,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
     if args.opt("--bridge").is_some() {
         return usage_err("render runs headless; use `exec renderQueue.add` / `renderQueue.render` with --bridge");
     }
+    let speed = RenderSpeed::of(args)?;
     let mut s = session(args)?;
     if args.opt("--template").is_some() {
         template::prepare(&mut s, args)?;
@@ -1151,6 +1172,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
     } else if args.flag("--demo") || !args.flag("--empty") {
         s.execute("file.openDemoProject", json!({})).map_err(|e| Failure::Error(e.to_string()))?;
     }
+    speed.apply(&mut s);
     let err = |e: effectcraft_engine::EngineError| Failure::Error(e.to_string());
     if !args.flag("--queue") {
         let Some(out) = args.opt("--out") else { return usage_err("render: --out FILE is required (or --queue)") };
@@ -1272,6 +1294,54 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         emit(&json!({"rendered": results}), true);
     }
     Ok(())
+}
+
+/// How `render` renders and encodes (E1–E3, 6 Nov 2026).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RenderSpeed {
+    /// `--cpu`: never the GPU compositor.
+    cpu: bool,
+    /// `--hw-h264` / `--fast`: H.264 on the hardware encoder.
+    hw_h264: bool,
+    /// `--hw-decode` / `--fast`: footage on the hardware decoders.
+    hw_decode: bool,
+}
+
+impl RenderSpeed {
+    fn of(args: &Args) -> Result<RenderSpeed, Failure> {
+        let cpu = args.flag("--cpu");
+        if cpu && args.flag("--gpu") {
+            return usage_err("render: --cpu and --gpu contradict each other (the GPU is the default)");
+        }
+        let fast = args.flag("--fast");
+        Ok(RenderSpeed { cpu, hw_h264: fast || args.flag("--hw-h264"), hw_decode: fast || args.flag("--hw-decode") })
+    }
+
+    /// Set up `s` (its project open): the GPU compositor unless `--cpu` or the project renders
+    /// with Mercury Software Only (no usable GPU: the CPU, with a note), and the export speed
+    /// switches.
+    fn apply(&self, s: &mut effectcraft_engine::Session) {
+        if !self.cpu && s.accel.is_none() && s.project.settings.gpu_acceleration {
+            match effectcraft_gpu::Gpu::try_headless() {
+                Ok(g) => {
+                    s.accel = Some(std::sync::Arc::new(g));
+                    s.accel_note = None;
+                }
+                Err(e) => {
+                    note!("render: no usable GPU ({e}), rendering on the CPU");
+                    s.accel_note = Some(format!("headless: no usable GPU ({e}), rendering on the CPU"));
+                }
+            }
+        }
+        effectcraft_export::speed::set_hardware_h264(self.hw_h264);
+        effectcraft_export::speed::set_hardware_decode(self.hw_decode);
+        if self.hw_decode {
+            // the exports read the pool's own view, which decodes on the hardware decoders where
+            // they take the footage (H.264, HEVC, ProRes on a Mac), reading ahead as playback does
+            s.footage.set_hardware_decoding(true);
+            s.footage.set_playing(true);
+        }
+    }
 }
 
 /// `commands` / `exec --list`: every engine command (id, label, shortcut, params doc; with
@@ -1985,6 +2055,26 @@ mod tests {
         assert_eq!(snap_to_frame(1.483333, 60.0), 89.0 / 60.0);
         assert_eq!(snap_to_frame(0.813559, 29.5), 24.0 / 29.5);
         assert_eq!(snap_to_frame(1.49, 60.0), 1.49);
+    }
+
+    /// E1–E3: `render` uses the GPU unless `--cpu` (`--gpu` is still accepted; both together are a
+    /// usage error); `--fast` turns on hardware H.264 and hardware footage decoding, each also on
+    /// its own; the flags belong to `render` alone.
+    #[test]
+    fn render_speed_flags() {
+        let speed = |args: &[&str]| RenderSpeed::of(&parse(args).unwrap());
+        let plain = speed(&["render", "p.ecproj", "--out", "x.mp4"]).ok().unwrap();
+        assert_eq!(plain, RenderSpeed::default(), "GPU, software H.264, exact decoding by default");
+        assert_eq!(speed(&["render", "--gpu", "--out", "x.mp4"]).ok(), Some(RenderSpeed::default()));
+        assert!(speed(&["render", "--cpu", "--out", "x.mp4"]).ok().unwrap().cpu);
+        assert!(matches!(speed(&["render", "--cpu", "--gpu", "--out", "x.mp4"]), Err(Failure::Usage(_))));
+        assert_eq!(speed(&["render", "--fast", "--out", "x.mp4"]).ok(), Some(RenderSpeed { cpu: false, hw_h264: true, hw_decode: true }));
+        assert_eq!(speed(&["render", "--hw-h264", "--out", "x.mp4"]).ok(), Some(RenderSpeed { cpu: false, hw_h264: true, hw_decode: false }));
+        assert_eq!(speed(&["render", "--hw-decode", "--cpu", "--queue"]).ok(), Some(RenderSpeed { cpu: true, hw_h264: false, hw_decode: true }));
+        for (cmd, flag) in [("render-frame", "--cpu"), ("info", "--fast"), ("bench", "--hw-h264"), ("serve", "--hw-decode")] {
+            let a = parse(&[cmd, flag]).unwrap();
+            assert!(matches!(run(cmd, &a, false), Err(Failure::Usage(e)) if e == format!("{flag} is only supported by render")), "{cmd} {flag}");
+        }
     }
 
     /// `std::env::args` panicked on an argument that is not Unicode; it is a usage error naming

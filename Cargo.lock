@@ -1482,6 +1482,7 @@ dependencies = [
  "cpu-time",
  "effectcraft-automation",
  "effectcraft-engine",
+ "effectcraft-export",
  "effectcraft-gpu",
  "effectcraft-host",
  "effectcraft-media",
