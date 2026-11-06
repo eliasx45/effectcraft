@@ -8,7 +8,9 @@
 //!
 //! The hybrid keeps the samples fed since the last point decoding can restart from (the run's
 //! first sample, then every IDR / IRAP access unit; an HEVC CRA keeps the one before it, since
-//! its leading pictures reference pictures before it). On a failure it makes the software decoder,
+//! its leading pictures reference pictures before it), and the samples before that point until the
+//! hardware has returned every picture fed before it (a decoder may hold them until the IDR
+//! arrives, and a lost session loses them). On a failure it makes the software decoder,
 //! replays those samples through it and carries on, dropping pictures the hardware already
 //! returned and keeping the ones it had decoded but not returned, so the output is the software
 //! decoder's own sequence: same pictures (pts), same presentation order. The replay log is
@@ -41,6 +43,13 @@ pub struct HybridDecoder {
     last_irap: usize,
     /// Pictures returned since the last reset (by pts).
     emitted: BTreeSet<i64>,
+    /// Samples fed to the hardware whose pictures it hasn't returned yet (by pts).
+    outstanding: BTreeSet<i64>,
+    /// A restart point whose log cut waits for pictures fed before it: the log drains up to the
+    /// index once every pts in the set has been returned (a decoder may hold pictures fed before
+    /// an IDR until that IDR arrives; a hardware session lost then loses them, and only the
+    /// samples before the IDR can bring them back).
+    pending_cut: Option<(usize, BTreeSet<i64>)>,
     /// Pictures the hardware had decoded but not returned when it failed.
     carry: BTreeMap<i64, DecodedFrame>,
 }
@@ -57,6 +66,8 @@ impl HybridDecoder {
             log_bytes: 0,
             last_irap: 0,
             emitted: BTreeSet::new(),
+            outstanding: BTreeSet::new(),
+            pending_cut: None,
             carry: BTreeMap::new(),
         }
     }
@@ -71,17 +82,23 @@ impl HybridDecoder {
             // A CRA keeps the previous restart point: replaying from the CRA itself would treat
             // it as a first picture and drop its RASL pictures, which the hardware decodes.
             let cra = self.stream.is_cra(sample);
-            match self.log.as_mut() {
-                Some(log) if cra => {
-                    log.drain(..self.last_irap.min(log.len()));
-                    self.log_bytes = log.iter().map(|s| s.0.len()).sum();
+            match self.log.as_ref().map(Vec::len) {
+                Some(len) => {
+                    let cut = if cra { self.last_irap.min(len) } else { len };
+                    self.last_irap = len;
+                    // Pictures fed before this point and not returned yet: keep their samples
+                    // until they are (`pending_cut`).
+                    let waiting: BTreeSet<i64> = self.outstanding.iter().copied().filter(|p| *p != pts).collect();
+                    self.pending_cut = Some((cut, waiting));
+                    self.apply_pending_cut();
                 }
-                _ => {
+                None => {
                     self.log = Some(Vec::new());
                     self.log_bytes = 0;
+                    self.last_irap = 0;
+                    self.pending_cut = None;
                 }
             }
-            self.last_irap = self.log.as_ref().map_or(0, Vec::len);
         }
         let Some(log) = self.log.as_mut() else { return };
         self.log_bytes = self.log_bytes.saturating_add(sample.len());
@@ -95,9 +112,33 @@ impl HybridDecoder {
     fn note_emitted(&mut self, out: &[DecodedFrame]) {
         for f in out {
             self.emitted.insert(f.pts);
+            self.outstanding.remove(&f.pts);
+            if let Some((_, waiting)) = self.pending_cut.as_mut() {
+                waiting.remove(&f.pts);
+            }
         }
         while self.emitted.len() > EMITTED_MAX {
             self.emitted.pop_first();
+        }
+        while self.outstanding.len() > EMITTED_MAX {
+            self.outstanding.pop_first();
+        }
+        self.apply_pending_cut();
+    }
+
+    /// Drain the log up to the pending restart point once nothing fed before it is outstanding.
+    fn apply_pending_cut(&mut self) {
+        let Some((cut, waiting)) = self.pending_cut.as_ref() else { return };
+        if !waiting.is_empty() {
+            return;
+        }
+        let cut = *cut;
+        self.pending_cut = None;
+        if let Some(log) = self.log.as_mut() {
+            let cut = cut.min(log.len());
+            log.drain(..cut);
+            self.log_bytes = log.iter().map(|s| s.0.len()).sum();
+            self.last_irap = self.last_irap.saturating_sub(cut);
         }
     }
 
@@ -185,6 +226,7 @@ impl VideoDecoder for HybridDecoder {
         let Some(hw) = self.hw.as_mut() else {
             return Err(CodecError::Decode("no decoder".into()));
         };
+        self.outstanding.insert(pts);
         match hw.decode(sample, pts) {
             Ok(out) => {
                 crate::FRAMES.fetch_add(out.len() as u64, Ordering::Relaxed);
@@ -219,6 +261,8 @@ impl VideoDecoder for HybridDecoder {
         self.log_bytes = 0;
         self.last_irap = 0;
         self.emitted.clear();
+        self.outstanding.clear();
+        self.pending_cut = None;
         self.carry.clear();
     }
 
