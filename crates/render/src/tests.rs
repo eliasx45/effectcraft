@@ -1429,3 +1429,64 @@ fn children_follow_opacity_and_blur_only_when_asked() {
     let r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
     assert!(r.follow_shutter(&ctx, &child).is_none());
 }
+
+/// Calls off the frame's footage reads during its first GPU run, as the viewer does when the
+/// playhead moves on, and counts the runs it is handed (VB1).
+struct CallOffTarget {
+    buf: Option<crate::Buf>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    runs: Vec<usize>,
+}
+impl crate::FxTarget for CallOffTarget {
+    fn gpu(&mut self, steps: &[crate::FxStep]) -> bool {
+        self.runs.push(steps.len());
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        // An empty run "succeeding" never moved the stack on; refusing it lets the old code end.
+        !steps.is_empty()
+    }
+    fn cpu(&mut self, f: &mut dyn FnMut(crate::Buf) -> crate::Buf) {
+        if let Some(b) = self.buf.take() {
+            self.buf = Some(f(b));
+        }
+    }
+    fn extent(&self) -> Option<([u32; 2], [f64; 2], f64)> {
+        self.buf.as_ref().map(|b| ([b.img.width, b.img.height], b.offset, b.scale))
+    }
+    fn shift(&mut self, d: [f64; 2]) {
+        if let Some(b) = &mut self.buf {
+            b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
+        }
+    }
+}
+
+/// VB1: a frame called off between its static first effects and the animated rest (the layer
+/// cache is gone by then) ends its effect stack. The static prefix stayed open, the next GPU run
+/// was empty, and an empty run that "succeeded" left the stack where it was: the Composition
+/// viewer drew black for good on F9's build.blue1107 (Ribbons BG precomp), one frame worker
+/// spinning on frame 99, while `effectcraft-cli render` (never called off) drew the frame.
+#[test]
+fn a_frame_called_off_after_its_static_effects_finishes_its_stack() {
+    let (mut p, cid, comp) = setup();
+    p.settings.gpu_acceleration = true;
+    let mut l = solid(&mut p, &comp, [0.2, 0.3, 0.4], 50, 50);
+    add_effect(&mut p, &mut l, "ec.color.tint", [50.0, 50.0], &[("amount", Value::Scalar(50.0))]);
+    add_effect(&mut p, &mut l, "ec.color.tint", [50.0, 50.0], &[]);
+    l.props.prop_mut("effects/#2/amount").unwrap().keys =
+        vec![Keyframe::new(Tick::ZERO, Value::Scalar(0.0)), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(100.0))];
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let t = Tick::from_seconds_f64(0.5);
+    let c = p.comp(cid).unwrap();
+    let layer = &c.layers[0];
+    let ctx = crate::EvalCtx::new(&p, cid, c, t);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let off = crate::CancellableFootage { inner: &crate::NoFootage, cancel: cancel.clone() };
+    let cache = crate::LayerCache::default();
+    let accel = ChainAccel::default();
+    let mut r = crate::Renderer::new(&p, &off, crate::RenderOpts { backend: crate::Backend::Gpu, ..Default::default() });
+    r.cache = Some(&cache);
+    r.accel = Some(&accel);
+    let buf = crate::Buf { img: crate::Image::new(50, 50), offset: [0.0; 2], scale: 1.0 };
+    let mut target = CallOffTarget { buf: Some(buf), cancel, runs: Vec::new() };
+    r.run_effect_stack(&ctx, layer, false, usize::MAX, None, [0.0; 2], &mut target, None);
+    assert_eq!(target.runs, vec![1, 1], "the static tint, then the animated one, each on the GPU once; no empty run");
+}

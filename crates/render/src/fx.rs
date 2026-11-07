@@ -588,10 +588,16 @@ impl<'a> Renderer<'a> {
             }
         }
         while k < stack.len() {
-            if let (Some((p, key)), Some(c)) = (prefix, self.cache_to_keep())
+            // The prefix ends here whether or not its result can still be kept: a frame whose
+            // footage reads are called off mid-stack (the viewer moved on) loses its layer cache,
+            // and a prefix left standing made the next GPU run empty, which "succeeded" without
+            // moving `k` (VB1: the viewer drew black forever, one worker spinning on the frame).
+            if let Some((p, key)) = prefix
                 && k == p
             {
-                target.keep(key, c, flight.take());
+                if let Some(c) = self.cache_to_keep() {
+                    target.keep(key, c, flight.take());
+                }
                 prefix = None;
             }
             let (i, g, spec) = stack[k];
@@ -606,7 +612,7 @@ impl<'a> Renderer<'a> {
                 && a.supports_effect(spec.id)
             {
                 why = crate::cpu_why::EFFECT_DECLINED;
-                let run: Vec<_> = stack[k..end].iter().take_while(|(_, _, s)| s.gpu && a.supports_effect(s.id)).collect();
+                let run: Vec<_> = stack.get(k..end).unwrap_or_default().iter().take_while(|(_, _, s)| s.gpu && a.supports_effect(s.id)).collect();
                 let params: Vec<Params> = run.iter().map(|(_, g, _)| self.effect_params(ctx, layer, g)).collect();
                 let hosts: Vec<_> = run.iter().map(|(i, _, _)| FxHost { index: *i, ..host }).collect();
                 let steps: Vec<FxStep> = run
@@ -626,7 +632,8 @@ impl<'a> Renderer<'a> {
                     })
                     .collect();
                 let t0 = web_time::Instant::now();
-                let done = target.gpu(&steps);
+                // An empty run makes no progress: run this effect on the CPU instead.
+                let done = !steps.is_empty() && target.gpu(&steps);
                 if done {
                     if let Some(v) = timing.as_deref_mut() {
                         let ms = t0.elapsed().as_secs_f64() * 1e3 / run.len() as f64;
