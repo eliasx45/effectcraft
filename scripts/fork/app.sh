@@ -46,6 +46,30 @@ esac
 # Owner-local artwork is pinned outside the checkout; catch accidental replacements before launch.
 python3 "$root/scripts/fork/check-owner-icons.py" || exit 1
 
+# Sign the CLI with a FIXED identity after every build. cargo leaves it ad-hoc signed with a new
+# identifier each build ("effectcraft_cli-<hash>"), so macOS privacy (TCC) sees a new app every rebuild
+# and asks again for Downloads/Documents, which stopped night runs (Elias, 8 Nov 2026: "i NEVER EVER
+# want these … they keep happening during night runs"). With one identity, a grant (Full Disk Access)
+# survives rebuilds. Never blocks: a codesign that waits on a keychain prompt is killed after 20 s and the
+# CLI stays ad-hoc. Override with EFFECTCRAFT_SIGN_ID; EFFECTCRAFT_SIGN_ID=- skips.
+sign_cli() {
+    id="${EFFECTCRAFT_SIGN_ID:-Apple Development: mohamed elias hamadouche (537WFR6N58)}"
+    [ "$id" = "-" ] && return 0
+    # Sign a copy and swap it in (new inode): CLIs running the old file keep their image untouched.
+    cp -p "$cli" "$cli.signing" || return 0
+    codesign -f -s "$id" --identifier com.elias.effectcraft-cli "$cli.signing" >>"$log" 2>&1 &
+    sp=$!
+    ( sleep 20; kill "$sp" 2>/dev/null ) &
+    kp=$!
+    if wait "$sp"; then
+        mv -f "$cli.signing" "$cli" && echo "signed effectcraft-cli as $id" >>"$log"
+    else
+        rm -f "$cli.signing"; echo "effectcraft-cli NOT signed (stays ad-hoc)" >>"$log"
+    fi
+    kill "$kp" 2>/dev/null
+    return 0
+}
+
 build_pid=""
 stop() {
     # Stop the whole build (cargo and every rustc it started), then free the lock.
@@ -83,6 +107,7 @@ build() {
     status=$?
     build_pid=""
     if [ "$status" -eq 0 ]; then
+        sign_cli
         mv -f "$stamp.new" "$stamp"
     else
         rm -f "$stamp.new"
