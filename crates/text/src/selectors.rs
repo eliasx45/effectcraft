@@ -157,6 +157,15 @@ pub fn ease(v: f64, high: f64, low: f64) -> f64 {
         return v;
     }
     let x = v.clamp(0.0, 1.0);
+    // The curve's ends, exactly: the bisection below stops short of them (5.6e-45 for 0, and
+    // 1 − 9e-9 for 1 where the curve arrives flat), which left every unselected character of an
+    // eased ramp a selection that isn't 0 and every fully selected one an opacity that isn't 0.
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
     let (low, high) = (low.clamp(-1.0, 1.0), high.clamp(-1.0, 1.0));
     let (x1, y1) = if low >= 0.0 { (low, 0.0) } else { (0.0, -low) };
     let (x2, y2) = if high >= 0.0 { (1.0 - high, 1.0) } else { (1.0, 1.0 + high) };
@@ -347,6 +356,12 @@ mod tests {
     fn ease_high_low() {
         assert_eq!(ease(0.3, 0.0, 0.0), 0.3);
         assert!((ease(0.0, 1.0, 1.0)).abs() < 1e-12 && (ease(1.0, 1.0, 1.0) - 1.0).abs() < 1e-12);
+        // The ends are exact whatever the handles (Q5b: 0 came out as 5.6e-45, 1 as 1 − 9e-9, so
+        // unselected characters kept a trace of every property and hidden ones of their opacity).
+        for (high, low) in [(-1.0, 0.0), (0.0, -1.0), (1.0, 1.0), (-1.0, -1.0), (0.3, 1.0), (1.0, -0.4)] {
+            assert_eq!((ease(0.0, high, low), ease(1.0, high, low)), (0.0, 1.0), "high {high} low {low}");
+            assert_eq!((ease(-0.5, high, low), ease(1.5, high, low)), (0.0, 1.0), "high {high} low {low}: clamped");
+        }
         // Ease Low 100% flattens the start, Ease High 100% the top.
         assert!(ease(0.1, 0.0, 1.0) < 0.1);
         assert!(ease(0.9, 1.0, 0.0) > 0.9);

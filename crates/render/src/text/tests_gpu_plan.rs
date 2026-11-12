@@ -179,3 +179,87 @@ fn motion_blurred_text_plans_average_the_sub_samples() {
         same(&format!("t {t}"), &cpu.img, &walk(&plan));
     }
 }
+
+/// The Blur a caption preset's expression gives its fade-in animator (the "Blur In (px)" slider).
+struct BlurSlider;
+
+impl crate::ExprHost for BlurSlider {
+    fn eval(&self, _: &EvalCtx, _: &Layer, prop: &effectcraft_project::Property, value: &Value) -> Result<Value, String> {
+        Ok(if prop.match_id == "blur" { Value::Vec2([15.0, 15.0]) } else { value.clone() })
+    }
+}
+
+/// Q5b: a caption built like the text presets (a fade-in animator of Opacity 0 and an
+/// expression-driven Blur under an eased Ramp Up range whose Offset sweeps the words in, and a
+/// Gradient Fill animator whose Expression Selector selects nothing) plans whenever no word is
+/// mid-fade: with words still hidden (opacity 0, blurred on paper), with a word in the tail of
+/// its ease (a Blur the CPU doesn't blur either) and after the last word, as plain text would.
+/// The eased ramp left every landed word a selection of 5.6e-45 (a Blur of 8e-44 px) and every
+/// hidden one an opacity of 9e-7 %, so the layer was drawn on the CPU at every frame.
+#[test]
+fn caption_presets_plan_except_while_a_word_fades_in() {
+    use effectcraft_keyframe::Keyframe;
+    use effectcraft_time::Tick;
+    let (mut p, cid, comp) = setup(420, 120);
+    let doc = TextDoc { text: "At the end of day".into(), size: 36.0, fill: [1.0; 4], ..Default::default() };
+    let mut l = text_layer(&mut p, &comp, doc);
+    set(&mut l, "transform/position", Value::Vec3([20.0, 70.0, 0.0]));
+    animator(&mut p, &mut l, &["opacity", "blur"], &["range"]);
+    set(&mut l, "text/animators/#1/properties/opacity", Value::Scalar(0.0));
+    l.props.prop_mut("text/animators/#1/properties/blur").unwrap().expr =
+        Some(effectcraft_project::Expression { text: "var b=effect(\"Blur In (px)\")(\"Slider\"); [b,b]".into(), enabled: true });
+    set(&mut l, "text/animators/#1/selectors/#1/end", Value::Scalar(10.0));
+    set(&mut l, "text/animators/#1/selectors/#1/advanced/basedOn", Value::Enum(2));
+    set(&mut l, "text/animators/#1/selectors/#1/advanced/shape", Value::Enum(1));
+    set(&mut l, "text/animators/#1/selectors/#1/advanced/easeHigh", Value::Scalar(-100.0));
+    // Offset −100 % → 100 % over 1 s: word i of 5 (centre 0.1 + 0.2 i) fades in while the
+    // Offset crosses the tenth before its centre, from 0.5 + 0.1 i s for 0.05 s.
+    l.props.prop_mut("text/animators/#1/selectors/#1/offset").unwrap().keys =
+        vec![Keyframe::new(Tick::ZERO, Value::Scalar(-100.0)), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(100.0))];
+    animator(&mut p, &mut l, &["gradientFill"], &["expression"]);
+    set(&mut l, "text/animators/#2/selectors/#1/amount", Value::Vec3([0.0; 3]));
+    p.comp_mut(cid).unwrap().layers.push(l);
+
+    let host = BlurSlider;
+    let cache = crate::LayerCache::default();
+    let mut r = Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+    r.expr = Some(&host);
+    r.cache = Some(&cache);
+    // (time, plans, why)
+    let cases = [
+        (0.25, true, "every word hidden"),
+        (0.525, false, "the first word half-way in"),
+        (0.5499, true, "the first word in the tail of its ease"),
+        (0.6, true, "one word in, the others hidden"),
+        (0.725, false, "the second word half-way in"),
+        (1.0, true, "the last key"),
+        (1.5, true, "after the fade"),
+    ];
+    for (t, gpu, label) in cases {
+        let c = r.eval_ctx(cid, Tick::from_seconds_f64(t)).unwrap();
+        let layer = &c.comp.layers[0];
+        let geom = text_geom(&c, layer).expect("laid out");
+        let s = r.raster_scale(&c, layer);
+        let drawn = || geom.glyphs.iter().filter(|g| g.xf.opacity > 0.0);
+        let blurs: Vec<f64> = drawn().map(|g| g.xf.blur[0].max(g.xf.blur[1]) * s).collect();
+        assert_eq!(blurs.iter().all(|b| *b <= 0.05), gpu, "{label} ({t} s): the case it names, {blurs:?}");
+        assert!(geom.glyphs.iter().all(|g| g.fills.is_none()), "{label}: no gradient at amount 0");
+        assert_eq!(r.text_raster_eligible(&c, layer), gpu, "{label} ({t} s): eligible");
+        let (_, clip) = r.resident_content(&c, layer).expect("keyed");
+        assert_eq!(r.text_raster_plan(&c, layer, clip).is_some(), gpu, "{label} ({t} s): plan");
+        match label {
+            "every word hidden" => assert_eq!(drawn().count(), 0, "{label}: opacity exactly 0"),
+            "the first word in the tail of its ease" => assert!(blurs.iter().any(|b| *b > 0.0), "{label}: a Blur under the threshold, {blurs:?}"),
+            // Landed words carry no trace of the animator: they join into runs as plain text.
+            "the last key" | "after the fade" => assert!(geom.glyphs.iter().all(|g| g.xf.blur == [0.0; 2] && g.xf.opacity == 100.0), "{label}: idle"),
+            _ => {}
+        }
+        if gpu {
+            // What the plan draws is what the CPU draws.
+            let cpu = super::super::render(&c, layer, s);
+            let whole = plan(Some(&geom), s, None).expect("plans");
+            assert_eq!(whole.offset, cpu.offset, "{label}: offset");
+            same(label, &cpu.img, &walk(&whole));
+        }
+    }
+}

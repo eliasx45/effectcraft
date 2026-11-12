@@ -1318,6 +1318,13 @@ fn raster_pass(g: &PlacedGlyph, stroke: bool, paths: &[BezPath], m: &Mat3, rect:
     paint_coverage(&cov.data, col, col[3] * op, w, h, blur_px)
 }
 
+/// Whether a character whose Blur comes to `blur_px` (buffer pixels) is painted without blurring
+/// it: up to 0.05 px (a number). The accelerator's plan asks the same question
+/// ([`gpu_plan`]), so the tail of an ease or a selection that is all but 0 blurs on neither.
+pub(crate) fn unblurred(blur_px: [f64; 2]) -> bool {
+    blur_px[0] <= 0.05 && blur_px[1] <= 0.05
+}
+
 /// [`paint_coverage`] with a colour per pixel (straight RGBA): premultiplied colour × coverage,
 /// each channel blurred on its own when the character has Blur.
 fn paint_coverage_colors(cov: &[f32], colors: &[[f32; 4]], op: f32, w: u32, h: u32, blur_px: [f64; 2]) -> Image {
@@ -1328,7 +1335,7 @@ fn paint_coverage_colors(cov: &[f32], colors: &[[f32; 4]], op: f32, w: u32, h: u
             *px = [col[0] * k, col[1] * k, col[2] * k, k];
         }
     }
-    if blur_px[0] <= 0.05 && blur_px[1] <= 0.05 {
+    if unblurred(blur_px) {
         return img;
     }
     let (pw, ph) = (w as usize, h as usize);
@@ -1349,7 +1356,7 @@ fn paint_coverage(cov: &[f32], col: [f32; 4], a: f32, w: u32, h: u32, blur_px: [
     let mut img = Image::new(w, h);
     // Before any blur: colour × coverage where covered.
     let k: Vec<f32> = cov.iter().map(|c| c * a).map(|k| if k > 0.0 { k } else { 0.0 }).collect();
-    if blur_px[0] <= 0.05 && blur_px[1] <= 0.05 {
+    if unblurred(blur_px) {
         for (px, &k) in img.data.iter_mut().zip(&k) {
             if k > 0.0 {
                 *px = [col[0] * k, col[1] * k, col[2] * k, k];

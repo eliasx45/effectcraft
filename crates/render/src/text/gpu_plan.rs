@@ -19,7 +19,7 @@ use effectcraft_geom::{Mat3, vec2};
 use effectcraft_path::{BezPath, StrokeStyle};
 use effectcraft_project::{Layer, LayerSource, PropGroup};
 
-use super::{TextGeom, runs, text_geom};
+use super::{PlacedGlyph, TextGeom, runs, text_geom};
 use crate::eval::EvalCtx;
 use crate::shapes::gpu_plan::{PlanDraw, PlanPaint, RasterPlan};
 use crate::shapes::skia_scan::{MAX_EDGES, Scan, ScanEdge, scan_edges};
@@ -31,7 +31,7 @@ impl Renderer<'_> {
     pub fn text_raster_eligible(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         matches!(layer.source, LayerSource::Text)
             && crate::masks::gpu_plan::gpu_eligible(layer)
-            && layer.props.sub("text").is_some_and(|t| plain_paint(ctx, layer, t))
+            && layer.props.sub("text").is_some_and(|t| plain_paint(ctx, layer, t, || self.raster_scale(ctx, layer)))
     }
 
     /// The raster plan of [`Self::resident_source`] for a text layer in the window `clip` that
@@ -96,12 +96,15 @@ impl Renderer<'_> {
     }
 }
 
-/// Normal inter-character blending, and no character blurred or gradient-filled at the context
-/// time. Blur animators whose Blur is 0 there blur nothing (each adds |Blur × selection|);
-/// otherwise, and with a Gradient Fill animator, the laid-out characters tell (the geometry is
-/// remembered for the frame, so the plan and a CPU render reuse it on this thread). Text presets
-/// carry both kinds of animator, idle at most frames (Q5).
-fn plain_paint(ctx: &EvalCtx, layer: &Layer, text: &PropGroup) -> bool {
+/// Normal inter-character blending, and no character the CPU would blur or gradient-fill at the
+/// context time and the layer's raster scale (`scale`). Blur animators whose Blur is 0 there blur
+/// nothing (each adds |Blur × selection|); otherwise, and with a Gradient Fill animator, the
+/// laid-out characters tell (the geometry is remembered for the frame, so the plan and a CPU
+/// render reuse it on this thread), by the plan's own test ([`on_cpu`]) of the passes it draws:
+/// characters at opacity 0 aren't drawn, and a Blur under the CPU's threshold isn't blurred (the
+/// tail of an eased fade-in, Q5b). Text presets carry both kinds of animator, idle at most frames
+/// (Q5).
+fn plain_paint(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, scale: impl FnOnce() -> f64) -> bool {
     let blend_idx = text.sub("moreOptions").map(|m| ctx.e(layer, m, "interCharBlend")).unwrap_or(0) as usize;
     let blend = effectcraft_project::build::INTER_CHAR_BLEND_MODES.get(blend_idx).and_then(|n| BlendMode::from_name(n)).unwrap_or_default();
     if blend != BlendMode::Normal {
@@ -113,7 +116,18 @@ fn plain_paint(ctx: &EvalCtx, layer: &Layer, text: &PropGroup) -> bool {
             .filter_map(|g| g.sub("properties"))
             .any(|p| p.get("gradientFillColors").is_some() || p.get("blur").is_some_and(|b| ctx.value(layer, b).as_vec2() != [0.0; 2]))
     });
-    !may_paint || text_geom(ctx, layer).is_none_or(|g| g.glyphs.iter().all(|g| g.xf.blur == [0.0; 2] && g.fills.is_none()))
+    !may_paint
+        || text_geom(ctx, layer).is_none_or(|geom| {
+            let s = scale();
+            runs(&geom).iter().all(|(run, stroke)| run.first().and_then(|&gi| geom.glyphs.get(gi)).is_none_or(|g| !on_cpu(g, *stroke, s)))
+        })
+}
+
+/// Whether the pass of `g` (its fill, or its stroke) at raster scale `s` is one the CPU must
+/// draw: a blurred patch (as [`super::unblurred`] tells the CPU's painter) or, for a fill,
+/// per-pixel gradient colour.
+fn on_cpu(g: &PlacedGlyph, stroke: bool, s: f64) -> bool {
+    !super::unblurred([g.xf.blur[0] * s, g.xf.blur[1] * s]) || (!stroke && g.fills.is_some())
 }
 
 /// [`super::render`] at scale `s` (then cropped to `window`, `[x, y, w, h]`) as a plan.
@@ -182,7 +196,7 @@ fn whole(geom: &TextGeom, s: f64) -> Result<Option<Whole>, ()> {
         let blur = [g.xf.blur[0] * s, g.xf.blur[1] * s];
         // Blurred patches and per-pixel gradient colour stay on the CPU (blurred as there:
         // above 0.05 px, or not a number).
-        if !(blur[0] <= 0.05 && blur[1] <= 0.05) || (!stroke && g.fills.is_some()) {
+        if on_cpu(g, stroke, s) {
             crate::cpu_why::declined(crate::cpu_why::TEXT_BLUR);
             return Err(());
         }
