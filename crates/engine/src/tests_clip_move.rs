@@ -124,7 +124,7 @@ fn every_kind_applies_at_29_97_and_24_fps() {
                 (before.in_point, before.out_point, before.start_time, before.stretch, before.parent),
                 "{kind}"
             );
-            assert_eq!(s.project.comp(ItemId(cid)).unwrap().index_of(LayerId(l)), Some(0), "{kind}: still on top");
+            assert_eq!(s.project.comp(ItemId(cid)).unwrap().index_of(LayerId(l)), Some(1), "{kind}: still on top");
             // Names and tags.
             for n in ours(&now) {
                 assert!(n.starts_with(&format!("ClipMove {kind} ")), "{kind}: “{n}”");
@@ -173,7 +173,9 @@ fn punch_frames_the_subject_and_never_shows_an_edge() {
     assert_eq!((pos.keys[3].out_interp, pos.keys[4].in_interp), (Interp::Bezier, Interp::Bezier));
     assert!(pos.keys.iter().all(|k| !k.spatial_auto && k.spatial_in == [0.0; 3] && k.spatial_out == [0.0; 3]));
     assert_eq!(r["layers"]["frame"]["scale"], json!([100.0, 130.0, 100.0, 100.0, 130.0]));
-    // Any centre, any kind: every framing stays inside the frame (P in [W (1 − m), 0]).
+    // Any centre, any kind: every framing stays inside the frame, half a source pixel in from the
+    // picture's edge (P in [(1 − m)(W − ½), (1 − m)/2]): the Transform effect reads between pixel
+    // centres, so with P in [W (1 − m), 0] the frame's last row / column was semi-transparent.
     for kind in FRAMING {
         for c in [[0.0, 0.0], [1920.0, 1080.0], [960.0, 440.0], [1500.0, 200.0]] {
             let (mut s, cid, l) = shot(29.97, 30.0, 9.0, false);
@@ -182,16 +184,50 @@ fn punch_frames_the_subject_and_never_shows_an_edge() {
             let sc = g.prop("scaleHeight").unwrap().keys.clone();
             for (k, sk) in g.prop("position").unwrap().keys.iter().zip(&sc) {
                 let (p, m) = (k.value.components(), sk.value.components()[0] / 100.0);
-                assert!(p[0] <= 1e-9 && p[0] >= 384.0 * (1.0 - m) - 1e-9, "{kind} {c:?}: x {} at {m}", p[0]);
-                assert!(p[1] <= 1e-9 && p[1] >= 216.0 * (1.0 - m) - 1e-9, "{kind} {c:?}: y {} at {m}", p[1]);
+                assert!(p[0] <= (1.0 - m) / 2.0 + 1e-9 && p[0] >= (1.0 - m) * 383.5 - 1e-9, "{kind} {c:?}: x {} at {m}", p[0]);
+                assert!(p[1] <= (1.0 - m) / 2.0 + 1e-9 && p[1] >= (1.0 - m) * 215.5 - 1e-9, "{kind} {c:?}: y {} at {m}", p[1]);
             }
         }
     }
-    // A corner subject is clamped: 130 % on (0, 0) shows the top-left corner, never past it.
+    // A corner subject is clamped: 130 % on (0, 0) shows the top-left corner, never past it (its
+    // first pixel's centre on the frame's first pixel's centre).
     let (mut s, cid, l) = shot(29.97, 30.0, 9.0, false);
     s.execute("clip.move", json!({"comp": cid, "layer": l, "kind": "punch", "at": 1.0, "centre": [0, 0]})).unwrap();
     let g = layer(&s, cid, l).effects().unwrap().groups().find(|g| g.name == "ClipMove punch Frame").unwrap().clone();
-    assert_eq!(g.prop("position").unwrap().keys[1].value.components()[..2], [0.0, 0.0]);
+    let p = g.prop("position").unwrap().keys[1].value.components();
+    assert!((p[0] + 0.15).abs() < 1e-9 && (p[1] + 0.15).abs() < 1e-9, "{p:?}");
+}
+
+#[test]
+fn framing_kinds_never_show_a_transparent_edge() {
+    // An opaque full-frame layer under every framing kind, the subject in each corner and where the
+    // kinds were built: no pixel of any frame of the move is see-through. (chain's 160 % holds on
+    // the right edge and zoom-ladder's 115 % landing on the bottom edge drew the frame's last
+    // column / row at 81 % / 93 % alpha.)
+    for kind in FRAMING {
+        for c in [[960.0, 540.0], [0.0, 0.0], [1920.0, 1080.0]] {
+            let mut s = Session::default();
+            s.execute("comp.new", json!({"name": "Shot", "width": 384, "height": 216, "frameRate": 29.97, "duration": 10.0})).unwrap();
+            let cid = s.active_comp_id().unwrap().0;
+            let l = s.execute("layer.newSolid", json!({"name": "A", "color": "#d02020"})).unwrap()["layer"].as_u64().unwrap();
+            let r = s.execute("clip.move", json!({"comp": cid, "layer": l, "kind": kind, "at": 0.5, "centre": c})).unwrap();
+            let fr = s.project.comp(ItemId(cid)).unwrap().frame_rate;
+            // Every key frame, and the frame in the middle of every segment.
+            let keys: Vec<i64> = r["layers"]["frame"]["frames"].as_array().unwrap().iter().map(|f| f.as_i64().unwrap()).collect();
+            let mut frames = keys.clone();
+            frames.extend(keys.windows(2).map(|w| (w[0] + w[1]) / 2));
+            for f in frames {
+                let img = s.render(ItemId(cid), fr.tick_of(f), crate::render::RenderOpts { scale: 1.0, motion_blur: false, ..Default::default() });
+                let (w, h) = (i64::from(img.width), i64::from(img.height));
+                for y in 0..h {
+                    for x in 0..w {
+                        let a = img.get(x, y)[3];
+                        assert!(a > 0.999, "{kind} {c:?} frame {f}: alpha {a} at ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -235,7 +271,7 @@ fn crop_reframe_masks_inside_the_frame_over_a_dark_backing() {
     // The backing: right below the shot, from `at` to its out point, the table's #08080b, tagged.
     let comp = s.project.comp(ItemId(cid)).unwrap();
     let bg = layer_named(&s, cid, "ClipMove crop-reframe BG").unwrap();
-    assert_eq!(comp.index_of(bg.id), Some(1), "right below the shot");
+    assert_eq!(comp.index_of(bg.id), comp.index_of(LayerId(l)).map(|i| i + 1), "right below the shot");
     assert_eq!(r["layers"]["crop"]["bg"], json!(bg.id.0));
     assert!((bg.in_point.seconds() - 1.0).abs() < 0.02 && bg.out_point == now.out_point, "{} {}", bg.in_point.seconds(), bg.out_point.seconds());
     assert_eq!(bg.comment, format!("ClipMove {l} · bg"));
@@ -398,7 +434,11 @@ fn calling_again_replaces_the_previous_clip_move() {
     let r = mv(&mut s, cid, l, "freeze", 1.0).unwrap();
     assert_eq!((r["removed"]["masks"].as_u64(), r["removed"]["layers"].as_u64(), r["removed"]["items"].as_u64()), (Some(1), Some(1), Some(1)));
     assert!(layer_named(&s, cid, "ClipMove crop-reframe BG").is_none());
-    assert_eq!(s.project.items.len(), items0, "no orphan solid");
+    // (The project's “Solids” folder the backing's solid made stays, empty, as when a solid is
+    // deleted by hand.)
+    let left: Vec<&str> = s.project.items.values().filter(|i| !matches!(i.kind, ItemKind::Folder)).map(|i| i.name.as_str()).collect();
+    assert_eq!(left.len(), items0, "no orphan solid: {left:?}");
+    assert!(s.project.items.values().all(|i| !matches!(i.kind, ItemKind::Solid(_))), "no orphan solid: {left:?}");
     assert_eq!(keeps(&s, cid).len(), 1);
     // → retime: one copy (not two), one time remap of the ClipMove's own.
     mv(&mut s, cid, l, "retime", 1.0).unwrap();

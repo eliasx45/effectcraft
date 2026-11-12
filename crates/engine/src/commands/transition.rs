@@ -47,6 +47,9 @@ pub const ZOOM_CUT_JSON: &str = include_str!("../../presets/zoom-cut.kinds.json"
 
 /// Everything the command adds is named with this prefix (effects and layers).
 pub(super) const PREFIX: &str = "ZoomCut ";
+/// The mirrored Motion Tile's name after `ZoomCut <kind> `: the table's own, and the one a shot
+/// gets when its zoom goes below 100 % and its kind lists none.
+pub(super) const MIRROR: &str = "Mirror edges";
 /// A layer comment or effect name the FX cuts add starts with this.
 const FX_PREFIX: &str = transition_fx::PREFIX;
 /// A layer comment or effect name the scene cuts add starts with this.
@@ -408,7 +411,7 @@ fn shot(
         let fx = layer.props.sub_mut("effects").ok_or_else(|| bad(C, format!("“{lname}” can't take effects")))?;
         let mut groups: Vec<PropGroup> = vec![];
         if min_z < 100.0 && !has_tile {
-            let mut g = new_effect(&mut next, "ec.stylize.motiontile", &format!("{label} Mirror edges"), fx_size, kind)?;
+            let mut g = new_effect(&mut next, "ec.stylize.motiontile", &format!("{label} {MIRROR}"), fx_size, kind)?;
             let n = need(c0);
             set_values(&mut g, Some(&json!({"outputWidth": n, "outputHeight": n, "mirrorEdges": true})), kind)?;
             groups.push(g);

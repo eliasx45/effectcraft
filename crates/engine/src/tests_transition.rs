@@ -639,7 +639,8 @@ fn zoom_cut_overlays_leave_no_orphan_solids() {
 
 #[test]
 fn fx_cut_expressions_evaluate() {
-    for kind in ["glitch", "chromatic-aberration", "ripple", "vhs-tape", "page-burn"] {
+    // The FX kinds whose table has an `expr` (chromatic-aberration has none: its channels are keyed).
+    for kind in ["glitch", "ripple", "vhs-tape", "page-burn"] {
         let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
         s.expr_check = Some(effectcraft_expr::check_syntax);
         let r = apply(&mut s, cid, old, new, kind).unwrap_or_else(|e| panic!("{kind}: {e}"));
@@ -1206,14 +1207,15 @@ fn cut_at_audio(fps: f64, secs: f64, at: f64) -> (Session, u64, u64, u64, f64) {
     (s, cid, old, new, cut)
 }
 
-/// The audio keep copies in the comp: (id, name, in, out, video, audio, index).
+/// The audio keep copies in the comp: (id, name, in, out, video, audio, layer number from 1 like
+/// `index_of`).
 fn keeps(s: &Session, cid: u64) -> Vec<(u64, String, f64, f64, bool, bool, usize)> {
     let comp = s.project.comp(ItemId(cid)).unwrap();
     comp.layers
         .iter()
         .enumerate()
         .filter(|(_, l)| l.name.contains(" keep)"))
-        .map(|(i, l)| (l.id.0, l.name.clone(), l.in_point.seconds(), l.out_point.seconds(), l.switches.video, l.switches.audio, i))
+        .map(|(i, l)| (l.id.0, l.name.clone(), l.in_point.seconds(), l.out_point.seconds(), l.switches.video, l.switches.audio, i + 1))
         .collect()
 }
 
@@ -1464,6 +1466,42 @@ fn transitions_on_a_shared_shot_never_collide_or_touch_each_other() {
     assert_eq!(names(&s, b).iter().filter(|n| n.starts_with("SceneCut crossfade ")).count(), 1, "{:?}", names(&s, b));
 }
 
+#[test]
+fn a_mirrored_tile_goes_with_its_own_transition_on_a_shared_shot() {
+    // white-flash zooms the old shot to 98 %: it gets a keyless `Mirror edges` tile the table lists
+    // for the new shot only. A 0–3 s, B 3–7 s, C from 7 s (C on top); white-flash on both cuts.
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Cut", "width": 384, "height": 216, "frameRate": 29.97, "duration": 10.0})).unwrap();
+    let solid =
+        |s: &mut Session, name: &str, colour: &str| s.execute("layer.newSolid", json!({"name": name, "color": colour})).unwrap()["layer"].as_u64().unwrap();
+    let (a, b, c) = (solid(&mut s, "A", "#d02020"), solid(&mut s, "B", "#20d020"), solid(&mut s, "C", "#2040d0"));
+    let cid = s.active_comp_id().unwrap().0;
+    s.execute("layer.timing", json!({"layers": [a], "out": 3.0})).unwrap();
+    s.execute("layer.timing", json!({"layers": [b], "in": 3.0, "out": 7.0})).unwrap();
+    s.execute("layer.timing", json!({"layers": [c], "in": 7.0})).unwrap();
+    let pair = |s: &mut Session, o: u64, n: u64, kind: &str| s.execute("transition.apply", json!({"comp": cid, "old": o, "new": n, "kind": kind})).unwrap();
+    let (tile, zoom, blur) = ("ZoomCut white-flash Mirror edges", "ZoomCut white-flash Zoom", "ZoomCut white-flash Blur");
+    pair(&mut s, a, b, "white-flash");
+    assert_eq!(zoom_cut_effects(&s, cid, a), [tile, zoom], "the old shot's own tile");
+    pair(&mut s, b, c, "white-flash");
+    assert_eq!(zoom_cut_effects(&s, cid, b), [tile, zoom, blur, tile, zoom]);
+    // Re-applying either cut replaces only its own effects on B, tile included.
+    pair(&mut s, b, c, "white-flash");
+    assert_eq!(zoom_cut_effects(&s, cid, b), [tile, zoom, blur, tile, zoom]);
+    pair(&mut s, a, b, "white-flash");
+    assert_eq!(zoom_cut_effects(&s, cid, b), [tile, zoom, tile, zoom, blur], "B → C's first, A → B's added again");
+    assert_eq!(zoom_cut_effects(&s, cid, a), [tile, zoom], "no stacking on A");
+    // Another kind on B → C: its tile and zoom go from B, A → B's stay.
+    pair(&mut s, b, c, "kick");
+    assert_eq!(zoom_cut_effects(&s, cid, b), [tile, zoom, blur]);
+    assert_eq!(zoom_cut_effects(&s, cid, c), ["ZoomCut kick Zoom"]);
+    // Another kind on A → B: nothing of the white flash is left anywhere.
+    pair(&mut s, a, b, "kick");
+    assert!(zoom_cut_effects(&s, cid, a).is_empty(), "{:?}", zoom_cut_effects(&s, cid, a));
+    assert_eq!(zoom_cut_effects(&s, cid, b), ["ZoomCut kick Zoom"]);
+    assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), 3, "no lights left");
+}
+
 // ---------------------------------------------------------------- keyframe moves (ZC5)
 
 #[test]
@@ -1519,7 +1557,7 @@ fn linear_wipe_and_point_iris_uncover_a_copy_of_the_new_shot_over_the_old_one() 
             // The copy: a precomp of the new shot from the window's start, on top, ending on the cut.
             let name = if kind == "linear-wipe" { "SceneCut linear-wipe Wipe" } else { "SceneCut point-iris Iris" };
             let c = layer_named(&s, cid, name);
-            assert_eq!(comp.index_of(c.id), Some(0), "{kind}: the copy is on top");
+            assert_eq!(comp.index_of(c.id), Some(1), "{kind}: the copy is on top");
             assert_eq!((fr.frame_at(c.in_point), fr.frame_at(c.out_point)), (start, r["cutFrame"].as_i64().unwrap()), "{kind}");
             let LayerSource::Comp { item } = c.source else { panic!("a precomp") };
             assert_eq!(s.project.comp(item).unwrap().layers.len(), 1, "{kind}: a copy of the new shot only");

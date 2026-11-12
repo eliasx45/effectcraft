@@ -73,13 +73,19 @@ fn key_span(l: &Layer, g: &PropGroup) -> Option<(Tick, Tick)> {
 
 /// A transition effect's side on its layer: by the kind's table when only one role has an effect
 /// of that name (keyed or keyless like this one), else by its keys (an in-side move starts at the
-/// in point, an out-side one ends at the out point; a tie is `None`).
+/// in point, an out-side one ends at the out point; a tie is `None`). A zoom cut's keyless mirrored
+/// tile is never told by the table: either shot gets one under that name whenever its zoom goes
+/// below 100 %, whatever the table lists (white-flash lists it for the new shot only, and its old
+/// shot zooms to 98 %), so it goes with the effects it was added with ([`sides`]).
 fn side_alone(l: &Layer, g: &PropGroup) -> Option<Side> {
     let prefix = prefix_of(&g.name)?;
     let keys = key_span(l, g);
     let by_table = (|| {
         let rest = g.name.strip_prefix(prefix)?;
         let (kind, ename) = rest.split_once(' ')?;
+        if keys.is_none() && prefix == super::transition::PREFIX && ename == super::transition::MIRROR {
+            return None;
+        }
         let k = table_of(prefix)?.get("kinds")?.get(kind)?;
         let keyed = |e: &Value| e.get("keys").and_then(Value::as_object).is_some_and(|m| !m.is_empty());
         let roles: Vec<Side> = [("old", Side::Out), ("new", Side::In)]
@@ -111,8 +117,10 @@ fn side_alone(l: &Layer, g: &PropGroup) -> Option<Side> {
     }
 }
 
-/// Every transition effect on a layer with its side (one it can't tell takes the side of the same
-/// kind's other effects on the layer, when they agree).
+/// Every transition effect on a layer with its side. One it can't tell alone takes the side of the
+/// same kind's other effects on the layer: the one they agree on, else (the same kind at both ends
+/// of the shot) that of the nearest one after it in the stack, else before it: a transition adds
+/// its effects in one run, a mirrored tile first.
 pub(super) fn sides(l: &Layer) -> Vec<(Uid, String, Option<Side>)> {
     let Some(fx) = l.effects() else { return vec![] };
     let mine: Vec<(Uid, String, Option<Side>)> =
@@ -123,12 +131,18 @@ pub(super) fn sides(l: &Layer) -> Vec<(Uid, String, Option<Side>)> {
         format!("{p}{k}")
     };
     mine.iter()
-        .map(|(uid, name, side)| {
+        .enumerate()
+        .map(|(i, (uid, name, side))| {
             let side = side.or_else(|| {
                 let kk = kind_key(name);
-                let mut found = mine.iter().filter(|(_, n, s)| s.is_some() && kind_key(n) == kk).filter_map(|x| x.2);
+                let known = |x: &(Uid, String, Option<Side>)| x.2.filter(|_| kind_key(&x.1) == kk);
+                let mut found = mine.iter().filter_map(known);
                 let first = found.next()?;
-                found.all(|s| s == first).then_some(first)
+                if found.all(|s| s == first) {
+                    return Some(first);
+                }
+                let after = mine.iter().skip(i.saturating_add(1)).find_map(known);
+                after.or_else(|| mine.iter().take(i).rev().find_map(known))
             });
             (*uid, name.clone(), side)
         })
@@ -242,7 +256,10 @@ pub(super) fn check_windows(s: &Session, cid: ItemId, kind: &str, span: (i64, i6
 /// The layers strictly between `a` and `b` in the stack (audio keep copies don't count: they have no
 /// picture), optionally only those on during `during` (comp ticks).
 pub(super) fn between(c: &Comp, a: LayerId, b: LayerId, during: Option<(Tick, Tick)>) -> Vec<String> {
-    let (Some(ia), Some(ib)) = (c.index_of(a), c.index_of(b)) else { return vec![] };
+    // Places in the stack from 0, like `enumerate` below (`index_of` counts from 1: with it the
+    // lower shot itself was the one "between").
+    let place = |id: LayerId| c.layers.iter().position(|l| l.id == id);
+    let (Some(ia), Some(ib)) = (place(a), place(b)) else { return vec![] };
     let (lo, hi) = (ia.min(ib), ia.max(ib));
     c.layers
         .iter()

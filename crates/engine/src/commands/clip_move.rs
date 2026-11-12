@@ -265,7 +265,8 @@ impl Mv<'_> {
 }
 
 /// framing: a Transform effect, anchor [0, 0], so position P and scale m show layer point p at
-/// P + m·p: the table's point at the frame centre, clamped so no edge shows.
+/// P + m·p: the table's point at the frame centre, clamped so no edge shows (P in
+/// [(1 − m)(W − ½), (1 − m)/2]: the edge pixels' centres stay inside the picture's).
 fn framing(s: &mut Session, mv: &Mv, l: &Layer) -> Result<Value> {
     let kind = mv.kind;
     let fk = mv.k.get("frame").ok_or_else(|| bad(C, format!("{kind}: no frame in the table")))?;
@@ -285,7 +286,11 @@ fn framing(s: &mut Session, mv: &Mv, l: &Layer) -> Result<Value> {
         let (Some(s_), Some(p)) = (s_, pt(v.get(1))) else { return Err(bad(C, format!("{kind}: a frame value is [scale %, [x, y]]"))) };
         let m = s_ / 100.0;
         let (fx, fy) = ((p[0] + d[0]) * kx, (p[1] + d[1]) * ky);
-        pos.push([clamp(w / 2.0 - m * fx, w * (1.0 - m), 0.0), clamp(h / 2.0 - m * fy, h * (1.0 - m), 0.0)]);
+        // The Transform effect reads the picture between its pixel centres (transparent outside):
+        // the frame's outermost pixel centres must land on or inside the picture's outermost ones,
+        // half a source pixel in from its edge, or that row / column fades (81 % alpha at 160 %).
+        let e = 0.5 * (m - 1.0).max(0.0);
+        pos.push([clamp(w / 2.0 - m * fx, w * (1.0 - m) + e, -e), clamp(h / 2.0 - m * fy, h * (1.0 - m) + e, -e)]);
         sc.push(s_);
     }
     let times: Vec<Tick> = fr.iter().map(|f| l.layer_time(mv.fr.tick_of(*f))).collect();
