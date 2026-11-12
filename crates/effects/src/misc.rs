@@ -1905,7 +1905,9 @@ mod tests {
         assert!(pixel(&corpus, 11, 8)[0] > 0.0, "AE View 2 must render final glow");
         let mut dim = Image::new(17, 17);
         dim.set(8, 8, [0.2, 0.05, 0.02, 1.0]);
-        let dim_run = |mode| run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(8.0)), ("PEDG-0008", native(mode))], dim.clone(), 0.0, EffectEnv::default());
+        let dim_run = |mode| {
+            run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(8.0)), ("PEDG-0008", native(mode))], dim.clone(), 0.0, EffectEnv::default())
+        };
         let (dim_add, dim_screen) = (dim_run(2), dim_run(1));
         assert!(pixel(&dim_add, 8, 8)[0] > pixel(&dim_screen, 8, 8)[0], "AE Blend Mode 2 (Add) lifts the source more than Screen");
         let low_auto = run(&[("PEDG-0001", num(8.0)), ("glowExposure", num(0.74))]);
@@ -1935,7 +1937,8 @@ mod tests {
         let wide = run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(320.0))], impulse.clone(), 0.0, EffectEnv::default());
         // The halo spans a fraction of the radius (AE: a 439 px glow fades out ~200 px past an edge).
         assert!(pixel(&wide, 64, 4)[0] > 0.0, "a 320 px radius reaches 60 px");
-        let opaque = run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(8.0)), ("PEDG-0025", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
+        let opaque =
+            run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(8.0)), ("PEDG-0025", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
         assert_eq!(pixel(&opaque, 7, 7)[3], 1.0, "Unmult off keeps a black opaque backdrop");
         let gray = Image::filled(9, 9, [0.3, 0.3, 0.3, 1.0]);
         let dithered = run_fx("ec.stylize.deepglow", &[legacy.clone(), ("PEDG-0001", num(8.0))], gray.clone(), 0.0, EffectEnv::default());

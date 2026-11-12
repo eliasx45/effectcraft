@@ -32,7 +32,8 @@ use crate::{Buf, EffectCtx};
 
 /// Quality Preset (Draft, Low, Medium, Standard, High, Extreme) → (Steps Multiplier,
 /// Resolution, extra buffer px).
-pub const DG2_PRESETS: [(f64, f64, f64); 6] = [(0.25, 0.80, 75.0), (0.25, 0.85, 55.0), (0.33, 0.90, 45.0), (0.5, 0.90, 40.0), (0.5, 0.97, 30.0), (1.0, 1.0, 10.0)];
+pub const DG2_PRESETS: [(f64, f64, f64); 6] =
+    [(0.25, 0.80, 75.0), (0.25, 0.85, 55.0), (0.33, 0.90, 45.0), (0.5, 0.90, 40.0), (0.5, 0.97, 30.0), (1.0, 1.0, 10.0)];
 
 /// The Glow Model popup (`glowModel`).
 pub const DEEP_GLOW_MODELS: [&str; 2] = ["Deep Glow 2", "Legacy"];
@@ -105,11 +106,8 @@ impl Dg2Settings {
                 (pr.f("PEDG2-0050").clamp(0.01, 3.0), q, true, true, (1.1 - q) * 40.0)
             }
         };
-        let gamma = if pr.b("PEDG-0043") {
-            if ctx.env.working_linear { 1.0 } else { 2.4 }
-        } else {
-            1.0 + 1.2 * pr.f("PEDG2-0154").clamp(0.0, 300.0) / 100.0
-        } as f32;
+        let gamma =
+            if pr.b("PEDG-0043") { if ctx.env.working_linear { 1.0 } else { 2.4 } } else { 1.0 + 1.2 * pr.f("PEDG2-0154").clamp(0.0, 300.0) / 100.0 } as f32;
         let tint = pr.b("PEDG-0037").then(|| {
             let c = pr.color("PEDG-0038");
             Dg2Tint { color: [c[0], c[1], c[2]], mode: pr.e("PEDG-0039"), mix: (pr.f("PEDG-0041") / 100.0).clamp(0.0, 1.0) as f32 }
@@ -172,7 +170,18 @@ impl Dg2Settings {
             }
         }
         // Fades of the first levels for small radii (a 0 ends the pyramid).
-        let raw = [1.0, r / 20.0, r / 40.0, (r - 5.0) / 55.0, (r - 10.0) / 70.0, (r - 20.0) / 100.0, (r - 35.0) / 105.0, (r - 60.0) / 100.0, (r - 90.0) / 90.0, (r - 110.0) / 110.0];
+        let raw = [
+            1.0,
+            r / 20.0,
+            r / 40.0,
+            (r - 5.0) / 55.0,
+            (r - 10.0) / 70.0,
+            (r - 20.0) / 100.0,
+            (r - 35.0) / 105.0,
+            (r - 60.0) / 100.0,
+            (r - 90.0) / 90.0,
+            (r - 110.0) / 110.0,
+        ];
         let sm = self.steps_mult / self.scale;
         let mut out: Vec<Dg2Level> = Vec::with_capacity(n);
         let (mut scale, mut half) = (1.0f64, v);
@@ -540,7 +549,11 @@ fn up_into(src: &Plane, dst: Plane, screen: bool) -> Plane {
                 madd(&mut u, wt, mix3(g(a), g(b), f));
             }
             let d = drow.map(|row| Plane::at(row, dst.r.x0, r.x0 + k)).unwrap_or([0.0; 3]);
-            *px = if screen { [u[0] + d[0] * (1.0 - u[0]), u[1] + d[1] * (1.0 - u[1]), u[2] + d[2] * (1.0 - u[2])] } else { [u[0] + d[0], u[1] + d[1], u[2] + d[2]] };
+            *px = if screen {
+                [u[0] + d[0] * (1.0 - u[0]), u[1] + d[1] * (1.0 - u[1]), u[2] + d[2] * (1.0 - u[2])]
+            } else {
+                [u[0] + d[0], u[1] + d[1], u[2] + d[2]]
+            };
         }
     });
     out
@@ -897,7 +910,8 @@ mod bench {
             acc = up_into(&acc, f, true);
         }
         let t_up = t.elapsed().as_secs_f64() * 1e3;
-        let per: Vec<String> = a.iter().zip(&levels).map(|(p, lv)| format!("{}x{} rect {}x{} steps {}", p.w, p.h, p.r.w(), p.r.y1 - p.r.y0, lv.steps[0])).collect();
+        let per: Vec<String> =
+            a.iter().zip(&levels).map(|(p, lv)| format!("{}x{} rect {}x{} steps {}", p.w, p.h, p.r.w(), p.r.y1 - p.r.y0, lv.steps[0])).collect();
         println!("STAGES down {t_down:.1} ms, blur {t_blur:.1} ms, up {t_up:.1} ms; c0 rect {}x{}; levels {per:?}", acc.r.w(), acc.r.y1 - acc.r.y0);
     }
 }
