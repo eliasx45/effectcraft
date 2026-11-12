@@ -298,7 +298,7 @@ fn apply_variant(s: &mut Session, p: &Value) -> Result<Value> {
         })();
         match res {
             Ok(r) => {
-                super::batch::fold(s, &snap, &format!("Apply {}", v.name));
+                super::batch::fold(s, &snap, &format!("Apply {}", v.name), &history);
                 r
             }
             Err(e) => {

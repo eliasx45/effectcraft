@@ -1149,7 +1149,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(o) = a.reply.as_object_mut() {
                 o.insert("moved".into(), Value::Array(mv));
             }
-            super::batch::fold(s, &snap, &a.label);
+            super::batch::fold(s, &snap, &a.label, &history);
             if s.active_comp_id() == Some(cid) {
                 s.state.selected_layers = a.select;
             }

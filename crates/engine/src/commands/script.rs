@@ -560,9 +560,9 @@ fn word_apply(s: &mut Session, p: &Value) -> Result<Value> {
     let comp_end = comp.duration.seconds();
     let (cw, ch) = (comp.width as f64, comp.height as f64);
     let label = format!("{} on “{}”", item_label(&item), phrase.chars().take(40).collect::<String>());
-    let snap = s.project.clone();
+    let (snap, history) = (s.project.clone(), s.history.clone());
     let r = build(s, p, &Build { cid, item: &item, phrase: &phrase, start, end, peak, on_stress, stressed, fd, comp_end, cw, ch });
-    super::batch::fold(s, &snap, &label);
+    super::batch::fold(s, &snap, &label, &history);
     match r {
         Ok(mut out) => {
             out["item"] = json!(item);

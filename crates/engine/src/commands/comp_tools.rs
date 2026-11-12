@@ -128,9 +128,9 @@ fn smart_precompose(s: &mut Session, p: &Value) -> Result<Value> {
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     check_group(comp, &ids, C)?;
     let label = label_p(p, C)?;
-    let snap = s.project.clone();
+    let (snap, history) = (s.project.clone(), s.history.clone());
     let r = precompose_group(s, cid, &ids, str_p(p, "name"), label);
-    super::batch::fold(s, &snap, "Smart Precomp");
+    super::batch::fold(s, &snap, "Smart Precomp", &history);
     r
 }
 
@@ -170,18 +170,18 @@ fn multi_precompose(s: &mut Session, p: &Value) -> Result<Value> {
     for g in &groups {
         check_group(comp, g, C)?;
     }
-    let snap = s.project.clone();
+    let (snap, history) = (s.project.clone(), s.history.clone());
     let mut made = vec![];
     for g in &groups {
         match precompose_group(s, cid, g, str_p(p, "name"), label) {
             Ok(r) => made.push(r),
             Err(e) => {
-                super::batch::fold(s, &snap, "Multi Precomp");
+                super::batch::fold(s, &snap, "Multi Precomp", &history);
                 return Err(e);
             }
         }
     }
-    super::batch::fold(s, &snap, "Multi Precomp");
+    super::batch::fold(s, &snap, "Multi Precomp", &history);
     Ok(json!({"precomps": made}))
 }
 

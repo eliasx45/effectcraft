@@ -1638,3 +1638,24 @@ fn keyframe_move_transitions_are_in_the_menus() {
     }
     assert!(!include_str!("../presets/zoom-cut.kinds.json").contains(concat!("/", "Users", "/")));
 }
+
+/// Night run 12 Nov 2026: in the app Page Burn left ~40 undo steps (Keep Audio, Layer Comment,
+/// Track Matte…) instead of one, and pushed the older steps off the line: it makes more steps
+/// than the 32 Undo Levels. Every kind must stay one step whatever the limit.
+#[test]
+fn every_kind_is_one_undo_step_under_a_small_undo_limit() {
+    for kind in ["page-burn", "white-flash", "card-flip-3d", "kick"] {
+        let (mut s, cid, old, new, _) = cut_at(29.97, 10.0, 4.0);
+        s.prefs.general.undo_levels = 8;
+        let before: Vec<String> = s.history.undo.iter().map(|(l, _)| l.clone()).collect();
+        let layers = s.project.comp(ItemId(cid)).unwrap().layers.len();
+        let r = apply(&mut s, cid, old, new, kind).unwrap();
+        let after: Vec<String> = s.history.undo.iter().map(|(l, _)| l.clone()).collect();
+        assert_eq!(after.len(), before.len() + 1, "{kind}: one undo step, the older ones kept: {after:?}");
+        assert_eq!(after[..before.len()], before[..], "{kind}: the older steps");
+        assert!(after.last().is_some_and(|l| l.starts_with("Apply Transition")), "{kind}: {after:?} ({})", r["title"]);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.project.comp(ItemId(cid)).unwrap().layers.len(), layers, "{kind}: one Undo takes it all back");
+        assert!(transition_effects(&s, cid, old).is_empty() && transition_effects(&s, cid, new).is_empty(), "{kind}: undo removes the effects");
+    }
+}

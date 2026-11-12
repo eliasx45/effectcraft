@@ -188,7 +188,7 @@ fn batch(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     if group_undo {
-        fold(s, &project, &label);
+        fold(s, &project, &label, &history);
     }
     // Steps' warnings (clamped or coerced values), gathered so they aren't missed.
     let warnings: Vec<String> = results
@@ -279,13 +279,13 @@ fn step_warnings(r: &Value) -> Vec<String> {
 }
 
 /// Fold the undo steps recorded since the project was `snap` into one step called `label`.
-pub(crate) fn fold(s: &mut Session, snap: &Arc<effectcraft_project::Project>, label: &str) {
-    let h = &mut s.history;
-    let Some(start) = h.undo.iter().rposition(|(_, p)| Arc::ptr_eq(p, snap)) else { return };
-    let first = h.undo[start].1.clone();
-    h.undo.truncate(start);
-    h.undo.push((label.to_string(), first));
-    h.merge_key = None;
+/// `before` is the history when the group began: a group with more steps than Undo Levels
+/// still ends as one step, with the older steps kept ([`crate::history::History::fold`]).
+pub(crate) fn fold(s: &mut Session, snap: &Arc<effectcraft_project::Project>, label: &str, before: &crate::history::History) {
+    let levels = s.prefs.general.undo_levels.max(1) as usize;
+    let current = s.project.clone();
+    s.history.fold(snap, label, before, &current, levels);
+    s.history.set_author(&s.project, s.client.clone());
 }
 
 pub fn specs() -> Vec<CommandSpec> {

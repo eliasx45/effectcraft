@@ -407,13 +407,11 @@ fn make_layer(
 }
 
 /// Fold the undo steps recorded since `snap` into one.
-fn fold(s: &mut Session, snap: &Arc<Project>, label: &str) {
-    let h = &mut s.history;
-    let Some(start) = h.undo.iter().rposition(|(_, p)| Arc::ptr_eq(p, snap)) else { return };
-    let first = h.undo[start].1.clone();
-    h.undo.truncate(start);
-    h.undo.push((label.to_string(), first));
-    h.merge_key = None;
+fn fold(s: &mut Session, snap: &Arc<Project>, label: &str, before: &crate::history::History) {
+    let levels = s.prefs.general.undo_levels.max(1) as usize;
+    let current = s.project.clone();
+    s.history.fold(snap, label, before, &current, levels);
+    s.history.set_author(&s.project, s.client.clone());
 }
 
 pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &Settings) -> Result<Value> {
@@ -526,7 +524,7 @@ pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &S
             return Err(e);
         }
     };
-    fold(s, &project, cfg.undo_label);
+    fold(s, &project, cfg.undo_label, &history);
     let roots: Vec<u64> = plan.roots.iter().filter_map(|i| comp_items.get(*i).copied().flatten()).map(|c| c.0).collect();
     let precomps: Vec<u64> =
         comp_items.iter().enumerate().filter(|(i, _)| !plan.roots.contains(i) && Some(*i) != plan.into_active).filter_map(|(_, c)| c.map(|c| c.0)).collect();

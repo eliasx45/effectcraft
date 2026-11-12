@@ -745,7 +745,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     let opts = Opts { sync, glow, word: word.as_deref(), words: words.as_ref(), occurrence, at };
     match run(s, p, cid, &preset, &sets, &opts, &mut notes) {
         Ok(mut r) => {
-            super::batch::fold(s, &snap, &format!("Text Preset {}", preset.name));
+            super::batch::fold(s, &snap, &format!("Text Preset {}", preset.name), &history);
             r["notes"] = json!(notes);
             Ok(r)
         }

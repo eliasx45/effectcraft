@@ -710,7 +710,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     })();
     match result {
         Ok(r) => {
-            super::batch::fold(s, &snap, &format!("Clip Move {title}"));
+            super::batch::fold(s, &snap, &format!("Clip Move {title}"), &history);
             if s.active_comp_id() == Some(cid) {
                 s.state.selected_layers = vec![lid];
             }

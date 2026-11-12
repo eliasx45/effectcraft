@@ -301,7 +301,7 @@ fn scene(s: &mut Session, p: &Value) -> Result<Value> {
     })();
     match result {
         Ok(r) => {
-            super::batch::fold(s, &snap, &format!("Apply Scene {}", r["scene"]["name"].as_str().unwrap_or(&id)));
+            super::batch::fold(s, &snap, &format!("Apply Scene {}", r["scene"]["name"].as_str().unwrap_or(&id)), &history);
             Ok(r)
         }
         Err(e) => {

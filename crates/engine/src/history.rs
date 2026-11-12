@@ -210,6 +210,43 @@ impl History {
         self.trim(levels, &before);
     }
 
+    /// Fold the steps recorded since the project was `snap` into one step called `label`
+    /// (a command made of other commands is one undo step). `before` is the history when the
+    /// group began and `current` the project now.
+    ///
+    /// A group can record more steps than Undo Levels allows (Page Burn makes 40): the limit
+    /// then dropped the oldest steps while it ran, the user's own and, past the limit, the
+    /// group's first one, which left nothing to fold from and every sub-step on the line.
+    /// The history is then built again from `before` plus the one step, as if the group had
+    /// been a single command.
+    pub(crate) fn fold(&mut self, snap: &Arc<Project>, label: &str, before: &History, current: &Arc<Project>, levels: usize) {
+        let start = self.undo.iter().rposition(|(_, p)| Arc::ptr_eq(p, snap));
+        // The oldest step is still the one the group began with: the limit dropped nothing.
+        let front_kept = match (before.undo.first(), self.undo.first()) {
+            (Some((_, a)), Some((_, b))) => Arc::ptr_eq(a, b),
+            (None, _) => start.is_some() || Arc::ptr_eq(current, snap),
+            (Some(_), None) => false,
+        };
+        match start {
+            Some(start) if front_kept => {
+                let Some((_, first)) = self.undo.get(start).cloned() else { return };
+                self.undo.truncate(start);
+                self.undo.push((label.to_string(), first));
+                self.merge_key = None;
+            }
+            // Nothing was recorded from `snap`: no step changed the project.
+            None if front_kept => {}
+            _ => {
+                if Arc::ptr_eq(current, snap) {
+                    return;
+                }
+                let mut h = before.clone();
+                h.record(label, snap.clone(), levels);
+                *self = h;
+            }
+        }
+    }
+
     /// Keep the undone states as a branch growing from `from` (the state a new step starts from).
     pub fn abandon_redo(&mut self, from: &Arc<Project>) {
         if self.redo.is_empty() {

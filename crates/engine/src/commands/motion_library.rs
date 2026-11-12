@@ -258,7 +258,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(e);
         }
     };
-    super::batch::fold(s, &snap, &format!("Apply {}", card.name));
+    super::batch::fold(s, &snap, &format!("Apply {}", card.name), &history);
     // Footage left out of the upload: the imported items that are missing, to relink.
     let imported: Vec<u64> = r["import"]["items"].as_array().map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
     let needs: Vec<Value> = card
@@ -302,7 +302,7 @@ fn apply_local(s: &mut Session, p: &Value, e: &crate::motion_library::LocalEntry
     let history = s.history.clone();
     match s.execute("library.insert", p.clone()) {
         Ok(mut r) => {
-            super::batch::fold(s, &snap, &format!("Apply {}", e.name));
+            super::batch::fold(s, &snap, &format!("Apply {}", e.name), &history);
             r["source"] = json!("local");
             r["file"] = json!(e.file);
             Ok(r)

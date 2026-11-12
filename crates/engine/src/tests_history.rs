@@ -491,3 +491,37 @@ fn undo_changes_takes_back_an_older_step_alone() {
     // An unknown revision is an error, not a guess.
     assert!(s.execute_checked("edit.undoChanges", json!({"revisions": [999_999]})).is_err());
 }
+
+/// Night run 12 Nov 2026: a grouped command with more steps than Undo Levels (FX cut Page Burn
+/// makes 40 against the default 32) left every sub-step on the undo line and pushed the user's
+/// older steps off it, because the limit dropped the step the fold starts from.
+#[test]
+fn a_group_longer_than_undo_levels_is_one_step_and_keeps_the_older_ones() {
+    let mut s = Session::default();
+    s.prefs.general.undo_levels = 4;
+    s.execute("comp.new", json!({"name": "H", "width": 64, "height": 64, "duration": 2})).unwrap();
+    solid(&mut s, "A");
+    solid(&mut s, "B");
+    let labels = |s: &Session| s.history.undo.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>();
+    let before = labels(&s);
+    assert_eq!(before.len(), 3);
+    // Six steps in one group: two more than the limit, so its first step is dropped while it runs.
+    let steps: Vec<Value> = ["C", "D", "E", "F", "G", "I"].iter().map(|n| json!({"command": "layer.newSolid", "params": {"name": n}})).collect();
+    s.execute("engine.batch", json!({"steps": steps, "label": "Six"})).unwrap();
+    let mut want = before.clone();
+    want.push("Six".to_string());
+    assert_eq!(labels(&s), want, "the group is one step after the older ones");
+    assert_eq!(s.active_comp().unwrap().layers.len(), 8);
+    // One Undo takes the whole group back, and the older steps still undo after it.
+    s.undo();
+    assert_eq!(s.active_comp().unwrap().layers.len(), 2);
+    s.undo();
+    assert_eq!(s.active_comp().unwrap().layers.len(), 1);
+    s.redo();
+    s.redo();
+    assert_eq!(s.active_comp().unwrap().layers.len(), 8, "redo brings the group back in one step");
+    // A group that only pushes older steps off (fewer steps than the limit) keeps them too.
+    let steps: Vec<Value> = ["J", "K", "L"].iter().map(|n| json!({"command": "layer.newSolid", "params": {"name": n}})).collect();
+    s.execute("engine.batch", json!({"steps": steps, "label": "Three"})).unwrap();
+    assert_eq!(labels(&s), [&before[1..], &["Six".to_string(), "Three".to_string()]].concat(), "only the limit trims, once, after the fold");
+}

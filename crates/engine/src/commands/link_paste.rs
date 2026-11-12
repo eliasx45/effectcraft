@@ -128,7 +128,7 @@ pub(crate) fn atomic(s: &mut Session, label: &str, f: impl FnOnce(&mut Session) 
         (s.warp_pending.clone(), s.camera_pending.clone(), s.roto_pending.clone(), s.analyses_checked.clone());
     match f(s) {
         Ok(v) => {
-            super::batch::fold(s, &project, label);
+            super::batch::fold(s, &project, label, &history);
             Ok(v)
         }
         Err(e) => {
